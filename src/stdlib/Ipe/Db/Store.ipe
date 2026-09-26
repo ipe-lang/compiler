@@ -137,13 +137,13 @@ type Column
         }
 
 
--- | A DB-only fact the record type cannot express: primary key, serial
+-- | A per-column DB-only fact the record type cannot express: serial
 -- (DB-assigned) id, uniqueness, or a DB-stamped default. A typed ADT, not a
 -- stringly flag — an impossible spec (a flag typo, a malformed default) is
--- unrepresentable.
+-- unrepresentable. The primary key is a table-level fact and lives only in the
+-- `PrimaryKeyDecl`, never as a spec, so the key is recorded in one place.
 type ColumnSpec
-    = PrimaryKey String
-    | Serial String
+    = Serial String
     | Unique String
     | DefaultNow String
     | DefaultText String String
@@ -582,11 +582,13 @@ public draft =
 
 -- ─── Column-spec builders ──────────────────────────────────────────
 --
--- Each attaches one typed `ColumnSpec` to the `Draft`, before classification,
--- because it shapes the schema, not the access policy. `primaryKey` additionally
--- records the validated key column the by-key operations read. The identifier
--- was validated when the draft was built, so no spec can smuggle an unchecked
--- name into SQL.
+-- Each shapes the `Draft`, before classification, because it shapes the schema,
+-- not the access policy. The key builders (`primaryKey` / `compositePrimaryKey2`
+-- / `compositePrimaryKey3` and their `…Named` forms) set the store's one
+-- `PrimaryKeyDecl`, which the DDL and the by-key operations both read; the others
+-- attach one typed `ColumnSpec`. Every name a builder records is checked against
+-- the store's own validated columns before it reaches DDL, so no builder can
+-- smuggle an unchecked name into SQL.
 
 
 -- | Mark the accessor-named column the primary key. The lowering intercept
@@ -633,9 +635,11 @@ primaryKey =
 -- a key column listed twice, records a typed `Err` that every read and write on
 -- the store fails with.
 --
--- `createSql` / `migrations` do not yet render a table-level
--- `PRIMARY KEY (...)` clause: for a composite key they ALWAYS return a typed
--- `Err`, so the table must already exist (created outside `Ipe.Db.Store`).
+-- `createSql` / `migrations` render the key as one table-level constraint,
+-- `PRIMARY KEY (user_id, group_id)`, columns in declared order, on SQLite and
+-- Postgres alike. A composite key on a store with a `serial` column is refused
+-- there with a typed `Err` (`AUTOINCREMENT` exists only on a one-column
+-- `INTEGER` key).
 --
 -- Example:
 --
@@ -658,10 +662,9 @@ compositePrimaryKey2 =
 -- a missing field is a type error, the by-key operations return a typed `Err`
 -- on the resulting store, `updateWhere` never writes any key column, and a
 -- second key declaration records a typed `Err` that every read and write fails
--- with. `createSql` / `migrations` ALWAYS return a typed `Err` for a composite
--- key (no table-level `PRIMARY KEY (...)` clause is rendered yet), so the table
--- must already exist. For more than three columns, or a raw-column
--- `fromColumns` draft, use `compositePrimaryKeyNamed`.
+-- with. `createSql` / `migrations` render the table-level
+-- `PRIMARY KEY (sensor, day, hour)`. For more than three columns, or a
+-- raw-column `fromColumns` draft, use `compositePrimaryKeyNamed`.
 --
 -- Example:
 --
@@ -773,17 +776,7 @@ primaryKeyNamed name draft =
                     draft
 
                 Ok NoPk ->
-                    Draft
-                        { table = r.table
-                        , frozenTable = r.frozenTable
-                        , frozenColumns = r.frozenColumns
-                        , currentColumns = r.currentColumns
-                        , codec = r.codec
-                        , specs = PrimaryKey name :: r.specs
-                        , pk = Ok (SinglePk name)
-                        , ops = r.ops
-                        , indexes = r.indexes
-                        }
+                    withPrimaryKey (Ok (SinglePk name)) draft
 
                 Ok existing ->
                     withPrimaryKey (Err (secondPrimaryKeyError existing)) draft
@@ -805,6 +798,11 @@ primaryKeyNamed name draft =
 -- * a name that is not a column of the draft;
 -- * a column listed twice;
 -- * a draft that already declares a primary key (single or composite).
+--
+-- `createSql` / `migrations` render the key as one table-level constraint,
+-- `PRIMARY KEY (user_id, group_id)`, columns in declared order; a `serial`
+-- column on the same store is refused there (`AUTOINCREMENT` exists only on a
+-- one-column `INTEGER` key).
 --
 -- Example:
 --
@@ -1300,9 +1298,6 @@ mapPkDeclColumns f decl =
 mapSpecColumn : (String -> String) -> ColumnSpec -> ColumnSpec
 mapSpecColumn f spec =
     case spec of
-        PrimaryKey c ->
-            PrimaryKey (f c)
-
         Serial c ->
             Serial (f c)
 
@@ -1864,9 +1859,6 @@ specOmitsColumn spec name =
         TouchOnUpdate c ->
             c == name
 
-        PrimaryKey _ ->
-            False
-
         Unique _ ->
             False
 
@@ -2087,9 +2079,6 @@ uniqueSpecColumn spec =
     case spec of
         Unique col ->
             Just col
-
-        PrimaryKey _ ->
-            Nothing
 
         Serial _ ->
             Nothing
@@ -4812,6 +4801,21 @@ readBool name row =
 -- create entry; it builds only from validated identifiers and holds no values,
 -- so there is nothing to inject.
 --
+-- The primary key renders from the store's one key declaration, identically on
+-- SQLite and Postgres:
+--
+-- * a one-column key (`primaryKey`) is inline on its column:
+--   `CREATE TABLE IF NOT EXISTS tags (slug TEXT PRIMARY KEY, label TEXT)`
+-- * a composite key (`compositePrimaryKey2` / `compositePrimaryKey3` /
+--   `compositePrimaryKeyNamed`) is one table-level constraint, its columns in
+--   declared order (the order the key's backing index uses):
+--   `CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT, PRIMARY KEY (user_id, group_id))`
+--
+-- An invalid key is an `Err`, never DDL without it: a refused declaration (a
+-- second key, a malformed composite list), a key column that is not a valid
+-- identifier or not a column of the store, or a composite key on a store with a
+-- `serial` column (`AUTOINCREMENT` exists only on a one-column `INTEGER` key).
+--
 -- The DDL is the store's FROZEN schema — the table name, columns, and specs as
 -- first constructed — and is exactly the create entry `migrations` emits first.
 -- A rename never edits it (the renames are later ledger entries), so the table
@@ -4825,26 +4829,25 @@ createSql store =
 
 -- The primary-key declaration is checked first: an illegal declaration (a
 -- second key, a malformed composite list) surfaces its recorded `Err`, and a
--- composite key fails closed because the table-level `PRIMARY KEY (…)` clause
--- is not rendered — never a table silently created without its declared key.
+-- legal one is checked against the schema it renders into before any DDL text
+-- is built — never a table silently created without its declared key.
 createSqlFromColumns : String -> List Column -> List ColumnSpec -> Result Error PrimaryKeyDecl -> Result Error String
 createSqlFromColumns table cols specs pk =
     case pk of
         Err e ->
             Err e
 
-        Ok (CompositePk _ _ _) ->
-            Err compositePkDdlUnsupportedError
+        Ok decl ->
+            case primaryKeyWithinSchema decl specs cols of
+                Err e ->
+                    Err e
 
-        Ok NoPk ->
-            createSqlFromColumnDefs table cols specs
-
-        Ok (SinglePk _) ->
-            createSqlFromColumnDefs table cols specs
+                Ok _ ->
+                    createSqlFromColumnDefs table cols specs decl
 
 
-createSqlFromColumnDefs : String -> List Column -> List ColumnSpec -> Result Error String
-createSqlFromColumnDefs table cols specs =
+createSqlFromColumnDefs : String -> List Column -> List ColumnSpec -> PrimaryKeyDecl -> Result Error String
+createSqlFromColumnDefs table cols specs decl =
     if Basics.not (validSqlIdentPlain table) then
         Err (invalidIdentError "table" table)
 
@@ -4854,7 +4857,7 @@ createSqlFromColumnDefs table cols specs =
                 Err e
 
             Ok _ ->
-                case columnDefs specs cols of
+                case columnDefs decl specs cols of
                     Err e ->
                         Err e
 
@@ -4864,10 +4867,83 @@ createSqlFromColumnDefs table cols specs =
                                 [ "CREATE TABLE IF NOT EXISTS "
                                 , table
                                 , " ("
-                                , String.join ", " defs
+                                , String.join ", " (defs ++ tableConstraints decl)
                                 , ")"
                                 ]
                             )
+
+
+-- The key declaration checked against the schema it renders into. Every key
+-- column must be a valid identifier AND one of the store's own columns (defence
+-- in depth: a composite list is already parsed at declaration, a one-column
+-- name is checked only here), so an unknown name fails closed instead of
+-- rendering a key over a column the table does not have. A composite key has
+-- no `serial` companion.
+primaryKeyWithinSchema : PrimaryKeyDecl -> List ColumnSpec -> List Column -> Result Error ()
+primaryKeyWithinSchema decl specs cols =
+    case List.head (List.filterMap (keyColumnError cols) (primaryKeyColumns decl)) of
+        Just e ->
+            Err e
+
+        Nothing ->
+            case decl of
+                CompositePk first second rest ->
+                    case List.filter (\s -> specIsSerial s (specColumn s)) specs of
+                        serialSpec :: _ ->
+                            Err (compositeKeySerialError (specColumn serialSpec) (first :: second :: rest))
+
+                        [] ->
+                            Ok ()
+
+                SinglePk _ ->
+                    Ok ()
+
+                NoPk ->
+                    Ok ()
+
+
+keyColumnError : List Column -> String -> Maybe Error
+keyColumnError cols name =
+    if Basics.not (validSqlIdentPlain name) then
+        Just (invalidIdentError "primary-key column" name)
+
+    else if Basics.not (hasColumn cols name) then
+        Just (unknownColumnError name)
+
+    else
+        Nothing
+
+
+-- Whether `name` carries the key inline (`col TYPE PRIMARY KEY`) — true only for
+-- the column of a one-column key. A composite key renders as a table-level
+-- constraint instead, so none of its columns carries an inline `PRIMARY KEY`.
+isInlineKey : PrimaryKeyDecl -> String -> Bool
+isInlineKey decl name =
+    case decl of
+        SinglePk keyCol ->
+            keyCol == name
+
+        CompositePk _ _ _ ->
+            False
+
+        NoPk ->
+            False
+
+
+-- The table-level constraint terms appended after the column definitions: the
+-- composite key's `PRIMARY KEY (a, b, …)`, columns in declared order. Its
+-- identifiers were validated by `primaryKeyWithinSchema`.
+tableConstraints : PrimaryKeyDecl -> List String
+tableConstraints decl =
+    case decl of
+        CompositePk first second rest ->
+            [ String.concat [ "PRIMARY KEY (", String.join ", " (first :: second :: rest), ")" ] ]
+
+        SinglePk _ ->
+            []
+
+        NoPk ->
+            []
 
 
 -- Every spec must name one of the codec's own derived columns; a spec for a
@@ -4900,9 +4976,6 @@ specsWithinColumns specs cols =
 specColumn : ColumnSpec -> String
 specColumn spec =
     case spec of
-        PrimaryKey c ->
-            c
-
         Serial c ->
             c
 
@@ -4922,31 +4995,34 @@ specColumn spec =
             c
 
 
-columnDefs : List ColumnSpec -> List Column -> Result Error (List String)
-columnDefs specs columns =
+columnDefs : PrimaryKeyDecl -> List ColumnSpec -> List Column -> Result Error (List String)
+columnDefs decl specs columns =
     case columns of
         [] ->
             Ok []
 
         first :: rest ->
-            case columnDef specs first of
+            case columnDef decl specs first of
                 Err e ->
                     Err e
 
                 Ok def ->
-                    Result.map (\more -> def :: more) (columnDefs specs rest)
+                    Result.map (\more -> def :: more) (columnDefs decl specs rest)
 
 
-columnDef : List ColumnSpec -> Column -> Result Error String
-columnDef specs col =
+columnDef : PrimaryKeyDecl -> List ColumnSpec -> Column -> Result Error String
+columnDef decl specs col =
     let
         name =
             columnName col
+
+        inlineKey =
+            isInlineKey decl name
     in
     if Basics.not (validSqlIdentPlain name) then
         Err (invalidIdentError "column" name)
 
-    else if List.any (\s -> specIsSerial s name) specs && Basics.not (List.any (\s -> specIsPrimaryKey s name) specs) then
+    else if List.any (\s -> specIsSerial s name) specs && Basics.not inlineKey then
         Err (serialWithoutPkError name)
 
     else if List.any (\s -> specHasUnsafeDefaultText s name) specs then
@@ -4958,7 +5034,7 @@ columnDef specs col =
                 [ name
                 , " "
                 , sqlType (columnColType col)
-                , columnConstraints specs name
+                , columnConstraints inlineKey specs name
                 ]
             )
 
@@ -5001,15 +5077,13 @@ sqlType colType =
 -- Instead of concatenating each spec's fragment in arbitrary list order, we
 -- emit in the canonical SQL constraint order:
 --   PRIMARY KEY  →  AUTOINCREMENT  →  UNIQUE  →  DEFAULT …
--- A column that is both `Serial` and `PrimaryKey` therefore always gets
--- `PRIMARY KEY AUTOINCREMENT`, regardless of the order the caller applied
--- those specs.
-columnConstraints : List ColumnSpec -> String -> String
-columnConstraints specs name =
+-- A `Serial` column that is the inline key therefore always gets
+-- `PRIMARY KEY AUTOINCREMENT`, regardless of the order the caller applied the
+-- builders. `inlineKey` is derived from the store's one key declaration
+-- (`isInlineKey`), never from a spec.
+columnConstraints : Bool -> List ColumnSpec -> String -> String
+columnConstraints inlineKey specs name =
     let
-        isPk =
-            List.any (\s -> specIsPrimaryKey s name) specs
-
         isSerial =
             List.any (\s -> specIsSerial s name) specs
 
@@ -5032,7 +5106,7 @@ columnConstraints specs name =
                     ""
 
         pkFragment =
-            if isPk then
+            if inlineKey then
                 " PRIMARY KEY"
 
             else
@@ -5046,7 +5120,7 @@ columnConstraints specs name =
                 ""
 
         uniqueFragment =
-            if isUnique && Basics.not isPk then
+            if isUnique && Basics.not inlineKey then
                 " UNIQUE"
 
             else
@@ -5055,39 +5129,11 @@ columnConstraints specs name =
     String.concat [ pkFragment, autoincFragment, uniqueFragment, defaultNowFragment, defaultLiteralFragment ]
 
 
-specIsPrimaryKey : ColumnSpec -> String -> Bool
-specIsPrimaryKey spec name =
-    case spec of
-        PrimaryKey c ->
-            c == name
-
-        Serial _ ->
-            False
-
-        Unique _ ->
-            False
-
-        DefaultNow _ ->
-            False
-
-        DefaultText _ _ ->
-            False
-
-        DefaultInt _ _ ->
-            False
-
-        TouchOnUpdate _ ->
-            False
-
-
 specIsSerial : ColumnSpec -> String -> Bool
 specIsSerial spec name =
     case spec of
         Serial c ->
             c == name
-
-        PrimaryKey _ ->
-            False
 
         Unique _ ->
             False
@@ -5110,9 +5156,6 @@ specIsUnique spec name =
     case spec of
         Unique c ->
             c == name
-
-        PrimaryKey _ ->
-            False
 
         Serial _ ->
             False
@@ -5138,9 +5181,6 @@ specIsDefaultNow spec name =
 
         TouchOnUpdate c ->
             c == name
-
-        PrimaryKey _ ->
-            False
 
         Serial _ ->
             False
@@ -5177,9 +5217,6 @@ specDefaultLiteral spec name =
             else
                 Nothing
 
-        PrimaryKey _ ->
-            Nothing
-
         Serial _ ->
             Nothing
 
@@ -5204,9 +5241,6 @@ specHasUnsafeDefaultText spec name =
             c == name && Basics.not (defaultTextByteSafe value)
 
         DefaultInt _ _ ->
-            False
-
-        PrimaryKey _ ->
             False
 
         Serial _ ->
@@ -7192,10 +7226,19 @@ duplicateCompositePkColumnError name =
         )
 
 
-compositePkDdlUnsupportedError : Error
-compositePkDdlUnsupportedError =
+compositeKeySerialError : String -> List String -> Error
+compositeKeySerialError name keyCols =
     Error.invalidInput
-        "Ipe.Db.Store: the CREATE TABLE DDL for a composite primary key is not supported yet — refusing to create the table without its declared key"
+        (String.concat
+            [ "Ipe.Db.Store: column \""
+            , name
+            , "\" is marked serial, but the store's primary key is the composite key ("
+            , String.join ", " keyCols
+            , ") — a DB-assigned serial (AUTOINCREMENT) exists only on a one-column INTEGER primary key; drop Store.serial and supply the key values, or key the table on \""
+            , name
+            , "\" alone with Store.primaryKey"
+            ]
+        )
 
 
 unknownColumnError : String -> Error

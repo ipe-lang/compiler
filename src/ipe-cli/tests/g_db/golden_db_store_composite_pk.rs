@@ -2,9 +2,12 @@
 //!
 //! A composite key's column list is parsed once, at declaration, into a typed
 //! key. The runtime refusals (an empty or one-column list, an invalid
-//! identifier, an unknown or repeated column, a second key declaration) are
-//! driven end to end by the `db_store_composite_pk_guard` golden, whose oracle
-//! pins one `:rejected` line per refusal. The `db_store_composite_pk_ops` golden
+//! identifier, an unknown or repeated column, a second key declaration, a
+//! composite key beside a `serial` column) are driven end to end by the
+//! `db_store_composite_pk_guard` golden, whose oracle pins one `:rejected` line
+//! per refusal and one `:ok` line per exact `CREATE TABLE` DDL (the composite
+//! key as one table-level `PRIMARY KEY (…)` in declared order, also in the
+//! `migrations` create entry). The `db_store_composite_pk_ops` golden
 //! drives the database-backed refusals: by-key operations on a composite store,
 //! every key column dropped from an `updateWhere` SET, and every operation on a
 //! store with an illegal key declaration. An accessor naming a field the row

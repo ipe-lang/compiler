@@ -7,7 +7,13 @@ single-then-composite:rejected
 composite-then-single:rejected
 single-then-single:rejected
 typed-single-then-composite:rejected
-raw-composite-ddl:rejected
-typed-composite2-ddl:rejected
-typed-composite3-ddl:rejected
+single-unknown-column:rejected
+composite-serial:rejected
+raw-composite-ddl:ok
+typed-composite2-ddl:ok
+typed-composite3-ddl:ok
+key-order-kept:ok
+composite-unique:ok
+composite-migrations:ok
+composite-rename-key:ok
 single-pk:ok

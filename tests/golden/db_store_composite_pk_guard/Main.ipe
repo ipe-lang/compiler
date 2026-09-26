@@ -6,18 +6,23 @@ module Main exposing (main)
 --
 -- Pure checks (no DB connection), one line each:
 --   * the refusals: an empty list, a one-column list, an invalid identifier, an
---     unknown column, a repeated column, and every second-key conflict
---     (single then composite, composite then single, single then single);
---   * the accessor forms `compositePrimaryKey2` / `compositePrimaryKey3` lower
---     through the intercept and record the key (the table-level DDL is not
---     rendered yet, so `createSql` fails closed rather than drop the key);
---   * a single-column key is unaffected.
+--     unknown column, a repeated column, every second-key conflict (single then
+--     composite, composite then single, single then single), a one-column key
+--     naming no store column, and a composite key beside a `serial` column;
+--   * the raw form and the accessor forms `compositePrimaryKey2` /
+--     `compositePrimaryKey3` render the exact table-level
+--     `PRIMARY KEY (…)` constraint, columns in declared order, and the
+--     `migrations` create entry carries the same DDL;
+--   * a `unique` key column keeps its inline `UNIQUE`;
+--   * a rename of a key column leaves the frozen create DDL unchanged;
+--   * a single-column key stays inline.
 
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db.Store as Store exposing (Draft, Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
+import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task exposing (Task)
@@ -83,18 +88,64 @@ refusedLine label needle ddl =
             String.concat [ label, ":FAIL-accepted:", sql ]
 
 
-singlePkLine : String
-singlePkLine =
-    case typedDdl (\d -> Store.primaryKey .userId d) of
-        Err e ->
-            String.concat [ "single-pk:FAIL-rejected:", Error.message e ]
-
+-- `label:ok` when the DDL is exactly `expected`.
+ddlLine : String -> String -> Result Error String -> String
+ddlLine label expected ddl =
+    case ddl of
         Ok sql ->
-            if String.contains "PRIMARY KEY" sql then
-                "single-pk:ok"
+            if sql == expected then
+                String.concat [ label, ":ok" ]
 
             else
-                String.concat [ "single-pk:FAIL-bad-ddl:", sql ]
+                String.concat [ label, ":FAIL-bad-ddl:", sql ]
+
+        Err e ->
+            String.concat [ label, ":FAIL-rejected:", Error.message e ]
+
+
+membershipsDdl : String
+membershipsDdl =
+    "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT, PRIMARY KEY (user_id, group_id))"
+
+
+-- The typed `memberships` store keyed on (user_id, group_id).
+membershipStore : Result Error (Store Membership)
+membershipStore =
+    Result.map (\d -> Store.public (Store.compositePrimaryKey2 .userId .groupId d))
+        (Store.fromCodec "memberships" membershipCodec)
+
+
+-- The SQL of the `migrations` create entry (the first ledger entry).
+createEntryOf : Result Error (Store a) -> Result Error String
+createEntryOf built =
+    case Result.andThen Store.migrations built of
+        Err e ->
+            Err e
+
+        Ok entries ->
+            case List.head entries of
+                Just first ->
+                    Ok first.sql
+
+                Nothing ->
+                    Err (Error.invalidInput "migrations produced no create entry")
+
+
+-- The DDL of a raw-column `shifts` draft (with an INTEGER `slot`) shaped by `shape`.
+shiftDdl : (Draft Store.Row -> Draft Store.Row) -> Result Error String
+shiftDdl shape =
+    case
+        Store.fromColumns "shifts"
+            [ Store.textColumn "site_id"
+            , Store.intColumn "slot"
+            , Store.textColumn "badge"
+            ]
+    of
+        Err e ->
+            Err e
+
+        Ok draft ->
+            Store.createSql (Store.public (shape draft))
 
 
 main : Task Error ()
@@ -126,15 +177,27 @@ main =
             , refusedLine "typed-single-then-composite"
                 "second one was declared after primary key (user_id)"
                 (typedDdl (\d -> Store.compositePrimaryKey2 .userId .groupId (Store.primaryKey .userId d)))
-            , refusedLine "raw-composite-ddl"
-                "composite primary key is not supported yet"
-                (rawDdl (StoreU.compositePrimaryKey [ "user_id", "group_id" ]))
-            , refusedLine "typed-composite2-ddl"
-                "composite primary key is not supported yet"
-                (typedDdl (\d -> Store.compositePrimaryKey2 .userId .groupId d))
-            , refusedLine "typed-composite3-ddl"
-                "composite primary key is not supported yet"
+            , refusedLine "single-unknown-column"
+                "\"tenant_id\" is not a column"
+                (rawDdl (StoreU.primaryKey "tenant_id"))
+            , refusedLine "composite-serial"
+                "is marked serial, but the store's primary key is the composite key (site_id, slot)"
+                (shiftDdl (\d -> StoreU.compositePrimaryKey [ "site_id", "slot" ] (StoreU.serial "slot" d)))
+            , ddlLine "raw-composite-ddl" membershipsDdl (rawDdl (StoreU.compositePrimaryKey [ "user_id", "group_id" ]))
+            , ddlLine "typed-composite2-ddl" membershipsDdl (typedDdl (\d -> Store.compositePrimaryKey2 .userId .groupId d))
+            , ddlLine "typed-composite3-ddl"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT, PRIMARY KEY (user_id, group_id, role))"
                 (typedDdl (\d -> Store.compositePrimaryKey3 .userId .groupId .role d))
-            , singlePkLine
+            , ddlLine "key-order-kept"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT, PRIMARY KEY (group_id, user_id))"
+                (rawDdl (StoreU.compositePrimaryKey [ "group_id", "user_id" ]))
+            , ddlLine "composite-unique"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT UNIQUE, group_id TEXT, role TEXT, PRIMARY KEY (user_id, group_id))"
+                (rawDdl (\d -> StoreU.compositePrimaryKey [ "user_id", "group_id" ] (StoreU.unique "user_id" d)))
+            , ddlLine "composite-migrations" membershipsDdl (createEntryOf membershipStore)
+            , ddlLine "composite-rename-key" membershipsDdl (Result.andThen Store.createSql (Result.map (Store.renameColumn "group_id" "team_id") membershipStore))
+            , ddlLine "single-pk"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT PRIMARY KEY, group_id TEXT, role TEXT)"
+                (typedDdl (\d -> Store.primaryKey .userId d))
             ]
         )
