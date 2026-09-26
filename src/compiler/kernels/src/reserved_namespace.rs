@@ -46,7 +46,9 @@ pub const RESERVED_PACKAGE_PREFIXES: &[&str] = &["ipe-registry-smoke"];
 ///
 /// Held here, once, so the resolver and the admission gate agree on who is
 /// first-party. Changing the first-party identity is a single edit at this
-/// constant, never a handle sprinkled across enforcement sites.
+/// constant, never a handle sprinkled across enforcement sites. It is compared
+/// only against a proven identity (the CLI's `publisher::BlessedPublisher`
+/// constructors), never against a self-declared `publisher` string.
 pub const BLESSED_PUBLISHER: &str = "arthurmaciel";
 
 /// The reserved prefix a parsed module path claims, if any.
@@ -87,18 +89,11 @@ pub fn is_reserved_module_path<S: AsRef<str>>(module_path: &[S]) -> bool {
     reserved_prefix_of(module_path).is_some()
 }
 
-/// Whether `publisher` is the blessed first-party identity permitted to own a
-/// reserved-namespace module in the registry.
-#[must_use]
-pub fn is_blessed_publisher(publisher: &str) -> bool {
-    publisher == BLESSED_PUBLISHER
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        BLESSED_PUBLISHER, RESERVED_MODULE_PREFIXES, is_blessed_publisher, is_reserved_module_path,
-        reserved_package_prefix_of, reserved_prefix_of,
+        RESERVED_MODULE_PREFIXES, is_reserved_module_path, reserved_package_prefix_of,
+        reserved_prefix_of,
     };
 
     #[test]
@@ -152,14 +147,5 @@ mod tests {
         assert_eq!(reserved_package_prefix_of("ipe-registry-smokehouse"), None);
         assert_eq!(reserved_package_prefix_of("cool-lib"), None);
         assert_eq!(reserved_package_prefix_of(""), None);
-    }
-
-    #[test]
-    fn only_the_blessed_publisher_is_first_party() {
-        assert!(is_blessed_publisher(BLESSED_PUBLISHER));
-        assert!(is_blessed_publisher("arthurmaciel"));
-        assert!(!is_blessed_publisher("attacker"));
-        assert!(!is_blessed_publisher(""));
-        assert!(!is_blessed_publisher("Arthurmaciel"));
     }
 }

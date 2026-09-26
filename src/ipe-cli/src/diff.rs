@@ -268,16 +268,94 @@ pub const fn required_bump(compat: Compatibility) -> RequiredBump {
     }
 }
 
-/// The minimum acceptable new version given the old version and the required
+/// The version a floor is measured from, classified once from its [`Version`].
+///
+/// A prerelease of core `C` precedes the release `C` itself (semver §11), so it
+/// admits `C` as a compatible successor; a release `C` does not. Each variant
+/// carries the bare core (`major.minor.patch`, no prerelease or build tag).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Predecessor {
+    /// A release version — its own core.
+    Release(Version),
+    /// A prerelease (`C-<pre>`) of the release core `C`.
+    PrereleaseOf(Version),
+}
+
+impl Predecessor {
+    /// Classify `version` by whether it carries a prerelease tag.
+    #[must_use]
+    pub fn of(version: &Version) -> Self {
+        let core = Version::new(version.major, version.minor, version.patch);
+        if version.pre.is_empty() {
+            Self::Release(core)
+        } else {
+            Self::PrereleaseOf(core)
+        }
+    }
+
+    /// The bare `major.minor.patch` core.
+    #[must_use]
+    pub const fn core(&self) -> &Version {
+        match self {
+            Self::Release(core) | Self::PrereleaseOf(core) => core,
+        }
+    }
+}
+
+/// No version can clear the floor: the required bump overflows a `u64`
+/// version component of the predecessor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloorOverflow {
+    /// The predecessor the floor was measured from.
+    pub predecessor: Predecessor,
+    /// The bump whose component overflowed.
+    pub required: RequiredBump,
+}
+
+impl std::fmt::Display for FloorOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no version can clear a {} bump over {}: a version component would overflow",
+            self.required.as_str(),
+            self.predecessor.core()
+        )
+    }
+}
+
+impl std::error::Error for FloorOverflow {}
+
+/// The minimum acceptable new version given the predecessor and the required
 /// bump (pre-1.0 floors).
 ///
-/// - `Patch`: any strict increase over `old` (`0.y.(z+1)` is the smallest).
-/// - `Minor`: at least `0.(y+1).0` — a patch bump does not clear it.
-#[must_use]
-pub const fn bump_floor(old: &Version, required: RequiredBump) -> Version {
-    match required {
-        RequiredBump::Patch => Version::new(old.major, old.minor, old.patch.saturating_add(1)),
-        RequiredBump::Minor => Version::new(old.major, old.minor.saturating_add(1), 0),
+/// - `Patch` over a release `C`: `C` with `patch + 1` — any strict increase.
+/// - `Patch` over a prerelease of `C`: `C` itself — graduating the prerelease.
+/// - `Minor` over either: at least `major.(minor + 1).0` — a patch bump, or
+///   graduating a prerelease, does not clear a breaking delta.
+///
+/// # Errors
+/// [`FloorOverflow`] when the bumped component would exceed `u64::MAX` — fail
+/// closed: no version is accepted rather than a wrapped or saturated floor.
+pub fn bump_floor(
+    predecessor: &Predecessor,
+    required: RequiredBump,
+) -> Result<Version, FloorOverflow> {
+    let overflow = || FloorOverflow {
+        predecessor: predecessor.clone(),
+        required,
+    };
+    match (predecessor, required) {
+        (Predecessor::PrereleaseOf(core), RequiredBump::Patch) => Ok(core.clone()),
+        (Predecessor::Release(core), RequiredBump::Patch) => core
+            .patch
+            .checked_add(1)
+            .map(|patch| Version::new(core.major, core.minor, patch))
+            .ok_or_else(overflow),
+        (Predecessor::Release(core) | Predecessor::PrereleaseOf(core), RequiredBump::Minor) => core
+            .minor
+            .checked_add(1)
+            .map(|minor| Version::new(core.major, minor, 0))
+            .ok_or_else(overflow),
     }
 }
 
@@ -285,7 +363,8 @@ pub const fn bump_floor(old: &Version, required: RequiredBump) -> Version {
 ///
 /// # Errors
 /// [`DiffError`] when either tree cannot be read, does not typecheck, or exposes
-/// an open interface.
+/// an open interface, or when the required bump overflows
+/// ([`DiffError::FloorOverflow`]).
 pub fn check_semver_bump(
     old_tree: &Path,
     new_tree: &Path,
@@ -294,29 +373,31 @@ pub fn check_semver_bump(
 ) -> Result<SemverReport, DiffError> {
     let old_api = extract_tree(old_tree)?;
     let new_api = extract_tree(new_tree)?;
-    Ok(report(&old_api, &new_api, old_version, new_version))
+    report(&old_api, &new_api, old_version, new_version).map_err(DiffError::from)
 }
 
 /// Build the [`SemverReport`] for two already-extracted APIs + versions.
-#[must_use]
+///
+/// # Errors
+/// [`FloorOverflow`] when the required bump over `old_version` overflows.
 pub fn report(
     old_api: &PublicApi,
     new_api: &PublicApi,
     old_version: &Version,
     new_version: &Version,
-) -> SemverReport {
+) -> Result<SemverReport, FloorOverflow> {
     let changes = diff_api(old_api, new_api);
     let compatibility = magnitude(&changes);
     let required = required_bump(compatibility);
-    let floor = bump_floor(old_version, required);
+    let floor = bump_floor(&Predecessor::of(old_version), required)?;
     let satisfied = *new_version >= floor;
-    SemverReport {
+    Ok(SemverReport {
         changes,
         compatibility,
         required,
         floor,
         satisfied,
-    }
+    })
 }
 
 impl RequiredBump {
@@ -528,7 +609,8 @@ fn run_diff_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<(), Cl
             let old_api = extract_tree(&old_tree)?;
             let new_api = extract_tree(&new_tree)?;
             let placeholder = Version::new(0, 0, 0);
-            let rep = report(&old_api, &new_api, &placeholder, &placeholder);
+            let rep =
+                report(&old_api, &new_api, &placeholder, &placeholder).map_err(DiffError::from)?;
             print_report(&rep, format);
             Ok(())
         }

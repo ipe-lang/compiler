@@ -264,7 +264,7 @@ pub fn emit_expr_at(
                             return Ok(result);
                         }
                         // Db projection kernels: DbExec / DbQuery / DbQueryDecode /
-                        // DbInsertFields / DbUpdateFields / DbInsertFieldsReturning need
+                        // DbInsertFields / DbUpdateFields / DbUpsertFields / DbInsertFieldsReturning need
                         // `List SqlValue` / `List (String, SqlField)` projected to
                         // `Vec<SqlParam>` / `Vec<(String, Option<SqlParam>)>` at the call
                         // site via the generated `into_sql_param` / `into_field_param` methods.

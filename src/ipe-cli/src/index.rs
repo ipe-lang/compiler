@@ -24,6 +24,7 @@ use ipe_ir::Capability;
 
 use crate::CliError;
 use crate::package_name::PackageName;
+use crate::publisher::{AttestedActor, BlessedPublisher, SelfDeclaredPublisher};
 use crate::signing::SignatureBundle;
 
 /// A validated source-repository URL accepted by the package index.
@@ -280,8 +281,10 @@ impl std::fmt::Display for Sha256Hex {
 pub struct IndexEntry {
     /// The package name, matching the entry file stem (`packages/<name>.toml`).
     pub name: String,
-    /// The publishing account (informational; provenance for the entry).
-    pub publisher: String,
+    /// The publisher the entry claims — self-declared and untrusted; provenance
+    /// only. A privilege rests on a [`crate::publisher::BlessedPublisher`], never
+    /// on this field.
+    pub publisher: SelfDeclaredPublisher,
     /// Every published version, in file order. [`resolve_version`] scans these
     /// for the highest match rather than relying on file order.
     pub versions: Vec<EntryVersion>,
@@ -527,7 +530,9 @@ pub const MAX_ENTRY_VERSIONS: usize = 1024;
 ///   dropped from the submission; the index never removes a published version.
 ///   The one carve-out (drop-only) is the disposable reserved smoke namespace
 ///   owned by the blessed first-party publisher, which may reset to a single
-///   version.
+///   version — granted only when `attested` (the admission workflow's
+///   authenticated PR author) proves the claimed publisher is blessed, never on
+///   the entry's self-declared `publisher` alone.
 /// - **Source continuity** — a package name is bound to one source repository.
 ///   The established source is the baseline's first published version's source
 ///   (on first publish, the submitted entry's own first version fixes it); a
@@ -538,6 +543,7 @@ pub const MAX_ENTRY_VERSIONS: usize = 1024;
 pub fn admission_precheck(
     submitted: &IndexEntry,
     baseline: Option<&IndexEntry>,
+    attested: Option<&AttestedActor>,
 ) -> Result<(), CliError> {
     if submitted.versions.len() > MAX_ENTRY_VERSIONS {
         return Err(CliError::UsageOwned(format!(
@@ -572,14 +578,27 @@ pub fn admission_precheck(
     // consumer's pinned resolution would vanish), so it is refused fail-closed.
     //
     // Carve-out (drop-only, both conditions required): the disposable reserved
-    // smoke namespace owned by the blessed first-party publisher may reset to a
-    // single version. A reserved name with a non-blessed publisher, or a
-    // non-reserved name, still hits the rejection — absent proof the drop is the
-    // sanctioned reset, the permissive branch is unreachable. Rewriting a version
-    // stays forbidden everywhere (enforced above); only dropping is carved out.
-    let reset_allowed = ipe_kernels::reserved_package_prefix_of(&submitted.name).is_some()
-        && ipe_kernels::is_blessed_publisher(&submitted.publisher);
+    // smoke namespace may reset to a single version when the attested PR author
+    // proves the claimed publisher is the blessed first-party identity. A reserved
+    // name without that proof (no attestation, an attestation not matching the
+    // claim, a non-blessed attestation), or a non-reserved name, still hits the
+    // rejection — absent proof the drop is the sanctioned reset, the permissive
+    // branch is unreachable. Rewriting a version stays forbidden everywhere
+    // (enforced above); only dropping is carved out.
+    let reserved_name = ipe_kernels::reserved_package_prefix_of(&submitted.name).is_some();
+    let blessing = BlessedPublisher::from_attested(attested, &submitted.publisher);
+    let reset_allowed = reserved_name
+        && blessing
+            .as_ref()
+            .is_ok_and(|blessed| blessed.vouches_for(&submitted.publisher));
     if !reset_allowed {
+        let reset_refusal = if reserved_name {
+            blessing.as_ref().err().map_or_else(String::new, |refusal| {
+                format!(" The reserved smoke-namespace reset is refused: {refusal}.")
+            })
+        } else {
+            String::new()
+        };
         let submitted_versions: std::collections::BTreeSet<&semver::Version> =
             submitted.versions.iter().map(|v| &v.version).collect();
         for baseline_version in baseline_by_version.keys() {
@@ -587,7 +606,7 @@ pub fn admission_precheck(
                 return Err(CliError::UsageOwned(format!(
                     "ipe package audit-entry: `{}` drops the published version {baseline_version}, \
                      but the index is append-only: a published version must never be removed. \
-                     Publish a new version instead.",
+                     Publish a new version instead.{reset_refusal}",
                     submitted.name
                 )));
             }
@@ -707,7 +726,7 @@ fn parse_entry(name: &str, text: &str) -> Result<IndexEntry, CliError> {
         }
     }
 
-    let publisher = publisher.ok_or_else(|| {
+    let publisher = publisher.map(SelfDeclaredPublisher::new).ok_or_else(|| {
         CliError::Resolve(format!(
             "package `{name}`: index entry is missing `publisher`"
         ))
@@ -771,8 +790,8 @@ pub fn parse_entry_json(name: &str, text: &str) -> Result<IndexEntry, CliError> 
     let publisher = object
         .get("publisher")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| malformed("missing string field `publisher`"))?
-        .to_owned();
+        .ok_or_else(|| malformed("missing string field `publisher`"))
+        .map(|claimed| SelfDeclaredPublisher::new(claimed.to_owned()))?;
 
     let raw_versions = object
         .get("versions")

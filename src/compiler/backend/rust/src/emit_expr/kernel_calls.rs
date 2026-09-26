@@ -640,7 +640,7 @@ pub fn emit_http_builder_call(
 /// projection.
 ///
 /// The Ipê surface for parameterised Db calls (`Db.exec`, `Db.query`,
-/// `Db.queryDecode`, `Db.insertFields`, `Db.updateFields`,
+/// `Db.queryDecode`, `Db.insertFields`, `Db.updateFields`, `Db.upsertFields`,
 /// `Db.insertFieldsReturning`) passes a `List SqlValue` or
 /// `List (String, SqlField)` as a plain Ipê argument. The runtime's typed-param
 /// functions (`db_exec_params`, `db_query_params`, …) expect `Vec<SqlParam>` /
@@ -1071,6 +1071,25 @@ pub fn emit_db_call(
                 "{fn_name}({conn_s}.clone(), {table_s}, {}, {})",
                 project_where(&where_s),
                 project_fields(&set_s)
+            )))
+        }
+        // ── DbUpsertFields: (conn, table, target: List String, List (String,SqlField)) ─
+        //
+        // The conflict target is a plain `List String` (`Vec<String>`), passed
+        // through; the field list is projected exactly like `DbInsertFields`'.
+        KernelFn::DbUpsertFields => {
+            let conn_e = arg!(0, "conn")?;
+            let table_e = arg!(1, "table")?;
+            let target_e = arg!(2, "conflict_target")?;
+            let fields_e = arg!(3, "fields")?;
+            let conn_s = emit_expr_at(ctx, conn_e, indent, child, generics)?;
+            let table_s = emit_expr_at(ctx, table_e, indent, child, generics)?;
+            let target_s = emit_expr_at(ctx, target_e, indent, child, generics)?;
+            let fields_s = emit_expr_at(ctx, fields_e, indent, child, generics)?;
+            let fn_name = crate::naming::kernel_name(*k);
+            Ok(Some(format!(
+                "{fn_name}({conn_s}.clone(), {table_s}, {target_s}, {})",
+                project_fields(&fields_s)
             )))
         }
         // ── DbUpdateWhere: (conn, table, List (String,SqlField), frag: SqlFragment) ─

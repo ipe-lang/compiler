@@ -7,9 +7,21 @@ use std::collections::BTreeMap;
 
 use ipe::api_surface::{ModuleApi, PublicApi, UnionApi};
 use ipe::diff::{
-    ApiChange, Compatibility, RequiredBump, bump_floor, diff_api, magnitude, report, required_bump,
+    ApiChange, Compatibility, FloorOverflow, Predecessor, RequiredBump, SemverReport, bump_floor,
+    diff_api, magnitude, required_bump,
 };
 use semver::Version;
+
+/// [`ipe::diff::report`] over versions whose floors cannot overflow.
+#[allow(clippy::expect_used)] // test helper: a non-overflowing fixture
+fn report(old: &PublicApi, new: &PublicApi, old_v: &Version, new_v: &Version) -> SemverReport {
+    ipe::diff::report(old, new, old_v, new_v).expect("floor does not overflow")
+}
+
+#[allow(clippy::expect_used)] // test helper: literal fixture versions
+fn parse(raw: &str) -> Version {
+    Version::parse(raw).expect("valid version")
+}
 
 /// A one-module API with the given values and unions.
 fn api(values: &[(&str, &str)], unions: &[(&str, UnionApi)]) -> PublicApi {
@@ -247,16 +259,112 @@ fn required_bump_maps_pre_one_zero() {
 
 #[test]
 fn bump_floors_are_pre_one_zero() {
-    let old = Version::new(0, 3, 2);
+    let old = Predecessor::of(&Version::new(0, 3, 2));
     assert_eq!(
         bump_floor(&old, RequiredBump::Patch),
-        Version::new(0, 3, 3),
+        Ok(Version::new(0, 3, 3)),
         "a patch floor is the next patch"
     );
     assert_eq!(
         bump_floor(&old, RequiredBump::Minor),
-        Version::new(0, 4, 0),
+        Ok(Version::new(0, 4, 0)),
         "a minor floor resets patch"
+    );
+}
+
+#[test]
+fn predecessor_classifies_a_prerelease_by_its_core() {
+    assert_eq!(
+        Predecessor::of(&parse("0.0.1-rc.1")),
+        Predecessor::PrereleaseOf(Version::new(0, 0, 1))
+    );
+    assert_eq!(
+        Predecessor::of(&parse("0.0.1+build.7")),
+        Predecessor::Release(Version::new(0, 0, 1)),
+        "build metadata is not a prerelease"
+    );
+}
+
+#[test]
+fn a_prerelease_graduates_to_its_own_release() {
+    let old_api = api(&[("f", "Int")], &[]);
+    let rc = parse("0.0.1-rc.1");
+
+    let graduated = report(&old_api, &old_api, &rc, &Version::new(0, 0, 1));
+    assert_eq!(graduated.floor, Version::new(0, 0, 1));
+    assert!(
+        graduated.satisfied,
+        "0.0.1-rc.1 -> 0.0.1 is the stable graduation"
+    );
+
+    let backwards = report(&old_api, &old_api, &rc, &Version::new(0, 0, 0));
+    assert!(
+        !backwards.satisfied,
+        "a release below the prerelease's core is refused"
+    );
+}
+
+#[test]
+fn a_release_does_not_admit_itself_as_successor() {
+    let old_api = api(&[("f", "Int")], &[]);
+    let same = report(
+        &old_api,
+        &old_api,
+        &Version::new(0, 0, 1),
+        &Version::new(0, 0, 1),
+    );
+    assert_eq!(same.floor, Version::new(0, 0, 2));
+    assert!(!same.satisfied, "0.0.1 -> 0.0.1 is refused");
+}
+
+#[test]
+fn a_breaking_change_over_a_prerelease_still_requires_a_minor_bump() {
+    let old_api = api(&[("f", "Int"), ("g", "Int")], &[]);
+    let new_api = api(&[("f", "Int")], &[]);
+    let rc = parse("1.0.0-rc.1");
+
+    let graduated = report(&old_api, &new_api, &rc, &Version::new(1, 0, 0));
+    assert_eq!(graduated.required, RequiredBump::Minor);
+    assert_eq!(graduated.floor, Version::new(1, 1, 0));
+    assert!(
+        !graduated.satisfied,
+        "graduating a prerelease does not clear a breaking delta"
+    );
+
+    let bumped = report(&old_api, &new_api, &rc, &Version::new(1, 1, 0));
+    assert!(bumped.satisfied);
+}
+
+#[test]
+fn a_floor_that_overflows_is_refused() {
+    let top_patch = Predecessor::of(&Version::new(0, 0, u64::MAX));
+    assert!(matches!(
+        bump_floor(&top_patch, RequiredBump::Patch),
+        Err(FloorOverflow {
+            required: RequiredBump::Patch,
+            ..
+        })
+    ));
+
+    let top_minor = Predecessor::of(&Version::new(0, u64::MAX, 0));
+    assert!(matches!(
+        bump_floor(&top_minor, RequiredBump::Minor),
+        Err(FloorOverflow {
+            required: RequiredBump::Minor,
+            ..
+        })
+    ));
+
+    let old_api = api(&[("f", "Int")], &[]);
+    assert!(
+        ipe::diff::report(
+            &old_api,
+            &old_api,
+            &Version::new(0, 0, u64::MAX),
+            &Version::new(0, 1, 0),
+        )
+        .is_err(),
+        "an overflowing floor refuses every successor"
     );
 }
 

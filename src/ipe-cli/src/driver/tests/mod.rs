@@ -2079,9 +2079,41 @@ fn parse_audit_entry_args_parses_path_and_index() {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let (path, index) = parse_audit_entry_args(&args).expect("parses");
-    assert_eq!(path, PathBuf::from("packages/foo.toml"));
-    assert_eq!(index, Some(PathBuf::from("/some/index")));
+    let parsed = parse_audit_entry_args(&args).expect("parses");
+    assert_eq!(parsed.entry_path, PathBuf::from("packages/foo.toml"));
+    assert_eq!(parsed.index_root, Some(PathBuf::from("/some/index")));
+    assert_eq!(parsed.attested_actor, None);
+}
+
+/// `parse_audit_entry_args` — `--attested-actor` parses into a typed attestation;
+/// a missing value, a repeat, or a non-login value is refused.
+#[test]
+fn parse_audit_entry_args_parses_and_refuses_attested_actor() {
+    let argv = |v: &[&str]| -> Vec<String> { v.iter().map(ToString::to_string).collect() };
+    let parsed =
+        parse_audit_entry_args(&argv(&["packages/foo.toml", "--attested-actor", "octocat"]))
+            .expect("parses");
+    assert_eq!(
+        parsed
+            .attested_actor
+            .as_ref()
+            .map(crate::publisher::AttestedActor::as_str),
+        Some("octocat")
+    );
+    for bad in [
+        argv(&["packages/foo.toml", "--attested-actor"]),
+        argv(&[
+            "packages/foo.toml",
+            "--attested-actor",
+            "a",
+            "--attested-actor",
+            "b",
+        ]),
+        argv(&["packages/foo.toml", "--attested-actor", "not a login"]),
+        argv(&["packages/foo.toml", "--attested-actor", "-lead"]),
+    ] {
+        assert!(parse_audit_entry_args(&bad).is_err(), "{bad:?}");
+    }
 }
 
 /// `run_audit_entry` — a malformed entry file (missing `sha256`) is a hard

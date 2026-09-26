@@ -6,6 +6,7 @@ use super::{
     force_cargo_terminal_ui, resolve_runtime, resolve_vendored_runtime_dir, run_build,
     runtime_context_for_message, typecheck_entry_via_graph,
 };
+use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
@@ -752,8 +753,16 @@ pub fn run_validate_entry(rest: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `ipe package audit-entry <packages/<name>.toml> [--index <root>]` — the index
-/// CI's authoritative receiving gate for a submitted entry.
+/// `ipe package audit-entry <packages/<name>.toml> [--index <root>]
+/// [--attested-actor <login>]` — the index CI's authoritative receiving gate for
+/// a submitted entry.
+///
+/// `--attested-actor` is the authenticated PR author the admission workflow reads
+/// from GitHub's event context. It is the only identity the reserved-namespace
+/// exemption and the reserved smoke reset accept: absent it, or when it does not
+/// equal the entry's claimed `publisher`, or is not the blessed first-party
+/// identity, both privileges are refused (fail-closed). Every other check is
+/// identical with or without it.
 ///
 /// Composes the existing pieces in a fixed, fail-closed order so the CI cannot
 /// diverge from `ipe package audit`:
@@ -783,10 +792,18 @@ pub fn run_validate_entry(rest: &[String]) -> Result<(), CliError> {
 /// failure; [`CliError::HashMismatch`] on an integrity mismatch; and
 /// [`CliError::PackageAudit`] when a Tier-1 check rejects a version.
 pub fn run_audit_entry(rest: &[String]) -> Result<(), CliError> {
-    let (entry_path, index_root_opt) = parse_audit_entry_args(rest)?;
+    let AuditEntryArgs {
+        entry_path,
+        index_root: index_root_opt,
+        attested_actor,
+    } = parse_audit_entry_args(rest)?;
 
     // Step 1 — schema: parse + validate the submitted entry file.
     let submitted = index::validate_entry_file(&entry_path)?;
+
+    // The blessed privileges rest on the attested PR author, bound to the entry's
+    // claimed publisher — never on the self-declared `publisher` alone.
+    let blessing = BlessedPublisher::from_attested(attested_actor.as_ref(), &submitted.publisher);
 
     // Step 2 — baseline: read the previously-published entry (if any).
     // Fail closed: a present-but-unreadable baseline propagates as an error
@@ -801,7 +818,7 @@ pub fn run_audit_entry(rest: &[String]) -> Result<(), CliError> {
     // is the authoritative wall (ADR 0007) — it enforces these even for an entry
     // hand-edited around the author-side `ipe publish`, which an attacker opening
     // the index PR directly would bypass.
-    index::admission_precheck(&submitted, baseline.as_ref())?;
+    index::admission_precheck(&submitted, baseline.as_ref(), attested_actor.as_ref())?;
 
     let baseline_by_version: std::collections::BTreeMap<&semver::Version, &index::EntryVersion> =
         baseline
@@ -857,14 +874,15 @@ pub fn run_audit_entry(rest: &[String]) -> Result<(), CliError> {
         // the verified source tree. Pass --index so the enforced-semver check reads
         // the right baseline. Reject on the first failing check.
         let checkout_str = checkout.to_string_lossy().into_owned();
-        // Pass the submitted entry's publisher so the reserved-namespace ownership
-        // check can exempt the blessed first-party publisher and reject any other
-        // publisher whose source tree provides a reserved-namespace (`Ipe.*`)
-        // module — the admission-time squat-proofing of the trusted namespace.
+        // Pass the submitted entry's claimed publisher (named in a reject) and the
+        // attestation-backed blessing: the reserved-namespace ownership check
+        // exempts only a proven blessed publisher and rejects any other whose
+        // source tree provides a reserved-namespace (`Ipe.*`) module — the
+        // admission-time squat-proofing of the trusted namespace.
         let mut audit_args: Vec<String> = vec![
             checkout_str,
             "--publisher".to_owned(),
-            submitted.publisher.clone(),
+            submitted.publisher.as_str().to_owned(),
         ];
         if let Some(ir) = &index_root_opt {
             audit_args.push("--index".to_owned());
@@ -874,7 +892,7 @@ pub fn run_audit_entry(rest: &[String]) -> Result<(), CliError> {
         // descriptive typed CliError (PackageAudit / HashMismatch / etc.) whose
         // Display names the failing check; the version context is clear from
         // the eprintln below and the structured error kind.
-        if let Err(e) = audit::run_audit(&audit_args) {
+        if let Err(e) = audit::run_audit_as(&audit_args, blessing.as_ref()) {
             eprintln!(
                 "audit-entry: `{}` version {} rejected",
                 submitted.name, ver_str
@@ -899,18 +917,42 @@ pub fn run_audit_entry(rest: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Parse `ipe package audit-entry`'s tail: a required positional entry-file path
-/// and an optional `--index <dir>`.
+/// The parsed `ipe package audit-entry` invocation.
+#[derive(Debug)]
+pub struct AuditEntryArgs {
+    /// The submitted `packages/<name>.toml` entry file.
+    pub entry_path: PathBuf,
+    /// The baseline index checkout (`--index`); the resolver's index root when absent.
+    pub index_root: Option<PathBuf>,
+    /// The admission workflow's authenticated PR author (`--attested-actor`).
+    pub attested_actor: Option<AttestedActor>,
+}
+
+/// Parse `ipe package audit-entry`'s tail: a required positional entry-file path,
+/// an optional `--index <dir>`, and an optional `--attested-actor <login>`.
 ///
 /// # Errors
 /// [`CliError::Usage`] when the entry file is missing; [`CliError::UsageOwned`] on
-/// an unknown flag, a missing `--index` value, or a duplicate flag/positional.
-pub fn parse_audit_entry_args(rest: &[String]) -> Result<(PathBuf, Option<PathBuf>), CliError> {
+/// an unknown flag, a missing flag value, a duplicate flag/positional, or an
+/// `--attested-actor` that is not a GitHub login.
+pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliError> {
     let mut entry_path: Option<PathBuf> = None;
     let mut index_root: Option<PathBuf> = None;
+    let mut attested_actor: Option<AttestedActor> = None;
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--attested-actor" => {
+                let value = it.next().ok_or(CliError::Usage(
+                    "ipe package audit-entry: --attested-actor needs a value",
+                ))?;
+                if attested_actor.is_some() {
+                    return Err(CliError::Usage(
+                        "ipe package audit-entry: --attested-actor given more than once",
+                    ));
+                }
+                attested_actor = Some(AttestedActor::parse(value)?);
+            }
             "--index" => {
                 let value = it.next().ok_or(CliError::Usage(
                     "ipe package audit-entry: --index needs a value",
@@ -935,10 +977,15 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<(PathBuf, Option<PathBu
             }
         }
     }
-    let path = entry_path.ok_or(CliError::Usage(
-        "usage: ipe package audit-entry <packages/<name>.toml> [--index <root>]",
+    let entry_path = entry_path.ok_or(CliError::Usage(
+        "usage: ipe package audit-entry <packages/<name>.toml> [--index <root>] \
+         [--attested-actor <login>]",
     ))?;
-    Ok((path, index_root))
+    Ok(AuditEntryArgs {
+        entry_path,
+        index_root,
+        attested_actor,
+    })
 }
 
 /// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the

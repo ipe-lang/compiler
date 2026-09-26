@@ -497,6 +497,24 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Run the engine-version floor on a freshly connected session-store pool,
+/// before its first statement. A refusal closes the pool and surfaces as the
+/// store's `sqlx::Error`; the caller then falls back to the memory store.
+#[cfg(feature = "db")]
+async fn refuse_below_engine_floor<DB>(pool: &sqlx::Pool<DB>) -> Result<(), sqlx::Error>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
+{
+    if let Err(e) = crate::db::enforce_engine_floor_on(pool).await {
+        pool.close().await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 // ─── SQLite store — persistent model checkpoint + live mem-cache ─────────────
 
 /// Persistent store: keeps a `mem_cache` of live handles (same-process, owns the
@@ -521,6 +539,7 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
     pub async fn new(path: &str, ttl: Duration, schema_tag: [u8; 32]) -> Result<Self, sqlx::Error> {
         let url = format!("sqlite:{path}?mode=rwc");
         let pool = sqlx::SqlitePool::connect(&url).await?;
+        refuse_below_engine_floor(&pool).await?;
         // A pre-existing table from before the schema-tag column existed is
         // left as-is by IF NOT EXISTS; statements referencing the missing
         // column then error and are swallowed by the callers' existing
@@ -712,6 +731,7 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
         schema_tag: [u8; 32],
     ) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(conn_str).await?;
+        refuse_below_engine_floor(&pool).await?;
         // Pre-existing tables keep their old column set (IF NOT EXISTS) —
         // same fail-soft degradation as SqliteStore::new.
         sqlx::query(

@@ -32,6 +32,7 @@ use std::process::Command;
 
 use ipe::index::{self, EntryVersion, IndexEntry, PinnedRev, SourceUrl};
 use ipe::lockfile::Lockfile;
+use ipe::publisher::{AttestedActor, SelfDeclaredPublisher};
 use ipe::resolve::{self, hash_source_tree};
 
 // ── temp / git helpers ──────────────────────────────────────────────────────
@@ -142,7 +143,7 @@ fn entry(name: &str, versions: Vec<EntryVersion>) -> IndexEntry {
 fn entry_with_publisher(name: &str, publisher: &str, versions: Vec<EntryVersion>) -> IndexEntry {
     IndexEntry {
         name: name.to_owned(),
-        publisher: publisher.to_owned(),
+        publisher: SelfDeclaredPublisher::new(publisher.to_owned()),
         versions,
     }
 }
@@ -292,7 +293,8 @@ fn precheck_accepts_a_faithful_new_version() {
             version("1.1.0", src, VALID_REV),
         ],
     );
-    index::admission_precheck(&submitted, Some(&baseline)).expect("a faithful new version passes");
+    index::admission_precheck(&submitted, Some(&baseline), None)
+        .expect("a faithful new version passes");
 }
 
 #[test]
@@ -310,7 +312,7 @@ fn precheck_denies_a_name_squat_via_divergent_source() {
             version("2.0.0", "https://example.invalid/attacker", VALID_REV),
         ],
     );
-    let err = index::admission_precheck(&submitted, Some(&baseline))
+    let err = index::admission_precheck(&submitted, Some(&baseline), None)
         .expect_err("a divergent source must be denied");
     assert!(format!("{err}").contains("name-squat"), "{err}");
 }
@@ -322,7 +324,7 @@ fn precheck_denies_rewriting_a_published_version() {
     let src = "https://example.invalid/pkg";
     let baseline = entry("pkg", vec![version("1.0.0", src, VALID_REV)]);
     let submitted = entry("pkg", vec![version("1.0.0", src, other_rev)]);
-    let err = index::admission_precheck(&submitted, Some(&baseline))
+    let err = index::admission_precheck(&submitted, Some(&baseline), None)
         .expect_err("rewriting a published version must be denied");
     assert!(format!("{err}").contains("immutable"), "{err}");
 }
@@ -335,7 +337,7 @@ fn precheck_denies_an_over_long_version_list() {
         versions.push(version(&format!("1.0.{n}"), src, VALID_REV));
     }
     let submitted = entry("pkg", versions);
-    let err = index::admission_precheck(&submitted, None)
+    let err = index::admission_precheck(&submitted, None, None)
         .expect_err("an over-long version list must be denied");
     assert!(format!("{err}").contains("ceiling"), "{err}");
 }
@@ -352,7 +354,7 @@ fn precheck_first_publish_binds_the_source() {
             version("1.1.0", "https://example.invalid/b", VALID_REV),
         ],
     );
-    let err = index::admission_precheck(&submitted, None)
+    let err = index::admission_precheck(&submitted, None, None)
         .expect_err("a divergent source in a first publish must be denied");
     assert!(format!("{err}").contains("name-squat"), "{err}");
 }
@@ -370,7 +372,7 @@ fn precheck_denies_dropping_a_baseline_version_for_an_ordinary_package() {
         ],
     );
     let submitted = entry("pkg", vec![version("2.0.0", src, VALID_REV)]);
-    let err = index::admission_precheck(&submitted, Some(&baseline))
+    let err = index::admission_precheck(&submitted, Some(&baseline), None)
         .expect_err("dropping a baseline version must be denied");
     let msg = format!("{err}");
     assert!(msg.contains("append-only"), "{msg}");
@@ -399,8 +401,67 @@ fn precheck_allows_a_reserved_blessed_reset_dropping_versions() {
         BLESSED,
         vec![version("0.0.0-smoke.3", src, VALID_REV)],
     );
-    index::admission_precheck(&submitted, Some(&baseline))
-        .expect("a reserved + blessed reset drops prior versions");
+    index::admission_precheck(&submitted, Some(&baseline), Some(&attested(BLESSED)))
+        .expect("a reserved + attested-blessed reset drops prior versions");
+}
+
+/// The admission workflow's attestation of the authenticated PR author `login`.
+fn attested(login: &str) -> AttestedActor {
+    AttestedActor::parse(login).expect("login-shaped attestation")
+}
+
+/// A reserved-probe reset (baseline smoke.1 + smoke.2 → submitted smoke.3 only)
+/// whose entry claims `claimed`, checked under `attestation`.
+fn reserved_reset(claimed: &str, attestation: Option<&AttestedActor>) -> Result<(), ipe::CliError> {
+    let src = "https://example.invalid/pkg";
+    let baseline = entry_with_publisher(
+        RESERVED_PROBE,
+        claimed,
+        vec![
+            version("0.0.0-smoke.1", src, VALID_REV),
+            version("0.0.0-smoke.2", src, VALID_REV),
+        ],
+    );
+    let submitted = entry_with_publisher(
+        RESERVED_PROBE,
+        claimed,
+        vec![version("0.0.0-smoke.3", src, VALID_REV)],
+    );
+    index::admission_precheck(&submitted, Some(&baseline), attestation)
+}
+
+#[test]
+fn precheck_denies_a_forged_blessed_reset_without_attestation() {
+    // A committed entry declaring `publisher = "<blessed>"` is attacker-writable:
+    // with no attested PR author the reset carve-out is refused.
+    let err = reserved_reset(BLESSED, None)
+        .expect_err("a self-declared blessed publisher alone must not license the reset");
+    let msg = format!("{err}");
+    assert!(msg.contains("append-only"), "{msg}");
+    assert!(
+        msg.contains("self-declared"),
+        "the reject says why the claim was not trusted: {msg}"
+    );
+}
+
+#[test]
+fn precheck_denies_a_blessed_reset_attested_as_someone_else() {
+    // The attested PR author is not the claimed (blessed) publisher: forged.
+    let err = reserved_reset(BLESSED, Some(&attested("attacker")))
+        .expect_err("an attestation not matching the claim must be denied");
+    let msg = format!("{err}");
+    assert!(msg.contains("append-only"), "{msg}");
+    assert!(msg.contains("does not match"), "{msg}");
+}
+
+#[test]
+fn precheck_denies_a_reset_with_a_non_blessed_attestation() {
+    // Claim and attestation agree, but the identity is not the blessed one.
+    let err = reserved_reset("tester", Some(&attested("tester")))
+        .expect_err("a non-blessed attestation must be denied");
+    let msg = format!("{err}");
+    assert!(msg.contains("append-only"), "{msg}");
+    assert!(msg.contains("not the first-party publisher"), "{msg}");
 }
 
 #[test]
@@ -421,7 +482,7 @@ fn precheck_denies_a_reserved_non_blessed_reset() {
         "tester",
         vec![version("0.0.0-smoke.2", src, VALID_REV)],
     );
-    let err = index::admission_precheck(&submitted, Some(&baseline))
+    let err = index::admission_precheck(&submitted, Some(&baseline), None)
         .expect_err("a reserved but non-blessed reset must be denied");
     assert!(format!("{err}").contains("append-only"), "{err}");
 }
@@ -443,7 +504,7 @@ fn precheck_denies_a_reserved_blessed_rewrite() {
         BLESSED,
         vec![version("0.0.0-smoke.1", src, other_rev)],
     );
-    let err = index::admission_precheck(&submitted, Some(&baseline))
+    let err = index::admission_precheck(&submitted, Some(&baseline), Some(&attested(BLESSED)))
         .expect_err("rewriting a reserved+blessed version must still be denied");
     assert!(format!("{err}").contains("immutable"), "{err}");
 }

@@ -22,7 +22,7 @@ pub use css_value_safety::css_value_is_safe;
 
 pub mod reserved_namespace;
 pub use reserved_namespace::{
-    BLESSED_PUBLISHER, RESERVED_MODULE_PREFIXES, RESERVED_PACKAGE_PREFIXES, is_blessed_publisher,
+    BLESSED_PUBLISHER, RESERVED_MODULE_PREFIXES, RESERVED_PACKAGE_PREFIXES,
     is_reserved_module_path, reserved_package_prefix_of, reserved_prefix_of,
 };
 
@@ -2901,6 +2901,11 @@ pub enum StdlibKernel {
     DbDeleteWhere,
     /// `Db.updateWhere : Db -> String -> List (String, SqlField) -> SqlFragment -> Task Error Int`
     DbUpdateWhere,
+    /// `Db.upsertFields : Db -> String -> List String -> List (String, SqlField) -> Task Error Int`
+    /// — `INSERT … ON CONFLICT (<target>) DO UPDATE SET c = excluded.c, …`
+    /// (update-in-place on both backends); the `List String` is the conflict
+    /// target.
+    DbUpsertFields,
     // ── Ipe.Secret — opaque secret-string wrapper ─────────
     // The ONLY public constructor: every `Secret` value traces back to one of
     // these calls. Never derivable from a bare `String` implicitly.
@@ -5074,6 +5079,7 @@ impl StdlibKernel {
             ),
             Self::DbDeleteWhere => d("Db", "deleteWhere", 3, Db, "db_delete_where"),
             Self::DbUpdateWhere => d("Db", "updateWhere", 4, Db, "db_update_where"),
+            Self::DbUpsertFields => d("Db", "upsertFields", 4, Db, "db_upsert_fields"),
             // ── Ipe.Secret — opaque secret-string wrapper ─
             Self::SecretFromString => d("Secret", "fromString", 1, Pure, "secret_from_string"),
             Self::SecretReveal => d("Secret", "reveal", 1, Pure, "secret_reveal"),
@@ -6424,6 +6430,7 @@ impl StdlibKernel {
         Self::DbFindProjectionOrdered,
         Self::DbDeleteWhere,
         Self::DbUpdateWhere,
+        Self::DbUpsertFields,
         Self::SecretFromString,
         Self::SecretReveal,
         Self::SecretUse,
@@ -8117,6 +8124,13 @@ impl StdlibKernel {
         const STRING_TO_UPDATE_FIELDS: TyShape =
             TyShape::Fun(&STRING, &LIST_SQLVALUE_TO_LIST_SQLFIELD_TO_TASK_INT);
         const DB_UPDATE_FIELDS: TyShape = TyShape::Fun(&DB, &STRING_TO_UPDATE_FIELDS);
+        // `upsertFields : Db -> String -> List String
+        //                 -> List (String, SqlField) -> Task Int`.
+        const LIST_STRING_TO_LIST_SQLFIELD_TO_TASK_INT: TyShape =
+            TyShape::Fun(&LIST_STRING, &LIST_SQLFIELD_TO_TASK_INT);
+        const STRING_TO_UPSERT_FIELDS: TyShape =
+            TyShape::Fun(&STRING, &LIST_STRING_TO_LIST_SQLFIELD_TO_TASK_INT);
+        const DB_UPSERT_FIELDS: TyShape = TyShape::Fun(&DB, &STRING_TO_UPSERT_FIELDS);
         // Db.exec / query / findWhere / deleteWhere / etc. (opaque Db + Dict rows,
         // no record).
         // `Db.connect : () -> Task Db`.
@@ -10066,6 +10080,7 @@ impl StdlibKernel {
             Self::DbFindProjectionOrdered => Some(&DB_FIND_PROJECTION_ORDERED),
             Self::DbDeleteWhere => Some(&DB_DELETE_WHERE),
             Self::DbUpdateWhere => Some(&DB_UPDATE_WHERE),
+            Self::DbUpsertFields => Some(&DB_UPSERT_FIELDS),
             Self::DbInsertFields => Some(&DB_INSERT_FIELDS),
             Self::DbUpdateFields => Some(&DB_UPDATE_FIELDS),
             Self::DbInsertFieldsReturning => Some(&DB_INSERT_FIELDS_RETURNING),
@@ -10981,6 +10996,7 @@ impl StdlibKernel {
             | Self::DbFindProjectionOrdered
             | Self::DbDeleteWhere
             | Self::DbUpdateWhere
+            | Self::DbUpsertFields
             | Self::DbDefaultMigration
             | Self::DbDecString
             | Self::DbDecInt

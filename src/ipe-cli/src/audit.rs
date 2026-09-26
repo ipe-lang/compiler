@@ -26,8 +26,9 @@
 //!    `[capabilities]`. A used-but-undeclared capability is a hidden effect; a
 //!    declared-but-unused one is an over-broad, misleading claim. Either rejects.
 //! 3. **Enforced semver** — `ipe diff` / [`crate::diff::check_semver_bump`]
-//!    between this version's public API and the previous published version; an
-//!    under-bump rejects. A first version (no predecessor) skips this check.
+//!    between this version's public API and the previous published STABLE
+//!    version; an under-bump rejects. A prerelease submission, and a first
+//!    stable version (no stable predecessor), skip this check.
 //! 4. **Supply chain** — `cargo-deny` over the emitted project's dependency
 //!    graph, plus the resolver's content-hash re-assertion over any Ipê package
 //!    dependencies (verify-before-trust, re-checked at publish).
@@ -59,6 +60,7 @@ use ipe_ir::Capability;
 use crate::CliError;
 use crate::cli_args::OutputFormat;
 use crate::project::{self, ProjectManifest};
+use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::scratch::ScratchDir;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
@@ -286,8 +288,27 @@ fn tier2_probe_fixture() -> Result<PathBuf, CliError> {
 /// package cannot be built or read; [`CliError::PackageAudit`] when a Tier-1
 /// check rejects the package (the gate's hard reject).
 pub fn run_audit(rest: &[String]) -> Result<(), CliError> {
+    let unproven = BlessingRefusal::NoProvenIdentity;
+    run_audit_as(rest, Err(&unproven))
+}
+
+/// [`run_audit`] under a proven publisher standing.
+///
+/// `blessing` is the [`BlessedPublisher`] an authenticated (`ipe package publish`) or attested
+/// (`ipe package audit-entry`) identity established for the claimed
+/// `--publisher`, or the [`BlessingRefusal`] saying why none was. Only a
+/// blessing covering the claimed publisher exempts a reserved-namespace package;
+/// a bare `--publisher` never does.
+///
+/// # Errors
+/// As [`run_audit`].
+pub fn run_audit_as(
+    rest: &[String],
+    blessing: Result<&BlessedPublisher, &BlessingRefusal>,
+) -> Result<(), CliError> {
     let (path, index_root, advisory_db_override, no_advisory_db, publisher, format) =
         parse_audit_args(rest)?;
+    let claimed = publisher.map(SelfDeclaredPublisher::new);
     let prepared = prepare(&path)?;
     let name = prepared.manifest.name.clone();
     let version = prepared
@@ -310,7 +331,10 @@ pub fn run_audit(rest: &[String]) -> Result<(), CliError> {
         &prepared,
         index_root.as_deref(),
         effective_advisory_db.as_deref(),
-        publisher.as_deref(),
+        PublisherStanding {
+            claimed: claimed.as_ref(),
+            blessing,
+        },
     );
 
     match format {
@@ -349,17 +373,17 @@ pub fn run_audit(rest: &[String]) -> Result<(), CliError> {
 /// a declared-scoped jail and reconciles observed-vs-declared, fail-closed
 /// (ADR 0004).
 ///
-/// `entry_publisher` is the index entry's publisher when the registry admission
-/// gate runs this (the blessed first-party publisher legitimately owns the
-/// reserved namespace); `None` for a plain `ipe package audit` with no index
-/// provenance, where any reserved-namespace module is rejected fail-closed.
+/// `standing` is the claimed publisher plus the proof (or refusal) of its
+/// blessed first-party identity: only a proven blessed publisher owns the
+/// reserved namespace; a plain `ipe package audit`, or any unproven claim, has
+/// every reserved-namespace module rejected fail-closed.
 fn audit_gate(
     prepared: &Prepared,
     index_root: Option<&Path>,
     advisory_db: Option<&Path>,
-    entry_publisher: Option<&str>,
+    standing: PublisherStanding<'_>,
 ) -> Result<(crate::audit_native::Tier2Outcome, Disclosure), CliError> {
-    reserved_namespace_ownership(prepared, entry_publisher)?;
+    reserved_namespace_ownership(prepared, standing)?;
     provenance_panic_scan(prepared)?;
 
     // The whole-tree inferred capability union — computed once and shared by the
@@ -1227,11 +1251,16 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
 /// Enforce the semver bump between this version's public API and the previous
 /// published version fetched from the index.
 ///
-/// Looks up the package in the index; the highest published version strictly
-/// below the manifest's declared version is the predecessor. When the package is
-/// not in the index, or has no version below this one, this is a FIRST version —
-/// the check has no predecessor to diff against and skips (per §1c). Otherwise it
-/// runs [`crate::diff::check_semver_bump`] and rejects an under-bump.
+/// Looks up the package in the index; the baseline is [`stable_baseline`] — the
+/// highest published RELEASE version strictly below the manifest's declared
+/// version. Prereleases are never the baseline: they carry no compatibility
+/// promise and a stable requirement never resolves them, so the promise a stable
+/// release must keep is to the previous stable release. Diffing against a
+/// prerelease instead would let a breaking change ride in through an exempt
+/// prerelease and reach stable ranges as a patch. When the package is not in the
+/// index, or has no release below this one, this is a FIRST stable version — the
+/// check has no baseline to diff against and skips (per §1c). Otherwise it runs
+/// [`crate::diff::check_semver_bump`] and rejects an under-bump.
 ///
 /// The predecessor's public API is rebuilt from its pinned source (fetched +
 /// hash-verified through the resolver), so the baseline is exactly the bytes the
@@ -1292,18 +1321,13 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
         return Ok(());
     };
 
-    // The predecessor is the highest published version strictly BELOW this one.
-    let Some(previous) = entry
-        .versions
-        .iter()
-        .filter(|v| v.version < new_version)
-        .max_by(|a, b| a.version.cmp(&b.version))
-    else {
+    let Some(previous) = stable_baseline(&entry.versions, &new_version) else {
         print!(
             "{}",
             crate::style::frame(&crate::style::gutter(&format!(
-                "package audit: `{}` has no published version below {new_version} — \
-                 skipping the enforced-semver check (first version).",
+                "package audit: `{}` has no published stable version below {new_version} — \
+                 skipping the enforced-semver check (first stable version; a prerelease \
+                 carries no compatibility promise to diff against).",
                 prepared.manifest.name
             )))
         );
@@ -1339,6 +1363,19 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
             ),
         ))
     }
+}
+
+/// The enforced-semver baseline for a release `new_version`: the highest
+/// published release (no prerelease tag) strictly below it, or `None` when there
+/// is none (a first stable version).
+fn stable_baseline<'a>(
+    versions: &'a [crate::index::EntryVersion],
+    new_version: &semver::Version,
+) -> Option<&'a crate::index::EntryVersion> {
+    versions
+        .iter()
+        .filter(|v| v.version.pre.is_empty() && v.version < *new_version)
+        .max_by(|a, b| a.version.cmp(&b.version))
 }
 
 // ===========================================================================
@@ -1701,11 +1738,10 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
 /// own source tree (`src/`), not from the package NAME — a package named `foo`
 /// that declares `module Ipe.Evil` is what this catches.
 ///
-/// `entry_publisher` is the index entry's publisher when the registry admission
-/// gate runs this (`Some`), and `None` for a plain `ipe package audit` with no
-/// index provenance. Fail-closed default-deny: a reserved-namespace module is
-/// rejected whenever the publisher is absent or is anyone but the blessed
-/// first-party identity. The reject NAMES the package and the offending module.
+/// Fail-closed default-deny: a reserved-namespace module is rejected unless
+/// `standing` carries a [`BlessedPublisher`] proof covering the claimed publisher
+/// — a claimed `publisher` alone, however it is spelled, never exempts. The
+/// reject NAMES the package and the offending module.
 ///
 /// # Errors
 /// [`CliError::PackageAudit`] with [`Check::ReservedNamespace`] when a
@@ -1713,21 +1749,58 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
 /// [`CliError::DiscoveryLimitReached`] if the source tree cannot be walked.
 fn reserved_namespace_ownership(
     prepared: &Prepared,
-    entry_publisher: Option<&str>,
+    standing: PublisherStanding<'_>,
 ) -> Result<(), CliError> {
     let modules = crate::project::discover_modules(&prepared.manifest.src_root)?;
     let module_paths: Vec<&[String]> = modules.iter().map(|m| m.module_path.as_slice()).collect();
-    reserved_namespace_verdict(&prepared.manifest.name, &module_paths, entry_publisher)
+    reserved_namespace_verdict(&prepared.manifest.name, &module_paths, standing)
+}
+
+/// The publisher an audit runs under: what the entry claims, and the proof (or
+/// the refusal) that the claim is the blessed first-party identity.
+#[derive(Clone, Copy, Debug)]
+struct PublisherStanding<'a> {
+    /// The claimed publisher (`--publisher`), named in a reject; `None` for a
+    /// plain local audit with no provenance.
+    claimed: Option<&'a SelfDeclaredPublisher>,
+    /// The blessing an authenticated or attested identity established, or why
+    /// none was.
+    blessing: Result<&'a BlessedPublisher, &'a BlessingRefusal>,
+}
+
+impl PublisherStanding<'_> {
+    /// Whether the proof covers the claim — the only way to the blessed
+    /// exemption.
+    fn is_proven_blessed(self) -> bool {
+        match (self.blessing, self.claimed) {
+            (Ok(blessed), Some(claimed)) => blessed.vouches_for(claimed),
+            _ => false,
+        }
+    }
+
+    /// The `(…)` provenance clause a reserved-namespace reject names.
+    fn describe(self) -> String {
+        let who = self.claimed.map_or_else(
+            || "with no first-party provenance".to_owned(),
+            |claimed| format!("published by `{claimed}`"),
+        );
+        let reason = self
+            .blessing
+            .err()
+            .map_or_else(String::new, |refusal| format!("; {refusal}"));
+        format!("{who}{reason}")
+    }
 }
 
 /// The pure core of [`reserved_namespace_ownership`]: over an already-discovered
 /// module set, refuse a reserved-namespace module unless the publisher is the
 /// blessed first-party identity.
 ///
-/// Fail-closed default-deny: the blessed exemption applies ONLY when
-/// `entry_publisher` is `Some(blessed)`. An absent publisher (a plain local
-/// audit) or any other publisher rejects on a reserved package name, or on the
-/// first reserved-namespace module, naming the package and the offending name.
+/// Fail-closed default-deny: the blessed exemption applies ONLY when `standing`
+/// proves the claimed publisher is the blessed identity. An absent claim (a plain
+/// local audit), an unproven claim (a forged `publisher`), or any other publisher
+/// rejects on a reserved package name, or on the first reserved-namespace module,
+/// naming the package, the offending name, and why the exemption was refused.
 ///
 /// Both the package NAME and the module namespaces are reserved: a package whose
 /// name lives in a reserved package namespace is refused on the name alone, even
@@ -1741,16 +1814,13 @@ fn reserved_namespace_ownership(
 fn reserved_namespace_verdict(
     package_name: &str,
     module_paths: &[&[String]],
-    entry_publisher: Option<&str>,
+    standing: PublisherStanding<'_>,
 ) -> Result<(), CliError> {
-    let is_blessed = entry_publisher.is_some_and(ipe_kernels::is_blessed_publisher);
+    let is_blessed = standing.is_proven_blessed();
     if let Some(prefix) = ipe_kernels::reserved_package_prefix_of(package_name)
         && !is_blessed
     {
-        let who = entry_publisher.map_or_else(
-            || "with no first-party provenance".to_owned(),
-            |p| format!("published by `{p}`"),
-        );
+        let who = standing.describe();
         return Err(reject(
             Check::ReservedNamespace,
             format!(
@@ -1769,10 +1839,7 @@ fn reserved_namespace_verdict(
     for module_path in module_paths {
         if let Some(prefix) = ipe_kernels::reserved_prefix_of(module_path) {
             let dotted = module_path.join(".");
-            let who = entry_publisher.map_or_else(
-                || "with no first-party provenance".to_owned(),
-                |p| format!("published by `{p}`"),
-            );
+            let who = standing.describe();
             return Err(reject(
                 Check::ReservedNamespace,
                 format!(
@@ -1823,13 +1890,104 @@ mod tests {
         assert!(parse_audit_args(&args(&["--publisher", "a", "--publisher", "b"])).is_err());
     }
 
+    /// Run the reserved-namespace verdict under `claimed`, with the blessing an
+    /// admission-workflow attestation of `attested` establishes for it.
+    fn verdict(
+        package_name: &str,
+        module_paths: &[&[String]],
+        claimed: Option<&str>,
+        attested: Option<&str>,
+    ) -> Result<(), CliError> {
+        let claimed = claimed.map(|c| SelfDeclaredPublisher::new(c.to_owned()));
+        let attested = attested
+            .map(|a| crate::publisher::AttestedActor::parse(a).expect("login-shaped attestation"));
+        let blessing = claimed
+            .as_ref()
+            .map_or(Err(BlessingRefusal::NoProvenIdentity), |claimed| {
+                BlessedPublisher::from_attested(attested.as_ref(), claimed)
+            });
+        reserved_namespace_verdict(
+            package_name,
+            module_paths,
+            PublisherStanding {
+                claimed: claimed.as_ref(),
+                blessing: blessing.as_ref(),
+            },
+        )
+    }
+
+    /// Whether `result` is a `ReservedNamespace` audit reject.
+    fn is_reserved_reject(result: &Result<(), CliError>) -> bool {
+        matches!(
+            result,
+            Err(CliError::PackageAudit(Rejection {
+                check: Check::ReservedNamespace,
+                ..
+            }))
+        )
+    }
+
+    #[test]
+    fn reserved_namespace_refuses_a_forged_blessed_claim_without_attestation() {
+        // A committed entry claiming `publisher = "<blessed>"` with no attested
+        // identity is refused on a reserved name AND on a reserved module.
+        let blessed = ipe_kernels::BLESSED_PUBLISHER;
+        let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
+        let ipe_mod: &[String] = &["Ipe".to_owned(), "Evil".to_owned()];
+        let by_name = verdict("ipe-registry-smoke-probe", &[app_mod], Some(blessed), None);
+        assert!(is_reserved_reject(&by_name), "{by_name:?}");
+        let by_module = verdict("totally-legit", &[ipe_mod], Some(blessed), None);
+        assert!(is_reserved_reject(&by_module), "{by_module:?}");
+        let message = by_module.expect_err("rejected").to_string();
+        assert!(
+            message.contains("self-declared"),
+            "the reject says why the claim was not trusted: {message}"
+        );
+    }
+
+    #[test]
+    fn reserved_namespace_refuses_an_attestation_not_matching_the_claim() {
+        // The attested PR author is someone else: the blessed claim is forged.
+        let blessed = ipe_kernels::BLESSED_PUBLISHER;
+        let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
+        let forged = verdict(
+            "ipe-registry-smoke-probe",
+            &[app_mod],
+            Some(blessed),
+            Some("attacker"),
+        );
+        assert!(is_reserved_reject(&forged), "{forged:?}");
+        // The blessed author attesting an entry that claims someone else is also
+        // not a blessed publish.
+        let crossed = verdict(
+            "ipe-registry-smoke-probe",
+            &[app_mod],
+            Some("attacker"),
+            Some(blessed),
+        );
+        assert!(is_reserved_reject(&crossed), "{crossed:?}");
+    }
+
+    #[test]
+    fn reserved_namespace_refuses_a_non_blessed_attestation() {
+        // A consistent claim + attestation that is not the blessed identity.
+        let ipe_mod: &[String] = &["Ipe".to_owned(), "Palette".to_owned()];
+        let result = verdict("ipe-stdlib", &[ipe_mod], Some("someone"), Some("someone"));
+        assert!(is_reserved_reject(&result), "{result:?}");
+    }
+
     #[test]
     fn reserved_namespace_rejects_third_party_ipe_module() {
         // A package (whatever its own name) whose source provides `Ipe.Evil`,
         // published by a non-blessed account, is refused fail-closed.
         let ipe_evil: &[String] = &["Ipe".to_owned(), "Evil".to_owned()];
-        let err = reserved_namespace_verdict("totally-legit", &[ipe_evil], Some("attacker"))
-            .expect_err("third-party Ipe.Evil must be rejected");
+        let err = verdict(
+            "totally-legit",
+            &[ipe_evil],
+            Some("attacker"),
+            Some("attacker"),
+        )
+        .expect_err("third-party Ipe.Evil must be rejected");
         assert!(
             matches!(
                 &err,
@@ -1851,7 +2009,7 @@ mod tests {
         // A plain local audit (no index provenance) refuses a reserved-namespace
         // module: the blessed exemption needs an explicit blessed publisher.
         let ipe_mod: &[String] = &["Ipe".to_owned(), "String".to_owned()];
-        let err = reserved_namespace_verdict("squatter", &[ipe_mod], None)
+        let err = verdict("squatter", &[ipe_mod], None, None)
             .expect_err("no-provenance Ipe.* must be rejected");
         assert!(matches!(
             err,
@@ -1864,13 +2022,15 @@ mod tests {
 
     #[test]
     fn reserved_namespace_accepts_blessed_publisher() {
-        // The blessed first-party publisher legitimately owns `Ipe.*`.
+        // The blessed first-party publisher, proven by attestation, legitimately
+        // owns `Ipe.*`.
         let ipe_mod: &[String] = &["Ipe".to_owned(), "Palette".to_owned()];
         assert!(
-            reserved_namespace_verdict(
+            verdict(
                 "ipe-stdlib",
                 &[ipe_mod],
-                Some(ipe_kernels::BLESSED_PUBLISHER)
+                Some(ipe_kernels::BLESSED_PUBLISHER),
+                Some(ipe_kernels::BLESSED_PUBLISHER),
             )
             .is_ok()
         );
@@ -1880,8 +2040,8 @@ mod tests {
     fn reserved_namespace_accepts_non_reserved_module_from_any_publisher() {
         // A package in an ordinary namespace is fine from any publisher.
         let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
-        assert!(reserved_namespace_verdict("cool-lib", &[app_mod], Some("anyone")).is_ok());
-        assert!(reserved_namespace_verdict("cool-lib", &[app_mod], None).is_ok());
+        assert!(verdict("cool-lib", &[app_mod], Some("anyone"), Some("anyone")).is_ok());
+        assert!(verdict("cool-lib", &[app_mod], None, None).is_ok());
     }
 
     #[test]
@@ -1890,9 +2050,13 @@ mod tests {
         // non-blessed account, is refused on the name alone — even though its
         // modules are all ordinary.
         let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
-        let err =
-            reserved_namespace_verdict("ipe-registry-smoke-probe", &[app_mod], Some("attacker"))
-                .expect_err("third-party reserved package name must be rejected");
+        let err = verdict(
+            "ipe-registry-smoke-probe",
+            &[app_mod],
+            Some("attacker"),
+            Some("attacker"),
+        )
+        .expect_err("third-party reserved package name must be rejected");
         assert!(
             matches!(
                 &err,
@@ -1920,7 +2084,7 @@ mod tests {
         // A plain local audit (no provenance) refuses a reserved package name:
         // the blessed exemption needs an explicit blessed publisher.
         let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
-        let err = reserved_namespace_verdict("ipe-registry-smoke-probe-bad", &[app_mod], None)
+        let err = verdict("ipe-registry-smoke-probe-bad", &[app_mod], None, None)
             .expect_err("no-provenance reserved package name must be rejected");
         assert!(matches!(
             err,
@@ -1933,14 +2097,15 @@ mod tests {
 
     #[test]
     fn reserved_package_name_accepts_blessed_publisher() {
-        // The blessed first-party publisher legitimately owns the reserved
-        // package namespace.
+        // The blessed first-party publisher, proven by attestation, legitimately
+        // owns the reserved package namespace.
         let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
         assert!(
-            reserved_namespace_verdict(
+            verdict(
                 "ipe-registry-smoke-probe",
                 &[app_mod],
-                Some(ipe_kernels::BLESSED_PUBLISHER)
+                Some(ipe_kernels::BLESSED_PUBLISHER),
+                Some(ipe_kernels::BLESSED_PUBLISHER),
             )
             .is_ok()
         );
@@ -1952,10 +2117,15 @@ mod tests {
         // segment boundary is not reserved, from any publisher.
         let app_mod: &[String] = &["App".to_owned(), "View".to_owned()];
         assert!(
-            reserved_namespace_verdict("ipe-registry-smokehouse", &[app_mod], Some("anyone"))
-                .is_ok()
+            verdict(
+                "ipe-registry-smokehouse",
+                &[app_mod],
+                Some("anyone"),
+                Some("anyone")
+            )
+            .is_ok()
         );
-        assert!(reserved_namespace_verdict("ipe-registry-smokehouse", &[app_mod], None).is_ok());
+        assert!(verdict("ipe-registry-smokehouse", &[app_mod], None, None).is_ok());
     }
 
     #[test]
@@ -2600,6 +2770,88 @@ mod tests {
         assert!(
             result.is_ok(),
             "a prerelease over a published predecessor is exempt from the bump: {result:?}"
+        );
+    }
+
+    /// Write a one-package index at `index_root` publishing `versions` of
+    /// `test-pkg`.
+    fn write_index_versions(index_root: &std::path::Path, versions: &[&str]) {
+        use std::fmt::Write as _;
+        let pkgs = index_root.join("packages");
+        std::fs::create_dir_all(&pkgs).expect("create packages/");
+        let mut body = "name = \"test-pkg\"\npublisher = \"someone\"\n".to_owned();
+        for version in versions {
+            let _ = write!(
+                body,
+                "\n[[version]]\n\
+                 version = \"{version}\"\n\
+                 source = \"https://github.com/example/test-pkg\"\n\
+                 rev = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+                 sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+            );
+        }
+        std::fs::write(pkgs.join("test-pkg.toml"), body).expect("write index entry");
+    }
+
+    /// A stable release whose only published predecessors are prereleases is a
+    /// FIRST stable version: the check skips instead of diffing against the
+    /// prerelease. Hermetic — the skip returns before any predecessor fetch.
+    #[test]
+    fn enforced_semver_skips_a_first_stable_release_over_only_prereleases() {
+        let index_root = make_test_dir("semver-first-stable");
+        write_index_versions(&index_root, &["0.0.1-rc.1"]);
+
+        let mut prepared = make_prepared(&index_root.join("proj"));
+        prepared.manifest.name = "test-pkg".to_owned();
+        prepared.manifest.version = Some("0.0.1".parse().expect("valid release"));
+
+        let result = enforced_semver(&prepared, Some(&index_root));
+        let _ = std::fs::remove_dir_all(&index_root);
+        assert!(
+            result.is_ok(),
+            "0.0.1-rc.1 -> 0.0.1 graduates as a first stable version: {result:?}"
+        );
+    }
+
+    /// The baseline skips a prerelease for the release below it, so a breaking
+    /// change carried in through an exempt prerelease (`0.1.0` → `0.1.1-rc.1`
+    /// removes an export) is measured against `0.1.0` and `0.1.1` is refused.
+    #[test]
+    fn enforced_semver_baseline_skips_prereleases_so_a_smuggled_break_is_refused() {
+        let index_root = make_test_dir("semver-stable-baseline");
+        write_index_versions(&index_root, &["0.1.0", "0.1.1-rc.1", "0.2.0-rc.1"]);
+        let entry = crate::index::read_entry_lookup(&index_root, "test-pkg")
+            .absent_or_err()
+            .expect("readable entry")
+            .expect("entry present");
+        let _ = std::fs::remove_dir_all(&index_root);
+
+        let new_version = semver::Version::new(0, 1, 1);
+        let baseline = stable_baseline(&entry.versions, &new_version).expect("a stable baseline");
+        assert_eq!(baseline.version, semver::Version::new(0, 1, 0));
+
+        let with_export = |names: &[&str]| {
+            let mut module = crate::api_surface::ModuleApi::default();
+            for name in names {
+                module.values.insert((*name).to_owned(), "Int".to_owned());
+            }
+            crate::api_surface::PublicApi {
+                modules: std::iter::once((vec!["Lib".to_owned()], module)).collect(),
+            }
+        };
+        let stable_api = with_export(&["f", "g"]);
+        let rc_api = with_export(&["f"]);
+        let report = crate::diff::report(&stable_api, &rc_api, &baseline.version, &new_version)
+            .expect("floor does not overflow");
+        assert_eq!(report.floor, semver::Version::new(0, 2, 0));
+        assert!(
+            !report.satisfied,
+            "a break smuggled through a prerelease still needs the minor bump"
+        );
+
+        assert!(
+            stable_baseline(&entry.versions, &semver::Version::new(0, 0, 9)).is_none(),
+            "no release below the new version is a first stable version"
         );
     }
 

@@ -648,46 +648,61 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // `webview_host` below.
     let delivery = resolve_delivery(&entry_path, &args.delivery, wants_static, "build")?;
 
-    // Trust-boundary consent gates — hoisted ABOVE the bundle early-return so a
-    // `desktop`/`ios`/`android` bundle build is gated too (a bundle is a
-    // distributable). Acknowledge any disclosed `.Unsafe` escape-hatch import
-    // BEFORE the (costly) emit + cargo build OR bundle. The safe path (no `.Unsafe`
-    // import) returns silently; an exposed program requires `--accept-risks`, the
-    // manifest token, or an interactive yes, and a non-interactive build without
-    // consent fails closed rather than blocking on a prompt.
-    acknowledge_unsafe_imports(
+    // Human-friendly progress: the consent gates and the compile+emit below are
+    // otherwise silent, so the banner and a start line come first and a done line
+    // closes the build. Shown only on an interactive terminal so piped / CI output
+    // stays clean; status goes to stderr (stdout carries data). Suppressed in
+    // quiet mode (only warnings/errors) and in JSON mode (machine output only —
+    // one JSON object to stdout at the end).
+    let show_progress = !args.quiet && args.format != cli_args::OutputFormat::Json && {
+        use std::io::IsTerminal as _;
+        std::io::stderr().is_terminal()
+    };
+    if show_progress {
+        style::print_command_header();
+        eprintln!(
+            "{}",
+            style::gutter(&format!(
+                "{} building {entry}",
+                style::outcome_glyph(style::Outcome::Step)
+            ))
+        );
+    }
+
+    // A `desktop`/`ios`/`android` host is an application bundle, not a plain
+    // artifact: it is routed through the delivery-grammar bundler (a fast dev
+    // bundle for `build`) once the consent gates below admit it.
+    let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
+
+    // `--fix` carries durable authorization: apply machine-applicable fixes
+    // non-interactively before the capability resolution and the build see the
+    // source, so the consented capability set describes the source that is
+    // actually compiled.
+    if bundle_host.is_none() && args.fix {
+        apply_fixes_cmd(&entry_path, true, &mut std::io::stdout())?;
+    }
+
+    // Trust-boundary consent gates over ONE capability resolution — ahead of the
+    // bundle route so a `desktop`/`ios`/`android` bundle build is gated too (a
+    // bundle is a distributable), and ahead of the (costly) emit + cargo build.
+    // A disclosed `.Unsafe` import needs `--accept-risks`, the manifest token, or
+    // an interactive yes (a non-interactive build without consent fails closed
+    // rather than blocking on a prompt); a disclosed `js-port:<axis>` must be
+    // granted by THIS app's `[capabilities] accept`; a disclosed `native-ffi`
+    // crossing by THIS app's `[capabilities] declared`.
+    let consented = consent_to_capabilities(
         manifest_parsed.as_ref(),
         manifest.as_deref(),
         &entry_path,
         args.accept_risks,
     )?;
 
-    // App-boundary web-capability consent: a disclosed `js-port:<axis>` reached by
-    // a dependency must be granted by THIS app's `[capabilities] accept`, else the
-    // build fails closed naming the disclosing module.
-    gate_web_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
-
-    // App-boundary native-crossing consent: a disclosed `native-ffi` crossing
-    // reached by a dependency must be granted by THIS app's `[capabilities]
-    // declared`, else the build fails closed naming the disclosing `Rust.<Crate>`.
-    gate_native_ffi_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
-
-    // A `desktop`/`ios`/`android` host is an application bundle, not a plain
-    // artifact: route it through the delivery-grammar bundler (a fast dev bundle
-    // for `build`). The served/default host falls through to the ordinary compile
-    // below. The delivery grammar is the one vocabulary for every bundle target.
-    if let Some(host) = BundleHost::from_delivery_host(delivery.host())? {
+    if let Some(host) = bundle_host {
         bundle_delivery(host, BundleProfile::Dev, Some(entry.as_str()))?;
         return Ok(BuildSuccess {
             entry,
             out_dir: PathBuf::new(),
         });
-    }
-
-    // `--fix` carries durable authorization: apply machine-applicable fixes
-    // non-interactively before the (re-run) build sees the source.
-    if args.fix {
-        apply_fixes_cmd(&entry_path, true, &mut std::io::stdout())?;
     }
 
     // Precedence: CLI --target wasm|wasi > IPE_TARGET=wasm|wasi > [wasm].mode.
@@ -755,26 +770,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         webview_window: None,
     };
 
-    // Human-friendly progress: the compile+emit below is otherwise silent, so
-    // bracket it with a start/done line. Shown only on an interactive terminal so
-    // piped / CI output stays clean; status goes to stderr (stdout carries data).
-    // Suppressed in quiet mode (only warnings/errors) and in JSON mode (machine
-    // output only — one JSON object to stdout at the end).
-    let show_progress = !args.quiet && args.format != cli_args::OutputFormat::Json && {
-        use std::io::IsTerminal as _;
-        std::io::stderr().is_terminal()
-    };
-    if show_progress {
-        style::print_command_header();
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
-                "{} building {entry}",
-                style::outcome_glyph(style::Outcome::Step)
-            ))
-        );
-    }
-
     // No manifest found: compile entry + all sibling .ipe files in the same
     // directory. Byte-identical to `build` when the directory holds only the
     // entry file (regression-covered by the golden suite).
@@ -805,7 +800,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             static_plan,
             runtime_dep,
             manifest.as_deref(),
-            &entry_path,
+            &consented,
             args.quiet,
         )?),
     };
@@ -852,7 +847,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 /// # Errors
 /// - [`CliError::EmittedBuildFailed`] when the emitted crate fails to compile.
 /// - [`CliError::Io`] when the artifact cannot be copied into the project.
-/// - The toolchain, manifest-parse, and capability-resolution errors of the
+/// - The toolchain, manifest-parse, and profile-construction errors of the
 ///   steps it composes.
 pub fn compile_and_finalize_native_build(
     out_dir: &Path,
@@ -860,7 +855,7 @@ pub fn compile_and_finalize_native_build(
     static_plan: Option<ipe_backend_rust::static_build::StaticPlan>,
     runtime_dep: bool,
     manifest: Option<&Path>,
-    entry_path: &Path,
+    consented: &ConsentedCapabilities,
     quiet: bool,
 ) -> Result<PathBuf, CliError> {
     // `native_cargo` is `Some` on every native path (the caller's wasm branch
@@ -903,9 +898,9 @@ pub fn compile_and_finalize_native_build(
     let driver = manifest_parsed
         .as_ref()
         .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed.as_ref(), manifest, entry_path)?;
+    let resolved = consented.resolved();
     if run_sandbox::is_native_bearing(&resolved.union()) {
-        let profile = run_sandbox::build_profile(&resolved, driver)?;
+        let profile = run_sandbox::build_profile(resolved, driver)?;
         run_sandbox::write_build_artifacts(out_dir, &profile)?;
     }
     Ok(artifact)
@@ -1164,14 +1159,12 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     // carries no `--accept-risks` and never prompts, so an ungranted disclosure
     // fails closed here, and the durable manifest `[capabilities]` grant is the
     // only way through (a CI release must not block on a TTY prompt).
-    acknowledge_unsafe_imports(
+    let consented = consent_to_capabilities(
         manifest_parsed.as_ref(),
         manifest.as_deref(),
         &entry_path,
         false,
     )?;
-    gate_web_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
-    gate_native_ffi_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
 
     // A `desktop`/`ios`/`android` host is a production distributable bundle:
     // route it through the delivery-grammar bundler (the `release` production
@@ -1292,13 +1285,12 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         }
     };
 
-    // Resolve capabilities up-front to discriminate between native-bearing
-    // (needs jail wrapper) and pure-native (plain optimised binary).
+    // The consented capabilities discriminate between native-bearing (needs jail
+    // wrapper) and pure-native (plain optimised binary).
     let driver = manifest_parsed
         .as_ref()
         .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved =
-        run_sandbox::resolve_for_run(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
+    let resolved = consented.resolved();
 
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime, false)?;
 
@@ -1461,7 +1453,7 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     build_emitted_project(&mut app_cargo, "the release app", None, &app_out)?;
 
     // Write the capability enforcement artifacts (ipe.profile + embedded floor).
-    let profile = run_sandbox::build_profile(&resolved, driver)?;
+    let profile = run_sandbox::build_profile(resolved, driver)?;
     run_sandbox::write_build_artifacts(&app_out, &profile)?;
 
     // Locate the compiled app binary. The target dir may be a global
@@ -2466,25 +2458,40 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // so a flag contradiction fires before the entry file is read.
     let delivery = resolve_delivery(&entry_path, &args.delivery, wants_static, "run")?;
 
-    // Acknowledge any disclosed `.Unsafe` escape-hatch import BEFORE the (costly)
-    // emit + cargo build. Same gate as `ipe build`: the safe path is silent, an
-    // exposed program needs consent, and a non-interactive run without consent
-    // fails closed rather than blocking on a prompt.
-    acknowledge_unsafe_imports(
+    // Human-friendly progress: the consent gates and the compile+emit below are
+    // otherwise silent, so the banner and the running step come first. On a
+    // terminal only (piped / CI output stays clean); to stderr, so stdout carries
+    // only the program's own output. The cargo build that follows streams its own
+    // progress; the exec that ends `ipe run` leaves no room for a settled "done"
+    // line, so the run just starts producing the program's output. Suppressed
+    // when `--quiet` is set.
+    let show_progress = !args.quiet && {
+        use std::io::IsTerminal as _;
+        std::io::stderr().is_terminal()
+    };
+    if show_progress {
+        style::print_command_header();
+        eprintln!(
+            "{}",
+            style::gutter(&format!(
+                "{} building {entry}",
+                style::outcome_glyph(style::Outcome::Step)
+            ))
+        );
+    }
+
+    // The same trust-boundary consent gates as `ipe build`, over ONE capability
+    // resolution, BEFORE the (costly) emit + cargo build: a disclosed `.Unsafe`
+    // import needs consent (a non-interactive run without it fails closed rather
+    // than blocking on a prompt), and a disclosed `js-port:<axis>` / `native-ffi`
+    // crossing must be granted by this app's manifest, else fail closed. The
+    // consented set is the one the WASI context and the native jail enforce.
+    let consented = consent_to_capabilities(
         manifest_parsed.as_ref(),
         manifest.as_deref(),
         &entry_path,
         args.accept_risks,
     )?;
-
-    // App-boundary web-capability consent: same gate as `ipe build` — a disclosed
-    // `js-port:<axis>` must be granted by this app's manifest, else fail closed.
-    gate_web_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
-
-    // App-boundary native-crossing consent: same gate as `ipe build` — a disclosed
-    // `native-ffi` crossing must be granted by this app's `[capabilities] declared`,
-    // else fail closed naming the disclosing `Rust.<Crate>`.
-    gate_native_ffi_consent(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
 
     // When the project declares [wasm].mode != "off", or IPE_TARGET=wasm is
     // set, treat `ipe run` as a browser wasm build-and-bundle (no native binary
@@ -2560,27 +2567,6 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         webview_window: None,
     };
 
-    // Human-friendly progress: the compile+emit below is otherwise silent, so
-    // announce the running step. On a terminal only (piped / CI output stays
-    // clean); to stderr, so stdout carries only the program's own output. The
-    // cargo build that follows streams its own progress; the exec that ends
-    // `ipe run` leaves no room for a settled "done" line, so the run just starts
-    // producing the program's output. Suppressed when `--quiet` is set.
-    let show_progress = !args.quiet && {
-        use std::io::IsTerminal as _;
-        std::io::stderr().is_terminal()
-    };
-    if show_progress {
-        style::print_command_header();
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
-                "{} building {entry}",
-                style::outcome_glyph(style::Outcome::Step)
-            ))
-        );
-    }
-
     manifest.as_ref().map_or_else(
         || {
             build_with_sibling_discovery_with_options(
@@ -2609,23 +2595,14 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
             // first — a green build is THE SEAL (ipe-accepts ⇒ cargo-builds for
             // the target) — then run it.
             let module = bundle_wasi(&out_dir)?;
-            // Derive the capability floor exactly as the native jail does
-            // (`resolve_for_run` → `build_profile`), so the WASI context enforces
-            // the SAME deny-by-default model — defend-in-depth, one capability
-            // model expressed two ways (seccomp+bwrap vs a `WasiCtx`).
-            let manifest_parsed = match &manifest {
-                Some(m) => Some(project::parse_manifest(m)?),
-                None => None,
-            };
+            // Derive the capability floor exactly as the native jail does (the
+            // consented set → `build_profile`), so the WASI context enforces the
+            // SAME deny-by-default model — defend-in-depth, one capability model
+            // expressed two ways (seccomp+bwrap vs a `WasiCtx`).
             let driver = manifest_parsed
                 .as_ref()
                 .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-            let resolved = run_sandbox::resolve_for_run(
-                manifest_parsed.as_ref(),
-                manifest.as_deref(),
-                &entry_path,
-            )?;
-            let profile = run_sandbox::build_profile(&resolved, driver)?;
+            let profile = run_sandbox::build_profile(consented.resolved(), driver)?;
             let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
                 path: PathBuf::from("."),
                 source: e,
@@ -2693,18 +2670,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // effects inference cannot prove, and only that is jailed. For a native
     // program a missing primitive is fail-closed (refuses unless recorded
     // consent).
-    let manifest_parsed = match &manifest {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
     let driver = manifest_parsed
         .as_ref()
         .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved =
-        run_sandbox::resolve_for_run(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
+    let resolved = consented.resolved();
     let union = resolved.union();
     let native = run_sandbox::is_native_bearing(&union);
-    let profile = run_sandbox::build_profile(&resolved, driver)?;
+    let profile = run_sandbox::build_profile(resolved, driver)?;
     let bin_args_os: Vec<std::ffi::OsString> =
         bin_args.iter().map(std::ffi::OsString::from).collect();
 
@@ -3417,26 +3389,73 @@ pub fn user_sources_for_unsafe_scan(
     }
 }
 
-/// The build-time acknowledgment gate for `Ipe.<M>.Unsafe` escape-hatch imports,
-/// shared by `ipe build` and `ipe run`.
+/// The program's resolved capability sets, admitted by every trust-boundary
+/// consent gate.
 ///
-/// Resolves the program's inferred capabilities the same way the sandbox does,
-/// and — only when the disclosed `unsafe` capability is present — surfaces the
-/// risk and requires consent (the `--accept-risks` flag, a `[capabilities]
-/// accept = ["unsafe"]` manifest token, or an interactive `y`). A non-interactive
+/// The one constructor is [`consent_to_capabilities`]: it resolves (infers) the
+/// capability set exactly once and runs the `.Unsafe`, web, and native-crossing
+/// gates over that single value. Every downstream consumer — the build-artifact
+/// profile, the release jail, the run jail, the WASI context — takes this
+/// witness, so none of them re-infers, and none is reachable without consent.
+pub struct ConsentedCapabilities {
+    resolved: run_sandbox::ResolvedCapabilities,
+}
+
+impl ConsentedCapabilities {
+    /// The inferred and declared sets the consent gates admitted.
+    #[must_use]
+    pub const fn resolved(&self) -> &run_sandbox::ResolvedCapabilities {
+        &self.resolved
+    }
+}
+
+/// Resolve the program's capabilities once and pass them through every
+/// trust-boundary consent gate, shared by `ipe build`, `ipe run`, and
+/// `ipe release`: the `.Unsafe` acknowledgment, then the app-boundary web
+/// consent, then the app-boundary native-crossing consent. All three judge the
+/// SAME resolved value, and the value is released only once all three admit it.
+///
+/// # Errors
+/// The first gate refusal (`IPE-S0001` / `IPE-S0002` / `IPE-S0003`); the
+/// capability-resolution errors it composes.
+pub fn consent_to_capabilities(
+    manifest_parsed: Option<&project::ProjectManifest>,
+    manifest_path: Option<&Path>,
+    entry: &Path,
+    accept_risks_flag: bool,
+) -> Result<ConsentedCapabilities, CliError> {
+    let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
+    acknowledge_unsafe_imports(
+        &resolved,
+        manifest_parsed,
+        manifest_path,
+        entry,
+        accept_risks_flag,
+    )?;
+    gate_web_consent(&resolved, manifest_parsed, manifest_path, entry)?;
+    gate_native_ffi_consent(&resolved, manifest_parsed, manifest_path, entry)?;
+    Ok(ConsentedCapabilities { resolved })
+}
+
+/// The acknowledgment gate for `Ipe.<M>.Unsafe` escape-hatch imports.
+///
+/// Judges the program's resolved capabilities, and — only when the disclosed
+/// `unsafe` capability is present — surfaces the risk and requires consent
+/// (the `--accept-risks` flag, a `[capabilities] accept = ["unsafe"]` manifest
+/// token, or an interactive `y`). A non-interactive
 /// build without pre-acceptance fails closed (`IPE-S0001`); it never blocks on a
 /// prompt. A program with no `.Unsafe` import is untouched.
 ///
 /// # Errors
 /// [`CliError::UsageOwned`] (`IPE-S0001`) when consent is required but absent;
-/// the capability-resolution errors it composes.
-pub fn acknowledge_unsafe_imports(
+/// the source-read errors of the provenance scan.
+fn acknowledge_unsafe_imports(
+    resolved: &run_sandbox::ResolvedCapabilities,
     manifest_parsed: Option<&project::ProjectManifest>,
     manifest_path: Option<&Path>,
     entry: &Path,
     accept_risks_flag: bool,
 ) -> Result<(), CliError> {
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
     // Short-circuit before any source read when the disclosed capability is
     // absent — the safe path does no work at all.
     if !resolved.inferred.contains(&ipe_ir::Capability::Unsafe) {
@@ -3460,10 +3479,10 @@ pub fn acknowledge_unsafe_imports(
     )
 }
 
-/// The app-boundary web-capability consent gate, shared by `ipe build` and
-/// `ipe run` and invoked right after the `.Unsafe` acknowledgment.
+/// The app-boundary web-capability consent gate, invoked right after the
+/// `.Unsafe` acknowledgment.
 ///
-/// Resolves the program's inferred capabilities the same way the sandbox does; if
+/// Judges the program's resolved capabilities; if
 /// any disclosed `js-port:<axis>` web capability is present, it demands that the
 /// top-level app's `[capabilities] accept` set grant it. An ungranted (or
 /// un-attributable) web axis is a fail-closed, typed refusal naming the disclosing
@@ -3472,13 +3491,13 @@ pub fn acknowledge_unsafe_imports(
 ///
 /// # Errors
 /// [`CliError::UsageOwned`] (`IPE-S0002`) when a disclosed web axis is ungranted;
-/// the capability-resolution errors it composes.
-pub fn gate_web_consent(
+/// the source-read errors of the provenance scan.
+fn gate_web_consent(
+    resolved: &run_sandbox::ResolvedCapabilities,
     manifest_parsed: Option<&project::ProjectManifest>,
     manifest_path: Option<&Path>,
     entry: &Path,
 ) -> Result<(), CliError> {
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
     // Short-circuit before any source read when no web axis is disclosed.
     if !resolved
         .inferred
@@ -3503,10 +3522,10 @@ pub fn gate_web_consent(
     web_consent::gate(&resolved.inferred, &granted, &provenance)
 }
 
-/// The app-boundary native-crossing consent gate, shared by `ipe build` and
-/// `ipe run` and invoked right after the web-capability consent.
+/// The app-boundary native-crossing consent gate, invoked right after the
+/// web-capability consent.
 ///
-/// Resolves the program's inferred capabilities the same way the sandbox does; if
+/// Judges the program's resolved capabilities; if
 /// the disclosed `native-ffi` capability is present (any `Rust.` crossing), it
 /// demands that the top-level app's `[capabilities] declared` set grant it. An
 /// ungranted (or un-attributable) crossing is a fail-closed, typed refusal naming
@@ -3523,13 +3542,13 @@ pub fn gate_web_consent(
 ///
 /// # Errors
 /// [`CliError::UsageOwned`] (`IPE-S0003`) when the disclosed native crossing is
-/// ungranted; the capability-resolution errors it composes.
-pub fn gate_native_ffi_consent(
+/// ungranted; the source-read errors of the provenance scan.
+fn gate_native_ffi_consent(
+    resolved: &run_sandbox::ResolvedCapabilities,
     manifest_parsed: Option<&project::ProjectManifest>,
     manifest_path: Option<&Path>,
     entry: &Path,
 ) -> Result<(), CliError> {
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
     // Short-circuit before any source read when no native crossing is disclosed.
     if !resolved.inferred.contains(&ipe_ir::Capability::NativeFfi) {
         return Ok(());
@@ -3627,5 +3646,59 @@ mod artifact_name_tests {
             file.starts_with(&name),
             "the delivered file name extends the friendly name"
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_resolution_once_tests {
+    //! Whole-program capability inference is the costliest pre-build step, and
+    //! its result is a trust-boundary fact: `build`, `run`, and `release` each
+    //! resolve it exactly once and hand that one value to every consent gate and
+    //! every enforcement artifact through the `ConsentedCapabilities` witness.
+    //! These tripwires pin that no second resolution site creeps back into this
+    //! module.
+
+    const SOURCE: &str = include_str!("commands.rs");
+    // Spelled in pieces so the needles never match this module's own text.
+    const RESOLVE_CALL: &str = concat!("resolve", "_for_run(");
+    const INFER_CALL: &str = concat!("infer_package", "_capabilities(");
+    const CONSENT_CALL: &str = concat!("consent_to", "_capabilities(");
+
+    /// The text of the `pub fn` named `name`, up to the next top-level `pub fn`.
+    fn fn_body(name: &str) -> Option<&'static str> {
+        let head = format!("\npub fn {name}(");
+        let start = SOURCE.find(&head)?;
+        let rest = SOURCE.get(start + head.len()..)?;
+        let end = rest.find("\npub fn ").unwrap_or(rest.len());
+        rest.get(..end)
+    }
+
+    #[test]
+    fn capability_resolution_has_one_consent_site_and_one_inspection_site() {
+        // `consent_to_capabilities` (build/run/release) and the read-only
+        // `release --capabilities` inspection — nothing else.
+        assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 2);
+        assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
+        for site in ["consent_to_capabilities", "run_release_capabilities"] {
+            let body = fn_body(site);
+            assert!(body.is_some(), "{site} is defined in this module");
+            let Some(body) = body else { return };
+            assert_eq!(body.matches(RESOLVE_CALL).count(), 1, "{site}");
+        }
+    }
+
+    #[test]
+    fn build_run_release_each_consent_exactly_once() {
+        for entry_point in ["run_build_body", "run_release", "run_run_with_args"] {
+            let body = fn_body(entry_point);
+            assert!(body.is_some(), "{entry_point} is defined in this module");
+            let Some(body) = body else { return };
+            assert_eq!(
+                body.matches(CONSENT_CALL).count(),
+                1,
+                "{entry_point} resolves and consents to its capabilities exactly once"
+            );
+            assert_eq!(body.matches(RESOLVE_CALL).count(), 0, "{entry_point}");
+        }
     }
 }

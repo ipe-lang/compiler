@@ -994,6 +994,248 @@ fn max_db_pools() -> usize {
         .unwrap_or(32)
 }
 
+// ─── Engine version floor (connect-time, fail closed) ─────────────────────────
+
+/// A database engine release, ordered numerically by `(major, minor)`. A patch
+/// level never moves a floor, so it is not carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EngineVersion {
+    major: u32,
+    minor: u32,
+}
+
+impl EngineVersion {
+    #[must_use]
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    #[must_use]
+    pub const fn major(self) -> u32 {
+        self.major
+    }
+
+    #[must_use]
+    pub const fn minor(self) -> u32 {
+        self.minor
+    }
+}
+
+impl std::fmt::Display for EngineVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// Oldest SQLite the runtime accepts: the release that introduced `RETURNING`
+/// (`db_insert_fields_returning`, the `RETURNING id` insert path) — the newest
+/// SQLite syntax Ipe.Db emits (`ON CONFLICT … DO UPDATE` and
+/// `ALTER TABLE … RENAME COLUMN` are older).
+pub const SQLITE_VERSION_FLOOR: EngineVersion = EngineVersion::new(3, 35);
+
+/// Oldest PostgreSQL the runtime accepts: the release that introduced
+/// `INSERT … ON CONFLICT` (the session-store upsert) and
+/// `CREATE INDEX IF NOT EXISTS` (`Ipe.Db.Store` index DDL) — the newest
+/// PostgreSQL syntax Ipe.Db emits (`RETURNING` is older).
+pub const POSTGRES_VERSION_FLOOR: EngineVersion = EngineVersion::new(9, 5);
+
+/// The database engines the runtime can be built against. Closed set: a driver
+/// with no declared floor has no variant, so it cannot be connected to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbEngine {
+    Sqlite,
+    Postgres,
+}
+
+impl DbEngine {
+    /// The engine the sqlx driver `DB` speaks, from the driver's own
+    /// `Database::NAME`. An unrecognised driver is refused, never assumed.
+    fn for_driver<DB: sqlx::Database>() -> Result<Self, EngineVersionError> {
+        Self::from_driver_name(DB::NAME).ok_or(EngineVersionError::UnknownEngine)
+    }
+
+    fn from_driver_name(name: &str) -> Option<Self> {
+        match name {
+            "SQLite" => Some(Self::Sqlite),
+            "PostgreSQL" => Some(Self::Postgres),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sqlite => "SQLite",
+            Self::Postgres => "PostgreSQL",
+        }
+    }
+
+    #[must_use]
+    pub const fn version_floor(self) -> EngineVersion {
+        match self {
+            Self::Sqlite => SQLITE_VERSION_FLOOR,
+            Self::Postgres => POSTGRES_VERSION_FLOOR,
+        }
+    }
+
+    /// Single-row, single-`TEXT`-column query reporting the server's version in
+    /// the form [`Self::parse_version`] accepts.
+    const fn version_query(self) -> &'static str {
+        match self {
+            Self::Sqlite => "SELECT sqlite_version()",
+            Self::Postgres => "SELECT current_setting('server_version_num')",
+        }
+    }
+
+    /// Parse the engine's self-reported version. Strict: anything but the
+    /// exact documented shape is `None`, so an unexpected report fails closed.
+    ///
+    /// - SQLite `sqlite_version()`: `MAJOR.MINOR.PATCH`, all decimal.
+    /// - PostgreSQL `server_version_num`: one decimal integer, encoded as
+    ///   `M*10000 + m*100 + p` before major 10 and `M*10000 + m` from major 10
+    ///   on.
+    fn parse_version(self, raw: &str) -> Option<EngineVersion> {
+        match self {
+            Self::Sqlite => {
+                let mut parts = raw.split('.');
+                let major = parse_decimal(parts.next()?)?;
+                let minor = parse_decimal(parts.next()?)?;
+                parse_decimal(parts.next()?)?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                Some(EngineVersion::new(major, minor))
+            }
+            Self::Postgres => {
+                let num = parse_decimal(raw)?;
+                let major = num / 10_000;
+                let minor = if major >= 10 {
+                    num % 10_000
+                } else {
+                    (num / 100) % 100
+                };
+                Some(EngineVersion::new(major, minor))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DbEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A non-empty run of ASCII digits that fits `u32`. Rejects the sign and empty
+/// forms `str::parse` would otherwise accept or report ambiguously.
+fn parse_decimal(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Why a connection was refused at the engine-version gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineVersionError {
+    /// The build's sqlx driver is not a [`DbEngine`] with a declared floor.
+    UnknownEngine,
+    /// The engine's version report did not parse.
+    Unparseable { engine: DbEngine },
+    /// The engine is older than its [`DbEngine::version_floor`].
+    BelowFloor {
+        engine: DbEngine,
+        found: EngineVersion,
+    },
+}
+
+impl std::fmt::Display for EngineVersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::UnknownEngine => {
+                f.write_str("db: unsupported database driver (no version floor is declared for it)")
+            }
+            Self::Unparseable { engine } => write!(
+                f,
+                "db: could not parse the {engine} server version; Ipe.Db requires {engine} >= {}",
+                engine.version_floor()
+            ),
+            Self::BelowFloor { engine, found } => write!(
+                f,
+                "db: {engine} {found} is too old; Ipe.Db requires {engine} >= {}",
+                engine.version_floor()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineVersionError {}
+
+/// Parse `raw` as `engine`'s version report and admit it only at or above the
+/// engine's floor.
+fn check_engine_version(engine: DbEngine, raw: &str) -> Result<EngineVersion, EngineVersionError> {
+    let found = engine
+        .parse_version(raw)
+        .ok_or(EngineVersionError::Unparseable { engine })?;
+    if found < engine.version_floor() {
+        return Err(EngineVersionError::BelowFloor { engine, found });
+    }
+    Ok(found)
+}
+
+/// Why [`enforce_engine_floor_on`] refused a pool.
+#[derive(Debug)]
+pub(crate) enum EngineFloorError {
+    /// The server answered, and its version is unsupported or unreadable.
+    Refused(EngineVersionError),
+    /// The version query itself failed.
+    Unreadable(sqlx::Error),
+}
+
+/// Session stores surface `sqlx::Error`: a refusal travels as a
+/// `Configuration` error carrying the floor message; a failed query is
+/// passed through unchanged.
+impl From<EngineFloorError> for sqlx::Error {
+    fn from(e: EngineFloorError) -> Self {
+        match e {
+            EngineFloorError::Refused(refused) => Self::Configuration(Box::new(refused)),
+            EngineFloorError::Unreadable(query) => query,
+        }
+    }
+}
+
+/// Read the connected server's version once and admit the pool only at or
+/// above its engine's floor. Shared by every pool the runtime opens — the
+/// `Ipe.Db` pool and the session-store pools — so each runs the gate before
+/// any other statement.
+pub(crate) async fn enforce_engine_floor_on<DB>(
+    pool: &sqlx::Pool<DB>,
+) -> Result<EngineVersion, EngineFloorError>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
+{
+    let engine = DbEngine::for_driver::<DB>().map_err(EngineFloorError::Refused)?;
+    let raw: String = sqlx::query_scalar::<DB, String>(engine.version_query())
+        .fetch_one(pool)
+        .await
+        .map_err(EngineFloorError::Unreadable)?;
+    check_engine_version(engine, &raw).map_err(EngineFloorError::Refused)
+}
+
+/// [`enforce_engine_floor_on`] for the `Ipe.Db` pool, as a typed runtime
+/// error. A failed version query goes through [`connect_err`], so a driver
+/// message can never echo the connection URL.
+async fn enforce_engine_floor<E: From<String> + Send>(pool: &Db) -> Result<(), E> {
+    match enforce_engine_floor_on(pool).await {
+        Ok(_) => Ok(()),
+        Err(EngineFloorError::Refused(e)) => Err(str_err(&e.to_string())),
+        Err(EngineFloorError::Unreadable(e)) => Err(connect_err(&e)),
+    }
+}
+
 /// Build one configured pool. SQLite (file, not `:memory:`) gets WAL — concurrent
 /// readers alongside a single writer — plus a `busy_timeout` so lock contention
 /// WAITS (sound) instead of erroring with `SQLITE_BUSY`. Without WAL a shared pool
@@ -1023,6 +1265,10 @@ async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E,
         Ok(p) => p,
         Err(e) => return IpeResult::Err(connect_err(&e)),
     };
+    if let Err(e) = enforce_engine_floor::<E>(&pool).await {
+        pool.close().await;
+        return IpeResult::Err(e);
+    }
     if url.contains("sqlite") && url_is_cacheable(url) {
         let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
         let _ = sqlx::query("PRAGMA busy_timeout=5000;")
@@ -3870,8 +4116,8 @@ pub fn db_conn_get_by_id<E: Send + From<String> + 'static>(
 ///
 /// Returns `(sql_without_returning, args)` on success, or
 /// `IpeResult::Err` on invalid table/column name.  All-OmitField → returns
-/// `"INSERT INTO t DEFAULT VALUES"` with an empty arg list (valid on SQLite ≥
-/// 3.35 and PostgreSQL).
+/// `"INSERT INTO t DEFAULT VALUES"` with an empty arg list (valid on every
+/// engine at or above its [`DbEngine::version_floor`]).
 ///
 /// Security: table and column names are validated before interpolation.
 /// Values are bound positionally — never interpolated.
@@ -4061,6 +4307,165 @@ pub fn db_update_fields<E: Send + From<String> + 'static>(
     })
 }
 
+/// Builds the upsert statement for `db_upsert_fields`:
+///
+/// ```sql
+/// INSERT INTO <table> (<set-cols>) VALUES (?, …)
+///   ON CONFLICT (<target-cols>) DO UPDATE SET <c> = excluded.<c>, …
+/// ```
+///
+/// The SET list is every `SetField` column that is not a conflict-target
+/// column. `OmitField` columns appear nowhere: the database fills them on
+/// insert and never overwrites them on conflict, so a DB-owned column
+/// (`Serial` / `DefaultNow` / `TouchOnUpdate`) is never replaced by a client
+/// value. An empty SET list yields `ON CONFLICT (…) DO NOTHING`
+/// (insert-if-absent), never an empty `SET`.
+///
+/// Refused with `Err` before any SQL exists:
+/// - a table name failing `SqlIdent::parse_dotted`;
+/// - a field or conflict-target column failing `SqlIdent::parse_plain` —
+///   columns are bare names because `ON CONFLICT (…)` and `excluded.<col>`
+///   admit no qualifier;
+/// - an empty conflict target (no `ON CONFLICT` target is valid on both
+///   engines for `DO UPDATE`);
+/// - a column named twice in the fields or in the conflict target, compared
+///   ASCII-case-insensitively as both engines compare unquoted identifiers;
+/// - a conflict-target column not supplied as a `SetField` — its value would be
+///   absent or DB-generated, the conflict could never match, and the upsert
+///   would silently degrade to a plain insert.
+/// - a conflict-target column bound to `SqlNull` — NULLs never compare equal
+///   under a unique constraint, so the upsert would likewise degrade to an insert.
+///
+/// Security: every interpolated name is a validated `SqlIdent`; `excluded.<col>`
+/// reuses the same validated identifier. Values bind positionally.
+#[cfg(feature = "db")]
+fn build_upsert_sql(
+    kernel: &str,
+    table: &str,
+    conflict_target: Vec<String>,
+    fields: Vec<(String, Option<SqlParam>)>,
+) -> Result<(String, Vec<SqlParam>), String> {
+    let qtable = SqlIdent::parse_dotted(table)
+        .ok_or_else(|| format!("{kernel}: invalid table name {table:?}"))?;
+    if conflict_target.is_empty() {
+        return Err(format!(
+            "{kernel}: empty conflict target; pass the primary-key or unique columns"
+        ));
+    }
+    let mut target_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(conflict_target.len());
+    let mut target_cols: Vec<SqlIdent> = Vec::with_capacity(conflict_target.len());
+    for col in conflict_target {
+        let qcol = SqlIdent::parse_plain(&col)
+            .ok_or_else(|| format!("{kernel}: invalid conflict-target column name {col:?}"))?;
+        if !target_keys.insert(qcol.as_str().to_ascii_lowercase()) {
+            return Err(format!(
+                "{kernel}: conflict-target column {col:?} is listed more than once"
+            ));
+        }
+        target_cols.push(qcol);
+    }
+    let mut field_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(fields.len());
+    let mut supplied_target_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(target_cols.len());
+    let mut insert_cols: Vec<String> = Vec::with_capacity(fields.len());
+    let mut set_clauses: Vec<String> = Vec::new();
+    let mut args: Vec<SqlParam> = Vec::with_capacity(fields.len());
+    for (col, opt) in fields {
+        let qcol = SqlIdent::parse_plain(&col)
+            .ok_or_else(|| format!("{kernel}: invalid column name {col:?}"))?;
+        let key = qcol.as_str().to_ascii_lowercase();
+        if !field_keys.insert(key.clone()) {
+            return Err(format!("{kernel}: column {col:?} is listed more than once"));
+        }
+        let Some(p) = opt else {
+            continue;
+        };
+        if target_keys.contains(&key) {
+            if matches!(p, SqlParam::Null(_)) {
+                return Err(format!(
+                    "{kernel}: conflict-target column {col:?} is NULL; a NULL key never conflicts"
+                ));
+            }
+            supplied_target_keys.insert(key);
+        } else {
+            set_clauses.push(format!("{0} = excluded.{0}", qcol.as_str()));
+        }
+        insert_cols.push(qcol.as_str().to_string());
+        args.push(p);
+    }
+    if let Some(missing) = target_cols
+        .iter()
+        .find(|t| !supplied_target_keys.contains(&t.as_str().to_ascii_lowercase()))
+    {
+        return Err(format!(
+            "{kernel}: conflict-target column {:?} must be supplied as a SetField; \
+             without a client value the conflict can never match",
+            missing.as_str()
+        ));
+    }
+    let target_list = target_cols
+        .iter()
+        .map(SqlIdent::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let action = if set_clauses.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        format!("DO UPDATE SET {}", set_clauses.join(", "))
+    };
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) {}",
+        qtable.as_str(),
+        insert_cols.join(", "),
+        vec!["?"; insert_cols.len()].join(", "),
+        target_list,
+        action
+    );
+    Ok((sql, args))
+}
+
+/// `Db.upsertFields : Db -> String -> List String -> List (String, SqlField) -> Task Error Int`
+///
+/// Insert-or-update-in-place on the conflict target (the `List String`, the
+/// table's primary-key or unique columns). On a conflict the existing row is
+/// UPDATED — its identity, rowid, and every column outside the SET list are
+/// preserved and no DELETE fires — identically on SQLite and Postgres, because
+/// the one statement built by [`build_upsert_sql`] is standard on both. SQLite's
+/// delete-then-insert `INSERT OR REPLACE` is never emitted.
+///
+/// Returns the affected-row count: `1` when a row was inserted or updated, `0`
+/// when a `DO NOTHING` upsert met an existing row.
+///
+/// Security: table + column names are identifier-validated; values are bound
+/// positionally — never interpolated into SQL.
+/// Totality: every error path returns `IpeResult::Err`; no panic/unwrap.
+#[cfg(feature = "db")]
+pub fn db_upsert_fields<E: Send + From<String> + 'static>(
+    conn: Db,
+    table: String,
+    conflict_target: Vec<String>,
+    fields: Vec<(String, Option<SqlParam>)>,
+) -> IpeTask<E, i64> {
+    Box::pin(async move {
+        let (sql, args) = match build_upsert_sql("db.upsertFields", &table, conflict_target, fields)
+        {
+            Ok(v) => v,
+            Err(e) => return IpeResult::Err(e.into()),
+        };
+        let sql = db_format_sql(sql);
+        let mut q = sqlx::query(&sql);
+        for p in args {
+            q = bind_sql_param(q, p);
+        }
+        match exec_routed(&conn, q).await {
+            Ok(res) => ok_res(res.rows_affected() as i64),
+            Err(e) => IpeResult::Err(ipe_err(&e)),
+        }
+    })
+}
+
 /// `Db.insertFieldsReturning : Db -> String -> List (String, SqlField) -> String -> Decoder a -> Task Error (List a)`
 ///
 /// Builds the same OmitField-aware INSERT as `db_insert_fields`, appends
@@ -4073,8 +4478,8 @@ pub fn db_update_fields<E: Send + From<String> + 'static>(
 /// SQL expressions and `AS` aliases are intentionally REJECTED (`Err`), as is an
 /// empty projection.
 ///
-/// Requires SQLite ≥ 3.35 (Mar 2021) or PostgreSQL — same requirement as
-/// other RETURNING uses already in Ipe.Db.
+/// `RETURNING` is what sets [`SQLITE_VERSION_FLOOR`]; the connect-time
+/// engine gate refuses any older server before this runs.
 ///
 /// Security: table + column names validated; values bound positionally; only
 /// the RETURNING projection is caller-supplied (and it's not executed as DML,
@@ -6975,6 +7380,228 @@ mod tests {
         }
     }
 
+    fn upsert_sql(
+        target: &[&str],
+        fields: Vec<(&str, Option<SqlParam>)>,
+    ) -> Result<(String, Vec<SqlParam>), String> {
+        build_upsert_sql(
+            "db.upsertFields",
+            "kv",
+            target.iter().map(|c| (*c).to_string()).collect(),
+            fields
+                .into_iter()
+                .map(|(c, p)| (c.to_string(), p))
+                .collect(),
+        )
+    }
+
+    /// The statement is the one standard form both engines share: SET covers
+    /// every `SetField` column except the conflict target, as `excluded.<col>`;
+    /// an `OmitField` column appears nowhere.
+    #[test]
+    fn upsert_sql_updates_non_target_set_fields_from_excluded() {
+        let built = upsert_sql(
+            &["k"],
+            vec![
+                ("k", Some(SqlParam::Text("a".to_string()))),
+                ("v", Some(SqlParam::Text("1".to_string()))),
+                ("created_at", None),
+                ("n", Some(SqlParam::Int(7))),
+            ],
+        );
+        assert!(
+            matches!(
+                &built,
+                Ok((sql, args)) if sql == "INSERT INTO kv (k, v, n) VALUES (?, ?, ?) \
+                    ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = excluded.n"
+                    && args.len() == 3
+            ),
+            "unexpected upsert SQL: {built:?}"
+        );
+    }
+
+    /// Nothing left to SET once the target and the `OmitField` columns are
+    /// excluded → `DO NOTHING` (insert-if-absent), never an empty `SET`.
+    #[test]
+    fn upsert_sql_with_empty_set_list_is_do_nothing() {
+        let built = upsert_sql(
+            &["a", "b"],
+            vec![
+                ("a", Some(SqlParam::Int(1))),
+                ("b", Some(SqlParam::Int(2))),
+                ("created_at", None),
+            ],
+        );
+        assert!(
+            matches!(
+                &built,
+                Ok((sql, _)) if sql == "INSERT INTO kv (a, b) VALUES (?, ?) \
+                    ON CONFLICT (a, b) DO NOTHING"
+            ),
+            "empty SET must degrade to DO NOTHING: {built:?}"
+        );
+    }
+
+    /// Every malformed upsert is refused before any SQL string exists.
+    #[test]
+    fn upsert_sql_refuses_malformed_requests() {
+        let key = || ("k", Some(SqlParam::Text("a".to_string())));
+        let cases = [
+            (
+                "hostile table",
+                build_upsert_sql(
+                    "db.upsertFields",
+                    "kv; DROP TABLE kv",
+                    vec!["k".to_string()],
+                    vec![("k".to_string(), Some(SqlParam::Int(1)))],
+                ),
+            ),
+            (
+                "hostile set column",
+                upsert_sql(&["k"], vec![key(), ("v = 1; --", Some(SqlParam::Int(1)))]),
+            ),
+            (
+                "hostile conflict-target column",
+                upsert_sql(&["k) DO NOTHING; --"], vec![key()]),
+            ),
+            (
+                "dotted column (no qualifier allowed in excluded.<col>)",
+                upsert_sql(&["k"], vec![key(), ("kv.v", Some(SqlParam::Int(1)))]),
+            ),
+            (
+                "dotted conflict-target column",
+                upsert_sql(&["kv.k"], vec![key()]),
+            ),
+            ("empty conflict target", upsert_sql(&[], vec![key()])),
+            (
+                "duplicate column (case-insensitive)",
+                upsert_sql(&["k"], vec![key(), ("K", Some(SqlParam::Int(1)))]),
+            ),
+            (
+                "duplicate conflict-target column",
+                upsert_sql(&["k", "K"], vec![key()]),
+            ),
+            (
+                "conflict-target column absent from fields",
+                upsert_sql(&["id"], vec![key()]),
+            ),
+            (
+                "conflict-target column is OmitField",
+                upsert_sql(&["id"], vec![key(), ("id", None)]),
+            ),
+            (
+                "conflict-target column is SqlNull",
+                upsert_sql(
+                    &["k"],
+                    vec![(
+                        "k",
+                        Some(SqlParam::Null(Box::new(SqlParam::Text(String::new())))),
+                    )],
+                ),
+            ),
+        ];
+        for (label, built) in cases {
+            assert!(built.is_err(), "{label} must be refused, got {built:?}");
+        }
+    }
+
+    /// Round-trip on SQLite: a conflicting upsert UPDATES the row in place —
+    /// rowid unchanged, the column outside the SET list preserved, still one
+    /// row — the semantics `INSERT OR REPLACE` would break. A `DO NOTHING`
+    /// upsert meeting the existing row affects zero rows.
+    #[tokio::test]
+    async fn upsert_fields_updates_in_place_on_sqlite() {
+        let db = fresh_db().await;
+        let mk: IpeResult<String, i64> = db_exec_raw(
+            db.clone(),
+            "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT, note TEXT DEFAULT 'none')".to_string(),
+        )
+        .await;
+        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+
+        let upsert = |v: &str| {
+            db_upsert_fields::<String>(
+                db.clone(),
+                "kv".to_string(),
+                vec!["k".to_string()],
+                vec![
+                    ("k".to_string(), Some(SqlParam::Text("a".to_string()))),
+                    ("v".to_string(), Some(SqlParam::Text(v.to_string()))),
+                    ("note".to_string(), None),
+                ],
+            )
+        };
+        let first = upsert("1").await;
+        assert!(matches!(first, IpeResult::Ok(1)), "insert: {first:?}");
+        let noted: IpeResult<String, i64> = db_exec_raw(
+            db.clone(),
+            "UPDATE kv SET note = 'kept' WHERE k = 'a'".to_string(),
+        )
+        .await;
+        assert!(matches!(noted, IpeResult::Ok(1)), "note: {noted:?}");
+        // A later row raises max(rowid), so a delete-then-insert of `a` would
+        // be assigned a fresh rowid rather than reusing its old one.
+        let other: IpeResult<String, i64> = db_exec_raw(
+            db.clone(),
+            "INSERT INTO kv (k, v) VALUES ('b', 'x')".to_string(),
+        )
+        .await;
+        assert!(matches!(other, IpeResult::Ok(1)), "second row: {other:?}");
+
+        let read = || {
+            db_query_params::<String>(
+                db.clone(),
+                "SELECT rowid AS rid, v, note FROM kv WHERE k = 'a'".to_string(),
+                Vec::new(),
+            )
+        };
+        let before = read().await.with_default(Vec::new());
+        let rid_before = before.first().and_then(|r| r.get("rid")).cloned();
+        assert!(rid_before.is_some(), "row missing after insert: {before:?}");
+
+        let second = upsert("2").await;
+        assert!(matches!(second, IpeResult::Ok(1)), "update: {second:?}");
+        let after = read().await.with_default(Vec::new());
+        assert_eq!(
+            after.len(),
+            1,
+            "conflict must update, not add a row: {after:?}"
+        );
+        let all: IpeResult<String, Vec<HashMap<String, String>>> =
+            db_query_params(db.clone(), "SELECT k FROM kv".to_string(), Vec::new()).await;
+        assert_eq!(all.with_default(Vec::new()).len(), 2, "row count changed");
+        let row = after.first();
+        assert_eq!(
+            row.and_then(|r| r.get("rid")).cloned(),
+            rid_before,
+            "rowid changed"
+        );
+        assert_eq!(row.and_then(|r| r.get("v")).map(String::as_str), Some("2"));
+        assert_eq!(
+            row.and_then(|r| r.get("note")).map(String::as_str),
+            Some("kept"),
+            "column outside the SET list must be preserved"
+        );
+
+        let key_only: IpeResult<String, i64> = db_upsert_fields(
+            db.clone(),
+            "kv".to_string(),
+            vec!["k".to_string()],
+            vec![("k".to_string(), Some(SqlParam::Text("a".to_string())))],
+        )
+        .await;
+        assert!(
+            matches!(key_only, IpeResult::Ok(0)),
+            "DO NOTHING on an existing key affects no row: {key_only:?}"
+        );
+        let last = read().await.with_default(Vec::new());
+        assert_eq!(
+            last.first().and_then(|r| r.get("v")).map(String::as_str),
+            Some("2"),
+            "DO NOTHING must leave the row untouched"
+        );
+    }
+
     #[tokio::test]
     async fn update_fields_refuses_unscoped_update() {
         let db = fresh_db().await;
@@ -7567,6 +8194,36 @@ mod tests {
                     hs.clone(),
                     vec![("title".to_string(), Some(SqlParam::Text("x".to_string())))],
                     sql_eq(sql_column("id".to_string()), sql_param("1".to_string())),
+                )
+            );
+            assert_rejects!(
+                "db_upsert_fields(table)",
+                db_upsert_fields(
+                    db.clone(),
+                    hs.clone(),
+                    vec!["id".to_string()],
+                    vec![("id".to_string(), Some(SqlParam::Int(1)))],
+                )
+            );
+            assert_rejects!(
+                "db_upsert_fields(column)",
+                db_upsert_fields(
+                    db.clone(),
+                    "todos".to_string(),
+                    vec!["id".to_string()],
+                    vec![
+                        ("id".to_string(), Some(SqlParam::Int(1))),
+                        (hs.clone(), Some(SqlParam::Text("x".to_string()))),
+                    ],
+                )
+            );
+            assert_rejects!(
+                "db_upsert_fields(conflict-target column)",
+                db_upsert_fields(
+                    db.clone(),
+                    "todos".to_string(),
+                    vec![hs.clone()],
+                    vec![(hs.clone(), Some(SqlParam::Text("x".to_string())))],
                 )
             );
             assert_rejects!(
@@ -8205,6 +8862,261 @@ mod tests {
                 );
             }
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+    }
+
+    // ─── Engine version floor ────────────────────────────────────────────────
+
+    /// The release immediately preceding `v` in `(major, minor)` order.
+    fn one_step_below(v: EngineVersion) -> EngineVersion {
+        if v.minor() > 0 {
+            EngineVersion::new(v.major(), v.minor() - 1)
+        } else {
+            EngineVersion::new(v.major().saturating_sub(1), 99)
+        }
+    }
+
+    fn sqlite_report(v: EngineVersion) -> String {
+        format!("{}.{}.0", v.major(), v.minor())
+    }
+
+    /// `server_version_num` encoding of `v` (patch 0).
+    fn postgres_report(v: EngineVersion) -> String {
+        let num = if v.major() >= 10 {
+            v.major() * 10_000 + v.minor()
+        } else {
+            v.major() * 10_000 + v.minor() * 100
+        };
+        num.to_string()
+    }
+
+    fn report(engine: DbEngine, v: EngineVersion) -> String {
+        match engine {
+            DbEngine::Sqlite => sqlite_report(v),
+            DbEngine::Postgres => postgres_report(v),
+        }
+    }
+
+    const ENGINES: [DbEngine; 2] = [DbEngine::Sqlite, DbEngine::Postgres];
+
+    #[test]
+    fn engine_floor_admits_the_floor_itself() {
+        for engine in ENGINES {
+            let floor = engine.version_floor();
+            assert_eq!(
+                check_engine_version(engine, &report(engine, floor)),
+                Ok(floor),
+                "{engine} at its floor must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_floor_refuses_one_step_below() {
+        for engine in ENGINES {
+            let below = one_step_below(engine.version_floor());
+            assert_eq!(
+                check_engine_version(engine, &report(engine, below)),
+                Err(EngineVersionError::BelowFloor {
+                    engine,
+                    found: below
+                }),
+                "{engine} one step below its floor must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_floor_admits_newer_majors() {
+        assert!(check_engine_version(DbEngine::Sqlite, "4.0.0").is_ok());
+        assert_eq!(
+            check_engine_version(DbEngine::Postgres, "170002"),
+            Ok(EngineVersion::new(17, 2))
+        );
+    }
+
+    #[test]
+    fn engine_floor_refuses_an_older_major_with_a_larger_minor() {
+        let floor = DbEngine::Sqlite.version_floor();
+        let older = EngineVersion::new(floor.major() - 1, floor.minor() + 1);
+        assert!(matches!(
+            check_engine_version(DbEngine::Sqlite, &sqlite_report(older)),
+            Err(EngineVersionError::BelowFloor { .. })
+        ));
+    }
+
+    #[test]
+    fn engine_floor_refuses_unparseable_sqlite_reports() {
+        let floor = SQLITE_VERSION_FLOOR;
+        let (maj, min) = (floor.major(), floor.minor());
+        for raw in [
+            String::new(),
+            "garbage".to_string(),
+            format!("{maj}.{min}"),
+            format!("{maj}.{min}."),
+            format!("{maj}.{min}.0.1"),
+            format!("+{maj}.{min}.0"),
+            format!(" {maj}.{min}.0"),
+            format!("{maj}.{min}.0 "),
+            format!("{maj}.x.0"),
+            format!("{maj}..{min}"),
+            "99999999999.0.0".to_string(),
+        ] {
+            assert_eq!(
+                check_engine_version(DbEngine::Sqlite, &raw),
+                Err(EngineVersionError::Unparseable {
+                    engine: DbEngine::Sqlite
+                }),
+                "SQLite report {raw:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_floor_refuses_unparseable_postgres_reports() {
+        let floor = POSTGRES_VERSION_FLOOR;
+        for raw in [
+            String::new(),
+            "garbage".to_string(),
+            floor.to_string(),
+            format!("+{}", postgres_report(floor)),
+            format!("-{}", postgres_report(floor)),
+            format!("{} ", postgres_report(floor)),
+            "99999999999".to_string(),
+        ] {
+            assert_eq!(
+                check_engine_version(DbEngine::Postgres, &raw),
+                Err(EngineVersionError::Unparseable {
+                    engine: DbEngine::Postgres
+                }),
+                "PostgreSQL report {raw:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_floor_error_names_the_required_floor() {
+        for engine in ENGINES {
+            let floor = engine.version_floor();
+            let below = EngineVersionError::BelowFloor {
+                engine,
+                found: one_step_below(floor),
+            }
+            .to_string();
+            let unparseable = EngineVersionError::Unparseable { engine }.to_string();
+            for msg in [below, unparseable] {
+                assert!(
+                    msg.contains(&format!("{engine} >= {floor}")),
+                    "error {msg:?} must name the required floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn engine_for_build_resolves_the_linked_driver() {
+        assert_eq!(DbEngine::for_driver::<DbDatabase>(), Ok(DbEngine::Sqlite));
+        assert_eq!(
+            DbEngine::for_driver::<sqlx::Postgres>(),
+            Ok(DbEngine::Postgres)
+        );
+        assert_eq!(DbEngine::from_driver_name("MySQL"), None);
+        assert_eq!(DbEngine::from_driver_name(""), None);
+    }
+
+    /// The bundled SQLite passes the gate end to end: `build_pool` reads the
+    /// live `sqlite_version()` and admits it.
+    #[tokio::test]
+    async fn engine_floor_admits_the_bundled_sqlite() {
+        let pool = build_pool::<String>("sqlite::memory:").await;
+        assert!(
+            matches!(pool, IpeResult::Ok(_)),
+            "bundled SQLite must clear its version floor"
+        );
+    }
+
+    /// The shared gate admits a live pool and reports the version it read.
+    #[tokio::test]
+    async fn engine_floor_on_admits_a_live_sqlite_pool() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await;
+        assert!(pool.is_ok(), "in-memory SQLite must connect");
+        if let Ok(pool) = pool {
+            let admitted = enforce_engine_floor_on(&pool).await;
+            assert!(
+                matches!(admitted, Ok(v) if v >= SQLITE_VERSION_FLOOR),
+                "bundled SQLite must clear the shared gate, got {admitted:?}"
+            );
+        }
+    }
+
+    /// A pool whose version cannot be read is refused, never admitted.
+    #[tokio::test]
+    async fn engine_floor_on_refuses_an_unreadable_pool() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await;
+        assert!(pool.is_ok(), "in-memory SQLite must connect");
+        if let Ok(pool) = pool {
+            pool.close().await;
+            assert!(matches!(
+                enforce_engine_floor_on(&pool).await,
+                Err(EngineFloorError::Unreadable(_))
+            ));
+        }
+    }
+
+    /// A refusal reaches a session store as a `Configuration` error that still
+    /// names the required floor; a failed query passes through unchanged.
+    #[test]
+    fn engine_floor_refusal_maps_to_a_configuration_error() {
+        for engine in ENGINES {
+            let floor = engine.version_floor();
+            let refused = EngineVersionError::BelowFloor {
+                engine,
+                found: one_step_below(floor),
+            };
+            let mapped = sqlx::Error::from(EngineFloorError::Refused(refused));
+            assert!(matches!(mapped, sqlx::Error::Configuration(_)));
+            assert!(
+                mapped.to_string().contains(&format!("{engine} >= {floor}")),
+                "store error {mapped} must name the required floor"
+            );
+        }
+        assert!(matches!(
+            sqlx::Error::from(EngineFloorError::Unreadable(sqlx::Error::PoolClosed)),
+            sqlx::Error::PoolClosed
+        ));
+    }
+
+    /// A failed version query on the `Ipe.Db` pool maps through `connect_err`:
+    /// the message is built from the error variant, never the driver payload.
+    #[tokio::test]
+    async fn engine_floor_query_failure_is_credential_free() {
+        let pool = sqlx::pool::PoolOptions::<DbDatabase>::new()
+            .connect("sqlite::memory:")
+            .await;
+        assert!(pool.is_ok(), "in-memory SQLite must connect");
+        if let Ok(pool) = pool {
+            pool.close().await;
+            let err = enforce_engine_floor::<String>(&pool).await;
+            assert_eq!(err, Err(connect_err::<String>(&sqlx::Error::PoolClosed)));
+        }
+    }
+
+    /// The floors are stated once, in their consts: no doc comment in this file
+    /// restates a floor's number, so prose cannot drift from the enforced value.
+    #[test]
+    fn engine_floor_numbers_are_not_restated_in_prose() {
+        let source = include_str!("db.rs");
+        for engine in ENGINES {
+            let rendered = engine.version_floor().to_string();
+            let restated = source.lines().filter(|line| {
+                let t = line.trim_start();
+                t.starts_with("//") && t.contains(rendered.as_str())
+            });
+            assert_eq!(
+                restated.count(),
+                0,
+                "a comment restates the {engine} floor {rendered}; reference the const instead"
+            );
         }
     }
 }

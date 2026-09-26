@@ -39,6 +39,9 @@ use crate::scratch::{ScratchDir, ScratchFile};
 use crate::CliError;
 use crate::index::{self, CommitId, EntryVersion, IndexEntry, PinnedRev, SourceUrl};
 use crate::project::{self, ProjectManifest};
+use crate::publisher::{
+    AuthenticatedPublisher, BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher,
+};
 
 /// A publish refusal: a typed reason publish declined to proceed.
 ///
@@ -162,45 +165,58 @@ const DEFAULT_INDEX_REPO: &str = "arthurmaciel/ipe-registry";
 pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
     let args = parse_args(rest)?;
 
-    // 1. Compute the entry version + publisher from the working package. This
-    //    runs before the local audit gate so the gate can be told which publisher
-    //    this publish claims: a reserved-namespace package (name or module) is
-    //    refused unless the claimed publisher is the blessed first-party identity,
-    //    so the blessed publisher must present that identity to its own local gate
-    //    exactly as it will to the registry admission gate. The publisher is the
-    //    same value written into the submitted entry below — the client gate audits
-    //    the exact provenance it is about to claim. This gate is best-effort and
-    //    runs on the caller's own machine over a spoofable `--source`; the
-    //    authoritative boundary is the registry workflow, which gates the
-    //    authenticated PR actor against the claimed publisher and re-runs this
-    //    audit, so a spoofed `--source` clears the local gate but is rejected there
-    //    (defense in depth).
+    // 1. Compute the entry version + the publisher this publish claims (the
+    //    source URL's owner — self-declared, written into the submitted entry).
     let manifest_path = locate_manifest(&args.path)?;
     let manifest = project::parse_manifest(&manifest_path)?;
     let entry_version =
         compute_entry_version(&manifest, args.source.as_deref(), args.rev.as_deref())?;
 
-    let publisher = infer_publisher(entry_version.source.as_str());
+    let claimed = SelfDeclaredPublisher::new(infer_publisher(entry_version.source.as_str()));
 
-    // 2. Gate locally — refuse to publish a package that fails its own audit.
-    //    `run_audit` prints its own passing line and returns the typed reject.
+    // 2. Prove the publishing identity. A real publish resolves the signing key
+    //    and then the authenticated account (`GET /user`) before the gate, so the
+    //    blessed privileges — the reserved-namespace exemption in the local audit
+    //    and the `--fresh` reset — rest on that proof, bound to the claim, never on
+    //    the claim alone. `--dry-run` makes no network call and so carries no
+    //    authenticated identity: a reserved-namespace preview is refused
+    //    fail-closed. The registry admission gate re-checks the same privileges
+    //    against the attested PR author (defense in depth).
+    let credentials = if args.dry_run {
+        None
+    } else {
+        Some(resolve_publish_credentials()?)
+    };
+    let blessing =
+        BlessedPublisher::from_authenticated(credentials.as_ref().map(|c| &c.identity), &claimed);
+
+    // 3. Gate locally — refuse to publish a package that fails its own audit.
+    //    `run_audit_as` prints its own passing line and returns the typed reject.
     //    It reads the previous published version from the resolver's index root
     //    (the same checkout `merge_into_entry` reads below), so the semver check
     //    and the duplicate-version check see one consistent index view.
-    crate::audit::run_audit(&audit_args_for_publish(&args.path, &publisher))?;
+    crate::audit::run_audit_as(
+        &audit_args_for_publish(&args.path, &claimed),
+        blessing.as_ref(),
+    )?;
 
-    // 3. Compute the entry file. The default appends the new version to the
+    // 4. Compute the entry file. The default appends the new version to the
     //    existing entry (refusing a duplicate); `--fresh` writes a single-version
     //    entry (the new version only), used to reset the disposable reserved smoke
     //    probe so its index entry never accumulates.
     let index_root = crate::resolve::index_root();
     let entry_toml = if args.fresh {
-        build_fresh_entry(&manifest.name, &publisher, &entry_version)?
+        build_fresh_entry(&manifest.name, &claimed, blessing.as_ref(), &entry_version)?
     } else {
-        merge_into_entry(&index_root, &manifest.name, &publisher, &entry_version)?
+        merge_into_entry(
+            &index_root,
+            &manifest.name,
+            claimed.as_str(),
+            &entry_version,
+        )?
     };
 
-    // 4/5. Open the PR, or under --dry-run print the entry + intended PR.
+    // 5/6. Open the PR, or under --dry-run print the entry + intended PR.
     let plan = PrPlan {
         index_repo: args.index_repo.clone(),
         entry_file: format!("packages/{}.toml", manifest.name),
@@ -215,6 +231,9 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
         print_dry_run(&entry_toml, &plan, None);
         return Ok(());
     }
+    let Some(credentials) = credentials else {
+        return Err(refuse(Refusal::UnresolvableIdentity));
+    };
 
     // The fork owner defaults to the source repo's owner — the account that
     // publishes its own package would fork the index under the same name.
@@ -229,7 +248,7 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
         ));
     }
 
-    open_pr(&entry_toml, &plan, &fork_owner)
+    open_pr(&entry_toml, &plan, &fork_owner, &credentials)
 }
 
 /// Parse `publish`'s tail into typed [`Args`].
@@ -527,34 +546,53 @@ fn merge_into_entry(
 /// existing published history — for the `--fresh` reset path.
 ///
 /// Fail-closed guard: `--fresh` is permitted ONLY when the package name is
-/// reserved (`ipe_kernels::reserved_package_prefix_of`) AND the publisher is
-/// blessed (`ipe_kernels::is_blessed_publisher`). This mirrors the admission
-/// gate's carve-out — defence in depth, so neither the CLI nor `admission_precheck`
-/// alone is the sole guard against erasing a package's published versions. Absent
-/// proof of both, the reset is unreachable and the caller must use the appending
-/// path.
+/// reserved (`ipe_kernels::reserved_package_prefix_of`) AND `blessing` proves the
+/// claimed publisher is the blessed first-party identity — the authenticated
+/// `GET /user` account equals both the claim and the blessed identity. This
+/// mirrors the admission gate's carve-out — defence in depth, so neither the CLI
+/// nor `admission_precheck` alone is the sole guard against erasing a package's
+/// published versions. Absent proof of both, the reset is unreachable and the
+/// caller must use the appending path.
 ///
 /// # Errors
-/// [`CliError::UsageOwned`] when the name is not reserved or the publisher is not
-/// blessed.
+/// [`CliError::UsageOwned`] when the name is not reserved or the claim is not a
+/// proven blessed publisher (including every `--dry-run`, which carries no
+/// authenticated identity).
 fn build_fresh_entry(
     name: &str,
-    publisher: &str,
+    claimed: &SelfDeclaredPublisher,
+    blessing: Result<&BlessedPublisher, &BlessingRefusal>,
     new_version: &EntryVersion,
 ) -> Result<String, CliError> {
-    let reserved = ipe_kernels::reserved_package_prefix_of(name).is_some();
-    let blessed = ipe_kernels::is_blessed_publisher(publisher);
-    if !(reserved && blessed) {
+    if ipe_kernels::reserved_package_prefix_of(name).is_none() {
         return Err(CliError::UsageOwned(format!(
-            "ipe package publish: `--fresh` is only permitted for the blessed publisher on a \
-             reserved-namespace package (the disposable smoke probe); it would otherwise erase \
-             `{name}`'s published history. Publish a new version without `--fresh` instead."
+            "ipe package publish: `--fresh` is only permitted on a reserved-namespace package \
+             (the disposable smoke probe); it would otherwise erase `{name}`'s published \
+             history. Publish a new version without `--fresh` instead."
         )));
     }
-    Ok(render_entry(
-        name,
-        publisher,
-        std::slice::from_ref(new_version),
+    match blessing {
+        Ok(blessed) if blessed.vouches_for(claimed) => Ok(render_entry(
+            name,
+            claimed.as_str(),
+            std::slice::from_ref(new_version),
+        )),
+        Ok(_) => Err(fresh_needs_blessing(
+            name,
+            &format!("the proof does not cover the claimed publisher `{claimed}`"),
+        )),
+        Err(refusal) => Err(fresh_needs_blessing(name, &refusal.to_string())),
+    }
+}
+
+/// The `--fresh` refusal for a reserved package whose claimed publisher is not a
+/// proven blessed identity; `reason` says why.
+fn fresh_needs_blessing(name: &str, reason: &str) -> CliError {
+    CliError::UsageOwned(format!(
+        "ipe package publish: `--fresh` on `{name}` requires an authenticated blessed \
+         publisher identity: {reason}. The identity is the account your `ipe login` token \
+         authenticates as, resolved only on a real publish — `--dry-run` makes no network \
+         call, so it can never preview a `--fresh` reset."
     ))
 }
 
@@ -672,53 +710,8 @@ impl SigningKey {
     }
 }
 
-/// The publishing account's GitHub identity, parsed once at the network boundary
-/// from the authenticated `GET /user` response.
-///
-/// `parse, don't validate`: the raw JSON is turned into this typed value exactly
-/// once, so downstream code (the commit-identity render) never re-encounters the
-/// untyped response. The identity comes from the authenticated account itself —
-/// the login (`String`) and numeric account id (`u64`) GitHub reports for the
-/// bearer token — so it cannot be spoofed by free-text configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PublisherIdentity {
-    /// The account's GitHub login (its `@handle`).
-    login: String,
-    /// The account's immutable numeric id, which fronts the noreply email so the
-    /// address is verified-by-construction for exactly this account.
-    id: u64,
-}
-
-impl PublisherIdentity {
-    /// Parse the authenticated `GET /user` response into a typed identity.
-    ///
-    /// Fail-closed: a response missing `login`, missing `id`, carrying a
-    /// non-string login or a non-integer id, or an empty login yields `None`, so
-    /// a malformed response can never produce a usable committer identity.
-    fn from_user_json(json: &serde_json::Value) -> Option<Self> {
-        let login = json.get("login").and_then(serde_json::Value::as_str)?;
-        if login.is_empty() {
-            return None;
-        }
-        let id = json.get("id").and_then(serde_json::Value::as_u64)?;
-        Some(Self {
-            login: login.to_owned(),
-            id,
-        })
-    }
-
-    /// The committer identity `git commit` is invoked with: the account's login
-    /// as the name and its GitHub noreply email as the address.
-    fn commit_identity(&self) -> CommitIdentity {
-        CommitIdentity {
-            name: self.login.clone(),
-            email: format!("{}+{}@users.noreply.github.com", self.id, self.login),
-        }
-    }
-}
-
 /// The committer identity the index-PR commit is authored under, built once from
-/// a [`PublisherIdentity`]. The email is the account's GitHub noreply address,
+/// an [`AuthenticatedPublisher`]. The email is the account's GitHub noreply address,
 /// which is verified-by-construction for that account — so the signed commit is
 /// marked "Verified" for the index CI and every third party, while leaking no
 /// real email address.
@@ -732,6 +725,20 @@ struct CommitIdentity {
 }
 
 impl CommitIdentity {
+    /// The committer identity `git commit` is invoked with: the account's login
+    /// as the name and its GitHub noreply email (fronted by the immutable numeric
+    /// account id) as the address.
+    fn of(account: &AuthenticatedPublisher) -> Self {
+        Self {
+            name: account.login().to_owned(),
+            email: format!(
+                "{}+{}@users.noreply.github.com",
+                account.id(),
+                account.login()
+            ),
+        }
+    }
+
     /// The `-c user.name=… -c user.email=…` overrides that pin this committer
     /// identity on the `git commit` invocation.
     fn commit_config(&self) -> Vec<String> {
@@ -752,11 +759,38 @@ impl CommitIdentity {
 /// stdin, response to an `O_EXCL` scratch file read back through the retained
 /// handle). Any missing token, transport failure, non-200 status, or malformed
 /// JSON collapses to the one typed refusal — never a placeholder identity.
-fn resolve_publisher_identity() -> Result<PublisherIdentity, Refusal> {
+fn resolve_publisher_identity() -> Result<AuthenticatedPublisher, Refusal> {
     let token = publish_token().ok_or(Refusal::UnresolvableIdentity)?;
     let json = github_api_get_json("https://api.github.com/user", &token)
         .ok_or(Refusal::UnresolvableIdentity)?;
-    PublisherIdentity::from_user_json(&json).ok_or(Refusal::UnresolvableIdentity)
+    AuthenticatedPublisher::from_authenticated_user_response(&json)
+        .ok_or(Refusal::UnresolvableIdentity)
+}
+
+/// What a real (non-`--dry-run`) publish proves before the gate: the
+/// commit-signing key and the authenticated publishing account.
+struct PublishCredentials {
+    signing_key: SigningKey,
+    identity: AuthenticatedPublisher,
+}
+
+/// Resolve the [`PublishCredentials`], the signing key FIRST: the curated index
+/// requires signed commits, so publish refuses an unsigned publish before any
+/// network work, then resolves the committer identity from the authenticated
+/// account. A `required_signatures` index only marks a commit "Verified" when its
+/// committer is the account's verified GitHub identity, so an unresolvable
+/// identity is refused up front rather than authored under a placeholder.
+///
+/// # Errors
+/// [`Refusal::UnsignedCommit`] with no usable signing key;
+/// [`Refusal::UnresolvableIdentity`] when `GET /user` cannot prove the account.
+fn resolve_publish_credentials() -> Result<PublishCredentials, CliError> {
+    let signing_key = SigningKey::from_env().ok_or_else(|| refuse(Refusal::UnsignedCommit))?;
+    let identity = resolve_publisher_identity().map_err(refuse)?;
+    Ok(PublishCredentials {
+        signing_key,
+        identity,
+    })
 }
 
 /// `GET` a JSON resource from the GitHub API with the bearer token, returning the
@@ -821,21 +855,15 @@ fn github_api_get_json(url: &str, token: &crate::login::PublishToken) -> Option<
 /// [`CliError::Resolve`] when a git step fails (clone / commit / push); the
 /// message carries the fork URL and the pre-filled PR URL as the manual
 /// fallback.
-fn open_pr(entry_toml: &str, plan: &PrPlan, fork_owner: &str) -> Result<(), CliError> {
-    // Resolve the signing key BEFORE any network work: the curated index
-    // requires signed commits, so publish refuses up front when it could only
-    // produce an unsigned commit, rather than clone, commit, and push a branch
-    // that can never merge.
-    let signing_key = SigningKey::from_env().ok_or_else(|| refuse(Refusal::UnsignedCommit))?;
-
-    // Resolve the committer identity from the authenticated publishing account.
-    // A `required_signatures` index only marks a commit "Verified" when its
-    // committer is the account's verified GitHub identity, so publish refuses up
-    // front when the identity is unresolvable rather than author the commit under
-    // a placeholder that can never be Verified.
-    let identity = resolve_publisher_identity()
-        .map_err(refuse)?
-        .commit_identity();
+fn open_pr(
+    entry_toml: &str,
+    plan: &PrPlan,
+    fork_owner: &str,
+    credentials: &PublishCredentials,
+) -> Result<(), CliError> {
+    // The signing key and the authenticated account were resolved up front
+    // (`resolve_publish_credentials`); the commit is authored under that account.
+    let identity = CommitIdentity::of(&credentials.identity);
 
     let index_name = index_repo_name(&plan.index_repo);
     let fork_url = format!("https://github.com/{fork_owner}/{index_name}.git");
@@ -862,7 +890,7 @@ fn open_pr(entry_toml: &str, plan: &PrPlan, fork_owner: &str) -> Result<(), CliE
     }
     std::fs::write(&entry_path, entry_toml).map_err(|e| scratch_io(&e))?;
 
-    for step in commit_and_push_steps(plan, &signing_key, &identity) {
+    for step in commit_and_push_steps(plan, &credentials.signing_key, &identity) {
         let refs: Vec<&str> = step.iter().map(String::as_str).collect();
         if let Err(git) = run_git_step(&clone, &refs) {
             return Err(push_failed(&fork_url, plan, fork_owner, &git));
@@ -1239,16 +1267,16 @@ fn infer_publisher(source: &str) -> String {
 }
 
 /// The `ipe package audit` argv the local publish gate runs: the package path
-/// plus the publisher this publish claims. Threading `--publisher` is what lets
-/// the blessed first-party publisher clear its own gate on a reserved-namespace
-/// package — the audit refuses a reserved name/module for any other (or an
-/// absent) publisher. A regression to a path-only argv would silently re-close
-/// the reserved namespace to its own owner, so the flag is pinned by a test.
-fn audit_args_for_publish(path: &Path, publisher: &str) -> Vec<String> {
+/// plus the publisher this publish claims. The blessed exemption on a
+/// reserved-namespace package needs both this claim and the authenticated
+/// blessing passed alongside it (`run_audit_as`), which covers only the claimed
+/// publisher — so a regression to a path-only argv would silently re-close the
+/// reserved namespace to its own owner, and the flag is pinned by a test.
+fn audit_args_for_publish(path: &Path, claimed: &SelfDeclaredPublisher) -> Vec<String> {
     vec![
         path.display().to_string(),
         "--publisher".to_owned(),
-        publisher.to_owned(),
+        claimed.as_str().to_owned(),
     ]
 }
 
@@ -1560,8 +1588,10 @@ mod tests {
         std::fs::create_dir_all(&packages).expect("packages dir");
 
         let v = sample_version("0.0.0-smoke.1", caps(&[]));
-        let toml = build_fresh_entry("ipe-registry-smoke-probe", "arthurmaciel", &v)
-            .expect("reserved + blessed --fresh is permitted");
+        let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
+        let blessing = authenticated_blessing(ipe_kernels::BLESSED_PUBLISHER, &claimed);
+        let toml = build_fresh_entry("ipe-registry-smoke-probe", &claimed, blessing.as_ref(), &v)
+            .expect("reserved + authenticated blessed --fresh is permitted");
         std::fs::write(packages.join("ipe-registry-smoke-probe.toml"), &toml).expect("write");
 
         let parsed =
@@ -1580,36 +1610,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `--fresh` on a NON-reserved package is refused, even for the blessed
-    /// publisher — it would erase a real package's published history.
+    /// A claimed publisher, as `infer_publisher` would produce it.
+    fn claim(publisher: &str) -> SelfDeclaredPublisher {
+        SelfDeclaredPublisher::new(publisher.to_owned())
+    }
+
+    /// The account a `GET /user` for `login` would authenticate.
+    fn authenticated(login: &str) -> AuthenticatedPublisher {
+        AuthenticatedPublisher::from_authenticated_user_response(
+            &serde_json::json!({"login": login, "id": 42}),
+        )
+        .expect("well-formed /user response")
+    }
+
+    /// The blessing an authenticated `login` establishes for `claimed`.
+    fn authenticated_blessing(
+        login: &str,
+        claimed: &SelfDeclaredPublisher,
+    ) -> Result<BlessedPublisher, BlessingRefusal> {
+        BlessedPublisher::from_authenticated(Some(&authenticated(login)), claimed)
+    }
+
+    /// Assert `--fresh` on the reserved probe is refused under `blessing`.
+    fn assert_fresh_refused(
+        claimed: &SelfDeclaredPublisher,
+        blessing: &Result<BlessedPublisher, BlessingRefusal>,
+    ) {
+        let v = sample_version("0.0.0-smoke.1", caps(&[]));
+        let err = build_fresh_entry("ipe-registry-smoke-probe", claimed, blessing.as_ref(), &v)
+            .expect_err("an unproven blessed claim must reject --fresh");
+        assert!(matches!(err, CliError::UsageOwned(_)));
+        assert!(format!("{err}").contains("--fresh"), "{err}");
+    }
+
+    /// `--fresh` on a NON-reserved package is refused, even for the
+    /// authenticated blessed publisher — it would erase a real package's
+    /// published history.
     #[test]
     fn fresh_on_a_non_reserved_package_is_refused() {
         let v = sample_version("1.0.0", caps(&[]));
-        let err = build_fresh_entry("http-extras", "arthurmaciel", &v)
+        let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
+        let blessing = authenticated_blessing(ipe_kernels::BLESSED_PUBLISHER, &claimed);
+        let err = build_fresh_entry("http-extras", &claimed, blessing.as_ref(), &v)
             .expect_err("a non-reserved name must reject --fresh");
         assert!(matches!(err, CliError::UsageOwned(_)));
         assert!(format!("{err}").contains("--fresh"), "{err}");
     }
 
-    /// `--fresh` on a reserved package by a NON-blessed publisher is refused —
-    /// fail-closed: reserved alone does not license the reset.
+    /// `--fresh` on a reserved package by a NON-blessed (authenticated)
+    /// publisher is refused — fail-closed: reserved alone does not license the
+    /// reset.
     #[test]
     fn fresh_on_reserved_non_blessed_is_refused() {
-        let v = sample_version("0.0.0-smoke.1", caps(&[]));
-        let err = build_fresh_entry("ipe-registry-smoke-probe", "attacker", &v)
-            .expect_err("a non-blessed publisher must reject --fresh");
-        assert!(matches!(err, CliError::UsageOwned(_)));
-        assert!(format!("{err}").contains("--fresh"), "{err}");
+        let claimed = claim("attacker");
+        assert_fresh_refused(&claimed, &authenticated_blessing("attacker", &claimed));
+    }
+
+    /// A blessed CLAIM with no authenticated identity (every `--dry-run`, or a
+    /// forged source owner) is refused — the claim alone never licenses the reset.
+    #[test]
+    fn fresh_with_an_absent_authenticated_identity_is_refused() {
+        let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
+        let blessing = BlessedPublisher::from_authenticated(None, &claimed);
+        assert_eq!(blessing, Err(BlessingRefusal::NoProvenIdentity));
+        assert_fresh_refused(&claimed, &blessing);
+    }
+
+    /// A blessed CLAIM whose authenticated account is someone else is refused —
+    /// `claimed == authenticated login == blessed` must all hold.
+    #[test]
+    fn fresh_with_a_mismatched_authenticated_login_is_refused() {
+        let claimed = claim(ipe_kernels::BLESSED_PUBLISHER);
+        let blessing = authenticated_blessing("attacker", &claimed);
+        assert!(matches!(
+            blessing,
+            Err(BlessingRefusal::IdentityMismatch { .. })
+        ));
+        assert_fresh_refused(&claimed, &blessing);
     }
 
     /// The local publish gate must audit with the claimed publisher, not a
-    /// path-only argv. Threading `--publisher` is what lets the blessed
-    /// first-party publisher clear its own gate on a reserved-namespace package;
-    /// a regression to a path-only argv silently re-closes the reserved namespace
-    /// to its owner (the smoke probe stops publishing). Pin the flag + value + order.
+    /// path-only argv. The authenticated blessing covers only the claimed
+    /// publisher, so threading `--publisher` is what lets the blessed first-party
+    /// publisher clear its own gate on a reserved-namespace package; a regression
+    /// to a path-only argv silently re-closes the reserved namespace to its owner
+    /// (the smoke probe stops publishing). Pin the flag + value + order.
     #[test]
     fn publish_audit_argv_carries_the_claimed_publisher() {
-        let argv = audit_args_for_publish(Path::new("/pkg"), "arthurmaciel");
+        let argv = audit_args_for_publish(Path::new("/pkg"), &claim("arthurmaciel"));
         assert_eq!(
             argv,
             vec![
@@ -2114,11 +2202,7 @@ mod tests {
     /// account `octocat` with numeric id `42`, whose noreply email is
     /// `42+octocat@users.noreply.github.com`.
     fn sample_identity() -> CommitIdentity {
-        PublisherIdentity {
-            login: "octocat".to_owned(),
-            id: 42,
-        }
-        .commit_identity()
+        CommitIdentity::of(&authenticated("octocat"))
     }
 
     /// The identity is built from the account's login and numeric id, and its
@@ -2139,35 +2223,47 @@ mod tests {
     #[test]
     fn user_json_parses_login_and_id_and_fails_closed() {
         let ok = serde_json::json!({"login": "octocat", "id": 42});
-        let parsed = PublisherIdentity::from_user_json(&ok).expect("well-formed /user parses");
-        assert_eq!(parsed.login, "octocat");
-        assert_eq!(parsed.id, 42);
+        let parsed = AuthenticatedPublisher::from_authenticated_user_response(&ok)
+            .expect("well-formed /user parses");
+        assert_eq!(parsed.login(), "octocat");
+        assert_eq!(parsed.id(), 42);
         assert_eq!(
-            parsed.commit_identity().email,
+            CommitIdentity::of(&parsed).email,
             "42+octocat@users.noreply.github.com"
         );
 
         // Each malformed shape fails closed.
         assert!(
-            PublisherIdentity::from_user_json(&serde_json::json!({"id": 42})).is_none(),
+            AuthenticatedPublisher::from_authenticated_user_response(
+                &serde_json::json!({"id": 42})
+            )
+            .is_none(),
             "a response with no login is unusable"
         );
         assert!(
-            PublisherIdentity::from_user_json(&serde_json::json!({"login": "octocat"})).is_none(),
+            AuthenticatedPublisher::from_authenticated_user_response(
+                &serde_json::json!({"login": "octocat"})
+            )
+            .is_none(),
             "a response with no id is unusable"
         );
         assert!(
-            PublisherIdentity::from_user_json(&serde_json::json!({"login": "", "id": 42}))
-                .is_none(),
+            AuthenticatedPublisher::from_authenticated_user_response(
+                &serde_json::json!({"login": "", "id": 42})
+            )
+            .is_none(),
             "an empty login is unusable"
         );
         assert!(
-            PublisherIdentity::from_user_json(&serde_json::json!({"login": "octocat", "id": "42"}))
-                .is_none(),
+            AuthenticatedPublisher::from_authenticated_user_response(
+                &serde_json::json!({"login": "octocat", "id": "42"})
+            )
+            .is_none(),
             "a non-integer id is unusable"
         );
         assert!(
-            PublisherIdentity::from_user_json(&serde_json::json!({})).is_none(),
+            AuthenticatedPublisher::from_authenticated_user_response(&serde_json::json!({}))
+                .is_none(),
             "an empty response is unusable"
         );
     }
@@ -2180,9 +2276,10 @@ mod tests {
     fn unresolvable_identity_is_a_typed_refusal_naming_the_fix() {
         // The refusal a malformed/absent `/user` response collapses to is the
         // typed, closed variant.
-        let mapped: Option<CliError> = PublisherIdentity::from_user_json(&serde_json::json!({}))
-            .map(|id| id.commit_identity())
-            .map_or_else(|| Some(refuse(Refusal::UnresolvableIdentity)), |_| None);
+        let mapped: Option<CliError> =
+            AuthenticatedPublisher::from_authenticated_user_response(&serde_json::json!({}))
+                .map(|id| CommitIdentity::of(&id))
+                .map_or_else(|| Some(refuse(Refusal::UnresolvableIdentity)), |_| None);
         let err = mapped.expect("an empty /user response must not yield an identity");
         assert!(matches!(
             err,

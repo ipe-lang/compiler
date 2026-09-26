@@ -92,6 +92,8 @@ pub enum DiffError {
     OpenInterface { module: ModulePath },
     /// The tree carries no `.ipe` modules to compare.
     Empty { path: PathBuf },
+    /// The required bump overflows a version component of the predecessor.
+    FloorOverflow(crate::diff::FloorOverflow),
 }
 
 impl std::fmt::Display for DiffError {
@@ -114,11 +116,18 @@ impl std::fmt::Display for DiffError {
             Self::Empty { path } => {
                 write!(f, "no Ipê modules found under {}", path.display())
             }
+            Self::FloorOverflow(overflow) => write!(f, "{overflow}"),
         }
     }
 }
 
 impl std::error::Error for DiffError {}
+
+impl From<crate::diff::FloorOverflow> for DiffError {
+    fn from(overflow: crate::diff::FloorOverflow) -> Self {
+        Self::FloorOverflow(overflow)
+    }
+}
 
 /// Read every `.ipe` module under a package source tree into `(path, source)`
 /// pairs keyed by module path.

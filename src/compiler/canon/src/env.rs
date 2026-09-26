@@ -757,6 +757,7 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
                 "getByIdOn",
                 "insertFields",
                 "updateFields",
+                "upsertFields",
                 "insertFieldsReturning",
                 "withTransaction",
                 "migrate",
