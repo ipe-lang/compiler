@@ -24,6 +24,8 @@ mod golden_db_store_draft_query_rejected;
 mod golden_db_store_immutable_update_seal;
 #[path = "g_db/golden_db_store_index_seal.rs"]
 mod golden_db_store_index_seal;
+#[path = "g_db/golden_db_store_insert_if_absent_seal.rs"]
+mod golden_db_store_insert_if_absent_seal;
 #[path = "g_db/golden_db_store_insert_returning_seal.rs"]
 mod golden_db_store_insert_returning_seal;
 #[path = "g_db/golden_db_store_join_seal.rs"]

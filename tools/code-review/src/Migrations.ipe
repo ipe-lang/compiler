@@ -3,6 +3,11 @@ module Migrations exposing (all)
 import Ipe.Db as Db
 
 
+-- Applied schema history. `Db.migrate` pins each entry by a checksum of its
+-- SQL, so an entry is never edited: a schema change is a new entry. Each
+-- table's `PRIMARY KEY` is the one its store in `Lib.Db` declares as its
+-- conflict key; the store's conflict writes fail against a table whose key
+-- differs, which the review tests exercise.
 all : List Db.Migration
 all =
     [ { name = "0001_review"

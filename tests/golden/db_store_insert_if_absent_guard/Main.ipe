@@ -1,0 +1,224 @@
+module Main exposing (main)
+
+-- `Store.insertIfAbsent` guard: the first write of a key wins, a later write of
+-- the same key affects no row and leaves the stored row unchanged, and a store
+-- with no usable key fails closed with a typed `Err` before any SQL is issued.
+--
+-- The refusal stores are never created, so a refusal that reached SQL would
+-- surface as a missing-table error, not the expected message.
+--
+-- Checks (one line each):
+--   no-key          no primary key and no unique column is refused
+--   serial-key      a key the database fills (serial) is refused
+--   first-write     inserting an absent composite key affects one row
+--   second-write    inserting the same key again affects no row
+--   other-key       a key differing in one composite column is inserted
+--   row-unchanged   the first write's values survive the second write
+--   row-count       two distinct keys leave exactly two rows
+
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Db.Store.Unsafe as StoreU
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+noteColumns : List Store.Column
+noteColumns =
+    [ Store.textColumn "slug", Store.textColumn "body" ]
+
+
+noteRow : String -> String -> Store.Row
+noteRow slug body =
+    Dict.fromList [ ( "slug", slug ), ( "body", body ) ]
+
+
+-- Build a raw-column store from `columns`, shaped by `shape`.
+rowStore : String -> List Store.Column -> (Store.Draft Store.Row -> Store.Draft Store.Row) -> Result Error (Store Store.Row)
+rowStore table columns shape =
+    case Store.fromColumns table columns of
+        Err e ->
+            Err e
+
+        Ok draft ->
+            Ok (Store.public (shape draft))
+
+
+eventColumns : List Store.Column
+eventColumns =
+    [ Store.intColumn "id", Store.textColumn "name" ]
+
+
+eventRow : Store.Row
+eventRow =
+    Dict.fromList [ ( "id", "7" ), ( "name", "boot" ) ]
+
+
+reviewColumns : List Store.Column
+reviewColumns =
+    [ Store.textColumn "uid"
+    , Store.textColumn "body_hash"
+    , Store.textColumn "decision"
+    ]
+
+
+reviewRow : String -> String -> String -> Store.Row
+reviewRow uid hash decision =
+    Dict.fromList
+        [ ( "uid", uid )
+        , ( "body_hash", hash )
+        , ( "decision", decision )
+        ]
+
+
+reviewStore : Result Error (Store Store.Row)
+reviewStore =
+    rowStore "review"
+        reviewColumns
+        (\d -> Store.compositePrimaryKeyNamed [ "uid", "body_hash" ] d)
+
+
+classifyRefusal : String -> String -> Error -> String
+classifyRefusal label needle e =
+    if String.contains needle (Error.toString e) then
+        String.concat [ label, ":ok" ]
+
+    else
+        String.concat [ label, ":FAIL-wrong-error:", Error.toString e ]
+
+
+-- `label:ok` when `insertIfAbsent` on the built store fails with an error
+-- containing `needle`.
+insertRefused : Db -> String -> String -> Result Error (Store Store.Row) -> Store.Row -> Task Error String
+insertRefused conn label needle built row =
+    case built of
+        Err e ->
+            Task.succeed (String.concat [ label, ":FAIL-store:", Error.toString e ])
+
+        Ok store ->
+            Task.onError
+                (\e -> Task.succeed (classifyRefusal label needle e))
+                (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) (Store.insertIfAbsent conn store row))
+
+
+refusalChecks : Db -> List (Task Error String)
+refusalChecks conn =
+    [ insertRefused conn
+        "no-key"
+        "insertIfAbsent requires a declared primary key or unique column"
+        (rowStore "notes" noteColumns (\d -> d))
+        (noteRow "a" "b")
+    , insertRefused conn
+        "serial-key"
+        "insertIfAbsent cannot match a conflict on column"
+        (rowStore "events" eventColumns (\d -> StoreU.primaryKey "id" (StoreU.serial "id" d)))
+        eventRow
+    ]
+
+
+-- Run each task in order, collecting its line.
+sequenceLines : List (Task Error String) -> Task Error (List String)
+sequenceLines tasks =
+    case tasks of
+        [] ->
+            Task.succeed []
+
+        first :: rest ->
+            Task.andThen
+                (\line -> Task.map (\lines -> line :: lines) (sequenceLines rest))
+                first
+
+
+countLine : String -> Int -> Int -> String
+countLine label expected actual =
+    if actual == expected then
+        String.concat [ label, ":ok" ]
+
+    else
+        String.concat [ label, ":FAIL-count:", String.fromInt actual ]
+
+
+rowField : String -> Store.Row -> String
+rowField key row =
+    Maybe.withDefault "" (Dict.get key row)
+
+
+isReview : String -> String -> Store.Row -> Bool
+isReview uid hash row =
+    rowField "uid" row == uid && rowField "body_hash" row == hash
+
+
+rowLines : List Store.Row -> List String
+rowLines rows =
+    let
+        unchanged =
+            case List.filter (isReview "u1" "h1") rows of
+                [ row ] ->
+                    if rowField "decision" row == "approve" then
+                        "row-unchanged:ok"
+
+                    else
+                        String.concat [ "row-unchanged:FAIL-decision:", rowField "decision" row ]
+
+                _ ->
+                    "row-unchanged:FAIL-missing"
+    in
+    [ unchanged, countLine "row-count" 2 (List.length rows) ]
+
+
+writeChecks : Db -> Task Error (List String)
+writeChecks conn =
+    case reviewStore of
+        Err e ->
+            Task.succeed [ String.concat [ "first-write:FAIL-store:", Error.toString e ] ]
+
+        Ok store ->
+            Task.andThen
+                (\_ ->
+                    Task.andThen
+                        (\first ->
+                            Task.andThen
+                                (\second ->
+                                    Task.andThen
+                                        (\other ->
+                                            Task.map
+                                                (\rows ->
+                                                    [ countLine "first-write" 1 first
+                                                    , countLine "second-write" 0 second
+                                                    , countLine "other-key" 1 other
+                                                    ]
+                                                        ++ rowLines rows
+                                                )
+                                                (Store.all conn store)
+                                        )
+                                        (Store.insertIfAbsent conn store (reviewRow "u1" "h2" "approve"))
+                                )
+                                (Store.insertIfAbsent conn store (reviewRow "u1" "h1" "refuse"))
+                        )
+                        (Store.insertIfAbsent conn store (reviewRow "u1" "h1" "approve"))
+                )
+                (Store.create conn store)
+
+
+runChecks : Db -> Task Error ()
+runChecks conn =
+    Task.andThen
+        (\refusals ->
+            Task.andThen
+                (\writes -> Io.println (String.join "\n" (List.concat [ refusals, writes ])))
+                (writeChecks conn)
+        )
+        (sequenceLines (refusalChecks conn))
+
+
+main : Task Error ()
+main =
+    Task.andThen
+        (\conn -> Db.withTransaction conn (\txconn -> runChecks txconn))
+        (Db.open "sqlite" "sqlite::memory:")

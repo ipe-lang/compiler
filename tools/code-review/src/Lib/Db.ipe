@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, open, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
+module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, open, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, reviewTableSql, storedReasonText)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -218,15 +218,20 @@ rowFromStored stored =
     }
 
 
--- The typed store for the review table. `fromCodec` validates every column
--- identifier; the composite key records `PRIMARY KEY (uid, body_hash)`, so the
--- by-key operations fail closed and every access names both key columns. The
--- table itself comes from the hand-written migration, since `createSql` does
--- not render a composite key.
+-- The typed store for the review table, keyed on `(uid, body_hash)` like its
+-- migration: `createSql` renders that `PRIMARY KEY (uid, body_hash)`, the
+-- by-key operations name both key columns, and `Store.insertIfAbsent` matches a
+-- re-reviewed pair on that key. `fromCodec` validates every column identifier.
 reviewStore : Result Error (Store ReviewRow)
 reviewStore =
     Store.fromCodec "review" reviewCodec
         |> Result.map (\draft -> Store.public (Store.compositePrimaryKey2 .uid .bodyHash draft))
+
+
+-- The `CREATE TABLE` the review store's declaration renders.
+reviewTableSql : Result Error String
+reviewTableSql =
+    Result.andThen Store.createSql reviewStore
 
 
 -- The startup check of `IPE_REVIEW_DB`: the review database is opened
@@ -270,33 +275,14 @@ insertDecision db attested decision =
     insertIfAbsent db (Index.attestedUid attested) (Index.attestedHash attested) decision
 
 
--- A duplicate (uid, body_hash) pair is a no-op: the first review wins and
--- re-reviewing the same pair never overwrites it. The insert runs first and
--- the primary key arbitrates, so two concurrent first reviews cannot both
--- pass a check and one then fail: an insert that fails where the pair's row
--- exists is the duplicate (0 rows), and one that fails with no row for the
--- pair keeps its own error. Review rows are never deleted, so a row seen
--- after a failed insert is the one that won.
+-- A duplicate (uid, body_hash) pair is a no-op returning 0: the first review
+-- wins and re-reviewing the same pair never overwrites it. The existence check
+-- and the insert are one atomic statement keyed on the table's primary key, so
+-- two concurrent first reviews of one pair never both write, and a write the
+-- database refuses (read-only, a `CHECK`) keeps its own error, never read as
+-- the duplicate.
 insertIfAbsent : Db -> String -> String -> Decision -> Task.Task Error Int
 insertIfAbsent db uid bodyHash decision =
-    insertNew db uid bodyHash decision
-        |> Task.onError (\insertError -> duplicateOr db uid bodyHash insertError)
-
-
-duplicateOr : Db -> String -> String -> Error -> Task.Task Error Int
-duplicateOr db uid bodyHash insertError =
-    do
-        existing <- findDecision db uid bodyHash
-        case existing of
-            Just _ ->
-                Task.succeed 0
-
-            Nothing ->
-                Task.fail insertError
-
-
-insertNew : Db -> String -> String -> Decision -> Task.Task Error Int
-insertNew db uid bodyHash decision =
     case reviewStore of
         Err e ->
             Task.fail e
@@ -321,7 +307,7 @@ insertNew db uid bodyHash decision =
                         , reviewedAt = now
                         }
                 in
-                Store.insert db store row
+                Store.insertIfAbsent db store row
 
 
 -- The review row recorded for one (uid, body_hash) key, if any. The

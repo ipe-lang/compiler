@@ -30,6 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
+import Migrations
 
 import TestSupport exposing
     ( tableExists
@@ -150,21 +151,45 @@ openDoesNotMigrateIn base =
 
 
 
--- A second decision on the same attested pair is a no-op: one row, the
--- first decision kept.
+-- A second decision on the same attested pair is a no-op: the first insert
+-- affects one row and the duplicate none, one row stays, the first decision
+-- kept. The counts also prove the store's `(uid, body_hash)` key matches the
+-- migrated table's primary key: a conflict target the table does not declare
+-- is a database error.
 duplicateInsertIsNoop : Task.Task Error Bool
 duplicateInsertIsNoop =
     onFreshReview "ipe-review-duplicate"
         (\db ->
             do
                 attested <- attestedFor "ipe-review-duplicate-index" "u-a"
-                LibDb.insertDecision db attested Approved
+                first <- LibDb.insertDecision db attested Approved
                 changed <- refuse "changed"
                 second <- LibDb.insertDecision db attested changed
                 n <- countReviewRows db "u-a" (Index.attest viewA)
                 found <- LibDb.findDecision db "u-a" (Index.attest viewA)
-                Task.succeed (second == 0 && n == 1 && isApproved found)
+                Task.succeed (first == 1 && second == 0 && n == 1 && isApproved found)
         )
+
+
+
+-- The review store's declared key renders the `PRIMARY KEY (uid, body_hash)`
+-- clause the applied `0001_review` migration declares, so the store's conflict
+-- target is the table's key.
+reviewStoreKeyMatchesMigration : Bool
+reviewStoreKeyMatchesMigration =
+    let
+        clause =
+            "PRIMARY KEY (uid, body_hash)"
+
+        migrated =
+            List.any (\m -> m.name == "0001_review" && String.contains clause m.sql) Migrations.all
+    in
+    case LibDb.reviewTableSql of
+        Ok sql ->
+            migrated && String.contains clause sql
+
+        Err _ ->
+            False
 
 
 
@@ -461,10 +486,11 @@ loadTicketsSettleLatest =
 
 
 
--- A write that fails for a reason other than the key keeps its own error, and
--- a failed insert whose pair already has a row is the duplicate no-op. A
--- read-only connection makes every insert fail without a key conflict, with
--- SQLite's read-only result code (`SQLITE_READONLY`, 8).
+-- A write the database refuses keeps its own error, even when the pair already
+-- has a row: the duplicate no-op is the atomic insert's own 0, never a failed
+-- insert read as one. A read-only connection refuses every insert, the
+-- duplicate included, with SQLite's read-only result code (`SQLITE_READONLY`,
+-- 8), and writes nothing.
 failedWritesKeepTheirError : Task.Task Error Bool
 failedWritesKeepTheirError =
     freshDir "ipe-review-failed-writes" |> Task.andThen failedWritesKeepTheirErrorIn
@@ -491,11 +517,11 @@ failedWritesKeepTheirErrorIn base =
         rw <- migratedReviewAt dbPath
         LibDb.insertDecision rw seen Approved
         ro <- openReadOnlyAt dbPath
-        duplicate <- LibDb.insertDecision ro seen Approved
+        duplicate <- failedReadOnly (LibDb.insertDecision ro seen Approved)
         freshReview <- failedReadOnly (LibDb.insertDecision ro fresh Approved)
         kept <- LibDb.findDecision rw "u-b" (Index.attest viewB)
         removeReviewFiles dbPath
-        Task.succeed (duplicate == 0 && freshReview && not (hasDecision kept))
+        Task.succeed (duplicate && freshReview && not (hasDecision kept))
 
 
 
@@ -586,6 +612,7 @@ checks =
         [ check "drain_cursor is gone after migrate" drainCursorGoneAfterMigrate
         , check "open does not migrate" openDoesNotMigrate
         , check "a duplicate attested decision is a no-op" duplicateInsertIsNoop
+        , Task.succeed ( "review store key renders the migration's PRIMARY KEY", reviewStoreKeyMatchesMigration )
         , check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)
