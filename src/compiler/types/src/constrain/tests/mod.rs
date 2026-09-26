@@ -1144,6 +1144,8 @@ mod registry_phase_c_tests {
             // Policy-checked secured writes (Store-private, Ipê-new).
             K::DbInsertFieldsChecked,
             K::DbUpdateWhereChecked,
+            // Cross-backend `ON CONFLICT … DO NOTHING` insert (Ipê-new, no legacy oracle).
+            K::DbInsertFieldsIfAbsent,
             // Two-store inner-join constructor (getter-arrow scheme, Ipê-new).
             K::StoreJoin,
             // Single-column projection over a join (getter-arrow scheme, Ipê-new).

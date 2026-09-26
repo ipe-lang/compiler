@@ -5194,19 +5194,30 @@ pub fn db_update_fields<E: Send + From<String> + 'static>(
     })
 }
 
-/// Builds the upsert statement for `db_upsert_fields`:
+/// What an `ON CONFLICT` insert does to the row already holding the key.
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictAction {
+    /// Overwrite every supplied non-target column from `excluded`.
+    UpdateNonKey,
+    /// Leave the existing row untouched (first write wins).
+    Ignore,
+}
+
+/// Builds the conflict-aware insert for `db_upsert_fields` / `db_insert_fields_if_absent`:
 ///
 /// ```sql
 /// INSERT INTO <table> (<set-cols>) VALUES (?, …)
 ///   ON CONFLICT (<target-cols>) DO UPDATE SET <c> = excluded.<c>, …
 /// ```
 ///
-/// The SET list is every `SetField` column that is not a conflict-target
-/// column. `OmitField` columns appear nowhere: the database fills them on
-/// insert and never overwrites them on conflict, so a DB-owned column
-/// (`Serial` / `DefaultNow` / `TouchOnUpdate`) is never replaced by a client
-/// value. An empty SET list yields `ON CONFLICT (…) DO NOTHING`
-/// (insert-if-absent), never an empty `SET`.
+/// Under [`ConflictAction::UpdateNonKey`] the SET list is every `SetField`
+/// column that is not a conflict-target column, and an empty SET list yields
+/// `ON CONFLICT (…) DO NOTHING`, never an empty `SET`; under
+/// [`ConflictAction::Ignore`] the action is always `DO NOTHING` (first write
+/// wins). `OmitField` columns appear nowhere: the database fills them on insert
+/// and never overwrites them on conflict, so a DB-owned column (`Serial` /
+/// `DefaultNow` / `TouchOnUpdate`) is never replaced by a client value.
 ///
 /// Refused with a [`DbBuildError`] before any SQL exists:
 /// - `InvalidIdent`: a table name failing `SqlIdent::parse_dotted`, or a field
@@ -5232,6 +5243,7 @@ fn build_upsert_sql(
     table: &str,
     conflict_target: Vec<String>,
     fields: Vec<(String, Option<SqlParam>)>,
+    on_conflict: ConflictAction,
 ) -> Result<(String, Vec<SqlParam>), DbBuildError> {
     let qtable = SqlIdent::parse_dotted(table).ok_or_else(|| DbBuildError::InvalidIdent {
         slot: IdentSlot::Table,
@@ -5306,10 +5318,11 @@ fn build_upsert_sql(
         .map(SqlIdent::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    let action = if set_clauses.is_empty() {
-        "DO NOTHING".to_string()
-    } else {
-        format!("DO UPDATE SET {}", set_clauses.join(", "))
+    let action = match on_conflict {
+        ConflictAction::UpdateNonKey if !set_clauses.is_empty() => {
+            format!("DO UPDATE SET {}", set_clauses.join(", "))
+        }
+        ConflictAction::UpdateNonKey | ConflictAction::Ignore => "DO NOTHING".to_string(),
     };
     let sql = format!(
         "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) {}",
@@ -5344,10 +5357,61 @@ pub fn db_upsert_fields<E: Send + From<String> + 'static>(
     conflict_target: Vec<String>,
     fields: Vec<(String, Option<SqlParam>)>,
 ) -> IpeTask<E, i64> {
+    exec_on_conflict_insert(
+        "db.upsertFields",
+        conn,
+        table,
+        conflict_target,
+        fields,
+        ConflictAction::UpdateNonKey,
+    )
+}
+
+/// `Db.insertFieldsIfAbsent : Db -> String -> List String -> List (String, SqlField) -> Task Error Int`
+///
+/// Insert unless a row already holds the conflict target's key, in which case
+/// that row is left untouched (first write wins). One atomic statement,
+/// `INSERT … ON CONFLICT (<target>) DO NOTHING`, identical on SQLite and
+/// Postgres, so no read-then-insert race exists between two writers.
+///
+/// Returns the affected-row count: `1` when the row was inserted, `0` when the
+/// key was already present.
+///
+/// Security: table + column names are identifier-validated; values are bound
+/// positionally — never interpolated into SQL. The refusals are exactly
+/// [`build_upsert_sql`]'s.
+/// Totality: every error path returns `IpeResult::Err`; no panic/unwrap.
+#[cfg(feature = "db")]
+pub fn db_insert_fields_if_absent<E: Send + From<String> + 'static>(
+    conn: Db,
+    table: String,
+    conflict_target: Vec<String>,
+    fields: Vec<(String, Option<SqlParam>)>,
+) -> IpeTask<E, i64> {
+    exec_on_conflict_insert(
+        "db.insertFieldsIfAbsent",
+        conn,
+        table,
+        conflict_target,
+        fields,
+        ConflictAction::Ignore,
+    )
+}
+
+/// Builds and runs one conflict-aware insert, returning rows affected.
+#[cfg(feature = "db")]
+fn exec_on_conflict_insert<E: Send + From<String> + 'static>(
+    kernel: &'static str,
+    conn: Db,
+    table: String,
+    conflict_target: Vec<String>,
+    fields: Vec<(String, Option<SqlParam>)>,
+    on_conflict: ConflictAction,
+) -> IpeTask<E, i64> {
     Box::pin(async move {
-        let (sql, args) = match build_upsert_sql(&table, conflict_target, fields) {
+        let (sql, args) = match build_upsert_sql(&table, conflict_target, fields, on_conflict) {
             Ok(v) => v,
-            Err(e) => return IpeResult::Err(build_refusal("db.upsertFields", &e)),
+            Err(e) => return IpeResult::Err(build_refusal(kernel, &e)),
         };
         let sql = db_format_sql(sql);
         let mut q = sqlx::query(&sql);
@@ -9140,6 +9204,14 @@ mod tests {
         target: &[&str],
         fields: Vec<(&str, Option<SqlParam>)>,
     ) -> Result<(String, Vec<SqlParam>), DbBuildError> {
+        conflict_sql(target, fields, ConflictAction::UpdateNonKey)
+    }
+
+    fn conflict_sql(
+        target: &[&str],
+        fields: Vec<(&str, Option<SqlParam>)>,
+        on_conflict: ConflictAction,
+    ) -> Result<(String, Vec<SqlParam>), DbBuildError> {
         build_upsert_sql(
             "kv",
             target.iter().map(|c| (*c).to_string()).collect(),
@@ -9147,7 +9219,96 @@ mod tests {
                 .into_iter()
                 .map(|(c, p)| (c.to_string(), p))
                 .collect(),
+            on_conflict,
         )
+    }
+
+    /// `Ignore` is `DO NOTHING` even when non-target columns are supplied: the
+    /// existing row is never overwritten.
+    #[test]
+    fn insert_if_absent_sql_is_do_nothing_with_non_target_columns() {
+        let built = conflict_sql(
+            &["k"],
+            vec![
+                ("k", Some(SqlParam::Text("a".to_string()))),
+                ("v", Some(SqlParam::Text("1".to_string()))),
+                ("created_at", None),
+            ],
+            ConflictAction::Ignore,
+        );
+        assert!(
+            matches!(
+                &built,
+                Ok((sql, args)) if sql == "INSERT INTO kv (k, v) VALUES (?, ?) \
+                    ON CONFLICT (k) DO NOTHING"
+                    && args.len() == 2
+            ),
+            "unexpected insert-if-absent SQL: {built:?}"
+        );
+    }
+
+    /// `Ignore` shares every refusal of the upsert builder.
+    #[test]
+    fn insert_if_absent_sql_refuses_malformed_requests() {
+        let key = || ("k", Some(SqlParam::Text("a".to_string())));
+        let cases = [
+            (
+                "hostile set column",
+                conflict_sql(
+                    &["k"],
+                    vec![key(), ("v = 1; --", Some(SqlParam::Int(1)))],
+                    ConflictAction::Ignore,
+                ),
+            ),
+            (
+                "empty conflict target",
+                conflict_sql(&[], vec![key()], ConflictAction::Ignore),
+            ),
+            (
+                "conflict-target column is OmitField",
+                conflict_sql(&["id"], vec![key(), ("id", None)], ConflictAction::Ignore),
+            ),
+        ];
+        for (label, built) in cases {
+            assert!(built.is_err(), "{label} must be refused, got {built:?}");
+        }
+    }
+
+    /// Round-trip on SQLite: the first write inserts; a second write on the
+    /// same key affects zero rows and leaves the first row's values intact.
+    #[tokio::test]
+    async fn insert_fields_if_absent_first_write_wins_on_sqlite() {
+        let db = fresh_db().await;
+        let mk: IpeResult<String, i64> = db_exec_raw(
+            db.clone(),
+            "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)".to_string(),
+        )
+        .await;
+        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+        let put = |v: &str| {
+            db_insert_fields_if_absent::<String>(
+                db.clone(),
+                "kv".to_string(),
+                vec!["k".to_string()],
+                vec![
+                    ("k".to_string(), Some(SqlParam::Text("a".to_string()))),
+                    ("v".to_string(), Some(SqlParam::Text(v.to_string()))),
+                ],
+            )
+        };
+        let first = put("first").await;
+        assert!(matches!(first, IpeResult::Ok(1)), "insert: {first:?}");
+        let second = put("second").await;
+        assert!(matches!(second, IpeResult::Ok(0)), "second: {second:?}");
+        let rows: IpeResult<String, Vec<HashMap<String, String>>> =
+            db_query_params(db.clone(), "SELECT v FROM kv".to_string(), Vec::new()).await;
+        let rows = rows.with_default(Vec::new());
+        assert_eq!(rows.len(), 1, "second write must not add a row: {rows:?}");
+        assert_eq!(
+            rows.first().and_then(|r| r.get("v")).map(String::as_str),
+            Some("first"),
+            "first write must win"
+        );
     }
 
     /// The statement is the one standard form both engines share: SET covers
@@ -9219,6 +9380,7 @@ mod tests {
                     "kv; DROP TABLE kv",
                     vec!["k".to_string()],
                     vec![("k".to_string(), Some(SqlParam::Int(1)))],
+                    ConflictAction::UpdateNonKey,
                 ),
                 invalid(IdentSlot::Table, "kv; DROP TABLE kv"),
             ),
@@ -10095,6 +10257,27 @@ mod tests {
             assert_rejects!(
                 "db_upsert_fields(column)",
                 db_upsert_fields(
+                    db.clone(),
+                    "todos".to_string(),
+                    vec!["id".to_string()],
+                    vec![
+                        ("id".to_string(), Some(SqlParam::Int(1))),
+                        (hs.clone(), Some(SqlParam::Text("x".to_string()))),
+                    ],
+                )
+            );
+            assert_rejects!(
+                "db_insert_fields_if_absent(table)",
+                db_insert_fields_if_absent(
+                    db.clone(),
+                    hs.clone(),
+                    vec!["id".to_string()],
+                    vec![("id".to_string(), Some(SqlParam::Int(1)))],
+                )
+            );
+            assert_rejects!(
+                "db_insert_fields_if_absent(column)",
+                db_insert_fields_if_absent(
                     db.clone(),
                     "todos".to_string(),
                     vec!["id".to_string()],

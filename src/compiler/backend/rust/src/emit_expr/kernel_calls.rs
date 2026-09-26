@@ -654,6 +654,7 @@ pub fn emit_http_builder_call(
 ///
 /// The Ipê surface for parameterised Db calls (`Db.exec`, `Db.query`,
 /// `Db.queryDecode`, `Db.insertFields`, `Db.updateFields`, `Db.upsertFields`,
+/// `Db.insertFieldsIfAbsent`,
 /// `Db.insertFieldsReturning`) passes a `List SqlValue` or
 /// `List (String, SqlField)` as a plain Ipê argument. The runtime's typed-param
 /// functions (`db_exec_params`, `db_query_params`, …) expect `Vec<SqlParam>` /
@@ -1153,11 +1154,12 @@ pub fn emit_db_call(
                 project_fields(&set_s)
             )))
         }
-        // ── DbUpsertFields: (conn, table, target: List String, List (String,SqlField)) ─
+        // ── DbUpsertFields / DbInsertFieldsIfAbsent:
+        //    (conn, table, target: List String, List (String,SqlField)) ─
         //
         // The conflict target is a plain `List String` (`Vec<String>`), passed
         // through; the field list is projected exactly like `DbInsertFields`'.
-        KernelFn::DbUpsertFields => {
+        KernelFn::DbUpsertFields | KernelFn::DbInsertFieldsIfAbsent => {
             let conn_e = arg!(0, "conn")?;
             let table_e = arg!(1, "table")?;
             let target_e = arg!(2, "conflict_target")?;

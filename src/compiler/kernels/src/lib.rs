@@ -3584,6 +3584,10 @@ pub enum StdlibKernel {
     /// update (fields, scoping `WHERE`, check): kept only when every updated row
     /// satisfies the check as stored. Store-private like `DbInsertFieldsChecked`.
     DbUpdateWhereChecked,
+    /// `Db.insertFieldsIfAbsent : Db -> String -> List String -> List (String, SqlField) -> Task Error Int`
+    /// — `INSERT … ON CONFLICT (<target>) DO NOTHING` (first write wins on
+    /// both backends); the `List String` is the conflict target.
+    DbInsertFieldsIfAbsent,
     // ── Ipe.Secret — opaque secret-string wrapper ─────────
     // The ONLY public constructor: every `Secret` value traces back to one of
     // these calls. Never derivable from a bare `String` implicitly.
@@ -7235,6 +7239,14 @@ impl StdlibKernel {
                 "db_update_where_checked",
                 IpeOrder,
             ),
+            Self::DbInsertFieldsIfAbsent => d(
+                "Db",
+                "insertFieldsIfAbsent",
+                4,
+                Db,
+                "db_insert_fields_if_absent",
+                IpeOrder,
+            ),
             // ── Ipe.Secret — opaque secret-string wrapper ─
             Self::SecretFromString => d(
                 "Secret",
@@ -8714,6 +8726,7 @@ impl StdlibKernel {
         Self::DbUpsertFields,
         Self::DbInsertFieldsChecked,
         Self::DbUpdateWhereChecked,
+        Self::DbInsertFieldsIfAbsent,
         Self::SecretFromString,
         Self::SecretReveal,
         Self::SecretUse,
@@ -10426,7 +10439,7 @@ impl StdlibKernel {
         const STRING_TO_UPDATE_FIELDS: TyShape =
             TyShape::Fun(&STRING, &LIST_SQLVALUE_TO_LIST_SQLFIELD_TO_TASK_INT);
         const DB_UPDATE_FIELDS: TyShape = TyShape::Fun(&DB, &STRING_TO_UPDATE_FIELDS);
-        // `upsertFields : Db -> String -> List String
+        // `upsertFields` / `insertFieldsIfAbsent : Db -> String -> List String
         //                 -> List (String, SqlField) -> Task Int`.
         const LIST_STRING_TO_LIST_SQLFIELD_TO_TASK_INT: TyShape =
             TyShape::Fun(&LIST_STRING, &LIST_SQLFIELD_TO_TASK_INT);
@@ -12415,7 +12428,7 @@ impl StdlibKernel {
             // (`Db -> String -> List (String, SqlField) -> SqlFragment -> Task Int`).
             Self::DbUpdateWhere | Self::DbInsertFieldsChecked => Some(&DB_UPDATE_WHERE),
             Self::DbUpdateWhereChecked => Some(&DB_UPDATE_WHERE_CHECKED),
-            Self::DbUpsertFields => Some(&DB_UPSERT_FIELDS),
+            Self::DbUpsertFields | Self::DbInsertFieldsIfAbsent => Some(&DB_UPSERT_FIELDS),
             Self::DbInsertFields => Some(&DB_INSERT_FIELDS),
             Self::DbUpdateFields => Some(&DB_UPDATE_FIELDS),
             Self::DbInsertFieldsReturning => Some(&DB_INSERT_FIELDS_RETURNING),
@@ -13427,6 +13440,7 @@ impl StdlibKernel {
             | Self::DbUpsertFields
             | Self::DbInsertFieldsChecked
             | Self::DbUpdateWhereChecked
+            | Self::DbInsertFieldsIfAbsent
             | Self::DbDefaultMigration
             | Self::DbDecString
             | Self::DbDecInt
