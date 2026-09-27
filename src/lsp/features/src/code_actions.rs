@@ -31,7 +31,9 @@
 //!   deletes the whole `import` declaration, including any `as Alias` /
 //!   `exposing (…)` continuation lines. The lint has already proved no
 //!   introduced name is used (it is conservative), so the deletion is
-//!   behavior-preserving.
+//!   behavior-preserving. Offered from a request anywhere within the
+//!   declaration's full span, not only when it lands on the `import` keyword
+//!   the diagnostic itself is anchored to (see `offer_range`).
 //!
 //! **Not offered — `IPE-N0048` (two definitions fold to one Rust name):** this
 //! diagnostic is raised at IR-level name mangling and carries NO source spans
@@ -95,10 +97,12 @@ pub fn code_actions(
         return Vec::new();
     };
 
-    // Collect actions for each diagnostic that overlaps the requested range.
+    // Collect actions for each diagnostic whose OFFER range overlaps the
+    // requested range. Most diagnostics offer at their own `d.range`; see
+    // `offer_range` for the `lint/unused-imports` exception.
     let in_range: Vec<&Diagnostic> = diagnostics
         .iter()
-        .filter(|d| ranges_overlap(d.range, range))
+        .filter(|d| ranges_overlap(offer_range(view, module, d, text, encoding), range))
         .collect();
 
     if in_range.is_empty() {
@@ -189,6 +193,36 @@ pub fn code_actions(
 
 fn ranges_overlap(a: Range, b: Range) -> bool {
     a.start <= b.end && b.start <= a.end
+}
+
+/// The range within which a diagnostic's quick-fix may be requested.
+///
+/// Defaults to the diagnostic's own `range`. `lint/unused-imports` is the one
+/// exception: the lint anchors its diagnostic on just the `import` keyword
+/// token, but its quick-fix (`remove_unused_import_action`) deletes the WHOLE
+/// declaration — so a request anywhere in that declaration (the module name,
+/// an `as Alias`, an `exposing (…)` clause, even one wrapped across lines)
+/// must still find it. Widened to the exact span
+/// `remove_unused_import_action` deletes (`unused_import_line_span`), computed
+/// once and shared, so the offerable range and the deleted range can never
+/// drift apart.
+///
+/// Falls back to `diag.range` when the diagnostic does not resolve to a real
+/// parsed import (a stale or mis-ranged diagnostic) — fail-closed, never a
+/// guessed span.
+fn offer_range(
+    view: DbView<'_>,
+    module: &[String],
+    diag: &Diagnostic,
+    text: &str,
+    encoding: PositionEncoding,
+) -> Range {
+    let is_unused_import =
+        matches!(&diag.code, Some(NumberOrString::String(c)) if c == "lint/unused-imports");
+    if !is_unused_import {
+        return diag.range;
+    }
+    unused_import_line_span(view, module, diag, text, encoding).unwrap_or(diag.range)
 }
 
 /// Quick-fix that inserts a type annotation above the binding named in the
@@ -621,34 +655,29 @@ fn wrap_in_ui_html_action(
     })
 }
 
-/// Quick-fix for `lint/unused-imports`: delete the whole unused `import`
-/// declaration.
-///
-/// The `unused-imports` lint has already proved that no name the import
-/// introduces is referenced anywhere in the module (it is conservative — a
-/// wildcard `exposing (..)` or any use suppresses it), so deleting the whole
-/// declaration is behavior-preserving.
+/// The whole-line span of the `import` declaration a `lint/unused-imports`
+/// diagnostic points at.
 ///
 /// The lint anchors its diagnostic on the `import` keyword token, but an
 /// `import` declaration may span several physical lines — its `as Alias` and
-/// `exposing (…)` clauses can each start a continuation line. Deleting only the
-/// keyword's line would strand the continuation and turn a compiling module
-/// into a parse error. The fix therefore locates the offending `Import` node in
-/// the parse tree, computes the declaration's true byte extent (keyword through
-/// the end of its last clause), and deletes the whole-line span that covers it —
-/// so no fragment of the declaration is left behind.
+/// `exposing (…)` clauses can each start a continuation line. This locates the
+/// offending `Import` node in the parse tree, computes the declaration's true
+/// byte extent (keyword through the end of its last clause) with
+/// `import_clause_end`, and returns the whole-line span that covers it — from
+/// the start of the keyword's line through the end of the line the last clause
+/// ends on — so both the deleting quick-fix and the offer-range check below
+/// agree on the exact same span (single source of truth).
 ///
-/// Fail-closed: the action is offered only when the diagnostic's start byte
-/// falls on the `import` keyword of a real parsed `Import`. A mis-ranged
-/// diagnostic, or one that does not land on an import, yields no action.
-fn remove_unused_import_action(
+/// Fail-closed: `None` unless the diagnostic's start byte falls on the
+/// `import` keyword of a real parsed `Import`. A mis-ranged diagnostic, or one
+/// that does not land on an import, is never guessed at.
+fn unused_import_line_span(
     view: DbView<'_>,
     module: &[String],
-    uri: &Url,
     diag: &Diagnostic,
     text: &str,
     encoding: PositionEncoding,
-) -> Option<CodeAction> {
+) -> Option<Range> {
     let DbView { db, root, .. } = view;
     let files = root.files(db);
     let &file = files.get(module)?;
@@ -662,19 +691,34 @@ fn remove_unused_import_action(
         .iter()
         .find(|imp| imp.import_kw.lo <= diag_byte && diag_byte < imp.import_kw.hi)?;
 
-    // Whole-line span covering the import's full extent: from the start of the
-    // line the keyword sits on through the end of the line its last clause ends
-    // on. The clause end is scanned from the source with `import_clause_end`,
-    // which handles `as Alias` / `exposing (…)` continuation lines the AST spans
-    // alone do not reach.
     let clause_end = import_clause_end(text, import);
     let start_line = offset_to_position(text, import.import_kw.lo as usize, encoding).line as usize;
     let end_line = offset_to_position(text, clause_end, encoding).line as usize;
     let (start_byte, _) = line_byte_range(text, start_line);
     let (_, end_byte) = line_byte_range(text, end_line);
 
-    let start = offset_to_position(text, start_byte, encoding);
-    let end = offset_to_position(text, end_byte, encoding);
+    Some(Range {
+        start: offset_to_position(text, start_byte, encoding),
+        end: offset_to_position(text, end_byte, encoding),
+    })
+}
+
+/// Quick-fix for `lint/unused-imports`: delete the whole unused `import`
+/// declaration.
+///
+/// The `unused-imports` lint has already proved that no name the import
+/// introduces is referenced anywhere in the module (it is conservative — a
+/// wildcard `exposing (..)` or any use suppresses it), so deleting the whole
+/// declaration (`unused_import_line_span`) is behavior-preserving.
+fn remove_unused_import_action(
+    view: DbView<'_>,
+    module: &[String],
+    uri: &Url,
+    diag: &Diagnostic,
+    text: &str,
+    encoding: PositionEncoding,
+) -> Option<CodeAction> {
+    let Range { start, end } = unused_import_line_span(view, module, diag, text, encoding)?;
     let edit = TextEdit {
         range: Range { start, end },
         new_text: String::new(),

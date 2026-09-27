@@ -162,6 +162,48 @@ pub fn scan_import_paths(src: &str) -> Option<Vec<Vec<String>>> {
     Some(out)
 }
 
+/// Token-level scan of every `import`'s dotted path AND its optional `as`
+/// alias, tolerant of the rest of `src` failing to parse.
+///
+/// Lexes `src` with the real lexer and, for each `import` keyword token,
+/// pairs the dotted-identifier token that follows it with the identifier
+/// named by a subsequent `as` token, when present. Unlike [`scan_import_paths`]
+/// this is LSP-only: it is never consulted by the import-cycle gate, so it is
+/// free to also capture the alias — the piece of an import declaration
+/// [`scan_import_paths`] deliberately drops.
+///
+/// Returns `None` when `src` does not lex. A qualifier resolved against this
+/// scan reflects only the import declarations `src` actually lexes to; it
+/// never falls back to a guess.
+#[must_use]
+pub fn scan_import_aliases(src: &str) -> Option<Vec<(Vec<String>, Option<String>)>> {
+    let toks = lexer::lex(src).ok()?;
+    let mut out: Vec<(Vec<String>, Option<String>)> = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        if tok.kind != lexer::Tok::Import {
+            continue;
+        }
+        let Some(path_tok) = toks.get(i.saturating_add(1)) else {
+            continue;
+        };
+        let lexer::Tok::Ident(text) = &path_tok.kind else {
+            continue;
+        };
+        let path: Vec<String> = text.split('.').map(str::to_owned).collect();
+        let alias = match (toks.get(i.saturating_add(2)), toks.get(i.saturating_add(3))) {
+            (Some(as_tok), Some(alias_tok)) if as_tok.kind == lexer::Tok::As => {
+                match &alias_tok.kind {
+                    lexer::Tok::Ident(alias_name) => Some(alias_name.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        out.push((path, alias));
+    }
+    Some(out)
+}
+
 /// Token-level scan of every identifier word occurring in `src` — the
 /// program-derived collision universe for the lowerer's fresh-name pools
 /// (`Interner::set_fresh_avoid`).
@@ -3470,6 +3512,34 @@ main = 1\n";
             err_code(src),
             "IPE-P0001",
             "a second consecutive doc-comment must fail with unexpected-token, not panic"
+        );
+    }
+
+    #[test]
+    fn scan_import_aliases_captures_path_and_alias() {
+        let src =
+            "module Main exposing (main)\n\nimport Ipe.System as Sys\nimport Helper\n\nmain = 1\n";
+        let imports = scan_import_aliases(src).expect("must lex");
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    vec!["Ipe".to_owned(), "System".to_owned()],
+                    Some("Sys".to_owned())
+                ),
+                (vec!["Helper".to_owned()], None),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_import_aliases_refuses_on_unlexable_source() {
+        // An unterminated string makes the buffer unlexable; the scan must
+        // report `None` rather than a partial/best-effort guess.
+        let src = "module Main exposing (main)\n\nmain = \"unterminated\n";
+        assert!(
+            scan_import_aliases(src).is_none(),
+            "unlexable source must yield None, not a partial scan"
         );
     }
 }

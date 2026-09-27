@@ -632,8 +632,25 @@ pub fn discover_modules(src_root: &Path) -> Result<Vec<DiscoveredModule>, CliErr
                 path: path.clone(),
                 source: e,
             })?;
+            // Only descend into a directory whose name could validly be a
+            // module-path segment. A directory shaped any other way (a
+            // dotfile directory, `node_modules`, another process's
+            // `systemd-private-*` scratch dir, …) can never hold a `.ipe`
+            // file `file_to_module` would accept — every ancestor segment of
+            // an accepted module path is itself checked by
+            // `is_module_segment` — so pruning it here changes nothing about
+            // which modules are found. It does stop the walk from ever
+            // reading a directory the caller has no reason to touch, which
+            // is what let discovery from a loose file wander into and choke
+            // on an unrelated, permission-denied sibling directory.
             if file_type.is_dir() {
-                stack.push_back((path, depth + 1));
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_module_segment)
+                {
+                    stack.push_back((path, depth + 1));
+                }
             } else if file_type.is_file()
                 && path.extension().and_then(|e| e.to_str()) == Some("ipe")
                 && let Some(m) = file_to_module(src_root, &path)
@@ -1205,6 +1222,87 @@ import String
         assert!(
             !has_only_legacy_toml(&root),
             "an empty project gets no legacy-toml hint"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #2863: a loose file's sibling discovery must never descend into a
+    /// directory whose name could never be a module segment — such as
+    /// another process's `systemd-private-*` scratch directory sitting next
+    /// to the file (this is exactly the scenario that made `ipe lsp` on a
+    /// file opened from `/tmp` crash with a permission-denied error). If the
+    /// walk still tried to read the locked-down directory below,
+    /// `discover_modules` would return `Err`, not `Ok`.
+    #[cfg(unix)]
+    #[test]
+    fn discover_modules_skips_invalid_named_directories_even_when_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("ipe_discovery_skips_invalid_dir");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("Main.ipe"),
+            "module Main exposing (main)\nmain = 0\n",
+        )
+        .expect("write Main.ipe");
+
+        // Not a valid module segment (lowercase-led, hyphenated) — the shape
+        // a `systemd-private-*` directory takes.
+        let unrelated = root.join("systemd-private-deadbeef");
+        fs::create_dir_all(&unrelated).expect("create unrelated dir");
+        fs::write(
+            unrelated.join("Owned.ipe"),
+            "module Owned exposing (x)\nx = 0\n",
+        )
+        .expect("seed a file inside the unrelated dir");
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o000))
+            .expect("lock down the unrelated dir");
+
+        let result = discover_modules(&root);
+
+        // Restore permissions before any assertion so cleanup always runs.
+        let _ = fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o755));
+
+        let discovered =
+            result.expect("an invalid-named sibling directory must never be crawled into");
+        assert!(
+            discovered
+                .iter()
+                .any(|m| m.module_path == vec!["Main".to_owned()]),
+            "the legitimate module must still be found: {discovered:?}"
+        );
+        assert!(
+            !discovered
+                .iter()
+                .any(|m| m.module_path == vec!["Owned".to_owned()]),
+            "a file inside an invalid-named directory must never be discovered: {discovered:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The refusal above must not regress legitimate ad hoc sibling
+    /// discovery: a nested directory whose name IS a valid module segment is
+    /// still crawled, so a `Foo/Bar.ipe` submodule is still found.
+    #[test]
+    fn discover_modules_still_recurses_into_validly_named_module_directories() {
+        let root = std::env::temp_dir().join("ipe_discovery_recurses_valid_dir");
+        let _ = fs::remove_dir_all(&root);
+        let nested = root.join("Foo");
+        fs::create_dir_all(&nested).expect("create Foo/");
+        fs::write(
+            nested.join("Bar.ipe"),
+            "module Foo.Bar exposing (bar)\nbar = 0\n",
+        )
+        .expect("write Foo/Bar.ipe");
+
+        let discovered =
+            discover_modules(&root).expect("a validly-shaped tree must still discover");
+        assert!(
+            discovered
+                .iter()
+                .any(|m| m.module_path == vec!["Foo".to_owned(), "Bar".to_owned()]),
+            "a nested module under a validly-named directory must still be found: {discovered:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }

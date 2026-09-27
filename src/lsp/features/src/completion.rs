@@ -112,6 +112,15 @@ pub fn completions(
         return Vec::new();
     };
 
+    // A qualifier written immediately before the cursor (`Mod.` / `Mod.part`)
+    // scopes completion to that module alone. Resolved from the raw buffer
+    // text, independent of whether the rest of it currently parses — the
+    // common case mid-edit, and exactly the case a dangling `Mod.` breaks
+    // whole-file parsing. See `qualified_completions`.
+    if let Some(qualifier) = qualifier_before_cursor(file.text(db), byte) {
+        return qualified_completions(db, root, entry, files, &qualifier, file.text(db), docs);
+    }
+
     // Demand all salsa queries before locking the interner — each query
     // internally acquires + releases the interner lock, and the Mutex is not
     // reentrant. All results are cloned out of their `Arc` wrappers here so
@@ -191,6 +200,140 @@ pub fn completions(
     });
 
     items
+}
+
+/// Completion scoped to one module qualifier (`Mod.` / `Mod.part`): only that
+/// module's exported values, constructors, and types.
+///
+/// `qualifier` resolves against `source_text`'s own `import` declarations
+/// (path + alias), via [`resolve_qualifier`] — independent of whether
+/// `source_text` as a whole currently parses, since a qualifier's import is
+/// typically already complete while the expression under the cursor is still
+/// being typed. An unresolved qualifier, or one whose target module does not
+/// canonicalize, yields an empty list: fail-closed, never a fallback to the
+/// unqualified (own-module + every dep + keywords) candidate set.
+fn qualified_completions(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    entry: ipe_db::SourceFile,
+    files: &BTreeMap<Vec<String>, ipe_db::SourceFile>,
+    qualifier: &str,
+    source_text: &str,
+    docs: Option<&ipe_docs::Index>,
+) -> Vec<CompletionItem> {
+    let Some(dep_path) = resolve_qualifier(source_text, qualifier) else {
+        return Vec::new();
+    };
+    let Some(&dep_file) = files.get(dep_path.as_slice()) else {
+        return Vec::new();
+    };
+    let Some(dep_canon) = crate::db_access::canonicalize_checked(db, root, entry, dep_file) else {
+        return Vec::new();
+    };
+    let dep_env: Option<BTreeMap<Symbol, Ty>> = ipe_db::typecheck_module(db, root, entry, dep_file)
+        .as_ref()
+        .ok()
+        .map(|types| types.env.clone());
+
+    let mut interner = db.interner().lock();
+    let dep_home: Vec<Symbol> = dep_path
+        .iter()
+        .map(|s| interner.intern(s).ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+
+    let mut candidates = Vec::new();
+    push_dep_candidates(&mut candidates, &dep_home, &dep_canon);
+
+    let mut solved_env: BTreeMap<Vec<Symbol>, BTreeMap<Symbol, Ty>> = BTreeMap::new();
+    if let Some(env) = dep_env {
+        solved_env.insert(dep_home, env);
+    }
+
+    // No `expected` type in a qualifier position — every export of the named
+    // module is offered, ranked by name only (never keywords: a keyword is
+    // never legal right after a qualifier's dot).
+    let mut items = render_candidates(&candidates, Some(&solved_env), None, &interner, docs);
+    drop(interner);
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    items.retain(|item| seen.insert(item.label.clone()));
+    items.sort_by(|a, b| {
+        let ka = (a.sort_text.as_deref().unwrap_or(""), a.label.as_str());
+        let kb = (b.sort_text.as_deref().unwrap_or(""), b.label.as_str());
+        ka.cmp(&kb)
+    });
+    items
+}
+
+/// Resolve a written qualifier (`Mod` in `Mod.name`) to the canonical dotted
+/// path of the module it names, via `source_text`'s own `import`
+/// declarations.
+///
+/// An `as` alias shadows a same-spelled bare-leaf import — mirrors
+/// `resolve_qualifier_to_module_path` in `ipe_canon`'s `shape_source`, the
+/// canon-layer counterpart for a fully parsed module. Returns `None` when no
+/// import in `source_text` names `qualifier`, or when `source_text` does not
+/// even lex.
+fn resolve_qualifier(source_text: &str, qualifier: &str) -> Option<Vec<String>> {
+    let imports = ipe_parse::scan_import_aliases(source_text)?;
+    for (path, alias) in &imports {
+        if alias.as_deref() == Some(qualifier) {
+            return Some(path.clone());
+        }
+    }
+    for (path, alias) in &imports {
+        if alias.is_none() && path.last().map(String::as_str) == Some(qualifier) {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+/// The module qualifier immediately before `byte`, when the cursor sits right
+/// after `Qualifier.` or `Qualifier.partial`.
+///
+/// A qualifier is capitalized, per Ipê's module-naming convention — a
+/// lowercase leading letter is never a module and is never treated as one, so
+/// this never misfires on an unrelated `.`-using construct. Scans `text`'s
+/// raw bytes rather than any parsed token stream, so it still finds the
+/// qualifier when the surrounding statement does not currently parse (a bare
+/// trailing `Mod.` is a dangling-dot parse failure at the grammar layer, but
+/// the qualifier itself is still legible from the text). Returns `None` when
+/// no such qualifier precedes the cursor.
+fn qualifier_before_cursor(text: &str, byte: u32) -> Option<String> {
+    let bytes = text.as_bytes();
+    let start = usize::try_from(byte).ok()?;
+    if start > bytes.len() {
+        return None;
+    }
+    let mut i = start;
+    while i > 0 && bytes.get(i - 1).copied().is_some_and(is_ident_byte) {
+        i -= 1;
+    }
+    if i == 0 || bytes.get(i - 1).copied() != Some(b'.') {
+        return None;
+    }
+    let dot = i - 1;
+    let mut j = dot;
+    while j > 0 && bytes.get(j - 1).copied().is_some_and(is_ident_byte) {
+        j -= 1;
+    }
+    if j == dot {
+        return None;
+    }
+    let qualifier = text.get(j..dot)?;
+    if !qualifier.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(qualifier.to_owned())
+}
+
+/// ASCII-only identifier-continuation byte test, mirroring the lexer's own
+/// identifier rule (Ipê identifiers are ASCII, so a raw byte scan needs no
+/// UTF-8 decoding).
+const fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Fetch the canonical module for each resolved import, before the interner
@@ -298,39 +441,52 @@ fn build_candidates(
             .map(|s| interner.intern(s).ok())
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default();
-        for &name_sym in &dep_canon.exports.values {
-            out.push(Candidate {
-                name: name_sym,
-                home: dep_home.clone(),
-                kind: CandidateKind::Value,
-                result_head: None,
-                arity: 0,
-            });
-        }
-        for &ctor_sym in dep_canon.exports.ctors.keys() {
-            // A dep constructor's owning-union head is recoverable from the
-            // dep's own unions (the export map records the ctor→type link).
-            let head = dep_ctor_head(dep_canon, ctor_sym);
-            let arity = dep_ctor_arity(dep_canon, ctor_sym);
-            out.push(Candidate {
-                name: ctor_sym,
-                home: dep_home.clone(),
-                kind: CandidateKind::Ctor,
-                result_head: head,
-                arity,
-            });
-        }
-        for &type_sym in dep_canon.exports.types.keys() {
-            out.push(Candidate {
-                name: type_sym,
-                home: dep_home.clone(),
-                kind: CandidateKind::Type,
-                result_head: None,
-                arity: 0,
-            });
-        }
+        push_dep_candidates(&mut out, &dep_home, dep_canon);
     }
     out
+}
+
+/// Push every export of one resolved dependency module as candidates, homed
+/// under `dep_home` (its already-interned dotted path). Shared by the
+/// unqualified path ([`build_candidates`], every dep) and the qualified path
+/// ([`qualified_completions`], exactly one dep) — the single source of truth
+/// for "what a dep module's export map turns into as candidates".
+fn push_dep_candidates(
+    out: &mut Vec<Candidate>,
+    dep_home: &[Symbol],
+    dep_canon: &ipe_db::CanonicalModule,
+) {
+    for &name_sym in &dep_canon.exports.values {
+        out.push(Candidate {
+            name: name_sym,
+            home: dep_home.to_vec(),
+            kind: CandidateKind::Value,
+            result_head: None,
+            arity: 0,
+        });
+    }
+    for &ctor_sym in dep_canon.exports.ctors.keys() {
+        // A dep constructor's owning-union head is recoverable from the dep's
+        // own unions (the export map records the ctor→type link).
+        let head = dep_ctor_head(dep_canon, ctor_sym);
+        let arity = dep_ctor_arity(dep_canon, ctor_sym);
+        out.push(Candidate {
+            name: ctor_sym,
+            home: dep_home.to_vec(),
+            kind: CandidateKind::Ctor,
+            result_head: head,
+            arity,
+        });
+    }
+    for &type_sym in dep_canon.exports.types.keys() {
+        out.push(Candidate {
+            name: type_sym,
+            home: dep_home.to_vec(),
+            kind: CandidateKind::Type,
+            result_head: None,
+            arity: 0,
+        });
+    }
 }
 
 /// The `(module, type-name)` head of the union a dep constructor produces,
@@ -852,6 +1008,99 @@ mod tests {
         assert!(
             user_item.documentation.is_none(),
             "a user-module symbol must carry no stdlib doc (fail-closed)"
+        );
+    }
+
+    const EXTRA: &str = "module Extra exposing (extraValue)\n\nextraValue : Int\nextraValue = 42\n";
+
+    /// A qualifier (`Helper.`) scopes completion to that one imported module:
+    /// its exports appear, a *different* imported module's export does not, and
+    /// neither does the entry module's own binding or any keyword. The cursor
+    /// sits right after a dangling `Helper.` with nothing typed after the dot —
+    /// which breaks whole-buffer parsing, reproducing the reported symptom that
+    /// this scoped path must survive without falling back to the unqualified
+    /// (own-module + every dep + keywords) candidate set.
+    #[test]
+    fn qualified_completion_offers_only_that_modules_exports() {
+        const QUALIFIED_MAIN: &str = "module Main exposing (main)\n\nimport Helper exposing (three, Color(..))\nimport Extra exposing (extraValue)\n\nmain : Int\nmain = Helper.";
+
+        let db = IpeDatabase::new();
+        let helper = file(&db, &["Helper"], HELPER);
+        let extra = file(&db, &["Extra"], EXTRA);
+        let entry = file(&db, &["Main"], QUALIFIED_MAIN);
+        let root = root_of(
+            &db,
+            &[
+                (&["Helper"], helper),
+                (&["Extra"], extra),
+                (&["Main"], entry),
+            ],
+        );
+
+        let byte = u32::try_from(QUALIFIED_MAIN.len()).expect("offset fits u32");
+        let items = completions(&db, root, entry, &["Main".to_owned()], byte, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"three"), "three missing: {labels:?}");
+        assert!(labels.contains(&"Color"), "Color missing: {labels:?}");
+        assert!(labels.contains(&"Red"), "Red missing: {labels:?}");
+        assert!(labels.contains(&"Blue"), "Blue missing: {labels:?}");
+
+        assert!(
+            !labels.contains(&"extraValue"),
+            "a different imported module's export leaked into a qualified list: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"main"),
+            "the entry module's own binding leaked into a qualified list: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"let"),
+            "a keyword is never legal right after a qualifier's dot: {labels:?}"
+        );
+    }
+
+    /// An `as` alias resolves the same as the bare module name: `H.` after
+    /// `import Helper as H` offers `Helper`'s exports.
+    #[test]
+    fn qualified_completion_respects_import_alias() {
+        const ALIASED_MAIN: &str = "module Main exposing (main)\n\nimport Helper as H exposing (three, Color(..))\n\nmain : Int\nmain = H.";
+
+        let db = IpeDatabase::new();
+        let helper = file(&db, &["Helper"], HELPER);
+        let entry = file(&db, &["Main"], ALIASED_MAIN);
+        let root = root_of(&db, &[(&["Helper"], helper), (&["Main"], entry)]);
+
+        let byte = u32::try_from(ALIASED_MAIN.len()).expect("offset fits u32");
+        let items = completions(&db, root, entry, &["Main".to_owned()], byte, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+        assert!(labels.contains(&"three"), "three missing: {labels:?}");
+        assert!(
+            !labels.contains(&"main"),
+            "the entry module's own binding leaked through an alias qualifier: {labels:?}"
+        );
+    }
+
+    /// A qualifier naming no import in scope resolves to nothing — fail-closed,
+    /// never a fallback to the unqualified candidate set (which would leak
+    /// every dep's exports plus keywords under a typo'd or stale qualifier).
+    #[test]
+    fn qualified_completion_unresolved_qualifier_yields_nothing() {
+        const UNRESOLVED_MAIN: &str = "module Main exposing (main)\n\nimport Helper exposing (three)\n\nmain : Int\nmain = Unknown.";
+
+        let db = IpeDatabase::new();
+        let helper = file(&db, &["Helper"], HELPER);
+        let entry = file(&db, &["Main"], UNRESOLVED_MAIN);
+        let root = root_of(&db, &[(&["Helper"], helper), (&["Main"], entry)]);
+
+        let byte = u32::try_from(UNRESOLVED_MAIN.len()).expect("offset fits u32");
+        let items = completions(&db, root, entry, &["Main".to_owned()], byte, None);
+
+        assert!(
+            items.is_empty(),
+            "an unresolved qualifier must yield no candidates, not the unqualified fallback: {:?}",
+            items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>()
         );
     }
 }

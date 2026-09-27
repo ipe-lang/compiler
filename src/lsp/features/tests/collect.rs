@@ -1027,6 +1027,111 @@ fn unused_imports_quick_fix_removes_a_multiline_as_import() {
     );
 }
 
+/// #2862: the code-action request range may land anywhere within the unused
+/// import's full declaration, not only on the `import` keyword the diagnostic
+/// itself is anchored to. Here the request is on the `exposing` continuation
+/// line, one line below the diagnostic's own (keyword-only) range — the exact
+/// shape of a real editor invocation (Neovim `gra`, Emacs `C-c C-a`) with the
+/// cursor inside the `exposing (…)` clause.
+#[test]
+fn unused_imports_quick_fix_offered_from_exposing_continuation_line() {
+    let db = IpeDatabase::new();
+    // Same fixture as `unused_imports_quick_fix_removes_a_multiline_exposing_import`:
+    // `import Foo` on line 2, `exposing (bar, baz)` continuation on line 3.
+    let src = "module Main exposing (main)\n\nimport Foo\n    exposing (bar, baz)\n\nmain : Int\nmain = 1\n";
+    let foo = file(
+        &db,
+        &["Foo"],
+        "module Foo exposing (bar, baz)\n\nbar = 1\n\nbaz = 2\n",
+    );
+    let entry = file(&db, &["Main"], src);
+    let root = root_of(&db, &[(&["Foo"], foo), (&["Main"], entry)]);
+
+    // The lint still anchors the diagnostic on the `import` keyword (line 2).
+    let lsp_diag = lint_diag_on_line("lint/unused-imports", 2);
+    // But the request range is on line 3, the `exposing` continuation.
+    let request_range = Range {
+        start: lsp_types::Position {
+            line: 3,
+            character: 4,
+        },
+        end: lsp_types::Position {
+            line: 3,
+            character: 4,
+        },
+    };
+    let uri = Url::from_file_path("/fake/Main.ipe").expect("uri");
+    let actions = code_actions(
+        DbView {
+            db: &db,
+            root,
+            entry,
+        },
+        &["Main".to_owned()],
+        &uri,
+        request_range,
+        std::slice::from_ref(&lsp_diag),
+        src,
+        PositionEncoding::Utf16,
+    );
+    let action = actions
+        .into_iter()
+        .find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => Some(ca),
+            CodeActionOrCommand::Command(_) => None,
+        })
+        .expect("a request anywhere in the import declaration must offer the remove action");
+    assert_eq!(action.title, "Remove unused import");
+}
+
+/// The refusal side of #2862: widening the offer range to the whole import
+/// declaration must not leak into unrelated lines. A request on `main = 1`,
+/// well outside the import's full extent (lines 2..=3), still yields no
+/// action — the widening is bounded to the declaration, not unconditional.
+#[test]
+fn unused_imports_quick_fix_refuses_request_outside_the_declaration() {
+    let db = IpeDatabase::new();
+    let src = "module Main exposing (main)\n\nimport Foo\n    exposing (bar, baz)\n\nmain : Int\nmain = 1\n";
+    let foo = file(
+        &db,
+        &["Foo"],
+        "module Foo exposing (bar, baz)\n\nbar = 1\n\nbaz = 2\n",
+    );
+    let entry = file(&db, &["Main"], src);
+    let root = root_of(&db, &[(&["Foo"], foo), (&["Main"], entry)]);
+
+    let lsp_diag = lint_diag_on_line("lint/unused-imports", 2);
+    // Line 6 is `main = 1` — outside the import's declaration (lines 2..=3).
+    let request_range = Range {
+        start: lsp_types::Position {
+            line: 6,
+            character: 0,
+        },
+        end: lsp_types::Position {
+            line: 6,
+            character: 8,
+        },
+    };
+    let uri = Url::from_file_path("/fake/Main.ipe").expect("uri");
+    let actions = code_actions(
+        DbView {
+            db: &db,
+            root,
+            entry,
+        },
+        &["Main".to_owned()],
+        &uri,
+        request_range,
+        std::slice::from_ref(&lsp_diag),
+        src,
+        PositionEncoding::Utf16,
+    );
+    assert!(
+        actions.is_empty(),
+        "a request outside the import's declaration must yield no action: {actions:?}"
+    );
+}
+
 #[test]
 fn edit_converges_error_then_clean() {
     let mut db = IpeDatabase::new();
