@@ -435,12 +435,85 @@ pub fn is_denylisted_public_env_name(name: &str) -> bool {
 }
 
 /// A discovered Ipê source file with its resolved module path.
+///
+/// Built only through [`DiscoveredModule::user`] or the crate-internal stdlib
+/// constructor, so the [`EntryProvenance`] cannot be set outside this crate.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiscoveredModule {
     /// Absolute path to the `.ipe` source file.
     pub path: PathBuf,
     /// Module path segments, e.g. `Lib/Utils.ipe` → `["Lib", "Utils"]`.
     pub module_path: Vec<String>,
+    /// Where the module's source comes from, fixed when it enters the graph.
+    provenance: EntryProvenance,
+}
+
+impl DiscoveredModule {
+    /// A user-authored module; its [`EntryRole`] derives from `module_path`.
+    #[must_use]
+    pub fn user(path: PathBuf, module_path: Vec<String>) -> Self {
+        let role = EntryRole::of_module_path(&module_path);
+        Self {
+            path,
+            module_path,
+            provenance: EntryProvenance::User(role),
+        }
+    }
+
+    /// A compiled-source stdlib module: inserted by the injection closure, or
+    /// extracted for the API surface of an embedded stdlib module.
+    pub(crate) const fn embedded_stdlib(path: PathBuf, module_path: Vec<String>) -> Self {
+        Self {
+            path,
+            module_path,
+            provenance: EntryProvenance::EmbeddedStdlib,
+        }
+    }
+
+    /// Where the module's source comes from.
+    #[must_use]
+    pub const fn provenance(&self) -> EntryProvenance {
+        self.provenance
+    }
+}
+
+/// The provenance of a [`DiscoveredModule`] in the source graph.
+///
+/// Only ranks which capability-inference refusal is surfaced; it never gates
+/// trust — the trust tag the resolver checks is [`ipe_canon::ModuleOrigin`].
+/// Only a user module carries an [`EntryRole`]: an injected stdlib module is
+/// never a package's `Main`, so that combination has no representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryProvenance {
+    /// A module the package author wrote, discovered under the source root.
+    User(EntryRole),
+    /// A compiled-source stdlib module injected from `ipe`'s embed table.
+    ///
+    /// Only [`inject_compiled_std_closure`] mints this provenance, and only for
+    /// a module it actually inserted, so a user file squatting on a stdlib path
+    /// stays [`EntryProvenance::User`].
+    EmbeddedStdlib,
+}
+
+/// The role a user module plays when lowered as its own entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryRole {
+    /// A module whose last path segment is `Main` — the program entry.
+    Main,
+    /// Any other user module.
+    Library,
+}
+
+impl EntryRole {
+    /// The role implied by a module path.
+    #[must_use]
+    pub fn of_module_path(module_path: &[String]) -> Self {
+        if module_path.last().is_some_and(|last| last == "Main") {
+            Self::Main
+        } else {
+            Self::Library
+        }
+    }
 }
 
 /// An import edge: the importing module's path and the imported module's path.
@@ -665,10 +738,7 @@ fn file_to_module(src_root: &Path, path: &Path) -> Option<DiscoveredModule> {
     if segments.is_empty() {
         return None;
     }
-    Some(DiscoveredModule {
-        path: path.to_path_buf(),
-        module_path: segments,
-    })
+    Some(DiscoveredModule::user(path.to_path_buf(), segments))
 }
 
 /// A Ipê module path segment must start with an ASCII uppercase letter and
@@ -741,7 +811,7 @@ where
 /// entry is inserted; if `sources` already holds the key (a user file squatting
 /// on `Ipe.Palette`, or an earlier injection), injection is skipped and the path
 /// is NOT tagged trusted. So a hostile `src/Std/Palette.ipe` is canonicalised as
-/// `ModuleOrigin::User` and stays IPE-N0025-rejected.
+/// `ipe_canon::ModuleOrigin::User` and stays IPE-N0025-rejected.
 ///
 /// Efficiency (design §7): the worklist is seeded only from imports that match a
 /// compiled-source module, so a build that imports none does zero work.
@@ -756,10 +826,10 @@ pub fn inject_compiled_std_closure(
         sources,
         extract_imports_from_source,
         |module_path, synth_path| {
-            discovered.push(DiscoveredModule {
-                path: synth_path.to_path_buf(),
-                module_path: module_path.to_vec(),
-            });
+            discovered.push(DiscoveredModule::embedded_stdlib(
+                synth_path.to_path_buf(),
+                module_path.to_vec(),
+            ));
         },
     )
 }
@@ -837,14 +907,11 @@ import String
     #[test]
     fn topological_order_two_modules() {
         let modules = vec![
-            DiscoveredModule {
-                path: PathBuf::from("src/Main.ipe"),
-                module_path: vec!["Main".to_owned()],
-            },
-            DiscoveredModule {
-                path: PathBuf::from("src/Lib/Utils.ipe"),
-                module_path: vec!["Lib".to_owned(), "Utils".to_owned()],
-            },
+            DiscoveredModule::user(PathBuf::from("src/Main.ipe"), vec!["Main".to_owned()]),
+            DiscoveredModule::user(
+                PathBuf::from("src/Lib/Utils.ipe"),
+                vec!["Lib".to_owned(), "Utils".to_owned()],
+            ),
         ];
         let order = topological_order(&modules, &["Main".to_owned()], |path| {
             if path == ["Main".to_owned()] {
@@ -881,10 +948,10 @@ import String
                     .to_owned(),
             ),
         );
-        let mut discovered = vec![DiscoveredModule {
-            path: PathBuf::from("src/Main.ipe"),
-            module_path: vec!["Main".to_owned()],
-        }];
+        let mut discovered = vec![DiscoveredModule::user(
+            PathBuf::from("src/Main.ipe"),
+            vec!["Main".to_owned()],
+        )];
 
         let injected = super::inject_compiled_std_closure(&mut sources, &mut discovered);
 
@@ -908,10 +975,10 @@ import String
                 "module Main exposing (main)\nmain = 0\n".to_owned(),
             ),
         );
-        let mut discovered = vec![DiscoveredModule {
-            path: PathBuf::from("src/Main.ipe"),
-            module_path: vec!["Main".to_owned()],
-        }];
+        let mut discovered = vec![DiscoveredModule::user(
+            PathBuf::from("src/Main.ipe"),
+            vec!["Main".to_owned()],
+        )];
 
         let injected = super::inject_compiled_std_closure(&mut sources, &mut discovered);
         assert!(
@@ -944,14 +1011,8 @@ import String
             ),
         );
         let mut discovered = vec![
-            DiscoveredModule {
-                path: PathBuf::from("src/Main.ipe"),
-                module_path: vec!["Main".to_owned()],
-            },
-            DiscoveredModule {
-                path: PathBuf::from("src/Std/Palette.ipe"),
-                module_path: palette.clone(),
-            },
+            DiscoveredModule::user(PathBuf::from("src/Main.ipe"), vec!["Main".to_owned()]),
+            DiscoveredModule::user(PathBuf::from("src/Std/Palette.ipe"), palette.clone()),
         ];
 
         let injected = super::inject_compiled_std_closure(&mut sources, &mut discovered);
@@ -970,14 +1031,8 @@ import String
     #[test]
     fn topological_order_detects_cycle() {
         let modules = vec![
-            DiscoveredModule {
-                path: PathBuf::from("src/A.ipe"),
-                module_path: vec!["A".to_owned()],
-            },
-            DiscoveredModule {
-                path: PathBuf::from("src/B.ipe"),
-                module_path: vec!["B".to_owned()],
-            },
+            DiscoveredModule::user(PathBuf::from("src/A.ipe"), vec!["A".to_owned()]),
+            DiscoveredModule::user(PathBuf::from("src/B.ipe"), vec!["B".to_owned()]),
         ];
         let result = topological_order(&modules, &["A".to_owned()], |path| {
             if path == ["A".to_owned()] {

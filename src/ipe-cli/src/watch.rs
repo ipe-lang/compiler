@@ -524,10 +524,10 @@ pub(crate) fn resolve_project_sources(
         .iter()
         .any(|m| m.module_path == entry_module_path)
     {
-        discovered.push(project::DiscoveredModule {
-            path: entry.to_path_buf(),
-            module_path: entry_module_path.clone(),
-        });
+        discovered.push(project::DiscoveredModule::user(
+            entry.to_path_buf(),
+            entry_module_path.clone(),
+        ));
     }
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     for m in &discovered {

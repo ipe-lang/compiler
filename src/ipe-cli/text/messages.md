@@ -244,9 +244,9 @@ ipe package audit-entry: expected a single entry-file path
 
 usage: ipe package audit-entry <packages/<name>.toml> [--index <root>] [--attested-actor <login>]
 
-## package-capability-inference-failed
+## package-capability-inference-no-module
 
-package capability inference: no module in the package could be lowered
+package capability inference: the package has no module to analyse
 
 ## package-manifest-name-required
 

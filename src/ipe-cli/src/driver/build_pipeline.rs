@@ -312,10 +312,10 @@ pub fn build_with_options(
 
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     sources.insert(entry_path.clone(), (entry.to_path_buf(), source.clone()));
-    let discovered = vec![project::DiscoveredModule {
-        path: entry.to_path_buf(),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        entry.to_path_buf(),
+        entry_path.clone(),
+    )];
 
     // No manifest on the single-file path — default to sqlite, matching the
     // documented `package.ipe` default for a project that has no database
@@ -565,10 +565,10 @@ pub fn ensure_entry_present(
         .iter()
         .any(|m| m.module_path == entry_module_path)
     {
-        discovered.push(project::DiscoveredModule {
-            path: entry.to_path_buf(),
-            module_path: entry_module_path.to_vec(),
-        });
+        discovered.push(project::DiscoveredModule::user(
+            entry.to_path_buf(),
+            entry_module_path.to_vec(),
+        ));
     }
 }
 

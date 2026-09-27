@@ -302,3 +302,54 @@ fn each_module_is_analyzed_once_per_package() -> Result<(), Box<dyn Error>> {
     assert_each_module_analyzed_once("once_unsafe", UNSAFE_AND_SIBLING_NETWORK, false)?;
     assert_each_module_analyzed_once("once_broken", NETWORK_CLOCK_WITH_BROKEN_SIBLING, true)
 }
+
+// ---------------------------------------------------------------------------
+// Every injected compiled-source stdlib module lowers as its own entry
+// ---------------------------------------------------------------------------
+
+/// A plain-`main` program importing `dotted`.
+fn importer_of(dotted: &str) -> Vec<(&'static str, String)> {
+    vec![(
+        "Main.ipe",
+        format!(
+            "module Main exposing (main)\nimport Ipe.Io as Io\nimport {dotted} as M\n\n\
+             main : Task Error ()\nmain =\n    Io.println \"ok\"\n"
+        ),
+    )]
+}
+
+/// Every module in `COMPILED_STD_MODULES` a package imports becomes its own
+/// capability-inference entry and lowers on its own.
+///
+/// The fold refuses a package when any entry fails, injected stdlib included,
+/// so a stdlib module that cannot lower alone would refuse every package that
+/// imports it. This pins that no such module exists.
+#[test]
+fn every_compiled_stdlib_module_lowers_as_its_own_entry() -> Result<(), Box<dyn Error>> {
+    let mut failures: Vec<String> = Vec::new();
+    for m in ipe_stdlib::COMPILED_STD_MODULES {
+        let files = importer_of(m.dotted);
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let dir = scratch_package(&format!("stdlib_entry_{}", m.dotted), &borrowed)?;
+        let package = PackageSourceSet::read(&dir.join("package.ipe"))?;
+        let segments: Vec<String> = m.dotted.split('.').map(str::to_owned).collect();
+        if !package
+            .entry_module_paths()
+            .any(|entry| entry == segments.as_slice())
+        {
+            failures.push(format!("{}: not injected as an inference entry", m.dotted));
+        } else if let Err(e) =
+            ipe::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &package)
+        {
+            failures.push(format!("{}: {e}", m.dotted));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+    assert!(
+        failures.is_empty(),
+        "every compiled-source stdlib module must lower as its own capability-\
+         inference entry, or every package importing it is refused:\n{}",
+        failures.join("\n"),
+    );
+    Ok(())
+}

@@ -2129,17 +2129,17 @@ pub fn verify_capabilities(
 ///
 /// Each discovered module is lowered as its own entry (with every sibling source
 /// present, so cross-module imports resolve) and their inferred capabilities are
-/// unioned. A module that fails to lower on its own — e.g. one that is only
-/// meaningful as a dependency of another — is skipped for the union rather than
-/// failing the whole inference, so a helper module never masks a sibling's real
-/// effect. Every entry links the WHOLE package source tree, exactly as
-/// `ipe build` does, so a module that does not compile at all (a name or type
-/// error, imported or not) fails every entry: the package is refused, never
-/// disclosed with that module's capabilities silently missing.
+/// unioned. Inference fails closed: when ANY entry fails to lower, the package
+/// is refused and nothing is disclosed, because a union over only the entries
+/// that lowered would silently drop the failing entry's capabilities from the
+/// consumer's consent surface. Every entry links the WHOLE package source tree,
+/// exactly as `ipe build` does, so a module that does not compile at all (a
+/// name or type error, imported or not) fails every entry and is refused the
+/// same way.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] / [`CliError::Io`] when the package cannot be read or
-/// no module lowers at all; the diagnostic is framed against the module that
+/// any entry fails to lower; the diagnostic is framed against the module that
 /// owns it.
 pub fn infer_package_capabilities(
     manifest_path: &Path,
@@ -2189,7 +2189,7 @@ impl PackageSourceSet {
         // Inject the FFI interface modules (installed crates + the asserted-call
         // `Rust.Ffi` module) exactly as the build does, so an FFI-using module
         // lowers here and its `native-ffi`/`ffi-raw` capabilities are inferred
-        // rather than the whole module being skipped on a resolve failure.
+        // instead of the package being refused on a resolve failure.
         let ffi_injected = ffi::prepare_ffi(&mut sources, manifest_path)?.injected;
         Ok(Self {
             sources,
@@ -2244,10 +2244,10 @@ impl PackageSourceSet {
 /// union is order-independent.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] when no module lowers (the entry `Main`'s diagnostic
-/// when it fails, else the first failure), framed against the module that owns
-/// it; [`CliError::Usage`] when the package
-/// has no module at all.
+/// [`CliError::Pipeline`] when any entry fails to lower (the entry `Main`'s
+/// diagnostic when it fails, else the first failure), framed against the
+/// module that owns it; [`CliError::Usage`] when the package has no module at
+/// all.
 pub fn infer_package_capabilities_in(
     db: &ipe_db::IpeDatabase,
     package: &PackageSourceSet,
@@ -2270,54 +2270,115 @@ pub fn infer_package_capabilities_in(
     }
     ipe_db::Db::interner(db).lock().set_fresh_avoid(fresh_avoid);
 
-    let mut inferred: std::collections::BTreeSet<ipe_ir::Capability> =
-        std::collections::BTreeSet::new();
-    let mut any_lowered = false;
-    // When nothing lowers, the entry module's real diagnostic is far more useful
-    // than a generic "nothing lowered". Keep the best candidate to surface: the
-    // entry module `Main` if it fails, otherwise the first failure seen.
-    let mut lowering_error: Option<CliError> = None;
+    // The fold consumes every entry (never short-circuits), so each entry is
+    // lowered exactly once and the surfaced refusal is the most actionable one.
+    aggregate_entry_inferences(
+        package
+            .entries
+            .iter()
+            .map(|m| (m.provenance(), infer_entry(db, source_root, package, m))),
+    )
+}
 
-    // Lower each module as its own entry. A module that does not lower
-    // standalone is skipped, never fatal — its capabilities, if any, surface
-    // through whichever sibling does reach it.
-    for m in &package.entries {
-        let Some(entry_file) = source_root.files(db).get(&m.module_path).copied() else {
-            continue;
-        };
-        match ipe_db::lower_program(db, source_root, entry_file) {
-            Ok(program) => {
-                inferred.extend(capabilities_including_served_widgets(
-                    db,
-                    source_root,
-                    entry_file,
-                    program,
-                ));
-                any_lowered = true;
-            }
-            Err((diag, home)) => {
-                let is_entry = m.module_path.last().map(String::as_str) == Some("Main");
-                if lowering_error.is_none() || is_entry {
-                    lowering_error = Some(attribute_entry_lowering_error(
-                        db,
-                        source_root,
-                        package,
-                        m,
-                        entry_file,
-                        diag.clone(),
-                        home,
-                    ));
+/// One entry's capability-inference outcome: its capability set, or the
+/// refusal that blocks the whole package.
+type EntryInference = Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError>;
+
+/// How early an entry's refusal is surfaced when several entries fail.
+///
+/// The user's `Main` first, then other user modules, then an injected stdlib
+/// module. A stdlib module failing to lower on its own is a compiler defect the
+/// author cannot act on, so a user diagnostic outranks it; it still refuses the
+/// package, because the stdlib is trusted to lower, not exempt from disclosure.
+const fn refusal_rank(provenance: project::EntryProvenance) -> u8 {
+    match provenance {
+        project::EntryProvenance::User(project::EntryRole::Main) => 0,
+        project::EntryProvenance::User(project::EntryRole::Library) => 1,
+        project::EntryProvenance::EmbeddedStdlib => 2,
+    }
+}
+
+/// Lower one package module as its own entry and infer its capabilities.
+///
+/// A lowering failure is a refusal framed against the module that owns it; an
+/// entry with no source file in the root is a refusal too, never a skip.
+fn infer_entry(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    package: &PackageSourceSet,
+    module: &project::DiscoveredModule,
+) -> EntryInference {
+    let Some(entry_file) = source_root.files(db).get(&module.module_path).copied() else {
+        return Err(CliError::Pipeline {
+            file: module.path.clone(),
+            src: package
+                .sources
+                .get(&module.module_path)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default(),
+            diag: Box::new(Diagnostic::CompilerBug {
+                where_: "ipe.infer_package_capabilities",
+                detail: format!(
+                    "entry module {} has no source file in the package root",
+                    module.module_path.join(".")
+                ),
+            }),
+        });
+    };
+    match ipe_db::lower_program(db, source_root, entry_file) {
+        Ok(program) => Ok(capabilities_including_served_widgets(
+            db,
+            source_root,
+            entry_file,
+            program,
+        )),
+        Err((diag, home)) => Err(attribute_entry_lowering_error(
+            db,
+            source_root,
+            package,
+            module,
+            entry_file,
+            diag.clone(),
+            home,
+        )),
+    }
+}
+
+/// Fold every entry's outcome into the package's disclosed capability set.
+///
+/// Fails closed: any refused entry refuses the whole package, since a union
+/// over only the entries that lowered would under-disclose the consumer's
+/// consent surface. An injected stdlib entry is folded under the same rule as
+/// a user entry; its provenance only lowers the precedence of its refusal (see
+/// [`refusal_rank`]), ties going to the first in entry order.
+///
+/// # Errors
+/// The selected entry refusal; [`CliError::Usage`] when there is no entry.
+fn aggregate_entry_inferences(
+    outcomes: impl IntoIterator<Item = (project::EntryProvenance, EntryInference)>,
+) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+    let mut union: std::collections::BTreeSet<ipe_ir::Capability> =
+        std::collections::BTreeSet::new();
+    let mut refusal: Option<(u8, CliError)> = None;
+    let mut any_entry = false;
+    for (provenance, outcome) in outcomes {
+        any_entry = true;
+        match outcome {
+            Ok(capabilities) => union.extend(capabilities),
+            Err(err) => {
+                let rank = refusal_rank(provenance);
+                if refusal.as_ref().is_none_or(|(held, _)| rank < *held) {
+                    refusal = Some((rank, err));
                 }
             }
         }
     }
-
-    if any_lowered {
-        Ok(inferred)
-    } else {
-        // Surface the real reason the entry could not be lowered, not a generic
-        // "nothing lowered" that hides the actual compiler diagnostic.
-        Err(lowering_error.unwrap_or(CliError::Usage(text::package_capability_inference_failed())))
+    match (refusal, any_entry) {
+        (Some((_, err)), _) => Err(err),
+        (None, true) => Ok(union),
+        (None, false) => Err(CliError::Usage(
+            text::package_capability_inference_no_module(),
+        )),
     }
 }
 
@@ -3087,5 +3148,128 @@ mod pack_gate_tests {
                 .expect("classification must succeed");
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
         assert!(!cap.wasm_enabled, "mode=None must set wasm_enabled=false");
+    }
+}
+
+// ── Capability-inference fold refusals ───────────────────────────────────────
+//
+// The fold over per-entry outcomes is the package's disclosure verdict: a
+// failed entry must refuse the package, never shrink the disclosed set.
+
+#[cfg(test)]
+mod capability_fold_tests {
+    use super::*;
+    use ipe_ir::Capability;
+    use std::collections::BTreeSet;
+
+    const MAIN: project::EntryProvenance = project::EntryProvenance::User(project::EntryRole::Main);
+    const SIBLING: project::EntryProvenance =
+        project::EntryProvenance::User(project::EntryRole::Library);
+    const STDLIB: project::EntryProvenance = project::EntryProvenance::EmbeddedStdlib;
+
+    fn set(capabilities: &[Capability]) -> BTreeSet<Capability> {
+        capabilities.iter().copied().collect()
+    }
+
+    const fn refused(reason: &'static str) -> EntryInference {
+        Err(CliError::Usage(reason))
+    }
+
+    /// One entry lowers with network access while its sibling fails to lower.
+    ///
+    /// The package is refused, and the lowered entry's set is not disclosed.
+    #[test]
+    fn a_failed_sibling_refuses_the_package_instead_of_under_disclosing() {
+        let verdict = aggregate_entry_inferences([
+            (MAIN, Ok(set(&[Capability::Network]))),
+            (SIBLING, refused("sibling failed to lower")),
+        ]);
+        assert!(
+            matches!(verdict, Err(CliError::Usage("sibling failed to lower"))),
+            "expected the sibling's refusal, got {verdict:?}"
+        );
+    }
+
+    /// A failed entry refuses the package whatever its position in entry order.
+    #[test]
+    fn a_failed_entry_refuses_regardless_of_order() {
+        let verdict = aggregate_entry_inferences([
+            (SIBLING, refused("first entry failed")),
+            (MAIN, Ok(set(&[Capability::Network]))),
+            (SIBLING, Ok(set(&[Capability::Unsafe]))),
+        ]);
+        assert!(
+            matches!(verdict, Err(CliError::Usage("first entry failed"))),
+            "expected the failed entry's refusal, got {verdict:?}"
+        );
+    }
+
+    /// When several entries fail, the `Main` entry's refusal is surfaced.
+    #[test]
+    fn the_main_entry_refusal_is_preferred() {
+        let verdict = aggregate_entry_inferences([
+            (SIBLING, refused("sibling failed")),
+            (MAIN, refused("main failed")),
+            (SIBLING, refused("later sibling failed")),
+        ]);
+        assert!(
+            matches!(verdict, Err(CliError::Usage("main failed"))),
+            "expected the Main entry's refusal, got {verdict:?}"
+        );
+    }
+
+    /// A failed injected stdlib entry refuses the package even when every user
+    /// entry lowers: trusted stdlib is never exempt from the fail-closed fold.
+    #[test]
+    fn a_failed_stdlib_entry_refuses_the_package() {
+        let verdict = aggregate_entry_inferences([
+            (MAIN, Ok(set(&[Capability::Network]))),
+            (STDLIB, refused("stdlib entry failed")),
+            (SIBLING, Ok(set(&[]))),
+        ]);
+        assert!(
+            matches!(verdict, Err(CliError::Usage("stdlib entry failed"))),
+            "expected the stdlib entry's refusal, got {verdict:?}"
+        );
+    }
+
+    /// A user entry's refusal outranks a stdlib entry's, whatever the order.
+    #[test]
+    fn a_user_refusal_is_preferred_over_a_stdlib_refusal() {
+        let verdict = aggregate_entry_inferences([
+            (STDLIB, refused("stdlib entry failed")),
+            (SIBLING, refused("sibling failed")),
+        ]);
+        assert!(
+            matches!(verdict, Err(CliError::Usage("sibling failed"))),
+            "expected the user entry's refusal, got {verdict:?}"
+        );
+    }
+
+    /// A package with no entry is refused, never disclosed as capability-free.
+    #[test]
+    fn a_package_without_entries_is_refused() {
+        let verdict = aggregate_entry_inferences(std::iter::empty());
+        assert!(
+            matches!(verdict, Err(CliError::Usage(_))),
+            "expected a refusal, got {verdict:?}"
+        );
+    }
+
+    /// When every entry lowers, the disclosed set is the union of all entries.
+    #[test]
+    fn every_entry_lowered_discloses_the_union() {
+        let verdict = aggregate_entry_inferences([
+            (MAIN, Ok(set(&[Capability::Network]))),
+            (SIBLING, Ok(set(&[Capability::Unsafe]))),
+            (SIBLING, Ok(set(&[]))),
+        ]);
+        let expected: BTreeSet<Capability> = [Capability::Network, Capability::Unsafe]
+            .into_iter()
+            .collect();
+        assert!(
+            matches!(&verdict, Ok(set) if *set == expected),
+            "expected the union {expected:?}, got {verdict:?}"
+        );
     }
 }

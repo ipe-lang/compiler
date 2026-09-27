@@ -164,10 +164,10 @@ pub fn read_tree(root: &Path) -> Result<BTreeMap<ModulePath, (PathBuf, String)>,
             .and_then(|s| s.to_str())
             .unwrap_or("Main")
             .to_owned();
-        vec![project::DiscoveredModule {
-            path: root.to_path_buf(),
-            module_path: vec![stem],
-        }]
+        vec![project::DiscoveredModule::user(
+            root.to_path_buf(),
+            vec![stem],
+        )]
     };
 
     let mut sources = BTreeMap::new();
@@ -407,10 +407,7 @@ pub fn extract_tree(root: &Path) -> Result<PublicApi, DiffError> {
     let mut prepared: BTreeMap<Vec<String>, (PathBuf, String)> = sources.clone();
     let mut discovered: Vec<project::DiscoveredModule> = sources
         .iter()
-        .map(|(p, (path, _))| project::DiscoveredModule {
-            path: path.clone(),
-            module_path: p.clone(),
-        })
+        .map(|(p, (path, _))| project::DiscoveredModule::user(path.clone(), p.clone()))
         .collect();
     let injected = project::inject_compiled_std_closure(&mut prepared, &mut discovered);
     let source_root = crate::create_source_root(&db, &prepared, &injected, &BTreeSet::new());
@@ -440,10 +437,10 @@ pub fn extract_stdlib_module(segments: &[String], source: &str) -> Result<Public
     let synth_path = PathBuf::from("<embedded-stdlib>").join(segments.join("."));
     prepared.insert(segments.to_vec(), (synth_path.clone(), source.to_owned()));
 
-    let mut discovered = vec![project::DiscoveredModule {
-        path: synth_path,
-        module_path: segments.to_vec(),
-    }];
+    let mut discovered = vec![project::DiscoveredModule::embedded_stdlib(
+        synth_path,
+        segments.to_vec(),
+    )];
 
     // Inject the module's compiled-source import closure, then mark the target
     // itself as embedded stdlib so it may declare into the reserved namespace.

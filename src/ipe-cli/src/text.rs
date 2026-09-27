@@ -445,8 +445,8 @@ messages! {
     package_audit_entry_single_path = "package-audit-entry-single-path";
     /// `ipe package audit-entry` without its entry-file path.
     package_audit_entry_usage = "package-audit-entry-usage";
-    /// No module in the package could be lowered for capability inference.
-    package_capability_inference_failed = "package-capability-inference-failed";
+    /// Capability inference over a package with no module to analyse.
+    package_capability_inference_no_module = "package-capability-inference-no-module";
     /// `package.ipe` with no `name` field.
     package_manifest_name_required = "package-manifest-name-required";
     /// `package.ipe`'s source root does not exist.

@@ -54,10 +54,7 @@ fn prepared(user: &UserSources) -> (PreparedSources, BTreeSet<Vec<String>>) {
         .collect();
     let mut discovered: Vec<project::DiscoveredModule> = sources
         .iter()
-        .map(|(p, (path, _))| project::DiscoveredModule {
-            path: path.clone(),
-            module_path: p.clone(),
-        })
+        .map(|(p, (path, _))| project::DiscoveredModule::user(path.clone(), p.clone()))
         .collect();
     let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
     (sources, injected)
