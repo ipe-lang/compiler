@@ -179,6 +179,33 @@ impl InitShape {
             Self::Script => PACKAGE_SCRIPT_IPE,
         }
     }
+
+    /// The post-init "how to try it" hint for this shape.
+    ///
+    /// The single source of truth for the text, so a new shape cannot silently
+    /// inherit another shape's instructions. `web` is the one shape with a
+    /// runtime choice (spec § 0.1): `runtime` picks between its served and solo
+    /// wording; every other arm ignores it.
+    const fn open_hint(self, runtime: InitRuntime) -> &'static str {
+        match self {
+            Self::Web => match runtime {
+                InitRuntime::Served => {
+                    "Then open http://localhost:8000 and click the counter buttons."
+                }
+                InitRuntime::Solo => {
+                    "This is a `solo` app: `ipe run` serves the wasm bundle at \
+                     http://localhost:8000; open it and click the counter buttons."
+                }
+            },
+            Self::Tui => "Then press the Up/Down arrow keys to change the count; press q to quit.",
+            Self::Cli => {
+                "Then type a line to echo it back (each line bumps the count); type q to quit."
+            }
+            Self::Worker => "It logs three ticks and exits on its own — no interaction needed.",
+            Self::Server => "Then open http://localhost:8000 (or curl it) to see the response.",
+            Self::Script => "It prints its greeting and exits — no interaction needed.",
+        }
+    }
 }
 
 // ── runtime model ──────────────────────────────────────────────────────────────
@@ -378,6 +405,7 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
             &files,
             args.force,
             true,
+            InitShape::default(),
             InitRuntime::default(),
         );
     }
@@ -418,6 +446,7 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
         &files,
         args.force,
         false,
+        shape,
         runtime,
     )
 }
@@ -710,6 +739,7 @@ fn run_scaffold(
     files: &[ManagedFile],
     force: bool,
     lib: bool,
+    shape: InitShape,
     runtime: InitRuntime,
 ) -> Result<(), CliError> {
     let fresh = is_fresh_target(target_dir)?;
@@ -720,7 +750,7 @@ fn run_scaffold(
         if lib {
             print_next_steps_lib(target_arg, project_name);
         } else {
-            print_next_steps(target_arg, project_name, interactive, runtime);
+            print_next_steps(target_arg, project_name, interactive, shape, runtime);
         }
         if interactive && prompt_yes_no("Verify your toolchain now?", true) {
             let _ = health::run_health_inline();
@@ -1008,9 +1038,16 @@ const fn should_offer_health_check(is_tty: bool, force: bool) -> bool {
     is_tty && !force
 }
 
-/// Print the friendly next-steps message, tuned to the resolved runtime so the
-/// hint matches how the scaffolded app actually runs (spec § 0.1).
-fn print_next_steps(target_arg: &str, project_name: &str, interactive: bool, runtime: InitRuntime) {
+/// Print the friendly next-steps message, tuned to the resolved shape (and, for
+/// `web`, its runtime) so the hint matches how the scaffolded app actually runs
+/// (spec § 0.1).
+fn print_next_steps(
+    target_arg: &str,
+    project_name: &str,
+    interactive: bool,
+    shape: InitShape,
+    runtime: InitRuntime,
+) {
     let run_cmd = if target_arg == "." {
         "    ipe run".to_owned()
     } else {
@@ -1021,14 +1058,7 @@ fn print_next_steps(target_arg: &str, project_name: &str, interactive: bool, run
     } else {
         "\nTip: run  ipe health  to tune your toolchain for faster builds.\n".to_owned()
     };
-    // A `solo` app ships a self-contained client bundle; a `served` app serves itself.
-    let open_hint = match runtime {
-        InitRuntime::Served => "Then open http://localhost:8000 and click the counter buttons.",
-        InitRuntime::Solo => {
-            "This is a `solo` app: `ipe run` serves the wasm bundle at \
-             http://localhost:8000; open it and click the counter buttons."
-        }
-    };
+    let open_hint = shape.open_hint(runtime);
     let body = format!(
         "Created Ipê project `{project_name}`.\n\
          \n\
