@@ -424,6 +424,18 @@ pub struct ArtifactPaths {
     pub pkg_json: PathBuf,
 }
 
+/// The per-project namespace directory ipe keeps its caches in.
+///
+/// Every consumer (reserved-name refusal, audit symlink walk, cache
+/// discovery) derives from this one constant.
+pub const CACHE_NAMESPACE_DIR: &str = ".ipe";
+
+/// The project-relative FFI cache path components, namespace first.
+///
+/// [`FfiCache::at_project_root`] joins exactly these, so a no-follow walk over
+/// them visits every component the cache's writes and deletes traverse.
+pub const FFI_CACHE_COMPONENTS: [&str; 4] = [CACHE_NAMESPACE_DIR, "cache", "ffi", "rust"];
+
 /// The project-local FFI artifact cache (`<project>/.ipe/cache/ffi/rust`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfiCache {
@@ -435,7 +447,9 @@ impl FfiCache {
     #[must_use]
     pub fn at_project_root(project_root: &Path) -> Self {
         Self {
-            root: project_root.join(".ipe/cache/ffi/rust"),
+            root: FFI_CACHE_COMPONENTS
+                .iter()
+                .fold(project_root.to_path_buf(), |dir, c| dir.join(c)),
         }
     }
 
@@ -1559,6 +1573,21 @@ pub fn shake_bindings(source: &str, reached: &BTreeSet<String>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The cache root is exactly the project root joined with
+    /// [`FFI_CACHE_COMPONENTS`], which begins with the cache namespace — so
+    /// every consumer deriving from those components names the same directory
+    /// the driver writes and deletes.
+    #[test]
+    fn ffi_cache_root_is_the_components_path() {
+        let project = Path::new("/project");
+        let expected: PathBuf = std::iter::once(project.as_os_str())
+            .chain(FFI_CACHE_COMPONENTS.iter().map(std::ffi::OsStr::new))
+            .collect();
+        assert_eq!(FfiCache::at_project_root(project).root(), expected);
+        assert_eq!(expected, Path::new("/project/.ipe/cache/ffi/rust"));
+        assert_eq!(FFI_CACHE_COMPONENTS.first(), Some(&CACHE_NAMESPACE_DIR));
+    }
 
     // ── source gates ────────────────────────────────────────────────────
 

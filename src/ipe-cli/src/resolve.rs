@@ -360,7 +360,7 @@ fn manifest_path(project_root: &Path) -> PathBuf {
 /// join and reroot the cache directory outside the project.
 fn package_cache_dir(project_root: &Path, name: &PackageName, version: &str) -> PathBuf {
     project_root
-        .join(".ipe")
+        .join(crate::output_dir::CACHE_NAMESPACE_DIR)
         .join("packages")
         .join(format!("{}-{version}", name.as_str()))
 }

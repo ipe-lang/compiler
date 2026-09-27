@@ -638,7 +638,8 @@ impl WrapperScan {
     /// # Errors
     /// [`CliError::Io`] on a failure to read the FFI wrapper cache.
     pub fn over_package(root: &Path) -> Result<Self, CliError> {
-        let cache_root = root.join(".ipe/cache/ffi/rust");
+        let cache = ipe_ffi::driver::FfiCache::at_project_root(root);
+        let cache_root = cache.root();
         if !cache_root.is_dir() {
             // No author wrapper Rust: the static scan sees no reachable axis, so
             // it cannot veto a declared-but-unused reject. That is the correct
@@ -650,7 +651,7 @@ impl WrapperScan {
         }
         let mut sources: Vec<(String, String)> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
-        collect_bindings(&cache_root, &mut files)?;
+        collect_bindings(cache_root, &mut files)?;
         files.sort();
         for file in files {
             let src = crate::io_bounded::read_to_string_capped(

@@ -20,8 +20,10 @@ use ipe_ffi::pkginfo::FeatureName;
 use crate::CliError;
 use crate::text;
 
-/// The project-relative FFI cache directory.
-const CACHE_REL: &str = ".ipe/cache/ffi/rust";
+/// The FFI cache directory under `dir`, the same path the FFI driver writes.
+fn cache_dir_under(dir: &Path) -> PathBuf {
+    FfiCache::at_project_root(dir).root().to_path_buf()
+}
 
 /// The project manifest that bounds the upward cache-discovery walk.
 const PROJECT_MANIFEST: &str = "package.ipe";
@@ -77,7 +79,7 @@ pub fn find_cache_root(start: &Path) -> Result<Option<PathBuf>, CliError> {
         start.parent()
     };
     while let Some(d) = dir {
-        let candidate = d.join(CACHE_REL);
+        let candidate = cache_dir_under(d);
         if candidate.is_dir() {
             if is_trusted_cache_dir(&candidate) {
                 return Ok(Some(candidate));
@@ -3831,7 +3833,7 @@ version = \"1\"
         let tmp = std::env::temp_dir().join(format!("ipe-t1-cacheroot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // Ancestor cache (a planted vector) ABOVE the project root.
-        let ancestor_cache = tmp.join(CACHE_REL);
+        let ancestor_cache = cache_dir_under(tmp.as_path());
         std::fs::create_dir_all(&ancestor_cache).expect("mk ancestor cache");
         // The project root, with its own package.ipe, one level down; no cache.
         let project = tmp.join("proj");
@@ -3854,7 +3856,7 @@ version = \"1\"
     fn owned_project_cache_is_discovered() {
         let tmp = std::env::temp_dir().join(format!("ipe-t1-owncache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let cache = tmp.join(CACHE_REL);
+        let cache = cache_dir_under(tmp.as_path());
         std::fs::create_dir_all(&cache).expect("mk cache");
         std::fs::write(
             tmp.join("package.ipe"),
@@ -3873,7 +3875,7 @@ version = \"1\"
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = std::env::temp_dir().join(format!("ipe-t1-wwcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let cache = tmp.join(CACHE_REL);
+        let cache = cache_dir_under(tmp.as_path());
         std::fs::create_dir_all(&cache).expect("mk cache");
         std::fs::write(
             tmp.join("package.ipe"),
