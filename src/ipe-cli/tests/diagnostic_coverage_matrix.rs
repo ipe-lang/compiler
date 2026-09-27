@@ -118,11 +118,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "refusal-tested",
-        "IPE-L0118",
-        "Web.appRouted gate not yet reached by any constant assertion or wire literal",
-    ),
-    (
-        "refusal-tested",
         "IPE-L0121",
         "succeed arity gate not yet reached by any constant assertion or wire literal",
     ),

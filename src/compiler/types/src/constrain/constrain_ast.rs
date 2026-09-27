@@ -894,6 +894,21 @@ impl Builder<'_> {
                 });
                 return Ok(var);
             }
+            // `Web.appRouted` — REACHABLE-BUT-UNLOWERED (see
+            // `REACHABLE_BUT_UNLOWERED` in `constrain/tests/mod.rs`): the kernel
+            // has a runtime fn and a canon qualifier, so a user program can name
+            // it, but routed-live lowering isn't implemented, so it must fail
+            // closed with its OWN diagnostic rather than the generic registry-miss
+            // fallback below. Checked here, before the "Parse-once registry
+            // lookup" fallback, so the specific `IPE-L0118` wins over the generic
+            // `IPE-L0108` that a bare registry miss would otherwise report —
+            // `Web.appRouted` never reaches `kernel_scheme_or_unsupported`.
+            if matches!(k, StdlibKernel::WebAppRouted) {
+                return Err(Diagnostic::Lower {
+                    span,
+                    msg: LowerError::Unsupported(Feature::RoutedWebApp),
+                });
+            }
         }
         // ── Parse-once registry lookup ──
         //
@@ -901,10 +916,11 @@ impl Builder<'_> {
         // WILDCARD-FREE, so every reachable kernel resolves via the
         // `StdlibKernel` id. There is no legacy string-keyed `kernel_ty`
         // table carrying a `Ty::Var(u32::MAX)` exit-0 sentinel for un-typed
-        // kernels. A `None` id (FFI `Rust.*`) or an excluded bucket
-        // (`WebAppRouted` — unlowered) misses the registry and is
+        // kernels. A `None` id (FFI `Rust.*`) misses the registry and is
         // fail-closed with IPE-L0108 (loud) via `kernel_scheme_or_unsupported`,
         // never silently typed as a free variable that `cargo` later rejects.
+        // `WebAppRouted` is excluded from this generic path entirely — it has
+        // its own dedicated, more specific fail-closed arm above (`IPE-L0118`).
         let _ = (module, name); // retained for diagnostics
         // Route through `resolve_scheme`, not `stdlib_scheme` directly, so a
         // kernel carrying a structural `TyShape` resolves via the interpreter and

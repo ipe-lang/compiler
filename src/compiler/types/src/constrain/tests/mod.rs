@@ -3,7 +3,7 @@ mod registry_phase_c_tests {
     use super::super::{
         Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind,
     };
-    use ipe_diagnostics::Span;
+    use ipe_diagnostics::{IPE_L0118, Span};
     use ipe_intern::Interner;
     use ipe_kernels::StdlibKernel;
 
@@ -1827,8 +1827,11 @@ mod registry_phase_c_tests {
     ///
     /// The legacy string table is DELETED and
     /// `constrain_var_kernel` passes `None` for the legacy slot, so a registry
-    /// miss (`None` id, or a `REACHABLE_BUT_UNLOWERED` bucket) reaches this exact
-    /// `Err` live in the constrain path — the seal that removed the exit-0 hole.
+    /// miss (a `None` id, or any other kernel with no scheme and no dedicated
+    /// arm) reaches this exact `Err` live in the constrain path — the seal that
+    /// removed the exit-0 hole. A `REACHABLE_BUT_UNLOWERED` kernel with its own
+    /// dedicated diagnostic (`WebAppRouted` → `IPE-L0118`) is intercepted before
+    /// reaching this generic fallback; see `constrain_var_kernel`.
     #[test]
     fn both_miss_is_fail_closed() {
         let span = Span::DUMMY;
@@ -1863,6 +1866,42 @@ mod registry_phase_c_tests {
         assert_eq!(
             Builder::kernel_scheme_or_unsupported(Some(a.clone()), Some(b), span),
             Ok(a),
+        );
+    }
+
+    /// `Web.appRouted` (`REACHABLE_BUT_UNLOWERED`) must fail closed with its OWN
+    /// specific `IPE-L0118` (`Feature::RoutedWebApp`), never the generic
+    /// registry-miss `IPE-L0108` (`Feature::Kernels`) that a bare `None` scheme
+    /// would otherwise report. This drives the real `constrain_var_kernel` tie
+    /// site — the exact path a `Web.appRouted cfg` reference walks — proving the
+    /// more specific refusal wins where it applies, while `both_miss_is_fail_closed`
+    /// (above) proves the generic `IPE-L0108` fallback still fires for a bare
+    /// registry miss with no dedicated arm. Both refusals must hold.
+    #[test]
+    fn web_app_routed_fails_closed_with_l0118_not_l0108() {
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let dummy = interner.intern("_").expect("intern placeholder symbol");
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+
+        let err = builder
+            .constrain_var_kernel(Some(StdlibKernel::WebAppRouted), dummy, dummy, Span::DUMMY)
+            .expect_err("Web.appRouted must fail closed, not type-check");
+        assert!(
+            matches!(
+                err,
+                Diagnostic::Lower {
+                    msg: LowerError::Unsupported(Feature::RoutedWebApp),
+                    ..
+                }
+            ),
+            "expected Feature::RoutedWebApp for Web.appRouted, got {err:?}",
+        );
+        assert_eq!(
+            err.code(),
+            IPE_L0118,
+            "Web.appRouted must surface the dedicated IPE-L0118, not the generic IPE-L0108",
         );
     }
 
