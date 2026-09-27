@@ -673,7 +673,7 @@ fn file_to_module(src_root: &Path, path: &Path) -> Option<DiscoveredModule> {
 
 /// A Ipê module path segment must start with an ASCII uppercase letter and
 /// contain only ASCII alphanumerics and `_`.
-fn is_module_segment(s: &str) -> bool {
+pub(crate) fn is_module_segment(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_uppercase() => chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
