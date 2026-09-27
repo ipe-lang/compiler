@@ -2,4 +2,4 @@ module Main exposing (report)
 
 
 report records =
-    List.map fmt (List.filter live records)
+    String.concat (List.map fmt (List.filter live records))

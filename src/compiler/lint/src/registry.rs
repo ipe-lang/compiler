@@ -52,7 +52,7 @@ pub const RULES: &[RuleInfo] = &[
     },
     RuleInfo {
         name: "prefer-pipeline",
-        summary: "a nested call chain that reads clearer left-to-right as a |> pipeline",
+        summary: "a call chain nested two paren levels deep that reads clearer as a `|>` or `<|` pipe chain",
         default_severity: Severity::Warn,
         fixable: true,
     },
@@ -89,6 +89,30 @@ pub const RULES: &[RuleInfo] = &[
     RuleInfo {
         name: "no-empty-icon-button-label",
         summary: "a Ui.iconButton label that is empty or whitespace-only leaves the control nameless to assistive tech",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "multiline-lambda-arg",
+        summary: "a lambda spanning several lines passed inline as a call argument instead of bound by name",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-bool-literal-compare",
+        summary: "an `==` / `/=` comparison against a `True` / `False` literal",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-redundant-bool-if",
+        summary: "an `if` whose branches are both `Bool` literals, restating its condition",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-simple-let-body",
+        summary: "a `let` whose body only returns the name its last binding introduces",
         default_severity: Severity::Warn,
         fixable: false,
     },

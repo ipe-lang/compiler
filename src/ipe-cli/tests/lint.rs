@@ -140,7 +140,7 @@ fn prefer_pipeline_reports_and_fixes() -> TestResult {
         "the fix rewrote the nested call:\n{fixed}"
     );
     assert!(
-        !fixed.contains("List.map fmt (List.filter"),
+        !fixed.contains("(List.map fmt (List.filter"),
         "the nested form is gone:\n{fixed}"
     );
 

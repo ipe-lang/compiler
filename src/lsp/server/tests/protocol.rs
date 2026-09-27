@@ -65,12 +65,10 @@ impl ProjectLoader for WorkspaceLoader {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn lint_ipe_workspace_config_is_respected() {
-    // Source that triggers the `prefer-pipeline` lint. The rule fires only on a
-    // genuine transform chain `outer a (inner b subject)` where BOTH calls carry
-    // a leading argument (arity >= 2) — a single wrap `f (g x)` is deliberately
-    // exempt — so the fixture must use the two-argument-each shape.
-    const LINT_SRC: &str =
-        "module Main exposing (main)\n\nmain =\n    List.map fmt (List.filter live records)\n";
+    // Source that triggers the `prefer-pipeline` lint. The rule fires only when
+    // a pipe chain would remove at least two paren levels — a single wrap
+    // `f (g x)` is deliberately exempt — so the fixture nests three calls.
+    const LINT_SRC: &str = "module Main exposing (main)\n\nmain =\n    String.concat (List.map fmt (List.filter live records))\n";
     const VIRTUAL_LINT_PATH: &str = "/ipe-lsp-lint-test/Main.ipe";
 
     // ── Round 1: deny severity → lint must appear as ERROR ────────────────

@@ -1061,8 +1061,7 @@ mod tests {
     #[test]
     fn fixes_are_idempotent() {
         // A nested call the prefer-pipeline rule rewrites; re-running finds none.
-        let src =
-            "module Main exposing (main)\n\nmain =\n    List.map fmt (List.filter live records)\n";
+        let src = "module Main exposing (main)\n\nmain =\n    String.concat (List.map fmt (List.filter live records))\n";
         let outcome = apply_fixes(&[module(src)], &LintConfig::default());
         assert_eq!(outcome.applied, 1, "one pipeline rewrite expected");
         let fixed = outcome
@@ -1079,17 +1078,16 @@ mod tests {
 
     /// When a nested call is a direct operand of a binary operator, the
     /// `--fix` replacement must be wrapped in parentheses.  Without parens,
-    /// `n * (List.map f (List.filter p xs))` would become
-    /// `n * xs |> List.filter p |> List.map f`, which re-parses as
-    /// `(n * xs) |> … |> …` — a completely different program.
+    /// `n * String.length (List.map f (List.filter p xs))` would become
+    /// `n * xs |> List.filter p |> List.map f |> String.length`, which re-parses
+    /// as `(n * xs) |> … |> …` — a completely different program.
     #[test]
     fn pipeline_fix_in_binop_operand_wraps_in_parens() {
-        // `n * List.map f (List.filter p xs)` — the nested call is a
-        // right-hand operand of `*`.
+        // The nested call is a right-hand operand of `*`.
         let src = concat!(
             "module Main exposing (main)\n\n",
             "main =\n",
-            "    n * List.map f (List.filter p xs)\n",
+            "    n * String.length (List.map f (List.filter p xs))\n",
         );
         let outcome = apply_fixes(&[module(src)], &LintConfig::default());
         assert_eq!(outcome.applied, 1, "one pipeline rewrite expected");
@@ -1100,7 +1098,7 @@ mod tests {
         // The replacement must be parenthesised so `*` still binds its original
         // operands.
         assert!(
-            fixed.contains("* (xs |> List.filter p |> List.map f)"),
+            fixed.contains("* (xs |> List.filter p |> List.map f |> String.length)"),
             "pipeline in binop operand must be parenthesised, got:\n{fixed}"
         );
     }
@@ -1112,7 +1110,7 @@ mod tests {
         let src = concat!(
             "module Main exposing (main)\n\n",
             "main =\n",
-            "    List.map fmt (List.filter live records)\n",
+            "    String.concat (List.map fmt (List.filter live records))\n",
         );
         let outcome = apply_fixes(&[module(src)], &LintConfig::default());
         assert_eq!(outcome.applied, 1, "one pipeline rewrite expected");
@@ -1233,7 +1231,7 @@ mod tests {
             "module Main exposing (listen)\n\n",
             "listen : Int -> String\n",
             "listen port =\n",
-            "    List.map fmt (List.filter live records)\n",
+            "    String.concat (List.map fmt (List.filter live records))\n",
         );
         let local_outcome = apply_fixes(&[module(src)], &LintConfig::default());
         // Build the post-local module list (as apply_and_report now does).

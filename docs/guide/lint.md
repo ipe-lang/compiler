@@ -45,14 +45,19 @@ still drive the ecosystem toward "invalid states unrepresentable".
 | `adjacent-bools` | Two or more adjacent `Bool` parameters that call sites cannot tell apart (`render True False` — which flag is which?). | advisory |
 | `wrapper-consistency` | A parameter that sibling exported APIs wrap as a newtype, but one signature leaves bare. | advisory |
 | `unsafe-convention` | A call to an `unsafe*` / `.Unsafe` escape hatch, surfaced so its use is deliberate and reviewed. | advisory |
-| `prefer-pipeline` | A nested call chain that reads clearer left-to-right as a `\|>` pipeline (`f (g x)` → `x \|> g \|> f`). | ✅ `--fix` |
+| `prefer-pipeline` | A call chain nested two paren levels deep. Both directions are offered as equally valid: `max 0 (min a (n + 1))` → `n + 1 \|> min a \|> max 0` or `max 0 <\| min a <\| n + 1`. A single wrap such as `f (g x)` is left alone. | ✅ `--fix` (applies the `\|>` form) |
+| `multiline-lambda-arg` | A lambda spanning several lines passed inline as a call argument; bind it by name in a `let` (or a `do`-block `let`) first. | advisory |
+| `no-bool-literal-compare` | A comparison against a `Bool` literal: `done == True` → `done`, `done /= True` → `not done`. | advisory |
+| `no-redundant-bool-if` | An `if` choosing between `Bool` literals: `if c then True else False` → `c`. | advisory |
+| `no-simple-let-body` | A `let` whose body only returns its last binding: `let total = a + b in total` → `a + b`. | advisory |
 
 An **advisory** rule reports and teaches but never rewrites your code: its remedy
-would change an exported signature and thread every call site, which is a design
-decision, not a mechanical edit. `prefer-pipeline` is the exception — `x |> f`
-desugars to exactly `f x`, so its rewrite is provably equivalent and `--fix`
-applies it safely. Re-running `ipe lint --fix` is idempotent: it reports "no
-machine-applicable fixes" once every fix has landed.
+is a decision — an exported signature to change and thread through every call
+site, a name to choose — not a mechanical edit. `prefer-pipeline` is the
+exception — `x |> f` and `f <| x` both desugar to exactly `f x`, so either
+rewrite is provably equivalent; `--fix` applies the `|>` form. Re-running
+`ipe lint --fix` is idempotent: it reports "no machine-applicable fixes" once
+every fix has landed.
 
 ## Configuring it — `lint.ipe`
 
