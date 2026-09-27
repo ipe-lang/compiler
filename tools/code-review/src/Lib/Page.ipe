@@ -1,0 +1,107 @@
+module Lib.Page exposing (PageBounds, PageError(..), boundsFor, first, limit, maxPageIndex, maxPageSize, offset, pageCount, pageErrorText, pageSize)
+
+import Ipe.String as String
+
+
+-- Units shown per queue page. The page is the unit of work: only its rows are
+-- fetched, only its source files are read, and only its uids are classified.
+pageSize : Int
+pageSize =
+    50
+
+
+-- Ceiling on any requested page size; a larger request clamps down to it.
+maxPageSize : Int
+maxPageSize =
+    200
+
+
+-- Ceiling on a page index. `maxPageIndex * maxPageSize` stays far inside
+-- `Int`, so the offset product can never overflow.
+maxPageIndex : Int
+maxPageIndex =
+    1000000
+
+
+-- A validated LIMIT/OFFSET pair. The constructor is not exported: every value
+-- comes from `boundsFor` or `first`, so the limit is always in
+-- 1..maxPageSize and the offset is a non-negative multiple of it.
+type PageBounds
+    = PageBounds { offset : Int, limit : Int }
+
+
+type PageError
+    = NegativePageIndex Int
+    | PageIndexPastCeiling Int
+
+
+pageErrorText : PageError -> String
+pageErrorText err =
+    case err of
+        NegativePageIndex i ->
+            "page index " ++ String.fromInt i ++ " is negative"
+
+        PageIndexPastCeiling i ->
+            "page index " ++ String.fromInt i ++ " is past the ceiling of " ++ String.fromInt maxPageIndex
+
+
+-- Bounds for page `pageIndex` (0-based) of `size` units. The size clamps to
+-- 1..maxPageSize; a negative index or one past `maxPageIndex` is refused
+-- before the offset is multiplied out.
+boundsFor : Int -> Int -> Result PageError PageBounds
+boundsFor pageIndex size =
+    let
+        clamped =
+            clampSize size
+    in
+    if pageIndex < 0 then
+        Err (NegativePageIndex pageIndex)
+
+    else if pageIndex > maxPageIndex then
+        Err (PageIndexPastCeiling pageIndex)
+
+    else
+        Ok (PageBounds { offset = pageIndex * clamped, limit = clamped })
+
+
+-- The first page at the default size.
+first : PageBounds
+first =
+    PageBounds { offset = 0, limit = pageSize }
+
+
+offset : PageBounds -> Int
+offset bounds =
+    case bounds of
+        PageBounds b ->
+            b.offset
+
+
+limit : PageBounds -> Int
+limit bounds =
+    case bounds of
+        PageBounds b ->
+            b.limit
+
+
+-- Number of pages `total` units span at `size` per page; at least 1, so an
+-- empty queue still has a (blank) first page.
+pageCount : Int -> Int -> Int
+pageCount total size =
+    let
+        clamped =
+            clampSize size
+    in
+    if total <= 0 then
+        1
+
+    else if modBy clamped total == 0 then
+        total // clamped
+
+    else
+        total // clamped + 1
+
+
+clampSize : Int -> Int
+clampSize size =
+    max 1 (min maxPageSize size)

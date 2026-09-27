@@ -1,5 +1,6 @@
 module Main exposing (main)
 
+import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
@@ -17,6 +18,7 @@ import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.Page as Page exposing (PageError(..))
 import Lib.Queue as Queue
 
 
@@ -207,7 +209,96 @@ allChecks db =
                 && Format.percent 0 0
                 == "0%"
             )
+        , Task.succeed
+            ( "formatBytes: binary units, one decimal"
+            , Format.formatBytes (ByteSize.bytes 50900992)
+                == "48.5 MiB"
+                && Format.formatBytes (ByteSize.bytes 0)
+                == "0 B"
+                && Format.formatBytes (ByteSize.bytes 1023)
+                == "1023 B"
+                && Format.formatBytes (ByteSize.bytes 1536)
+                == "1.5 KiB"
+                && Format.formatBytes (ByteSize.bytes 1073741824)
+                == "1.0 GiB"
+            )
+        , Task.succeed
+            ( "formatBytes: negative clamps to zero"
+            , Format.formatBytes (ByteSize.bytes (-5)) == "0 B"
+            )
+        , Task.succeed
+            ( "dbFileName: url, absolute path, bare name"
+            , Index.dbFileName "sqlite:///a/b/index.db?mode=ro"
+                == "index.db"
+                && Index.dbFileName "/x/.ipe-index/index.db"
+                == "index.db"
+                && Index.dbFileName "rel.db"
+                == "rel.db"
+                && Index.dbPathOf "sqlite:///a/b/index.db?mode=ro"
+                == "/a/b/index.db"
+                && Index.dbPathOf "/plain/index.db"
+                == "/plain/index.db"
+            )
+        , Task.succeed
+            ( "boundsFor: offset is index times size"
+            , boundsIs 2 50 100 50 && boundsIs 0 50 0 50
+            )
+        , Task.succeed
+            ( "boundsFor: page size clamps to 1..maxPageSize"
+            , boundsIs 0 0 0 1 && boundsIs 0 (-7) 0 1 && boundsIs 0 10000 0 Page.maxPageSize
+            )
+        , Task.succeed
+            ( "boundsFor: negative page index rejected"
+            , isNegativeIndex (Page.boundsFor (-1) 50)
+            )
+        , Task.succeed
+            ( "boundsFor: page index past ceiling rejected"
+            , isPastCeiling (Page.boundsFor (Page.maxPageIndex + 1) 50)
+                && isPastCeiling (Page.boundsFor 9223372036854775807 Page.maxPageSize)
+                && not (isPastCeiling (Page.boundsFor Page.maxPageIndex Page.maxPageSize))
+            )
+        , Task.succeed
+            ( "pageCount: ceiling division, at least one page"
+            , Page.pageCount 0 50
+                == 1
+                && Page.pageCount 100 50
+                == 2
+                && Page.pageCount 101 50
+                == 3
+                && Page.pageCount (-3) 50
+                == 1
+            )
         ]
+
+
+boundsIs : Int -> Int -> Int -> Int -> Bool
+boundsIs pageIndex size wantOffset wantLimit =
+    case Page.boundsFor pageIndex size of
+        Ok bounds ->
+            Page.offset bounds == wantOffset && Page.limit bounds == wantLimit
+
+        Err _ ->
+            False
+
+
+isNegativeIndex : Result PageError Page.PageBounds -> Bool
+isNegativeIndex result =
+    case result of
+        Err (NegativePageIndex _) ->
+            True
+
+        _ ->
+            False
+
+
+isPastCeiling : Result PageError Page.PageBounds -> Bool
+isPastCeiling result =
+    case result of
+        Err (PageIndexPastCeiling _) ->
+            True
+
+        _ ->
+            False
 
 
 isKeyword : String -> Token -> Bool
@@ -377,7 +468,7 @@ isUnknown lang =
 -- ── B3: ipe-index bridge ───────────────────────────────────────────────────
 --
 -- Seeds a scratch ipe-index database (units + change_queue) plus two source
--- files, then asks Lib.Index.loadPending for the queue and checks the loaded
+-- files, then asks Lib.Index.loadPendingPage for the queue and checks the loaded
 -- units' metadata and source slices.
 indexBridge : Task.Task Error Bool
 indexBridge =
@@ -395,7 +486,7 @@ indexBridge =
         |> Task.andThen File.remove
         |> Task.onError (\_ -> Task.succeed ())
         |> Task.andThen (\_ -> seedIndex indexDb repo)
-        |> Task.andThen (\_ -> Index.loadPending |> Task.map checkUnits)
+        |> Task.andThen (\_ -> Index.loadPendingPage Page.first |> Task.map checkUnits)
         |> Task.andThen (\ok -> cleanupIndex indexDb repo |> Task.map (\_ -> ok))
 
 
@@ -647,7 +738,7 @@ traversalPathsRejected =
         |> Task.andThen (\_ -> seedTraversalDb base)
         |> Task.andThen
             (\_ ->
-                Index.loadPending
+                Index.loadPendingPage Page.first
                     |> Task.map (\_ -> False)
                     |> Task.onError (\_ -> Task.succeed True)
             )
@@ -694,7 +785,7 @@ seedTraversalDb base =
 --
 -- A decided unit leaves the index queue: recordDrain writes the drain cursor
 -- (idempotent on the same pair), drainUnit deletes the consumed change_queue
--- row, and a subsequent loadPending no longer lists the unit.
+-- row, and a subsequent loadPendingPage no longer lists the unit.
 drainFlow : Task.Task Error Bool
 drainFlow =
     let
@@ -719,7 +810,7 @@ drainFlow =
         |> Task.andThen (\_ -> seedDrainDb indexDb)
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_DB" indexDb)
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
-        |> Task.andThen (\_ -> Index.loadPending)
+        |> Task.andThen (\_ -> Index.loadPendingPage Page.first)
         |> Task.map (\units -> List.length units == 1)
         |> Task.andThen
             (\queued ->
@@ -744,7 +835,7 @@ drainFlow =
 
                 else
                     Index.drainUnit "u-d"
-                        |> Task.andThen (\_ -> Index.loadPending)
+                        |> Task.andThen (\_ -> Index.loadPendingPage Page.first)
                         |> Task.map (\units -> List.length units == 0)
             )
         |> Task.andThen
@@ -899,7 +990,7 @@ changeReenqueue =
                                 |> Task.map (\_ -> db)
                         )
                     |> Task.andThen (\_ -> System.setenv "IPE_REVIEW_DB" reviewDb)
-                    |> Task.andThen (\_ -> Queue.load)
+                    |> Task.andThen (\_ -> Queue.loadPage Page.first)
             )
         |> Task.map
             (\units ->

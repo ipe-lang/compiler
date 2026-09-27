@@ -1,10 +1,12 @@
-module Lib.Queue exposing (QueuedUnit, load)
+module Lib.Queue exposing (QueuedUnit, classifyWith, loadPage)
 
-import Ipe.Db as Db
 import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
 import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb
 import Lib.Index as Index
+import Lib.Page exposing (PageBounds)
 
 
 -- A pending unit plus its resurfacing state. `changed` is Just the previous
@@ -16,42 +18,79 @@ type alias QueuedUnit =
     }
 
 
--- The queue as the review app sees it, one pass over both databases:
---
---   * a unit whose exact (uid, body_hash) pair was already decided is
---     hidden — the first review of a pair is final (B6) and the drain loop
---     already cleared it; a re-queued identical unit is a no-op;
---   * a unit decided on an older hash resurfaced at the head, flagged with
---     its previous review (B8 change re-enqueue);
---   * never-seen units keep the index's enqueue order after resurfaced ones.
-load : Task.Task Error (List QueuedUnit)
-load =
+-- One page of the queue as the review app sees it: the page's units from the
+-- index db plus every review row for their uids, fetched in one query.
+loadPage : PageBounds -> Task.Task Error (List QueuedUnit)
+loadPage bounds =
     do
         db <- LibDb.open
-        units <- Index.loadPending
-        classify db units
+        units <- Index.loadPendingPage bounds
+        reviews <- LibDb.findReviewsFor db (List.map (\u -> u.uid) units)
+        Task.fromResult (classifyWith reviews units)
 
 
-classify : Db.Db -> List Index.Unit -> Task.Task Error (List QueuedUnit)
-classify db units =
+-- Classifies a page of units against their review rows:
+--
+--   * a unit whose exact (uid, body_hash) pair was already decided is
+--     hidden — the first review of a pair is final and the drain loop
+--     already cleared it; a re-queued identical unit is a no-op;
+--   * a unit decided on an older hash resurfaces at the head of the page,
+--     flagged with its latest review (newest reviewed_at, then lowest
+--     body_hash);
+--   * never-seen units keep the index's enqueue order after resurfaced ones.
+--
+-- A malformed decision on the exact pair fails the page with a typed error.
+classifyWith : List LibDb.ReviewRow -> List Index.Unit -> Result Error (List QueuedUnit)
+classifyWith reviews units =
     units
-        |> List.map (classifyUnit db)
-        |> Task.sequence
-        |> Task.map prioritize
+        |> List.map (classifyUnit reviews)
+        |> Result.combine
+        |> Result.map prioritize
 
 
-classifyUnit : Db.Db -> Index.Unit -> Task.Task Error (Maybe QueuedUnit)
-classifyUnit db unit =
-    do
-        decided <- LibDb.findDecision db unit.uid unit.bodyHash
-        case decided of
-            Just _ ->
-                Task.succeed Nothing
+classifyUnit : List LibDb.ReviewRow -> Index.Unit -> Result Error (Maybe QueuedUnit)
+classifyUnit reviews unit =
+    let
+        forUid =
+            List.filter (\r -> r.uid == unit.uid) reviews
+    in
+    case List.head (List.filter (\r -> r.bodyHash == unit.bodyHash) forUid) of
+        Just exact ->
+            Result.map (\_ -> Nothing) (LibDb.decodeDecision exact)
 
-            Nothing ->
-                do
-                    old <- LibDb.findLatestForUid db unit.uid
-                    Task.succeed (Just { unit = unit, changed = old })
+        Nothing ->
+            Ok (Just { unit = unit, changed = latest forUid })
+
+
+latest : List LibDb.ReviewRow -> Maybe LibDb.ReviewRow
+latest rows =
+    List.foldl
+        (\row best ->
+            case best of
+                Just b ->
+                    if newer row b then
+                        Just row
+
+                    else
+                        best
+
+                Nothing ->
+                    Just row
+        )
+        Nothing
+        rows
+
+
+newer : LibDb.ReviewRow -> LibDb.ReviewRow -> Bool
+newer a b =
+    let
+        ta =
+            Timestamp.toUnixMillis a.reviewedAt
+
+        tb =
+            Timestamp.toUnixMillis b.reviewedAt
+    in
+    ta > tb || (ta == tb && a.bodyHash < b.bodyHash)
 
 
 prioritize : List (Maybe QueuedUnit) -> List QueuedUnit

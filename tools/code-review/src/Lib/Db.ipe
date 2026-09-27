@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), ReviewRow, findDecision, findDecisions, findLatestForUid, insertDecision, migrate, open, openAt, recordDrain)
+module Lib.Db exposing (Decision(..), ReviewRow, decodeDecision, findDecision, findDecisions, findReviewsFor, insertDecision, migrate, open, openAt, recordDrain)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -217,23 +217,24 @@ decodeDecision row =
             Err (Error.unexpected ("malformed review decision: " ++ other))
 
 
--- The most recent review row for a uid across all hashes, if any. Filter uses
--- `Store.eq .uid` (field name "uid" matches SRecord key "uid"); ordering uses
--- the snake_case column names the store knows ("reviewed_at", "body_hash");
--- in-Ipê sort + limit-1 via the query builder.
-findLatestForUid : Db -> String -> Task.Task Error (Maybe ReviewRow)
-findLatestForUid db uid =
-    case reviewStore of
-        Err e ->
-            Task.fail e
+-- Every review row for the given uids, across all body hashes, in one query:
+-- `Store.inList` binds each uid as a parameter. The caller passes one queue
+-- page of uids, so the IN list is bounded by the page size; an empty list
+-- runs no query.
+findReviewsFor : Db -> List String -> Task.Task Error (List ReviewRow)
+findReviewsFor db uids =
+    if List.isEmpty uids then
+        Task.succeed []
 
-        Ok store ->
-            Store.query store
-                |> Store.where (Store.eq .uid uid)
-                |> Store.orderDesc "reviewed_at"
-                |> Store.orderAsc "body_hash"
-                |> Store.limit 1
-                |> Store.toMaybe db
+    else
+        case reviewStore of
+            Err e ->
+                Task.fail e
+
+            Ok store ->
+                Store.query store
+                    |> Store.where (Store.inList .uid uids)
+                    |> Store.toList db
 
 
 -- One row of the drain cursor. `updatedAt` is a typed instant, bound as the

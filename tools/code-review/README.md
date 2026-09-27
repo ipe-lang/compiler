@@ -36,6 +36,18 @@ The index DB is opened read-only for listing and read-write only to delete a
 consumed `change_queue` row. `IPE_REVIEW_DB` is optional and defaults to
 `review.db` (the app creates and owns this database).
 
+## The queue page
+
+The header names the index DB by file name (hover it for the full location),
+its size in binary units — taken from SQLite's `page_count × page_size`, so no
+file-system call or shell-out is needed — and how many units are queued (one
+`COUNT(*)` over the same rows the pages list). The queue is paged 50 units at a
+time with Prev/Next controls: each page fetches only its own rows (bound
+`LIMIT`/`OFFSET` parameters), reads only its units' source files, and looks up
+their reviews in one query. Units whose code changed since their last review
+come first within each page. While a page loads the body says so, and a failed
+load shows its error rather than an empty queue.
+
 ## Running
 
 From the repo root:

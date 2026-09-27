@@ -26,6 +26,7 @@ import Lib.Highlight as Highlight exposing (Token(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.Page as Page
 import Lib.Queue as Queue
 
 
@@ -48,10 +49,20 @@ type alias HistoryRow =
     }
 
 
+-- A value fetched asynchronously: not yet arrived, arrived, or failed. The
+-- queue page renders each state distinctly, so a load still in flight is never
+-- mistaken for an empty queue.
+type Load a
+    = Loading
+    | Loaded a
+    | Failed String
+
+
 type alias Model =
     { page : Page
-    , queue : List Queue.QueuedUnit
-    , queueError : Maybe String
+    , queue : Load (List Queue.QueuedUnit)
+    , pageIndex : Int
+    , info : Load Index.IndexInfo
     , decidedThisPass : Int
     , refusingUid : Maybe String
     , refuseDraft : String
@@ -68,8 +79,9 @@ type alias Model =
 init : Web.WebReq -> ( Model, Cmd Msg )
 init req =
     ( { page = pageFor req.path
-      , queue = []
-      , queueError = Nothing
+      , queue = Loading
+      , pageIndex = 0
+      , info = Loading
       , decidedThisPass = 0
       , refusingUid = Nothing
       , refuseDraft = ""
@@ -82,7 +94,8 @@ init req =
       , selected = 0
       }
     , Cmd.batch
-        [ Cmd.perform Queue.load PendingLoaded
+        [ Cmd.perform (Queue.loadPage Page.first) (PendingLoaded 0)
+        , Cmd.perform Index.loadInfo InfoLoaded
         , pageCmd req.path
         ]
     )
@@ -121,7 +134,10 @@ reviewDb =
 
 
 type Msg
-    = PendingLoaded (Result Error (List Queue.QueuedUnit))
+    = PendingLoaded Int (Result Error (List Queue.QueuedUnit))
+    | InfoLoaded (Result Error Index.IndexInfo)
+    | NextPage
+    | PrevPage
     | ApproveUnit String
     | RefuseStart String
     | RefuseDraft String
@@ -139,13 +155,39 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        PendingLoaded result ->
+        PendingLoaded pageIndex result ->
+            if pageIndex /= model.pageIndex then
+                ( model, Cmd.none )
+
+            else
+                case result of
+                    Ok units ->
+                        ( { model | queue = Loaded units, refusingUid = Nothing, selected = clampIndex model.selected (List.length units) }, Cmd.none )
+
+                    Err e ->
+                        ( { model | queue = Failed ("Queue load failed: " ++ Error.toString e) }, Cmd.none )
+
+        InfoLoaded result ->
             case result of
-                Ok units ->
-                    ( { model | queue = units, refusingUid = Nothing, selected = clampIndex model.selected (List.length units) }, Cmd.none )
+                Ok info ->
+                    ( { model | info = Loaded info }, Cmd.none )
 
                 Err e ->
-                    ( { model | queue = [], queueError = Just (Error.toString e) }, Cmd.none )
+                    ( { model | info = Failed ("Index info failed: " ++ Error.toString e) }, Cmd.none )
+
+        NextPage ->
+            if hasNextPage model then
+                goToPage (model.pageIndex + 1) model
+
+            else
+                ( model, Cmd.none )
+
+        PrevPage ->
+            if model.pageIndex > 0 then
+                goToPage (model.pageIndex - 1) model
+
+            else
+                ( model, Cmd.none )
 
         ApproveUnit uid ->
             ( model, saveDecision model uid Approved )
@@ -168,7 +210,7 @@ update msg model =
                     ( { model | decidedThisPass = model.decidedThisPass + 1 }, drainAndReload model uid )
 
                 Err e ->
-                    ( { model | queueError = Just ("Decision save failed: " ++ Error.toString e) }, Cmd.none )
+                    ( { model | queue = Failed ("Decision save failed: " ++ Error.toString e) }, Cmd.none )
 
         ShowQueue ->
             ( { model | page = QueuePage }, Cmd.none )
@@ -193,10 +235,57 @@ update msg model =
                     ( { model | unitError = Just ("Unit load failed: " ++ Error.toString e) }, Cmd.none )
 
         KeyDown key ->
-            keyActionMsg (Keys.keyAction (model.refusingUid /= Nothing) (List.length model.queue) model.selected key) model
+            keyActionMsg (Keys.keyAction (model.refusingUid /= Nothing) (List.length (queueUnits model)) model.selected key) model
 
         SelectUnit i ->
-            ( { model | selected = clampIndex i (List.length model.queue) }, Cmd.none )
+            ( { model | selected = clampIndex i (List.length (queueUnits model)) }, Cmd.none )
+
+
+-- The units of the loaded page; empty while loading or after a failure.
+queueUnits : Model -> List Queue.QueuedUnit
+queueUnits model =
+    case model.queue of
+        Loaded units ->
+            units
+
+        Loading ->
+            []
+
+        Failed _ ->
+            []
+
+
+-- Moves to page `pageIndex`, refusing an out-of-range index before any query
+-- is built. A stale load for another page is dropped by `PendingLoaded`.
+goToPage : Int -> Model -> ( Model, Cmd Msg )
+goToPage pageIndex model =
+    case Page.boundsFor pageIndex Page.pageSize of
+        Ok bounds ->
+            ( { model | pageIndex = pageIndex, queue = Loading, selected = 0, refusingUid = Nothing }
+            , Cmd.perform (Queue.loadPage bounds) (PendingLoaded pageIndex)
+            )
+
+        Err e ->
+            ( { model | queue = Failed (Page.pageErrorText e) }, Cmd.none )
+
+
+-- Pages the pending count spans; 1 until the count has loaded.
+totalPages : Model -> Int
+totalPages model =
+    case model.info of
+        Loaded info ->
+            Page.pageCount info.pending Page.pageSize
+
+        Loading ->
+            1
+
+        Failed _ ->
+            1
+
+
+hasNextPage : Model -> Bool
+hasNextPage model =
+    model.pageIndex + 1 < totalPages model
 
 
 -- B10: every KeyAction dispatches the same Msg the matching button sends —
@@ -249,7 +338,7 @@ submitRefuse model uid =
 
 selectedUid : Model -> Maybe String
 selectedUid model =
-    case List.head (List.drop model.selected model.queue) of
+    case List.head (List.drop model.selected (queueUnits model)) of
         Just q ->
             Just q.unit.uid
 
@@ -267,7 +356,7 @@ saveDecision model uid decision =
     Cmd.perform
         (do
             db <- reviewDb
-            case bodyHashOf uid model.queue of
+            case bodyHashOf uid (queueUnits model) of
                 Just bodyHash ->
                     LibDb.insertDecision db uid bodyHash decision
 
@@ -280,22 +369,26 @@ saveDecision model uid decision =
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the
 -- consumed queue entry leaves the index queue and the drain cursor records
 -- the hand-off. A failure anywhere fails closed with the queue unchanged —
--- the unit stays visible with its badge and the next click retries.
+-- the unit stays visible with its badge and the next click retries. Only the
+-- current page and the header facts are reloaded.
 drainAndReload : Model -> String -> Cmd Msg
 drainAndReload model uid =
-    case bodyHashOf uid model.queue of
-        Nothing ->
-            Cmd.none
+    case ( bodyHashOf uid (queueUnits model), Page.boundsFor model.pageIndex Page.pageSize ) of
+        ( Just bodyHash, Ok bounds ) ->
+            Cmd.batch
+                [ Cmd.perform
+                    (do
+                        db <- reviewDb
+                        LibDb.recordDrain db uid bodyHash
+                        Index.drainUnit uid
+                        Queue.loadPage bounds
+                    )
+                    (PendingLoaded model.pageIndex)
+                , Cmd.perform Index.loadInfo InfoLoaded
+                ]
 
-        Just bodyHash ->
-            Cmd.perform
-                (do
-                    db <- reviewDb
-                    LibDb.recordDrain db uid bodyHash
-                    Index.drainUnit uid
-                    Queue.load
-                )
-                PendingLoaded
+        _ ->
+            Cmd.none
 
 
 bodyHashOf : String -> List Queue.QueuedUnit -> Maybe String
@@ -365,11 +458,34 @@ header model =
         , Border.widthEach { top = 0, right = 0, bottom = 1, left = 0 }
         ]
         [ Ui.el [ Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
+        , indexFacts model
         , Ui.el [ Ui.width Ui.fill ] Ui.none
         , navButton (model.page == QueuePage) "Queue" ShowQueue
         , navButton (model.page == HistoryPage) "History" ShowHistory
         , progressEl model
         ]
+
+
+-- The index db's file name (full location on hover), its size, and the
+-- pending-unit count, from one cheap aggregate load.
+indexFacts : Model -> Ui.Element Msg
+indexFacts model =
+    case model.info of
+        Loaded info ->
+            Ui.row
+                [ Ui.spacing 10, Font.size 12, Font.color (Ui.rgb 160 160 175) ]
+                [ Ui.el
+                    [ Font.family Font.monospace, Ui.htmlAttribute "title" info.location ]
+                    (Ui.text info.fileName)
+                , Ui.text (Format.formatBytes info.size)
+                , Ui.text (String.fromInt info.pending ++ " queued")
+                ]
+
+        Loading ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 120 120 135) ] (Ui.text "Loading index…")
+
+        Failed err ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 230 120 120) ] (Ui.text err)
 
 
 navButton : Bool -> String -> Msg -> Ui.Element Msg
@@ -396,7 +512,15 @@ progressEl model =
             model.decidedThisPass
 
         n =
-            k + List.length model.queue
+            case model.info of
+                Loaded info ->
+                    k + info.pending
+
+                Loading ->
+                    k + List.length (queueUnits model)
+
+                Failed _ ->
+                    k + List.length (queueUnits model)
 
         pct =
             Format.percent k n
@@ -461,42 +585,88 @@ pageBody model =
 
 queueBody : Model -> Ui.Element Msg
 queueBody model =
-    case model.queueError of
-        Just err ->
+    case model.queue of
+        Loading ->
+            Ui.text "Loading queue…"
+
+        Failed err ->
             Ui.text err
 
-        Nothing ->
-            if List.isEmpty model.queue then
-                Ui.text "No units queued yet."
+        Loaded units ->
+            if List.isEmpty units && model.pageIndex == 0 && not (hasNextPage model) then
+                Ui.text "No units queued."
 
             else
-                Ui.row
-                    [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16 ]
-                    [ queueRail model
-                    , Ui.column
-                        [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16, Ui.scrollbars ]
-                        [ hintLine
-                        , case selectedUnit model of
-                            Just q ->
-                                unitCard model True q
+                Ui.column
+                    [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 12 ]
+                    [ pageControls model
+                    , if List.isEmpty units then
+                        Ui.text "No units on this page."
 
-                            Nothing ->
-                                Ui.none
-                        ]
+                      else
+                        Ui.row
+                            [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16 ]
+                            [ queueRail model units
+                            , Ui.column
+                                [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16, Ui.scrollbars ]
+                                [ hintLine
+                                , case selectedUnit model of
+                                    Just q ->
+                                        unitCard model True q
+
+                                    Nothing ->
+                                        Ui.none
+                                ]
+                            ]
                     ]
+
+
+pageControls : Model -> Ui.Element Msg
+pageControls model =
+    Ui.row
+        [ Ui.spacing 10, Ui.centerY ]
+        [ pageButton (model.pageIndex > 0) "‹ Prev" PrevPage
+        , Ui.el
+            [ Font.size 12, Font.color (Ui.rgb 160 160 175) ]
+            (Ui.text ("Page " ++ String.fromInt (model.pageIndex + 1) ++ " of " ++ String.fromInt (totalPages model)))
+        , pageButton (hasNextPage model) "Next ›" NextPage
+        ]
+
+
+pageButton : Bool -> String -> Msg -> Ui.Element Msg
+pageButton enabled label msg =
+    Ui.button
+        [ Ui.paddingXY 10 5
+        , Border.rounded 4
+        , Font.size 12
+        , Background.color (Ui.rgb 34 34 46)
+        , if enabled then
+            Font.color (Ui.rgb 200 200 210)
+
+          else
+            Font.color (Ui.rgb 90 90 100)
+        ]
+        { onPress =
+            if enabled then
+                Just msg
+
+            else
+                Nothing
+        , label = Ui.text label
+        }
 
 
 -- B10: the left rail is the keyboard-first overview — one button per queued
 -- unit, the selected one highlighted; j/k, g and 1-5 move the selection.
-queueRail : Model -> Ui.Element Msg
-queueRail model =
+queueRail : Model -> List Queue.QueuedUnit -> Ui.Element Msg
+queueRail model units =
     Ui.column
         [ Ui.width (Ui.px 280)
         , Ui.height Ui.fill
         , Ui.spacing 4
         , Ui.scrollbars
         ]
-        (List.indexedMap (railItem model) model.queue)
+        (List.indexedMap (railItem model) units)
 
 
 railItem : Model -> Int -> Queue.QueuedUnit -> Ui.Element Msg
@@ -535,7 +705,7 @@ railItem model i q =
 
 selectedUnit : Model -> Maybe Queue.QueuedUnit
 selectedUnit model =
-    List.head (List.drop model.selected model.queue)
+    List.head (List.drop model.selected (queueUnits model))
 
 
 hintLine : Ui.Element Msg

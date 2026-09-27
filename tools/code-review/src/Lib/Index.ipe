@@ -1,17 +1,21 @@
-module Lib.Index exposing (Unit, drainUnit, indexDbUrl, loadPending, loadUnitByUid, nameFor, qualifiedUids)
+module Lib.Index exposing (IndexInfo, Unit, dbFileName, dbPathOf, drainUnit, indexDbUrl, loadInfo, loadPendingPage, loadUnitByUid, nameFor, qualifiedUids)
 
+import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
 import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Dict as Dict exposing (Dict)
 import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
+import Ipe.Maybe as Maybe
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result)
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
+import Lib.Page as Page exposing (PageBounds)
 
 
 -- One queued ipe-index unit plus its source slice. `path` is the
@@ -57,7 +61,7 @@ loadUnitByUid uid =
         rows <- Db.queryDecode conn unitByUidSql [ SqlString uid ] rowDecoder
         case List.head rows of
             Just row ->
-                Task.map Just (loadSource root row)
+                Task.map List.head (loadSources root [ row ])
 
             Nothing ->
                 Task.succeed Nothing
@@ -204,7 +208,7 @@ partBDecoder =
 -- Read URL for the ipe-index sqlite database. A `sqlite://` URL with an
 -- explicit `mode=ro` query is passed through verbatim by the runtime, so the
 -- index DB is never created or modified. This is a function of the env value
--- (not a cached top-level value): loadPending runs against different
+-- (not a cached top-level value): loadPendingPage runs against different
 -- IPE_INDEX_DB settings within one process (tests).
 indexDbUrlFor : String -> String
 indexDbUrlFor raw =
@@ -263,26 +267,126 @@ indexRoot =
     System.getenv "IPE_INDEX_ROOT"
 
 
-pendingSql : String
-pendingSql =
-    "SELECT q.uid, q.change, q.old_hash, q.new_hash, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha FROM change_queue q JOIN units u ON u.uid = q.uid WHERE q.change IN ('new','modified') ORDER BY q.enqueued_at, q.uid"
+-- The pending rowset, shared by the page query and the count query so the
+-- header's count is exactly the set the pages walk.
+pendingFrom : String
+pendingFrom =
+    "FROM change_queue q JOIN units u ON u.uid = q.uid WHERE q.change IN ('new','modified')"
 
 
--- Queue units (new + modified, ordered by enqueue time), each with its
--- source slice resolved against the index root. Deleted units drop out of
--- the JOIN — they have no row to slice.
-loadPending : Task.Task Error (List Unit)
-loadPending =
+-- One page of the pending rowset. LIMIT and OFFSET are bound parameters
+-- filled from a validated `PageBounds`.
+pendingPageSql : String
+pendingPageSql =
+    "SELECT q.uid, q.change, q.old_hash, q.new_hash, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha "
+        ++ pendingFrom
+        ++ " ORDER BY q.enqueued_at, q.uid LIMIT ? OFFSET ?"
+
+
+pendingCountSql : String
+pendingCountSql =
+    "SELECT COUNT(*) AS n " ++ pendingFrom
+
+
+-- The database file size as SQLite reports it (page count times page size),
+-- read through the open connection: the stdlib has no file-metadata call, and
+-- the app never shells out.
+dbBytesSql : String
+dbBytesSql =
+    "SELECT p.page_count * s.page_size AS bytes FROM pragma_page_count() AS p, pragma_page_size() AS s"
+
+
+-- One page of queue units (new + modified, ordered by enqueue time), each with
+-- its source slice resolved against the index root. Deleted units drop out of
+-- the JOIN — they have no row to slice. Only this page's rows are fetched and
+-- only its distinct source files are read.
+loadPendingPage : PageBounds -> Task.Task Error (List Unit)
+loadPendingPage bounds =
     do
         root <- indexRoot
         url <- indexDbUrl
         conn <- Db.open "sqlite" url
-        rows <- Db.queryDecode conn pendingSql [] rowDecoder
+        rows <- Db.queryDecode conn pendingPageSql [ SqlInt (Page.limit bounds), SqlInt (Page.offset bounds) ] rowDecoder
         loadSources root rows
 
 
+-- Header facts about the index database: its file name, its location with
+-- any URL scheme and query stripped, its size, and the pending-unit count.
+type alias IndexInfo =
+    { fileName : String
+    , location : String
+    , size : ByteSize
+    , pending : Int
+    }
+
+
+loadInfo : Task.Task Error IndexInfo
+loadInfo =
+    do
+        raw <- indexDbRaw
+        conn <- Db.open "sqlite" (indexDbUrlFor raw)
+        pending <- singleInt conn pendingCountSql "n"
+        bytes <- singleInt conn dbBytesSql "bytes"
+        Task.succeed
+            { fileName = dbFileName raw
+            , location = dbPathOf raw
+            , size = ByteSize.bytes bytes
+            , pending = pending
+            }
+
+
+-- The one integer an aggregate query returns; no row is a typed error.
+singleInt : Db.Db -> String -> String -> Task.Task Error Int
+singleInt conn sql column =
+    do
+        values <- Db.queryDecode conn sql [] (Db.Decode.succeed (\n -> n) |> Db.Decode.required column (Db.Decode.int column))
+        case List.head values of
+            Just n ->
+                Task.succeed n
+
+            Nothing ->
+                Task.fail (Error.unexpected ("index query returned no row: " ++ sql))
+
+
+-- The filesystem path inside an `IPE_INDEX_DB` value: a `scheme://` prefix and
+-- a `?query` suffix are stripped, a bare path passes through.
+-- `sqlite:///data/index.db?mode=ro` -> `/data/index.db`.
+dbPathOf : String -> String
+dbPathOf raw =
+    let
+        noQuery =
+            Maybe.withDefault raw (List.head (String.split "?" raw))
+    in
+    case String.split "://" noQuery of
+        _ :: afterScheme :: more ->
+            String.join "://" (afterScheme :: more)
+
+        _ ->
+            noQuery
+
+
+-- The last path segment of an `IPE_INDEX_DB` value (`index.db`); the whole
+-- path when it has no usable segment.
+dbFileName : String -> String
+dbFileName raw =
+    let
+        path =
+            dbPathOf raw
+    in
+    case List.head (List.reverse (String.split "/" path)) of
+        Just segment ->
+            if segment == "" then
+                path
+
+            else
+                segment
+
+        Nothing ->
+            path
+
+
 -- The review app consumes and clears explicitly: after a unit is decided,
--- its change_queue row is deleted so it stops appearing in loadPending. The
+-- its change_queue row is deleted so it stops appearing in the pending pages. The
 -- row comes back only when the index re-queues the unit after it changes
 -- again (per-uid PRIMARY KEY in change_queue — a fresh change, a fresh
 -- review).
@@ -329,27 +433,66 @@ nameFor conn uid =
                         Task.succeed Nothing
 
 
+-- Each distinct source file of the page is read once, then every row takes
+-- its slice from that text.
 loadSources : String -> List RowUnit -> Task.Task Error (List Unit)
 loadSources root rows =
-    rows
-        |> List.map (loadSource root)
-        |> Task.sequence
+    do
+        texts <-
+            rows
+                |> List.map (\row -> row.path)
+                |> distinct
+                |> List.map (readSource root)
+                |> Task.sequence
+        let
+            byPath =
+                Dict.fromList texts
+        in
+        rows
+            |> List.map (sliceFrom byPath)
+            |> Task.sequence
+
+
+distinct : List String -> List String
+distinct items =
+    List.reverse
+        (List.foldl
+            (\item seen ->
+                if List.member item seen then
+                    seen
+
+                else
+                    item :: seen
+            )
+            []
+            items
+        )
+
+
+sliceFrom : Dict String String -> RowUnit -> Task.Task Error Unit
+sliceFrom byPath row =
+    case Dict.get row.path byPath of
+        Just text ->
+            Task.succeed (withSource (sliceLines row.lineStart row.lineEnd text) row)
+
+        Nothing ->
+            Task.fail (Error.unexpected ("index unit source was not read: " ++ row.path))
 
 
 -- Reading a unit's source fails the whole load with a typed error: a queued
 -- unit whose file cannot be resolved or read is a real problem, not a row to
 -- silently skip.
-loadSource : String -> RowUnit -> Task.Task Error Unit
-loadSource root row =
-    case resolvePath root row.path of
+readSource : String -> String -> Task.Task Error ( String, String )
+readSource root stored =
+    case resolvePath root stored of
         Nothing ->
-            Task.fail (Error.unexpected ("index unit has an unresolvable path: " ++ row.path))
+            Task.fail (Error.unexpected ("index unit has an unresolvable path: " ++ stored))
 
         Just absPath ->
             do
                 path <- Task.fromResult (Path.fromString absPath)
                 text <- File.readFile path
-                Task.succeed (withSource (sliceLines row.lineStart row.lineEnd text) row)
+                Task.succeed ( stored, text )
 
 
 withSource : String -> RowUnit -> Unit

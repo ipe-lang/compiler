@@ -1,5 +1,6 @@
-module Lib.Format exposing (formatReviewedAt, numberedLines, percent)
+module Lib.Format exposing (formatBytes, formatReviewedAt, numberedLines, percent)
 
+import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.List as List
 import Ipe.String
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
@@ -108,3 +109,36 @@ percent k n =
 
     else
         String.fromInt ((k * 100) // n) ++ "%"
+
+
+-- Human-readable binary size with one floored decimal: "512 B", "1.5 KiB",
+-- "48.5 MiB". The remainder is scaled after the division, so no intermediate
+-- product can exceed the unit times ten.
+formatBytes : ByteSize -> String
+formatBytes size =
+    let
+        b =
+            ByteSize.toBytes size
+    in
+    case List.head (List.filter (\( unit, _ ) -> b >= unit) byteUnits) of
+        Just ( unit, suffix ) ->
+            let
+                whole =
+                    b // unit
+
+                tenths =
+                    ((b - whole * unit) * 10) // unit
+            in
+            String.fromInt whole ++ "." ++ String.fromInt tenths ++ " " ++ suffix
+
+        Nothing ->
+            String.fromInt b ++ " B"
+
+
+byteUnits : List ( Int, String )
+byteUnits =
+    [ ( 1099511627776, "TiB" )
+    , ( 1073741824, "GiB" )
+    , ( 1048576, "MiB" )
+    , ( 1024, "KiB" )
+    ]
