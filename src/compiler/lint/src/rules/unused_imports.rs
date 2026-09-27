@@ -108,7 +108,7 @@ pub fn check(ctx: &Ctx) -> Vec<Finding> {
             .join(".");
         findings.push(ctx.advisory(
             "unused-imports",
-            import.import_kw,
+            import.span,
             format!("`import {module_text}` is never used in this module"),
             vec![
                 "remove the import or add an `exposing` clause for the names you need".to_owned(),

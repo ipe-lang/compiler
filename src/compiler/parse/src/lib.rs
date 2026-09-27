@@ -3472,4 +3472,78 @@ main = 1\n";
             "a second consecutive doc-comment must fail with unexpected-token, not panic"
         );
     }
+
+    // ── declaration spans ───────────────────────────────────────────────────
+
+    /// The source text `span` covers.
+    fn spanned(src: &str, span: Span) -> &str {
+        src.get(span.lo as usize..span.hi as usize).unwrap_or("")
+    }
+
+    /// The single import of `src`, parsed.
+    fn only_import(src: &str) -> ipe_syntax::Import {
+        let mut i = Interner::new();
+        let m = parse_module(src, &mut i).expect("fixture must parse");
+        assert_eq!(m.imports.len(), 1, "fixture has exactly one import");
+        m.imports.into_iter().next().expect("one import")
+    }
+
+    /// An import's span ends at its last token: the module name, the alias, or
+    /// the `exposing` list's closing `)`.
+    #[test]
+    fn import_span_ends_at_its_last_token() {
+        for (decl, clause) in [
+            ("import Foo", ""),
+            ("import Foo as Bar", ""),
+            ("import Foo exposing (bar)", "exposing (bar)"),
+            ("import Foo as Bar exposing (..)", "exposing (..)"),
+            (
+                "import Foo\n    exposing\n        ( bar\n        , Baz(..)\n        )",
+                "exposing\n        ( bar\n        , Baz(..)\n        )",
+            ),
+        ] {
+            let src = format!("module Main exposing (main)\n\n{decl}\n\nmain = 1\n");
+            let imp = only_import(&src);
+            assert_eq!(spanned(&src, imp.span), decl, "declaration span");
+            assert_eq!(spanned(&src, imp.exposing.span), clause, "exposing span");
+        }
+    }
+
+    /// Comments never move an import's end: a `)` inside a `--` comment in the
+    /// list does not close it early, a `(` inside a comment plus a later stray
+    /// `)` does not stretch it into the next declaration, and a `{- -}` block
+    /// between clauses does not stop it short.
+    #[test]
+    fn import_span_ignores_parens_inside_comments() {
+        for (decl, rest) in [
+            (
+                "import Foo exposing\n    ( bar -- keeps ) the old name\n    , baz\n    )",
+                "\n\nmain = 1\n",
+            ),
+            (
+                "import Foo exposing (bar -- (\n    )",
+                "\n\nmain = 1 -- )\n",
+            ),
+            (
+                "import Foo\n    {- ( note ) -}\n    as Bar\n    {- ) -}\n    exposing (bar)",
+                "\n\nmain = 1\n",
+            ),
+            ("import Foo as Bar", " -- ( trailing )\n\nmain = (1)\n"),
+        ] {
+            let src = format!("module Main exposing (main)\n\n{decl}{rest}");
+            let imp = only_import(&src);
+            assert_eq!(spanned(&src, imp.span), decl, "declaration span of {src:?}");
+        }
+    }
+
+    /// The module header's `exposing` span covers the keyword through the
+    /// closing `)`, even when the list wraps across lines.
+    #[test]
+    fn module_exposing_span_covers_the_whole_clause() {
+        let clause = "exposing\n    ( main\n    , helper -- )\n    )";
+        let src = format!("module Main {clause}\n\nmain = 1\n\nhelper = 2\n");
+        let mut i = Interner::new();
+        let m = parse_module(&src, &mut i).expect("fixture must parse");
+        assert_eq!(spanned(&src, m.exposing.span), clause);
+    }
 }

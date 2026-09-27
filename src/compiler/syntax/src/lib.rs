@@ -127,6 +127,7 @@ mod tests {
             name: loc(vec![main_mod]),
             exposing: loc(Exposing::List(vec![loc(Exposed::Value(main))])),
             imports: vec![Import {
+                span: sp(),
                 import_kw: sp(),
                 name: loc(vec![ipe, core, prelude]),
                 alias: None,

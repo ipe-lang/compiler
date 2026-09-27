@@ -1244,6 +1244,7 @@ pub fn canonicalise_module_in_project(
                 && !env.qual_vars.contains_key(&ffi_sym)
             {
                 let synthetic_import = src::Import {
+                    span: ipe_diagnostics::Span::DUMMY,
                     import_kw: ipe_diagnostics::Span::DUMMY,
                     name: ipe_diagnostics::Located::new(
                         ipe_diagnostics::Span::DUMMY,

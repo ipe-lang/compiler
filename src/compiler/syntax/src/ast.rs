@@ -130,7 +130,8 @@ pub struct Module {
     pub module_kw: Span,
     /// Dotted module-name segments, e.g. `Main` → `[Main]`.
     pub name: Located<Vec<Symbol>>,
-    /// The `exposing (...)` clause of the `module` header.
+    /// The `exposing (...)` clause of the `module` header, spanning the
+    /// `exposing` keyword through its closing `)`.
     pub exposing: Located<Exposing>,
     pub imports: Vec<Import>,
     pub values: Vec<Located<Value>>,
@@ -178,12 +179,24 @@ pub enum Privacy {
 /// An `import` declaration.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Import {
+    /// Span of the whole declaration.
+    ///
+    /// Runs from the `import` keyword through the last token the parser
+    /// consumed for it (module name, `as` alias, or the `exposing` list's
+    /// closing `)`), however the declaration wraps across lines. Comments
+    /// inside or after the declaration never move its end.
+    pub span: Span,
     /// Span of the `import` keyword token.
     pub import_kw: Span,
     /// Dotted module-name segments, e.g. `Ipe.String`.
     pub name: Located<Vec<Symbol>>,
     /// Optional `as Alias`.
     pub alias: Option<Symbol>,
+    /// The `exposing (…)` clause, spanning the `exposing` keyword through its
+    /// closing `)`.
+    ///
+    /// An import without a clause holds an empty list at a zero-width span
+    /// just past the declaration's last token.
     pub exposing: Located<Exposing>,
 }
 

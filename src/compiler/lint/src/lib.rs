@@ -2002,4 +2002,57 @@ mod tests {
             "`http_timeout_2 : Int` must be flagged (timeout token, snake + digit)"
         );
     }
+
+    // ── unused-imports span tests ─────────────────────────────────────────────
+
+    /// The source text of the single `unused-imports` finding for `src`.
+    fn unused_import_text(src: &str) -> Option<String> {
+        let report = run(&[module(src)], &LintConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == "unused-imports")?;
+        src.get(finding.span.lo as usize..finding.span.hi as usize)
+            .map(str::to_owned)
+    }
+
+    /// The finding covers the whole declaration, never less: a `)` inside a
+    /// `--` comment in the list does not end it early, a `{- -}` block
+    /// between clauses does not stop it short, and the alias form ends at the
+    /// alias.
+    #[test]
+    fn unused_import_span_is_the_whole_declaration() {
+        for decl in [
+            "import Ipe.Url exposing\n    ( fromString -- keeps ) the old name\n    , toString\n    )",
+            "import Ipe.Url\n    {- ( note ) -}\n    as U\n    {- ) -}\n    exposing (fromString)",
+            "import Ipe.Url as U",
+        ] {
+            let src = format!(
+                "module Main exposing (main)\n\n{decl} -- ( trailing\n\nmain = \"hello\" -- )\n"
+            );
+            assert_eq!(
+                unused_import_text(&src).as_deref(),
+                Some(decl),
+                "in {src:?}"
+            );
+        }
+    }
+
+    /// The refusal: a `(` inside a comment in the list plus a stray `)` in a
+    /// later comment must not stretch the finding into the next declaration,
+    /// so a suppression on that unrelated later line cannot hide it.
+    #[test]
+    fn unrelated_later_suppression_does_not_hide_unused_import() {
+        let decl = "import Ipe.Url exposing (fromString -- (\n    )";
+        let src = format!(
+            "module Main exposing (main)\n\n{decl}\n\n\
+             -- ipe-lint: allow unused-imports\n\
+             main = \"hello\" -- )\n"
+        );
+        assert_eq!(
+            unused_import_text(&src).as_deref(),
+            Some(decl),
+            "a suppression outside the declaration must not silence it"
+        );
+    }
 }

@@ -499,10 +499,8 @@ impl Printer<'_> {
             Exposing::All => return " exposing (..)".to_owned(),
             Exposing::List(items) => items,
         };
-        // The header's own `Located` span covers only `module <Name>` (not the
-        // `exposing` clause), so multi-line-ness is read from the items: the
-        // clause was written across multiple lines iff its items do not all
-        // begin on the same source line.
+        // The clause is multi-line iff its items do not all begin on the same
+        // source line (a lone `(` or `)` line does not make it multi-line).
         let multiline = items
             .first()
             .zip(items.last())

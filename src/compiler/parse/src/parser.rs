@@ -327,10 +327,8 @@ impl<'a> Parser<'a> {
         let name = self.parse_module_name()?;
 
         // The `exposing` keyword must follow the module name.
-        match self.peek() {
-            Some(t) if t.kind == Tok::Exposing => {
-                self.bump(Construct::ModuleHeader)?;
-            }
+        let exposing_kw = match self.peek() {
+            Some(t) if t.kind == Tok::Exposing => self.bump(Construct::ModuleHeader)?.span,
             Some(t) => {
                 return Err(Self::malformed_header(
                     t.span,
@@ -343,8 +341,9 @@ impl<'a> Parser<'a> {
                     HeaderDefect::MissingExposing,
                 ));
             }
-        }
-        let exposing = self.parse_exposing()?;
+        };
+        let (exposing, exposing_close) = self.parse_exposing()?;
+        let exposing = Located::new(Self::span_merge(exposing_kw, exposing_close), exposing);
 
         // Imports may be preceded by a `{-| … -}` doc-comment. One before an
         // `import` documents the module, not the import, and is dropped; one
@@ -376,12 +375,11 @@ impl<'a> Parser<'a> {
             decls.push(self.parse_decl(first_doc.take())?);
         }
 
-        let header_span = Self::span_merge(module_tok.span, name.span);
         let (values, unions, aliases, foreigns) = self.assemble(decls)?;
         Ok(Module {
             module_kw: module_tok.span,
             name,
-            exposing: Located::new(header_span, exposing),
+            exposing,
             imports,
             values,
             unions,
@@ -542,7 +540,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_exposing(&mut self) -> DResult<Exposing> {
+    /// Parse an `exposing` clause's parenthesised list.
+    ///
+    /// Returns the list together with the span of its closing `)`.
+    fn parse_exposing(&mut self) -> DResult<(Exposing, Span)> {
         // Opening `(`.
         match self.peek() {
             Some(t) if t.kind == Tok::LParen => {
@@ -563,19 +564,18 @@ impl<'a> Parser<'a> {
         }
         if self.peek_kind() == Some(&Tok::DotDot) {
             self.bump(Construct::ExposingList)?;
-            self.expect_exposing_close()?;
-            return Ok(Exposing::All);
+            let close = self.expect_exposing_close()?;
+            return Ok((Exposing::All, close));
         }
         let mut items = Vec::new();
-        loop {
+        let close = loop {
             items.push(self.parse_exposed()?);
             match self.peek() {
                 Some(t) if t.kind == Tok::Comma => {
                     self.bump(Construct::ExposingList)?;
                 }
                 Some(t) if t.kind == Tok::RParen => {
-                    self.bump(Construct::ExposingList)?;
-                    break;
+                    break self.bump(Construct::ExposingList)?.span;
                 }
                 Some(t) => {
                     return Err(Self::malformed_exposing(
@@ -590,17 +590,14 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
-        }
-        Ok(Exposing::List(items))
+        };
+        Ok((Exposing::List(items), close))
     }
 
-    /// Require the `)` that closes an `exposing (..)` clause.
-    fn expect_exposing_close(&mut self) -> DResult<()> {
+    /// Require the `)` that closes an `exposing (..)` clause, returning its span.
+    fn expect_exposing_close(&mut self) -> DResult<Span> {
         match self.peek() {
-            Some(t) if t.kind == Tok::RParen => {
-                self.bump(Construct::ExposingList)?;
-                Ok(())
-            }
+            Some(t) if t.kind == Tok::RParen => Ok(self.bump(Construct::ExposingList)?.span),
             Some(t) => Err(Self::malformed_exposing(
                 t.span,
                 ExposingDefect::BadSeparator,
@@ -699,11 +696,17 @@ impl<'a> Parser<'a> {
         // The caller has already peeked `import`.
         let import_tok = self.bump(Construct::ModuleHeader)?;
         let name = self.parse_dotted_name()?;
+        // The span of the last token the declaration consumed: the recorded
+        // declaration span ends exactly where its grammar does.
+        let mut last = name.span;
         let alias = if self.peek_kind() == Some(&Tok::As) {
             self.bump(Construct::ModuleHeader)?;
             let tok = self.bump(Construct::ModuleHeader)?;
             match &tok.kind {
-                Tok::Ident(text) => Some(self.interner.intern(text)?),
+                Tok::Ident(text) => {
+                    last = tok.span;
+                    Some(self.interner.intern(text)?)
+                }
                 _ => {
                     return Err(Self::unexpected_token(&tok, &[Expected::Identifier]));
                 }
@@ -712,13 +715,16 @@ impl<'a> Parser<'a> {
             None
         };
         let exposing = if self.peek_kind() == Some(&Tok::Exposing) {
-            self.bump(Construct::ModuleHeader)?;
-            let clause = self.parse_exposing()?;
-            Located::new(name.span, clause)
+            let exposing_kw = self.bump(Construct::ModuleHeader)?.span;
+            let (clause, close) = self.parse_exposing()?;
+            last = close;
+            Located::new(Self::span_merge(exposing_kw, close), clause)
         } else {
-            Located::new(name.span, Exposing::List(Vec::new()))
+            // No clause in the source: a zero-width span where one would begin.
+            Located::new(Span::new(last.hi, last.hi), Exposing::List(Vec::new()))
         };
         Ok(Import {
+            span: Self::span_merge(import_tok.span, last),
             import_kw: import_tok.span,
             name,
             alias,

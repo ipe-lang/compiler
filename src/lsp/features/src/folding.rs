@@ -19,12 +19,11 @@ pub fn folding_ranges(
     let text = file.text(db);
     let mut out: Vec<FoldingRange> = Vec::new();
 
-    // The import block folds as one region (first to last import). A bare
-    // `import Foo` may carry a synthetic (zero) exposing span — the `max`
-    // against the name span keeps the bound on real source text.
+    // The import block folds as one region: from the first import's module
+    // name through the last import's final token.
     if let (Some(first), Some(last)) = (module.imports.first(), module.imports.last()) {
         let lo = first.name.span.lo;
-        let hi = last.name.span.hi.max(last.exposing.span.hi);
+        let hi = last.span.hi;
         push_range(
             &mut out,
             text,
