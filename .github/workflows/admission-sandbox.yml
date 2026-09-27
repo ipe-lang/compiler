@@ -60,6 +60,8 @@ jobs:
   # the required-check context. On any code PR (or push/schedule/merge_group) the
   # gate is `code == 'true'` and all proofs run at full strictness.
   changes:
+    # Unique context: a required `changes` shared with ci.yml would be ambiguous.
+    name: admission-changes
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}

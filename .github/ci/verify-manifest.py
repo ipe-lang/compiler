@@ -15,7 +15,14 @@ Checks performed
          `informational` (§0/§1/§3: a guarantee may not sit in an un-gated bucket);
        - a `gate`/`nightly-gate` entry has a producer workflow that exists;
        - a `delete` entry has no producer (an orphan), else it is a live check.
-  3. Required-set reconciliation (best-effort, non-fatal by default): every
+  3. Fail-closed dependency surfacing: GitHub reports a job whose `needs`
+     failed as SKIPPED, and a skipped required check counts as passing.  So
+     every job a gate transitively `needs` must itself surface in a gate (its
+     own context is a gate, or a gate `aggregates` it); likewise a
+     nightly-gate's ancestors must surface in a gate or nightly-gate.  A
+     status context produced by two jobs is refused outright — a required
+     context must resolve to exactly one producer.
+  4. Required-set reconciliation (best-effort, non-fatal by default): every
      manifest `gate` context should be in the branch-protection required set and
      vice-versa.  Run with `--ruleset FILE` (a JSON dump of the ruleset's
      required contexts) to make mismatches fatal; without it the manifest is the
@@ -86,9 +93,19 @@ def expand_matrix_names(name: str, strategy: dict) -> list[str]:
     return result
 
 
-def produced_contexts() -> dict[str, str]:
-    """Map produced status-context string -> producing workflow filename."""
-    contexts: dict[str, str] = {}
+class Job:
+    """One workflow job: its status contexts and direct `needs`."""
+
+    def __init__(self, workflow: str, job_id: str, contexts: list[str], needs: list[str]):
+        self.workflow = workflow
+        self.job_id = job_id
+        self.contexts = contexts
+        self.needs = needs
+
+
+def workflow_jobs() -> list[Job]:
+    """Every job of every non-plumbing workflow, matrix legs expanded."""
+    jobs: list[Job] = []
     for path in sorted(glob.glob(WORKFLOW_GLOB)):
         fname = os.path.basename(path)
         if fname in PLUMBING_WORKFLOWS:
@@ -100,13 +117,24 @@ def produced_contexts() -> dict[str, str]:
             sys.exit(2)
         if not isinstance(doc, dict):
             continue
-        jobs = doc.get("jobs") or {}
-        for job_id, job in jobs.items():
+        for job_id, job in (doc.get("jobs") or {}).items():
             if not isinstance(job, dict):
                 continue
             name = job.get("name", job_id)
-            for ctx in expand_matrix_names(str(name), job.get("strategy") or {}):
-                contexts.setdefault(ctx, fname)
+            needs = job.get("needs") or []
+            if isinstance(needs, str):
+                needs = [needs]
+            contexts = expand_matrix_names(str(name), job.get("strategy") or {})
+            jobs.append(Job(fname, str(job_id), contexts, [str(n) for n in needs]))
+    return jobs
+
+
+def produced_contexts(jobs: list[Job]) -> dict[str, list[str]]:
+    """Map produced status-context string -> producing workflow filenames."""
+    contexts: dict[str, list[str]] = {}
+    for job in jobs:
+        for ctx in job.contexts:
+            contexts.setdefault(ctx, []).append(job.workflow)
     return contexts
 
 
@@ -166,7 +194,8 @@ def main() -> int:
             )
 
     # ---- 1. every produced context is classified ----
-    produced = produced_contexts()
+    jobs = workflow_jobs()
+    produced = produced_contexts(jobs)
     manifest_ctxs = set(by_context)
 
     # A context named in some entry's `aggregates:` list is an internal matrix
@@ -187,13 +216,62 @@ def main() -> int:
         # matrix leg "asan (1/6)" is aggregated by "asan"
         return any(ctx.startswith(p + " (") or ctx == p for p in aggregated_prefixes)
 
-    for ctx, wf in sorted(produced.items()):
+    for ctx, wfs in sorted(produced.items()):
+        if len(wfs) > 1:
+            errors.append(
+                f"context {ctx!r} is produced by {len(wfs)} jobs ({', '.join(wfs)}) — "
+                "a required context must resolve to exactly one producer; give "
+                "each job a unique `name:`"
+            )
         if ctx in manifest_ctxs or is_aggregated(ctx):
             continue
         errors.append(
-            f"produced context {ctx!r} (from {wf}) has NO disposition in "
+            f"produced context {ctx!r} (from {wfs[0]}) has NO disposition in "
             "ci/check-manifest.yml — every check must be classified"
         )
+
+    # ---- 3. fail-closed dependency surfacing ----
+    def surfaced_dispositions(job: Job) -> set[str]:
+        """Dispositions of the manifest entries this job's outcome reaches."""
+        disps: set[str] = set()
+        for ctx in job.contexts:
+            entry = by_context.get(ctx)
+            if entry:
+                disps.add(entry["disposition"])
+        for entry in by_context.values():
+            for agg in entry.get("aggregates") or []:
+                if agg == job.job_id or any(
+                    c == agg or c.startswith(agg + " (") for c in job.contexts
+                ):
+                    disps.add(entry["disposition"])
+        return disps
+
+    surfacing = {"gate": {"gate"}, "nightly-gate": {"gate", "nightly-gate"}}
+    for job in jobs:
+        direct = {by_context[c]["disposition"] for c in job.contexts if c in by_context}
+        siblings = {j.job_id: j for j in jobs if j.workflow == job.workflow}
+        for disp, allowed in surfacing.items():
+            if disp not in direct:
+                continue
+            seen: set[str] = set()
+            pending = list(job.needs)
+            while pending:
+                dep_id = pending.pop()
+                if dep_id in seen:
+                    continue
+                seen.add(dep_id)
+                dep = siblings.get(dep_id)
+                if dep is None:
+                    errors.append(f"{job.workflow}: job {job.job_id!r} needs unknown job {dep_id!r}")
+                    continue
+                if surfaced_dispositions(dep).isdisjoint(allowed):
+                    errors.append(
+                        f"{job.workflow}: {disp} {job.contexts[0]!r} needs {dep_id!r}, "
+                        f"which surfaces in no {'/'.join(sorted(allowed))} context — its "
+                        "failure would skip the gate, and a skipped required check "
+                        "passes (fail-open)"
+                    )
+                pending.extend(dep.needs)
 
     # A manifest gate/nightly-gate that claims a live producer but is not
     # actually produced (an orphan the other way).  gate-external is excluded:
@@ -208,7 +286,7 @@ def main() -> int:
                 "(orphaned required context — wire it or set disposition:delete)"
             )
 
-    # ---- 3. required-set reconciliation ----
+    # ---- 4. required-set reconciliation ----
     # gate-external contexts are required by the ruleset even though no CI
     # workflow produces them; include them alongside plain gate entries.
     gate_ctxs = {c for c, e in by_context.items() if e["disposition"] in ("gate", "gate-external")}

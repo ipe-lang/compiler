@@ -39,6 +39,8 @@ env:
 jobs:
   # Path filter: skip on PRs that touch nothing playground-relevant.
   changes:
+    # Unique context: a required `changes` shared with ci.yml would be ambiguous.
+    name: playground-changes
     runs-on: ubuntu-latest
     outputs:
       playground: ${{ steps.filter.outputs.playground }}
