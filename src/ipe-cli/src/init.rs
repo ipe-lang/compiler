@@ -206,6 +206,35 @@ impl InitShape {
             Self::Script => "It prints its greeting and exits — no interaction needed.",
         }
     }
+
+    /// The `README.md`'s one-sentence description of what `src/Main.ipe` is.
+    ///
+    /// The single source of truth for that sentence, exhaustively matched like
+    /// [`InitShape::open_hint`], so a new shape can't ship a README describing
+    /// another shape's app.
+    const fn readme_description(self) -> &'static str {
+        match self {
+            Self::Web => {
+                "a small `Ipe.Web` counter — a Model holding a count, `Increment` and \
+                 `Decrement` messages, and a two-button view — that serves its UI over HTTP."
+            }
+            Self::Tui => {
+                "a small `Ipe.Tea.Tui` counter — a Model holding a count, updated by the \
+                 Up/Down arrow keys and rendered to the terminal screen."
+            }
+            Self::Cli => {
+                "a small `Ipe.Tea.Cli` line-echo app — each line you type bumps a counter \
+                 and is echoed back; `q` quits."
+            }
+            Self::Worker => {
+                "a small `Ipe.Tea.Worker` — it logs three ticks on a timer, then exits."
+            }
+            Self::Server => {
+                "a small `Ipe.Server.Http` server — it replies `Hello, world!` on `GET /`."
+            }
+            Self::Script => "a one-shot `Ipe.Task` script — it prints a greeting and exits.",
+        }
+    }
 }
 
 // ── runtime model ──────────────────────────────────────────────────────────────
@@ -763,10 +792,11 @@ fn run_scaffold(
 
 /// The complete set of files `init` writes for an application project.
 ///
-/// `shape` selects which `Main.ipe` and `package.ipe` are scaffolded; `runtime`
-/// fills the web `package.ipe`'s delivery set (`solo` declares an explicit
-/// `ships`, `served` stays the implicit default). All other files are
-/// shape-independent.
+/// `shape` selects which `Main.ipe`, `package.ipe`, and `README.md` wording are
+/// scaffolded; `runtime` fills the web `package.ipe`'s delivery set (`solo`
+/// declares an explicit `ships`, `served` stays the implicit default) and picks
+/// `README.md`'s open-hint wording. `.gitignore` and `AGENTS.md` are the only
+/// shape-independent files.
 fn managed_files(project_name: &str, shape: InitShape, runtime: InitRuntime) -> Vec<ManagedFile> {
     vec![
         ManagedFile {
@@ -779,7 +809,10 @@ fn managed_files(project_name: &str, shape: InitShape, runtime: InitRuntime) -> 
         },
         ManagedFile {
             rel: PathBuf::from("README.md"),
-            content: README_MD.replace("{name}", project_name),
+            content: README_MD
+                .replace("{name}", project_name)
+                .replace("{description}", shape.readme_description())
+                .replace("{run_hint}", shape.open_hint(runtime)),
         },
         ManagedFile {
             rel: PathBuf::from(".gitignore"),
