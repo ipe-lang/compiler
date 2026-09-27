@@ -345,7 +345,7 @@ fn scan_raw_imports(text: &str) -> Vec<RawImport> {
         let Some(rest) = line.trim_start().strip_prefix("import ") else {
             continue;
         };
-        let mut words = rest.trim_start().split_whitespace();
+        let mut words = rest.split_whitespace();
         let Some(path_word) = words.next() else {
             continue;
         };
@@ -353,10 +353,11 @@ fn scan_raw_imports(text: &str) -> Vec<RawImport> {
         if path.iter().any(String::is_empty) {
             continue;
         }
-        let mut alias = None;
-        if words.next() == Some("as") {
-            alias = words.next().map(str::to_owned);
-        }
+        let alias = if words.next() == Some("as") {
+            words.next().map(str::to_owned)
+        } else {
+            None
+        };
         out.push(RawImport { path, alias });
     }
     out

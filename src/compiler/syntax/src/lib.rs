@@ -24,6 +24,18 @@ mod tests {
         Located::new(sp(), v)
     }
 
+    /// `import Ipe.Core.Prelude exposing (..)`.
+    fn prelude_import(i: &mut Interner) -> DResult<Import> {
+        let path = vec![i.intern("Ipe")?, i.intern("Core")?, i.intern("Prelude")?];
+        Ok(Import {
+            span: sp(),
+            import_kw: sp(),
+            name: loc(path),
+            alias: None,
+            exposing: loc(Exposing::All),
+        })
+    }
+
     /// Build, by hand, the Source AST the parser is expected to produce for
     /// `tests/golden/basics/Main.ipe`. Returns the module plus the interner so the
     /// caller can resolve symbols if needed.
@@ -119,20 +131,11 @@ mod tests {
         };
 
         let main_mod = i.intern("Main")?;
-        let ipe = i.intern("Ipe")?;
-        let core = i.intern("Core")?;
-        let prelude = i.intern("Prelude")?;
         Ok(Module {
             module_kw: sp(),
             name: loc(vec![main_mod]),
             exposing: loc(Exposing::List(vec![loc(Exposed::Value(main))])),
-            imports: vec![Import {
-                span: sp(),
-                import_kw: sp(),
-                name: loc(vec![ipe, core, prelude]),
-                alias: None,
-                exposing: loc(Exposing::All),
-            }],
+            imports: vec![prelude_import(i)?],
             values: vec![loc(update_value), loc(main_value)],
             unions: vec![loc(union)],
             aliases: Vec::new(),
