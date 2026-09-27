@@ -112,8 +112,16 @@ pub fn collect(
         }
         Ok(solved) => {
             for warning in &solved.warnings {
-                let owner = attribute(db, root, entry, &[], warning.primary_span(), &entry_module);
-                push(&mut by_module, &owner, warning.clone());
+                let diag = warning.diagnostic();
+                let owner = attribute(
+                    db,
+                    root,
+                    entry,
+                    warning.home(),
+                    diag.primary_span(),
+                    &entry_module,
+                );
+                push(&mut by_module, &owner, diag.clone());
             }
             if let Err((diag, home)) = ipe_db::lower_program(db, root, entry) {
                 let owner = attribute(db, root, entry, home, diag.primary_span(), &entry_module);

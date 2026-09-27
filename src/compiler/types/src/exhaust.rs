@@ -38,9 +38,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
-use ipe_diagnostics::{DResult, Diagnostic, Severity, SortedNames, Span, TypeError};
+use ipe_diagnostics::{DResult, Diagnostic, SortedNames, Span, TypeError};
 use ipe_intern::{Interner, Symbol};
 
+use crate::homed::{HomedDiagnostic, HomedWarning};
 use crate::ty::Ty;
 
 /// Solved scrutinee types, keyed the way [`crate::SolvedTypes::regions`] is:
@@ -574,8 +575,10 @@ fn check_param_irrefutable(pat: &canon::Pattern) -> DResult<()> {
 /// full constructor signature instead of being skipped as unknown.
 ///
 /// Redundant-branch findings ([`TypeError::RedundantCaseBranch`], IPE-T0011)
-/// are pushed onto `warnings` instead of being returned as errors — they are
-/// severity-Warning and must not abort compilation.
+/// are pushed onto `warnings`, each paired with its owning definition's home,
+/// instead of being returned as errors — they are severity-Warning and must not
+/// abort compilation. A finding [`HomedWarning::new`] refuses (any non-Warning
+/// severity) becomes the returned error instead.
 ///
 /// Every returned error carries the `home` of the definition that owns it. In a
 /// linked program spans are byte offsets local to their own source file, so a
@@ -595,7 +598,7 @@ pub fn check(
     extra_unions: &[&canon::Union],
     regions: &Regions,
     interner: &mut Interner,
-    warnings: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<HomedWarning>,
 ) -> Result<(), HomedDiagnostic> {
     let sigs = Sigs::build(module, extra_unions, interner).map_err(|d| (d, Vec::new()))?;
     let mut first_error: Option<HomedDiagnostic> = None;
@@ -613,20 +616,16 @@ pub fn check(
         check_expr(body, home, &sigs, regions, interner, &mut findings)
             .map_err(|d| (d, home.to_vec()))?;
         for finding in findings {
-            if first_error.is_none() && finding.severity() == Severity::Error {
-                first_error = Some((finding, home.to_vec()));
-            } else {
-                warnings.push(finding);
+            match HomedWarning::new(finding, home) {
+                Ok(warning) => warnings.push(warning),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
     }
     first_error.map_or(Ok(()), Err)
 }
-
-/// A diagnostic paired with the `home` module path of the definition owning it.
-///
-/// The path is empty when the diagnostic belongs to no single definition.
-pub type HomedDiagnostic = (Diagnostic, Vec<Symbol>);
 
 /// The read-only context threaded through the recursive `case` walk: the
 /// signature tables, the owning module's `home` (the [`Regions`] key prefix),

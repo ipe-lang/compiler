@@ -847,6 +847,7 @@ impl Builder<'_> {
                     model_var,
                     not_found_var,
                     span,
+                    home: self.current_home.clone(),
                 });
                 return Ok(var);
             }

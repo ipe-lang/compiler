@@ -3387,3 +3387,91 @@ fn walked_rewrite_refuses_a_file_outside_the_project() {
     let _ = fs::remove_file(&outside);
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn redundant_red_branch_at(lo: u32) -> Diagnostic {
+    Diagnostic::Type {
+        span: Span {
+            lo,
+            hi: lo.saturating_add(3),
+        },
+        msg: ipe_diagnostics::TypeError::RedundantCaseBranch {
+            constructor: "Red".into(),
+        },
+    }
+}
+
+/// A warning homed in an imported module renders against that module's file.
+///
+/// The entry module's text also has a line at the warning's byte offset, so
+/// only the home can pick the right file.
+#[test]
+fn homed_warning_renders_against_its_home_module_file() {
+    let lib_src =
+        "module Lib exposing (label)\nlabel c =\n    case c of\n        Red ->\n            3\n";
+    let main_src = "module Main exposing (main)\nmain =\n    label Red\n\n\n\n\n\n\n\n";
+    let lib = vec![ipe_intern::Symbol::from_raw(1)];
+    let main = vec![ipe_intern::Symbol::from_raw(0)];
+    let mut home_to_source = BTreeMap::new();
+    home_to_source.insert(
+        lib.clone(),
+        (PathBuf::from("src/Lib.ipe"), lib_src.to_owned()),
+    );
+    home_to_source.insert(main, (PathBuf::from("src/Main.ipe"), main_src.to_owned()));
+    let entry = (PathBuf::from("src/Main.ipe"), main_src.to_owned());
+    let lo = lib_src
+        .rfind("Red ->")
+        .and_then(|o| u32::try_from(o).ok())
+        .unwrap_or_default();
+    let warning = ipe_types::HomedWarning::new(redundant_red_branch_at(lo), &lib);
+    assert!(warning.is_ok(), "a homed T0011 warning is accepted");
+    let Ok(warning) = warning else { return };
+
+    let rendered = render_homed_warnings(&home_to_source, &entry, &[warning]);
+    assert!(rendered.is_ok(), "a known home renders, got {rendered:?}");
+    let Ok(rendered) = rendered else { return };
+    assert_eq!(rendered.len(), 1, "one warning renders once");
+    let text = rendered.concat();
+    assert!(
+        text.contains("--> src/Lib.ipe:4:9"),
+        "the warning must be located in Lib at the redundant arm, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Main.ipe"),
+        "the entry file must not frame an imported module's warning, got:\n{text}"
+    );
+}
+
+/// A warning whose home names no known module is refused as a compiler bug.
+///
+/// The refusal is blamed on the entry file; the warning is never framed
+/// against a guessed file.
+#[test]
+fn homed_warning_with_unknown_home_is_refused() {
+    let main_src = "module Main exposing (main)\nmain =\n    1\n";
+    let mut home_to_source = BTreeMap::new();
+    home_to_source.insert(
+        vec![ipe_intern::Symbol::from_raw(0)],
+        (PathBuf::from("src/Main.ipe"), main_src.to_owned()),
+    );
+    let entry = (PathBuf::from("src/Main.ipe"), main_src.to_owned());
+    let warning = ipe_types::HomedWarning::new(
+        redundant_red_branch_at(0),
+        &[ipe_intern::Symbol::from_raw(7)],
+    );
+    assert!(warning.is_ok(), "a homed T0011 warning is accepted");
+    let Ok(warning) = warning else { return };
+
+    let rendered = render_homed_warnings(&home_to_source, &entry, &[warning]);
+    assert!(
+        matches!(
+            &rendered,
+            Err(CliError::Pipeline { file, diag, .. })
+                if file == &entry.0
+                    && matches!(
+                        diag.as_ref(),
+                        Diagnostic::CompilerBug { where_: "driver.render_homed_warnings", .. }
+                    )
+        ),
+        "an unknown home must fail closed as a compiler bug, got {rendered:?}"
+    );
+}

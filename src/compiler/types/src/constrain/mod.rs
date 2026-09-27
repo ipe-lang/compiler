@@ -408,6 +408,8 @@ pub struct RoutedWebCheck {
     pub not_found_var: VarId,
     /// The `Web.tea { … }` call span; used to blame a type mismatch.
     pub span: Span,
+    /// The module path owning the call, so a finding at `span` names its file.
+    pub home: Vec<Symbol>,
 }
 
 /// A deferred per-route page-witness check for `Web.route`.
