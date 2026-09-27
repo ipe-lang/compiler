@@ -502,7 +502,7 @@ pub fn ipe_result_and_then<E, A, B>(
 
 /// `Result.mapError : (e -> f) -> Result e a -> Result f a`. Container-first in
 /// the runtime (matching `ipe_result_map` / `ipe_result_and_then`); the emitter
-/// reverses the Ipê `(fn, result)` order via `kernel_swaps_first_two`. Maps the
+/// reverses the Ipê `(fn, result)` order via `StdlibKernel::swaps_first_two`. Maps the
 /// `Err` channel and leaves the `Ok` value untouched — total, no panic path.
 pub fn ipe_result_map_error<E, F, A>(
     r: IpeResult<E, A>,
@@ -582,7 +582,7 @@ pub fn result_traverse<T0, T1, E>(
 // Result / Maybe applicative combinators (mapN / andMap / combine)
 // ===========================================
 // FUNCTION-FIRST argument order (matches the Ipê call surface AND the JsonDec
-// `decode_mapN` runtime shape), so NO `kernel_swaps_first_two` entry is needed.
+// `decode_mapN` runtime shape), so NO `StdlibKernel::swaps_first_two` entry is needed.
 // The N-ary function is a MULTI-ARG Rust fn value — a Ipê arity-N function /
 // record-alias auto-constructor lowers to `impl Fn(A, .., N) -> V`, so `f(a, b,
 // ..)` type-checks. Each combinator is TOTAL: the first `Err` / `Nothing` in

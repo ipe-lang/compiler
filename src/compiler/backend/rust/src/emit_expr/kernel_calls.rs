@@ -1,43 +1,50 @@
 use super::{
     ArgPlan, Callee, DResult, Diagnostic, Expr, GenericScope, Guard, IrType, KernelClass, KernelFn,
     LitKind, LowerError, NativeUiEmit, Span, Symbol, UiDelegate, UiEmitPlan,
-    appearance_literal_record_fields, callee_name, emit_expr_at, emit_lambda_unboxed,
-    emit_shared_lambda, emit_sub_arm, float_literal, free_vars, kernel_name, render_type,
-    shape_appearance_literal_args, ui_call_shape,
+    appearance_literal_record_fields, callee_name, clone_targets_in_expr, collect_free_vars,
+    emit_expr_at, emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars,
+    kernel_name, render_type, shape_appearance_literal_args, ui_call_shape,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
 
-/// Whether a kernel's runtime function takes its two arguments in the OPPOSITE
-/// order to the Ipê call. The `Maybe` / `Result` mapping combinators are
-/// container-first in the runtime (`ipe_maybe_map(m, f)`) but function-first in
-/// Ipê (`Maybe.map f m`); every other wired kernel matches the Ipê order. Used by
-/// the [`Expr::Call`] emitter to reverse the rendered argument list.
-pub const fn kernel_swaps_first_two(k: ipe_ir::KernelFn) -> bool {
-    matches!(
-        k,
-        KernelFn::MaybeMap
-            | KernelFn::MaybeAndThen
-            | KernelFn::ResultMap
-            // `Result.andThen f r` / `Result.mapError f r` — Ipê passes the
-            // fn first; the runtime `ipe_result_and_then(r, f)` /
-            // `ipe_result_map_error(r, f)` take the container first.
-            | KernelFn::ResultAndThen
-            | KernelFn::ResultMapError
-            // `JsonDec.andThen f decoder` — Ipê passes fn first; Rust runtime
-            // `decode_and_then(decoder, f)` expects decoder first. `Config.andThen`
-            // and `Db.Decode.andThen` share `decode_and_then`, so they need the
-            // same reorder.
-            | KernelFn::JsonDecAndThen
-            | KernelFn::ConfigAndThen
-            | KernelFn::DbDecAndThen
-            // `Task.andThen f task` — Ipê passes continuation first; Rust runtime
-            // `task_and_then(task, f)` expects effect first so Rust evaluates the
-            // effect expression BEFORE the continuation closure captures shared Db
-            // pool values, preventing E0507 / E0382 move conflicts at connect-use
-            // sites (see `Expr::TaskSeq` below for the auto-force counterpart).
-            | KernelFn::TaskAndThen
-    )
+/// The clone-rewritten container argument of a call whose runtime takes its
+/// arguments reversed ([`Callee::evaluates_args_reversed`], the single source of
+/// truth the argument reversal and the lowerer's use-ordering share).
+///
+/// The reversal renders `k f container` as `k(container, f)`, so `container` is
+/// evaluated before `f`'s closure captures. The lowerer's last-use clone rewrite
+/// walks the same evaluation order, so a `Clone` binding both use is already
+/// cloned at its container read. This rewrite is the backstop for a binding the
+/// lowerer's rewrite does not cover: every variable `f` captures is cloned at a
+/// CONSUMING read in `container` (borrowing reads stay bare — see
+/// [`clone_targets_in_expr`]), so the original survives into the closure
+/// instead of being moved first (E0382).
+///
+/// `None` when the callee does not reverse, the call is not the two-argument
+/// `f container` shape, or `f` captures none of `container`'s free variables —
+/// the caller then emits `container` unchanged.
+pub fn swapped_container_clone_rewrite(callee: &Callee, args: &[Expr]) -> Option<Expr> {
+    if !callee.evaluates_args_reversed() {
+        return None;
+    }
+    let [func, container] = args else {
+        return None;
+    };
+    // `container` is typically the small head; collect its vars first so the
+    // whole-`func` walk is skipped when it has none.
+    let container_vars = free_vars(container);
+    if container_vars.is_empty() {
+        return None;
+    }
+    let targets: std::collections::BTreeSet<Symbol> = free_vars(func)
+        .intersection(&container_vars)
+        .copied()
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(clone_targets_in_expr(container.clone(), &targets))
 }
 
 /// Whether a `Call` node hits one of the bespoke kernel special cases the
@@ -1895,12 +1902,28 @@ pub fn emit_tea_call(
 /// `requires_sync_capture`), or a `Copy` leaf (whose `.clone()` is a bitwise
 /// copy).
 pub fn stream_handler_capture_prologue(ctx: &EmitCtx, handler: &Expr) -> DResult<String> {
+    capture_clone_prologue(ctx, [handler])
+}
+
+/// A `let <v> = <v>.clone(); …` prologue for every free local of `exprs`, each named once.
+///
+/// Spliced ahead of emitted code that `move`-captures those locals while the
+/// originals must stay available afterwards — the prologue's shadowing clones
+/// are what the captures consume.
+pub fn capture_clone_prologue<'e>(
+    ctx: &EmitCtx,
+    exprs: impl IntoIterator<Item = &'e Expr>,
+) -> DResult<String> {
+    let mut captured = std::collections::BTreeSet::new();
+    for expr in exprs {
+        collect_free_vars(expr, &mut captured);
+    }
     let mut prologue = String::new();
-    for sym in free_vars(handler) {
+    for sym in captured {
         let id = ctx.emit_ident(sym)?;
         write!(prologue, "let {id} = {id}.clone(); ").map_err(|_| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::stream_handler_capture_prologue",
-            detail: "writing stream-handler capture-clone prologue failed".to_owned(),
+            where_: "ipe_backend_rust::capture_clone_prologue",
+            detail: "writing capture-clone prologue failed".to_owned(),
         })?;
     }
     Ok(prologue)

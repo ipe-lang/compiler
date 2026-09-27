@@ -1,0 +1,131 @@
+module Main exposing (main)
+
+-- SEAL repro: helpers whose `Sync`-bounded generic sits only in their RETURN
+-- type, referenced from a caller generic over the same variable where no
+-- argument exposes it:
+--
+--   * `nonTail`      — the nullary `emptyList : Decoder (List a)` as a `oneOf`
+--                      element, not in tail position;
+--   * `viaLet`       — the same helper bound by `let`, used later;
+--   * `viaPointFree` — `emptyWhen : Bool -> Decoder (List a)` passed as a
+--                      function value;
+--   * `twoHop`       — through `emptyAgain`, itself a return-only forwarder;
+--   * `togglePanel`  — `checkboxOf` passed point-free to a generic view.
+--
+-- `decode_succeed` moves `[] : List a` into a `Send + Sync` factory, and
+-- `input_checkbox_` bounds its message `Sync`, so each helper's generic is
+-- `Send + Sync`. Every caller instantiating it must carry the same bound, or
+-- the emitted crate fails `cargo build` with E0277 after ipe accepts it.
+--
+-- Output: the fallback list length per decoder, then the rendered view.
+
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+
+
+type Msg
+    = Toggled Bool
+
+
+emptyList : Decoder (List a)
+emptyList =
+    Decode.succeed []
+
+
+emptyWhen : Bool -> Decoder (List a)
+emptyWhen enabled =
+    if enabled then
+        Decode.succeed []
+
+    else
+        Decode.fail "disabled"
+
+
+emptyAgain : Decoder (List a)
+emptyAgain =
+    Decode.oneOf [ Decode.fail "never", emptyList ]
+
+
+nonTail : Decoder (List a) -> Decoder (List a)
+nonTail primary =
+    Decode.oneOf [ primary, emptyList ]
+
+
+viaLet : Decoder (List a) -> Decoder (List a)
+viaLet primary =
+    let
+        fallback =
+            emptyList
+    in
+    Decode.oneOf [ primary, fallback ]
+
+
+pickWith : (Bool -> Decoder (List a)) -> Decoder (List a) -> Decoder (List a)
+pickWith mkFallback primary =
+    Decode.oneOf [ primary, mkFallback True ]
+
+
+viaPointFree : Decoder (List a) -> Decoder (List a)
+viaPointFree primary =
+    pickWith emptyWhen primary
+
+
+twoHop : Decoder (List a) -> Decoder (List a)
+twoHop primary =
+    Decode.oneOf [ primary, emptyAgain ]
+
+
+checkboxOf : (Bool -> msg) -> Bool -> Element msg
+checkboxOf toMsg checked =
+    Input.checkbox []
+        { onChange = toMsg
+        , checked = checked
+        , icon = \_ -> Ui.text "x"
+        , label = Input.labelRight [] (Ui.text "done")
+        }
+
+
+withToggle : ((Bool -> msg) -> Bool -> Element msg) -> (Bool -> msg) -> Element msg
+withToggle build toMsg =
+    Ui.column [] [ Ui.text "Done?", build toMsg True ]
+
+
+togglePanel : (Bool -> msg) -> Element msg
+togglePanel toMsg =
+    Ui.column [] [ withToggle checkboxOf toMsg ]
+
+
+render : String -> Decoder (List Int) -> String
+render label dec =
+    case Decode.decodeString dec "\"not a list\"" of
+        Ok xs ->
+            String.concat [ label, ":", String.fromInt (List.length xs) ]
+
+        Err e ->
+            String.concat [ label, ":", Error.toString e ]
+
+
+renderView : Element Msg -> String
+renderView element =
+    Html.render (Ui.layout [] element)
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ render "nonTail" (nonTail (Decode.list Decode.int))
+            , render "viaLet" (viaLet (Decode.list Decode.int))
+            , render "viaPointFree" (viaPointFree (Decode.list Decode.int))
+            , render "twoHop" (twoHop (Decode.list Decode.int))
+            , renderView (togglePanel Toggled)
+            ]
+        )

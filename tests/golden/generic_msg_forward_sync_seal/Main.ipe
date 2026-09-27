@@ -1,0 +1,115 @@
+module Main exposing (main)
+
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+
+
+-- SEAL repro: view helpers generic over `msg` that FORWARD their callback to a
+-- `Sync`-bounded Input helper in a non-tail position (an element of a
+-- `Ui.column` / `Ui.row` child list). The helper's `msg` rides only behind the
+-- callback's arrow (`Bool -> msg`), never bare, so the forwarding caller learns
+-- the obligation only by aligning the callee's parameter type against its own
+-- argument's type. Every forwarding caller's generic must carry `Send + Sync`,
+-- or the emitted crate fails `cargo build` with E0277 after ipe accepts it.
+
+
+type Msg
+    = Toggled Bool
+    | Picked String
+
+
+checkboxOf : (Bool -> msg) -> Bool -> Element msg
+checkboxOf toMsg checked =
+    Input.checkbox []
+        { onChange = toMsg
+        , checked = checked
+        , icon = \_ -> Ui.text "x"
+        , label = Input.labelRight [] (Ui.text "done")
+        }
+
+
+radioOf : (String -> msg) -> String -> Element msg
+radioOf toMsg selected =
+    Input.radio []
+        { onChange = toMsg
+        , options =
+            [ Input.option "red" (Ui.text "Red")
+            , Input.option "blue" (Ui.text "Blue")
+            ]
+        , selected = selected
+        , label = Input.labelAbove [] (Ui.text "Pick a color")
+        }
+
+
+radioRowOf : (String -> msg) -> String -> Element msg
+radioRowOf toMsg selected =
+    Input.radioRow []
+        { onChange = toMsg
+        , options =
+            [ Input.option "red" (Ui.text "Red")
+            , Input.option "blue" (Ui.text "Blue")
+            ]
+        , selected = selected
+        , label = Input.labelAbove [] (Ui.text "Pick a color (row)")
+        }
+
+
+
+-- The callback parameter handed straight to each helper, non-tail.
+
+
+checkboxPanel : (Bool -> msg) -> Element msg
+checkboxPanel toMsg =
+    Ui.column [] [ Ui.text "Done?", checkboxOf toMsg True ]
+
+
+radioPanel : (String -> msg) -> Element msg
+radioPanel toMsg =
+    Ui.column [] [ Ui.text "Colour", radioOf toMsg "red" ]
+
+
+radioRowPanel : (String -> msg) -> Element msg
+radioRowPanel toMsg =
+    Ui.row [] [ Ui.text "Colour", radioRowOf toMsg "blue" ]
+
+
+
+-- The callback wrapped in a lambda, then bound by `let`, before forwarding.
+
+
+wrappedPanel : (Bool -> msg) -> Element msg
+wrappedPanel toMsg =
+    Ui.column [] [ checkboxOf (\checked -> toMsg (not checked)) False ]
+
+
+letPanel : (String -> msg) -> Element msg
+letPanel toMsg =
+    let
+        onPick =
+            toMsg
+    in
+    Ui.row [] [ radioOf onPick "blue" ]
+
+
+
+-- A second forwarding hop: the obligation chains through the panels.
+
+
+page : (Bool -> msg) -> (String -> msg) -> (String -> msg) -> Element msg
+page onCheck onPick onPickRow =
+    Ui.column [] [ checkboxPanel onCheck, radioPanel onPick, radioRowPanel onPickRow ]
+
+
+render : Element Msg -> String
+render element =
+    Html.render (Ui.layout [] element)
+
+
+main =
+    Io.println
+        (render (page Toggled Picked Picked)
+            ++ render (wrappedPanel Toggled)
+            ++ render (letPanel Picked)
+        )

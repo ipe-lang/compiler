@@ -1,0 +1,123 @@
+module Main exposing (main)
+
+-- SEAL repro: generic decoder combinators that `succeed` with a MATCH-ARM LOCAL
+-- `decoded : a` — no parameter — so the captured value is visible only through
+-- the kernel's solved instantiation at the call site. `decode_succeed` moves
+-- that value into a `Box<dyn Fn() -> T1 + Send + Sync>` factory, so every
+-- enclosing generic must carry `T1: Send + Sync`, wherever the `succeed` sits:
+--
+--   * `rewrap`   — tail position of a `-> Decoder a` closure;
+--   * `viaLet`   — bound by `let`, used later;
+--   * `viaOneOf` — an element of a `oneOf` list;
+--   * `viaMap2`  — an argument to `map2`;
+--   * `viaField` — stored in a record field, read back out.
+--
+-- Output: one decoded value per combinator.
+
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+rewrap : ({} -> Decoder a) -> Decoder a
+rewrap mkInner =
+    Decode.andThen
+        (\v ->
+            case Decode.decodeValue (mkInner {}) v of
+                Ok decoded ->
+                    Decode.succeed decoded
+
+                Err e ->
+                    Decode.fail (Error.toString e)
+        )
+        Decode.value
+
+
+viaLet : ({} -> Decoder a) -> Decoder a
+viaLet mkInner =
+    Decode.andThen
+        (\v ->
+            case Decode.decodeValue (mkInner {}) v of
+                Ok decoded ->
+                    let
+                        held =
+                            Decode.succeed decoded
+                    in
+                    Decode.andThen (\_ -> held) Decode.value
+
+                Err e ->
+                    Decode.fail (Error.toString e)
+        )
+        Decode.value
+
+
+viaOneOf : ({} -> Decoder a) -> Decoder a
+viaOneOf mkInner =
+    Decode.andThen
+        (\v ->
+            case Decode.decodeValue (mkInner {}) v of
+                Ok decoded ->
+                    Decode.oneOf [ Decode.fail "never", Decode.succeed decoded ]
+
+                Err e ->
+                    Decode.fail (Error.toString e)
+        )
+        Decode.value
+
+
+viaMap2 : ({} -> Decoder a) -> Decoder a
+viaMap2 mkInner =
+    Decode.andThen
+        (\v ->
+            case Decode.decodeValue (mkInner {}) v of
+                Ok decoded ->
+                    Decode.map2 (\kept _ -> kept) (Decode.succeed decoded) Decode.value
+
+                Err e ->
+                    Decode.fail (Error.toString e)
+        )
+        Decode.value
+
+
+viaField : ({} -> Decoder a) -> Decoder a
+viaField mkInner =
+    Decode.andThen
+        (\v ->
+            case Decode.decodeValue (mkInner {}) v of
+                Ok decoded ->
+                    let
+                        holder =
+                            { dec = Decode.succeed decoded }
+                    in
+                    holder.dec
+
+                Err e ->
+                    Decode.fail (Error.toString e)
+        )
+        Decode.value
+
+
+render : String -> Decoder Int -> String
+render label dec =
+    case Decode.decodeString dec "42" of
+        Ok n ->
+            String.concat [ label, ":", String.fromInt n ]
+
+        Err e ->
+            String.concat [ label, ":", Error.toString e ]
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ render "rewrap" (rewrap (\_ -> Decode.int))
+            , render "viaLet" (viaLet (\_ -> Decode.int))
+            , render "viaOneOf" (viaOneOf (\_ -> Decode.int))
+            , render "viaMap2" (viaMap2 (\_ -> Decode.int))
+            , render "viaField" (viaField (\_ -> Decode.int))
+            ]
+        )

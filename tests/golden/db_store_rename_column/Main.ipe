@@ -1,0 +1,387 @@
+module Main exposing (main)
+
+-- `Store.renameColumn` is ONE mapping over the whole store: the current-column
+-- view, the codec (write binds and decoded reads), and every declared-name fact
+-- (`DefaultNow` / `TouchOnUpdate` specs, the primary key, index columns) follow
+-- the rename, while `createSql` stays the frozen create entry `migrations` emits
+-- first. Runs against an in-memory SQLite database.
+--
+-- Checks (one output line each):
+--   * a raw-column store renames a `defaultNow` and a `touchOnUpdate` column:
+--     insert and update still OMIT them, so the database value survives a client
+--     value, and the row reads back keyed by its declared column names;
+--   * a codec store renames its primary key and a field: insert binds the new
+--     names, `update` / `get` key on the renamed primary key, `insertReturning`
+--     decodes the renamed row, and `findBy` names the DECLARED column;
+--   * every query-layer name is the declared name, emitted as the current
+--     column: a `Cond` accessor, `orderDesc`, a join key, a join filter, a join
+--     sort column, and a `select` projection (plain, `upper`, `coalesce`);
+--   * a current name that is not a declared one is refused with a typed `Err`
+--     by `orderAsc` and by `findBy`;
+--   * `createSql` names the FROZEN table with the frozen columns, identical to
+--     the first `migrations` entry, after both a table and a column rename;
+--   * an index on a renamed column targets the current table and column while
+--     its ledger identity stays frozen;
+--   * refusals: a rename of an unknown column, and a rename onto an existing
+--     column, are refused by `migrations` and leave the current columns as-is.
+
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Store as Store exposing (Store, Order(..))
+import Ipe.Db.Store.Unsafe as StoreU
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+-- ── Raw-column store: DB-filled columns survive a rename ─────────────
+
+eventsStore : Result Error (Store Store.Row)
+eventsStore =
+    Store.fromColumns "events"
+        [ Store.textColumn "id"
+        , Store.textColumn "label"
+        , Store.textColumn "created_at"
+        , Store.textColumn "updated_at"
+        ]
+        |> Result.map (StoreU.primaryKey "id")
+        |> Result.map (StoreU.defaultNow "created_at")
+        |> Result.map (StoreU.touchOnUpdate "updated_at")
+        |> Result.map Store.public
+        |> Result.map (Store.renameColumn "created_at" "stamped_at")
+        |> Result.map (Store.renameColumn "updated_at" "touched_at")
+        |> Result.map (Store.renameColumn "label" "title")
+
+
+eventRow : String -> String -> Store.Row
+eventRow label stamp =
+    Dict.fromList
+        [ ( "id", "e1" )
+        , ( "label", label )
+        , ( "created_at", stamp )
+        , ( "updated_at", stamp )
+        ]
+
+
+cell : String -> Store.Row -> String
+cell name row =
+    Maybe.withDefault "?" (Dict.get name row)
+
+
+-- A DB-filled cell is the database's own value: present, and never the client's.
+dbFilled : String -> Store.Row -> String -> Bool
+dbFilled name row clientValue =
+    cell name row /= clientValue && cell name row /= "?" && cell name row /= ""
+
+
+eventsChecks : Db -> Store Store.Row -> Task Error ()
+eventsChecks conn store =
+    do
+        _ <- Store.create conn store
+        _ <- Store.insert conn store (eventRow "hello" "CLIENT")
+        inserted <- Store.get conn store (SqlString "e1")
+        Io.println (insertLine inserted)
+        _ <- Store.update conn store (eventRow "bye" "CLIENT2")
+        updated <- Store.get conn store (SqlString "e1")
+        Io.println (updateLine updated)
+        found <- Store.findBy conn store "label" (SqlString "bye")
+        Io.println (String.concat [ "raw-findBy-declared-name:", String.fromInt (List.length found) ])
+
+
+insertLine : Maybe Store.Row -> String
+insertLine maybeRow =
+    case maybeRow of
+        Just row ->
+            if dbFilled "created_at" row "CLIENT" && dbFilled "updated_at" row "CLIENT" then
+                String.concat [ "raw-insert-omits-defaultNow:ok label=", cell "label" row ]
+
+            else
+                "raw-insert-omits-defaultNow:FAIL client value written"
+
+        Nothing ->
+            "raw-insert-omits-defaultNow:FAIL missing row"
+
+
+updateLine : Maybe Store.Row -> String
+updateLine maybeRow =
+    case maybeRow of
+        Just row ->
+            if dbFilled "updated_at" row "CLIENT2" && dbFilled "created_at" row "CLIENT2" then
+                String.concat [ "raw-update-omits-touchOnUpdate:ok label=", cell "label" row ]
+
+            else
+                "raw-update-omits-touchOnUpdate:FAIL client value written"
+
+        Nothing ->
+            "raw-update-omits-touchOnUpdate:FAIL missing row"
+
+
+-- ── Codec store: binds, keys, and decodes follow the rename ──────────
+
+type alias Person =
+    { id : String
+    , name : String
+    }
+
+
+blankPerson : Person
+blankPerson =
+    { id = "", name = "" }
+
+
+personCodec : Codec Person
+personCodec =
+    Codec.auto blankPerson
+
+
+peopleStore : Result Error (Store Person)
+peopleStore =
+    Store.fromCodec "people" personCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+        |> Result.map (Store.renameColumn "id" "person_id")
+        |> Result.map (Store.renameColumn "name" "full_name")
+
+
+peopleChecks : Db -> Store Person -> Task Error ()
+peopleChecks conn store =
+    do
+        _ <- Store.create conn store
+        _ <- Store.insert conn store { id = "p1", name = "Ada" }
+        _ <- Store.update conn store { id = "p1", name = "Grace" }
+        got <- Store.get conn store (SqlString "p1")
+        Io.println (String.concat [ "codec-get-renamed-pk:", personName got ])
+        returned <- Store.insertReturning conn store { id = "p2", name = "Hopper" }
+        Io.println (String.concat [ "codec-insertReturning:", returned.id, "=", returned.name ])
+        found <- Store.findBy conn store "name" (SqlString "Grace")
+        Io.println (String.concat [ "codec-findBy-declared-name:", String.join "," (List.map .id found) ])
+
+
+personName : Maybe Person -> String
+personName maybePerson =
+    case maybePerson of
+        Just p ->
+            String.concat [ p.id, "=", p.name ]
+
+        Nothing ->
+            "missing"
+
+
+-- ── Query layer: declared names in, current columns out ─────────────
+
+type alias Pet =
+    { id : String
+    , owner : String
+    , label : String
+    }
+
+
+blankPet : Pet
+blankPet =
+    { id = "", owner = "", label = "" }
+
+
+petCodec : Codec Pet
+petCodec =
+    Codec.auto blankPet
+
+
+petsStore : Result Error (Store Pet)
+petsStore =
+    Store.fromCodec "pets" petCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+        |> Result.map (Store.renameColumn "owner" "owner_ref")
+        |> Result.map (Store.renameColumn "label" "pet_label")
+
+
+personIds : List Person -> String
+personIds people =
+    String.join "," (List.map .id people)
+
+
+pairLine : ( Person, Pet ) -> String
+pairLine pair =
+    case pair of
+        ( person, pet ) ->
+            String.concat [ person.id, "=", person.name, "/", pet.label ]
+
+
+projectedLine : ( String, String, String ) -> String
+projectedLine triple =
+    case triple of
+        ( upperName, label, fallback ) ->
+            String.concat [ upperName, "/", label, "/", fallback ]
+
+
+-- A query that must be refused: its typed `Err` is the expected outcome.
+refusal : String -> Task Error (List Person) -> Task Error String
+refusal label task =
+    Task.onError
+        (\_ -> Task.succeed (String.concat [ label, ":refused" ]))
+        (Task.map (\_ -> String.concat [ label, ":FAIL accepted" ]) task)
+
+
+queryChecks : Db -> Store Person -> Store Pet -> Task Error ()
+queryChecks conn people pets =
+    do
+        _ <- Store.create conn pets
+        _ <- Store.insert conn pets { id = "t1", owner = "p1", label = "cat" }
+        _ <- Store.insert conn pets { id = "t2", owner = "p2", label = "dog" }
+        matched <-
+            Store.toList conn
+                (Store.query people |> Store.where (Store.eq .name "Grace"))
+        Io.println (String.concat [ "query-cond-declared-name:", personIds matched ])
+        ordered <-
+            Store.toList conn
+                (Store.query people
+                    |> Store.where (Store.inList .id [ "p1", "p2" ])
+                    |> Store.orderDesc "name"
+                )
+        Io.println (String.concat [ "query-order-declared-name:", personIds ordered ])
+        orderRefused <-
+            refusal "query-order-current-name"
+                (Store.toList conn (Store.query people |> Store.orderAsc "full_name"))
+        Io.println orderRefused
+        findRefused <-
+            refusal "findBy-current-name"
+                (Store.findBy conn people "full_name" (SqlString "Grace"))
+        Io.println findRefused
+        filtered <-
+            Store.joinToList conn
+                (Store.join people .id pets .owner
+                    |> Store.joinFilterRight (Store.eq .label "cat")
+                )
+        Io.println (String.concat [ "join-filter-declared-names:", String.join "," (List.map pairLine filtered) ])
+        sorted <-
+            Store.joinToList conn
+                (Store.join people .id pets .owner
+                    |> Store.orderByLeft .name Desc
+                )
+        Io.println (String.concat [ "join-order-declared-names:", String.join "," (List.map pairLine sorted) ])
+        projected <-
+            Store.selectToList conn
+                (Store.select
+                    (\( person, pet ) -> ( Store.upper person.name, pet.label, Store.coalesce pet.label (Store.literal "none") ))
+                    (Store.join people .id pets .owner
+                        |> Store.joinFilterRight (Store.eq .label "cat")
+                    )
+                )
+        Io.println (String.concat [ "select-declared-names:", String.join "," (List.map projectedLine projected) ])
+
+
+-- ── createSql / migrations / index: one frozen identity ──────────────
+
+usersStore : Result Error (Store Store.Row)
+usersStore =
+    Store.fromColumns "users"
+        [ Store.textColumn "id"
+        , Store.textColumn "name"
+        ]
+        |> Result.map (StoreU.primaryKey "id")
+        |> Result.map (Store.index [ "name" ])
+        |> Result.map Store.public
+        |> Result.map (Store.renameColumn "name" "full_name")
+        |> Result.map (Store.renameTable "accounts")
+
+
+schemaLines : Store Store.Row -> List String
+schemaLines store =
+    case ( Store.createSql store, Store.migrations store ) of
+        ( Ok ddl, Ok ms ) ->
+            let
+                sameAsCreateEntry =
+                    case ms of
+                        first :: _ ->
+                            first.sql == ddl
+
+                        [] ->
+                            False
+            in
+            String.concat [ "createSql-frozen:", ddl ]
+                :: String.concat
+                    [ "createSql-equals-create-entry:"
+                    , if sameAsCreateEntry then
+                        "ok"
+
+                      else
+                        "FAIL"
+                    ]
+                :: List.map (\m -> String.concat [ m.name, ": ", m.sql ]) ms
+
+        ( Err e, _ ) ->
+            [ String.concat [ "createSql:FAIL ", Error.toString e ] ]
+
+        ( _, Err e ) ->
+            [ String.concat [ "migrations:FAIL ", Error.toString e ] ]
+
+
+-- ── Refusals: a rename that would drift the identity map ─────────────
+
+baseStore : Result Error (Store Store.Row)
+baseStore =
+    Store.fromColumns "items"
+        [ Store.textColumn "id"
+        , Store.textColumn "name"
+        ]
+        |> Result.map Store.public
+
+
+refusalLine : String -> Result Error (Store Store.Row) -> String
+refusalLine label storeResult =
+    case storeResult of
+        Err e ->
+            String.concat [ label, ":FAIL build ", Error.toString e ]
+
+        Ok store ->
+            case Store.migrations store of
+                Err _ ->
+                    String.concat
+                        [ label
+                        , ":refused columns="
+                        , String.join "," (Store.columnNames store)
+                        ]
+
+                Ok _ ->
+                    String.concat [ label, ":FAIL accepted" ]
+
+
+refusals : List String
+refusals =
+    [ refusalLine "rename-unknown-column"
+        (Result.map (Store.renameColumn "nope" "other") baseStore)
+    , refusalLine "rename-onto-existing-column"
+        (Result.map (Store.renameColumn "name" "id") baseStore)
+    ]
+
+
+-- ── Driver ───────────────────────────────────────────────────────────
+
+main : Task Error ()
+main =
+    case ( eventsStore, peopleStore, usersStore ) of
+        ( Ok events, Ok people, Ok users ) ->
+            case petsStore of
+                Ok pets ->
+                    do
+                        conn <- Db.open "sqlite" "sqlite::memory:"
+                        Db.withTransaction conn
+                            (\tx ->
+                                do
+                                    eventsChecks tx events
+                                    peopleChecks tx people
+                                    queryChecks tx people pets
+                                    Io.println (String.join "\n" (schemaLines users ++ refusals))
+                            )
+
+                Err _ ->
+                    Io.println "store-build:FAIL"
+
+        _ ->
+            Io.println "store-build:FAIL"

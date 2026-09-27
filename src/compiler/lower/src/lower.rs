@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    DResult, Diagnostic, Feature, Located, LowerError, MainRetName, NameError, Span,
-    StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    DResult, Diagnostic, Feature, GenericAppEntryReach, Located, LowerError, MainRetName,
+    NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
@@ -161,6 +161,88 @@ fn peel_arrow_arity<'a>(
         cur = rest.as_ref();
     }
     Ok((arg_tys, cur))
+}
+
+/// Every parameter type of the curried arrow `fn_ty`, in order (empty for a non-arrow).
+fn arrow_params(fn_ty: &Ty) -> Vec<&Ty> {
+    let mut params = Vec::new();
+    let mut cur = fn_ty;
+    while let Ty::Fun(arg, rest) = cur {
+        params.push(arg.as_ref());
+        cur = rest.as_ref();
+    }
+    params
+}
+
+/// Whether `t` still holds a type variable anywhere, an open record row tail included.
+///
+/// The walk is bounded by the solved type's own depth.
+fn ty_has_type_var(t: &Ty) -> bool {
+    match t {
+        Ty::Var(_) => true,
+        Ty::Fun(a, b) => ty_has_type_var(a) || ty_has_type_var(b),
+        Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_has_type_var),
+        Ty::Record(fields, tail) => {
+            matches!(tail, RowTail::Open(_)) || fields.values().any(ty_has_type_var)
+        }
+        Ty::Unit => false,
+    }
+}
+
+/// The qualified surface name of app entry `kernel` (`Web.embed`), as diagnostics print it.
+fn app_entry_name(kernel: KernelFn) -> Box<str> {
+    let def = kernel.def();
+    format!("{}.{}", def.qualifier, def.name).into_boxed_str()
+}
+
+/// The built-in constructor table and interner a kernel scheme shape is read against.
+#[derive(Clone, Copy)]
+struct SchemeHeads<'h> {
+    builtins: &'h ipe_types::Builtins,
+    interner: &'h Interner,
+}
+
+/// The solved type scheme variable `var` is instantiated to, found by walking `shape` alongside `solved`.
+///
+/// Aligns exactly the positions [`ipe_kernels::shape_aligns_var`] counts — an
+/// arrow side, a constructor argument, a tuple element; a record field is keyed
+/// by an interned symbol the shape cannot name, so it is skipped. A constructor
+/// aligns only when its full head (tag and home) is the solved one, by the rule
+/// unification applies, and its arity agrees. `None` when no aligned occurrence
+/// exists or the two trees disagree in structure. The walk is bounded by the
+/// `'static` shape's depth.
+fn scheme_var_instance<'t>(
+    shape: &ipe_kernels::TyShape,
+    solved: &'t Ty,
+    var: u8,
+    heads: SchemeHeads<'_>,
+) -> Option<&'t Ty> {
+    use ipe_kernels::TyShape;
+    let align = |items: &[TyShape], solved_items: &'t [Ty]| {
+        if items.len() != solved_items.len() {
+            return None;
+        }
+        items
+            .iter()
+            .zip(solved_items)
+            .find_map(|(item, solved_item)| scheme_var_instance(item, solved_item, var, heads))
+    };
+    match (shape, solved) {
+        (TyShape::Var(v), _) => (*v == var).then_some(solved),
+        (TyShape::Fun(arg, res), Ty::Fun(solved_arg, solved_res)) => {
+            scheme_var_instance(arg, solved_arg, var, heads)
+                .or_else(|| scheme_var_instance(res, solved_res, var, heads))
+        }
+        (TyShape::Con(tag, items), Ty::Con { module, name, args })
+            if heads
+                .builtins
+                .con_head_is(*tag, module, *name, heads.interner) =>
+        {
+            align(items, args)
+        }
+        (TyShape::Tuple(items), Ty::Tuple(solved_items)) => align(items, solved_items),
+        _ => None,
+    }
 }
 
 /// The `Maybe a` type carries exactly one argument; an arity-1 guard cleared it,
@@ -1248,8 +1330,9 @@ fn canon_collect_free_locals(
 // only the FIRST move is valid; subsequent reads of a moved value are E0382.
 //
 // Fix: when a `let`-binding or function parameter of `CloneOk` type is used
-// N > 1 times in its scope, insert `.clone()` on all but the syntactically LAST
-// occurrence (DFS left-to-right order).  The last occurrence stays bare — it
+// N > 1 times in its scope, insert `.clone()` on all but the LAST-EVALUATED
+// occurrence (DFS left-to-right, with a reversed-argument kernel call visited
+// last-argument-first).  The last occurrence stays bare — it
 // is the "real" final consume.  Over-cloning is acceptable (conservatism);
 // a precision pass can follow once the correctness seal holds.
 //
@@ -3060,6 +3143,28 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
     }
 }
 
+/// The payload of a `Send + 'static` carrier: a `Cmd`, `Sub` or `Decoder`.
+///
+/// The runtime boxes each of these as a `Send + 'static` value, so every type
+/// it carries must be `Send + 'static` too. `None` for every other type.
+const fn ir_type_send_carrier_payload(ty: &IrType) -> Option<&IrType> {
+    match ty {
+        IrType::Cmd(inner) | IrType::Sub(inner) | IrType::Decoder(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Does the type variable `tv` appear inside a `Send + 'static` carrier's payload anywhere in `ty`?
+///
+/// The carriers are [`ir_type_send_carrier_payload`]'s; the walk is the total
+/// [`ir_type_mentions`] recursion, so a carrier nested under a function type,
+/// a container, or another carrier is found.
+fn ir_type_generic_in_send_carrier(ty: &IrType, tv: Symbol) -> bool {
+    ir_type_mentions(ty, &|t| {
+        ir_type_send_carrier_payload(t).is_some_and(|inner| ir_type_mentions_generic(inner, tv))
+    })
+}
+
 /// Does the type variable `tv` appear INSIDE a [`IrType::Decoder`] payload
 /// anywhere in `ty`?
 ///
@@ -4045,35 +4150,18 @@ fn apply_kernel_type_param_bounds(
     let ws_open_msg_matcher = |tracked: Symbol, k: KernelFn, args: &[Expr]| -> bool {
         matches!(k, KernelFn::SubSubscribeWebSocket) && arg_is_tracked_var(args, 2, tracked)
     };
-    // `Sync` — the optional-decoder slots (`JsonDecP.optional` /
-    // `Db.Decode.optional`) capture their element DEFAULT behind a thread-shared
-    // carrier, so their runtime slot bounds the decoded element `T: Send + Sync`
-    // (`decode_pipeline_optional` / `db_decode_optional`). Both kernels share the
-    // scheme `String -> Decoder a -> a -> Decoder (a -> b) -> Decoder b`: the
-    // `Sync`-obliged element `a` is the BARE default at arg index 2 (of type
-    // exactly `Generic(tv)`), while the result `b` never appears bare — it only
-    // sits under a `Decoder`/function — so tracking the arg-2 default selects `a`
-    // ALONE and never over-bounds `b`. Applies to wildcard `any` AND named tvars.
-    let optional_sync_matcher = |tracked: Symbol, k: KernelFn, args: &[Expr]| -> bool {
-        matches!(k, KernelFn::JsonDecPOptional | KernelFn::DbDecOptional)
-            && arg_is_tracked_var(args, 2, tracked)
-    };
-    // `Sync` — `Config.succeed`/`JsonDec.succeed`/`Db.Decode.succeed` (all lower
-    // to `decode_succeed`) take their value at arg index 0 and MOVE it into the
-    // decoder's factory closure `Box<dyn Fn() -> A + Send + Sync>`, whose captured
-    // `A` must therefore be `Send + Sync`. When that value is a tracked
-    // `Generic(tv)` binder — `custom fallback = Config.succeed fallback`, emitting
-    // `fn custom<T>(fallback: T) -> Decoder<T>` — the tvar needs `Sync`, or the
-    // closure→trait-object cast fails E0277 (`T cannot be shared between threads`),
-    // an exit-0-then-cargo-fail SEAL break. The sibling `decode_list`/`decode_map`
-    // slots capture a pre-built `Decoder` (itself `Send + Sync` for free), not a
-    // bare `tv` value, so they oblige `Send` only — this arg-0 capture is the exact
-    // position that adds `Sync`, never over-bounding a run-through element.
-    let succeed_sync_matcher = |tracked: Symbol, k: KernelFn, args: &[Expr]| -> bool {
-        matches!(
-            k,
-            KernelFn::ConfigSucceed | KernelFn::JsonDecSucceed | KernelFn::DbDecSucceed
-        ) && arg_is_tracked_var(args, 0, tracked)
+    // `Sync` — a kernel that MOVES an argument value into a thread-shared
+    // `Send + Sync` carrier (`KernelFn::sync_captured_args`, the single source
+    // of truth: `succeed`'s factory value, an optional decoder's default, a
+    // fixed `onSubmit` message) obliges its captured type `Send + Sync`. This
+    // binder-keyed matcher is the defence-in-depth twin of the call-site
+    // obligation `Lowerer::note_sync_captures` records from the kernel's solved
+    // instantiation: it fires when the captured argument is exactly a tracked
+    // `Generic(tv)` parameter binder.
+    let sync_capture_matcher = |tracked: Symbol, k: KernelFn, args: &[Expr]| -> bool {
+        k.sync_captured_args()
+            .iter()
+            .any(|&idx| arg_is_tracked_var(args, idx, tracked))
     };
 
     for (tv, bounds) in type_params.iter_mut() {
@@ -4149,7 +4237,7 @@ fn apply_kernel_type_param_bounds(
         // running a pre-built `Decoder`, or an optional's produced result `b`)
         // keeps `Send` and gains no spurious `Sync`. Companion to the `Send`
         // propagation above (`with_sync` re-implies `Send` + `'static`).
-        if fires_on(&optional_sync_matcher) || fires_on(&succeed_sync_matcher) {
+        if fires_on(&sync_capture_matcher) {
             *bounds = bounds.with_sync();
         }
         // `Sync` — GENERAL capture obligation: the tvar's VALUE binder is
@@ -4625,13 +4713,34 @@ fn collect_local_derived_tvars(
 ///     stops at opaque `Send + Sync` carriers). A pass-through the callee left
 ///     [`BoundSet::UNBOUNDED`] contributes nothing, so a truly-parametric
 ///     forwarder stays reusable.
+///   * A callee generic a position carries only behind a function arrow or an
+///     opaque carrier (`checkboxOf : (Bool -> msg) -> …` handed the caller's
+///     `toMsg`) is instantiated by the mirrored slot of the argument's own type,
+///     so the argument's type — a parameter's or `let`'s declared type, a
+///     function value's solved type, a lambda's signature — is aligned against
+///     the callee parameter type ([`aligned_param_tvars`]) and the caller
+///     generics reaching that slot bare inherit the bound, whatever position the
+///     call sits in. An argument of unrecoverable type, or of a shape the
+///     parameter does not share, obliges every caller generic (fail closed).
+///   * Every user-function reference — a call in any position, a point-free
+///     value, a `let`-bound alias — carries the solved type it instantiates
+///     the callee at (`instances`, recorded by `Lowerer::note_callee_instance`).
+///     The callee's whole signature, return type included, is aligned against
+///     it ([`instance_tvars`]), so a generic the callee bounds only in its
+///     return type (`helper : Ui msg`) reaches the caller generic it is
+///     instantiated with, whichever position the reference sits in. The
+///     binder- and tail-keyed rules above stay as defence in depth: they also
+///     cover calls the lowerer synthesises without a source reference.
 ///
 /// The fixpoint iterates because propagation chains: a caller of `Store.toMaybe`
 /// that itself forwards its generic acquires the bound only once `toMaybe` has
 /// acquired it. Termination is guaranteed — each iteration only ever SETS bits
 /// in a finite [`BoundSet`], so the total bit count is monotone and bounded.
 #[allow(clippy::too_many_lines)] // A fixpoint pass with per-caller seeding + nested call walk.
-fn propagate_call_site_bounds(funcs: &mut [Func]) {
+fn propagate_call_site_bounds(
+    funcs: &mut [Func],
+    instances: &std::collections::HashMap<FuncId, Vec<CalleeInstance>>,
+) {
     // Callee lookup by raw id, plus a snapshot of each callee's (param types,
     // type-param bounds) so a caller can read a callee's obligations without
     // aliasing the `&mut [Func]` it is about to write.
@@ -4679,6 +4788,15 @@ fn propagate_call_site_bounds(funcs: &mut [Func]) {
             }
             collect_local_derived_tvars(&caller.body, &mut binder_tvars);
 
+            // The declared type of every binder whose type is recoverable —
+            // each parameter, and each `let` bound to a value of known type —
+            // for aligning a forwarded argument against a callee parameter.
+            let mut site_types: std::collections::HashMap<Symbol, Option<IrType>> = caller_params
+                .iter()
+                .map(|(b, bty)| (*b, Some(bty.clone())))
+                .collect();
+            collect_let_site_types(&caller.body, &mut site_types);
+
             let mut calls: Vec<(FuncId, &[Expr])> = Vec::new();
             collect_user_calls(&caller.body, &mut calls);
 
@@ -4702,19 +4820,35 @@ fn propagate_call_site_bounds(funcs: &mut [Func]) {
                     // candidate to inherit the callee position's bound.
                     let mut binders: Vec<Symbol> = Vec::new();
                     arg_forwarded_binders(arg, &mut binders);
-                    if binders.is_empty() {
-                        continue;
-                    }
                     let Some(callee_pty) = callee_param_tys.get(pos) else {
                         continue;
                     };
-                    // Which callee generic does this position carry bare, and
-                    // does it carry an auto-trait bound worth propagating?
                     for (g, gbound) in callee_tparams {
-                        if !ir_type_generic_reaches_bare(callee_pty, *g) {
+                        if !(gbound.has_sync() || gbound.has_send() || gbound.has_static()) {
                             continue;
                         }
-                        if !(gbound.has_sync() || gbound.has_send() || gbound.has_static()) {
+                        // A callee generic riding this position only behind a
+                        // function arrow or an opaque carrier (`Bool -> msg`)
+                        // is instantiated by the mirrored slot of the argument's
+                        // own type, so the argument type is aligned against the
+                        // callee parameter type. An argument whose type is not
+                        // recoverable, or whose shape the parameter does not
+                        // share, obliges every caller generic (fail closed).
+                        if !ir_type_generic_reaches_bare(callee_pty, *g) {
+                            if !ir_type_mentions_generic(callee_pty, *g) {
+                                continue;
+                            }
+                            let obliged = arg_site_type(arg, &site_types)
+                                .and_then(|site| {
+                                    aligned_param_tvars(callee_pty, *g, &site, &caller_tvars)
+                                })
+                                .unwrap_or_else(|| caller_tvars.clone());
+                            for tv in obliged {
+                                oblige_auto_traits(
+                                    add.entry(tv).or_insert(BoundSet::UNBOUNDED),
+                                    *gbound,
+                                );
+                            }
                             continue;
                         }
                         for binder in &binders {
@@ -4726,18 +4860,46 @@ fn propagate_call_site_bounds(funcs: &mut [Func]) {
                                 continue;
                             };
                             for tv in tvs {
-                                let slot = add.entry(*tv).or_insert(BoundSet::UNBOUNDED);
-                                if gbound.has_sync() {
-                                    *slot = slot.with_sync();
-                                }
-                                if gbound.has_send() {
-                                    *slot = slot.with_send();
-                                }
-                                if gbound.has_static() {
-                                    *slot = slot.with_static();
-                                }
+                                oblige_auto_traits(
+                                    add.entry(*tv).or_insert(BoundSet::UNBOUNDED),
+                                    *gbound,
+                                );
                             }
                         }
+                    }
+                }
+            }
+
+            // Instantiation propagation: every user-function reference the
+            // caller's body makes — a call in any position, a point-free value,
+            // a `let`-bound alias — was recorded at lowering time with the
+            // solved type it instantiates the callee at. Aligning the callee's
+            // full signature (parameters AND return type) against that type
+            // names exactly the caller generics each bounded callee generic is
+            // instantiated with, so a generic the callee bounds only in its
+            // return type (`helper : Ui msg` built from a `Sync`-bounded
+            // kernel, used as `Ui.column [] [ helper ]`) obliges the caller
+            // just as a forwarded argument does. An unknown instantiation
+            // fails closed (see [`instance_slot_tvars`]).
+            for instance in instances.get(&caller.id).into_iter().flatten() {
+                let Some(callee_idx) = by_id.get(&instance.callee.as_raw()).copied() else {
+                    continue;
+                };
+                let (Some(callee_param_tys), Some(callee_ret), Some(callee_tparams)) = (
+                    sig_param_tys.get(callee_idx),
+                    sig_rets.get(callee_idx),
+                    sig_tparams.get(callee_idx),
+                ) else {
+                    continue;
+                };
+                for (g, gbound) in callee_tparams {
+                    if !(gbound.has_sync() || gbound.has_send() || gbound.has_static()) {
+                        continue;
+                    }
+                    for tv in
+                        instance_tvars(callee_param_tys, callee_ret, *g, instance, &caller_tvars)
+                    {
+                        oblige_auto_traits(add.entry(tv).or_insert(BoundSet::UNBOUNDED), *gbound);
                     }
                 }
             }
@@ -4771,16 +4933,10 @@ fn propagate_call_site_bounds(funcs: &mut [Func]) {
                         continue;
                     }
                     for caller_tv in aligned_caller_tvars(sig_ret, *g, &caller_ret) {
-                        let slot = add.entry(caller_tv).or_insert(BoundSet::UNBOUNDED);
-                        if gbound.has_sync() {
-                            *slot = slot.with_sync();
-                        }
-                        if gbound.has_send() {
-                            *slot = slot.with_send();
-                        }
-                        if gbound.has_static() {
-                            *slot = slot.with_static();
-                        }
+                        oblige_auto_traits(
+                            add.entry(caller_tv).or_insert(BoundSet::UNBOUNDED),
+                            *gbound,
+                        );
                     }
                 }
             }
@@ -4920,6 +5076,375 @@ fn align_ret_tvars(sig: &IrType, target: Symbol, site: &IrType, out: &mut Vec<Sy
             align_ret_tvars(ra, target, rb, out);
         }
         _ => {}
+    }
+}
+
+/// One slot of a user-function reference's solved instantiation, in the referencing def's generics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SiteSlot {
+    /// The slot's solved type, lowered.
+    Lowered(IrType),
+    /// The slot's solved type does not lower; the def generics it mentions anywhere.
+    Unlowered(Vec<Symbol>),
+}
+
+/// A lowered definition before its generics' body-derived bounds are folded in.
+///
+/// Produced by `Lowerer::lower_def_parts` for every definition shape and
+/// consumed only by `Lowerer::lower_def`, the single place a [`Func`] is
+/// assembled.
+struct DefParts {
+    /// The definition's generics with their signature-derived bounds.
+    type_params: Vec<(Symbol, BoundSet)>,
+    /// The generics minted for wildcard `any` positions.
+    wildcard_any_syms: BTreeSet<Symbol>,
+    /// Erased record-row parameters.
+    row_params: Vec<RowParam>,
+    /// Parameter binders and their lowered types.
+    params: Vec<(Symbol, IrType)>,
+    /// The lowered return type.
+    ret: IrType,
+    /// The lowered body.
+    body: Expr,
+}
+
+/// A user-function reference in a def body, paired with the solved type it instantiates the callee at.
+///
+/// Recorded for every call and every point-free value reference alike, so a
+/// callee generic is aligned against its instantiation wherever it sits in
+/// the callee's signature — a parameter, the return type, or behind an arrow
+/// — and whatever position the reference occupies in the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CalleeInstance {
+    callee: FuncId,
+    /// The `i`-th curried arrow parameter of the reference's solved type.
+    params: Vec<SiteSlot>,
+    /// The solved type left after peeling `d` arrows, at index `d`.
+    ///
+    /// Empty when the reference has no solved type, so every lookup misses
+    /// and the alignment fails closed.
+    tails: Vec<SiteSlot>,
+}
+
+/// The caller generics a callee generic `target` is instantiated with through one signature slot.
+///
+/// `sig` is the callee's declared slot type, `site` the reference's solved
+/// slot. A slot that does not mention `target` obliges nothing; a missing
+/// `site` (the reference type is unknown, or shallower than the callee's
+/// arity) obliges every caller generic; a lowered `site` of a shape `sig`
+/// does not share obliges every caller generic the site mentions, since the
+/// instantiation is one of its subterms.
+fn instance_slot_tvars(
+    sig: &IrType,
+    target: Symbol,
+    site: Option<&SiteSlot>,
+    caller_tvars: &[Symbol],
+) -> Vec<Symbol> {
+    if !ir_type_mentions_generic(sig, target) {
+        return Vec::new();
+    }
+    match site {
+        None => caller_tvars.to_vec(),
+        Some(SiteSlot::Unlowered(mentioned)) => mentioned.clone(),
+        Some(SiteSlot::Lowered(site)) => aligned_param_tvars(sig, target, site, caller_tvars)
+            .unwrap_or_else(|| {
+                caller_tvars
+                    .iter()
+                    .copied()
+                    .filter(|tv| ir_type_mentions_generic(site, *tv))
+                    .collect()
+            }),
+    }
+}
+
+/// The caller generics a bounded callee generic `target` is instantiated with at one reference.
+///
+/// Aligns the callee's full signature — each parameter, then the return type
+/// — against the reference's solved instantiation (see [`instance_slot_tvars`]).
+fn instance_tvars(
+    callee_params: &[IrType],
+    callee_ret: &IrType,
+    target: Symbol,
+    instance: &CalleeInstance,
+    caller_tvars: &[Symbol],
+) -> Vec<Symbol> {
+    let slots = callee_params
+        .iter()
+        .enumerate()
+        .map(|(i, sig)| (sig, instance.params.get(i)))
+        .chain(std::iter::once((
+            callee_ret,
+            instance.tails.get(callee_params.len()),
+        )));
+    let mut out: Vec<Symbol> = Vec::new();
+    for (sig, site) in slots {
+        for tv in instance_slot_tvars(sig, target, site, caller_tvars) {
+            if !out.contains(&tv) {
+                out.push(tv);
+            }
+        }
+    }
+    out
+}
+
+/// Fold `from`'s auto-trait and lifetime bits (`Sync`/`Send`/`'static`) into `slot`.
+const fn oblige_auto_traits(slot: &mut BoundSet, from: BoundSet) {
+    if from.has_sync() {
+        *slot = slot.with_sync();
+    }
+    if from.has_send() {
+        *slot = slot.with_send();
+    }
+    if from.has_static() {
+        *slot = slot.with_static();
+    }
+}
+
+/// The lowered type of a call argument, when the argument or the binder it names records one.
+///
+/// A binder resolves through `site_types` (a parameter, or a `let` bound to a
+/// value of known type); a function value carries its solved type; a lambda
+/// its parameter and return types. Any other shape has no recoverable type and
+/// yields `None`, which [`propagate_call_site_bounds`] treats as fail-closed.
+fn arg_site_type(
+    arg: &Expr,
+    site_types: &std::collections::HashMap<Symbol, Option<IrType>>,
+) -> Option<IrType> {
+    match arg {
+        Expr::Var(s) | Expr::CloneVar(s) => site_types.get(s).cloned().flatten(),
+        Expr::FuncValue { ty, .. } => Some(ty.clone()),
+        Expr::Lambda { params, ret, .. } => Some(IrType::Fun(
+            params.iter().map(|(_, t)| t.clone()).collect(),
+            Box::new(ret.clone()),
+        )),
+        Expr::SharedLambda { params, ret, .. } => Some(IrType::SharedFun(
+            params.iter().map(|(_, t)| t.clone()).collect(),
+            Box::new(ret.clone()),
+        )),
+        _ => None,
+    }
+}
+
+/// Record `ty` as `name`'s site type; a name bound twice to differing types becomes unknown.
+///
+/// An unknown (`None`) entry makes every argument naming the binder fail
+/// closed, so a shadowing binder can never lend the shadowed one's type.
+fn record_site_type(
+    site_types: &mut std::collections::HashMap<Symbol, Option<IrType>>,
+    name: Symbol,
+    ty: Option<IrType>,
+) {
+    let conflicting = site_types
+        .get(&name)
+        .is_some_and(|existing| *existing != ty);
+    site_types.insert(name, if conflicting { None } else { ty });
+}
+
+/// Record every binder `pat` introduces as of unknown type.
+fn record_pat_site_types(
+    pat: &Pat,
+    site_types: &mut std::collections::HashMap<Symbol, Option<IrType>>,
+) {
+    let mut binders: Vec<Symbol> = Vec::new();
+    pat_binder_syms(pat, &mut binders);
+    for b in binders {
+        record_site_type(site_types, b, None);
+    }
+}
+
+/// Extend `site_types` with every binder `body` introduces.
+///
+/// A `let` records its value's type ([`arg_site_type`]); a lambda or loop
+/// parameter its declared type; a pattern binder is recorded unknown, since
+/// the lowered pattern carries no per-binder type.
+#[allow(clippy::too_many_lines)] // A recursive tree-walk over a large enum — necessarily long.
+fn collect_let_site_types(
+    body: &Expr,
+    site_types: &mut std::collections::HashMap<Symbol, Option<IrType>>,
+) {
+    match body {
+        Expr::Let { name, value, body } => {
+            collect_let_site_types(value, site_types);
+            let ty = arg_site_type(value, site_types);
+            record_site_type(site_types, *name, ty);
+            collect_let_site_types(body, site_types);
+        }
+        Expr::Destructure {
+            binder,
+            value,
+            body,
+        } => {
+            collect_let_site_types(value, site_types);
+            record_pat_site_types(binder, site_types);
+            collect_let_site_types(body, site_types);
+        }
+        Expr::Match(m) => {
+            collect_let_site_types(m.scrutinee(), site_types);
+            for arm in m.arms() {
+                record_pat_site_types(&arm.pat, site_types);
+                if let Some(g) = arm.guard.as_ref() {
+                    collect_let_site_types(g, site_types);
+                }
+                collect_let_site_types(&arm.body, site_types);
+            }
+        }
+        Expr::Lambda { params, body, .. }
+        | Expr::SharedLambda { params, body, .. }
+        | Expr::TailLoop { params, body } => {
+            for (p, pty) in params {
+                record_site_type(site_types, *p, Some(pty.clone()));
+            }
+            collect_let_site_types(body, site_types);
+        }
+        Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
+            for a in args {
+                collect_let_site_types(a, site_types);
+            }
+        }
+        Expr::Apply { func, args } => {
+            collect_let_site_types(func, site_types);
+            for a in args {
+                collect_let_site_types(a, site_types);
+            }
+        }
+        Expr::If { cond, then_, else_ } => {
+            collect_let_site_types(cond, site_types);
+            collect_let_site_types(then_, site_types);
+            collect_let_site_types(else_, site_types);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_let_site_types(lhs, site_types);
+            collect_let_site_types(rhs, site_types);
+        }
+        Expr::Tuple(items) | Expr::List { items, .. } => {
+            for e in items {
+                collect_let_site_types(e, site_types);
+            }
+        }
+        Expr::Cons { head, tail } => {
+            collect_let_site_types(head, site_types);
+            collect_let_site_types(tail, site_types);
+        }
+        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
+            collect_let_site_types(list, site_types);
+        }
+        Expr::Record { fields, .. } | Expr::Update { fields, .. } => {
+            for (_, e) in fields {
+                collect_let_site_types(e, site_types);
+            }
+        }
+        Expr::TaskSeq { effect, rest } => {
+            collect_let_site_types(effect, site_types);
+            collect_let_site_types(rest, site_types);
+        }
+        Expr::Access { record, .. } => collect_let_site_types(record, site_types),
+        Expr::Var(_)
+        | Expr::CloneVar(_)
+        | Expr::FuncValue { .. }
+        | Expr::Int(_)
+        | Expr::Bool(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::PathLit(_)
+        | Expr::CustomElementRef { .. }
+        | Expr::Char(_)
+        | Expr::Unit => {}
+    }
+}
+
+/// The caller generics a callee parameter's generic `target` is instantiated with at one call.
+///
+/// Walks the callee parameter type `sig` alongside the argument's type `site`
+/// through every shape they share — function arrows, value containers, effect
+/// carriers, tuples, records, enums. Where `sig` holds `target` itself, the
+/// mirrored `site` slot is `target`'s instantiation, so every generic of
+/// `caller_tvars` reaching that slot bare must meet `target`'s bound.
+/// `None` when `target` occurs under a `sig` shape `site` does not share: the
+/// instantiation is unknown and the caller must fail closed.
+fn aligned_param_tvars(
+    sig: &IrType,
+    target: Symbol,
+    site: &IrType,
+    caller_tvars: &[Symbol],
+) -> Option<Vec<Symbol>> {
+    let mut out = Vec::new();
+    align_param_slot(sig, target, site, caller_tvars, &mut out).then_some(out)
+}
+
+/// One step of [`aligned_param_tvars`]; `false` when alignment is impossible.
+fn align_param_slot(
+    sig: &IrType,
+    target: Symbol,
+    site: &IrType,
+    caller_tvars: &[Symbol],
+    out: &mut Vec<Symbol>,
+) -> bool {
+    if !ir_type_mentions_generic(sig, target) {
+        return true;
+    }
+    // `sig` mentions `target`, so a generic here IS `target`: `site` is its
+    // instantiation.
+    if matches!(sig, IrType::Generic(_)) {
+        for tv in caller_tvars {
+            if ir_type_generic_reaches_bare(site, *tv) && !out.contains(tv) {
+                out.push(*tv);
+            }
+        }
+        return true;
+    }
+    let mut slot = |a: &IrType, b: &IrType| align_param_slot(a, target, b, caller_tvars, out);
+    match (sig, site) {
+        (IrType::List(a), IrType::List(b))
+        | (IrType::Maybe(a), IrType::Maybe(b))
+        | (IrType::Set(a), IrType::Set(b))
+        | (IrType::Task(a), IrType::Task(b))
+        | (IrType::Cmd(a), IrType::Cmd(b))
+        | (IrType::Sub(a), IrType::Sub(b))
+        | (IrType::Decoder(a), IrType::Decoder(b))
+        | (IrType::WebRoute(a), IrType::WebRoute(b)) => slot(a, b),
+        (
+            IrType::Ui {
+                ctor: sig_ctor,
+                msg: a,
+            },
+            IrType::Ui {
+                ctor: site_ctor,
+                msg: b,
+            },
+        ) if sig_ctor == site_ctor => slot(a, b),
+        (IrType::Result(a1, a2), IrType::Result(b1, b2))
+        | (IrType::Dict(a1, a2), IrType::Dict(b1, b2))
+        | (
+            IrType::CustomElement { down: a1, up: a2 },
+            IrType::CustomElement { down: b1, up: b2 },
+        ) => slot(a1, b1) && slot(a2, b2),
+        (IrType::Tuple(a), IrType::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(ca, cb)| slot(ca, cb))
+        }
+        (
+            IrType::Enum {
+                home: sig_home,
+                name: sig_name,
+                args: a,
+            },
+            IrType::Enum {
+                home: site_home,
+                name: site_name,
+                args: b,
+            },
+        ) if sig_home == site_home && sig_name == site_name => {
+            a.len() == b.len() && a.iter().zip(b).all(|(ca, cb)| slot(ca, cb))
+        }
+        (IrType::Record(a), IrType::Record(b)) => a
+            .iter()
+            .all(|(field, ca)| b.get(field).is_some_and(|cb| slot(ca, cb))),
+        // The three function carriers share one arrow shape; which box the
+        // argument arrives in does not move the generic's slot.
+        (
+            IrType::Fun(pa, ra) | IrType::SharedFun(pa, ra) | IrType::FnOnceChain(pa, ra),
+            IrType::Fun(pb, rb) | IrType::SharedFun(pb, rb) | IrType::FnOnceChain(pb, rb),
+        ) => pa.len() == pb.len() && pa.iter().zip(pb).all(|(ca, cb)| slot(ca, cb)) && slot(ra, rb),
+        _ => false,
     }
 }
 
@@ -5137,6 +5662,13 @@ fn fn_value_move_walk(sym: Symbol, expr: &Expr, state: &mut FnValueMoveState) {
                 other => fn_value_move_walk(sym, other, state),
             }
             for a in args {
+                fn_value_move_walk(sym, a, state);
+            }
+        }
+        // A kernel whose runtime takes its arguments reversed evaluates them
+        // last-to-first.
+        Expr::Call { callee, args, .. } if callee.evaluates_args_reversed() => {
+            for a in args.iter().rev() {
                 fn_value_move_walk(sym, a, state);
             }
         }
@@ -8025,88 +8557,77 @@ fn scan_kernel_usage(expr: &Expr, usage: &mut KernelUsage) {
     }
 }
 
-/// `true` when `expr` constructs or matches a `SqlValue` / `SqlField` value —
-/// i.e. it names one of those built-in enums as a first-class value rather than
-/// only threading it through a Db kernel. Drives the synthetic-enum injection so
-/// a module that builds bound binds from the `SqlString`/`SqlInt`/… constructors
-/// (with no Db kernel call) still gets the concrete Rust enum emitted.
+/// `true` when `expr` constructs or matches a value of one of the Prelude `enums`.
 ///
-/// Checks every `Expr::Ctor` head and every `case` arm's `Pat::Ctor` head for
-/// the `SqlValue` / `SqlField` type symbol, recursing structurally over the same
-/// child positions the kernel-usage scan walks.
-fn expr_constructs_sqlvalue(expr: &Expr, sqlvalue: Symbol, sqlfield: Symbol) -> bool {
-    let is_sql = |ty: Symbol| ty == sqlvalue || ty == sqlfield;
+/// The Prelude enums are the synthesized `SqlValue` / `SqlField` /
+/// `ProjectionTerm` / `ProjectionOperand` / `ArithOp` (empty home). Naming one
+/// as a first-class value rather than only threading it through a Db kernel
+/// still needs the concrete Rust enum emitted, so this drives the
+/// synthetic-enum injection.
+///
+/// Checks every `Expr::Ctor` head and every `case` arm's `Pat::Ctor` head,
+/// recursing structurally over the same child positions the kernel-usage scan
+/// walks.
+fn expr_constructs_sqlvalue(expr: &Expr, enums: &[Symbol]) -> bool {
+    let is_sql = |home: &ModPath, ty: Symbol| home.0.is_empty() && enums.contains(&ty);
     match expr {
-        Expr::Ctor { ty, args, .. } => {
-            is_sql(*ty)
-                || args
-                    .iter()
-                    .any(|a| expr_constructs_sqlvalue(a, sqlvalue, sqlfield))
+        Expr::Ctor { home, ty, args, .. } => {
+            is_sql(home, *ty) || args.iter().any(|a| expr_constructs_sqlvalue(a, enums))
         }
-        Expr::TailRecur { args } => args
-            .iter()
-            .any(|a| expr_constructs_sqlvalue(a, sqlvalue, sqlfield)),
-        Expr::Call { args, .. } => args
-            .iter()
-            .any(|a| expr_constructs_sqlvalue(a, sqlvalue, sqlfield)),
+        Expr::TailRecur { args } => args.iter().any(|a| expr_constructs_sqlvalue(a, enums)),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_constructs_sqlvalue(a, enums)),
         Expr::Apply { func, args } => {
-            expr_constructs_sqlvalue(func, sqlvalue, sqlfield)
-                || args
-                    .iter()
-                    .any(|a| expr_constructs_sqlvalue(a, sqlvalue, sqlfield))
+            expr_constructs_sqlvalue(func, enums)
+                || args.iter().any(|a| expr_constructs_sqlvalue(a, enums))
         }
         Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
-            expr_constructs_sqlvalue(value, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(body, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(value, enums) || expr_constructs_sqlvalue(body, enums)
         }
         Expr::If { cond, then_, else_ } => {
-            expr_constructs_sqlvalue(cond, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(then_, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(else_, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(cond, enums)
+                || expr_constructs_sqlvalue(then_, enums)
+                || expr_constructs_sqlvalue(else_, enums)
         }
         Expr::Match(m) => {
-            if expr_constructs_sqlvalue(m.scrutinee(), sqlvalue, sqlfield) {
+            if expr_constructs_sqlvalue(m.scrutinee(), enums) {
                 return true;
             }
             m.arms().iter().any(|arm| {
-                pat_matches_sqlvalue(&arm.pat, sqlvalue, sqlfield)
+                pat_matches_sqlvalue(&arm.pat, enums)
                     || arm
                         .guard
                         .as_ref()
-                        .is_some_and(|g| expr_constructs_sqlvalue(g, sqlvalue, sqlfield))
-                    || expr_constructs_sqlvalue(&arm.body, sqlvalue, sqlfield)
+                        .is_some_and(|g| expr_constructs_sqlvalue(g, enums))
+                    || expr_constructs_sqlvalue(&arm.body, enums)
             })
         }
         Expr::Lambda { body, .. }
         | Expr::SharedLambda { body, .. }
-        | Expr::TailLoop { body, .. } => expr_constructs_sqlvalue(body, sqlvalue, sqlfield),
+        | Expr::TailLoop { body, .. } => expr_constructs_sqlvalue(body, enums),
         Expr::Cons { head, tail } => {
-            expr_constructs_sqlvalue(head, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(tail, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(head, enums) || expr_constructs_sqlvalue(tail, enums)
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            expr_constructs_sqlvalue(list, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(list, enums)
         }
-        Expr::Tuple(elems) | Expr::List { items: elems, .. } => elems
-            .iter()
-            .any(|e| expr_constructs_sqlvalue(e, sqlvalue, sqlfield)),
+        Expr::Tuple(elems) | Expr::List { items: elems, .. } => {
+            elems.iter().any(|e| expr_constructs_sqlvalue(e, enums))
+        }
         Expr::Record { fields, .. } => fields
             .iter()
-            .any(|(_, v)| expr_constructs_sqlvalue(v, sqlvalue, sqlfield)),
-        Expr::Access { record, .. } => expr_constructs_sqlvalue(record, sqlvalue, sqlfield),
+            .any(|(_, v)| expr_constructs_sqlvalue(v, enums)),
+        Expr::Access { record, .. } => expr_constructs_sqlvalue(record, enums),
         Expr::Update { record, fields } => {
-            expr_constructs_sqlvalue(record, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(record, enums)
                 || fields
                     .iter()
-                    .any(|(_, v)| expr_constructs_sqlvalue(v, sqlvalue, sqlfield))
+                    .any(|(_, v)| expr_constructs_sqlvalue(v, enums))
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            expr_constructs_sqlvalue(lhs, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(rhs, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(lhs, enums) || expr_constructs_sqlvalue(rhs, enums)
         }
         Expr::TaskSeq { effect, rest } => {
-            expr_constructs_sqlvalue(effect, sqlvalue, sqlfield)
-                || expr_constructs_sqlvalue(rest, sqlvalue, sqlfield)
+            expr_constructs_sqlvalue(effect, enums) || expr_constructs_sqlvalue(rest, enums)
         }
         Expr::FuncValue { .. }
         | Expr::Int(_)
@@ -8122,32 +8643,23 @@ fn expr_constructs_sqlvalue(expr: &Expr, sqlvalue: Symbol, sqlfield: Symbol) -> 
     }
 }
 
-/// `true` when a pattern matches on a `SqlValue` / `SqlField` constructor,
+/// `true` when a pattern matches on a constructor of one of the Prelude `enums`,
 /// recursing into every sub-pattern position.
-fn pat_matches_sqlvalue(pat: &Pat, sqlvalue: Symbol, sqlfield: Symbol) -> bool {
+fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
     match pat {
-        Pat::Ctor { ty, args, .. } => {
-            *ty == sqlvalue
-                || *ty == sqlfield
-                || args
-                    .iter()
-                    .any(|p| pat_matches_sqlvalue(p, sqlvalue, sqlfield))
+        Pat::Ctor { home, ty, args, .. } => {
+            (home.0.is_empty() && enums.contains(ty))
+                || args.iter().any(|p| pat_matches_sqlvalue(p, enums))
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => ps
-            .iter()
-            .any(|p| pat_matches_sqlvalue(p, sqlvalue, sqlfield)),
-        Pat::Record(fields) => fields
-            .iter()
-            .any(|(_, p)| pat_matches_sqlvalue(p, sqlvalue, sqlfield)),
+        Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
         Pat::Slice { prefix, rest } => {
-            prefix
-                .iter()
-                .any(|p| pat_matches_sqlvalue(p, sqlvalue, sqlfield))
+            prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
                 || rest
                     .as_ref()
-                    .is_some_and(|p| pat_matches_sqlvalue(p, sqlvalue, sqlfield))
+                    .is_some_and(|p| pat_matches_sqlvalue(p, enums))
         }
-        Pat::Alias(inner, _) => pat_matches_sqlvalue(inner, sqlvalue, sqlfield),
+        Pat::Alias(inner, _) => pat_matches_sqlvalue(inner, enums),
         Pat::Wildcard | Pat::Var(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Int(_) => {
             false
         }
@@ -9374,6 +9886,20 @@ pub struct Lowerer<'a> {
     /// IPE-L0126 instead of emitting a `.clone()` on a non-`Clone` `Box`
     /// (E0599 — a SEAL break). Cleared per def.
     deferred_fun_captures: std::cell::RefCell<BTreeMap<Symbol, Span>>,
+    /// The auto-trait bounds the current def's body obliges on its type variables.
+    ///
+    /// `Send + Sync` where a sync-capturing kernel moves a value reaching the
+    /// variable bare into a thread-shared carrier ([`Self::note_sync_captures`]);
+    /// `Send + 'static` where a reference's solved type carries the variable
+    /// under a `Cmd` / `Sub` / `Decoder` ([`Self::note_carrier_sends`]).
+    /// Recorded at every reference, folded into the def's generic bounds when it
+    /// is finalized. Cleared per def.
+    recorded_bounds: std::cell::RefCell<BTreeMap<Symbol, BoundSet>>,
+    /// The current def's user-function references, each with the solved type
+    /// it instantiates the callee at. Recorded at every reference by
+    /// [`Self::note_callee_instance`], drained per def into the cross-call
+    /// bound propagation ([`propagate_call_site_bounds`]). Cleared per def.
+    callee_instances: std::cell::RefCell<Vec<CalleeInstance>>,
     /// A `let`-bound local that names a top-level function, mapped to that
     /// function's `(module, name)` key — a point-free alias `let w = wrap`.
     ///
@@ -9713,6 +10239,10 @@ pub struct BuiltinCtors {
     pub redirect_policy: Symbol,
     pub no_redirects: Symbol,
     pub follow_redirects: Symbol,
+    /// The type checker's built-in symbol table, so a kernel scheme's
+    /// [`ipe_kernels::BuiltinTag`] resolves to the same constructor head
+    /// inference minted.
+    pub kernel_types: ipe_types::Builtins,
 }
 
 /// The parameter-pattern count of a single top-level binding — the number of
@@ -10932,40 +11462,9 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ok), 1);
         ctor_arity.insert((prelude_home.clone(), builtins.err), 1);
 
-        // Seed `SqlValue` / `SqlField` variant sets + arities.
-        // These are Prelude built-ins (like Maybe/Result) — no user `type`
-        // declaration; the symbols must be present here so any `case v of
-        // SqlString s -> … ; SqlInt i -> …` pattern is exhaustively validated and
-        // constructor applications (e.g. `SqlInt 42`) lower as saturated.
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.sqlvalue),
-            vec![
-                builtins.sql_string,
-                builtins.sql_int,
-                builtins.sql_float,
-                builtins.sql_bool,
-                builtins.sql_bytes,
-                builtins.sql_time,
-                builtins.sql_decimal,
-                builtins.sql_money,
-                builtins.sql_null,
-            ],
-        );
-        enum_variants.insert(
-            (prelude_home.clone(), builtins.sqlfield),
-            vec![builtins.set_field, builtins.omit_field],
-        );
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_string), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_int), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_float), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_bool), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_bytes), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_time), 1);
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_decimal), 1); // SqlDecimal(Decimal)
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_money), 1); // SqlMoney(String) — "ISO_CODE AMOUNT"
-        ctor_arity.insert((prelude_home.clone(), builtins.sql_null), 1); // SqlNull(SqlValue)
-        ctor_arity.insert((prelude_home.clone(), builtins.set_field), 1); // SetField(SqlValue)
-        ctor_arity.insert((prelude_home.clone(), builtins.omit_field), 0);
+        // `SqlValue` / `SqlField` / `ProjectionTerm` / `ProjectionOperand` /
+        // `ArithOp` are seeded from their synthesized `EnumDef`s once the
+        // lowerer exists — see `Self::seed_synthetic_prelude_enums`.
         // ── Order ADT ─────────────────────────────────────────────────
         enum_variants.insert(
             (prelude_home.clone(), builtins.order),
@@ -11087,7 +11586,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.no_redirects), 0);
         ctor_arity.insert((prelude_home, builtins.follow_redirects), 1); // FollowRedirects(Int) — final move
 
-        Self {
+        let mut lowerer = Self {
             m,
             types,
             interner,
@@ -11119,6 +11618,8 @@ impl<'a> Lowerer<'a> {
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
+            recorded_bounds: std::cell::RefCell::new(BTreeMap::new()),
+            callee_instances: std::cell::RefCell::new(Vec::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             shared_fn_reads: std::cell::RefCell::new(BTreeMap::new()),
@@ -11126,6 +11627,55 @@ impl<'a> Lowerer<'a> {
             source_path: source_path.to_owned(),
             source_text: source_text.to_owned(),
             port_seal_enum_legal: std::cell::RefCell::new(None),
+        };
+        lowerer.seed_synthetic_prelude_enums();
+        lowerer
+    }
+
+    /// The Prelude built-in enums whose `EnumDef` the lowerer synthesizes.
+    ///
+    /// Declared by no Ipê source; injected into the program whenever a Db
+    /// kernel or any use of one of [`Self::synthetic_prelude_enum_names`] is
+    /// present.
+    fn synthetic_prelude_enums(&self) -> [EnumDef; 5] {
+        [
+            self.synthetic_sqlvalue_enum(),
+            self.synthetic_sqlfield_enum(),
+            self.synthetic_projection_term_enum(),
+            self.synthetic_projection_operand_enum(),
+            self.synthetic_arith_op_enum(),
+        ]
+    }
+
+    /// The type names of [`Self::synthetic_prelude_enums`], in the same order.
+    const fn synthetic_prelude_enum_names(&self) -> [Symbol; 5] {
+        let b = self.builtins;
+        [
+            b.sqlvalue,
+            b.sqlfield,
+            b.projection_term,
+            b.projection_operand,
+            b.arith_op,
+        ]
+    }
+
+    /// Register the variant set and payload arities of every synthesized Prelude enum.
+    ///
+    /// Read off the same [`EnumDef`]s the program is emitted with, so a
+    /// constructor's arity and a `case`'s variant set cannot drift from the
+    /// emitted enum, and a Prelude constructor matched or built in Ipê source
+    /// (the `Ipe.Db.Store` projection rewrite does both) resolves like any
+    /// declared constructor.
+    fn seed_synthetic_prelude_enums(&mut self) {
+        for def in self.synthetic_prelude_enums() {
+            for variant in &def.variants {
+                self.ctor_arity
+                    .insert((def.home.clone(), variant.name), variant.fields.len());
+            }
+            self.enum_variants.insert(
+                (def.home.clone(), def.name),
+                def.variants.iter().map(|v| v.name).collect(),
+            );
         }
     }
 
@@ -13353,6 +13903,10 @@ impl<'a> Lowerer<'a> {
         // is actually used, so a program that never calls it keeps the accessor
         // pruned.
         let mut duration_to_millis_id: Option<FuncId> = None;
+        // Each def's user-function references with their solved
+        // instantiations, for the cross-call bound propagation below.
+        let mut callee_instances: std::collections::HashMap<FuncId, Vec<CalleeInstance>> =
+            std::collections::HashMap::with_capacity(self.m.defs.len());
         for (idx, def) in self.m.defs.iter().enumerate() {
             // Positional id: `func_ids` was assigned from this very
             // enumeration order in `new()` under the unique-`(home, name)`
@@ -13378,6 +13932,7 @@ impl<'a> Lowerer<'a> {
             // its needed default pin. Centralised here so no `lower_def` branch
             // can silently miss it.
             func.body = clear_let_bound_task_fail_pins(func.body);
+            callee_instances.insert(func.id, self.callee_instances.take());
             if self.interner.resolve(func.name) == Some("main") {
                 entry = Some(func.id);
                 entry_span = Some(def.name().span);
@@ -13415,7 +13970,7 @@ impl<'a> Lowerer<'a> {
         // obligation onto the caller's forwarded tvar, so the emitted caller
         // proves the bound instead of cargo-failing E0277 (an
         // exit-0-then-cargo-fail SEAL break).
-        propagate_call_site_bounds(&mut funcs);
+        propagate_call_site_bounds(&mut funcs, &callee_instances);
 
         // when any Db kernel call is present, inject the synthetic
         // `SqlValue` and `SqlField` `EnumDef`s into `module.types`.  They are
@@ -13566,25 +14121,19 @@ impl<'a> Lowerer<'a> {
             prune_dead_type_decls(&funcs, &mut types_ir, &mut records);
         }
 
-        let sqlvalue_sym = self.builtins.sqlvalue;
-        let sqlfield_sym = self.builtins.sqlfield;
+        // Every synthesized Prelude enum lives in (or aliases into) the Db
+        // runtime surface, so one condition injects them all: a Db kernel, or
+        // any construction, match, or type mention of one of them.
+        let prelude_enum_names = self.synthetic_prelude_enum_names();
         let uses_sqlvalue = kernel_usage.db
             || funcs
                 .iter()
-                .any(|f| expr_constructs_sqlvalue(&f.body, sqlvalue_sym, sqlfield_sym))
+                .any(|f| expr_constructs_sqlvalue(&f.body, &prelude_enum_names))
             || program_type_mentions(&funcs, &records, &types_ir, &|t| {
-                ir_type_mentions_sqlvalue(t, sqlvalue_sym, sqlfield_sym)
+                ir_type_mentions_sqlvalue(t, &prelude_enum_names)
             });
         if uses_sqlvalue {
-            types_ir.push(TypeDef::Enum(self.synthetic_sqlvalue_enum()));
-            types_ir.push(TypeDef::Enum(self.synthetic_sqlfield_enum()));
-            // `ProjectionTerm`/`ProjectionOperand` are consumed only by the
-            // `selectNamed` Db helper; any Db kernel use already implies
-            // `uses_sqlvalue`, so piggyback the injection here to keep the
-            // condition in one place.
-            types_ir.push(TypeDef::Enum(self.synthetic_projection_term_enum()));
-            types_ir.push(TypeDef::Enum(self.synthetic_projection_operand_enum()));
-            types_ir.push(TypeDef::Enum(self.synthetic_arith_op_enum()));
+            types_ir.extend(self.synthetic_prelude_enums().map(TypeDef::Enum));
         }
 
         // detect whether any TEA kernel call is present. The backend uses
@@ -14689,7 +15238,14 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // the T5 multi-use-clone pre-pass pushes it past 100
+    /// Lower one top-level definition to its [`Func`].
+    ///
+    /// Every definition shape (annotated, unannotated with parameters,
+    /// unannotated zero-parameter value binding) yields a [`DefParts`] from
+    /// [`Self::lower_def_parts`]; the `Func` is assembled only here, after
+    /// [`Self::finalize_type_params`] folds every body-derived bound obligation
+    /// into the generics, so no shape can emit a generic missing an obligation
+    /// its body recorded.
     fn lower_def(&self, def: &canon::Def, id: FuncId) -> DResult<Func> {
         // Track the current def's home so every `region_ty(span)` lookup uses the
         // correct `(home, span)` key, matching what the constraint builder wrote.
@@ -14698,12 +15254,57 @@ impl<'a> Lowerer<'a> {
         // classifier and the binder sites; a def that errored out mid-lowering
         // must not leak its signals into the next def.
         self.deferred_fun_captures.borrow_mut().clear();
+        self.recorded_bounds.borrow_mut().clear();
+        self.callee_instances.borrow_mut().clear();
         // Eta names are scope-local to one function: reset the monotonic cursor so
         // each def draws `eta_0, eta_1, …` afresh. Within the def the cursor only
         // advances (never reuses), so no two live eta binders collide even when a
         // composed higher-order combinator nests them.
         self.eta_base.set(0);
+        let DefParts {
+            mut type_params,
+            wildcard_any_syms,
+            row_params,
+            params,
+            ret,
+            body,
+        } = self.lower_def_parts(def, id)?;
+        self.finalize_type_params(&mut type_params, &wildcard_any_syms, &params, &ret, &body);
+        Ok(Func {
+            id,
+            name: def.name().value,
+            home: ModPath(def.home().to_vec()),
+            type_params,
+            row_params,
+            params,
+            ret,
+            body,
+        })
+    }
 
+    /// Fold every body-derived bound obligation into a definition's generics.
+    ///
+    /// Two independent sources oblige a generic: a kernel the body applies to a
+    /// parameter binder of that generic ([`apply_kernel_type_param_bounds`]:
+    /// `IpeRow` for wildcard `any` only, `IpeStringify`, `Send + 'static`,
+    /// `Sync`), and a reference whose solved instantiation reaches the generic
+    /// through a sync capture or a `Cmd` / `Sub` / `Decoder` carrier
+    /// ([`Self::apply_recorded_bounds`], recorded while the body lowered).
+    fn finalize_type_params(
+        &self,
+        type_params: &mut [(Symbol, BoundSet)],
+        wildcard_any_syms: &BTreeSet<Symbol>,
+        params: &[(Symbol, IrType)],
+        ret: &IrType,
+        body: &Expr,
+    ) {
+        apply_kernel_type_param_bounds(type_params, wildcard_any_syms, params, ret, body);
+        self.apply_recorded_bounds(type_params);
+    }
+
+    /// Lower one definition's signature and body, before its bounds are folded in.
+    #[allow(clippy::too_many_lines)] // the T5 multi-use-clone pre-pass pushes it past 100
+    fn lower_def_parts(&self, def: &canon::Def, id: FuncId) -> DResult<DefParts> {
         // `id` is the def's position in `m.defs` — identical to the
         // `func_ids` entry `new()` recorded for `(home, name)` (the map is
         // populated from the same enumeration), passed in to avoid a
@@ -14977,8 +15578,13 @@ impl<'a> Lowerer<'a> {
                 // classifier (an inner lambda capturing a pure-`Fun` param
                 // defers to the param loop below instead of IPE-L0126).
                 let param_syms: Vec<Symbol> = params.iter().map(|(s, _)| *s).collect();
-                let body_result =
-                    self.with_promotable_fn_binders(param_syms, || self.lower_expr(body));
+                let mut row_vars = BTreeSet::new();
+                canon_sig_collect_arg_row_vars(ty, &mut row_vars);
+                let body_result = self
+                    .reject_generic_app_entries_in(body, &row_vars)
+                    .and_then(|()| {
+                        self.with_promotable_fn_binders(param_syms, || self.lower_expr(body))
+                    });
                 *self.current_poly_tvars.borrow_mut() = saved_poly_tvars;
                 self.fn_is_async.set(prev_async);
                 let mut lowered_body = self.fold_param_prologues(prologue, body_result?, body)?;
@@ -15215,7 +15821,7 @@ impl<'a> Lowerer<'a> {
                 // Rust generic, worse than the bug this fix closes. Each is
                 // trivially unbounded (`bounds_for` returns `UNBOUNDED` on a
                 // missing `var_bounds` entry, which every fresh symbol has).
-                let mut type_params: Vec<(Symbol, BoundSet)> = free_vars
+                let type_params: Vec<(Symbol, BoundSet)> = free_vars
                     .iter()
                     .copied()
                     .filter(|v| used_generics.contains(v))
@@ -15246,23 +15852,11 @@ impl<'a> Lowerer<'a> {
                 {
                     lowered_body = rewrite_tail_calls(id, arity, params.clone(), lowered_body);
                 }
-                // General kernel→type-param-bound propagation: a param that flows
-                // into a bound-obliging kernel gains that kernel's Rust bound —
-                // IpeRow (`Db.get*`→`IpeRow`, wildcard-only) + Display
-                // (`toString`→`Display`, any tvar). See
-                // `apply_kernel_type_param_bounds`.
-                // The wildcard-only obligations (IpeRow) key on the minted
+                // The wildcard-only bound obligations (IpeRow) key on the minted
                 // per-occurrence `any` symbols — the single source of truth for
                 // which tvars are compiler-minted wildcards, so a legal user
                 // tvar can never be misclassified by a name-shape guess.
                 let wildcard_any_syms: BTreeSet<Symbol> = any_syms_minted.iter().copied().collect();
-                apply_kernel_type_param_bounds(
-                    &mut type_params,
-                    &wildcard_any_syms,
-                    &params,
-                    &ret,
-                    &lowered_body,
-                );
                 // Register this def's erased row params, paired with their
                 // parameter positions, so call sites can verify that the
                 // caller's actual field types match the required field types
@@ -15284,11 +15878,9 @@ impl<'a> Lowerer<'a> {
                             .insert((def.home().to_vec(), name), positioned);
                     }
                 }
-                Ok(Func {
-                    id,
-                    name,
-                    home: ModPath(def.home().to_vec()),
+                Ok(DefParts {
                     type_params,
+                    wildcard_any_syms,
                     row_params,
                     params,
                     ret,
@@ -15397,8 +15989,11 @@ impl<'a> Lowerer<'a> {
                     self.fn_is_async.set(matches!(ret, IrType::Task(_)));
                     // Same promotable-fn-binder registration as the Typed path.
                     let param_syms: Vec<Symbol> = params.iter().map(|(s, _)| *s).collect();
-                    let body_result =
-                        self.with_promotable_fn_binders(param_syms, || self.lower_expr(body));
+                    let body_result = self
+                        .reject_generic_app_entries_in(body, &BTreeSet::new())
+                        .and_then(|()| {
+                            self.with_promotable_fn_binders(param_syms, || self.lower_expr(body))
+                        });
                     self.fn_is_async.set(prev_async);
                     if let Some(saved) = saved_poly_tvars {
                         *self.current_poly_tvars.borrow_mut() = saved;
@@ -15418,25 +16013,13 @@ impl<'a> Lowerer<'a> {
                     {
                         lowered_body = rewrite_tail_calls(id, arity, params.clone(), lowered_body);
                     }
-                    let mut type_params =
+                    let type_params =
                         compute_type_params(quantified_syms, var_bounds, &params, &ret);
-                    // General kernel→type-param-bound propagation (IpeRow +
-                    // Display) — see `apply_kernel_type_param_bounds`. An
-                    // unannotated def's tvars are all genuine HM-quantified
-                    // vars; none are minted wildcard-`any`, so the wildcard set
-                    // is empty and the wildcard-only obligations never fire.
-                    apply_kernel_type_param_bounds(
-                        &mut type_params,
-                        &BTreeSet::new(),
-                        &params,
-                        &ret,
-                        &lowered_body,
-                    );
-                    return Ok(Func {
-                        id,
-                        name,
-                        home: ModPath(def.home().to_vec()),
+                    return Ok(DefParts {
                         type_params,
+                        // An unannotated def's tvars are all genuine
+                        // HM-quantified vars; none is a minted wildcard `any`.
+                        wildcard_any_syms: BTreeSet::new(),
                         // An unannotated binding never generalises over a record
                         // row (D3): pinned on first concrete use, so no row params.
                         row_params: Vec::new(),
@@ -15458,7 +16041,9 @@ impl<'a> Lowerer<'a> {
                 // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                 let prev_async = self.fn_is_async.get();
                 self.fn_is_async.set(matches!(ret, IrType::Task(_)));
-                let lowered_body = self.lower_expr(body);
+                let lowered_body = self
+                    .reject_generic_app_entries_in(body, &BTreeSet::new())
+                    .and_then(|()| self.lower_expr(body));
                 self.fn_is_async.set(prev_async);
                 if let Some(saved) = saved_poly_tvars {
                     *self.current_poly_tvars.borrow_mut() = saved;
@@ -15470,11 +16055,9 @@ impl<'a> Lowerer<'a> {
                 // emits for zero-arg fn calls — no shared mutable cell, no
                 // memoization to break.
                 let type_params = compute_type_params(quantified_syms, var_bounds, &[], &ret);
-                Ok(Func {
-                    id,
-                    name,
-                    home: ModPath(def.home().to_vec()),
+                Ok(DefParts {
                     type_params,
+                    wildcard_any_syms: BTreeSet::new(),
                     // Zero-param value binding: no arguments, so no row params.
                     row_params: Vec::new(),
                     params: Vec::new(),
@@ -24454,7 +25037,414 @@ impl<'a> Lowerer<'a> {
     fn lower_callee(&self, callee: &canon::Expr) -> DResult<Callee> {
         let resolved = self.lower_callee_resolve(callee)?;
         self.reject_curried_andmap_payload(&resolved, callee)?;
+        match &resolved {
+            Callee::Kernel(kernel) => {
+                // Row generics are refused by the body pre-walk, which alone knows them.
+                self.reject_generic_app_entry(*kernel, callee.span, &BTreeSet::new())?;
+                self.note_sync_captures(*kernel, callee.span);
+            }
+            Callee::Func(id) => self.note_callee_instance(*id, callee.span),
+            Callee::Ffi { .. } => {}
+        }
+        self.note_carrier_sends(callee.span);
         Ok(resolved)
+    }
+
+    /// Record a user-function reference with the solved type it instantiates the callee at.
+    ///
+    /// Every call and point-free value reference resolves through
+    /// [`Self::lower_callee`], so each reference is recorded whatever position
+    /// it sits in. The reference's region type (`span`) is split into its
+    /// curried arrow parameters and the tail left after each peel, each lowered
+    /// in the current def's generics; [`propagate_call_site_bounds`] aligns the
+    /// callee's signature against them once every callee's bounds are known.
+    /// A slot that does not lower keeps the def generics it mentions; a
+    /// missing region type records no slots, so alignment fails closed. A def
+    /// with no generics has nothing to oblige and records nothing.
+    fn note_callee_instance(&self, callee: FuncId, span: Span) {
+        let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
+        if poly.is_empty() {
+            return;
+        }
+        let slot = |t: &Ty| {
+            self.ir_type_from_ty(t, span).map_or_else(
+                |_| {
+                    SiteSlot::Unlowered(
+                        poly.iter()
+                            .copied()
+                            .filter(|tv| self.ty_mentions_poly_tvar(t, *tv))
+                            .collect(),
+                    )
+                },
+                SiteSlot::Lowered,
+            )
+        };
+        let mut params = Vec::new();
+        let mut tails = Vec::new();
+        // Bounded by the solved type's own arrow depth.
+        let mut cur = self.region_ty(span);
+        while let Some(t) = cur {
+            tails.push(slot(t));
+            cur = match t {
+                Ty::Fun(arg, rest) => {
+                    params.push(slot(arg));
+                    Some(rest.as_ref())
+                }
+                _ => None,
+            };
+        }
+        self.callee_instances.borrow_mut().push(CalleeInstance {
+            callee,
+            params,
+            tails,
+        });
+    }
+
+    /// Refuse an app-entry reference whose solved type still mentions a generic of the enclosing definition.
+    ///
+    /// Every [`KernelFn::is_app_entry`] kernel's runtime function bounds the
+    /// cfg's `Model` / `Msg` with traits a Rust generic does not carry
+    /// (`IpeStringify`, `Serialize + DeserializeOwned + PartialEq`, `Sync`), and
+    /// they reach the runtime only through the cfg record, so no per-bound
+    /// obligation can be threaded onto the generic. A helper generic over `msg`
+    /// that builds the cfg would pass `ipe` and fail `cargo build`; it is
+    /// refused here with IPE-N0051. The check reads the entry's solved
+    /// instantiation at this reference (`span`'s region type), so every
+    /// syntactic position — a direct call, a pipe, a point-free reference — is
+    /// covered by the one [`Self::lower_callee`] funnel.
+    ///
+    /// A definition with no generics cannot leak one into the entry. With
+    /// generics in scope, a missing region type proves nothing, so it is
+    /// refused (fail-closed).
+    ///
+    /// A region type carries no record row tails, so it cannot show whether an
+    /// entry's model reaches one of `row_vars` (the annotation's row
+    /// generics); with any in scope the entry is refused (fail-closed).
+    ///
+    /// A solved type still holding a type variable that is no generic of the
+    /// definition means the program never fixes the app's model or message
+    /// type (an `update` that ignores its message, a view that emits none);
+    /// that entry is refused too. This is the one classification of an app
+    /// entry, so a generic is named before an unfixed type is reported, and
+    /// both are reported before any cfg value reaches the polymorphic-value
+    /// check.
+    fn reject_generic_app_entry(
+        &self,
+        kernel: KernelFn,
+        span: Span,
+        row_vars: &BTreeSet<Symbol>,
+    ) -> DResult<()> {
+        if !kernel.is_app_entry() {
+            return Ok(());
+        }
+        self.reject_poly_tvar_app_entry(kernel, span)?;
+        if let Some(row_var) = row_vars.first() {
+            return Err(self.generic_app_entry_error(
+                kernel,
+                span,
+                *row_var,
+                GenericAppEntryReach::Undetermined,
+            ));
+        }
+        if self.region_ty(span).is_some_and(ty_has_type_var) {
+            return Err(Diagnostic::Name {
+                span,
+                msg: NameError::UnpinnedAppEntry {
+                    entry: app_entry_name(kernel),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// The generic-of-the-definition half of [`Self::reject_generic_app_entry`].
+    fn reject_poly_tvar_app_entry(&self, kernel: KernelFn, span: Span) -> DResult<()> {
+        if self.current_poly_tvars.borrow().is_empty() {
+            return Ok(());
+        }
+        let offending = self.region_ty(span).map_or_else(
+            || {
+                self.current_poly_tvars
+                    .borrow()
+                    .values()
+                    .next()
+                    .map(|&tv| (tv, GenericAppEntryReach::Undetermined))
+            },
+            |solved| {
+                self.first_poly_tvar(solved)
+                    .map(|tv| (tv, GenericAppEntryReach::Mentioned))
+            },
+        );
+        let Some((type_var, reach)) = offending else {
+            return Ok(());
+        };
+        Err(self.generic_app_entry_error(kernel, span, type_var, reach))
+    }
+
+    /// The IPE-N0051 refusal of app entry `kernel` at `span`, naming the generic
+    /// `type_var` and how the entry relates to it (`reach`).
+    fn generic_app_entry_error(
+        &self,
+        kernel: KernelFn,
+        span: Span,
+        type_var: Symbol,
+        reach: GenericAppEntryReach,
+    ) -> Diagnostic {
+        Diagnostic::Name {
+            span,
+            msg: NameError::GenericAppEntry {
+                entry: app_entry_name(kernel),
+                type_var: self.resolve(type_var).unwrap_or("a").into(),
+                reach,
+            },
+        }
+    }
+
+    /// Refuse every app-entry reference in a definition's body before any of the body is lowered.
+    ///
+    /// [`Self::lower_callee`] refuses a generic app entry where the reference
+    /// itself is lowered, but a sub-expression lowered earlier — a `let`
+    /// alias's value, a cfg field — can hit an unrelated lowering limit first
+    /// and report the program for the wrong reason. Walking the whole body
+    /// first makes IPE-N0051 the refusal wherever the entry sits. `row_vars`
+    /// are the annotation's row generics ([`Self::reject_generic_app_entry`]).
+    ///
+    /// The walk is an explicit work stack over the canonical tree, whose size
+    /// the parser's limits already bound.
+    fn reject_generic_app_entries_in(
+        &self,
+        body: &canon::Expr,
+        row_vars: &BTreeSet<Symbol>,
+    ) -> DResult<()> {
+        let mut work: Vec<&canon::Expr> = vec![body];
+        while let Some(e) = work.pop() {
+            match &e.value {
+                canon::Expr_::VarKernel {
+                    id: Some(kernel), ..
+                } => {
+                    self.reject_generic_app_entry(*kernel, e.span, row_vars)?;
+                }
+                canon::Expr_::Lambda(_, inner) | canon::Expr_::Access(inner, _) => {
+                    work.push(inner);
+                }
+                canon::Expr_::Call(callee, args) => {
+                    work.extend(args.iter().rev());
+                    work.push(callee);
+                }
+                canon::Expr_::ForeignCall { args, .. }
+                | canon::Expr_::Tuple(args)
+                | canon::Expr_::List(args) => work.extend(args.iter().rev()),
+                canon::Expr_::Binop { lhs, rhs, .. } | canon::Expr_::Cons(lhs, rhs) => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                canon::Expr_::Case(scrutinee, branches) => {
+                    work.extend(branches.iter().rev().map(|b| &b.body));
+                    work.push(scrutinee);
+                }
+                canon::Expr_::Let(bindings, inner) => {
+                    work.push(inner);
+                    work.extend(bindings.iter().rev().map(|b| &b.body));
+                }
+                canon::Expr_::If(branches, else_expr) => {
+                    work.push(else_expr);
+                    for (cond, then) in branches.iter().rev() {
+                        work.push(then);
+                        work.push(cond);
+                    }
+                }
+                canon::Expr_::Record(fields) => work.extend(fields.iter().rev().map(|(_, v)| v)),
+                canon::Expr_::Update(base, fields) => {
+                    work.extend(fields.iter().rev().map(|(_, v)| v));
+                    work.push(base);
+                }
+                canon::Expr_::VarKernel { id: None, .. }
+                | canon::Expr_::VarLocal(_)
+                | canon::Expr_::VarTopLevel { .. }
+                | canon::Expr_::VarCtor { .. }
+                | canon::Expr_::Int(_)
+                | canon::Expr_::Float(_)
+                | canon::Expr_::Str(_)
+                | canon::Expr_::PathLit(_)
+                | canon::Expr_::CustomElementCtor(_)
+                | canon::Expr_::Char(_)
+                | canon::Expr_::Unit => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The first generic of the enclosing definition that `t` mentions, in a left-to-right walk.
+    fn first_poly_tvar(&self, t: &Ty) -> Option<Symbol> {
+        match t {
+            Ty::Var(v) => self.poly_tvar_symbol(*v),
+            Ty::Fun(a, b) => self.first_poly_tvar(a).or_else(|| self.first_poly_tvar(b)),
+            Ty::Con { args, .. } | Ty::Tuple(args) => {
+                args.iter().find_map(|a| self.first_poly_tvar(a))
+            }
+            Ty::Record(fields, tail) => fields
+                .values()
+                .find_map(|f| self.first_poly_tvar(f))
+                .or_else(|| self.row_tail_poly_tvar(tail)),
+            Ty::Unit => None,
+        }
+    }
+
+    /// The generic of the enclosing definition an open record's row variable is, if any.
+    ///
+    /// A row variable shares [`Ty::Var`]'s id space, so an open tail over one of
+    /// the def's quantified variables is as much a mention of that generic as a
+    /// field typed by it.
+    fn row_tail_poly_tvar(&self, tail: &RowTail) -> Option<Symbol> {
+        match tail {
+            RowTail::Open(raw) => self.poly_tvar_symbol(*raw),
+            RowTail::Closed => None,
+        }
+    }
+
+    /// Record the `Sync` obligation a sync-capturing kernel reference places on the def's generics.
+    ///
+    /// `kernel` moves each argument listed by [`KernelFn::sync_captured_args`]
+    /// into a `Send + Sync` carrier, so every type variable reaching that
+    /// argument's type bare must be `Sync`. The argument type is read off the
+    /// kernel's SOLVED instantiation at this reference (`span`'s region type,
+    /// an arrow whose `idx`-th parameter is the captured value), so the
+    /// obligation is positional-independent: a tail `succeed`, one bound by
+    /// `let`, passed to `oneOf` / `map2`, stored in a record, or referenced
+    /// point-free all record it alike. Every kernel resolution routes through
+    /// [`Self::lower_callee`], the one hook point.
+    ///
+    /// A kernel whose runtime signature bounds a scheme variable `Sync`
+    /// ([`KernelFn::sync_obliged_scheme_vars`] — the `msg` of `Input.checkbox`)
+    /// obliges the generics reaching that variable's instantiation the same way;
+    /// the instantiation is found by aligning the kernel's
+    /// [`KernelFn::scheme_shape`] with the same solved type.
+    ///
+    /// Fail-closed: a missing region type, an arrow shorter than a listed
+    /// index, or a scheme variable with no aligned instantiation obliges every
+    /// generic of the def; a type that does not lower to an `IrType` obliges
+    /// every generic it mentions.
+    fn note_sync_captures(&self, kernel: KernelFn, span: Span) {
+        let captured = kernel.sync_captured_args();
+        let scheme_vars = kernel.sync_obliged_scheme_vars();
+        if captured.is_empty() && scheme_vars.is_empty() {
+            return;
+        }
+        let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
+        if poly.is_empty() {
+            return;
+        }
+        let solved = self.region_ty(span);
+        // A missing region type yields no parameters and no instantiations, so
+        // every listed entry falls to the fail-closed arm below.
+        let arg_tys: Vec<&Ty> = solved.map(arrow_params).unwrap_or_default();
+        let heads = SchemeHeads {
+            builtins: &self.builtins.kernel_types,
+            interner: self.interner,
+        };
+        let obliged_tys =
+            captured
+                .iter()
+                .map(|&idx| arg_tys.get(idx).copied())
+                .chain(scheme_vars.iter().map(|&var| {
+                    solved
+                        .zip(kernel.scheme_shape())
+                        .and_then(|(ty, shape)| scheme_var_instance(shape, ty, var, heads))
+                }));
+        let mut obliged: BTreeSet<Symbol> = BTreeSet::new();
+        for obliged_ty in obliged_tys {
+            let Some(obliged_ty) = obliged_ty else {
+                obliged.extend(poly.iter().copied());
+                continue;
+            };
+            let lowered = self.ir_type_from_ty(obliged_ty, span).ok();
+            obliged.extend(poly.iter().copied().filter(|tv| {
+                lowered.as_ref().map_or_else(
+                    || self.ty_mentions_poly_tvar(obliged_ty, *tv),
+                    |ir| ir_type_generic_reaches_bare(ir, *tv),
+                )
+            }));
+        }
+        let mut recorded = self.recorded_bounds.borrow_mut();
+        for tv in obliged {
+            let slot = recorded.entry(tv).or_insert(BoundSet::UNBOUNDED);
+            *slot = slot.with_sync();
+        }
+    }
+
+    /// Whether `t` mentions the current def's generic `tv` anywhere.
+    fn ty_mentions_poly_tvar(&self, t: &Ty, tv: Symbol) -> bool {
+        match t {
+            Ty::Var(v) => self.poly_tvar_symbol(*v) == Some(tv),
+            Ty::Fun(a, b) => self.ty_mentions_poly_tvar(a, tv) || self.ty_mentions_poly_tvar(b, tv),
+            Ty::Con { args, .. } | Ty::Tuple(args) => {
+                args.iter().any(|a| self.ty_mentions_poly_tvar(a, tv))
+            }
+            Ty::Record(fields, tail) => {
+                self.row_tail_poly_tvar(tail) == Some(tv)
+                    || fields.values().any(|f| self.ty_mentions_poly_tvar(f, tv))
+            }
+            Ty::Unit => false,
+        }
+    }
+
+    /// Record the `Send + 'static` obligation a reference's `Cmd` / `Sub` / `Decoder` carriers place on the def's generics.
+    ///
+    /// The runtime boxes every `Cmd` / `Sub` / `Decoder` as a `Send + 'static`
+    /// value and bounds the types they carry to match (`cmd_map`'s and
+    /// `sub_map`'s `A`, the decoder combinators' element). A generic can ride
+    /// such a carrier only inside the body — `Sub.map k (Sub.every 1000 x)` with
+    /// `x : a` — while the signature shows it bare or under a function type
+    /// only, so a signature walk misses it. Every reference routes through
+    /// [`Self::lower_callee`], and each one's solved type (`span`'s region
+    /// type) is lowered in the def's generics; every generic under a carrier
+    /// anywhere in it, a produced value or an argument alike, is obliged. The
+    /// carrier set is [`ir_type_send_carrier_payload`], so a kernel producing
+    /// one of those carriers is covered with no per-kernel entry.
+    ///
+    /// Fail-closed: a missing region type obliges every generic of the def; a
+    /// type that does not lower obliges every generic it mentions. Over-bounding
+    /// stays buildable: every emitted concrete type is `Send + 'static`, and a
+    /// generic caller receives the bound through call-site propagation.
+    fn note_carrier_sends(&self, span: Span) {
+        let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
+        if poly.is_empty() {
+            return;
+        }
+        let obliged: Vec<Symbol> = self.region_ty(span).map_or_else(
+            || poly.iter().copied().collect(),
+            |solved| {
+                self.ir_type_from_ty(solved, span).map_or_else(
+                    |_| {
+                        poly.iter()
+                            .copied()
+                            .filter(|tv| self.ty_mentions_poly_tvar(solved, *tv))
+                            .collect()
+                    },
+                    |ir| {
+                        poly.iter()
+                            .copied()
+                            .filter(|tv| ir_type_generic_in_send_carrier(&ir, *tv))
+                            .collect()
+                    },
+                )
+            },
+        );
+        let mut recorded = self.recorded_bounds.borrow_mut();
+        for tv in obliged {
+            let slot = recorded.entry(tv).or_insert(BoundSet::UNBOUNDED);
+            *slot = slot.with_send();
+        }
+    }
+
+    /// Fold the def's recorded auto-trait obligations into its generic bounds.
+    fn apply_recorded_bounds(&self, type_params: &mut [(Symbol, BoundSet)]) {
+        let recorded = self.recorded_bounds.take();
+        for (tv, bounds) in type_params.iter_mut() {
+            if let Some(obliged) = recorded.get(tv) {
+                oblige_auto_traits(bounds, *obliged);
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)] // declarative kernel-name dispatch table
@@ -28202,6 +29192,7 @@ mod tests {
             redirect_policy,
             no_redirects,
             follow_redirects,
+            kernel_types: ipe_types::Builtins::new(interner).unwrap(),
         }
     }
 
@@ -28245,13 +29236,6 @@ mod tests {
             .expect("intern shared built-in table");
         let chunk_event = interner.intern("ChunkEvent").expect("intern");
         let stream_id = interner.intern("StreamId").expect("intern");
-        // `ProjectionTerm` / `ProjectionOperand` / `ArithOp` — injected into
-        // `types_ir` AFTER functions are lowered (when `uses_sqlvalue` is true),
-        // so they are never seeded into `enum_variants` at construction time.
-        // Skip exactly like `StreamId` / `ChunkEvent`.
-        let projection_term = interner.intern("ProjectionTerm").expect("intern");
-        let projection_operand = interner.intern("ProjectionOperand").expect("intern");
-        let arith_op = interner.intern("ArithOp").expect("intern");
         let module = canon::Module {
             imports_unsafe_submodule: false,
             imported_web_capabilities: std::collections::BTreeSet::new(),
@@ -28282,12 +29266,7 @@ mod tests {
 
         let prelude_home = ModPath(Vec::new());
         for (&union, ctors) in &shared.exhaust_union_ctors {
-            if union == chunk_event
-                || union == stream_id
-                || union == projection_term
-                || union == projection_operand
-                || union == arith_op
-            {
+            if union == chunk_event || union == stream_id {
                 continue;
             }
             let seeded_variants = lowerer
@@ -31328,5 +32307,330 @@ mod tests {
         assert!(fused.nested_cons_payload_sites >= 1, "nested cons seen");
         assert!(fused.nested_strlit_payload_sites >= 1, "nested strlit seen");
         assert!(fused.tuple_elem_rebind_sites >= 1, "tuple rebind seen");
+    }
+
+    /// Solved `Input.checkbox` types over built-in heads, keyed by the checker's own table.
+    ///
+    /// `checkbox_ty(attrs, result, result_arg)` builds
+    /// `attrs -> {} -> result Web result_arg`, and `attr_list(list, arg)` builds
+    /// `list (Attribute arg)`, so a test can swap either constructor head for
+    /// another of equal arity.
+    struct CheckboxFixture {
+        interner: Interner,
+        builtins: ipe_types::Builtins,
+        ipe_root: ipe_intern::Symbol,
+    }
+
+    impl CheckboxFixture {
+        fn new() -> Self {
+            let mut interner = Interner::new();
+            #[allow(clippy::expect_used)] // a fresh interner holds every built-in name
+            let builtins = ipe_types::Builtins::new(&mut interner).expect("intern built-ins");
+            #[allow(clippy::expect_used)] // a fresh interner accepts the stdlib root
+            let ipe_root = interner.intern("Ipe").expect("intern stdlib root");
+            Self {
+                interner,
+                builtins,
+                ipe_root,
+            }
+        }
+
+        fn heads(&self) -> super::SchemeHeads<'_> {
+            super::SchemeHeads {
+                builtins: &self.builtins,
+                interner: &self.interner,
+            }
+        }
+
+        fn con(&self, tag: ipe_kernels::BuiltinTag, args: Vec<Ty>) -> Ty {
+            Ty::Con {
+                module: self.builtins.builtin_con_module(tag).to_vec(),
+                name: self.builtins.builtin_symbol(tag),
+                args,
+            }
+        }
+
+        fn checkbox_ty(
+            &self,
+            attr_list: Ty,
+            result: ipe_kernels::BuiltinTag,
+            result_arg: Ty,
+        ) -> Ty {
+            let web = self.con(ipe_kernels::BuiltinTag::ProgramShapeWeb, vec![]);
+            let element = self.con(result, vec![web, result_arg]);
+            let cfg = Ty::Record(BTreeMap::new(), ipe_types::RowTail::Closed);
+            Ty::Fun(
+                Box::new(attr_list),
+                Box::new(Ty::Fun(Box::new(cfg), Box::new(element))),
+            )
+        }
+
+        fn attr_list(&self, list: ipe_kernels::BuiltinTag, attr_arg: Ty) -> Ty {
+            let attr = self.con(ipe_kernels::BuiltinTag::UiAttribute, vec![attr_arg]);
+            self.con(list, vec![attr])
+        }
+    }
+
+    /// `Input.checkbox`'s scheme shape, whose `msg` (var 0) the lowerer obliges `Sync`.
+    fn checkbox_shape() -> Option<&'static ipe_kernels::TyShape> {
+        assert_eq!(
+            KernelFn::InputCheckbox.sync_obliged_scheme_vars(),
+            &[0],
+            "Input.checkbox obliges its msg variable Sync"
+        );
+        let shape = KernelFn::InputCheckbox.scheme_shape();
+        assert!(shape.is_some(), "Input.checkbox must carry a scheme shape");
+        shape
+    }
+
+    /// `scheme_var_instance` reads a scheme variable's instantiation off the solved kernel type.
+    ///
+    /// `Input.checkbox`'s `msg` (var 0) is found through the attribute list and
+    /// the `View Web msg` result; the cfg record is skipped. An `Ipe`-rooted home
+    /// on a builtin head is the stdlib spelling unification accepts, so it still
+    /// aligns. A solved type whose structure disagrees with the scheme yields
+    /// `None`, the fail-closed arm.
+    #[test]
+    fn scheme_var_instance_aligns_input_msg() {
+        use ipe_kernels::BuiltinTag;
+        let fx = CheckboxFixture::new();
+        let Some(shape) = checkbox_shape() else {
+            return;
+        };
+        let msg = fx.con(BuiltinTag::Int, vec![]);
+        let solved = fx.checkbox_ty(
+            fx.attr_list(BuiltinTag::List, msg.clone()),
+            BuiltinTag::View,
+            msg.clone(),
+        );
+        assert_eq!(
+            super::scheme_var_instance(shape, &solved, 0, fx.heads()),
+            Some(&msg)
+        );
+        assert_eq!(super::scheme_var_instance(shape, &msg, 0, fx.heads()), None);
+
+        let ipe_rooted_list = Ty::Con {
+            module: vec![fx.ipe_root, fx.builtins.builtin_symbol(BuiltinTag::List)],
+            name: fx.builtins.builtin_symbol(BuiltinTag::List),
+            args: vec![fx.con(BuiltinTag::UiAttribute, vec![msg.clone()])],
+        };
+        let solved = fx.checkbox_ty(ipe_rooted_list, BuiltinTag::View, msg.clone());
+        assert_eq!(
+            super::scheme_var_instance(shape, &solved, 0, fx.heads()),
+            Some(&msg)
+        );
+    }
+
+    /// A constructor of the scheme's arity but a different tag never aligns a scheme variable.
+    ///
+    /// `Set` stands where the scheme says `List`, and `Element` where it says
+    /// `View` — each of equal arity. An arity-only walk would read `other` off
+    /// the swapped head; the head comparison skips it, reading `msg` off the
+    /// true `View` result, or refusing outright (`None`, which obliges every
+    /// generic) when no correctly-headed occurrence remains.
+    #[test]
+    fn scheme_var_instance_refuses_distinct_constructor_of_equal_arity() {
+        use ipe_kernels::BuiltinTag;
+        let fx = CheckboxFixture::new();
+        let Some(shape) = checkbox_shape() else {
+            return;
+        };
+        let msg = fx.con(BuiltinTag::Int, vec![]);
+        let other = fx.con(BuiltinTag::String, vec![]);
+
+        let swapped_list = fx.checkbox_ty(
+            fx.attr_list(BuiltinTag::Set, other.clone()),
+            BuiltinTag::View,
+            msg.clone(),
+        );
+        assert_eq!(
+            super::scheme_var_instance(shape, &swapped_list, 0, fx.heads()),
+            Some(&msg),
+            "a Set in the List position must not bind msg"
+        );
+
+        let swapped_both = fx.checkbox_ty(
+            fx.attr_list(BuiltinTag::Set, other.clone()),
+            BuiltinTag::UiElement,
+            other,
+        );
+        assert_eq!(
+            super::scheme_var_instance(shape, &swapped_both, 0, fx.heads()),
+            None,
+            "no correctly-headed occurrence remains"
+        );
+    }
+
+    /// `aligned_param_tvars` reads a callee generic's instantiation behind a function arrow.
+    ///
+    /// A callee parameter `Bool -> msg` handed the caller's `Bool -> t` binds
+    /// `msg` to `t`, whichever function carrier the argument arrives in. A
+    /// concrete result obliges nothing, a wrapped one obliges the generic it
+    /// wraps, and a shape the parameter does not share yields `None` — the
+    /// fail-closed arm that obliges every caller generic.
+    #[test]
+    fn aligned_param_tvars_reaches_through_function_arrows() {
+        let mut interner = Interner::new();
+        let mut intern = |name: &str| interner.intern(name).expect("intern type variable name");
+        let (msg, other, t, u) = (intern("msg"), intern("other"), intern("t"), intern("u"));
+        let callback = |ret: IrType| IrType::Fun(vec![IrType::Bool], Box::new(ret));
+        let sig = callback(IrType::Generic(msg));
+        let caller = [t, u];
+        let align = |site: &IrType| super::aligned_param_tvars(&sig, msg, site, &caller);
+
+        assert_eq!(align(&callback(IrType::Generic(t))), Some(vec![t]));
+        assert_eq!(
+            align(&IrType::SharedFun(
+                vec![IrType::Bool],
+                Box::new(IrType::Generic(u))
+            )),
+            Some(vec![u])
+        );
+        assert_eq!(align(&callback(IrType::Str)), Some(vec![]));
+        assert_eq!(
+            align(&callback(IrType::Maybe(Box::new(IrType::Generic(u))))),
+            Some(vec![u])
+        );
+
+        // Refusals: a non-function argument, or an arrow of another arity,
+        // cannot be aligned.
+        assert_eq!(align(&IrType::Generic(t)), None);
+        assert_eq!(align(&IrType::Int), None);
+        assert_eq!(
+            align(&IrType::Fun(
+                vec![IrType::Bool, IrType::Bool],
+                Box::new(IrType::Generic(t))
+            )),
+            None
+        );
+
+        // A parameter that never mentions the target imposes nothing, even
+        // against a mismatched argument.
+        assert_eq!(
+            super::aligned_param_tvars(&IrType::Generic(other), msg, &IrType::Int, &caller),
+            Some(vec![])
+        );
+    }
+
+    /// A binder bound twice to differing types has no recoverable site type.
+    #[test]
+    fn record_site_type_forgets_a_conflicting_rebind() {
+        let mut interner = Interner::new();
+        let f = interner.intern("f").expect("intern binder name");
+        let mut site_types = std::collections::HashMap::new();
+        super::record_site_type(&mut site_types, f, Some(IrType::Int));
+        super::record_site_type(&mut site_types, f, Some(IrType::Int));
+        assert_eq!(site_types.get(&f), Some(&Some(IrType::Int)));
+        super::record_site_type(&mut site_types, f, Some(IrType::Str));
+        assert_eq!(site_types.get(&f), Some(&None));
+        super::record_site_type(&mut site_types, f, Some(IrType::Int));
+        assert_eq!(site_types.get(&f), Some(&None));
+    }
+
+    /// `instance_tvars` aligns a callee's full signature against one reference's solved instantiation.
+    ///
+    /// A `msg` bounded only in the callee's return type (`helper : Html msg`)
+    /// is instantiated by the reference's tail after peeling the callee's
+    /// arity; a parameter slot aligns the same way. The refusals fail closed:
+    /// an unknown reference type (no slots) obliges every caller generic, an
+    /// unlowered slot the generics it mentions, and a shape the signature
+    /// does not share every caller generic the site mentions.
+    #[test]
+    fn instance_tvars_aligns_return_and_parameter_slots() {
+        use super::{CalleeInstance, SiteSlot};
+        let mut interner = Interner::new();
+        let mut intern = |name: &str| interner.intern(name).expect("intern type variable name");
+        let (msg, t, u) = (intern("msg"), intern("t"), intern("u"));
+        let html = |m: IrType| IrType::Ui {
+            ctor: ipe_ir::UiCtor::Html,
+            msg: Box::new(m),
+        };
+        let caller = [t, u];
+        let instance = |params: Vec<SiteSlot>, tails: Vec<SiteSlot>| CalleeInstance {
+            callee: ipe_ir::FuncId::from_raw(0),
+            params,
+            tails,
+        };
+        let lowered = SiteSlot::Lowered;
+
+        // Return-only generic, nullary helper referenced as a value.
+        let ret = html(IrType::Generic(msg));
+        let site = instance(vec![], vec![lowered(html(IrType::Generic(t)))]);
+        assert_eq!(
+            super::instance_tvars(&[], &ret, msg, &site, &caller),
+            vec![t]
+        );
+
+        // The same return with one parameter: the tail after one peel is the
+        // instantiated return.
+        let params = [IrType::Int];
+        let site = instance(
+            vec![lowered(IrType::Int)],
+            vec![
+                lowered(IrType::Fun(
+                    vec![IrType::Int],
+                    Box::new(html(IrType::Generic(u))),
+                )),
+                lowered(html(IrType::Generic(u))),
+            ],
+        );
+        assert_eq!(
+            super::instance_tvars(&params, &ret, msg, &site, &caller),
+            vec![u]
+        );
+
+        // A generic in a parameter slot behind an arrow.
+        let callback = [IrType::Fun(
+            vec![IrType::Bool],
+            Box::new(IrType::Generic(msg)),
+        )];
+        let site = instance(
+            vec![lowered(IrType::Fun(
+                vec![IrType::Bool],
+                Box::new(IrType::Generic(t)),
+            ))],
+            vec![],
+        );
+        assert_eq!(
+            super::instance_tvars(&callback, &IrType::Unit, msg, &site, &caller),
+            vec![t]
+        );
+
+        // A concrete instantiation obliges nothing.
+        let site = instance(vec![], vec![lowered(html(IrType::Str))]);
+        assert!(super::instance_tvars(&[], &ret, msg, &site, &caller).is_empty());
+
+        // Refusals: an unknown reference type obliges every caller generic.
+        let site = instance(vec![], vec![]);
+        assert_eq!(
+            super::instance_tvars(&[], &ret, msg, &site, &caller),
+            vec![t, u]
+        );
+        // A reference type shallower than the callee's arity does too.
+        let site = instance(vec![], vec![lowered(html(IrType::Generic(t)))]);
+        assert_eq!(
+            super::instance_tvars(&params, &ret, msg, &site, &caller),
+            vec![t, u]
+        );
+        // An unlowered slot obliges the generics it mentions.
+        let site = instance(vec![], vec![SiteSlot::Unlowered(vec![u])]);
+        assert_eq!(
+            super::instance_tvars(&[], &ret, msg, &site, &caller),
+            vec![u]
+        );
+        // A shape the signature does not share obliges every generic the site mentions.
+        let site = instance(
+            vec![],
+            vec![lowered(IrType::List(Box::new(IrType::Generic(t))))],
+        );
+        assert_eq!(
+            super::instance_tvars(&[], &ret, msg, &site, &caller),
+            vec![t]
+        );
+        // A signature that never mentions the target imposes nothing.
+        assert!(
+            super::instance_tvars(&[], &IrType::Int, msg, &instance(vec![], vec![]), &caller)
+                .is_empty()
+        );
     }
 }

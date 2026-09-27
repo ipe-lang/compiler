@@ -442,6 +442,10 @@ code! {
     IPE_N0049 = "IPE-N0049", "a pattern binds the same name twice", "IPE-N0049";
     /// a Script imports a shape's view module but renders nothing
     IPE_N0050 = "IPE-N0050", "a Script imports a shape's UI, which it cannot render", "IPE-N0050";
+    /// an app entry (`Web.tea`, `Tui.tea`, `Cli.tea`, `Worker.tea`, …) is built
+    /// inside a definition whose `Model` / `Msg` is still a type variable; the
+    /// running app needs one concrete model and message type
+    IPE_N0051 = "IPE-N0051", "an app entry is built with a Model or Msg that is still a type variable", "IPE-N0051";
 
     // -----------------------------------------------------------------------
     // Type (IPE-T####)

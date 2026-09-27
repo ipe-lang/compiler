@@ -2758,6 +2758,474 @@ main =
 }
 
 // ===========================================================================
+// App entries need a concrete Model / Msg — IPE-N0051. Every app entry's
+// runtime function bounds the cfg's model and message types with traits a
+// Rust generic does not carry, so an entry built inside a definition generic
+// over a type variable the cfg mentions is refused at ipe time — one refusal
+// per entry kind, plus the concrete contrapositive.
+// ===========================================================================
+
+/// The `Web` cfg preamble shared by the `Web.tea` / `Web.appWith` fixtures: a
+/// concrete app whose `main` is a valid entry, so the only defect is the
+/// msg-generic helper each fixture appends.
+const WEB_ENTRY_PREAMBLE: &str = r#"module Main exposing (main)
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+type Page = HomePage
+type Msg = Noop
+type alias Model = { count : Int }
+initialModel : Model
+initialModel = { count = 0 }
+init : WebReq -> ( Model, Cmd Msg )
+init _req = ( initialModel, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Element Msg
+view _model = Ui.text "hi"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
+main =
+    Web.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        , routes = [], notFound = HomePage
+        }
+"#;
+
+/// A `Web.tea` built by a helper generic over its message type is refused.
+#[test]
+fn generic_msg_web_tea_rejected() {
+    let src = format!(
+        "{WEB_ENTRY_PREAMBLE}\
+         appOf step render =\n\
+         \x20   Web.tea\n\
+         \x20       {{ init = \\_ -> ( initialModel, Cmd.none )\n\
+         \x20       , update = step\n\
+         \x20       , view = render\n\
+         \x20       , subscriptions = \\_ -> Sub.none\n\
+         \x20       , routes = []\n\
+         \x20       , notFound = HomePage\n\
+         \x20       }}\n"
+    );
+    assert_rejected("generic_msg_web_tea", &src, "IPE-N0051");
+}
+
+/// A `Web.appWith` built by a helper generic over its message type is refused.
+#[test]
+fn generic_msg_web_app_with_rejected() {
+    let src = format!(
+        "{WEB_ENTRY_PREAMBLE}\
+         appOf step render =\n\
+         \x20   Web.appWith []\n\
+         \x20       {{ init = \\_ -> ( initialModel, Cmd.none )\n\
+         \x20       , update = step\n\
+         \x20       , view = render\n\
+         \x20       , subscriptions = \\_ -> Sub.none\n\
+         \x20       , routes = []\n\
+         \x20       , notFound = HomePage\n\
+         \x20       }}\n"
+    );
+    assert_rejected("generic_msg_web_app_with", &src, "IPE-N0051");
+}
+
+/// A server mounting a `Web.embed` app, built by a helper whose annotation
+/// keeps `msg` generic: `embedOf` would emit as a Rust generic the runtime's
+/// `Serialize + PartialEq + Sync` bounds cannot reach.
+const WEB_EMBED_GENERIC: &str = r#"module Main exposing (main)
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+type alias Model = { count : Int }
+type Msg = Noop
+initialModel : Model
+initialModel = { count = 0 }
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Element Msg
+view _model = Ui.text "hi"
+embedOf : (msg -> Model -> ( Model, Cmd.Cmd msg )) -> (Model -> Element msg) -> msg -> Web.WebApp
+embedOf step render fallback =
+    Web.embed
+        { init = \_ -> ( initialModel, Cmd.none )
+        , update = step
+        , view = render
+        , subscriptions = \_ -> Sub.none
+        , routes = []
+        , notFound = fallback
+        }
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" (embedOf update view Noop) ]
+"#;
+
+/// A mounted `Web.embed` built by a msg-generic helper is refused.
+#[test]
+fn generic_msg_web_embed_rejected() {
+    assert_rejected("generic_msg_web_embed", WEB_EMBED_GENERIC, "IPE-N0051");
+}
+
+/// The contrapositive: the same helper annotated with the concrete `Msg` is accepted.
+#[test]
+fn concrete_msg_web_embed_compiles() {
+    let src = WEB_EMBED_GENERIC.replace(
+        "embedOf : (msg -> Model -> ( Model, Cmd.Cmd msg )) -> (Model -> Element msg) -> msg -> Web.WebApp",
+        "embedOf : (Msg -> Model -> ( Model, Cmd.Cmd Msg )) -> (Model -> Element Msg) -> Msg -> Web.WebApp",
+    );
+    assert!(
+        src != WEB_EMBED_GENERIC,
+        "the fixture must carry the generic annotation this test concretises"
+    );
+    assert_compiles("concrete_msg_web_embed", &src);
+}
+
+/// A mounted `Web.embed` whose only open generic is the row variable of its
+/// model: `embedRow` quantifies `r`, the open tail of `{ r | count : Int }`,
+/// and the entry's solved cfg type reaches it only through that tail.
+const WEB_EMBED_ROW_GENERIC: &str = r#"module Main exposing (main)
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+type alias Model = { count : Int }
+type Msg = Noop
+initialModel : Model
+initialModel = { count = 0 }
+embedRow : { r | count : Int } -> Web.WebApp
+embedRow start =
+    Web.embed
+        { init = \_ -> ( start, Cmd.none )
+        , update = \_ m -> ( m, Cmd.none )
+        , view = \_ -> Ui.text "hi"
+        , subscriptions = \_ -> Sub.none
+        , routes = []
+        , notFound = Noop
+        }
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" (embedRow initialModel) ]
+"#;
+
+/// A mounted `Web.embed` whose model is generic only through an open row tail is refused.
+#[test]
+fn generic_row_model_web_embed_rejected() {
+    assert_rejected(
+        "generic_row_model_web_embed",
+        WEB_EMBED_ROW_GENERIC,
+        "IPE-N0051",
+    );
+}
+
+/// A mounted `Web.embed` built inside a definition whose annotation carries a
+/// row generic the entry's model does not visibly use: the model is the
+/// concrete `Model`, and `r` is only the open tail of the `cfg` parameter the
+/// view reads a label from. Region types carry no record row tails, so whether
+/// the entry reaches `r` cannot be determined, and the entry is refused
+/// fail-closed.
+const WEB_EMBED_ROW_IN_SCOPE: &str = r#"module Main exposing (main)
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+type alias Model = { count : Int }
+type Msg = Noop
+initialModel : Model
+initialModel = { count = 0 }
+embedLabelled : { r | label : String } -> Web.WebApp
+embedLabelled cfg =
+    Web.embed
+        { init = \_ -> ( initialModel, Cmd.none )
+        , update = \_ m -> ( m, Cmd.none )
+        , view = \_ -> Ui.text cfg.label
+        , subscriptions = \_ -> Sub.none
+        , routes = []
+        , notFound = Noop
+        }
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" (embedLabelled { label = "hi" }) ]
+"#;
+
+/// An app entry under an annotation row generic is refused with IPE-N0051,
+/// reported as an undetermined reach of `r` rather than an entry built over it.
+#[test]
+fn row_generic_in_scope_web_embed_refused_undetermined() {
+    let name = "row_generic_in_scope_web_embed";
+    let Some(entry) = write_entry(name, WEB_EMBED_ROW_IN_SCOPE) else {
+        return;
+    };
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-out")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&out);
+    let Ok(runtime) = ipe::resolve_runtime() else {
+        return;
+    };
+    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+        Err(CliError::Pipeline { diag, .. }) => match *diag {
+            ipe_diagnostics::Diagnostic::Name {
+                msg:
+                    ipe_diagnostics::NameError::GenericAppEntry {
+                        type_var, reach, ..
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    &*type_var, "r",
+                    "{name}: the refusal must name the row generic"
+                );
+                assert_eq!(
+                    reach,
+                    ipe_diagnostics::GenericAppEntryReach::Undetermined,
+                    "{name}: a row generic in scope is an undetermined reach, not a proven mention"
+                );
+            }
+            other => assert!(
+                false_marker(),
+                "{name}: expected IPE-N0051 for the row generic in scope, got {}",
+                other.code().as_str()
+            ),
+        },
+        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
+    }
+}
+
+/// A mounted `Web.embed` in a definition with no generics whose message type
+/// nothing fixes: `update` ignores its message, the view emits none, and
+/// `notFound` is the route fallback, so `msg` stays a type variable.
+const WEB_EMBED_UNPINNED_MSG: &str = r#"module Main exposing (main)
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+type alias Model = { count : Int }
+type Msg = Noop
+app : Web.WebApp
+app =
+    Web.embed
+        { init = \_ -> ( { count = 0 }, Cmd.none )
+        , update = \_ m -> ( m, Cmd.none )
+        , view = \_ -> Ui.text "hi"
+        , subscriptions = \_ -> Sub.none
+        , routes = []
+        , notFound = Noop
+        }
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" app ]
+"#;
+
+/// An app entry whose message type the program never fixes is refused with
+/// IPE-N0051 at the entry, before any cfg value reaches the polymorphic-value
+/// check (IPE-L0102).
+#[test]
+fn unpinned_msg_web_embed_refused() {
+    let name = "unpinned_msg_web_embed";
+    let Some(entry) = write_entry(name, WEB_EMBED_UNPINNED_MSG) else {
+        return;
+    };
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-out")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&out);
+    let Ok(runtime) = ipe::resolve_runtime() else {
+        return;
+    };
+    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+        Err(CliError::Pipeline { diag, .. }) => match *diag {
+            ipe_diagnostics::Diagnostic::Name {
+                msg: ipe_diagnostics::NameError::UnpinnedAppEntry { entry },
+                ..
+            } => assert_eq!(
+                &*entry, "Web.embed",
+                "{name}: the refusal must name the entry"
+            ),
+            other => assert!(
+                false_marker(),
+                "{name}: expected IPE-N0051 for the unpinned message type, got {}",
+                other.code().as_str()
+            ),
+        },
+        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
+    }
+}
+
+/// The contrapositive: the same app with `update` matching on its `Msg` is accepted.
+#[test]
+fn pinned_msg_web_embed_compiles() {
+    let src = WEB_EMBED_UNPINNED_MSG.replace(
+        "        , update = \\_ m -> ( m, Cmd.none )\n",
+        "        , update = \\msg m -> case msg of\n            Noop -> ( m, Cmd.none )\n",
+    );
+    assert!(
+        src != WEB_EMBED_UNPINNED_MSG,
+        "the fixture must carry the message-ignoring update this test replaces"
+    );
+    assert_compiles("pinned_msg_web_embed", &src);
+}
+
+/// A point-free `let` alias of `Web.embed` inside a msg-generic helper is refused.
+///
+/// The alias is monomorphic (no let-generalization), so its `Web.embed`
+/// reference is instantiated at the helper's `msg` and refused at that
+/// reference, not only at a direct call.
+#[test]
+fn generic_msg_web_embed_let_alias_rejected() {
+    let src = WEB_EMBED_GENERIC.replace(
+        "embedOf step render fallback =\n    Web.embed\n",
+        "embedOf step render fallback =\n    let\n        mk = Web.embed\n    in\n    mk\n",
+    );
+    assert!(
+        src != WEB_EMBED_GENERIC,
+        "the fixture must carry the direct `Web.embed` call this test aliases"
+    );
+    assert_rejected("generic_msg_web_embed_let_alias", &src, "IPE-N0051");
+}
+
+/// A `Web.appRouted` built by a msg-generic helper is refused before lowering.
+///
+/// `Web.appRouted` carries no type scheme, so every reference to it is refused
+/// by the type checker (IPE-L0108) and never reaches the generic-entry check.
+#[test]
+fn generic_msg_web_app_routed_rejected() {
+    let src = format!(
+        "{WEB_ENTRY_PREAMBLE}\
+         appOf step render =\n\
+         \x20   Web.appRouted\n\
+         \x20       {{ init = \\_ -> ( initialModel, Cmd.none )\n\
+         \x20       , update = step\n\
+         \x20       , view = render\n\
+         \x20       , subscriptions = \\_ -> Sub.none\n\
+         \x20       , routes = []\n\
+         \x20       , notFound = HomePage\n\
+         \x20       }}\n"
+    );
+    assert_rejected("generic_msg_web_app_routed", &src, "IPE-L0108");
+}
+
+/// A `Tui.tea` built by a helper generic over its message type is refused.
+#[test]
+fn generic_msg_tui_tea_rejected() {
+    let src = r#"module Main exposing (main)
+import Ipe.Tea.Tui as Tui
+import Ipe.Ui.Cells as Cells
+import Ipe.Ui.Cells exposing (Screen)
+import Ipe.Tea.Tui.Cmd
+import Ipe.Tea.Tui.Sub
+type Msg = NoOp
+type alias Model = { count : Int }
+type alias KeyEvent = { kind : String, value : String }
+initialModel : Model
+initialModel = { count = 0 }
+init : () -> ( Model, Cmd Msg )
+init _unit = ( initialModel, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Screen Msg
+view _model = Cells.text "hello"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
+onKey : KeyEvent -> Msg
+onKey _event = NoOp
+main =
+    Tui.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions, onKey = onKey
+        }
+appOf step render toMsg =
+    Tui.tea
+        { init = \_ -> ( initialModel, Cmd.none )
+        , update = step
+        , view = render
+        , subscriptions = \_ -> Sub.none
+        , onKey = toMsg
+        }
+"#;
+    assert_rejected("generic_msg_tui_tea", src, "IPE-N0051");
+}
+
+/// A `Cli.tea` built by a helper generic over its message type is refused.
+#[test]
+fn generic_msg_cli_tea_rejected() {
+    let src = r#"module Main exposing (main)
+import Ipe.Tea.Cli as Cli
+import Ipe.Tea.Cli.Cmd
+import Ipe.Tea.Cli.Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+type Msg = Line String
+type alias Model = { count : Int }
+initialModel : Model
+initialModel = { count = 0 }
+init : () -> ( Model, Cmd Msg )
+init _unit = ( initialModel, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Lines Msg
+view _model = Ui.text "ok"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
+onLine : String -> Msg
+onLine s = Line s
+main =
+    Cli.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions, onLine = onLine
+        }
+appOf step render toMsg =
+    Cli.tea
+        { init = \_ -> ( initialModel, Cmd.none )
+        , update = step
+        , view = render
+        , subscriptions = \_ -> Sub.none
+        , onLine = toMsg
+        }
+"#;
+    assert_rejected("generic_msg_cli_tea", src, "IPE-N0051");
+}
+
+/// A `Worker.tea` built by a helper generic over its message type is refused.
+#[test]
+fn generic_msg_worker_tea_rejected() {
+    let src = r"module Main exposing (main)
+import Ipe.Tea.Worker
+import Ipe.Tea.Worker.Cmd as Cmd
+import Ipe.Tea.Worker.Sub as Sub
+type Msg = Tick
+type alias Model = { ticks : Int }
+initialModel : Model
+initialModel = { ticks = 0 }
+init : () -> ( Model, Cmd Msg )
+init _unit = ( initialModel, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.every 100 Tick
+main =
+    Worker.tea { init = init, update = update, subscriptions = subscriptions }
+workerOf step =
+    Worker.tea
+        { init = \_ -> ( initialModel, Cmd.none )
+        , update = step
+        , subscriptions = \_ -> Sub.none
+        }
+";
+    assert_rejected("generic_msg_worker_tea", src, "IPE-N0051");
+}
+
+// ===========================================================================
 // FFI trust boundary (T1) — the decode/emit gate rejects injection-bearing
 // inspector data, and the warm-cache load re-derives `_bindings.rs` from the
 // validated inspection document so a planted `_bindings.rs` is inert. These

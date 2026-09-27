@@ -246,22 +246,22 @@ impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for RecEncMkDecS
     }
 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct RecOuterColShareColShareColumnsShareReadShareTable {
+pub struct RecOuterColShareColShareReadShareTableShareView {
     outerCol: String,
     shareCol: String,
-    shareColumns: Vec<IpeDbStoreColumn>,
     shareRead: IpeDbStorePred,
     shareTable: String,
+    shareView: IpeDbStoreColumnView,
 }
-impl IpeStringify for RecOuterColShareColShareColumnsShareReadShareTable {
+impl IpeStringify for RecOuterColShareColShareReadShareTableShareView {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {} {} {}}}",
             (&ipe_runtime::stringify::Wrap(&self.outerCol)).dispatch(),
             (&ipe_runtime::stringify::Wrap(&self.shareCol)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareColumns)).dispatch(),
             (&ipe_runtime::stringify::Wrap(&self.shareRead)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareTable)).dispatch()
+            (&ipe_runtime::stringify::Wrap(&self.shareTable)).dispatch(),
+            (&ipe_runtime::stringify::Wrap(&self.shareView)).dispatch()
         )
     }
 }

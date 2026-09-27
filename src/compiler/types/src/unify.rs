@@ -339,6 +339,26 @@ fn unify_nonstructure(
     }
 }
 
+/// Whether two constructor heads `m1.n1` and `m2.n2` name the same type constructor.
+///
+/// The single head-identity rule: the names agree, and the homes agree or one
+/// side is the empty builtin home and the other passes [`empty_home_compat`].
+/// Arity is the caller's concern; the head alone decides identity, so two
+/// distinct constructors of equal arity are never conflated.
+#[must_use]
+pub fn con_heads_compatible(
+    m1: &[ipe_intern::Symbol],
+    n1: ipe_intern::Symbol,
+    m2: &[ipe_intern::Symbol],
+    n2: ipe_intern::Symbol,
+    interner: &Interner,
+) -> bool {
+    n1 == n2
+        && (m1 == m2
+            || (m1.is_empty() && empty_home_compat(m2, n2, interner))
+            || (m2.is_empty() && empty_home_compat(m1, n1, interner)))
+}
+
 /// Whether an empty-home `Con` may unify with a `Con` of the same `name`
 /// carrying the non-empty `other_home`.
 ///
@@ -456,10 +476,7 @@ fn unify_flat(
             // of that name (`type Order` in `Main`), a genuinely distinct type
             // from the empty-home builtin; unifying them would let a wrong program
             // type-check and then lower to conflicting Rust representations.
-            let modules_compat = m1 == m2
-                || (m1.is_empty() && empty_home_compat(&m2, n2, interner))
-                || (m2.is_empty() && empty_home_compat(&m1, n1, interner));
-            if !modules_compat || n1 != n2 || as1.len() != as2.len() {
+            if !con_heads_compatible(&m1, n1, &m2, n2, interner) || as1.len() != as2.len() {
                 return Err(mismatch(uf, budget, interner, span, ra, rb));
             }
             // Prefer the non-empty (more specific) module path as canonical.

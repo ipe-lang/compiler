@@ -214,6 +214,9 @@ pub fn collect_free_vars(expr: &Expr, out: &mut std::collections::BTreeSet<Symbo
                 pat_bound_symbols(&arm.pat, &mut bound);
                 let mut body_free = std::collections::BTreeSet::new();
                 collect_free_vars(&arm.body, &mut body_free);
+                if let Some(guard) = &arm.guard {
+                    collect_free_vars(guard, &mut body_free);
+                }
                 for b in &bound {
                     body_free.remove(b);
                 }
@@ -280,20 +283,21 @@ pub fn collect_free_vars(expr: &Expr, out: &mut std::collections::BTreeSet<Symbo
 /// clones a variable that a caller determined is genuinely captured (see
 /// `clone_targets_in_expr`).
 ///
-/// `row_binders` is the enclosing function's set of row-generic parameter
-/// binders (the symbols the Access emitter routes through a borrowing witness
-/// getter `ipe_<field>()`). A whole-row `CloneVar` on such a receiver would
-/// fall through the emitter's `Var`-only getter route to a raw struct-field
-/// read on the opaque `R{n}` generic — the exit-0-then-cargo-fail class. The
-/// getter borrows, so no whole-row clone is ever needed there: a row-generic
-/// Access receiver is left a bare `Var`, upholding the invariant that a
-/// row-generic value only ever reaches emission as `Access { record: Var(row) }`.
+/// Only a CONSUMING position is rewritten. A bare `Var` in a borrowing
+/// position stays a `Var`, because the emitted read never moves it and the
+/// variable's type may not be `Clone` at all:
+///
+/// * a direct [`Expr::Apply`] callee — a call through `Fn` borrows (the same
+///   exemption as the lowerer's `fn_value_move_walk`); an unpromoted
+///   `Box<dyn Fn>` has no `clone` (E0599);
+/// * an [`Expr::Access`] receiver — `(rec).field.clone()` borrows the record,
+///   which may hold a `Task`, a function, or an opaque handle and derive no
+///   `Clone` (E0599); a row-generic receiver must also stay a bare `Var` so the
+///   Access emitter routes it through the borrowing witness getter;
+/// * the list of an [`Expr::ListIndexClone`] / [`Expr::ListLenCheck`] — an
+///   index or length read borrows the `Vec`.
 #[allow(clippy::too_many_lines)] // A recursive tree-walk over a large enum — necessarily long.
-pub fn clone_free_target(
-    expr: Expr,
-    target: Symbol,
-    row_binders: &std::collections::BTreeSet<Symbol>,
-) -> Expr {
+pub fn clone_free_target(expr: Expr, target: Symbol) -> Expr {
     match expr {
         Expr::Var(s) if s == target => Expr::CloneVar(s),
         Expr::Var(_)
@@ -309,15 +313,15 @@ pub fn clone_free_target(
         | Expr::FuncValue { .. } => expr,
         Expr::BinOp { op, lhs, rhs } => Expr::BinOp {
             op,
-            lhs: Box::new(clone_free_target(*lhs, target, row_binders)),
-            rhs: Box::new(clone_free_target(*rhs, target, row_binders)),
+            lhs: Box::new(clone_free_target(*lhs, target)),
+            rhs: Box::new(clone_free_target(*rhs, target)),
         },
         Expr::Let { name, value, body } => {
-            let new_value = Box::new(clone_free_target(*value, target, row_binders));
+            let new_value = Box::new(clone_free_target(*value, target));
             let new_body = if name == target {
                 body
             } else {
-                Box::new(clone_free_target(*body, target, row_binders))
+                Box::new(clone_free_target(*body, target))
             };
             Expr::Let {
                 name,
@@ -330,11 +334,11 @@ pub fn clone_free_target(
             value,
             body,
         } => {
-            let new_value = Box::new(clone_free_target(*value, target, row_binders));
+            let new_value = Box::new(clone_free_target(*value, target));
             let new_body = if pat_binds_target(&binder, target) {
                 body
             } else {
-                Box::new(clone_free_target(*body, target, row_binders))
+                Box::new(clone_free_target(*body, target))
             };
             Expr::Destructure {
                 binder,
@@ -343,18 +347,18 @@ pub fn clone_free_target(
             }
         }
         Expr::If { cond, then_, else_ } => Expr::If {
-            cond: Box::new(clone_free_target(*cond, target, row_binders)),
-            then_: Box::new(clone_free_target(*then_, target, row_binders)),
-            else_: Box::new(clone_free_target(*else_, target, row_binders)),
+            cond: Box::new(clone_free_target(*cond, target)),
+            then_: Box::new(clone_free_target(*then_, target)),
+            else_: Box::new(clone_free_target(*else_, target)),
         },
         Expr::Match(m) => Expr::Match(m.map_bodies(
-            |scrutinee| clone_free_target(scrutinee, target, row_binders),
+            |scrutinee| clone_free_target(scrutinee, target),
             |pat, body, guard| {
                 let binds = pat_binds_target(pat, target);
                 let new_body = if binds {
                     body
                 } else {
-                    clone_free_target(body, target, row_binders)
+                    clone_free_target(body, target)
                 };
                 // Preserve the list-length guard, rewriting it too when the arm
                 // pattern does not bind `target`.
@@ -362,7 +366,7 @@ pub fn clone_free_target(
                     if binds {
                         g
                     } else {
-                        clone_free_target(g, target, row_binders)
+                        clone_free_target(g, target)
                     }
                 });
                 (new_body, new_guard)
@@ -377,7 +381,7 @@ pub fn clone_free_target(
             callee,
             args: args
                 .into_iter()
-                .map(|a| clone_free_target(a, target, row_binders))
+                .map(|a| clone_free_target(a, target))
                 .collect(),
             pin,
             on_form,
@@ -385,33 +389,33 @@ pub fn clone_free_target(
         Expr::Tuple(items) => Expr::Tuple(
             items
                 .into_iter()
-                .map(|e| clone_free_target(e, target, row_binders))
+                .map(|e| clone_free_target(e, target))
                 .collect(),
         ),
         Expr::List { elem, items } => Expr::List {
             elem,
             items: items
                 .into_iter()
-                .map(|e| clone_free_target(e, target, row_binders))
+                .map(|e| clone_free_target(e, target))
                 .collect(),
         },
         Expr::Cons { head, tail } => Expr::Cons {
-            head: Box::new(clone_free_target(*head, target, row_binders)),
-            tail: Box::new(clone_free_target(*tail, target, row_binders)),
+            head: Box::new(clone_free_target(*head, target)),
+            tail: Box::new(clone_free_target(*tail, target)),
         },
         Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
-            list: Box::new(clone_free_target(*list, target, row_binders)),
+            list: Box::new(clone_borrowed_position(*list, target)),
             index,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
-            list: Box::new(clone_free_target(*list, target, row_binders)),
+            list: Box::new(clone_borrowed_position(*list, target)),
             len,
             exact,
         },
         Expr::Record { fields, ty } => Expr::Record {
             fields: fields
                 .into_iter()
-                .map(|(s, e)| (s, clone_free_target(e, target, row_binders)))
+                .map(|(s, e)| (s, clone_free_target(e, target)))
                 .collect(),
             ty,
         },
@@ -419,34 +423,23 @@ pub fn clone_free_target(
             record,
             field,
             field_ty,
-        } => {
-            // A row-generic Access receiver stays a bare `Var`: the witness
-            // getter `ipe_<field>()` BORROWS, so a whole-row `CloneVar` here is
-            // both spurious and unroutable (the emitter's getter route matches
-            // `Var` alone). Leaving it `Var(row)` is what upholds the invariant
-            // uniformly at emit time. Any other receiver is rewritten normally.
-            let new_record = match *record {
-                Expr::Var(s) if row_binders.contains(&s) => Expr::Var(s),
-                other => clone_free_target(other, target, row_binders),
-            };
-            Expr::Access {
-                record: Box::new(new_record),
-                field,
-                field_ty,
-            }
-        }
+        } => Expr::Access {
+            record: Box::new(clone_borrowed_position(*record, target)),
+            field,
+            field_ty,
+        },
         Expr::Update { record, fields } => Expr::Update {
-            record: Box::new(clone_free_target(*record, target, row_binders)),
+            record: Box::new(clone_free_target(*record, target)),
             fields: fields
                 .into_iter()
-                .map(|(s, e)| (s, clone_free_target(e, target, row_binders)))
+                .map(|(s, e)| (s, clone_free_target(e, target)))
                 .collect(),
         },
         Expr::Lambda { params, ret, body } => {
             let new_body = if params.iter().any(|(s, _)| *s == target) {
                 body
             } else {
-                Box::new(clone_free_target(*body, target, row_binders))
+                Box::new(clone_free_target(*body, target))
             };
             Expr::Lambda {
                 params,
@@ -458,7 +451,7 @@ pub fn clone_free_target(
             let new_body = if params.iter().any(|(s, _)| *s == target) {
                 body
             } else {
-                Box::new(clone_free_target(*body, target, row_binders))
+                Box::new(clone_free_target(*body, target))
             };
             Expr::SharedLambda {
                 params,
@@ -467,15 +460,15 @@ pub fn clone_free_target(
             }
         }
         Expr::Apply { func, args } => Expr::Apply {
-            func: Box::new(clone_free_target(*func, target, row_binders)),
+            func: Box::new(clone_borrowed_position(*func, target)),
             args: args
                 .into_iter()
-                .map(|a| clone_free_target(a, target, row_binders))
+                .map(|a| clone_free_target(a, target))
                 .collect(),
         },
         Expr::TaskSeq { effect, rest } => Expr::TaskSeq {
-            effect: Box::new(clone_free_target(*effect, target, row_binders)),
-            rest: Box::new(clone_free_target(*rest, target, row_binders)),
+            effect: Box::new(clone_free_target(*effect, target)),
+            rest: Box::new(clone_free_target(*rest, target)),
         },
         Expr::Ctor {
             home,
@@ -488,14 +481,14 @@ pub fn clone_free_target(
             variant,
             args: args
                 .into_iter()
-                .map(|a| clone_free_target(a, target, row_binders))
+                .map(|a| clone_free_target(a, target))
                 .collect(),
         },
         Expr::TailLoop { params, body } => {
             let new_body = if params.iter().any(|(s, _)| *s == target) {
                 body
             } else {
-                Box::new(clone_free_target(*body, target, row_binders))
+                Box::new(clone_free_target(*body, target))
             };
             Expr::TailLoop {
                 params,
@@ -505,9 +498,19 @@ pub fn clone_free_target(
         Expr::TailRecur { args } => Expr::TailRecur {
             args: args
                 .into_iter()
-                .map(|a| clone_free_target(a, target, row_binders))
+                .map(|a| clone_free_target(a, target))
                 .collect(),
         },
+    }
+}
+
+/// [`clone_free_target`] for a BORROWING position: a bare `Var` there is read by
+/// reference, never moved, so it is left as is; any compound expression is
+/// still walked for the consuming positions inside it.
+fn clone_borrowed_position(expr: Expr, target: Symbol) -> Expr {
+    match expr {
+        Expr::Var(s) => Expr::Var(s),
+        other => clone_free_target(other, target),
     }
 }
 
@@ -538,19 +541,10 @@ pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
 /// Fold [`clone_free_target`] over every symbol in `targets`. Each fold step
 /// only ever rewrites bare `Var` occurrences into `CloneVar` — the passes
 /// don't interfere with each other regardless of order (a `CloneVar` leaf is
-/// never re-matched by a later target's pass).
-///
-/// `row_binders` is the enclosing function's set of row-generic parameter
-/// binders. A row-generic Access receiver is left a bare `Var` (never cloned)
-/// so the borrowing witness getter still routes — see [`clone_free_target`].
-pub fn clone_targets_in_expr(
-    expr: Expr,
-    targets: &std::collections::BTreeSet<Symbol>,
-    row_binders: &std::collections::BTreeSet<Symbol>,
-) -> Expr {
-    targets
-        .iter()
-        .fold(expr, |e, &t| clone_free_target(e, t, row_binders))
+/// never re-matched by a later target's pass). Borrowing positions are left
+/// untouched — see [`clone_free_target`].
+pub fn clone_targets_in_expr(expr: Expr, targets: &std::collections::BTreeSet<Symbol>) -> Expr {
+    targets.iter().fold(expr, |e, &t| clone_free_target(e, t))
 }
 
 /// Does `sym` — a function-typed binder — appear anywhere in `body` in a

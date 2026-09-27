@@ -58,9 +58,16 @@ validated primary-key column used by the by-key operations. `frozenTable` and
 `frozenColumns` hold the table name and columns as first constructed (the
 source for the never-drifting create entry — neither is edited by a rename).
 `table` and `currentColumns` track the current-schema view after any renames
-(the identifiers CRUD targets). `ops` is the ordered schema-op log folded by
-`migrations`, threaded from `frozenTable` so each rename entry names the table
-as of its own position. `indexes` is the ordered list of declarative index
+(the identifiers CRUD targets); `currentColumns` stays positionally parallel to
+`frozenColumns`, so a column's identity is its position and its current name
+is the `currentColumns` entry at that position. `specs`, `pk`, and each index
+column are declared names (recorded on the `Draft`, before any rename): the
+DDL reads them as-is against the frozen columns, and every DML path reads
+them through that one declared → current mapping. A rename re-keys `codec` itself,
+so its binds and decoded reads name the current columns while the record it
+reads and writes keeps its declared fields. `ops` is the ordered schema-op
+log folded by `migrations`, threaded from `frozenTable` so each rename entry
+names the table as of its own position. `indexes` is the ordered list of declarative index
 specs emitted after the create entry by `create` / `migrations`.
 
 ## `Column`
@@ -487,6 +494,11 @@ with no DDL produced. This is the one place a Store builds SQL text for the
 create entry; it builds only from validated identifiers and holds no values,
 so there is nothing to inject.
 
+The DDL is the store's FROZEN schema — the table name, columns, and specs as
+first constructed — and is exactly the create entry `migrations` emits first.
+A rename never edits it (the renames are later ledger entries), so the table
+name, the columns, and the specs it names always belong to one schema.
+
 ## `readText`
 
 ```ipe
@@ -757,9 +769,10 @@ findBy : Db -> Store a -> String -> SqlValue -> Task Error (List a)
 ```
 
 `findBy conn store col value` — read every row whose `col` equals `value`,
-decoded through the store's codec. `col` is validated against the store's own
-derived column list before any SQL is built (a name absent from the codec's
-columns is a typed `Err`, parse-don't-validate), then reaches SQL only through
+decoded through the store's codec. `col` is the column's declared name (the
+record field it decodes into, unchanged by `renameColumn`); it is resolved to
+the store's current column before any SQL is built (a name the store does not
+declare is a typed `Err`, parse-don't-validate), then reaches SQL only through
 `Sql.column`; `value` binds as a parameter through `Sql.param`. This is the
 convenience single-column equality read; a compound predicate uses the query
 builder (`query |> where …`) or the raw-fragment escape `findWhere`.
@@ -785,15 +798,35 @@ renameColumn : String -> String -> Store a -> Store a
 ```
 
 `renameColumn from to store` — record a column rename in the store's
-schema-op log and update the current-column view so subsequent
-`insert` / `get` / `all` target `to`. The frozen create columns are
-unchanged; the rename appears as a separate ledger entry when `migrations`
-is called.
+schema-op log and move the store's current schema onto `to`. The rename is
+ONE mapping applied to the whole store: the current-column view and the codec
+(so every write bind and every decoded read) name `to`, and the declared-name
+facts — each `ColumnSpec`, the primary key, each index column — resolve
+through the same column identity, so a `DefaultNow` /
+`TouchOnUpdate` / `Serial` column stays DB-filled and a by-key operation keys
+on the renamed column. The frozen create columns are unchanged; the rename
+appears as a separate ledger entry when `migrations` is called.
+
+A column keeps its identity (its position in the frozen column list) across
+renames, so the declared names the `Draft` builders recorded never drift from
+the current schema. Rows stay in the codec's declared field names: a codec
+store decodes into the same record, and a raw-column store reads and writes a
+`Row` keyed by its declared column names.
+
+Queries name columns the same way: every query-layer name — a `Cond` accessor
+(`eq .name …`), `orderAsc` / `orderDesc`, `findBy`, a join key, a join filter
+or sort column, a `select` projection, and every policy column — is the
+DECLARED name, resolved through the same mapping to the current column the
+emitted SQL names. A current name that is not also a declared one is not a
+query name: it is refused with a typed unknown-column `Err`, exactly as a name
+the store never had.
 
 This function is a total constructor: `from` and `to` are admitted into the
 op log unconditionally. Identifier validation happens once, in `migrations`,
 which is the only point SQL text is built — an invalid name therefore
-surfaces as `Err` there, not here.
+surfaces as `Err` there, not here. A rename whose `from` is not a current
+column, or whose `to` already names one, leaves the current schema unchanged
+and is refused by `migrations`, so a store carrying it cannot be migrated.
 
 Example:
 
@@ -882,7 +915,9 @@ This is the single point where rename DDL text is assembled. Every identifier
 that will appear in SQL — the table name and each rename's `from`/`to` — is
 checked through `validSqlIdent` before it reaches the string. The first
 failing identifier returns `Err` and produces no SQL. A no-op rename
-(`from == to`) is also rejected with `noopRenameError`.
+(`from == to`) is also rejected with `noopRenameError`, and a column rename
+whose `from` is not a column at that point of the log, or whose `to` already
+names one, is rejected too (it would target a missing column or merge two).
 
 For a store with no rename ops, `migrations` yields exactly the frozen create
 entry — identical to calling `Store.create`, which routes through here.
@@ -1463,9 +1498,11 @@ joinNamed : Store a -> String -> Store b -> String -> Joined a b
 ```
 
 The lowered form of `join`: each accessor `.field` has already been turned
-into its validated, snake_cased column name (`keyA` / `keyB`). Builds the
-`Joined` with the key-equality WHERE fragment `a0.keyA = a1.keyB` — both sides
-reach SQL only through `Sql.column` on the aliased reference. If either key is
+into its validated, snake_cased declared column name (`keyA` / `keyB`). Each
+key resolves to its side's current column (a key the side does not declare
+poisons the join with a typed `Err`), and the `Joined` carries the
+key-equality WHERE fragment `a0.keyA = a1.keyB` — both sides reach SQL only
+through `Sql.column` on the aliased reference. If either key is
 somehow not a valid dotted identifier the fragment poisons itself (the
 `Sql.column` gate), which the runners surface as a typed `Err`; no value is
 interpolated.
@@ -1668,7 +1705,9 @@ selectNamed : Joined a b -> List ProjectionTerm -> List SqlValue -> Select row
 The lowered form of `select`: the lambda has already been read into the
 ordered `ProjectionTerm` list. Each term is one typed SELECT descriptor:
 `ColumnTerm alias col`, `LiteralTerm`, `UpperTerm dotted`, `LowerTerm dotted`,
-or `CoalesceTerm operandA operandB`. Literal-position `SqlValue` binds appear
+or `CoalesceTerm operandA operandB`; every column it names is a declared
+column, resolved here to its side's current column (an unresolvable one
+poisons the `Select`). Literal-position `SqlValue` binds appear
 in `extraBinds` in left→right, coalesce-left-before-right order, ahead of the
 WHERE binds. Builds the `Select` from the join's tables, alias-bound `FROM …
 WHERE` fragment, and any inherited `poison`. Reached only through the

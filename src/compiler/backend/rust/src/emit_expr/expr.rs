@@ -8,8 +8,8 @@ use super::{
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template, emit_update,
     expr_value_is_non_clone, float_literal, free_vars, indent_of, ir_type_is_definitely_copy,
-    kernel_swaps_first_two, op_str, render_type, rust_string_literal, scan_free_target,
-    substitute_var,
+    op_str, render_type, rust_string_literal, scan_free_target, substitute_var,
+    swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
 
@@ -525,59 +525,15 @@ pub fn emit_expr_at(
             } else {
                 pin_turbofish
             };
-            // `Task.andThen cont effect` renders (after the `swaps_first_two`
-            // reverse below) as `task_and_then(effect, cont)`. Rust evaluates the
-            // args left-to-right, so `effect` runs BEFORE `cont`'s closure is
-            // built. A non-Copy handle that `effect` MOVES (e.g. an
-            // `IpeCacheHandle` passed by value into `Cache.put cache …`) is gone
-            // by the time `cont` tries to capture the same binding — the
-            // `let h = h.clone()` the lowerer inserts for `cont`'s capture then
-            // borrows a moved value (E0382). Clone every var `cont` captures at
-            // its `effect` use site so the original survives into the closure —
-            // the same IR-level `clone_targets_in_expr` rewrite the `TaskSeq` arm
-            // applies to its auto-forced continuation. `effect` (args[1] in Ipê
-            // order) is the only arg rewritten; a no-op when `cont` captures none
-            // of `effect`'s vars, so non-reusing chains stay byte-identical.
-            let rewritten_effect: Option<Expr> =
-                if matches!(callee, Callee::Kernel(KernelFn::TaskAndThen))
-                    && let [cont, effect] = args.as_slice()
-                {
-                    // Only `effect`'s own free vars can be rewritten, and only if
-                    // `cont` also captures them. Collect `effect`'s vars first (it
-                    // is the small head task); when it has none there is nothing to
-                    // clone, so the whole-continuation `free_vars(cont)` walk is
-                    // skipped. Otherwise the rewrite targets are exactly the shared
-                    // vars — folding over that subset instead of all of `cont`'s
-                    // captures is a proven no-op difference (a target absent from
-                    // `effect` never matches), so the emitted bytes are identical.
-                    let effect_vars = free_vars(effect);
-                    let targets: std::collections::BTreeSet<Symbol> = if effect_vars.is_empty() {
-                        std::collections::BTreeSet::new()
-                    } else {
-                        free_vars(cont)
-                            .intersection(&effect_vars)
-                            .copied()
-                            .collect()
-                    };
-                    if targets.is_empty() {
-                        None
-                    } else {
-                        let row_binders: std::collections::BTreeSet<Symbol> =
-                            generics.row_binders().iter().copied().collect();
-                        Some(clone_targets_in_expr(
-                            effect.clone(),
-                            &targets,
-                            &row_binders,
-                        ))
-                    }
-                } else {
-                    None
-                };
+            // A container-first kernel renders its container before the
+            // function closure; clone the function's captures at their container
+            // use sites so the closure's capture never reads a moved value.
+            let rewritten_container = swapped_container_clone_rewrite(callee, args);
             let mut parts = Vec::with_capacity(args.len());
             for (i, arg) in args.iter().enumerate() {
-                // For a `Task.andThen`, substitute the clone-rewritten effect (the
-                // second Ipê arg) so its shared-handle reads clone rather than move.
-                let arg: &Expr = match (&rewritten_effect, i) {
+                // Substitute the clone-rewritten container (the second Ipê arg)
+                // so its reads of the function's captures clone rather than move.
+                let arg: &Expr = match (&rewritten_container, i) {
                     (Some(rw), 1) => rw,
                     _ => arg,
                 };
@@ -635,7 +591,7 @@ pub fn emit_expr_at(
             // the function first (`Maybe.map f m`). The lowerer keeps the Ipê
             // order; re-point the two arguments here so the runtime call is
             // well-formed.
-            if matches!(callee, Callee::Kernel(k) if kernel_swaps_first_two(*k)) {
+            if callee.evaluates_args_reversed() {
                 parts.reverse();
             }
             Ok(format!("{name}{turbofish}({})", parts.join(", ")))
@@ -789,9 +745,7 @@ pub fn emit_expr_at(
             let effect_s = if targets.is_empty() {
                 emit_expr_at(ctx, effect, indent, child, generics)?
             } else {
-                let row_binders: std::collections::BTreeSet<Symbol> =
-                    generics.row_binders().iter().copied().collect();
-                let effect_rw = clone_targets_in_expr((**effect).clone(), &targets, &row_binders);
+                let effect_rw = clone_targets_in_expr((**effect).clone(), &targets);
                 emit_expr_at(ctx, &effect_rw, indent, child, generics)?
             };
             let rest_s = emit_expr_at(ctx, rest, indent, child, generics)?;

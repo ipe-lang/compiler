@@ -554,6 +554,15 @@ fn emit_web_app_inner(
     )
 }
 
+/// `code` preceded by the capture-clone `prologue` in its own block, or `code` alone when there is none.
+fn with_capture_clones(prologue: &str, code: &str) -> String {
+    if prologue.is_empty() {
+        code.to_owned()
+    } else {
+        format!("{{ {prologue}{code} }}")
+    }
+}
+
 /// Emit the routed (`Model` has a `page` field) `WebApp` leaf. Routing (routes
 /// table + `notFound` + generated `set_page`) is forwarded to the runtime entry.
 ///
@@ -563,8 +572,8 @@ fn emit_web_app_inner(
 /// `Server.mountApp` to nest under a prefix on the shared port — the routed
 /// counterpart of the single-page `Mountable` handle. The router builder needs
 /// its own copies of the four callbacks + the route table + `set_page`, so those
-/// are emitted a SECOND time (each yields a fresh named `fn` item / pure closure
-/// / by-value list, so re-emitting is a fresh value, not a move).
+/// are emitted a SECOND time; the `serve` half captures clones of the cfg's free
+/// locals, so the two copies never move the same binding.
 #[allow(clippy::too_many_arguments)] // threads the pre-emitted callback strings + their source exprs + the solved model/page types
 fn emit_routed_web_leaf(
     ctx: &EmitCtx,
@@ -625,9 +634,17 @@ fn emit_routed_web_leaf(
         let store_args = "::std::env::var(\"IPE_WEB_STORE\").unwrap_or_else(|_| \"memory\".to_string()), \
              ::std::env::var(\"IPE_WEB_STORE_PATH\").unwrap_or_else(|_| ::std::string::String::new()), \
              IPE_WEB_MODEL_SCHEMA_TAG";
-        let serve_call = format!(
-            "ipe_runtime::web::web_app_routed({init_s}, {update_s}, {view_s}, {subs_s}, \
-             {routes_s}, {not_found_s}, {set_page}, {store_args})"
+        // The serve task and the router builder each `move`-capture the cfg's
+        // free locals; the serve half takes shadowing clones so the router keeps
+        // the originals.
+        let serve_captures =
+            crate::emit_expr::capture_clone_prologue(ctx, fields.iter().map(|(_, e)| e))?;
+        let serve_call = with_capture_clones(
+            &serve_captures,
+            &format!(
+                "ipe_runtime::web::web_app_routed({init_s}, {update_s}, {view_s}, {subs_s}, \
+                 {routes_s}, {not_found_s}, {set_page}, {store_args})"
+            ),
         );
         let router_call = format!(
             "ipe_runtime::web::web_embed_router_routed({init_s2}, {update_s2}, {view_s2}, \
@@ -663,8 +680,8 @@ fn emit_routed_web_leaf(
 ///
 /// The store kind/path come from env at call time so one binary can switch
 /// stores without recompilation. For `Web.embed` the four callbacks are emitted
-/// a SECOND time for the router builder — each `emit_web_fn` yields a named `fn`
-/// item / pure closure, so re-emitting is a fresh reference, not a move.
+/// a SECOND time for the router builder; the `serve` half captures clones of the
+/// callbacks' free locals, so the two copies never move the same binding.
 #[allow(clippy::too_many_arguments)] // threads the already-emitted callback strings + their source exprs
 fn emit_single_page_web_leaf(
     ctx: &EmitCtx,
@@ -703,10 +720,16 @@ fn emit_single_page_web_leaf(
         let router_call = format!(
             "ipe_runtime::web::web_embed_router({init_s2}, {update_s2}, {view_s2}, {subs_s2}, {store_args})"
         );
+        // The serve task and the router builder each `move`-capture the cfg's
+        // free locals; the serve half takes shadowing clones so the router keeps
+        // the originals.
+        let serve_captures =
+            crate::emit_expr::capture_clone_prologue(ctx, [init_e, update_e, view_e, subs_e])?;
         return Ok(Some(format!(
             "{{ {register}{tag_const} {msg_set_item}\
              ipe_runtime::tea::WebApp(ipe_runtime::tea::WebAppKind::Mountable {{ \
-             serve: {serve_call}, router: {router_call} }}) }}"
+             serve: {serve_call}, router: {router_call} }}) }}",
+            serve_call = with_capture_clones(&serve_captures, &serve_call),
         )));
     }
     Ok(Some(format!(

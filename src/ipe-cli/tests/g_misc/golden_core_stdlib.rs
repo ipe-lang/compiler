@@ -11,7 +11,7 @@
 //!
 //! * `Result.andThen` / `Result.mapError` reuse the container-first runtime
 //!   (`ipe_result_and_then(r, f)` / new `ipe_result_map_error(r, f)`); the
-//!   emitter reverses the Ipê `(fn, result)` order via `kernel_swaps_first_two`
+//!   emitter reverses the Ipê `(fn, result)` order via `StdlibKernel::swaps_first_two`
 //!   (verified here — a wrong arg order would short-circuit the WRONG channel).
 //! * `String.{containsIn,startsWithIn,endsWithIn}` are haystack-first
 //!   companions; their new runtime wrappers take Ipê order directly (NO swap).

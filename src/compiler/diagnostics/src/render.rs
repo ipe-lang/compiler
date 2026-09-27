@@ -32,9 +32,9 @@ use core::fmt::Write as _;
 use crate::code::{ISSUE_TRACKER_URL, Severity, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, HeaderDefect, HelpLine, Hint, IfDefect,
-    LetDefect, LowerError, NameError, ParseError, SandboxError, SealRejection, SpanRole,
-    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
+    Hint, IfDefect, LetDefect, LowerError, NameError, ParseError, SandboxError, SealRejection,
+    SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
     TypeDeclDefect, TypeError,
 };
 use crate::span::Span;
@@ -574,6 +574,28 @@ fn name_prose(msg: &NameError) -> String {
             "This is a script — its `main` is a plain `Task`, so it renders nothing — but it \
              imports `{shape_ui_module}`, the {shape} view. A script has no `view`, so that UI \
              never reaches the screen."
+        ),
+        NameError::GenericAppEntry {
+            entry,
+            type_var,
+            reach: GenericAppEntryReach::Mentioned,
+        } => format!(
+            "`{entry}` is built here with `{type_var}` still a type variable, but a running app \
+             needs one concrete model and message type."
+        ),
+        NameError::GenericAppEntry {
+            entry,
+            type_var,
+            reach: GenericAppEntryReach::Undetermined,
+        } => format!(
+            "`{entry}` is refused here: the generic `{type_var}` is in scope and whether the \
+             app's model or message reaches it cannot be determined, but a running app needs \
+             one concrete model and message type."
+        ),
+        NameError::UnpinnedAppEntry { entry } => format!(
+            "`{entry}` is built here, but nothing in the program fixes its model or message to \
+             a concrete type — e.g. `update` ignores its message and no view emits one — and a \
+             running app needs one concrete model and message type."
         ),
         NameError::Unknown => "Something is off with a name in this code.".to_string(),
     }
@@ -1622,6 +1644,15 @@ fn name_label(msg: &NameError) -> Option<String> {
         NameError::ScriptImportsShapeView { shape, entry, .. } => Some(format!(
             "this script has no `view`; did you mean `main = {entry} {{ … }}` to run a {shape} app?"
         )),
+        NameError::GenericAppEntry { type_var, .. } => Some(format!(
+            "fix `{type_var}` to your concrete type (e.g. `Msg`) in this definition's annotation, \
+             or build the app where the model and message types are known"
+        )),
+        NameError::UnpinnedAppEntry { .. } => Some(
+            "annotate the app's functions with your concrete types, e.g. \
+             `update : Msg -> Model -> ( Model, Cmd Msg )`"
+                .to_string(),
+        ),
         NameError::RustNameFold { .. } | NameError::Unknown => None,
     }
 }

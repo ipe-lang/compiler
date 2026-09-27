@@ -1,0 +1,75 @@
+module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+import Ipe.Ui as Ui exposing (Element)
+import Lib
+
+
+-- Uses each of `Lib`'s unannotated values at two instantiations, so each
+-- generalizes and lowers to a generic Rust function.
+
+
+type Msg
+    = Toggled Bool
+
+
+type Other
+    = Flipped Bool
+
+
+ints : Decoder (List Int)
+ints =
+    Lib.emptyList
+
+
+names : Decoder (List String)
+names =
+    Lib.emptyList
+
+
+intsLine : String
+intsLine =
+    case Decode.decodeString ints "null" of
+        Ok _ ->
+            "ints:ok"
+
+        Err e ->
+            String.concat [ "ints:", Error.toString e ]
+
+
+namesLine : String
+namesLine =
+    case Decode.decodeString names "null" of
+        Ok _ ->
+            "names:ok"
+
+        Err e ->
+            String.concat [ "names:", Error.toString e ]
+
+
+toggled : Element Msg
+toggled =
+    Lib.checkboxOf Toggled True
+
+
+flipped : Element Other
+flipped =
+    Lib.checkboxOf Flipped False
+
+
+boxesLine : String
+boxesLine =
+    String.concat
+        [ Html.render (Ui.layout [] toggled)
+        , Html.render (Ui.layout [] flipped)
+        ]
+
+
+main : Task Error ()
+main =
+    Io.println (String.join "\n" [ intsLine, namesLine, boxesLine ])

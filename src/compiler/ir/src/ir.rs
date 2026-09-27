@@ -3024,6 +3024,17 @@ pub enum Callee {
     },
 }
 
+impl Callee {
+    /// Whether a call to this callee evaluates its arguments in the REVERSE of
+    /// their IR order — a kernel whose runtime function takes them reversed
+    /// ([`ipe_kernels::StdlibKernel::swaps_first_two`]). Analyses that depend on
+    /// evaluation order visit a call's arguments reversed exactly when this holds.
+    #[must_use]
+    pub const fn evaluates_args_reversed(&self) -> bool {
+        matches!(self, Self::Kernel(k) if k.swaps_first_two())
+    }
+}
+
 /// A per-call-site turbofish pin for a polymorphic kernel.
 ///
 /// Set when the HM solver left the kernel's free result type parameter

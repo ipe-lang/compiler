@@ -1,0 +1,103 @@
+module Main exposing (main)
+
+-- SEAL repro: helpers generic over `a` that carry it under a `Cmd` / `Sub` only
+-- inside their body. Each signature shows `a` bare or under a function type,
+-- never under `Cmd` / `Sub`, yet the runtime's `cmd_map` / `cmd_perform` /
+-- `sub_map` bound the carried type `Send + 'static`:
+--
+--   * `subMapped`    — `Sub.map k (Sub.every 1000 x)`;
+--   * `cmdMapped`    — `Cmd.map k (Cmd.perform (Task.succeed x) …)`;
+--   * `subDiscarded` — a `Sub a` bound by `let` and never used;
+--   * `cmdDiscarded` — a `Cmd.map` over `Cmd a` bound by `let` and never used.
+--
+-- Every helper's `a` must carry `Send + 'static`, or the emitted crate fails
+-- `cargo build` with E0277 after ipe accepts it. `Cli.tea` renders `view` once
+-- at stdin EOF and exits 0.
+
+import Ipe.Tea.Cli as Cli
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+import Ipe.Tea.Terminal.Cmd as Cmd
+import Ipe.Tea.Terminal.Sub as Sub
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+type Msg
+    = Ticked Int
+    | GotLine String
+
+
+type alias Model =
+    { lines : Int }
+
+
+subMapped : a -> (a -> m) -> Sub m
+subMapped x k =
+    Sub.map k (Sub.every 1000 x)
+
+
+cmdMapped : a -> (a -> m) -> Cmd m
+cmdMapped x k =
+    Cmd.map k (Cmd.perform (Task.succeed x) (\_result -> x))
+
+
+subDiscarded : a -> Int
+subDiscarded x =
+    let
+        _sub =
+            Sub.every 1000 x
+    in
+    0
+
+
+cmdDiscarded : a -> (a -> m) -> Int
+cmdDiscarded x k =
+    let
+        _cmd =
+            Cmd.map k (Cmd.perform (Task.succeed x) (\_result -> x))
+    in
+    0
+
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { lines = 0 }, cmdMapped 1 Ticked )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Ticked _n ->
+            ( model, Cmd.none )
+
+        GotLine _line ->
+            ( { model | lines = model.lines + 1 }, Cmd.none )
+
+
+view : Model -> Lines Msg
+view model =
+    Ui.text
+        (String.fromInt
+            (model.lines + subDiscarded "x" + cmdDiscarded 3 Ticked)
+        )
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    subMapped 2 Ticked
+
+
+onLine : String -> Msg
+onLine line =
+    GotLine line
+
+
+main =
+    Cli.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , onLine = onLine
+        }

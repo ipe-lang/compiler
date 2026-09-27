@@ -1,0 +1,21 @@
+raw-insert-omits-defaultNow:ok label=hello
+raw-update-omits-touchOnUpdate:ok label=bye
+raw-findBy-declared-name:1
+codec-get-renamed-pk:p1=Grace
+codec-insertReturning:p2=Hopper
+codec-findBy-declared-name:p1
+query-cond-declared-name:p1
+query-order-declared-name:p2,p1
+query-order-current-name:refused
+findBy-current-name:refused
+join-filter-declared-names:p1=Grace/cat
+join-order-declared-names:p2=Hopper/dog,p1=Grace/cat
+select-declared-names:GRACE/cat/cat
+createSql-frozen:CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)
+createSql-equals-create-entry:ok
+create_users: CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT)
+rename_column_users_name_to_full_name: ALTER TABLE users RENAME COLUMN name TO full_name
+rename_table_users_to_accounts: ALTER TABLE users RENAME TO accounts
+create_index_idx_users_name: CREATE INDEX IF NOT EXISTS idx_users_name ON accounts (full_name)
+rename-unknown-column:refused columns=id,name
+rename-onto-existing-column:refused columns=id,name

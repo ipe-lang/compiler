@@ -630,6 +630,100 @@ pub enum RowTailShape {
     Open(u8),
 }
 
+/// Whether scheme variable `var` occurs in `shape` at a position that aligns positionally with a solved type.
+///
+/// An arrow side, a constructor argument, and a tuple element align by
+/// position; a record field is keyed by an interned symbol this leaf crate
+/// cannot name, so an occurrence only under a record does not count.
+#[must_use]
+pub const fn shape_aligns_var(shape: &TyShape, var: u8) -> bool {
+    match shape {
+        TyShape::Var(v) => *v == var,
+        TyShape::Fun(arg, res) => shape_aligns_var(arg, var) || shape_aligns_var(res, var),
+        TyShape::Con(_, items) | TyShape::Tuple(items) => {
+            let mut rest: &[TyShape] = items;
+            while let Some((item, tail)) = rest.split_first() {
+                if shape_aligns_var(item, var) {
+                    return true;
+                }
+                rest = tail;
+            }
+            false
+        }
+        TyShape::Record { .. } | TyShape::Unit => false,
+    }
+}
+
+/// Whether every [`StdlibKernel::sync_obliged_scheme_vars`] entry of `kernels` aligns in its scheme.
+///
+/// A kernel listing a variable must carry a [`StdlibKernel::scheme_shape`] in
+/// which [`shape_aligns_var`] finds that variable; otherwise the lowerer cannot
+/// read the variable's instantiation at a call site.
+#[must_use]
+pub const fn sync_obliged_scheme_vars_are_aligned(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        let mut vars = kernel.sync_obliged_scheme_vars();
+        if !vars.is_empty() {
+            let Some(shape) = kernel.scheme_shape() else {
+                return false;
+            };
+            while let Some((var, more)) = vars.split_first() {
+                if !shape_aligns_var(shape, *var) {
+                    return false;
+                }
+                vars = more;
+            }
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `sync_obliged_scheme_vars` entry has no aligned occurrence in its kernel's scheme, the capture-`Sync` SEAL invariant [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    sync_obliged_scheme_vars_are_aligned(StdlibKernel::ALL),
+    "a kernel's sync_obliged_scheme_vars names a variable its scheme_shape does not carry at an aligned position",
+);
+
+/// Whether `shape`'s final result, past every arrow, is an app carrier (a `Program` or the opaque `WebApp` leaf).
+#[must_use]
+pub const fn shape_yields_app(shape: &TyShape) -> bool {
+    match shape {
+        TyShape::Fun(_, res) => shape_yields_app(res),
+        TyShape::Con(tag, _) => matches!(tag, BuiltinTag::Program | BuiltinTag::WebApp),
+        TyShape::Var(_) | TyShape::Tuple(_) | TyShape::Record { .. } | TyShape::Unit => false,
+    }
+}
+
+/// Whether [`StdlibKernel::is_app_entry`] holds for exactly the schemed kernels of `kernels` that yield an app carrier.
+///
+/// A new kernel whose scheme builds a program is thereby an app entry, so it
+/// reaches the lowerer's concrete-`Model` / `Msg` gate; a kernel listed as an
+/// app entry whose scheme builds no program is stale. An unschemed kernel has
+/// no result to compare and is not constrained.
+#[must_use]
+pub const fn app_entries_match_their_schemes(kernels: &[StdlibKernel]) -> bool {
+    let mut rest = kernels;
+    while let Some((kernel, tail)) = rest.split_first() {
+        if let Some(shape) = kernel.scheme_shape()
+            && shape_yields_app(shape) != kernel.is_app_entry()
+        {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a kernel building a program is not registered as an app entry (so it would skip the concrete Model/Msg gate), the app-entry SEAL invariant [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    app_entries_match_their_schemes(StdlibKernel::ALL),
+    "a kernel whose scheme yields a Program / WebApp carrier must be StdlibKernel::is_app_entry, and only those",
+);
+
 /// A record field name, named structurally by tag rather than by an interned
 /// [`ipe_intern::Symbol`].
 ///
@@ -10695,6 +10789,62 @@ impl StdlibKernel {
         Self::ACCESSOR_INTERCEPT_PLACEHOLDERS.contains(&self)
     }
 
+    /// The argument positions whose value this kernel moves into a `Send + Sync` box.
+    ///
+    /// The single source of truth for the capture-`Sync` obligation: the
+    /// kernel's emitted Rust moves each listed argument into a thread-shared
+    /// carrier (`Box<dyn Fn() -> A + Send + Sync>` / an `Arc<dyn Fn + Send +
+    /// Sync>` handler), so every type variable that reaches the argument's
+    /// instantiated type bare must itself be `Send + Sync`. The lowerer reads the
+    /// argument type off the call site's solved kernel instantiation, so the
+    /// obligation holds wherever the kernel is referenced — tail or not, bound to
+    /// a parameter or to any local.
+    ///
+    /// * `succeed` (`Json.Decode` / `Config` / `Db.Decode`) — arg 0, the value
+    ///   `decode_succeed`'s factory captures.
+    /// * the optional-field decoders (`JsonDecP.optional` /
+    ///   `Db.Decode.optional`) — arg 2, the captured default.
+    /// * `onSubmit` (`Ui` / `Event`) — arg 0, a fixed message value dispatched
+    ///   from a thread-shared handler (a function-typed handler never reaches a
+    ///   type variable bare, so the decoder form obliges nothing).
+    #[must_use]
+    pub const fn sync_captured_args(self) -> &'static [usize] {
+        match self {
+            Self::JsonDecSucceed
+            | Self::ConfigSucceed
+            | Self::DbDecSucceed
+            | Self::UiOnSubmit
+            | Self::HtmlOnSubmit => &[0],
+            Self::JsonDecPOptional | Self::DbDecOptional => &[2],
+            _ => &[],
+        }
+    }
+
+    /// The scheme variables ([`TyShape::Var`] indices) this kernel's runtime call bounds `Sync`.
+    ///
+    /// The sibling of [`Self::sync_captured_args`] for a `Sync` bound no argument
+    /// exposes bare: the runtime function puts `Sync` on a type parameter the Ipê
+    /// scheme spells only as a constructor argument (the `msg` of `Element msg`),
+    /// so the obligation is keyed on the scheme variable. The lowerer reads the
+    /// variable's instantiation off the call site's solved kernel type, and every
+    /// generic reaching that instantiation bare becomes `Send + Sync`.
+    ///
+    /// * `Input.checkbox` / `Input.radio` / `Input.radioRow` — var 0, the `msg`
+    ///   bound `M: Clone + Send + Sync` by `input_checkbox_` / `input_radio_` /
+    ///   `input_radio_row_`.
+    ///
+    /// Every listed variable occurs in the kernel's [`Self::scheme_shape`] at a
+    /// position the lowerer aligns (an arrow, constructor-argument, or tuple
+    /// slot — not only under a record field); the build asserts it
+    /// ([`sync_obliged_scheme_vars_are_aligned`]).
+    #[must_use]
+    pub const fn sync_obliged_scheme_vars(self) -> &'static [u8] {
+        match self {
+            Self::InputCheckbox | Self::InputRadio | Self::InputRadioRow => &[0],
+            _ => &[],
+        }
+    }
+
     /// The conditionally-vendored runtime module this kernel's emitted symbol
     /// needs, when that module is NOT already pulled in by the kernel's emit
     /// [`KernelClass`]. `None` for the common case (symbol lives in the module
@@ -13309,6 +13459,57 @@ impl StdlibKernel {
     #[must_use]
     pub const fn is_worker(self) -> bool {
         matches!(self, Self::TeaWorker)
+    }
+
+    /// `true` when the runtime function takes this kernel's arguments in the
+    /// REVERSE of the Ipê call order, so the emitted call evaluates them
+    /// last-to-first.
+    ///
+    /// The `Maybe` / `Result` / decoder / `Task` mapping combinators are
+    /// container-first in the runtime (`ipe_maybe_map(m, f)`,
+    /// `task_and_then(task, f)`) but function-first in Ipê (`Maybe.map f m`).
+    /// The backend reverses the rendered argument list for these kernels, and
+    /// every lowering analysis that orders uses (the last-use clone rewrite, the
+    /// fn-value move walk) visits the arguments in that same reversed order, so
+    /// the container's reads come before the function's captures in both.
+    #[must_use]
+    pub const fn swaps_first_two(self) -> bool {
+        matches!(
+            self,
+            Self::MaybeMap
+                | Self::MaybeAndThen
+                | Self::ResultMap
+                | Self::ResultAndThen
+                | Self::ResultMapError
+                // `JsonDec.andThen` / `Config.andThen` / `Db.Decode.andThen`
+                // share the runtime `decode_and_then(decoder, f)`.
+                | Self::JsonDecAndThen
+                | Self::ConfigAndThen
+                | Self::DbDecAndThen
+                | Self::TaskAndThen
+        )
+    }
+
+    /// `true` when this variant is an app entry: it takes an app cfg record and builds a program.
+    ///
+    /// Every app entry's runtime function bounds the cfg's `Model` / `Msg` with
+    /// traits a generic type parameter does not carry (`IpeStringify`,
+    /// `Serialize`, `Sync`, …), so the lowerer refuses an entry reference whose
+    /// solved type still mentions a generic of the enclosing definition. The
+    /// build asserts this set equals the schemed kernels yielding an app carrier
+    /// ([`app_entries_match_their_schemes`]).
+    #[must_use]
+    pub const fn is_app_entry(self) -> bool {
+        matches!(
+            self,
+            Self::WebApp
+                | Self::WebEmbed
+                | Self::WebAppRouted
+                | Self::WebAppWith
+                | Self::TerminalAppScreen
+                | Self::TerminalAppLines
+                | Self::TeaWorker
+        )
     }
 
     /// `true` when this variant belongs to the `Ipe.CssSafety` leaf

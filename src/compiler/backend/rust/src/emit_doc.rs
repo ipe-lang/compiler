@@ -58,8 +58,8 @@ use crate::doc::{ChainOperand, Doc};
 use crate::emit_expr::{
     call_has_kernel_special_case, callee_name, clone_targets_in_expr, combine_guards,
     emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, expr_value_is_non_clone,
-    free_vars, kernel_swaps_first_two, record_struct_name, scan_free_target, substitute_var,
-    wants_arc_ctor,
+    free_vars, record_struct_name, scan_free_target, substitute_var,
+    swapped_container_clone_rewrite, wants_arc_ctor,
 };
 use crate::emit_types::{GenericScope, render_type};
 
@@ -1011,7 +1011,7 @@ fn build_cons(
 /// then the pin's turbofish (with the `Ipe.Csv` parse `::<IpeError>` override the
 /// string emitter applies), then a delimited argument list — with the two
 /// arguments pre-swapped for the container-first `Maybe`/`Result`/… kernels that
-/// [`crate::emit_expr::kernel_swaps_first_two`] flags, exactly as the string
+/// [`ipe_ir::Callee::evaluates_args_reversed`] flags, exactly as the string
 /// emitter reverses `parts` before joining.
 fn build_generic_call(
     ctx: &EmitCtx,
@@ -1039,42 +1039,21 @@ fn build_generic_call(
     } else {
         pin_turbofish
     };
-    // `Task.andThen cont effect` renders (after the swap-reverse below) as
-    // `task_and_then(effect, cont)`. Rust evaluates the args left-to-right, so
-    // `effect` runs BEFORE `cont`'s closure is built; a non-Copy handle that
-    // `effect` MOVES (an `IpeCacheHandle` passed by value into `Cache.put cache …`)
-    // is gone by the time `cont` captures the same binding, and the `let h =
-    // h.clone()` the lowerer inserts for `cont`'s capture then borrows a moved
-    // value (E0382). Clone every var `cont` captures at its `effect` use site so
-    // the original survives into the closure — the same rewrite `build_task_seq`
-    // applies to its auto-forced continuation. A no-op when `cont` captures none
-    // of `effect`'s vars, so non-reusing chains stay byte-identical.
-    let swapped_effect: Option<Expr> = if matches!(callee, Callee::Kernel(KernelFn::TaskAndThen))
-        && let [cont, effect] = args
-    {
-        let cont_captures = free_vars(cont);
-        let row_binders: std::collections::BTreeSet<Symbol> =
-            generics.row_binders().iter().copied().collect();
-        Some(clone_targets_in_expr(
-            effect.clone(),
-            &cont_captures,
-            &row_binders,
-        ))
-    } else {
-        None
-    };
-    let mut docs = match &swapped_effect {
-        Some(effect_rw) => {
-            let [cont, _] = args else {
+    // A container-first kernel renders its container before the function
+    // closure; clone the function's captures at their container use sites so the
+    // closure's capture never reads a moved value (the string emitter's rewrite).
+    let mut docs = match swapped_container_clone_rewrite(callee, args) {
+        Some(container_rw) => {
+            let [func, _] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::build_generic_call",
-                    detail: "Task.andThen effect-clone rewrite lost its two args".to_owned(),
+                    detail: "container clone rewrite lost its two args".to_owned(),
                 });
             };
             build_call_args_task_and_then(
                 ctx,
                 callee,
-                &[cont.clone(), effect_rw.clone()],
+                &[func.clone(), container_rw],
                 indent,
                 child,
                 generics,
@@ -1085,7 +1064,7 @@ fn build_generic_call(
     // Container-first kernels take their two arguments in the opposite order to
     // the Ipê call; the string emitter reverses the rendered `parts`, so the Doc
     // builder reverses the built arg docs to carry the identical token sequence.
-    if matches!(callee, Callee::Kernel(k) if kernel_swaps_first_two(*k)) {
+    if callee.evaluates_args_reversed() {
         docs.reverse();
     }
     Ok(delimited(
@@ -1507,9 +1486,7 @@ fn build_task_seq(
     generics: GenericScope,
 ) -> DResult<Doc> {
     let rest_captures = free_vars(rest);
-    let row_binders: std::collections::BTreeSet<Symbol> =
-        generics.row_binders().iter().copied().collect();
-    let effect_rw = clone_targets_in_expr(effect.clone(), &rest_captures, &row_binders);
+    let effect_rw = clone_targets_in_expr(effect.clone(), &rest_captures);
     let effect_doc = build_doc(ctx, &effect_rw, indent, child, generics)?;
     let rest_doc = build_doc(ctx, rest, indent, child, generics)?;
     // The continuation `Box::new(move |_| <brace-body>[rest])`: the closure body's
@@ -4261,14 +4238,13 @@ mod tests {
     /// `CloneVar` — the witness getter borrows, so the whole-row clone is
     /// spurious AND unroutable (the Access emitter routes `Var` alone). Rewriting
     /// it would emit a raw struct-field read on the opaque `R{n}` generic (E0609
-    /// — the exit-0-then-cargo-fail class this seal closes).
+    /// — the exit-0-then-cargo-fail class this seal closes). The same borrowing
+    /// receiver rule keeps a non-`Clone` record receiver bare (E0599).
     #[test]
     fn clone_capture_leaves_row_access_receiver_a_var() {
         let fx = fixture();
         let row = sym(&fx, 0); // `a` stands in for the row binder `rec`.
         let field = sym(&fx, 1); // `b` stands in for the read field `name`.
-        let row_binders: std::collections::BTreeSet<ipe_intern::Symbol> =
-            std::iter::once(row).collect();
         // `rec` is captured by the continuation, so it lands in the target set.
         let captures: std::collections::BTreeSet<ipe_intern::Symbol> =
             std::iter::once(row).collect();
@@ -4277,7 +4253,7 @@ mod tests {
             field,
             field_ty: IrType::Str,
         };
-        let rewritten = crate::emit_expr::clone_targets_in_expr(effect, &captures, &row_binders);
+        let rewritten = crate::emit_expr::clone_targets_in_expr(effect, &captures);
         match rewritten {
             Expr::Access { record, .. } => assert!(
                 matches!(*record, Expr::Var(s) if s == row),
@@ -4287,20 +4263,18 @@ mod tests {
         }
     }
 
-    /// A NON-row captured variable read in an effect is still cloned (the ordinary
-    /// left-to-right move hazard). The invariant only exempts row-generic Access
-    /// receivers; every other captured read keeps its `CloneVar` rewrite, so a
-    /// String/record moved into the effect is not double-moved by the continuation.
+    /// A captured variable read in a CONSUMING position of an effect is still
+    /// cloned (the ordinary left-to-right move hazard). Only borrowing positions
+    /// are exempt; a String/record moved into the effect is not double-moved by
+    /// the continuation.
     #[test]
     fn clone_capture_still_clones_non_row_var() {
         let fx = fixture();
         let plain = sym(&fx, 2); // `c`: a captured non-row value.
-        let row_binders: std::collections::BTreeSet<ipe_intern::Symbol> =
-            std::collections::BTreeSet::new();
         let captures: std::collections::BTreeSet<ipe_intern::Symbol> =
             std::iter::once(plain).collect();
         let effect = Expr::Var(plain);
-        let rewritten = crate::emit_expr::clone_targets_in_expr(effect, &captures, &row_binders);
+        let rewritten = crate::emit_expr::clone_targets_in_expr(effect, &captures);
         assert!(
             matches!(rewritten, Expr::CloneVar(s) if s == plain),
             "a captured non-row variable must be rewritten to CloneVar"

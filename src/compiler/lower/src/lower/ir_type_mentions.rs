@@ -147,18 +147,18 @@ pub(super) fn ir_type_mentions_server(ty: &IrType) -> bool {
     })
 }
 
-/// `true` when `ty` mentions the built-in `SqlValue` or `SqlField` nominal enum
-/// (each an `IrType::Enum` with empty home and the interned builtin name). A
-/// surviving emitted type can reference one in a field — e.g. `Ipe.Db.Store`'s
-/// query `Cond` carries a `SqlValue` — without any function constructing the
-/// value, so the synthetic-enum injection must follow type mentions as well as
-/// value construction, or the backend has no Rust name for the enum (ICE).
-/// Mirrors [`ir_type_mentions_server`] for the SQL value surface.
-pub(super) fn ir_type_mentions_sqlvalue(ty: &IrType, sqlvalue: Symbol, sqlfield: Symbol) -> bool {
+/// `true` when `ty` mentions one of the synthesized Prelude `enums`.
+///
+/// Each is an `IrType::Enum` with empty home and the interned builtin name
+/// (`SqlValue`, `SqlField`, `ProjectionTerm`, …). A surviving emitted type can
+/// reference one in a field — e.g. `Ipe.Db.Store`'s query `Cond` carries a
+/// `SqlValue` — without any function constructing the value, so the
+/// synthetic-enum injection must follow type mentions as well as value
+/// construction, or the backend has no Rust name for the enum (ICE). Mirrors
+/// [`ir_type_mentions_server`] for the SQL value surface.
+pub(super) fn ir_type_mentions_sqlvalue(ty: &IrType, enums: &[Symbol]) -> bool {
     ir_type_mentions(ty, &|t| match t {
-        IrType::Enum { home, name, .. } => {
-            home.0.is_empty() && (*name == sqlvalue || *name == sqlfield)
-        }
+        IrType::Enum { home, name, .. } => home.0.is_empty() && enums.contains(name),
         _ => false,
     })
 }

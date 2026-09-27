@@ -359,25 +359,12 @@ pub(crate) fn user_ipe_db_store_all<T1: 'static + Send + Sync + Clone>(
 ) -> IpeTask<Vec<T1>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match store {
-        IpeDbStoreStore::Store(r) => {
-            task_and_then(
-                db_find_where(conn.clone(), (r.clone()).table.clone(), crate::user_ipe_db_store_always_true()),
-                ({
-                    let r = r.clone();
-                    {
-                        let __ipe_fn: Box<
-                            dyn Fn(Vec<HashMap<String, String>>) -> IpeTask<Vec<T1>>
-                                + Send
-                                + Sync
-                                + 'static,
-                        > = Box::new(move |rows: Vec<HashMap<String, String>>| -> IpeTask<Vec<T1>> {
-                            crate::user_ipe_db_store_decode_rows((r.clone()).codec.clone(), rows)
-                        });
-                        __ipe_fn
-                    }
-                }),
-            )
-        }
+        IpeDbStoreStore::Store(r) => task_and_then(
+            db_find_where(conn.clone(), (r.clone()).table.clone(), crate::user_ipe_db_store_always_true()),
+            Box::new(move |rows: Vec<HashMap<String, String>>| -> IpeTask<Vec<T1>> {
+                crate::user_ipe_db_store_decode_rows((r.clone()).codec.clone(), rows)
+            }),
+        ),
     }
 }
 pub(crate) fn user_ipe_db_store_always_true() -> ipe_runtime::db::SqlFragment {

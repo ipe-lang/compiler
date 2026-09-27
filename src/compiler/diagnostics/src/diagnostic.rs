@@ -23,13 +23,13 @@ use crate::code::{
     IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027,
     IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035,
     IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044,
-    IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_P0001, IPE_P0002,
-    IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
-    IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
-    IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
-    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003,
-    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
-    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, Severity,
+    IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_P0001,
+    IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015,
+    IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040,
+    IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065,
+    IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002,
+    IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015,
+    IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, Severity,
 };
 use crate::span::Span;
 
@@ -771,6 +771,39 @@ pub enum NameError {
         shape: Box<str>,
         entry: Box<str>,
     },
+    /// An app entry (`Web.tea`, `Web.embed`, `Web.appWith`, `Tui.tea`,
+    /// `Cli.tea`, `Worker.tea`, …) is referenced inside a definition generic
+    /// over a type variable its cfg still mentions — a helper generic over `msg`
+    /// that builds the cfg. The running app stores, serialises, compares, and
+    /// prints its model and messages, which needs one concrete `Model` / `Msg`;
+    /// an unfixed type variable there is refused rather than deferred to a
+    /// failing Rust build (THE SEAL). `entry` is the entry's qualified name,
+    /// `type_var` the offending variable, `reach` whether the entry is proven
+    /// to mention it or only cannot be proven free of it. [IPE-N0051]
+    GenericAppEntry {
+        entry: Box<str>,
+        type_var: Box<str>,
+        reach: GenericAppEntryReach,
+    },
+    /// An app entry whose model or message type the program never fixes — an
+    /// `update` that ignores its message and a view that emits none leave
+    /// `msg` a type variable no definition is generic over. The running app
+    /// needs one concrete `Model` / `Msg` exactly as for
+    /// [`NameError::GenericAppEntry`]. `entry` is the entry's qualified name.
+    /// [IPE-N0051]
+    UnpinnedAppEntry { entry: Box<str> },
+}
+
+/// How a [`NameError::GenericAppEntry`] refusal relates the entry to its
+/// generic — selects the rendered message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GenericAppEntryReach {
+    /// The entry's solved instantiation mentions the generic.
+    Mentioned,
+    /// The generic is in scope and no type information shows whether the
+    /// entry's model or message reaches it (a row generic of the annotation,
+    /// or an entry reference with no solved type); refused fail-closed.
+    Undetermined,
 }
 
 /// Which namespace a [`NameError::RustNameFold`] collision falls in — selects
@@ -2129,6 +2162,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::RustNameFold { .. } => IPE_N0048,
         NameError::DuplicatePatternBinder { .. } => IPE_N0049,
         NameError::ScriptImportsShapeView { .. } => IPE_N0050,
+        NameError::GenericAppEntry { .. } | NameError::UnpinnedAppEntry { .. } => IPE_N0051,
     })
 }
 
@@ -2343,6 +2377,8 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::RuntimeBranchedMain
         | NameError::ModuleNotAllowedInPlacement(..)
         | NameError::ScriptImportsShapeView { .. }
+        | NameError::GenericAppEntry { .. }
+        | NameError::UnpinnedAppEntry { .. }
         | NameError::WebInitPolyArg => Vec::new(), // no span-based help
     }
 }

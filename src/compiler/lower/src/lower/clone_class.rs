@@ -932,8 +932,11 @@ fn match_arm_peak_uses(sym: Symbol, m: &ipe_ir::Match) -> usize {
         .unwrap_or(0)
 }
 
-/// Rewrite `Var(sym)` / `Lambda`-captures of `sym` in DFS left-to-right order
-/// so that all but the syntactically last occurrence are `.clone()`d.
+/// Rewrite `Var(sym)` / `Lambda`-captures of `sym` in evaluation order so that
+/// all but the last-evaluated occurrence are `.clone()`d. Evaluation order is
+/// DFS left-to-right, except that a call whose callee evaluates its arguments
+/// reversed ([`ipe_ir::Callee::evaluates_args_reversed`]) is visited
+/// last-argument-first.
 ///
 /// `remaining` starts at `count_var_uses(sym, expr)`.  Each consuming
 /// occurrence decrements it; when `remaining > 1` the occurrence is non-last
@@ -1141,20 +1144,35 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             *remaining = after_scrut.saturating_sub(peak);
             Expr::Match(m)
         }
+        // Arguments are visited in EVALUATION order, so the last-evaluated
+        // occurrence is the one left bare. A kernel whose runtime takes its
+        // arguments reversed evaluates the container before the function, so a
+        // capture by the function is the later use and the container's read the
+        // one cloned.
         Expr::Call {
             callee,
-            args,
+            mut args,
             pin,
             on_form,
-        } => Expr::Call {
-            callee,
-            args: args
+        } => {
+            let reversed = callee.evaluates_args_reversed();
+            if reversed {
+                args.reverse();
+            }
+            let mut args: Vec<Expr> = args
                 .into_iter()
                 .map(|a| rewrite_multiuse_clones(sym, remaining, a))
-                .collect(),
-            pin,
-            on_form,
-        },
+                .collect();
+            if reversed {
+                args.reverse();
+            }
+            Expr::Call {
+                callee,
+                args,
+                pin,
+                on_form,
+            }
+        }
         Expr::Apply { func, args } => {
             let new_func = Box::new(rewrite_multiuse_clones(sym, remaining, *func));
             let new_args = args

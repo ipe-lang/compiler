@@ -10,14 +10,12 @@ ipe_diagnostics = { path = "../diagnostics" }
 ipe_canon = { path = "../canon" }
 ipe_types = { path = "../types" }
 ipe_ir = { path = "../ir" }
+# Kernel scheme shapes (`TyShape`) align a kernel's scheme variables against
+# the solved call-site type when deriving auto-trait obligations.
+ipe_kernels = { path = "../kernels" }
 
 [dev-dependencies]
 ipe_parse = { path = "../parse" }
-# Explicit dev-dep for the SSOT cross-check test
-# (`accessor_intercept_placeholder_predicate_covers_ssot`). `ipe_kernels` is
-# already a transitive dep via `ipe_ir`; listing it here makes the coupling
-# visible and lets the test import it without relying on transitive resolution.
-ipe_kernels = { path = "../kernels" }
 
 [lints]
 workspace = true

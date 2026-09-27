@@ -44,7 +44,7 @@ use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span, TypeError};
 use ipe_intern::{Interner, Symbol};
 
-pub use constrain::{kernel_type_table, resolve_scheme};
+pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
@@ -57,6 +57,7 @@ use constrain::{
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
+pub use unify::con_heads_compatible;
 use unify::unify;
 use unionfind::{UnionFind, VarId};
 

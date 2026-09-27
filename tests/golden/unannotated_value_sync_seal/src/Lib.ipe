@@ -1,0 +1,32 @@
+module Lib exposing (checkboxOf, emptyList)
+
+import Ipe.Json.Decode as Decode
+import Ipe.Ui as Ui
+import Ipe.Ui.Input as Input
+
+
+-- SEAL repro: unannotated zero-parameter values that generalize at the module
+-- boundary. Each is used from `Main` at two instantiations, so each lowers to a
+-- generic Rust function with no parameters.
+--
+--   * `emptyList`  — `succeed` moves its value into a `Send + Sync` factory, so
+--                    the element generic must be `Sync`;
+--   * `checkboxOf` — `Input.checkbox`'s runtime function bounds its message
+--                    type `Sync`, reached through the lambda the value is.
+--
+-- Without the obligation the emitted generic misses `Sync` and the crate fails
+-- `cargo build` with E0277 after ipe accepts it.
+
+
+emptyList =
+    Decode.succeed []
+
+
+checkboxOf =
+    \toMsg checked ->
+        Input.checkbox []
+            { onChange = toMsg
+            , checked = checked
+            , icon = \_ -> Ui.text "x"
+            , label = Input.labelRight [] (Ui.text "done")
+            }

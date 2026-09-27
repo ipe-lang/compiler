@@ -272,6 +272,7 @@ pub fn lower(
         redirect_policy: interner.intern("RedirectPolicy").map_err(homeless)?,
         no_redirects: interner.intern("NoRedirects").map_err(homeless)?,
         follow_redirects: interner.intern("FollowRedirects").map_err(homeless)?,
+        kernel_types: ipe_types::Builtins::new(interner).map_err(homeless)?,
     };
     lower::Lowerer::new(
         m,

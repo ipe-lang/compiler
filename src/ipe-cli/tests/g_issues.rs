@@ -4,6 +4,16 @@
 
 mod support;
 
+#[path = "g_issues/golden_generic_carrier_send_seal.rs"]
+mod golden_generic_carrier_send_seal;
+#[path = "g_issues/golden_generic_msg_forward_sync_seal.rs"]
+mod golden_generic_msg_forward_sync_seal;
+#[path = "g_issues/golden_generic_msg_input_sync_seal.rs"]
+mod golden_generic_msg_input_sync_seal;
+#[path = "g_issues/golden_generic_return_only_sync_seal.rs"]
+mod golden_generic_return_only_sync_seal;
+#[path = "g_issues/golden_generic_succeed_tail_sync_seal.rs"]
+mod golden_generic_succeed_tail_sync_seal;
 #[path = "g_issues/golden_i1005_generic_capture_append_seal.rs"]
 mod golden_i1005_generic_capture_append_seal;
 #[path = "g_issues/golden_i1005_generic_capture_tuple_cons_seal.rs"]
@@ -104,3 +114,9 @@ mod golden_i99_alias_match_arm;
 mod golden_l0135_access_base_move_seal;
 #[path = "g_issues/golden_l0135_union_task_reuse_seal.rs"]
 mod golden_l0135_union_task_reuse_seal;
+#[path = "g_issues/golden_swapped_container_capture_seal.rs"]
+mod golden_swapped_container_capture_seal;
+#[path = "g_issues/golden_unannotated_value_sync_seal.rs"]
+mod golden_unannotated_value_sync_seal;
+#[path = "g_issues/golden_untyped_app_entry_row_seal.rs"]
+mod golden_untyped_app_entry_row_seal;

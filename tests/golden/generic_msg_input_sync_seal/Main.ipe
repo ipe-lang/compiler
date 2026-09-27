@@ -1,0 +1,70 @@
+module Main exposing (main)
+
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Ui as Ui exposing (Element)
+import Ipe.Ui.Input as Input
+
+
+-- SEAL repro: view helpers generic over `msg` that build every Input control
+-- whose runtime function bounds its message type `Sync`
+-- (`input_checkbox_` / `input_radio_` / `input_radio_row_`, each
+-- `M: Clone + Send + Sync`). No argument exposes `msg` bare — it rides inside
+-- the `onChange` callback and the `Element msg` result — so the obligation comes
+-- from the kernel's scheme variable, read off the solved call-site type. Every
+-- helper's generic must carry `Send + Sync`, or the emitted crate fails
+-- `cargo build` with E0277 after ipe accepts it.
+
+
+type Msg
+    = Toggled Bool
+    | Picked String
+
+
+checkboxOf : (Bool -> msg) -> Bool -> Element msg
+checkboxOf toMsg checked =
+    Input.checkbox []
+        { onChange = toMsg
+        , checked = checked
+        , icon = \_ -> Ui.text "x"
+        , label = Input.labelRight [] (Ui.text "done")
+        }
+
+
+radioOf : (String -> msg) -> String -> Element msg
+radioOf toMsg selected =
+    Input.radio []
+        { onChange = toMsg
+        , options =
+            [ Input.option "red" (Ui.text "Red")
+            , Input.option "blue" (Ui.text "Blue")
+            ]
+        , selected = selected
+        , label = Input.labelAbove [] (Ui.text "Pick a color")
+        }
+
+
+radioRowOf : (String -> msg) -> String -> Element msg
+radioRowOf toMsg selected =
+    Input.radioRow []
+        { onChange = toMsg
+        , options =
+            [ Input.option "red" (Ui.text "Red")
+            , Input.option "blue" (Ui.text "Blue")
+            ]
+        , selected = selected
+        , label = Input.labelAbove [] (Ui.text "Pick a color (row)")
+        }
+
+
+render : Element Msg -> String
+render element =
+    Html.render (Ui.layout [] element)
+
+
+main =
+    Io.println
+        (render (checkboxOf Toggled True)
+            ++ render (radioOf Picked "red")
+            ++ render (radioRowOf Picked "blue")
+        )

@@ -1,5 +1,6 @@
 use super::{CtorScheme, DResult, Interner, Symbol, Ty, TyBounds};
 
+/// Interned symbols of every built-in type, constructor, and field name.
 pub struct Builtins {
     pub int: Symbol,
     pub float: Symbol,
@@ -719,6 +720,17 @@ pub struct Builtins {
     /// `"OperandLiteral"` — `OperandLiteral` nullary constructor of `ProjectionOperand`
     /// (a `?` literal placeholder).
     pub operand_literal: Symbol,
+    /// `"ArithTerm"` — `ArithTerm ArithOp ProjectionOperand ProjectionOperand`
+    /// constructor of `ProjectionTerm` (SQL arithmetic over two operands).
+    pub arith_term: Symbol,
+    /// `"ArithOp"` — the closed operator tag of `ArithTerm`. Zero type arguments.
+    pub arith_op: Symbol,
+    /// `"ArithAdd"` — nullary `ArithOp` constructor (SQL `+`).
+    pub arith_add: Symbol,
+    /// `"ArithSub"` — nullary `ArithOp` constructor (SQL `-`).
+    pub arith_sub: Symbol,
+    /// `"ArithMul"` — nullary `ArithOp` constructor (SQL `*`).
+    pub arith_mul: Symbol,
     // ── Shape opaque app-leaf type constructor symbols ────────────────────────
     /// `"WebApp"` — opaque app handle returned by `Web.tea` / `Web.appRouted` /
     /// `Web.appWith`. Nullary; backed by `ipe_runtime::tea::WebApp`.
@@ -753,6 +765,11 @@ pub struct Builtins {
 }
 
 impl Builtins {
+    /// Interns every built-in name into `interner`; re-interning is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the interner refuses a name (its symbol space is exhausted).
     #[allow(clippy::too_many_lines)] // declarative intern table — each field listed explicitly for exhaustiveness
     pub fn new(interner: &mut Interner) -> DResult<Self> {
         Ok(Self {
@@ -1035,6 +1052,11 @@ impl Builtins {
             projection_operand: interner.intern("ProjectionOperand")?,
             operand_column: interner.intern("OperandColumn")?,
             operand_literal: interner.intern("OperandLiteral")?,
+            arith_term: interner.intern("ArithTerm")?,
+            arith_op: interner.intern("ArithOp")?,
+            arith_add: interner.intern("ArithAdd")?,
+            arith_sub: interner.intern("ArithSub")?,
+            arith_mul: interner.intern("ArithMul")?,
             // ── Shape opaque app-leaf type constructor symbols ─────────────
             web_app: interner.intern("WebApp")?,
             tui_app: interner.intern("TuiApp")?,
@@ -1060,6 +1082,7 @@ impl Builtins {
     /// an empty module path, matching how `from_canon` renders the builtin type
     /// names (`Int` / `Bool` / …) and how the lowerer recognises them by name.
     #[allow(clippy::too_many_lines)]
+    #[must_use]
     pub fn ctor_schemes(&self) -> Vec<(Symbol, CtorScheme)> {
         let bool_ty = Ty::Con {
             module: Vec::new(),
@@ -1574,6 +1597,69 @@ impl Builtins {
                     result: Ty::Con {
                         module: Vec::new(),
                         name: self.projection_operand,
+                        args: Vec::new(),
+                    },
+                },
+            ),
+            // ArithTerm : ArithOp -> ProjectionOperand -> ProjectionOperand -> ProjectionTerm
+            (
+                self.arith_term,
+                CtorScheme {
+                    arg_tys: vec![
+                        Ty::Con {
+                            module: Vec::new(),
+                            name: self.arith_op,
+                            args: Vec::new(),
+                        },
+                        Ty::Con {
+                            module: Vec::new(),
+                            name: self.projection_operand,
+                            args: Vec::new(),
+                        },
+                        Ty::Con {
+                            module: Vec::new(),
+                            name: self.projection_operand,
+                            args: Vec::new(),
+                        },
+                    ],
+                    result: Ty::Con {
+                        module: Vec::new(),
+                        name: self.projection_term,
+                        args: Vec::new(),
+                    },
+                },
+            ),
+            // ── ArithOp constructors ─────────────────────────────────────────────
+            // ArithAdd / ArithSub / ArithMul : ArithOp  (nullary operator tags)
+            (
+                self.arith_add,
+                CtorScheme {
+                    arg_tys: Vec::new(),
+                    result: Ty::Con {
+                        module: Vec::new(),
+                        name: self.arith_op,
+                        args: Vec::new(),
+                    },
+                },
+            ),
+            (
+                self.arith_sub,
+                CtorScheme {
+                    arg_tys: Vec::new(),
+                    result: Ty::Con {
+                        module: Vec::new(),
+                        name: self.arith_op,
+                        args: Vec::new(),
+                    },
+                },
+            ),
+            (
+                self.arith_mul,
+                CtorScheme {
+                    arg_tys: Vec::new(),
+                    result: Ty::Con {
+                        module: Vec::new(),
+                        name: self.arith_op,
                         args: Vec::new(),
                     },
                 },

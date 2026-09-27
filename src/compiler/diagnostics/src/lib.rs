@@ -18,8 +18,8 @@ pub use code::*;
 pub use diagnostic::{
     AliasExpansionKind, AppShape, Applicability, CaseDefect, CmdSubShapeMismatch,
     CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic, Expected, ExpectedSet,
-    ExposingDefect, Feature, FfiError, HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint,
-    IfDefect, LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason,
+    ExposingDefect, Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HeaderDefect,
+    HelpLine, Hint, IfDefect, LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason,
     ModulePlacementRejection, NameError, ParseError, RustNameFoldKind, SandboxError, SealRejection,
     SortedNames, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
     TokenKind, TyDoc, TypeDeclDefect, TypeError,

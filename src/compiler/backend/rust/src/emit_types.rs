@@ -232,16 +232,6 @@ impl<'a> GenericScope<'a> {
         self.row_binders.contains(&sym)
     }
 
-    /// The parameter-binder symbols whose type is a row generic — the same set
-    /// [`Self::is_row`] tests. A capture-clone rewrite consults this to leave a
-    /// row-generic Access receiver as a bare `Var` (the only shape the Access
-    /// emitter routes through the borrowing witness getter), rather than minting
-    /// a spurious whole-row `CloneVar`.
-    #[must_use]
-    pub const fn row_binders(&self) -> &'a [Symbol] {
-        self.row_binders
-    }
-
     /// The deterministic Rust generic name for `sym` (`T1`, `T2`, … by position).
     ///
     /// # Errors
