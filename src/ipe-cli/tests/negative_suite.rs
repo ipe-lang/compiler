@@ -2047,6 +2047,107 @@ fn wasm_server_only_kernel_native_ok() {
 }
 
 // ===========================================================================
+// wasm `Decoder` element holding an effect carrier — IPE-N0052
+// ===========================================================================
+
+/// A Web-shape TEA app whose `init` evaluates `probe`, with `defs` spliced in
+/// as extra top-level definitions.
+fn decoder_probe_app(defs: &str, probe: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Tea.Web.Cmd as Cmd\n\
+         import Ipe.Tea.Web.Sub as Sub\n\
+         import Ipe.Ui as Ui\n\
+         import Ipe.Json.Decode as Decode\n\
+         type alias Model = {{ n : Int }}\n\
+         type Msg = Tick\n\
+         {defs}\
+         init : WebReq -> ( Model, Cmd.Cmd Msg )\n\
+         init _r =\n\
+         \x20   let\n\
+         \x20       _probe = {probe}\n\
+         \x20   in\n\
+         \x20   ( {{ n = 0 }}, Cmd.none )\n\
+         update : Msg -> Model -> ( Model, Cmd.Cmd Msg )\n\
+         update _msg model =\n\
+         \x20   ( model, Cmd.none )\n\
+         view : Model -> Element Msg\n\
+         view _model =\n\
+         \x20   Ui.text \"ok\"\n\
+         subscriptions : Model -> Sub.Sub Msg\n\
+         subscriptions _model =\n\
+         \x20   Sub.none\n\
+         main =\n\
+         \x20   Web.tea\n\
+         \x20       {{ init = init, update = update, view = view, subscriptions = subscriptions\n\
+         \x20       , routes = [], notFound = Tick\n\
+         \x20       }}\n"
+    )
+}
+
+/// A generic whose signature hides the decoder its body builds over `a`.
+const HIDDEN_DECODER: &str = "hidden : a -> Int\n\
+                              hidden x =\n\
+                              \x20   let\n\
+                              \x20       _d = Decode.succeed x\n\
+                              \x20   in\n\
+                              \x20   0\n";
+
+/// A generic whose signature exposes the decoder it builds over `a`.
+const EXPOSED_DECODER: &str = "wrap : a -> Decode.Decoder a\n\
+                               wrap x =\n\
+                               \x20   Decode.succeed x\n";
+
+/// A `Decoder (Cmd Msg)` has no wasm build (the decoding kernels require a
+/// `Send` element; a wasm `Cmd` is not `Send`) — IPE-N0052 at `ipe` time.
+#[test]
+fn wasm_decoder_of_cmd_rejected() {
+    let src = decoder_probe_app("", "Decode.succeed Cmd.none");
+    assert_rejected_wasm("wasm_decoder_of_cmd", &src, "IPE-N0052");
+}
+
+/// A generic whose body places its unexposed `a` in a decoder element is
+/// refused: no use site would ever see what `a` is instantiated to.
+#[test]
+fn wasm_decoder_hidden_generic_rejected() {
+    let src = decoder_probe_app(HIDDEN_DECODER, "hidden Cmd.none");
+    assert_rejected_wasm("wasm_decoder_hidden_generic", &src, "IPE-N0052");
+}
+
+/// A generic exposing its decoder is checked at each use: instantiated at a
+/// `Cmd`, it is refused.
+#[test]
+fn wasm_decoder_exposed_generic_at_cmd_rejected() {
+    let src = decoder_probe_app(EXPOSED_DECODER, "wrap Cmd.none");
+    assert_rejected_wasm("wasm_decoder_exposed_generic_at_cmd", &src, "IPE-N0052");
+}
+
+/// The same exposed generic instantiated at plain data builds for wasm.
+#[test]
+fn wasm_decoder_exposed_generic_at_data_ok() {
+    let src = decoder_probe_app(EXPOSED_DECODER, "wrap Tick");
+    if let Outcome::Rejected(got) = compile("wasm_decoder_data_ok", &src, Target::WasmClient) {
+        assert!(
+            false_marker(),
+            "a decoder of plain data must build for wasm, got rejection {got}"
+        );
+    }
+}
+
+/// A `Decoder (Cmd Msg)` builds natively, where the effect carriers are `Send`.
+#[test]
+fn wasm_decoder_of_cmd_native_ok() {
+    let src = decoder_probe_app("", "Decode.succeed Cmd.none");
+    if let Outcome::Rejected(got) = compile("wasm_decoder_native_ok", &src, Target::Native) {
+        assert!(
+            false_marker(),
+            "the native build of a decoder of `Cmd` must stay green, got rejection {got}"
+        );
+    }
+}
+
+// ===========================================================================
 // Lowering / not-yet-supported — IPE-L####
 // ===========================================================================
 

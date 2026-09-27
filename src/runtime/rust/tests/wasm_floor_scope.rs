@@ -15,10 +15,10 @@
 //!      concrete values. If any grows a Task return, an `await`, or a tokio
 //!      dependency, this file stops compiling / passing.
 //!
-//!   2. `IpeTask`'s `Send` bound (`core.rs`) stays intact on native. Any wasm
-//!      relaxation must be `#[cfg(target_arch = "wasm32")]`-gated — never a
-//!      forked type, never a `MaybeSend` marker trait — leaving the native
-//!      assertion below untouched.
+//!   2. `IpeTask`'s `Send` bound (`core.rs`) stays intact on native. The wasm
+//!      relaxation is the `#[cfg(target_arch = "wasm32")]`-split `EffectSend`
+//!      bound (`Send + 'static` on native, `'static` on wasm32) — never a
+//!      forked type — leaving the native assertion below untouched.
 //!
 //! Keep this small, deterministic, dependency-free, and panic-free on every
 //! Ipê-reachable path.
@@ -129,14 +129,12 @@ fn maybe_result_combinators_are_pure_and_total() {
 
 // ── (2) The `IpeTask` `Send` gate (core.rs:17) ─────────────────────────────
 //
-// Per the spec (Q2), the floor is blocked on relaxing `IpeTask`'s `Send` bound,
-// and that relaxation MUST be `#[cfg(target_arch = "wasm32")]`-gated, never a
-// forked type and never a `MaybeSend` marker trait. We cannot assert the wasm
-// shape from a native test, but we CAN nail down the native invariant the future
-// cfg-split must preserve: on the native (non-wasm) target a `IpeTask` value is
+// `IpeTask`'s `Send` bound is relaxed only under `#[cfg(target_arch = "wasm32")]`,
+// through the cfg-split `EffectSend` bound, never a forked type. A native test
+// cannot assert the wasm shape, but it nails down the native invariant the
+// cfg-split preserves: on the native (non-wasm) target a `IpeTask` value is
 // `Send`. A regression that drops `Send` on native (or a fork that diverges the
-// type) breaks this assertion; a correct wasm cfg-split leaves it untouched
-// because it only adds a `#[cfg(target_arch = "wasm32")]` arm.
+// type) breaks this assertion.
 
 /// Compile-time witness: `T: Send`. Never called — its existence is the proof.
 #[allow(dead_code)]
@@ -146,7 +144,7 @@ fn assert_send<T: Send>() {}
 fn ipe_task_is_send_on_native_target() {
     // Native host (`not(target_arch = "wasm32")`) MUST keep the `Send` bound —
     // tokio `block_on` on a spawned OS thread and `tokio::spawn` both require it.
-    // The future wasm cfg-split (spec Q2) relaxes this ONLY under the wasm cfg.
+    // The wasm cfg-split relaxes this ONLY under the wasm cfg.
     #[cfg(not(target_arch = "wasm32"))]
     {
         // `IpeTask<E, A>` is `Pin<Box<dyn Future<..> + Send + 'static>>` per

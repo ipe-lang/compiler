@@ -6,6 +6,8 @@ mod support;
 
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
 mod golden_generic_carrier_send_seal;
+#[path = "g_issues/golden_generic_carrier_send_wasm_seal.rs"]
+mod golden_generic_carrier_send_wasm_seal;
 #[path = "g_issues/golden_generic_msg_forward_sync_seal.rs"]
 mod golden_generic_msg_forward_sync_seal;
 #[path = "g_issues/golden_generic_msg_input_sync_seal.rs"]

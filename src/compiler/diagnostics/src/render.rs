@@ -597,6 +597,10 @@ fn name_prose(msg: &NameError) -> String {
              a concrete type — e.g. `update` ignores its message and no view emits one — and a \
              running app needs one concrete model and message type."
         ),
+        NameError::EffectCarrierInDecoder { found } => format!(
+            "`{found}` ends up inside a `Decoder` here, but this wasm build's `Cmd`, `Sub` and \
+             `Task` values cannot be shared across threads while a decoder's element must be."
+        ),
         NameError::Unknown => "Something is off with a name in this code.".to_string(),
     }
 }
@@ -1651,6 +1655,11 @@ fn name_label(msg: &NameError) -> Option<String> {
         NameError::UnpinnedAppEntry { .. } => Some(
             "annotate the app's functions with your concrete types, e.g. \
              `update : Msg -> Model -> ( Model, Cmd Msg )`"
+                .to_string(),
+        ),
+        NameError::EffectCarrierInDecoder { .. } => Some(
+            "decode plain data into a message, then build the `Cmd`, `Sub` or `Task` from it \
+             in `update`"
                 .to_string(),
         ),
         NameError::RustNameFold { .. } | NameError::Unknown => None,

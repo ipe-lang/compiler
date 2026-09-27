@@ -17,12 +17,33 @@ use std::pin::Pin;
 // The `Send` bound backs tokio `spawn`/`block_on` on native hosts. On wasm32
 // the runtime is single-threaded and browser futures (`JsFuture`, DOM-touching
 // async) are `!Send`, so the bound is relaxed there — one type, cfg-split,
-// never a fork or a `MaybeSend` trait (the native assertion in
-// `tests/wasm_floor_scope.rs` pins the native half).
+// never a fork (the native assertion in `tests/wasm_floor_scope.rs` pins the
+// native half).
 #[cfg(not(target_arch = "wasm32"))]
 pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + Send + 'static>>;
 #[cfg(target_arch = "wasm32")]
 pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + 'static>>;
+
+/// The bound every effect-carrier element and callback carries on this target.
+///
+/// `Send + 'static` on a native host, whose `Task` / `Cmd` / `Sub` carriers are
+/// `Send`; only `'static` on wasm32, whose carriers are not. The task and
+/// decoder combinators bound their elements with it, so a `Task` or `Decoder`
+/// of a `Cmd` / `Sub` / `Task` value builds on every target. Mirrors the
+/// compiler's `Target::effect_carriers_are_send`, which decides whether an
+/// emitted generic riding one of these carriers is bounded `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait EffectSend: Send + 'static {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + 'static> EffectSend for T {}
+/// The bound every effect-carrier element and callback carries on this target.
+///
+/// Only `'static` on wasm32: the single-threaded browser / WASI runtime's
+/// carriers are not `Send`. See the native definition.
+#[cfg(target_arch = "wasm32")]
+pub trait EffectSend: 'static {}
+#[cfg(target_arch = "wasm32")]
+impl<T: 'static> EffectSend for T {}
 
 /// Construct Ok with generic error type.  Use `ok_res::<IpeError>` to
 /// instantiate with the project's concrete error type.

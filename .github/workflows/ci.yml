@@ -884,6 +884,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-toolchain-pinned
+        # The wasm32 SEAL goldens `cargo check` their emitted crate for this
+        # target and fail under CI when it is missing.
+        with:
+          targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       # The shard driver is `cargo nextest run`; the runner has no nextest unless
       # this installs it (every other nextest-driven job installs it too).
@@ -1058,6 +1062,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-toolchain-pinned
+        # The wasm32 SEAL goldens `cargo check` their emitted crate for this
+        # target and fail under CI when it is missing.
+        with:
+          targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: taiki-e/install-action@nextest
       - uses: actions/download-artifact@v7

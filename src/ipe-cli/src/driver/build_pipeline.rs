@@ -1500,6 +1500,17 @@ pub fn compile_prepared(
         .map_err(|(diag, home)| {
             attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
         })?;
+    // IPE-N0052: on a target whose effect carriers are not `Send`, a `Decoder`
+    // element holding a `Cmd` / `Sub` / `Task` has no valid build (THE SEAL).
+    if !config.target(db).effect_carriers_are_send() {
+        let gate_result = {
+            let interner = shared_interner.lock();
+            ipe_types::check_wasm_decoder_elements(&types, linked, &interner)
+        };
+        gate_result.map_err(|(diag, home)| {
+            attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
+        })?;
+    }
     // Print non-fatal warnings (e.g. IPE-T0011 RedundantCaseBranch) to stderr.
     // These are Severity::Warning: the build continues and exit code stays 0.
     for w in &types.warnings {

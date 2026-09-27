@@ -3143,25 +3143,51 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
     }
 }
 
-/// The payload of a `Send + 'static` carrier: a `Cmd`, `Sub` or `Decoder`.
+/// The `Send` obligation a runtime carrier places on the types it carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CarrierSend {
+    /// `Send + 'static` on every target: a `Decoder`, whose combinators
+    /// bound their element `Send` unconditionally.
+    Always,
+    /// `Send` only where the target's effect carriers are `Send`, `'static`
+    /// everywhere: a `Cmd`, `Sub` or `Task` (see
+    /// `Target::effect_carriers_are_send`).
+    Effect,
+}
+
+impl CarrierSend {
+    /// `slot` with this carrier's obligation folded in.
+    const fn oblige(self, slot: BoundSet) -> BoundSet {
+        match self {
+            Self::Always => slot.with_send(),
+            Self::Effect => slot.with_effect_send(),
+        }
+    }
+}
+
+/// The payload of a `Send`-obligating carrier — a `Cmd`, `Sub`, `Task` or `Decoder` — with its obligation.
 ///
-/// The runtime boxes each of these as a `Send + 'static` value, so every type
-/// it carries must be `Send + 'static` too. `None` for every other type.
-const fn ir_type_send_carrier_payload(ty: &IrType) -> Option<&IrType> {
+/// The runtime boxes each of these as a `'static` value whose payload must be
+/// `Send` per [`CarrierSend`]. `None` for every other type.
+const fn ir_type_send_carrier_payload(ty: &IrType) -> Option<(CarrierSend, &IrType)> {
     match ty {
-        IrType::Cmd(inner) | IrType::Sub(inner) | IrType::Decoder(inner) => Some(inner),
+        IrType::Cmd(inner) | IrType::Sub(inner) | IrType::Task(inner) => {
+            Some((CarrierSend::Effect, inner))
+        }
+        IrType::Decoder(inner) => Some((CarrierSend::Always, inner)),
         _ => None,
     }
 }
 
-/// Does the type variable `tv` appear inside a `Send + 'static` carrier's payload anywhere in `ty`?
+/// Does the type variable `tv` appear inside the payload of a `carrier`-kind carrier anywhere in `ty`?
 ///
 /// The carriers are [`ir_type_send_carrier_payload`]'s; the walk is the total
 /// [`ir_type_mentions`] recursion, so a carrier nested under a function type,
 /// a container, or another carrier is found.
-fn ir_type_generic_in_send_carrier(ty: &IrType, tv: Symbol) -> bool {
+fn ir_type_generic_in_send_carrier(ty: &IrType, tv: Symbol, carrier: CarrierSend) -> bool {
     ir_type_mentions(ty, &|t| {
-        ir_type_send_carrier_payload(t).is_some_and(|inner| ir_type_mentions_generic(inner, tv))
+        ir_type_send_carrier_payload(t)
+            .is_some_and(|(kind, inner)| kind == carrier && ir_type_mentions_generic(inner, tv))
     })
 }
 
@@ -4183,11 +4209,12 @@ fn apply_kernel_type_param_bounds(
         if fires_on(&stringify_matcher) {
             *bounds = bounds.with_show();
         }
-        // `Send + 'static` — the bare `onOpen` msg moved into the
-        // `sub_subscribe_ws_open` Source closure. Wildcard OR named (the msg is a
+        // Effect-carrier `Send` + `'static` — the bare `onOpen` msg moved into
+        // the `sub_subscribe_ws_open` Source closure, which is `Send` exactly
+        // where the target's `Sub` carrier is. Wildcard OR named (the msg is a
         // genuine `msg` tvar in the `onOpen` wrapper).
         if fires_on(&ws_open_msg_matcher) {
-            *bounds = bounds.with_send();
+            *bounds = bounds.with_effect_send();
         }
         // `'static` — wildcard OR named. NOT a kernel-on-param obligation:
         // the tvar appears in the TYPE of a boxed callback (a `FuncValue` /
@@ -4953,6 +4980,9 @@ fn propagate_call_site_bounds(
                     if extra.has_send() {
                         *bounds = bounds.with_send();
                     }
+                    if extra.has_effect_send() {
+                        *bounds = bounds.with_effect_send();
+                    }
                     if extra.has_static() {
                         *bounds = bounds.with_static();
                     }
@@ -5187,13 +5217,16 @@ fn instance_tvars(
     out
 }
 
-/// Fold `from`'s auto-trait and lifetime bits (`Sync`/`Send`/`'static`) into `slot`.
+/// Fold `from`'s auto-trait and lifetime bits (`Sync`/`Send`/effect `Send`/`'static`) into `slot`.
 const fn oblige_auto_traits(slot: &mut BoundSet, from: BoundSet) {
     if from.has_sync() {
         *slot = slot.with_sync();
     }
     if from.has_send() {
         *slot = slot.with_send();
+    }
+    if from.has_effect_send() {
+        *slot = slot.with_effect_send();
     }
     if from.has_static() {
         *slot = slot.with_static();
@@ -25388,11 +25421,15 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Record the `Send + 'static` obligation a reference's `Cmd` / `Sub` / `Decoder` carriers place on the def's generics.
+    /// Record the `Send + 'static` obligation a reference's `Cmd` / `Sub` / `Decoder` / `Task` carriers place on the def's generics.
     ///
-    /// The runtime boxes every `Cmd` / `Sub` / `Decoder` as a `Send + 'static`
-    /// value and bounds the types they carry to match (`cmd_map`'s and
-    /// `sub_map`'s `A`, the decoder combinators' element). A generic can ride
+    /// The runtime boxes every `Cmd` / `Sub` / `Decoder` / `Task` as a
+    /// `'static` value and bounds the types they carry to match (`cmd_map`'s
+    /// and `sub_map`'s `A`, the decoder and task combinators' element). A
+    /// `Decoder` element is `Send` on every target; a `Cmd` / `Sub` / `Task`
+    /// payload is `Send` only where the target's effect carriers are, so it
+    /// records the target-relative effect `Send`
+    /// ([`CarrierSend`]) that emit resolves per target. A generic can ride
     /// such a carrier only inside the body — `Sub.map k (Sub.every 1000 x)` with
     /// `x : a` — while the signature shows it bare or under a function type
     /// only, so a signature walk misses it. Every reference routes through
@@ -25403,37 +25440,49 @@ impl<'a> Lowerer<'a> {
     /// one of those carriers is covered with no per-kernel entry.
     ///
     /// Fail-closed: a missing region type obliges every generic of the def; a
-    /// type that does not lower obliges every generic it mentions. Over-bounding
-    /// stays buildable: every emitted concrete type is `Send + 'static`, and a
-    /// generic caller receives the bound through call-site propagation.
+    /// type that does not lower obliges every generic it mentions — both with
+    /// the unconditional `Send`, since the carrier kind is unknown. Over-bounding
+    /// stays buildable on a native host, where every emitted concrete type is
+    /// `Send + 'static`, and a generic caller receives the bound through
+    /// call-site propagation. The unconditional bound is the weaker failure on
+    /// a wasm target too: an effect-only bound under a `Decoder` element fails
+    /// cargo at every instantiation, the unconditional one only at an effect
+    /// carrier.
     fn note_carrier_sends(&self, span: Span) {
         let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
         if poly.is_empty() {
             return;
         }
-        let obliged: Vec<Symbol> = self.region_ty(span).map_or_else(
-            || poly.iter().copied().collect(),
+        let obliged: Vec<(Symbol, CarrierSend)> = self.region_ty(span).map_or_else(
+            || poly.iter().map(|tv| (*tv, CarrierSend::Always)).collect(),
             |solved| {
                 self.ir_type_from_ty(solved, span).map_or_else(
                     |_| {
                         poly.iter()
                             .copied()
                             .filter(|tv| self.ty_mentions_poly_tvar(solved, *tv))
+                            .map(|tv| (tv, CarrierSend::Always))
                             .collect()
                     },
                     |ir| {
                         poly.iter()
-                            .copied()
-                            .filter(|tv| ir_type_generic_in_send_carrier(&ir, *tv))
+                            .flat_map(|tv| {
+                                [CarrierSend::Always, CarrierSend::Effect]
+                                    .into_iter()
+                                    .filter(|carrier| {
+                                        ir_type_generic_in_send_carrier(&ir, *tv, *carrier)
+                                    })
+                                    .map(|carrier| (*tv, carrier))
+                            })
                             .collect()
                     },
                 )
             },
         );
         let mut recorded = self.recorded_bounds.borrow_mut();
-        for tv in obliged {
+        for (tv, carrier) in obliged {
             let slot = recorded.entry(tv).or_insert(BoundSet::UNBOUNDED);
-            *slot = slot.with_send();
+            *slot = carrier.oblige(*slot);
         }
     }
 
@@ -30479,6 +30528,51 @@ mod tests {
             body: Box::new(Expr::Var(p)),
         };
         assert_eq!(super::body_tail_threaded_param(&shadow, &params), None);
+    }
+
+    /// A `Cmd` / `Sub` / `Task` payload obliges the target-relative effect `Send`; a `Decoder` payload the unconditional one.
+    #[test]
+    fn carrier_payload_send_kind_is_per_carrier() {
+        use super::{BoundSet, CarrierSend, ir_type_generic_in_send_carrier};
+        use ipe_ir::IrType;
+
+        let mut interner = Interner::new();
+        let a = interner.intern("a").unwrap();
+        let generic = || Box::new(IrType::Generic(a));
+        for effect in [
+            IrType::Cmd(generic()),
+            IrType::Sub(generic()),
+            IrType::Task(generic()),
+        ] {
+            assert!(ir_type_generic_in_send_carrier(
+                &effect,
+                a,
+                CarrierSend::Effect
+            ));
+            assert!(!ir_type_generic_in_send_carrier(
+                &effect,
+                a,
+                CarrierSend::Always
+            ));
+        }
+        let always = IrType::Decoder(generic());
+        assert!(ir_type_generic_in_send_carrier(
+            &always,
+            a,
+            CarrierSend::Always
+        ));
+        assert!(!ir_type_generic_in_send_carrier(
+            &always,
+            a,
+            CarrierSend::Effect
+        ));
+        let effect_bound = CarrierSend::Effect.oblige(BoundSet::UNBOUNDED);
+        assert!(effect_bound.has_effect_send() && effect_bound.has_static());
+        assert!(
+            !effect_bound.has_send(),
+            "a Cmd/Sub payload must not force Send on wasm32"
+        );
+        assert!(CarrierSend::Always.oblige(BoundSet::UNBOUNDED).has_send());
     }
 
     /// End-to-end of the obligation: `apply_kernel_type_param_bounds` stamps

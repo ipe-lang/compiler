@@ -13604,6 +13604,29 @@ pub enum Target {
     WasmWasi,
 }
 
+impl Target {
+    /// Whether the runtime's `Cmd` / `Sub` / `Task` carriers are `Send` on this target.
+    ///
+    /// The single source of truth for the per-target effect-carrier auto-trait:
+    /// it mirrors the runtime's `cfg(target_arch = "wasm32")` split of `IpeTask`
+    /// (`core.rs`) and of its element marker `EffectSend` (`core.rs`, bounding
+    /// the task combinators), of `PerformThunk` / `SubSpawn` and of the
+    /// `cmd_map` / `sub_map` / `cmd_perform` / `sub_subscribe_ws_open` element
+    /// bounds (`tea.rs`, `ws_client.rs`). A native host drives these carriers on a
+    /// multi-threaded tokio runtime, so they and every type they carry are
+    /// `Send + 'static`; every wasm32 target is single-threaded and drops
+    /// `Send`, keeping only `'static`. The `Decoder` carrier is `Send` on every
+    /// target and is not governed by this; a wasm build refuses a `Decoder`
+    /// element carrying an effect carrier at `ipe` time (`IPE-N0052`).
+    #[must_use]
+    pub const fn effect_carriers_are_send(self) -> bool {
+        match self {
+            Self::Native => true,
+            Self::WasmClient | Self::WasmWasi => false,
+        }
+    }
+}
+
 impl StdlibKernel {
     /// Whether this kernel has a denotation on `target`.
     ///

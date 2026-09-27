@@ -14,7 +14,7 @@
 // When adding a new security-bearing random value, route it through `OsRng`, NOT
 // through any `lcg_*` / `random_*` fn here. (Audit finding: low/weak-crypto —
 // recorded as an invariant so a future change can't silently violate it.)
-use super::{IpeMaybe, IpeResult, IpeTask, ok_res, str_err};
+use super::{EffectSend, IpeMaybe, IpeResult, IpeTask, ok_res, str_err};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static LCG_STATE: AtomicU64 = AtomicU64::new(0);
@@ -221,7 +221,7 @@ pub fn random_choice<E: Send + From<String> + 'static>(items: Vec<String>) -> Ip
 /// Matches  `Random_choiceMaybe` which uses `Ok(makeMaybeNothing())` /
 /// `Ok(makeMaybeJust(...))`.
 #[must_use]
-pub fn random_choice_maybe<E: Send + 'static, T: Clone + Send + 'static>(
+pub fn random_choice_maybe<E: EffectSend, T: Clone + EffectSend>(
     items: Vec<T>,
 ) -> IpeTask<E, IpeMaybe<T>> {
     Box::pin(async move {
@@ -244,9 +244,7 @@ pub fn random_choice_maybe<E: Send + 'static, T: Clone + Send + 'static>(
 /// Matches  `Random_shuffle` which uses `mrand.Shuffle` over a copy of
 /// the list (input not mutated).
 #[must_use]
-pub fn random_shuffle<E: Send + 'static, T: Clone + Send + 'static>(
-    items: Vec<T>,
-) -> IpeTask<E, Vec<T>> {
+pub fn random_shuffle<E: EffectSend, T: Clone + EffectSend>(items: Vec<T>) -> IpeTask<E, Vec<T>> {
     Box::pin(async move {
         lcg_init();
         let mut result = items;
@@ -266,7 +264,7 @@ pub fn random_shuffle<E: Send + 'static, T: Clone + Send + 'static>(
 /// weights are skipped. Returns `Ok Nothing` when every weight is ≤ 0 or the
 /// list is empty — matches  `Random_weighted`.
 #[must_use]
-pub fn random_weighted<E: Send + 'static, T: Clone + Send + 'static>(
+pub fn random_weighted<E: EffectSend, T: Clone + EffectSend>(
     items: Vec<(f64, T)>,
 ) -> IpeTask<E, IpeMaybe<T>> {
     Box::pin(async move {

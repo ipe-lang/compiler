@@ -1,0 +1,112 @@
+module Main exposing (main)
+
+-- SEAL repro, wasm-client target: helpers generic over `a` that carry it under a
+-- `Cmd`, `Sub` or `Task` only inside their body, each instantiated at an effect
+-- carrier. On wasm32 the runtime's `Cmd`, `Sub` and `Task` carriers drop `Send`
+-- and keep `'static`:
+--
+--   * `subDiscarded`  — a `Sub a` bound by `let`, used at `a = Cmd Msg`;
+--   * `cmdBatched`    — a `Cmd.batch` over a `Cmd a`, used at `a = Cmd Msg`;
+--   * `taskDiscarded` — a `Task e a` bound by `let`, used at `a = Cmd Msg`;
+--   * `pendingCmd`    — a `Task` whose element is a `Cmd`, with no generic.
+--
+-- A `Send` bound on any of these fails `cargo build` for wasm32 with E0277,
+-- because a `Cmd` is not `Send` there.
+
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Tea.Web exposing (tea)
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type Page
+    = CounterPage
+
+
+type Msg
+    = Increment
+
+
+type alias Model =
+    { count : Int }
+
+
+subDiscarded : a -> Int
+subDiscarded x =
+    let
+        _sub =
+            Sub.every 1000 x
+    in
+    0
+
+
+cmdBatched : Cmd a -> Int
+cmdBatched cmd =
+    let
+        _cmd =
+            Cmd.batch [ cmd, Cmd.none ]
+    in
+    0
+
+
+taskDiscarded : a -> Int
+taskDiscarded x =
+    let
+        _task =
+            Task.succeed x
+    in
+    0
+
+
+noCmd : Cmd Msg
+noCmd =
+    Cmd.none
+
+
+noCmdOfCmd : Cmd (Cmd Msg)
+noCmdOfCmd =
+    Cmd.none
+
+
+pendingCmd : Task Never (Cmd Msg)
+pendingCmd =
+    Task.succeed noCmd
+
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    let
+        _pending =
+            pendingCmd
+    in
+    ( { count = subDiscarded noCmd + cmdBatched noCmdOfCmd + taskDiscarded noCmd }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+view : Model -> Element Msg
+view model =
+    Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) }
+
+
+main =
+    tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = CounterPage
+        }

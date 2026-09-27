@@ -33,6 +33,7 @@ pub(crate) mod super_bounds;
 mod ty;
 mod unify;
 mod unionfind;
+mod wasm_send;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -50,6 +51,7 @@ pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
     RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var, untag_solver_var,
 };
+pub use wasm_send::check_wasm_decoder_elements;
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp,

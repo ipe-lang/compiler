@@ -24,7 +24,7 @@ fn trace_enabled() -> bool {
 }
 
 // Trace.span : String -> Task e a -> Task e a
-pub fn trace_span<E: Send + 'static, A: Send + 'static>(
+pub fn trace_span<E: EffectSend, A: EffectSend>(
     name: String,
     task: IpeTask<E, A>,
 ) -> IpeTask<E, A> {

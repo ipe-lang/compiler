@@ -151,11 +151,11 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 # paired with the test's stable, warm wasm target dir — removes the race at its
 # root, so no retry mask is needed and a real failure stays visible.
 [[profile.ci.overrides]]
-filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm)'
+filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm) | test(generic_carrier_send_wasm_seal_checks)'
 test-group = 'wasm-external-cargo'
 
 [[profile.default.overrides]]
-filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm)'
+filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm) | test(generic_carrier_send_wasm_seal_checks)'
 test-group = 'wasm-external-cargo'
 
 [[profile.default.overrides]]

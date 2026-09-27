@@ -580,8 +580,21 @@ impl BoundSet {
     /// wildcard `any` variable and ONLY when the body actually calls a `db_get_*`
     /// — no blast radius on genuine named type variables (`a`, `msg`).
     const IPE_ROW: u16 = 1 << 11;
-    // 1 << 12 is free — the former `DISPLAY` (`Basics.toString`) bound folded
-    // into `SHOW` (`IpeStringify`), which covers scalar AND composite arguments.
+    /// The target-relative `Send` bound of a `Cmd` / `Sub` / `Task` payload generic.
+    ///
+    /// Renders `Send` exactly where the target's effect carriers are `Send`,
+    /// plus `'static` on every target.
+    /// A generic riding a `Cmd` / `Sub` / `Task` payload (`cmd_map` /
+    /// `sub_map`'s `A`, the task combinators' element, `sub_subscribe_ws_open`'s
+    /// `M`) needs `Send` only on a target whose
+    /// runtime carriers are `Send` ([`ipe_kernels::Target::effect_carriers_are_send`]);
+    /// on wasm32 the carriers themselves are not `Send`, so demanding it would
+    /// refuse an instantiation at a `Cmd` / `Sub` / `Task` type and break the
+    /// SEAL. The target is an emit-time fact, so the lowerer records this
+    /// target-relative flag and [`Self::requires_send_on`] resolves it. Distinct
+    /// from [`Self::SEND`], which is unconditional (`Decoder` elements, boxed `Send`
+    /// callbacks). Always paired with `STATIC`.
+    const EFFECT_SEND: u16 = 1 << 12;
     /// The `'static` lifetime bound: a generic type-param that flows,
     /// INSIDE the function body, into a value boxed as a boxed `dyn Fn` trait
     /// object (`Box<dyn Fn(..) -> .. + Send + 'static>`, or the `Arc` +Sync
@@ -607,16 +620,14 @@ impl BoundSet {
     /// relocates the pre-existing E0310 from the callee body to a bound that
     /// makes acceptance-by-`ipe` prove the box coercion type-checks.
     const STATIC: u16 = 1 << 13;
-    /// The `Send` auto-trait bound: a generic type-param whose VALUE is moved
-    /// into a runtime consumer that requires `Send` — a `Sub` message value
-    /// stored in a `IpeSub::Source` closure that is itself `Box<dyn FnOnce(..) +
-    /// Send>` (e.g. `Ipe.WebSocket.onOpen`'s bare `msg`, which flows into
-    /// `sub_subscribe_ws_open<M: Send + 'static>`). Unlike the boxed-CALLBACK
-    /// `'static` bound ([`Self::STATIC`]), the value here is a bare `msg`, not a
-    /// callback — so it has its own kernel-on-param matcher. Always paired with
-    /// `STATIC` (a moved value that must be `Send` for a spawned/boxed consumer
-    /// is also `'static`). Satisfied by every concrete Ipê type (emitted values
-    /// own their data and never borrow), so no caller-side failure.
+    /// The unconditional `Send` auto-trait bound: a generic type-param whose
+    /// VALUE is moved into a runtime consumer that requires `Send` on EVERY
+    /// target — a `Decoder` element (`decode_list<T: 'static + Send>`), or a
+    /// value captured by a boxed `+ Send` callback. A consumer that requires
+    /// `Send` only where the target's effect carriers are `Send` uses
+    /// [`Self::EFFECT_SEND`] instead. Always paired with `STATIC` (a moved value
+    /// that must be `Send` for a spawned/boxed consumer is also `'static`).
+    /// Satisfied by every concrete Ipê type the target's runtime can carry.
     const SEND: u16 = 1 << 14;
     /// The `Sync` auto-trait bound: a generic type-param whose VALUE is captured
     /// behind a `Send + Sync` shared carrier that itself requires the element
@@ -748,6 +759,32 @@ impl BoundSet {
     #[must_use]
     pub const fn has_send(self) -> bool {
         self.0 & Self::SEND != 0
+    }
+
+    /// This set with the target-relative effect-carrier `Send` bound (and `'static`).
+    ///
+    /// See [`Self::EFFECT_SEND`].
+    #[must_use]
+    pub const fn with_effect_send(self) -> Self {
+        Self(self.0 | Self::EFFECT_SEND | Self::STATIC)
+    }
+
+    /// Whether the target-relative effect-carrier `Send` bound is set.
+    ///
+    /// See [`Self::EFFECT_SEND`].
+    #[must_use]
+    pub const fn has_effect_send(self) -> bool {
+        self.0 & Self::EFFECT_SEND != 0
+    }
+
+    /// Whether this set demands `Send` when emitted for `target`.
+    ///
+    /// The unconditional [`Self::SEND`] always does; the effect-carrier
+    /// [`Self::EFFECT_SEND`] does only where
+    /// [`ipe_kernels::Target::effect_carriers_are_send`] holds.
+    #[must_use]
+    pub const fn requires_send_on(self, target: ipe_kernels::Target) -> bool {
+        self.has_send() || (self.has_effect_send() && target.effect_carriers_are_send())
     }
 
     /// This set with the `Sync` auto-trait bound (and its always-implied
@@ -3867,6 +3904,39 @@ mod tests {
     use super::*;
     use ipe_diagnostics::DResult;
     use ipe_intern::Interner;
+    use ipe_kernels::Target;
+
+    /// An effect-carrier `Send` renders `Send` natively and only `'static` on wasm32.
+    #[test]
+    fn effect_send_is_target_relative() {
+        let effect = BoundSet::UNBOUNDED.with_effect_send();
+        assert!(effect.has_static(), "effect-carrier Send implies 'static");
+        assert!(
+            !effect.has_send(),
+            "effect-carrier Send is not unconditional"
+        );
+        assert!(effect.requires_send_on(Target::Native));
+        assert!(!effect.requires_send_on(Target::WasmClient));
+        assert!(!effect.requires_send_on(Target::WasmWasi));
+    }
+
+    /// An unconditional `Send` (a `Decoder` element) holds on every target.
+    #[test]
+    fn unconditional_send_holds_on_every_target() {
+        let decoder = BoundSet::UNBOUNDED.with_send();
+        for target in [Target::Native, Target::WasmClient, Target::WasmWasi] {
+            assert!(decoder.requires_send_on(target), "{target:?}");
+            assert!(
+                decoder.with_effect_send().requires_send_on(target),
+                "{target:?}"
+            );
+        }
+        assert!(
+            !BoundSet::UNBOUNDED
+                .with_static()
+                .requires_send_on(Target::Native)
+        );
+    }
 
     fn msg_enum(i: &mut Interner) -> DResult<(Symbol, Symbol, Symbol)> {
         let ty = i.intern("Msg")?;

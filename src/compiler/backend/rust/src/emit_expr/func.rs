@@ -454,7 +454,11 @@ pub fn emit_shared_lambda(
 /// order is fixed (`Add`, `Sub`, `Mul`, `PartialOrd`, `PartialEq`, `Ord`,
 /// `Hash`, `Copy`, `Clone`, `Into<SqlParam>`) so the emission is deterministic
 /// regardless of how the bound set was assembled.
-pub fn render_bounds(bounds: BoundSet, n: usize) -> String {
+///
+/// `target` resolves the target-relative effect-carrier `Send`
+/// ([`BoundSet::requires_send_on`]): `Send` on a native host, only `'static` on
+/// wasm32, whose `Cmd` / `Sub` / `Task` carriers are not `Send`.
+pub fn render_bounds(bounds: BoundSet, n: usize, target: ipe_ir::Target) -> String {
     if bounds.is_unbounded() {
         return String::new();
     }
@@ -470,12 +474,11 @@ pub fn render_bounds(bounds: BoundSet, n: usize) -> String {
         // so no caller-side failure — see `BoundSet::STATIC`.
         traits.push("'static".to_owned());
     }
-    if bounds.has_send() {
-        // `Send` auto-trait: a bare `msg` value moved into a `IpeSub::Source`
-        // closure (`Box<dyn FnOnce(..) + Send>`) — e.g. `WebSocket.onOpen`'s
-        // `msg` into `sub_subscribe_ws_open<M: Send + 'static>`. Pushed after the
-        // `'static` lifetime bound (a lifetime must precede trait bounds).
-        // Satisfied by every concrete Ipê type (owned, never borrows).
+    if bounds.requires_send_on(target) {
+        // `Send` auto-trait: an unconditional obligation (a `Decoder` / `Task` element, a
+        // boxed `+ Send` callback), or a `Cmd` / `Sub` payload on a target whose
+        // effect carriers are `Send`. Pushed after the `'static` lifetime bound
+        // (a lifetime must precede trait bounds).
         traits.push("Send".to_owned());
     }
     if bounds.has_sync() {
@@ -1341,7 +1344,7 @@ pub fn render_fn_generics(
             // ONE render pass: `render_bounds` orders the lifetime bound first
             // and de-duplicates, so `'static` never doubles even when the
             // lowerer's `BoundSet::STATIC` already set it.
-            let clause = render_bounds(bounds, n);
+            let clause = render_bounds(bounds, n, ctx.target);
             if clause.is_empty() {
                 format!("T{n}")
             } else {

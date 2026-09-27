@@ -446,6 +446,9 @@ code! {
     /// inside a definition whose `Model` / `Msg` is still a type variable; the
     /// running app needs one concrete model and message type
     IPE_N0051 = "IPE-N0051", "an app entry is built with a Model or Msg that is still a type variable", "IPE-N0051";
+    /// a wasm build carries a `Cmd`, `Sub` or `Task` inside a `Decoder`
+    /// element, which the browser runtime cannot share across threads
+    IPE_N0052 = "IPE-N0052", "a wasm build carries a Cmd, Sub or Task inside a Decoder", "IPE-N0052";
 
     // -----------------------------------------------------------------------
     // Type (IPE-T####)

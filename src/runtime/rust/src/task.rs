@@ -209,8 +209,8 @@ where
 ))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
-    A: Send + 'static,
+    E: From<String> + EffectSend,
+    A: EffectSend,
 {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -301,18 +301,15 @@ where
     rt.block_on(future)
 }
 
-pub fn task_succeed<E: Send + 'static, A: Send + 'static>(a: A) -> IpeTask<E, A> {
+pub fn task_succeed<E: EffectSend, A: EffectSend>(a: A) -> IpeTask<E, A> {
     Box::pin(ready(ok_res::<E, A>(a)))
 }
 
-pub fn task_map<E, A, B>(
-    f: impl FnOnce(A) -> B + Send + 'static,
-    task: IpeTask<E, A>,
-) -> IpeTask<E, B>
+pub fn task_map<E, A, B>(f: impl FnOnce(A) -> B + EffectSend, task: IpeTask<E, A>) -> IpeTask<E, B>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
 {
     Box::pin(async move {
         match task.await {
@@ -328,15 +325,15 @@ where
 // dependence is none (the function sees all results at once); only the effect
 // order is fixed.
 pub fn task_map2<E, A, B, R>(
-    f: impl FnOnce(A, B) -> R + Send + 'static,
+    f: impl FnOnce(A, B) -> R + EffectSend,
     ta: IpeTask<E, A>,
     tb: IpeTask<E, B>,
 ) -> IpeTask<E, R>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
-    R: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
+    R: EffectSend,
 {
     Box::pin(async move {
         let a = match ta.await {
@@ -352,17 +349,17 @@ where
 }
 
 pub fn task_map3<E, A, B, C, R>(
-    f: impl FnOnce(A, B, C) -> R + Send + 'static,
+    f: impl FnOnce(A, B, C) -> R + EffectSend,
     ta: IpeTask<E, A>,
     tb: IpeTask<E, B>,
     tc: IpeTask<E, C>,
 ) -> IpeTask<E, R>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
-    C: Send + 'static,
-    R: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
+    C: EffectSend,
+    R: EffectSend,
 {
     Box::pin(async move {
         let a = match ta.await {
@@ -382,19 +379,19 @@ where
 }
 
 pub fn task_map4<E, A, B, C, D, R>(
-    f: impl FnOnce(A, B, C, D) -> R + Send + 'static,
+    f: impl FnOnce(A, B, C, D) -> R + EffectSend,
     ta: IpeTask<E, A>,
     tb: IpeTask<E, B>,
     tc: IpeTask<E, C>,
     td: IpeTask<E, D>,
 ) -> IpeTask<E, R>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
-    C: Send + 'static,
-    D: Send + 'static,
-    R: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
+    C: EffectSend,
+    D: EffectSend,
+    R: EffectSend,
 {
     Box::pin(async move {
         let a = match ta.await {
@@ -418,7 +415,7 @@ where
 }
 
 pub fn task_map5<E, A, B, C, D, G, R>(
-    f: impl FnOnce(A, B, C, D, G) -> R + Send + 'static,
+    f: impl FnOnce(A, B, C, D, G) -> R + EffectSend,
     ta: IpeTask<E, A>,
     tb: IpeTask<E, B>,
     tc: IpeTask<E, C>,
@@ -426,13 +423,13 @@ pub fn task_map5<E, A, B, C, D, G, R>(
     te: IpeTask<E, G>,
 ) -> IpeTask<E, R>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
-    C: Send + 'static,
-    D: Send + 'static,
-    G: Send + 'static,
-    R: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
+    C: EffectSend,
+    D: EffectSend,
+    G: EffectSend,
+    R: EffectSend,
 {
     Box::pin(async move {
         let a = match ta.await {
@@ -461,12 +458,12 @@ where
 
 pub fn task_and_then<E, A, B>(
     task: IpeTask<E, A>,
-    f: impl FnOnce(A) -> IpeTask<E, B> + Send + 'static,
+    f: impl FnOnce(A) -> IpeTask<E, B> + EffectSend,
 ) -> IpeTask<E, B>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
 {
     Box::pin(async move {
         match task.await {
@@ -477,13 +474,13 @@ where
 }
 
 pub fn task_map_error<E1, E2, A>(
-    f: impl FnOnce(E1) -> E2 + Send + 'static,
+    f: impl FnOnce(E1) -> E2 + EffectSend,
     task: IpeTask<E1, A>,
 ) -> IpeTask<E2, A>
 where
-    E1: Send + 'static,
-    E2: Send + 'static,
-    A: Send + 'static,
+    E1: EffectSend,
+    E2: EffectSend,
+    A: EffectSend,
 {
     Box::pin(async move {
         match task.await {
@@ -496,24 +493,24 @@ where
 /// `Task.lazy : (() -> Task e a) -> Task e a`.
 /// Ipê closures of type `() -> Task e a` are lowered as `FnOnce(()) -> IpeTask`
 /// (unit-arg), so the wrapper must accept `(())` and pass it through.
-pub fn task_lazy<E: Send + 'static, A: Send + 'static>(
-    f: impl FnOnce(()) -> IpeTask<E, A> + Send + 'static,
+pub fn task_lazy<E: EffectSend, A: EffectSend>(
+    f: impl FnOnce(()) -> IpeTask<E, A> + EffectSend,
 ) -> IpeTask<E, A> {
     Box::pin(async move { f(()).await })
 }
 
-pub fn task_from_result<E: Send + 'static, A: Send + 'static>(r: IpeResult<E, A>) -> IpeTask<E, A> {
+pub fn task_from_result<E: EffectSend, A: EffectSend>(r: IpeResult<E, A>) -> IpeTask<E, A> {
     Box::pin(ready(r))
 }
 
 pub fn task_and_then_result<E, A, B>(
-    f: impl FnOnce(A) -> IpeResult<E, B> + Send + 'static,
+    f: impl FnOnce(A) -> IpeResult<E, B> + EffectSend,
     task: IpeTask<E, A>,
 ) -> IpeTask<E, B>
 where
-    E: Send + 'static,
-    A: Send + 'static,
-    B: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
+    B: EffectSend,
 {
     Box::pin(async move {
         match task.await {
@@ -524,12 +521,12 @@ where
 }
 
 pub fn task_on_error<E, A>(
-    f: impl FnOnce(E) -> IpeTask<E, A> + Send + 'static,
+    f: impl FnOnce(E) -> IpeTask<E, A> + EffectSend,
     task: IpeTask<E, A>,
 ) -> IpeTask<E, A>
 where
-    E: Send + 'static,
-    A: Send + 'static,
+    E: EffectSend,
+    A: EffectSend,
 {
     Box::pin(async move {
         match task.await {
@@ -539,11 +536,11 @@ where
     })
 }
 
-pub fn task_fail<E: Send + 'static, A: Send + 'static>(e: E) -> IpeTask<E, A> {
+pub fn task_fail<E: EffectSend, A: EffectSend>(e: E) -> IpeTask<E, A> {
     Box::pin(ready(IpeResult::Err(e)))
 }
 
-pub fn task_perform<E: Send + 'static, A: Send + 'static>(task: IpeTask<E, A>) -> IpeTask<E, ()> {
+pub fn task_perform<E: EffectSend, A: EffectSend>(task: IpeTask<E, A>) -> IpeTask<E, ()> {
     Box::pin(async move {
         match task.await {
             IpeResult::Ok(_) => ok_res(()),
@@ -552,7 +549,7 @@ pub fn task_perform<E: Send + 'static, A: Send + 'static>(task: IpeTask<E, A>) -
     })
 }
 
-pub fn task_sequence<E: Send + 'static, A: Send + 'static>(
+pub fn task_sequence<E: EffectSend, A: EffectSend>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
@@ -572,7 +569,7 @@ pub fn task_sequence<E: Send + 'static, A: Send + 'static>(
 // its entry differently (`spawn_local`), so it is excluded there but present on
 // `wasm32-wasip1`, where a `Direct` program's `main` calls it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
-pub fn task_run<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_run<E: From<String> + EffectSend, A: EffectSend>(
     task: IpeTask<E, A>,
 ) -> IpeResult<E, A> {
     block_on(task)
@@ -683,7 +680,7 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
     not(all(target_arch = "wasm32", feature = "wasm-client")),
     any(not(feature = "tokio"), target_arch = "wasm32")
 ))]
-pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_parallel<E: From<String> + EffectSend, A: EffectSend>(
     tasks: Vec<IpeTask<E, A>>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
