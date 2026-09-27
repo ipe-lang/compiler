@@ -135,3 +135,118 @@ fn a_project_with_a_failing_test_names_it_and_exits_non_zero() -> TestResult {
     );
     Ok(())
 }
+
+/// A test entry that links the database stdlib and holds a `case` over `Result`.
+///
+/// `Ipe.Db.Store` pulls in `Ipe.Db.Codec`; `catch_all_arm` is the pattern of the
+/// arm that follows `Err _`.
+fn db_test_entry(catch_all_arm: &str) -> String {
+    format!(
+        "module Main exposing (main)
+
+import Ipe.Db.Dsn as Dsn exposing (Connection, ReadOnly)
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error exposing (Error)
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Test as Test exposing (Test)
+
+
+readAll : Connection ReadOnly -> Store Store.Row -> Task Error (List Store.Row)
+readAll conn store =
+    Store.allOn conn store
+
+
+isOk : Result String Int -> Bool
+isOk result =
+    case result of
+        Err _ ->
+            False
+
+        {catch_all_arm} ->
+            True
+
+
+tests : List Test
+tests =
+    [ Test.test \"isOk\" (\\_ -> Test.equal True (isOk (Ok 1))) ]
+
+
+main =
+    Test.runMain tests
+"
+    )
+}
+
+/// Lay out a project whose `tests/Main.ipe` is `test_entry`, returning its root.
+fn write_db_test_project(name: &str, test_entry: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
+    std::fs::write(dir.join("tests").join("Main.ipe"), test_entry)?;
+    Ok(dir)
+}
+
+/// A closed-union catch-all in the test entry is refused with IPE-T0018 at its own arm.
+///
+/// The refusal is framed against the test file at the `_` arm itself — never
+/// against an embedded stdlib module whose byte offsets overlap it. Offline: the
+/// refusal happens at type-check, before any `cargo` build.
+#[test]
+fn a_catch_all_in_the_test_entry_is_refused_at_its_own_arm() -> TestResult {
+    let entry = db_test_entry("_");
+    let Some(arm_line) = entry
+        .lines()
+        .position(|l| l.trim_start().starts_with("_ ->"))
+        .map(|i| i + 1)
+    else {
+        return Err("the test entry must contain a `_ ->` arm".into());
+    };
+    let dir = write_db_test_project("ipe_test_catch_all", &entry)?;
+
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !ok,
+        "a closed-union catch-all in the test entry must be refused, got stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("IPE-T0018"),
+        "the refusal must be IPE-T0018, got stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("<embedded-stdlib>"),
+        "the refusal must not be framed against the embedded stdlib, got stderr:\n{stderr}"
+    );
+    let location = format!("Main.ipe:{arm_line}:9");
+    assert!(
+        stderr.contains(&location),
+        "the refusal must point at the `_` arm ({location}), got stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// The same entry with an explicit `Ok _` arm passes `ipe test`.
+///
+/// Linking the database stdlib raises no lint of its own. Gated on `IPE_E2E=1`
+/// — it builds and runs the emitted test binary.
+#[test]
+fn a_test_entry_importing_the_database_stdlib_passes() -> TestResult {
+    if std::env::var("IPE_E2E").is_err() {
+        eprintln!("skipping: set IPE_E2E=1 to run the database-stdlib test E2E");
+        return Ok(());
+    }
+    let dir = write_db_test_project("ipe_test_db_clean", &db_test_entry("Ok _"))?;
+
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "a test entry importing the database stdlib must pass, got stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("all tests passed"),
+        "the settled outcome must appear, got stdout:\n{stdout}"
+    );
+    Ok(())
+}

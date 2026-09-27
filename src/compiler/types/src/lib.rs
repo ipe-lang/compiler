@@ -525,22 +525,24 @@ fn infer_core(
     // finding, so all offending sites are reported in one run. IPE-T0011 is a
     // Warning and must not abort; IPE-T0018 over a closed union is an Error.
     // IPE-T0010 (non-exhaustive) still early-returns `Err` from inside the pass.
-    lift!(exhaust::check(
+    // Every error the pass returns carries its owning definition's home, so the
+    // driver frames it against that module's source rather than guessing a file
+    // from byte offsets that every linked module shares.
+    exhaust::check(
         m,
         &dep_unions,
         &regions_for_exhaust,
         interner,
-        &mut warnings
-    ));
+        &mut warnings,
+    )?;
 
     // Fail-closed promotion: a diagnostic collected above is only a compilation
-    // failure if it is Error-severity. Partition the sink — Warning-severity
-    // diagnostics ride on in `SolvedTypes::warnings`; the first Error-severity
-    // diagnostic (IPE-T0018 over a closed union) is returned as `Err`, failing
-    // compilation. Without this, an Error pushed onto `warnings` would render
-    // but the program would still compile — the exact silent-accept this feature
-    // exists to prevent. All Error sites are already collected; returning the
-    // first still reports every warning-severity finding and fails the build.
+    // failure if it is Error-severity. The pass already returns its first Error
+    // with a home; this partition is the second, independent boundary — an
+    // Error-severity diagnostic that ever reaches the sink still fails
+    // compilation instead of rendering while the program compiles (the exact
+    // silent-accept the lint exists to prevent). Warning-severity diagnostics
+    // ride on in `SolvedTypes::warnings`.
     let first_error = warnings
         .iter()
         .position(|d| d.severity() == ipe_diagnostics::Severity::Error);
@@ -3962,6 +3964,60 @@ mod tests {
                 "the error names the absorbed ctors in canonical string order"
             );
         }
+    }
+
+    /// A closed-union catch-all in a NON-entry module is returned with that
+    /// module's home and the span of the `_` arm itself.
+    ///
+    /// Linked spans are file-local byte offsets, so the home is the only thing
+    /// that tells the driver which file to frame the error against; without it
+    /// the error was framed against whichever module's definition enclosed the
+    /// same offsets (an embedded stdlib module, in practice).
+    #[test]
+    fn closed_union_catch_all_error_carries_owning_module_home_and_arm_span() {
+        let lib_src = "module Lib exposing (Color(..), isRed)\n\n\
+                       type Color = Red | Green | Blue\n\n\
+                       isRed : Color -> Bool\n\
+                       isRed c =\n    case c of\n        Red ->\n            True\n\n        \
+                       _ ->\n            False\n";
+        let main_src = "module Main exposing (main)\n\n\
+                        import Lib exposing (Color(..), isRed)\n\n\
+                        main =\n    Io.println (if isRed Green then \"red\" else \"other\")\n";
+        let Some((m, mut i)) = link_modules(&[("Lib", lib_src), ("Main", main_src)]) else {
+            return;
+        };
+        let r = infer_attributed(&m, &mut i);
+        assert!(r.is_err(), "a closed-union catch-all must fail compilation");
+        let Err((err, home)) = r else {
+            return;
+        };
+        let Ok(lib) = i.intern("Lib") else {
+            return;
+        };
+        assert_eq!(
+            home,
+            vec![lib],
+            "the error must carry the owning module's home, not an empty one"
+        );
+        assert!(
+            matches!(
+                &err,
+                Diagnostic::Type {
+                    msg: TypeError::WildcardCoversKnownConstructors { .. },
+                    ..
+                }
+            ),
+            "expected IPE-T0018 WildcardCoversKnownConstructors, got {err:?}"
+        );
+        let Diagnostic::Type { span, .. } = &err else {
+            return;
+        };
+        let arm_offset = lib_src.find("_ ->").and_then(|o| u32::try_from(o).ok());
+        assert_eq!(
+            Some(span.lo),
+            arm_offset,
+            "the error must point at the `_` arm in Lib"
+        );
     }
 
     /// FAIL-CLOSED, MULTI-SITE: a module with more than one closed-union

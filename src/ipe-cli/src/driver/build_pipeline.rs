@@ -1487,9 +1487,9 @@ pub fn compile_prepared(
     // span ranges.
     //
     // When `home` is non-empty we look it up in `home_to_source` directly —
-    // O(log N) and exact.  When the home is empty (non-solver errors: constraint
-    // generation, field-access pass, exhaustiveness) we fall back to the
-    // byte-offset heuristic.
+    // O(log N) and exact (solver and exhaustiveness errors carry their owning
+    // def's home). When the home is empty (non-solver errors: constraint
+    // generation, field-access pass) we fall back to the byte-offset heuristic.
     //
     // `ipe_db::typecheck` is the memoized
     // SEAM over `ipe_types::infer_attributed`: same whole-program computation,
@@ -1517,7 +1517,7 @@ pub fn compile_prepared(
     // against the entry file at a coincidental byte offset — e.g. a State.ipe
     // IPE-L0115 shown at an unrelated Main.ipe line. `source_for_span` maps the
     // span back to its owning def's file, the same heuristic already used for
-    // constraint-gen / exhaustiveness type errors.
+    // homeless constraint-gen type errors.
     // Lowering (and emit) errors carry the owning def's `home`,
     // exactly like `typecheck` above. When `home` is non-empty we resolve the
     // source file DIRECTLY via `home_to_source` (O(log N), exact) — this is what
