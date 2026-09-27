@@ -461,6 +461,13 @@ jobs:
     steps:
       - name: Gate on shard + doctest results
         run: |
+          # Fail closed: a skip below is legitimate only when the path classifier
+          # ran and succeeded; a failed/cancelled `changes` skips every tier.
+          changes='${{ needs.changes.result }}'
+          if [ "$changes" != success ]; then
+            echo "test gate FAILED: changes result=$changes (path classifier did not succeed; no skip is proven legitimate)" >&2
+            exit 1
+          fi
           # A skipped `test-prep`/`test-run` is legitimate ONLY when the change
           # gate deliberately skipped them (docs-only PR); in that case `test`
           # passes vacuously. Any failure/cancellation is a hard stop.
@@ -764,11 +771,18 @@ jobs:
   asan-all:
     name: asan-all
     runs-on: ubuntu-latest
-    needs: asan
+    needs: [changes, asan]
     if: always()
     steps:
       - name: Gate on every asan shard result
         run: |
+          # Fail closed: a skip below is legitimate only when the path classifier
+          # ran and succeeded; a failed/cancelled `changes` skips every tier.
+          changes='${{ needs.changes.result }}'
+          if [ "$changes" != success ]; then
+            echo "asan-all FAILED: changes result=$changes (path classifier did not succeed; no skip is proven legitimate)" >&2
+            exit 1
+          fi
           result='${{ needs.asan.result }}'
           case "$result" in
             success) echo "asan-all: every shard passed — no memory UB detected." ;;
@@ -990,11 +1004,18 @@ jobs:
   e2e-all:
     name: e2e-all
     runs-on: ubuntu-latest
-    needs: [e2e, test-prep]
+    needs: [changes, e2e, test-prep]
     if: always()
     steps:
       - name: Gate on every e2e shard result
         run: |
+          # Fail closed: a skip below is legitimate only when the path classifier
+          # ran and succeeded; a failed/cancelled `changes` skips every tier.
+          changes='${{ needs.changes.result }}'
+          if [ "$changes" != success ]; then
+            echo "e2e-all FAILED: changes result=$changes (path classifier did not succeed; no skip is proven legitimate)" >&2
+            exit 1
+          fi
           # A failed `test-prep` skips every e2e shard (they `needs` it); catch
           # that here so the archive-build failure can't slip through as a
           # vacuous skip below.
@@ -1132,6 +1153,13 @@ jobs:
     steps:
       - name: Gate on every seal-slice sub-shard
         run: |
+          # Fail closed: a skip below is legitimate only when the path classifier
+          # ran and succeeded; a failed/cancelled `changes` skips every tier.
+          changes='${{ needs.changes.result }}'
+          if [ "$changes" != success ]; then
+            echo "seal-slice FAILED: changes result=$changes (path classifier did not succeed; no skip is proven legitimate)" >&2
+            exit 1
+          fi
           # A failed `test-prep` skips every sub-shard (they `needs` it); catch it
           # here so the archive-build failure can't slip through as a vacuous skip.
           prep='${{ needs.test-prep.result }}'

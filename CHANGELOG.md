@@ -10,6 +10,81 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.3.0](https://github.com/arthurmaciel/ipe-lang/compare/ipe-v0.2.6...ipe-v0.3.0) (2026-09-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** fold `ipe debugger` into `ipe run --record`
+* **cli:** remove `ipe migrate`
+* **cli:** `--out <dir>` for build/run/watch/release names the output root (crate at `<dir>/rust`, binary at `<dir>/bin`, release under `<dir>/release`); an existing unmarked `out/` must be removed once by hand.
+
+### Features
+
+* **cli:** `ipe run --replay` shows a trace-only session, sanitised ([1975b79](https://github.com/arthurmaciel/ipe-lang/commit/1975b79bf742f470317410b9cdf3b013799a51f6)), closes [#2847](https://github.com/arthurmaciel/ipe-lang/issues/2847)
+* **cli:** deterministic `ipe run --replay` of recorded cli/worker sessions ([4b67789](https://github.com/arthurmaciel/ipe-lang/commit/4b67789e7f7a9a84e5e643303f3d824276e66682)), closes [#2848](https://github.com/arthurmaciel/ipe-lang/issues/2848)
+* **db:** Db.upsertFields kernel — cross-backend ON CONFLICT DO UPDATE ([#2833](https://github.com/arthurmaciel/ipe-lang/issues/2833)) ([b991c63](https://github.com/arthurmaciel/ipe-lang/commit/b991c639e00459433f9a4609050a07a0a4245e58))
+* **runtime/db:** typed engine version floors + fail-closed connect-time check ([f74166a](https://github.com/arthurmaciel/ipe-lang/commit/f74166aa52e74fa8d936b54050aac06e2649a4ea)), closes [#2789](https://github.com/arthurmaciel/ipe-lang/issues/2789)
+
+
+### Bug Fixes
+
+* **backend:** declare tokio net wherever the ssrf module is emitted ([c493302](https://github.com/arthurmaciel/ipe-lang/commit/c493302a0aff9418326b9f2ab698cc99a53e225d))
+* **build:** store the build cache only after the emit claims the output dir ([6e38379](https://github.com/arthurmaciel/ipe-lang/commit/6e383792ecf333d41eb307058fffd102c2ddd264))
+* capability-inference perf, fmt do-block re-parse, semver major line (batch) ([94c7732](https://github.com/arthurmaciel/ipe-lang/commit/94c77325313b601b1d3023e0396f3dd90e063336))
+* **cli:** a handed-over eject tree can never sit inside an ipe-owned one ([e99617a](https://github.com/arthurmaciel/ipe-lang/commit/e99617ac34045bb053e6f85829ebabdd67d41ede))
+* **cli:** classify emitted-build causes ([#2900](https://github.com/arthurmaciel/ipe-lang/issues/2900)) ([c117136](https://github.com/arthurmaciel/ipe-lang/commit/c117136602301ccb8ceda02a902e7e1d562a6e29))
+* **cli:** never follow a symlink planted inside an owned output dir ([f4a11b0](https://github.com/arthurmaciel/ipe-lang/commit/f4a11b01c0a13a05c3623a81505a544374f274e0)), closes [#2827](https://github.com/arthurmaciel/ipe-lang/issues/2827)
+* **cli:** never overwrite or delete user files; build output lives in ipe-owned out/ ([ce04a16](https://github.com/arthurmaciel/ipe-lang/commit/ce04a162f88dad13170d734c1d8c855b14e5d319)), closes [#2827](https://github.com/arthurmaciel/ipe-lang/issues/2827)
+* **cli:** no output root may sit in any project's .ipe cache namespace ([230f0df](https://github.com/arthurmaciel/ipe-lang/commit/230f0df021b7601de62dabd5cecc9c9a6a6f67b4))
+* **cli:** owned output dirs, single session gate, record/replay ([f841c22](https://github.com/arthurmaciel/ipe-lang/commit/f841c227c57bb8b57198f1d839691c9204278db4))
+* **editors:** Emacs setup ships ipe-mode (font-lock + Eglot) and wires it into init.el or Doom's config.el, verified in batch ([99ae7bb](https://github.com/arthurmaciel/ipe-lang/commit/99ae7bb5cae467a92fa1236c1aaea611128682fc))
+* **editors:** Helix setup builds the grammar locally, manages one languages.toml block, verifies before success ([eaf968a](https://github.com/arthurmaciel/ipe-lang/commit/eaf968abceb9a3b01ce5111a972599627ec55687))
+* **editors:** Neovim setup installs parser, queries and a built-in-LSP plugin into the site dir, verified headlessly ([7929098](https://github.com/arthurmaciel/ipe-lang/commit/7929098910f756b448f817b89d2eca62153bc343))
+* **editors:** Zed extension starts ipe lsp and builds under any cargo config; configure.sh never edits settings.json; shared tests ([efdd039](https://github.com/arthurmaciel/ipe-lang/commit/efdd0394069ef50e7e7fb67bf12624b1163061a9))
+* **fmt:** re-sugar do blocks so formatted output always re-parses ([50e1af9](https://github.com/arthurmaciel/ipe-lang/commit/50e1af9c848c228ae848455b45919fb2e15b5008)), closes [#2843](https://github.com/arthurmaciel/ipe-lang/issues/2843)
+* **ipe-index:** resolve wrapper binary out-of-tree, never in-tree target/ ([#2836](https://github.com/arthurmaciel/ipe-lang/issues/2836)) ([564bcdc](https://github.com/arthurmaciel/ipe-lang/commit/564bcdc754e27e43c3bf4820d003967582f78cbb))
+* **pkg:** refuse a package with an uncompilable sibling, blamed on its own file ([61b9876](https://github.com/arthurmaciel/ipe-lang/commit/61b9876d6bb8ca54e7317a81b8df515222734054))
+* **registry:** enforced-semver baseline is the last stable release; prerelease-aware floor ([83838ee](https://github.com/arthurmaciel/ipe-lang/commit/83838eefcf10f640fe24bef46ff7c26d8f4cbfbf)), closes [#2816](https://github.com/arthurmaciel/ipe-lang/issues/2816)
+* **registry:** enforced-semver bump follows the predecessor's release line ([1113054](https://github.com/arthurmaciel/ipe-lang/commit/1113054e741b6d75cc72cd23023ee32570897c97)), closes [#2835](https://github.com/arthurmaciel/ipe-lang/issues/2835)
+* **registry:** login-shaped publisher parse; diff report measures from the old version ([3a679d6](https://github.com/arthurmaciel/ipe-lang/commit/3a679d65eb0c34e73270a5bc40d1cb4da84396f4))
+* **registry:** type publisher identity; blessed privileges need a proven identity ([d1f0515](https://github.com/arthurmaciel/ipe-lang/commit/d1f051519c43513ee4360dff34c9611680a0989c)), closes [#2802](https://github.com/arthurmaciel/ipe-lang/issues/2802)
+* **run:** judge the session's native-bearing refusal over the consented capabilities ([b847520](https://github.com/arthurmaciel/ipe-lang/commit/b847520e96d8a749f40ef9ca36c010842bba95af))
+* **runtime/db:** gate host-less and Unix-socket PostgreSQL targets; refuse startup on a policy-refused store ([#2830](https://github.com/arthurmaciel/ipe-lang/issues/2830)) ([23ebb73](https://github.com/arthurmaciel/ipe-lang/commit/23ebb737bf6a199f8638b7556c860178cf52396c))
+* **runtime/db:** gate session-store pools on the engine floor; credential-free version-query errors ([691f83b](https://github.com/arthurmaciel/ipe-lang/commit/691f83b9dab0b5e2fc48d946874251d05d621cf7))
+* **runtime/db:** one VettedPool constructor for every caller-URL pool; credential-free connect errors ([#2830](https://github.com/arthurmaciel/ipe-lang/issues/2830)) ([b207291](https://github.com/arthurmaciel/ipe-lang/commit/b20729132436a985020fb7a239d35160c7f96d37))
+* **runtime/tests:** dial-scan strips only cfg(test) items, not whole file tail ([21511c3](https://github.com/arthurmaciel/ipe-lang/commit/21511c330d59bd6b1f11b4cc044d567b3b9558ce))
+* **runtime/tests:** harden the dial-scan cfg(test) stripper against fooling ([817a707](https://github.com/arthurmaciel/ipe-lang/commit/817a707c944a6d37ff7268854a3388f067380f1e))
+* **runtime:** carry the credential-free host proof in the type of every named SSRF dial ([1e25a07](https://github.com/arthurmaciel/ipe-lang/commit/1e25a0797807f0010beb83abe06a9819f6091411))
+* **runtime:** classify store refusals exhaustively; dial scans read masked code structurally ([f6fac03](https://github.com/arthurmaciel/ipe-lang/commit/f6fac0397edd2c43a20d73a8dab2fbe49ef0e056))
+* **runtime:** derive URL error text from the gate's parse, never echo a scheme ([a796975](https://github.com/arthurmaciel/ipe-lang/commit/a796975c1eb34923427ac34327782eb6cd4451ff))
+* **runtime:** drop derived equality on DsnPart; test SQLite modes without to_url_lossy ([fd60bd3](https://github.com/arthurmaciel/ipe-lang/commit/fd60bd342bfe3b63b2804304486e069d2551ccc4)), closes [#2838](https://github.com/arthurmaciel/ipe-lang/issues/2838)
+* **runtime:** gate server-only origin helpers on the server feature ([fb72643](https://github.com/arthurmaciel/ipe-lang/commit/fb72643465fb37966219d5f456dc42665b2b546d))
+* **runtime:** hold a Dsn password only beside its user, and bound Dsn input ([5fe5767](https://github.com/arthurmaciel/ipe-lang/commit/5fe5767f6b802c5e6870852af4920007779baea6)), closes [#2838](https://github.com/arthurmaciel/ipe-lang/issues/2838)
+* **runtime:** one typed SSRF gate for every dial; credential-free DB errors ([7c9b8b0](https://github.com/arthurmaciel/ipe-lang/commit/7c9b8b0c4a10424fc57da1d13d54f21e4e992ea8))
+* **runtime:** open the cache root without following symlinks ([#2883](https://github.com/arthurmaciel/ipe-lang/issues/2883)) ([9ecd39e](https://github.com/arthurmaciel/ipe-lang/commit/9ecd39e9b0b1e7be565000c813fc9b4df7af47e7))
+* **runtime:** parse a SQLite Dsn path once so it cannot change the open mode ([1137ca3](https://github.com/arthurmaciel/ipe-lang/commit/1137ca37842009845f6ee81ebf02c446264f9fc4)), closes [#2838](https://github.com/arthurmaciel/ipe-lang/issues/2838)
+* **runtime:** parse the DB URL once into the engine it selects ([014c5b5](https://github.com/arthurmaciel/ipe-lang/commit/014c5b52b99fbdb8168d6c0282f4a380afaae3e7))
+* **runtime:** percent-encode every Dsn part so a built name cannot downgrade TLS ([a522962](https://github.com/arthurmaciel/ipe-lang/commit/a522962d0177495c480e54bd095b415b20bd110a)), closes [#2838](https://github.com/arthurmaciel/ipe-lang/issues/2838)
+* **runtime:** pin Postgres TLS to vetted address, fail closed on relay loss ([#2909](https://github.com/arthurmaciel/ipe-lang/issues/2909)) ([2a563b5](https://github.com/arthurmaciel/ipe-lang/commit/2a563b50ebe631f20b9c66b2bf93cb8e05f009a5))
+* **runtime:** pin SSRF-vetted dials, resolve without blocking, type the refusal ([d0df83b](https://github.com/arthurmaciel/ipe-lang/commit/d0df83bb1dc3f7021e128a391616090f5f54a2e5))
+* **runtime:** refuse ambiguous DB URLs and withhold hosts that may be credentials ([8d83b79](https://github.com/arthurmaciel/ipe-lang/commit/8d83b79857b9aa18c8c8101a635f0e50906fa6ad))
+* **runtime:** route the HTTP resolver through the one SSRF gate ([785fcb1](https://github.com/arthurmaciel/ipe-lang/commit/785fcb19c7c175be100789789ba517d16d9c4fb7)), closes [#2854](https://github.com/arthurmaciel/ipe-lang/issues/2854)
+* **runtime:** withhold credential-derived hosts, addresses and URL tails from every refusal ([488bbc2](https://github.com/arthurmaciel/ipe-lang/commit/488bbc20cb42719759c8339449c122cc674ee5de))
+* typed db build errors, publisher login parse, editor setup ([a2e60db](https://github.com/arthurmaciel/ipe-lang/commit/a2e60db99961731ab4ee5861f88f575ff59f5901))
+
+
+### Performance Improvements
+
+* **cli:** resolve capabilities once per build/run/release invocation ([878da3a](https://github.com/arthurmaciel/ipe-lang/commit/878da3a3d022f89098b4a7129b98ea250ffb2072)), closes [#2822](https://github.com/arthurmaciel/ipe-lang/issues/2822)
+* **pkg:** infer package capabilities over one shared source graph ([a88bcdd](https://github.com/arthurmaciel/ipe-lang/commit/a88bcddb45147be10136211a1c4c2f67cc53913f)), closes [#2826](https://github.com/arthurmaciel/ipe-lang/issues/2826)
+
+
+### Code Refactoring
+
+* **cli:** fold `ipe debugger` into `ipe run --record` ([7df345d](https://github.com/arthurmaciel/ipe-lang/commit/7df345d11a91435adfe248d893be7a12c79bd8c9)), closes [#2827](https://github.com/arthurmaciel/ipe-lang/issues/2827)
+* **cli:** remove `ipe migrate` ([d646da9](https://github.com/arthurmaciel/ipe-lang/commit/d646da9107b3f1f629cbf8eecda88482d1c81d12)), closes [#2827](https://github.com/arthurmaciel/ipe-lang/issues/2827)
+
 ## [0.2.6](https://github.com/arthurmaciel/ipe-lang/compare/ipe-v0.2.5...ipe-v0.2.6) (2026-09-26)
 
 

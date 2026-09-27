@@ -1271,6 +1271,9 @@ pub enum DbConnectError {
     HostRefused(crate::ssrf::SsrfRefusal),
     /// The driver could not open the pool.
     Unreachable(DbFailure),
+    /// The local relay that pins a TLS dial to its vetted address could not
+    /// be opened, so the dial is refused rather than unpinned.
+    RelayUnavailable,
     /// The server's version query failed.
     VersionUnreadable(DbFailure),
     /// The engine is unsupported, or its version is unparseable or too old.
@@ -1305,11 +1308,21 @@ impl std::fmt::Display for DbConnectError {
                 write!(f, "db: {failure}")
             }
             Self::EngineRefused(refused) => write!(f, "{refused}"),
+            Self::RelayUnavailable => f.write_str(
+                "db: the local relay to the pinned database address could not be opened",
+            ),
         }
     }
 }
 
 impl std::error::Error for DbConnectError {}
+
+#[cfg(unix)]
+impl From<crate::ssrf::RelayUnavailable> for DbConnectError {
+    fn from(crate::ssrf::RelayUnavailable: crate::ssrf::RelayUnavailable) -> Self {
+        Self::RelayUnavailable
+    }
+}
 
 /// Admit a pool only when its server's version is at or above its engine's floor.
 ///
@@ -1552,14 +1565,16 @@ async fn vet_dial_target<R: HostResolver>(
 /// pointing at an internal host (DNS rebinding) is not dialled on this
 /// connect nor on any connection the pool opens afterwards.
 ///
-/// The driver verifies a `verify-full` certificate against the host it dials,
-/// so a pinned named host cannot keep that check; it is refused rather than
-/// silently weakened.
+/// A named host that may negotiate TLS keeps its name for SNI and certificate
+/// verification and is dialled through a `PinnedRelay` to the vetted address
+/// (see [`pin_postgres_options`]); the relay is returned alongside the options
+/// and must outlive every connection they open.
 async fn postgres_connect_options<R: HostResolver>(
     url: &PostgresUrl,
     policy: DialPolicy,
     resolver: &R,
-) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
+    max_connections: u32,
+) -> Result<PinnedPgOptions, DbConnectError> {
     let mut vetted = Vec::with_capacity(url.targets.len());
     for target in &url.targets {
         let dial = vet_dial_target(target, policy, resolver).await?;
@@ -1571,23 +1586,33 @@ async fn postgres_connect_options<R: HostResolver>(
         .parse()
         .map_err(|_| DbConnectError::InvalidUrl)?;
     match policy {
-        DialPolicy::AllowAll => Ok(options),
-        DialPolicy::DenyPrivate => pin_postgres_options(&url.url, options, &vetted, resolver).await,
+        DialPolicy::AllowAll => Ok((options, None)),
+        DialPolicy::DenyPrivate => {
+            pin_postgres_options(&url.url, options, &vetted, resolver, max_connections).await
+        }
     }
 }
 
-/// Replace the dialled host in `options`, the driver's reading of `url`, with
-/// its vetted address.
+/// Pin the dial of `options`, the driver's reading of `url`, to its vetted address.
 ///
 /// Reuses the address a target in `vetted` already resolved to for the same
 /// host and port, so the name is resolved once; a host the target scan did not
 /// name is vetted here. A host `url` does not name is refused as unproven.
+///
+/// An IP-literal host, or any host under a mode that never negotiates TLS, is
+/// replaced by the vetted address. A named host that may negotiate TLS keeps
+/// its name, because the driver sends it as SNI and verifies the certificate
+/// against it; the driver instead dials the socket of a `PinnedRelay` that
+/// carries every connection to the vetted address, so no dial resolves the
+/// name again. Where no relay exists, `verify-full` on a named host is refused
+/// rather than silently weakened.
 async fn pin_postgres_options<R: HostResolver>(
     url: &UnambiguousUrl,
     options: sqlx::postgres::PgConnectOptions,
     vetted: &[(DialTarget, VettedDial)],
     resolver: &R,
-) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
+    max_connections: u32,
+) -> Result<PinnedPgOptions, DbConnectError> {
     if options.get_socket().is_some() || options.get_host().starts_with('/') {
         return Err(DbConnectError::HostRefused(SsrfRefusal::LocalSocket));
     }
@@ -1599,6 +1624,9 @@ async fn pin_postgres_options<R: HostResolver>(
     let literal = crate::ssrf::strip_ipv6_brackets(&host)
         .parse::<std::net::IpAddr>()
         .is_ok();
+    #[cfg(not(unix))]
+    let _no_relay_to_cap = max_connections;
+    #[cfg(not(unix))]
     if !literal
         && matches!(
             options.get_ssl_mode(),
@@ -1627,8 +1655,26 @@ async fn pin_postgres_options<R: HostResolver>(
                 .map_err(DbConnectError::HostRefused)?
         }
     };
-    Ok(options.host(&dial.dial_host(&host)))
+    #[cfg(unix)]
+    if let VettedDial::Pinned(target) = dial
+        && !literal
+        && !matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Disable | sqlx::postgres::PgSslMode::Allow
+        )
+    {
+        let relay = crate::ssrf::PinnedRelay::open(target, port, max_connections)?;
+        let relayed = options.socket(relay.socket_dir());
+        return Ok((relayed, Some(relay)));
+    }
+    Ok((options.host(&dial.dial_host(&host)), None))
 }
+
+/// PostgreSQL options gated and pinned, with the relay their dials go through.
+type PinnedPgOptions = (
+    sqlx::postgres::PgConnectOptions,
+    Option<crate::ssrf::PinnedRelay>,
+);
 
 /// A driver whose connect options pass the SSRF gate before any dial.
 ///
@@ -1637,10 +1683,14 @@ async fn pin_postgres_options<R: HostResolver>(
 pub trait GatedDial: sqlx::Database {
     /// The options `url` makes the driver dial, admitted by the gate.
     ///
-    /// A URL selecting another engine is refused with
+    /// A pinned dial that runs through a `PinnedRelay` leaves it in `relay`;
+    /// the relay must outlive every connection the options open. A URL
+    /// selecting another engine is refused with
     /// [`DbConnectError::EngineMismatch`].
     fn gated_connect_options(
         url: &DbUrl,
+        max_connections: u32,
+        relay: &mut Option<crate::ssrf::PinnedRelay>,
     ) -> impl std::future::Future<
         Output = Result<<Self::Connection as sqlx::Connection>::Options, DbConnectError>,
     > + Send;
@@ -1650,6 +1700,8 @@ impl GatedDial for sqlx::Sqlite {
     /// SQLite opens a local file and dials no host.
     async fn gated_connect_options(
         url: &DbUrl,
+        _max_connections: u32,
+        _relay: &mut Option<crate::ssrf::PinnedRelay>,
     ) -> Result<sqlx::sqlite::SqliteConnectOptions, DbConnectError> {
         match url {
             DbUrl::Sqlite(sqlite) => Ok(sqlite.options.clone()),
@@ -1662,10 +1714,20 @@ impl GatedDial for sqlx::Postgres {
     /// Every target is vetted under the environment's policy and pinned.
     async fn gated_connect_options(
         url: &DbUrl,
+        max_connections: u32,
+        relay: &mut Option<crate::ssrf::PinnedRelay>,
     ) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
         match url {
             DbUrl::Postgres(postgres) => {
-                postgres_connect_options(postgres, DialPolicy::from_env(), &SystemResolver).await
+                let (options, pinned) = postgres_connect_options(
+                    postgres,
+                    DialPolicy::from_env(),
+                    &SystemResolver,
+                    max_connections,
+                )
+                .await?;
+                *relay = pinned;
+                Ok(options)
             }
             DbUrl::Sqlite(_) => Err(url.mismatch(DbEngine::Postgres)),
         }
@@ -1680,7 +1742,7 @@ impl GatedDial for sqlx::Postgres {
 /// It runs, in order: the driver's [`GatedDial`] gate (for PostgreSQL, the
 /// SSRF gate on every target the URL dials, with the dial pinned to the vetted
 /// address), a bounded connection cap, and the engine-version floor before any
-/// other statement.
+/// other statement. A relay the gate opened is held until the pool closes.
 /// Every failure is a [`DbConnectError`], which holds no driver payload, so no
 /// caller can log or return a connection URL a driver echoed. The runtime's
 /// own telemetry spill (`telemetry_spill.rs`, and the hub reading it) is not a
@@ -1701,7 +1763,8 @@ where
     ///
     /// [`DbConnectError`] when a gate refuses or the driver cannot connect.
     pub async fn connect(url: &DbUrl, max_connections: u32) -> Result<Self, DbConnectError> {
-        let options = DB::gated_connect_options(url).await?;
+        let mut relay = None;
+        let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
         let pool = sqlx::pool::PoolOptions::<DB>::new()
             .max_connections(max_connections)
             .connect_with(options)
@@ -1710,6 +1773,9 @@ where
         if let Err(refused) = enforce_engine_floor_on(&pool).await {
             pool.close().await;
             return Err(refused);
+        }
+        if let Some(relay) = relay {
+            relay.hold_until(pool.close_event());
         }
         Ok(Self(pool))
     }
@@ -9262,15 +9328,12 @@ mod tests {
         url: &str,
         policy: DialPolicy,
         resolver: &R,
-    ) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
-        postgres_connect_options(&PostgresUrl::parse(url)?, policy, resolver).await
+    ) -> Result<PinnedPgOptions, DbConnectError> {
+        postgres_connect_options(&PostgresUrl::parse(url)?, policy, resolver, 4).await
     }
 
     /// The gate's verdict on `url` under `policy`, with no DNS available.
-    async fn pg_gate(
-        url: &str,
-        policy: DialPolicy,
-    ) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
+    async fn pg_gate(url: &str, policy: DialPolicy) -> Result<PinnedPgOptions, DbConnectError> {
         pg_gate_with(url, policy, &NoDns).await
     }
 
@@ -9339,7 +9402,7 @@ mod tests {
         let (Ok(url), Ok(options)) = (url, options) else {
             return;
         };
-        let pinned = pin_postgres_options(&url, options, &[], &NoDns).await;
+        let pinned = pin_postgres_options(&url, options, &[], &NoDns, 4).await;
         assert!(matches!(
             pinned,
             Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget))
@@ -9379,8 +9442,8 @@ mod tests {
         }
         let unpinned = pg_gate("postgres://db.internal/x", DialPolicy::AllowAll).await;
         assert_eq!(
-            unpinned.map(|o| o.get_host().to_owned()),
-            Ok("db.internal".to_owned())
+            unpinned.map(|(o, relay)| (o.get_host().to_owned(), relay.is_none())),
+            Ok(("db.internal".to_owned(), true))
         );
     }
 
@@ -9388,8 +9451,9 @@ mod tests {
     #[tokio::test]
     async fn pg_gate_keeps_a_public_literal_host() {
         let gated = pg_gate("postgres://u:p@1.1.1.1:6543/x", DialPolicy::DenyPrivate).await;
-        let gated = gated.map(|o| (o.get_host().to_owned(), o.get_port()));
-        assert_eq!(gated, Ok(("1.1.1.1".to_owned(), 6543)));
+        let gated =
+            gated.map(|(o, relay)| (o.get_host().to_owned(), o.get_port(), relay.is_none()));
+        assert_eq!(gated, Ok(("1.1.1.1".to_owned(), 6543, true)));
     }
 
     /// DNS rebinding: the named host is resolved once and the options the
@@ -9399,13 +9463,13 @@ mod tests {
     async fn pg_gate_pins_a_named_host_against_rebinding() {
         let resolver = PublicThenPrivate::new();
         let gated = pg_gate_with(
-            "postgres://u:p@rebind.example:5432/x",
+            "postgres://u:p@rebind.example:5432/x?sslmode=disable",
             DialPolicy::DenyPrivate,
             &resolver,
         )
         .await
-        .map(|o| (o.get_host().to_owned(), o.get_port()));
-        assert_eq!(gated, Ok((REBIND_PUBLIC.to_string(), 5432)));
+        .map(|(o, relay)| (o.get_host().to_owned(), o.get_port(), relay.is_none()));
+        assert_eq!(gated, Ok((REBIND_PUBLIC.to_string(), 5432, true)));
         assert_eq!(
             resolver.calls(),
             1,
@@ -9431,9 +9495,10 @@ mod tests {
         );
     }
 
-    /// A named host under `sslmode=verify-full` cannot be pinned without
-    /// losing the certificate's host-name check, so it is refused; an IP
-    /// literal under the same mode is pinned as itself.
+    /// Without a relay, a named host under `sslmode=verify-full` cannot be
+    /// pinned without losing the certificate's host-name check, so it is
+    /// refused; an IP literal under the same mode is pinned as itself.
+    #[cfg(not(unix))]
     #[tokio::test]
     async fn pg_gate_refuses_verify_full_on_a_named_host_under_deny_private() {
         let resolver = PublicThenPrivate::new();
@@ -9459,6 +9524,269 @@ mod tests {
         assert!(literal.is_ok(), "{:?}", literal.err());
     }
 
+    /// DNS rebinding under every mode that may negotiate TLS: the host keeps
+    /// its name for SNI and certificate verification, the driver dials the
+    /// relay socket, and the relay carries the dial to the address vetted by
+    /// the only lookup, so the rebound (private) answer is never dialled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pg_gate_relays_a_tls_named_host_to_its_vetted_address() {
+        for mode in [
+            "",
+            "?sslmode=prefer",
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+        ] {
+            let resolver = PublicThenPrivate::new();
+            let url = format!("postgres://u:p@rebind.example:5432/x{mode}");
+            let gated = pg_gate_with(&url, DialPolicy::DenyPrivate, &resolver).await;
+            assert!(gated.is_ok(), "{url:?}: {:?}", gated.as_ref().err());
+            let Ok((options, relay)) = gated else { return };
+            assert!(relay.is_some(), "{url:?} must dial through a relay");
+            let Some(relay) = relay else { return };
+            assert_eq!(options.get_host(), "rebind.example", "{url:?}");
+            assert_eq!(
+                options.get_socket().map(std::path::PathBuf::as_path),
+                Some(relay.socket_dir()),
+                "{url:?}"
+            );
+            assert_eq!(
+                relay.target().socket_addr(),
+                std::net::SocketAddr::new(REBIND_PUBLIC, 5432),
+                "{url:?}"
+            );
+            assert_eq!(
+                resolver.calls(),
+                1,
+                "{url:?}: the name must be resolved exactly once"
+            );
+        }
+    }
+
+    /// A relay that could not be opened refuses the dial as `RelayUnavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unavailable_relay_is_a_relay_unavailable_connect_error() {
+        assert!(matches!(
+            DbConnectError::from(crate::ssrf::RelayUnavailable),
+            DbConnectError::RelayUnavailable
+        ));
+    }
+
+    /// An IP-literal host under `sslmode=verify-full` is pinned as itself,
+    /// with no relay.
+    #[tokio::test]
+    async fn pg_gate_pins_a_literal_verify_full_host_without_a_relay() {
+        let literal = pg_gate(
+            "postgres://1.1.1.1/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+        )
+        .await
+        .map(|(o, relay)| (o.get_host().to_owned(), relay.is_none()));
+        assert_eq!(literal, Ok(("1.1.1.1".to_owned(), true)));
+    }
+
+    /// A named host resolving only to a private address is refused before any
+    /// relay opens, whatever the TLS mode.
+    #[tokio::test]
+    async fn pg_gate_refuses_a_private_named_tls_host_before_relaying() {
+        let resolver = PublicThenPrivate::new();
+        let first = pg_gate_with(
+            "postgres://rebind.example/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert!(
+            first.is_ok() || cfg!(not(unix)),
+            "{:?}",
+            first.as_ref().err()
+        );
+        let second = pg_gate_with(
+            "postgres://rebind.example/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert!(
+            matches!(
+                second,
+                Err(DbConnectError::HostRefused(
+                    SsrfRefusal::Blocked {
+                        range: BlockedRange::Private,
+                        ..
+                    } | SsrfRefusal::UnpinnableTlsName { .. }
+                ))
+            ),
+            "{:?}",
+            second.err()
+        );
+    }
+
+    /// The test CA that signed [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    const PG_TLS_CA_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/ca.pem"
+    ));
+
+    /// A server certificate valid only for [`PG_TLS_HOST`].
+    #[cfg(unix)]
+    const PG_TLS_SERVER_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.pem"
+    ));
+
+    /// The private key of [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    const PG_TLS_SERVER_KEY: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.key"
+    ));
+
+    /// The only name [`PG_TLS_SERVER_PEM`] is valid for.
+    #[cfg(unix)]
+    const PG_TLS_HOST: &str = "db.example.test";
+
+    /// What the fake TLS server saw of one client.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct TlsSeen {
+        /// The SNI name the client sent, if any.
+        sni: Option<String>,
+        /// Whether the TLS handshake completed.
+        handshaken: bool,
+    }
+
+    /// The fake server's TLS configuration, serving [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    fn pg_tls_server_config() -> Option<rustls::ServerConfig> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_slice_iter(PG_TLS_SERVER_PEM)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let key = PrivateKeyDer::from_pem_slice(PG_TLS_SERVER_KEY).ok()?;
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()
+    }
+
+    /// Answer one PostgreSQL `SSLRequest` on `listener` with TLS, then hang up.
+    #[cfg(unix)]
+    fn serve_one_pg_tls_client(listener: &std::net::TcpListener) -> Option<TlsSeen> {
+        use std::io::{Read, Write};
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+        let (mut tcp, _) = listener.accept().ok()?;
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok()?;
+        let mut request = [0_u8; 8];
+        tcp.read_exact(&mut request).ok()?;
+        if request != SSL_REQUEST {
+            return None;
+        }
+        tcp.write_all(b"S").ok()?;
+        let config = pg_tls_server_config()?;
+        let mut tls = rustls::ServerConnection::new(std::sync::Arc::new(config)).ok()?;
+        while tls.is_handshaking() {
+            if tls.complete_io(&mut tcp).is_err() {
+                break;
+            }
+        }
+        Some(TlsSeen {
+            sni: tls.server_name().map(str::to_owned),
+            handshaken: !tls.is_handshaking(),
+        })
+    }
+
+    /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
+    /// through a relay pinned to the server's address.
+    #[cfg(unix)]
+    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DbFailure>, Option<TlsSeen>) {
+        use sqlx::ConnectOptions;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "{:?}", listener.as_ref().err());
+        let Ok(listener) = listener else {
+            return (Err(DbFailure::Io), None);
+        };
+        let Ok(server) = listener.local_addr() else {
+            return (Err(DbFailure::Io), None);
+        };
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
+        });
+        let relay = crate::ssrf::PinnedRelay::open(
+            crate::ssrf::VettedAddr::assume_vetted_for_test(server),
+            5432,
+            4,
+        );
+        assert!(relay.is_ok(), "{:?}", relay.as_ref().err());
+        let Ok(relay) = relay else {
+            return (Err(DbFailure::Io), None);
+        };
+        let options = sqlx::postgres::PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .socket(relay.socket_dir())
+            .username("ipe")
+            .database("ipe")
+            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
+            .ssl_root_cert_from_pem(PG_TLS_CA_PEM.to_vec());
+        let limit = std::time::Duration::from_secs(20);
+        let connected = tokio::time::timeout(limit, options.connect()).await;
+        let outcome = match connected {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(DbFailure::of(&e)),
+            Err(_) => Err(DbFailure::PoolTimedOut),
+        };
+        let seen = tokio::time::timeout(limit, seen_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        (outcome, seen)
+    }
+
+    /// Through the relay, the driver sends the host name, not the pinned IP,
+    /// as SNI and completes a `verify-full` handshake against a certificate
+    /// valid only for that name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relayed_tls_dial_sends_the_host_name_and_verifies_it() {
+        let (_outcome, seen) = dial_pg_tls_through_relay(PG_TLS_HOST).await;
+        assert_eq!(
+            seen,
+            Some(TlsSeen {
+                sni: Some(PG_TLS_HOST.to_owned()),
+                handshaken: true,
+            })
+        );
+    }
+
+    /// Through the relay, a certificate that is not valid for the dialled
+    /// host name is refused by the driver before the handshake completes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
+        let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
+        assert!(
+            matches!(outcome, Err(DbFailure::Tls | DbFailure::Io)),
+            "{outcome:?}"
+        );
+        assert!(
+            seen.as_ref()
+                .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
+            "{seen:?}"
+        );
+    }
+
     /// An unresolvable named host is refused with the typed reason.
     #[tokio::test]
     async fn pg_gate_refuses_an_unresolvable_named_host() {
@@ -9478,7 +9806,8 @@ mod tests {
             let parsed = DbUrl::parse(url);
             assert!(parsed.is_ok(), "{url:?}: {:?}", parsed.err());
             let Ok(parsed) = parsed else { return };
-            let gated = <sqlx::Sqlite as GatedDial>::gated_connect_options(&parsed).await;
+            let gated =
+                <sqlx::Sqlite as GatedDial>::gated_connect_options(&parsed, 4, &mut None).await;
             assert!(gated.is_ok(), "{url:?}: {:?}", gated.err());
         }
     }
@@ -9610,7 +9939,7 @@ mod tests {
         assert!(postgres.is_ok(), "{:?}", postgres.as_ref().err());
         let Ok(postgres) = postgres else { return };
         assert_eq!(
-            <sqlx::Sqlite as GatedDial>::gated_connect_options(&postgres)
+            <sqlx::Sqlite as GatedDial>::gated_connect_options(&postgres, 4, &mut None)
                 .await
                 .err(),
             Some(DbConnectError::EngineMismatch {
@@ -9622,7 +9951,7 @@ mod tests {
         assert!(sqlite.is_ok(), "{:?}", sqlite.as_ref().err());
         let Ok(sqlite) = sqlite else { return };
         assert_eq!(
-            <sqlx::Postgres as GatedDial>::gated_connect_options(&sqlite)
+            <sqlx::Postgres as GatedDial>::gated_connect_options(&sqlite, 4, &mut None)
                 .await
                 .err(),
             Some(DbConnectError::EngineMismatch {

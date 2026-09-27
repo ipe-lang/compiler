@@ -664,6 +664,9 @@ pbkdf2 = "0.12"
 # (it now backs the front-door concurrency-cap layer, not only the test-only
 # `ServiceExt::oneshot`). The `server` unit tests reach it through that feature.
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
+# A fake TLS PostgreSQL server proves the pinned relay keeps SNI and
+# certificate host-name verification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

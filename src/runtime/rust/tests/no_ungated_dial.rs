@@ -111,7 +111,7 @@ impl AllowedDial {
 }
 
 /// Every raw dial admitted outside `db.rs`; each must match exactly one dial.
-const ALLOWED_DIALS: [AllowedDial; 4] = [
+const ALLOWED_DIALS: [AllowedDial; 5] = [
     AllowedDial {
         file: "web/hub.rs",
         func: "open_spill",
@@ -129,6 +129,12 @@ const ALLOWED_DIALS: [AllowedDial; 4] = [
         func: "do_connect",
         dial: "tokio::net::TcpStream::connect",
         why: "a TCP dial of the address `VettedDial::Pinned` proved, not a sqlx dial",
+    },
+    AllowedDial {
+        file: "ssrf.rs",
+        func: "dial_relay_target",
+        dial: "tokio::net::TcpStream::connect",
+        why: "the pinned relay's TCP dial of a `VettedAddr`, which only `VettedDial::Pinned` can mint, not a sqlx dial",
     },
     AllowedDial {
         file: "web/console_proxy.rs",

@@ -390,7 +390,7 @@ async fn do_connect<E: From<String> + Send + 'static>(
                 // its class: the address may re-encode an IP-literal host the
                 // displayable URL withholds.
                 Box::pin(async move {
-                    let tcp = tokio::net::TcpStream::connect(addr)
+                    let tcp = tokio::net::TcpStream::connect(addr.socket_addr())
                         .await
                         .map_err(|e| WsFailure::Dial(e.kind()))?;
                     tokio_tungstenite::client_async_with_config(

@@ -48,7 +48,7 @@ fn signature_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
 fn generic_succeed_capture_sync_bounds_emitted() {
     let root = crate::support::repo_root();
     let entry = fixture_dir(&root).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_emit"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -84,7 +84,7 @@ fn generic_succeed_tail_sync_seal_runs() {
     let root = crate::support::repo_root();
     let dir = fixture_dir(&root);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

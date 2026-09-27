@@ -65,7 +65,7 @@ fn t1_bounds(signature: &str) -> Option<&str> {
 fn generic_return_only_sync_bounds_emitted() {
     let root = crate::support::repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_emit"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -97,7 +97,7 @@ fn generic_return_only_sync_bounds_emitted() {
 fn generic_return_only_sync_seal_builds() {
     let root = crate::support::repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

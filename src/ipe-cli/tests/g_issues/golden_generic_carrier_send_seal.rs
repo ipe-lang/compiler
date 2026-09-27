@@ -53,7 +53,7 @@ fn first_generic_of<'a>(main_rs: &'a str, ipe_name: &str) -> Option<&'a str> {
 fn generic_carrier_send_bounds_emitted() {
     let root = crate::support::repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_emit"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -81,7 +81,7 @@ fn generic_carrier_send_bounds_emitted() {
 fn generic_carrier_send_seal_builds() {
     let root = crate::support::repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
