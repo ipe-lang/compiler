@@ -21,11 +21,14 @@
 //! | `NoUnused.Imports`, `NoUnused.Variables` (let bindings) | covered: `unused-imports`, `unused-bindings` |
 //! | `NoDebug.Log`, `NoDebug.TodoOrToString` | rejected: the compiler already refuses `Debug.*` in a release build (IPE-L0140) |
 //! | `NoSinglePatternCase` | rejected: `let` does not destructure, so a one-arm `case` is the only destructuring form |
-//! | `NoExposingEverything`, `NoImportingEverything` | remaining: needs a per-shape allowance (`Main`, tests) to stay precise |
-//! | `NoMissingTypeAnnotation` | remaining: precise, but a policy choice better left to `lint.ipe` opt-in |
-//! | `Simplify` (`[a] ++ xs` → `a :: xs`, `List.map identity xs` → `xs`, `not (not x)`) | remaining: cheap syntactic batch |
-//! | `NoRedundantConcat`, `NoRedundantCons` | remaining: cheap syntactic batch |
-//! | `NoUnused.Parameters`, `NoUnused.Patterns` | remaining: needs the binder-scope walk `unused-bindings` owns |
+//! | `NoExposingEverything`, `NoImportingEverything` | rejected: `import X exposing (..)` is idiomatic in every example's `package.ipe` manifest — a blanket rule misfires across the whole example corpus with no `package.ipe`-shaped allowance to except it |
+//! | `NoMissingTypeAnnotation` | ported: `no-missing-type-annotation`, `Allow` by default (opt in via `lint.ipe`) |
+//! | `Simplify` (`[a] ++ xs` → `a :: xs`) | ported: `simplify-cons-append` |
+//! | `Simplify` (`List.map identity xs` → `xs`) | ported: `simplify-map-identity` |
+//! | `Simplify` (`not (not x)` → `x`) | ported: `simplify-double-not` |
+//! | `NoRedundantConcat` | ported: `no-redundant-concat` |
+//! | `NoRedundantCons` | ported: `no-redundant-cons` |
+//! | `NoUnused.Parameters`, `NoUnused.Patterns` | remaining: needs a general recursive pattern-variable collector (`unused-bindings` only walks flat `PVar` `let` binders); a parameter conventionally kept for interface clarity also risks false positives |
 //! | `NoPrematureLetComputation` | remaining: needs a branch-usage analysis |
 //! | `NoRecursiveUpdate`, `NoMissingSubscriptionsCall` | remaining: needs TEA-shape knowledge per app kind |
 //! | `NoUnused.Exports`, `NoUnused.CustomTypeConstructors`, `NoUnused.Dependencies` | remaining: whole-project passes (cross-module engine) |
@@ -34,17 +37,25 @@ mod adjacent_bools;
 mod multiline_lambda_arg;
 mod no_bool_literal_compare;
 mod no_empty_icon_button_label;
+mod no_missing_type_annotation;
 mod no_redundant_bool_if;
+mod no_redundant_concat;
+mod no_redundant_cons;
 mod no_silent_outline_none;
 mod no_simple_let_body;
 mod prefer_pipeline;
 mod prim_param;
+mod simplify_cons_append;
+mod simplify_double_not;
+mod simplify_map_identity;
 mod unsafe_convention;
 mod unused_bindings;
 mod unused_imports;
 mod wrapper_consistency;
 mod wrapper_consistency_cross;
 
+#[cfg(test)]
+mod simplify_tests;
 #[cfg(test)]
 mod style_tests;
 
@@ -142,6 +153,12 @@ pub fn run_all(ctx: &Ctx) -> Vec<Finding> {
     findings.extend(no_bool_literal_compare::check(ctx));
     findings.extend(no_redundant_bool_if::check(ctx));
     findings.extend(no_simple_let_body::check(ctx));
+    findings.extend(simplify_double_not::check(ctx));
+    findings.extend(simplify_map_identity::check(ctx));
+    findings.extend(simplify_cons_append::check(ctx));
+    findings.extend(no_redundant_cons::check(ctx));
+    findings.extend(no_redundant_concat::check(ctx));
+    findings.extend(no_missing_type_annotation::check(ctx));
     findings
 }
 

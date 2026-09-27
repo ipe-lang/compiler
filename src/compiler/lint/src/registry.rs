@@ -116,6 +116,42 @@ pub const RULES: &[RuleInfo] = &[
         default_severity: Severity::Warn,
         fixable: false,
     },
+    RuleInfo {
+        name: "simplify-double-not",
+        summary: "`not (not x)`, which restates `x`",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "simplify-map-identity",
+        summary: "`List.map identity xs`, which restates `xs`",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "simplify-cons-append",
+        summary: "`[ a ] ++ xs`, which restates `a :: xs`",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-redundant-cons",
+        summary: "consing onto a list literal, which restates a longer list literal",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-redundant-concat",
+        summary: "`List.concat` / `String.concat` of a single-element list, which restates that element",
+        default_severity: Severity::Warn,
+        fixable: false,
+    },
+    RuleInfo {
+        name: "no-missing-type-annotation",
+        summary: "a top-level declaration with no `: T` signature",
+        default_severity: Severity::Allow,
+        fixable: false,
+    },
 ];
 
 /// The metadata for `name`, or `None` when no such rule ships.

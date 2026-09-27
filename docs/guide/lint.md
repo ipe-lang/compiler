@@ -50,6 +50,12 @@ still drive the ecosystem toward "invalid states unrepresentable".
 | `no-bool-literal-compare` | A comparison against a `Bool` literal: `done == True` → `done`, `done /= True` → `not done`. | advisory |
 | `no-redundant-bool-if` | An `if` choosing between `Bool` literals: `if c then True else False` → `c`. | advisory |
 | `no-simple-let-body` | A `let` whose body only returns its last binding: `let total = a + b in total` → `a + b`. | advisory |
+| `simplify-double-not` | A double negation: `not (not x)` → `x`. | advisory |
+| `simplify-map-identity` | Mapping the identity function: `List.map identity xs` → `xs`. | advisory |
+| `simplify-cons-append` | Appending a single-element list: `[ a ] ++ xs` → `a :: xs`. | advisory |
+| `no-redundant-cons` | Consing onto a list literal: `x :: [ a, b ]` → `[ x, a, b ]`. | advisory |
+| `no-redundant-concat` | Flattening a single-element list of lists (or strings): `List.concat [ xs ]` → `xs`. | advisory |
+| `no-missing-type-annotation` | A top-level declaration with no `: T` signature. `Allow` by default — opt in via `lint.ipe` (`Lint.warn "no-missing-type-annotation"`). | advisory |
 
 An **advisory** rule reports and teaches but never rewrites your code: its remedy
 is a decision — an exported signature to change and thread through every call
