@@ -114,6 +114,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '**/Cargo.toml'
+              - 'rust-toolchain.toml'
               - '.github/workflows/**'
               # AGENTS.md is a BUILD input: include_str!'d into ipe-cli's init.rs
               # and asserted by the init_subcommand test. Every other root *.md /
@@ -1430,6 +1431,30 @@ jobs:
         run: cargo run -p ipe --bin gen-cli-docs -- --repo-root "${{ github.workspace }}"
       - name: Fail if generated docs differ from committed files
         run: git diff --exit-code docs/reference/cli.md
+
+  # Drift gate for docs/reference/requirements.md.
+  #
+  # Runs the gen-requirements-docs generator against the committed file and
+  # fails when the output differs, so a change to the pinned Rust toolchain,
+  # the workspace edition, or a DB engine version floor that is not reflected
+  # in the committed reference reddens the build (no silent drift).
+  #
+  # Change-gated: rust-toolchain.toml, the workspace Cargo.toml, and db.rs are
+  # already covered by the `code` filter, so a pure prose-only PR skips this
+  # vacuously; it always runs on push/nightly.
+  requirements-docs-drift:
+    runs-on: ubuntu-latest
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate docs/reference/requirements.md
+        run: cargo run -p ipe_docs --bin gen-requirements-docs -- --repo-root "${{ github.workspace }}"
+      - name: Fail if generated docs differ from committed files
+        run: git diff --exit-code docs/reference/requirements.md
 
   # Drift gate for the byte-exact CLI transcript goldens.
   #

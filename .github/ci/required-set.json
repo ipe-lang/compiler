@@ -23,6 +23,7 @@
   "playground-jail",
   "quick-check",
   "registry-admission",
+  "requirements-docs-drift",
   "runtime-full-features",
   "seal-slice",
   "seal-smoke",

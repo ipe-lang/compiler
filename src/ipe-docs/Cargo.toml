@@ -17,6 +17,10 @@ name = "gen-stdlib-docs"
 path = "src/bin/gen_stdlib_docs.rs"
 
 [[bin]]
+name = "gen-requirements-docs"
+path = "src/bin/gen_requirements_docs.rs"
+
+[[bin]]
 name = "gen_site"
 path = "src/bin/gen_site.rs"
 

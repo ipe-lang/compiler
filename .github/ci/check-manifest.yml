@@ -85,6 +85,9 @@ checks:
   - context: cli-docs-drift
     disposition: gate
     producer: ci.yml
+  - context: requirements-docs-drift
+    disposition: gate
+    producer: ci.yml
   - context: cli-transcripts-drift
     disposition: gate
     producer: ci.yml
