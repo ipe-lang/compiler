@@ -1818,7 +1818,7 @@ fn update_arm_step_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
     write_main(&ipe_dir, &web_fixture_counter(1, ""))?;
 
     let sink = EventSink::default();
-    let port = 19181;
+    let port = 19177;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink)?;
 
     assert!(
@@ -2201,18 +2201,23 @@ fn cmd_perform_arm_composes_and_serves() -> Result<(), BoxError> {
     let port = 19184;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink)?;
 
+    // Poll BOTH "serving" and "Restarted recorded" together, under the SAME
+    // generous cold-build budget: the app answers HTTP the instant its
+    // readiness probe passes, slightly BEFORE the loop emits the cold
+    // build's `Restarted` event (readiness is checked synchronously, and
+    // only once it passes does the orchestrator emit `Restarted`). Chaining
+    // a separate short-lived wait after this one raced the two conditions
+    // against each other under CPU contention — a loaded host can starve the
+    // orchestrator thread between readiness and `emit()` well past a short
+    // fixed window — so polling the conjunction under one generous deadline
+    // removes that race instead of tightening it.
     assert!(
-        wait_for_serving(port, Duration::from_mins(4)),
+        wait_for(Duration::from_mins(4), || {
+            sink.count_restarted() >= 1 && http_get_body(port).is_some_and(|b| b.contains("marker"))
+        }),
         "the flag-on cold build of a Cmd.perform update arm must serve \
-         (the composed fire_cmd_wiring dispatch compiles and boots)"
-    );
-    assert!(
-        wait_for(Duration::from_secs(10), || sink.count_restarted() >= 1),
-        "the cold build must record its initial Restarted event"
-    );
-    assert!(
-        http_get_body(port).is_some_and(|b| b.contains("marker")),
-        "the composed-wiring app must serve its view"
+         (the composed fire_cmd_wiring dispatch compiles and boots) and \
+         record its initial Restarted event"
     );
 
     stop_and_join(&handle, join)

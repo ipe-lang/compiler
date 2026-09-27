@@ -529,7 +529,7 @@ fn bluegreen_rebuild_keeps_the_client_connection_alive() -> Result<(), BoxError>
     let (ipe_dir, out_dir) = fresh_dirs("keepalive")?;
     write_main(&ipe_dir, &web_fixture("MARKER-V1"))?;
 
-    let port = 19171;
+    let port = 19191;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
 
     assert!(
@@ -622,7 +622,7 @@ fn bluegreen_rebuild_preserves_the_model_across_the_swap() -> Result<(), BoxErro
     let (ipe_dir, out_dir) = fresh_dirs("handoff")?;
     write_main(&ipe_dir, &ticker_fixture("HANDOFF-V1"))?;
 
-    let port = 19173;
+    let port = 19193;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
     assert!(
         wait_for_marker(port, "HANDOFF-V1", Duration::from_mins(5)),
@@ -699,7 +699,7 @@ fn bluegreen_rebuild_resets_cleanly_on_model_type_change() -> Result<(), BoxErro
     let (ipe_dir, out_dir) = fresh_dirs("reset")?;
     write_main(&ipe_dir, &ticker_fixture("RESET-V1"))?;
 
-    let port = 19174;
+    let port = 19194;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
     assert!(
         wait_for_marker(port, "RESET-V1", Duration::from_mins(5)),
@@ -806,7 +806,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
     let (ipe_dir, out_dir) = fresh_dirs("additive")?;
     write_main(&ipe_dir, &ticker_fixture("ADDITIVE-V1"))?;
 
-    let port = 19175;
+    let port = 19195;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
     assert!(
         wait_for_marker(port, "ADDITIVE-V1", Duration::from_mins(5)),
@@ -867,7 +867,7 @@ fn flag_off_direct_path_still_swaps_the_binary() -> Result<(), BoxError> {
     let (ipe_dir, out_dir) = fresh_dirs("flagoff")?;
     write_main(&ipe_dir, &web_fixture("OFF-V1"))?;
 
-    let port = 19172;
+    let port = 19192;
     let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false)?;
 
     assert!(

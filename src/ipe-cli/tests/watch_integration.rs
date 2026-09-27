@@ -411,11 +411,17 @@ fn watch_coalesces_a_rapid_double_save_into_one_rebuild() -> Result<(), BoxError
 
     let rebuilds_before = sink.count_rebuild_started();
 
-    // Two writes ~20ms apart — well inside the 120ms quiescence window
-    // configured in `start_watch` — must coalesce into exactly ONE
-    // rebuild cycle, and the LAST write (v3) must be what ships.
+    // Back-to-back writes, deliberately with NO intervening sleep: a
+    // `thread::sleep` only guarantees a MINIMUM wait — under CPU contention
+    // the scheduler can wake a parked thread arbitrarily late, so a fixed
+    // sleep meant to land "well inside" the 120ms quiescence window
+    // configured in `start_watch` can instead overshoot it, splitting this
+    // burst into two rebuild cycles instead of one. Never voluntarily
+    // yielding between the two writes keeps the real gap between them down
+    // to the two syscalls' own cost, which stays inside the window
+    // regardless of scheduler load. Both writes must still coalesce into
+    // exactly ONE rebuild cycle, and the LAST write (v3) must be what ships.
     write_main(&ipe_dir, &server_fixture("v2"))?;
-    std::thread::sleep(Duration::from_millis(20));
     write_main(&ipe_dir, &server_fixture("v3"))?;
 
     assert!(

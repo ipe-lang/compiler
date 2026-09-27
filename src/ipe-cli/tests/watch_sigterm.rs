@@ -366,7 +366,7 @@ fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() ->
     std::fs::write(ipe_dir.join("Main.ipe"), server_fixture("v1"))
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
 
-    let port = 19157;
+    let port = 19159;
     let mut ipe_proc = spawn_ipe_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false)?;
 
     if !wait_for_body(port, "v1", WATCH_SERVE_BUDGET) {
