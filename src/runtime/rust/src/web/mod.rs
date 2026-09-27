@@ -2046,6 +2046,163 @@ where
     })
 }
 
+/// `Web.embed`'s mountable handle over one evaluation of the single-page cfg.
+///
+/// Carries both run modes of the same app: the standalone `serve` task
+/// ([`web_app`]) and the [`web_embed_router`] mount builder. Each callback is
+/// shared between the two through an `Arc`, so the cfg's values — and every
+/// local they capture, `Clone` or not (a function-typed parameter, a `Cmd`) —
+/// are built once and never duplicated or cloned.
+#[cfg(feature = "web")]
+pub fn web_embed<Model, Msg, FInit, FUpdate, FView, FSubs>(
+    init: FInit,
+    update: FUpdate,
+    view: FView,
+    subscriptions: FSubs,
+    store_kind: String,
+    store_path: String,
+    schema_tag: [u8; 32],
+) -> crate::tea::WebApp
+where
+    Model: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + crate::stringify::IpeStringify
+        + 'static,
+    Msg: Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + crate::stringify::IpeStringify
+        + 'static,
+    FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
+    FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
+{
+    let init = Arc::new(init);
+    let update = Arc::new(update);
+    let view = Arc::new(view);
+    let subscriptions = Arc::new(subscriptions);
+    let serve = {
+        let (init, update, view, subscriptions) = (
+            Arc::clone(&init),
+            Arc::clone(&update),
+            Arc::clone(&view),
+            Arc::clone(&subscriptions),
+        );
+        web_app::<crate::error::IpeError, Model, Msg, _, _, _, _>(
+            move |req| (*init)(req),
+            move |msg, model| (*update)(msg, model),
+            move |model| (*view)(model),
+            move |model| (*subscriptions)(model),
+            store_kind.clone(),
+            store_path.clone(),
+            schema_tag,
+        )
+    };
+    let router = web_embed_router::<Model, Msg, _, _, _, _>(
+        move |req| (*init)(req),
+        move |msg, model| (*update)(msg, model),
+        move |model| (*view)(model),
+        move |model| (*subscriptions)(model),
+        store_kind,
+        store_path,
+        schema_tag,
+    );
+    crate::tea::WebApp(crate::tea::WebAppKind::Mountable { serve, router })
+}
+
+/// `Web.embed`'s mountable handle over one evaluation of the routed cfg.
+///
+/// The routed sibling of [`web_embed`]: [`web_app_routed`] serves standalone,
+/// [`web_embed_router_routed`] builds the mount. The callbacks and `set_page`
+/// are shared through an `Arc`; the route table and `notFound` page are `Clone`
+/// by their bounds, so each half owns a copy.
+#[allow(clippy::too_many_arguments)] // mirrors web_app_routed's routed cfg (callbacks + route table + set_page + store)
+#[cfg(feature = "web")]
+pub fn web_embed_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage>(
+    init: FInit,
+    update: FUpdate,
+    view: FView,
+    subscriptions: FSubs,
+    routes: Vec<route::Route<Page>>,
+    not_found: Page,
+    set_page: FSetPage,
+    store_kind: String,
+    store_path: String,
+    schema_tag: [u8; 32],
+) -> crate::tea::WebApp
+where
+    Model: serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + crate::stringify::IpeStringify
+        + 'static,
+    Msg: Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + crate::stringify::IpeStringify
+        + 'static,
+    Page: Clone + Send + Sync + 'static,
+    FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+    FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
+    FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
+    FSetPage: Fn(Page, Model) -> Model + Send + Sync + 'static,
+{
+    let init = Arc::new(init);
+    let update = Arc::new(update);
+    let view = Arc::new(view);
+    let subscriptions = Arc::new(subscriptions);
+    let set_page = Arc::new(set_page);
+    let serve = {
+        let (init, update, view, subscriptions, set_page) = (
+            Arc::clone(&init),
+            Arc::clone(&update),
+            Arc::clone(&view),
+            Arc::clone(&subscriptions),
+            Arc::clone(&set_page),
+        );
+        web_app_routed::<crate::error::IpeError, Model, Msg, Page, _, _, _, _, _>(
+            move |req| (*init)(req),
+            move |msg, model| (*update)(msg, model),
+            move |model| (*view)(model),
+            move |model| (*subscriptions)(model),
+            routes.clone(),
+            not_found.clone(),
+            move |page, model| (*set_page)(page, model),
+            store_kind.clone(),
+            store_path.clone(),
+            schema_tag,
+        )
+    };
+    let router = web_embed_router_routed::<Model, Msg, Page, _, _, _, _, _>(
+        move |req| (*init)(req),
+        move |msg, model| (*update)(msg, model),
+        move |model| (*view)(model),
+        move |model| (*subscriptions)(model),
+        routes,
+        not_found,
+        move |page, model| (*set_page)(page, model),
+        store_kind,
+        store_path,
+        schema_tag,
+    );
+    crate::tea::WebApp(crate::tea::WebAppKind::Mountable { serve, router })
+}
+
 /// A router that answers EVERY path with `503 Service Unavailable` + a plain
 /// message. Used when a mounted `Web.embed` cannot honour its store config
 /// (fail-closed): the mount stays reachable enough to report the fault, but

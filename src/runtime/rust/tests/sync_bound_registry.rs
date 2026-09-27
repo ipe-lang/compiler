@@ -78,6 +78,14 @@ const SYNC_SITES: &[(&str, SyncSite)] = &[
         SyncSite::ProgramEntry(&[StdlibKernel::WebApp, StdlibKernel::WebAppRouted]),
     ),
     (
+        "web_embed",
+        SyncSite::ProgramEntry(&[StdlibKernel::WebEmbed]),
+    ),
+    (
+        "web_embed_routed",
+        SyncSite::ProgramEntry(&[StdlibKernel::WebEmbed]),
+    ),
+    (
         "web_embed_router",
         SyncSite::ProgramEntry(&[StdlibKernel::WebEmbed]),
     ),

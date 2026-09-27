@@ -167,8 +167,8 @@ fn untyped_embed_row_model_refused_or_builds() {
 }
 
 /// With its message type fixed nothing is generic, so the entry must be
-/// accepted and its crate must `cargo build` (the mounted app's two callback
-/// copies both capture `m`).
+/// accepted and its crate must `cargo build` (the mounted app's `init` captures
+/// `m`).
 #[test]
 fn untyped_embed_row_model_pinned_msg_builds() {
     let name = "untyped_embed_row_model_pinned_msg";
