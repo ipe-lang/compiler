@@ -27,20 +27,6 @@ use lsp_types::{TextEdit, Url, WorkspaceEdit};
 use crate::navigation::goto_definition;
 use crate::offset::{PositionEncoding, span_to_range};
 
-// ── Identifier grammar ───────────────────────────────────────────────────────
-//
-// These predicates mirror `ipe_parse`'s lexer
-// (`src/compiler/parse/src/lexer.rs`: `is_ident_start` / `is_ident_continue`).
-// If those rules change, update here in lockstep — SSOT is the lexer.
-
-const fn ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-const fn ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
 // ── Case class ───────────────────────────────────────────────────────────────
 
 /// Whether a renamed symbol is a type/constructor (uppercase) or a value
@@ -72,21 +58,14 @@ impl ValidatedIdentifier {
     /// the wrong case class for `kind`.
     #[must_use]
     pub fn parse(raw: &str, kind: SymbolKind) -> Option<Self> {
-        let mut chars = raw.chars();
-        let first = chars.next()?;
-        if !ident_start(first) {
+        // Gate on the lexer's own identifier shape and keyword table (the
+        // single source of truth) so a rename can never produce a keyword or a
+        // non-token — renaming to `foreign`, `do`, or any other reserved word
+        // rewrites references into unparseable source.
+        if !ipe_parse::is_identifier(raw) {
             return None;
         }
-        if !chars.all(ident_continue) {
-            return None;
-        }
-        // Gate on the lexer's own keyword table (the single source of truth) so
-        // a rename can never turn a value into a keyword token — renaming to
-        // `foreign`, `do`, or any other reserved word rewrites references into
-        // unparseable source.
-        if ipe_parse::is_keyword(raw) {
-            return None;
-        }
+        let first = raw.chars().next()?;
         match kind {
             SymbolKind::Type => {
                 if !first.is_ascii_uppercase() {
@@ -590,12 +569,8 @@ mod tests {
 
     #[test]
     fn keywords_are_rejected() {
-        // `foreign` and `do` are the words a hand-mirrored list had dropped;
-        // gating on the lexer's own table (`ipe_parse::is_keyword`) covers them.
-        for kw in [
-            "let", "if", "then", "else", "type", "case", "of", "in", "module", "import", "do",
-            "foreign", "exposing", "as",
-        ] {
+        // Driven off the lexer's own table so a new keyword is covered on add.
+        for kw in ipe_parse::KEYWORDS {
             assert!(
                 ValidatedIdentifier::parse(kw, SymbolKind::Value).is_none(),
                 "keyword {kw:?} must be rejected"

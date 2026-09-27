@@ -20,7 +20,8 @@ static NEXT: AtomicU32 = AtomicU32::new(0);
 /// A fresh, empty scratch directory unique to this process and call.
 fn scratch(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("ipe_lint_{tag}_{}_{n}", std::process::id()));
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_lint_{tag}_{}_{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -213,6 +214,53 @@ fn unknown_rule_in_config_fails_closed() -> TestResult {
     assert!(
         stderr.contains("not a known lint rule"),
         "the rejection names the problem:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Human `ipe lint <file>` output is the one screen frame.
+///
+/// The product header, then every line in the two-space gutter; `NO_COLOR` output carries no colour.
+#[test]
+fn human_output_is_framed_and_guttered() -> TestResult {
+    let out = Command::new(support::ipe_bin())
+        .args(["lint", &fixture("prim_param.ipe").to_string_lossy()])
+        .env("NO_COLOR", "1")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let header = format!(
+        "\n  Ipê language - v{} - https://github.com/arthurmaciel/ipe-lang\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(
+        stdout.starts_with(&header),
+        "the frame header leads:\n{stdout}"
+    );
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        assert!(line.starts_with("  "), "line outside the gutter: {line:?}");
+    }
+    assert!(
+        !stdout.contains('\x1b'),
+        "NO_COLOR output is plain:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// `--json` and `--plain` are machine output: never framed, never coloured.
+#[test]
+fn machine_output_is_never_framed() -> TestResult {
+    let file = fixture("prim_param.ipe").to_string_lossy().into_owned();
+    let (_ok, json, _e) = run_ipe(&["lint", "--json", &file])?;
+    assert!(json.starts_with('{'), "JSON is flush and unframed:\n{json}");
+    assert!(!json.contains("Ipê language"), "no header in JSON:\n{json}");
+    let (_ok, plain, _e) = run_ipe(&["lint", "--plain", &file])?;
+    assert!(
+        !plain.contains("Ipê language"),
+        "no header in plain:\n{plain}"
+    );
+    assert!(
+        plain.lines().all(|l| !l.starts_with(' ')),
+        "plain lines are flush-left:\n{plain}"
     );
     Ok(())
 }

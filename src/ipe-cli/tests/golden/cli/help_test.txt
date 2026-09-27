@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Build and run the project's tests/Main.ipe, reporting pass/fail.
 
   ipe test [<path>]
@@ -10,4 +11,3 @@ exit: 0
 
   Options:
     [--json]  emit a compact {"result":…} verdict on stdout (non-zero exit on a failing case)
-

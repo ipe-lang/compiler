@@ -61,6 +61,70 @@ pub fn ipe_bin() -> PathBuf {
         .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ipe")), PathBuf::from)
 }
 
+/// Per-binary scratch root for e2e output, isolated per `CARGO_TARGET_DIR` pool
+/// so two gates building from different pools never share `/tmp` and clobber
+/// each other's fixed-name output (cargo sets `CARGO_TARGET_TMPDIR` at compile
+/// time for integration test binaries, rooted inside that binary's own target
+/// dir).
+#[must_use]
+#[allow(dead_code)] // adopted file-by-file as tests migrate to the shared helper
+pub fn scratch_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
+/// Unwrap a refusal/acceptance test's scratch-dir setup, failing the test loudly
+/// when it is `None` instead of letting the caller skip silently.
+///
+/// A vacuous skip here would let a rejection/acceptance test pass without ever
+/// running the pipeline — defeating the very SEAL coverage the test exists to
+/// prove. The placeholder `PathBuf` returned after the assertion is unreachable:
+/// the assertion above it already failed the test on that path.
+#[must_use]
+#[allow(dead_code)] // adopted file-by-file as refusal/acceptance tests migrate
+#[track_caller]
+pub fn expect_scratch_entry(test_name: &str, entry: Option<PathBuf>) -> PathBuf {
+    assert!(
+        entry.is_some(),
+        "{test_name}: scratch dir setup failed — a refusal/acceptance test must \
+         fail loudly, never skip silently"
+    );
+    entry.unwrap_or_default()
+}
+
+/// Unwrap a refusal/acceptance test's runtime resolution, failing the test
+/// loudly when it is `Err` instead of letting the caller skip silently.
+///
+/// See [`expect_scratch_entry`] for why a silent skip here is unacceptable; the
+/// placeholder `PathBuf` returned after the assertion is unreachable.
+#[must_use]
+#[allow(dead_code)] // adopted file-by-file as refusal/acceptance tests migrate
+#[track_caller]
+pub fn expect_runtime(test_name: &str, runtime: Result<PathBuf, ipe::CliError>) -> PathBuf {
+    assert!(
+        runtime.is_ok(),
+        "{test_name}: runtime resolution failed — a refusal/acceptance test must \
+         fail loudly, never skip silently: {:?}",
+        runtime.as_ref().err()
+    );
+    runtime.unwrap_or_default()
+}
+
+/// Assert a refusal/acceptance test's scratch-dir setup step (a directory
+/// create, file write, or symlink) succeeded, failing the test loudly instead
+/// of letting the caller skip silently on an `Err`.
+///
+/// See [`expect_scratch_entry`] for why a silent skip here is unacceptable.
+#[allow(dead_code)] // adopted file-by-file as refusal/acceptance tests migrate
+#[track_caller]
+pub fn expect_scratch_step(test_name: &str, result: std::io::Result<()>) {
+    assert!(
+        result.is_ok(),
+        "{test_name}: scratch dir setup step failed — a refusal/acceptance test \
+         must fail loudly, never skip silently: {:?}",
+        result.err()
+    );
+}
+
 /// The `ipe-lang` workspace root (two levels up from this crate's manifest).
 ///
 /// Shared so every golden test resolves the golden tree the same way, rather

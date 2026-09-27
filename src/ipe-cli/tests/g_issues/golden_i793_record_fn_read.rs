@@ -44,7 +44,7 @@ fn record_fn_read_emits_byte_identical() {
         .join("golden")
         .join("fcf_record_fn_read")
         .join("main.rs");
-    let out = std::env::temp_dir().join("ipec_i793_fcf_record_fn_read_emit");
+    let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -71,7 +71,7 @@ fn record_fn_read_emits_byte_identical() {
 fn record_fn_read_builds_and_runs() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i793_fcf_record_fn_read_e2e");
+    let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

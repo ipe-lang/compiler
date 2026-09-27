@@ -72,7 +72,7 @@ const COUNTER_JS: &str =
 /// Materialise a widget project (`package.ipe` + `src/Main.ipe` + `src/js/…`)
 /// under a unique temp dir, returning the dir. The caller removes it.
 fn widget_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-ce-cap-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -262,7 +262,7 @@ main =
 
 /// Materialise a server-mounts-web project under a unique temp dir.
 fn server_mount_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-mount-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -397,7 +397,7 @@ main =
 /// Materialise an unmounted-handle widget project (a `customElement` handle
 /// constructed but never mounted), returning its dir. The caller removes it.
 fn unmounted_widget_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-ce-unmounted-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -458,7 +458,7 @@ fn an_unmounted_handle_that_hides_custom_element_is_rejected() -> TestResult {
 /// program, so a handle a dependency constructs is disclosed by the consumer.
 #[test]
 fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> TestResult {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-ce-transitive-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -501,7 +501,7 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
 /// resolves against the lone entry's own directory, so the JS sits beside it.
 #[test]
 fn a_manifest_less_single_file_handle_discloses_custom_element() -> TestResult {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-ce-singlefile-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -573,7 +573,7 @@ main =
 
 /// Write [`JS_PORT_APP`] as a manifest-less single file and return its dir.
 fn js_port_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-jsport-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -650,7 +650,7 @@ main =
 /// linked set) pins MUST-FIX #1's link-fold at the CLI level.
 #[test]
 fn importing_browser_clipboard_discloses_js_port_clipboard() -> TestResult {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-clip-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -680,7 +680,7 @@ fn importing_browser_clipboard_discloses_js_port_clipboard() -> TestResult {
 /// must still carry `Widget`'s disclosure into the whole-program inferred set.
 #[test]
 fn a_transitive_browser_import_reaches_the_linked_set() -> TestResult {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-cliptrans-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -821,7 +821,7 @@ main =
 "#;
 
 fn write_single(tag: &str, src: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()

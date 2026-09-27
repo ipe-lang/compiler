@@ -44,7 +44,7 @@ fn as_str(path: &Path) -> &str {
 
 /// A fresh, unique temp directory for one test (removed first if present).
 fn fresh_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe_doc_test_{tag}"));
+    let dir = crate::support::scratch_root().join(format!("ipe_doc_test_{tag}"));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -567,4 +567,100 @@ fn help_page_describes_the_shipped_surface() {
         !stdout.to_lowercase().contains("search"),
         "help must not advertise unshipped full-text search, got:\n{stdout}"
     );
+}
+
+/// `ipe doc Module.member` resolves to the member's own doc — a value of a
+/// compiled-source stdlib module included — never "unknown module".
+#[test]
+fn a_qualified_member_resolves_to_its_doc() -> io::Result<()> {
+    let dir = fresh_dir("member_lookup");
+    fs::create_dir_all(&dir)?;
+    for key in ["Ipe.Time.unixMillis", "Time.unixMillis", "Ipe.List.map"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
+        assert!(ok, "`ipe doc {key}` must resolve:\n{stdout}\n{stderr}");
+        let member = key.rsplit('.').next().unwrap_or(key);
+        assert!(
+            stdout.contains(member),
+            "`ipe doc {key}` shows the member:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains("unknown module"),
+            "no unknown-module error:\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A query that names no entry is a miss that never dead-ends.
+///
+/// It lists the closest entries of any kind as ready-to-run `ipe doc` commands, in the error
+/// frame, without the command's usage page.
+#[test]
+fn a_miss_lists_the_closest_matches_as_commands() -> io::Result<()> {
+    let dir = fresh_dir("miss_suggestions");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis"]);
+    assert!(!ok, "a miss exits non-zero");
+    assert!(
+        stdout.is_empty(),
+        "a miss writes nothing to stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("no documentation entry is named `unixMilis`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Closest matches:"), "{stderr}");
+    assert!(
+        stderr.contains("ipe doc Ipe.Time.unixMillis"),
+        "the typo'd member is suggested as a command:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Options:"),
+        "a miss is not misuse; no usage page:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("If you find any bugs, please report them at"),
+        "a miss is the user's to fix; no bug footer:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Even a query close to nothing gets suggestions (bounded), and a bare member
+/// name lists every module member of that name.
+#[test]
+fn every_miss_suggests_something_and_bare_names_find_members() -> io::Result<()> {
+    let dir = fresh_dir("miss_nearest");
+    fs::create_dir_all(&dir)?;
+    let (ok, _stdout, stderr) = run_in(&dir, &["doc", "qqqqzzzzxxxx"]);
+    assert!(!ok);
+    let suggested = stderr.matches("ipe doc ").count();
+    assert!(
+        (1..=8).contains(&suggested),
+        "a far miss still suggests a bounded list:\n{stderr}"
+    );
+    let (ok, _stdout, stderr) = run_in(&dir, &["doc", "unixMillis"]);
+    assert!(!ok, "a bare member name is not an exact key");
+    assert!(
+        stderr.contains("ipe doc Ipe.Time.unixMillis"),
+        "the bare member name finds the qualified member:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Under `--json` a miss is a machine outcome: the shared error envelope on
+/// stderr, nothing on stdout, never the human frame.
+#[test]
+fn a_miss_under_json_is_the_machine_error_envelope() -> io::Result<()> {
+    let dir = fresh_dir("miss_json");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "qqqqzzzzxxxx", "--json"]);
+    assert!(!ok);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("\"ipe.cli.error/1\""), "{stderr}");
+    assert!(stderr.contains("doc-not-found"), "{stderr}");
+    assert!(
+        !stderr.contains("Ipê language"),
+        "no human frame:\n{stderr}"
+    );
+    Ok(())
 }

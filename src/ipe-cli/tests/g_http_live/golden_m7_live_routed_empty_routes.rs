@@ -177,12 +177,12 @@ main =
 /// Compile `source` through the ipe pipeline (no cargo). Returns `None` to
 /// skip when the embedded runtime cannot be resolved.
 fn compile_src(test_name: &str, source: &str) -> Option<Result<(), ipe::CliError>> {
-    let ipe_dir = std::env::temp_dir().join(format!("live_routed_empty_{test_name}_ipe"));
+    let ipe_dir = crate::support::scratch_root().join(format!("live_routed_empty_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(&ipe_dir).ok()?;
     let entry = ipe_dir.join("Main.ipe");
     std::fs::write(&entry, source).ok()?;
-    let out = std::env::temp_dir().join(format!("live_routed_empty_{test_name}_out"));
+    let out = crate::support::scratch_root().join(format!("live_routed_empty_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return None;

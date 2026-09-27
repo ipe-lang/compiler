@@ -61,7 +61,7 @@ fn compile_module_probe(slug: &str, main: &str) -> Option<PathBuf> {
     };
     let uid = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp = std::env::temp_dir().join(format!("ipec_stdlib_seal_{slug}_{pid}_{uid}"));
+    let tmp = crate::support::scratch_root().join(format!("ipec_stdlib_seal_{slug}_{pid}_{uid}"));
     assert!(
         write_project(&tmp, main),
         "must write the {slug} fixture project"
@@ -522,7 +522,7 @@ fn pubsub_topic_type_mismatch_is_rejected() {
     // Fold the PID in so two parallel test binaries never collide on the shared
     // temp_dir (the per-process counter alone restarts at 0 in each binary).
     let pid = std::process::id();
-    let tmp = std::env::temp_dir().join(format!("ipec_pubsub_mismatch_{pid}_{uid}"));
+    let tmp = crate::support::scratch_root().join(format!("ipec_pubsub_mismatch_{pid}_{uid}"));
     assert!(
         write_project(&tmp, PUBSUB_TOPIC_MISMATCH),
         "must write the pubsub_mismatch fixture"

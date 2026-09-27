@@ -5,58 +5,85 @@
 //!
 //! Each finding renders as a title rule naming the rule and file, a one-line
 //! message, the offending source line with a caret underline, and the teaching
-//! help lines. Colour is omitted so output is byte-stable for goldens and CI.
-
-use std::fmt::Write as _;
+//! help lines. Colour is omitted so output is byte-stable for goldens and CI;
+//! each line carries its [`LineRole`] so a terminal front-end can paint it.
 
 use crate::finding::{Finding, Severity};
 
-/// Render one finding against its module's `source`, showing `file` on the title
-/// line. Deterministic and colour-free.
+/// The part of a rendered finding a line belongs to — what a front-end keys its
+/// colour on, so no caller re-parses the rendered text to find the title.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineRole {
+    /// The `-- <SEVERITY> lint/<rule> ----- file` title rule.
+    Title,
+    /// The finding's message.
+    Message,
+    /// A location, source, or caret line of the snippet.
+    Snippet,
+    /// A teaching `= ` help line.
+    Help,
+    /// An empty separator line.
+    Blank,
+}
+
+/// Render one finding against its module's `source`, showing `file` on the title line.
 ///
-/// Every `write!` targets an in-memory `String`, which is infallible; a
-/// formatting error (impossible here) is silently dropped rather than propagated,
-/// keeping the signature a plain `String`.
+/// Deterministic and colour-free: the lines of [`render_finding_lines`], each ended by a newline.
 #[must_use]
 pub fn render_finding(finding: &Finding, file: &str, source: &str, severity: Severity) -> String {
-    let loc = locate(source, finding.span.lo);
     let mut out = String::new();
+    for (_, line) in render_finding_lines(finding, file, source, severity) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
 
-    // Title rule: `-- <SEVERITY> lint/<rule> ----- file`.
+/// Render one finding as role-tagged lines (no trailing newlines): the title
+/// rule, the message, the caret snippet, then the teaching help lines.
+#[must_use]
+pub fn render_finding_lines(
+    finding: &Finding,
+    file: &str,
+    source: &str,
+    severity: Severity,
+) -> Vec<(LineRole, String)> {
+    let loc = locate(source, finding.span.lo);
+    let mut lines = Vec::with_capacity(finding.help.len().saturating_add(8));
+
     let title = format!("{} lint/{}", severity.word().to_uppercase(), finding.rule);
-    out.push_str(&title_rule(&title, file));
-    out.push('\n');
+    lines.push((LineRole::Title, title_rule(&title, file)));
+    lines.push((LineRole::Blank, String::new()));
+    lines.push((LineRole::Message, finding.message.clone()));
+    lines.push((LineRole::Blank, String::new()));
 
-    // The message, indented one space under the rule.
-    out.push('\n');
-    out.push_str(&finding.message);
-    out.push('\n');
-
-    // The snippet: a location line, the source line, and a caret underline.
-    out.push('\n');
     let line_text = source
         .get(loc.line_start..loc.line_end)
         .unwrap_or("")
         .replace('\t', "    ");
-    let gutter = loc.line.to_string();
-    let pad = " ".repeat(gutter.len());
-    let _ = writeln!(out, "{pad} ┌─ {file}:{}:{}", loc.line, loc.col);
-    let _ = writeln!(out, "{pad} │");
-    let _ = writeln!(out, "{gutter} │ {line_text}");
+    let line_no = loc.line.to_string();
+    let pad = " ".repeat(line_no.len());
     let caret_indent = caret_indent(source, loc.line_start, finding.span.lo);
     let caret_width = caret_width(source, finding.span.lo, finding.span.hi);
-    let _ = writeln!(
-        out,
-        "{pad} │ {}{}",
-        " ".repeat(caret_indent),
-        "^".repeat(caret_width.max(1))
-    );
+    lines.push((
+        LineRole::Snippet,
+        format!("{pad} ┌─ {file}:{}:{}", loc.line, loc.col),
+    ));
+    lines.push((LineRole::Snippet, format!("{pad} │")));
+    lines.push((LineRole::Snippet, format!("{line_no} │ {line_text}")));
+    lines.push((
+        LineRole::Snippet,
+        format!(
+            "{pad} │ {}{}",
+            " ".repeat(caret_indent),
+            "^".repeat(caret_width.max(1))
+        ),
+    ));
 
-    // Teaching help lines, each on its own `= ` note line.
-    for line in &finding.help {
-        let _ = writeln!(out, "{pad} = {line}");
+    for help in &finding.help {
+        lines.push((LineRole::Help, format!("{pad} = {help}")));
     }
-    out
+    lines
 }
 
 /// A resolved 1-based line/column plus the byte bounds of the containing line.

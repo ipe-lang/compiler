@@ -110,7 +110,7 @@ fn await_response(rx: &mpsc::Receiver<serde_json::Value>, id: i64) -> serde_json
 #[allow(clippy::too_many_lines)] // one linear protocol script, deliberately unsplit
 fn stdio_server_serves_live_diagnostics_for_a_real_project() {
     // A real project on disk: sibling discovery, disk starts CLEAN.
-    let dir = std::env::temp_dir().join(format!("ipe_lsp_e2e_{}", std::process::id()));
+    let dir = crate::support::scratch_root().join(format!("ipe_lsp_e2e_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create project dir");
     let dir = std::fs::canonicalize(&dir).expect("canonical project dir");

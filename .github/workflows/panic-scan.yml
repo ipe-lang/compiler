@@ -15,6 +15,7 @@ on:
     branches: [main]
     paths:
       - 'src/**/*.rs'
+      - 'src/**/Cargo.toml'
       - 'tools/panic-scan/**'
       - '.github/workflows/panic-scan.yml'
   pull_request:
@@ -39,25 +40,29 @@ jobs:
           filters: |
             relevant:
               - 'src/**/*.rs'
+              - 'src/**/Cargo.toml'
               - 'tools/panic-scan/**'
               - '.github/workflows/panic-scan.yml'
 
       - uses: ./.github/actions/rust-toolchain-pinned
         if: steps.filter.outputs.relevant == 'true'
 
+      - name: Test the scanner
+        if: steps.filter.outputs.relevant == 'true'
+        run: cargo test --manifest-path tools/panic-scan/Cargo.toml
+
       - name: Build the scanner
         if: steps.filter.outputs.relevant == 'true'
         run: cargo build --release --manifest-path tools/panic-scan/Cargo.toml
 
-      - name: Scan production Rust (skips /tests/, /templates/, and #[cfg(test)])
+      - name: Scan production Rust
         if: steps.filter.outputs.relevant == 'true'
-        run: |
-          # `.rs` under src/ (the runtime lives at src/runtime/), excluding
-          # integration-test crates and the emitted-program templates (scanned
-          # by the separate package gate, not as compiler code). The scanner
-          # skips these segments too; the find prune just keeps the list small.
-          mapfile -t files < <(find src -name '*.rs' -not -path '*/tests/*' -not -path '*/templates/*')
-          tools/panic-scan/target/release/panic-scan "${files[@]}"
+        # `.rs` under src/ (the runtime lives at src/runtime/). The scanner owns
+        # the test-path and template-path rules: it skips a `tests/` directory
+        # or `tests.rs` only after confirming its `#[cfg(test)] mod tests;`
+        # declaration (or, for integration tests, the crate's `Cargo.toml`),
+        # and exits 2 naming the file when that premise does not hold.
+        run: tools/panic-scan/target/release/panic-scan --walk src
 
       - name: No panic-scan-relevant paths changed
         if: steps.filter.outputs.relevant != 'true'

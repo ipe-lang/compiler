@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Scaffold a new Ipê project.
 
   ipe init [<directory>] [<shape>] [<runtime>]
@@ -12,4 +13,3 @@ exit: 0
     [--shape <shape>]  select the shape without a positional (script|tui|cli|server|web)
     [--force]          overwrite a non-empty target directory
     [--lib]            scaffold a library package (exposedModules) instead of an application
-

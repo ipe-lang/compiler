@@ -58,7 +58,7 @@ fn icon_is_an_optional_project_contained_path() {
     // A manifest with no `icon` field parses with `icon = None`; a manifest that
     // declares one resolves it against the project root (the desktop packager's
     // single icon source). A path escaping the root is refused at parse time.
-    let dir = std::env::temp_dir().join("manifest_schema_icon");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("manifest_schema_icon");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("project src dir");
     std::fs::write(
@@ -77,10 +77,11 @@ fn icon_is_an_optional_project_contained_path() {
                 package : Package\npackage =\n    { name = \"iconed\", icon = \"assets/logo.png\" }\n";
     std::fs::write(dir.join("package.ipe"), with).expect("write manifest");
     let m = parse_manifest(&dir.join("package.ipe")).expect("iconed manifest parses");
+    let canon_dir = dir.canonicalize().expect("project dir canonicalizes");
     assert_eq!(
         m.icon,
-        Some(dir.join("assets/logo.png")),
-        "icon resolves against the project root"
+        Some(canon_dir.join("assets/logo.png")),
+        "icon resolves against the canonical project root"
     );
 
     let escaping = "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\

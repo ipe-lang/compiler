@@ -87,7 +87,7 @@ fn assert_cargo_builds_and_runs(fixture: &str, expected_stdout: &str) {
 
     let root = repo_root();
     let entry = entry_path(&root, fixture);
-    let out = std::env::temp_dir().join(format!("ipec_{fixture}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

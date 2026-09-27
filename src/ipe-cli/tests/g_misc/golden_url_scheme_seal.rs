@@ -40,7 +40,7 @@ fn built_url_scheme(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>
 #[test]
 fn url_scheme_seal_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_url_scheme_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_url_scheme_seal_emit");
     let Some(built) = built_url_scheme(&root, &out) else {
         return;
     };
@@ -56,7 +56,7 @@ fn url_scheme_seal_emits() {
 #[test]
 fn url_scheme_seal_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_url_scheme_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_url_scheme_seal_e2e");
     let Some(built) = built_url_scheme(&root, &out) else {
         return;
     };

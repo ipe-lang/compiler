@@ -87,7 +87,7 @@ fn i186_false_positive_cargo_builds_and_runs() {
 
     let root = repo_root();
     let entry = entry_path(&root);
-    let out = std::env::temp_dir().join("ipec_i186_display_false_positive_e2e");
+    let out = crate::support::scratch_root().join("ipec_i186_display_false_positive_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

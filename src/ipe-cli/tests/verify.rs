@@ -102,7 +102,7 @@ fn unknown_flag_is_misuse_and_shows_help() {
         matches!(
             &result,
             Err(ipe::CliError::CommandUsage { command, reason })
-                if *command == "verify" && reason.contains("--bogus")
+                if *command == "verify" && reason.as_str().contains("--bogus")
         ),
         "expected a `verify` command-usage error naming the offending flag, got: {result:?}"
     );
@@ -119,7 +119,8 @@ fn clean_project_passes_every_stage() -> TestResult {
     }
     // Copy the clean entry into a fresh directory named `Main.ipe` so the build
     // stage's default entry conventions apply cleanly.
-    let dir = std::env::temp_dir().join(format!("ipe_verify_clean_{}", std::process::id()));
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_verify_clean_{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("Main.ipe");
     std::fs::copy(fixture("clean.ipe"), &src)?;
@@ -150,7 +151,8 @@ fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
         return Ok(());
     }
     // Set up a project dir with Main.ipe + tests/Main.ipe (all tests pass).
-    let dir = std::env::temp_dir().join(format!("ipe_verify_tests_pass_{}", std::process::id()));
+    let dir = crate::support::scratch_root()
+        .join(format!("ipe_verify_tests_pass_{}", std::process::id()));
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(
@@ -182,7 +184,8 @@ fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the cross-directory test-stage E2E");
         return Ok(());
     }
-    let dir = std::env::temp_dir().join(format!("ipe_verify_src_tests_{}", std::process::id()));
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_verify_src_tests_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src").join("Lib"))?;
     std::fs::create_dir_all(dir.join("tests"))?;
@@ -232,7 +235,8 @@ fn project_with_failing_tests_fails_the_test_stage() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the test-stage E2E");
         return Ok(());
     }
-    let dir = std::env::temp_dir().join(format!("ipe_verify_tests_fail_{}", std::process::id()));
+    let dir = crate::support::scratch_root()
+        .join(format!("ipe_verify_tests_fail_{}", std::process::id()));
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(

@@ -1,0 +1,26 @@
+module Main exposing (main)
+
+-- A `Stream.stream` handler that captures a function bound by a tuple
+-- destructure. A destructure binder cannot be promoted to the `Arc` fn carrier,
+-- so the capture stays a non-`Clone` `Box<dyn Fn>` the emit re-wrap could not
+-- clone: ipe must refuse it (IPE-L0126) rather than emit Rust cargo rejects.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+import Ipe.String as String
+
+exportHandler : Server.Request -> Task Error Server.Response
+exportHandler _ =
+    let
+        ( f, g ) =
+            ( \s -> String.append s "\n", \s -> s )
+    in
+    Stream.stream "text/plain; charset=utf-8"
+        (\writer ->
+            Stream.emit (f (g "tick")) writer
+                |> Task.andThen (\_ -> Stream.finish writer)
+        )
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" exportHandler ]

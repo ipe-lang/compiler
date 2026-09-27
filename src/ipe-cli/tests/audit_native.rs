@@ -28,7 +28,7 @@ mod support;
 // ===========================================================================
 
 fn temp_pkg(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-tier2-test-{}-{}-{}",
         std::process::id(),
         tag,
@@ -42,7 +42,11 @@ fn temp_pkg(tag: &str) -> PathBuf {
 }
 
 fn empty_index(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe-tier2-index-{}-{}", std::process::id(), tag));
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe-tier2-index-{}-{}",
+        std::process::id(),
+        tag
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("packages")).expect("create index packages dir");
     dir
@@ -326,7 +330,7 @@ mod real_jail {
     }
 
     fn fresh_scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::support::scratch_root().join(format!(
             "ipe-tier2-e2e-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -555,7 +559,10 @@ mod real_jail {
     ) -> JailProbeRunner<'a> {
         // The real build needs the toolchain reachable inside the jail (read-only).
         let mut ro_binds = default_ro_binds();
-        ro_binds.extend(ipe::audit_native::toolchain_ro_binds());
+        ro_binds.extend(
+            ipe::audit_native::toolchain_ro_binds()
+                .expect("the test environment's toolchain homes are absolute or unset"),
+        );
         JailProbeRunner::new(
             tools,
             harness.wrapper.clone(),

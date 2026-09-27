@@ -120,6 +120,14 @@ impl Drop for Secret {
     }
 }
 
+impl Secret {
+    /// The payload's length in bytes, the non-secret metadata a bound reads.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // only `Db.Dsn` bounds a secret
+    pub(crate) const fn byte_len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// `Secret.fromString : String -> Secret` — THE seal. The only public
 /// constructor: every `Secret` value in a Ipê program traces back to exactly
 /// one of these calls, so a security reviewer can `grep` this one symbol to

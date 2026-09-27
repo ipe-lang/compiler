@@ -36,7 +36,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn unconstrained_msg_defaulting_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_unconstrained_msg_defaulting_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_unconstrained_msg_defaulting_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -58,7 +58,7 @@ fn unconstrained_msg_defaulting_emits() {
 fn unconstrained_msg_defaulting_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_unconstrained_msg_defaulting_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_unconstrained_msg_defaulting_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

@@ -155,76 +155,6 @@ pub fn module_prefix(module: &[&str]) -> String {
         .join("_")
 }
 
-/// Every Rust keyword that cannot appear as a bare identifier in emitted code:
-/// the strict keywords (2015 + 2018), the reserved-for-future keywords, and the
-/// 2024-reserved `gen`. Mirrors the backend's `reservedGoNames` audit. A name
-/// in this set is mangled by [`mangle_reserved`] before it reaches the output.
-///
-/// `union`/`dyn`-style weak/contextual keywords are intentionally excluded: they
-/// are legal in identifier position. The four keywords that additionally cannot
-/// be written as raw identifiers (`crate`/`self`/`Self`/`super`) are covered
-/// here too, which is why [`mangle_reserved`] uses the universally-valid
-/// trailing-underscore form rather than `r#name`.
-fn is_reserved_rust_name(s: &str) -> bool {
-    matches!(
-        s,
-        // Strict keywords (Rust 2015).
-        "as" | "break"
-            | "const"
-            | "continue"
-            | "crate"
-            | "else"
-            | "enum"
-            | "extern"
-            | "false"
-            | "fn"
-            | "for"
-            | "if"
-            | "impl"
-            | "in"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "pub"
-            | "ref"
-            | "return"
-            | "self"
-            | "Self"
-            | "static"
-            | "struct"
-            | "super"
-            | "trait"
-            | "true"
-            | "type"
-            | "unsafe"
-            | "use"
-            | "where"
-            | "while"
-            // Strict keywords added in the 2018 edition.
-            | "async"
-            | "await"
-            | "dyn"
-            // Reserved for future use.
-            | "abstract"
-            | "become"
-            | "box"
-            | "do"
-            | "final"
-            | "macro"
-            | "override"
-            | "priv"
-            | "typeof"
-            | "unsized"
-            | "virtual"
-            | "yield"
-            // Reserved in the 2024 edition.
-            | "gen"
-    )
-}
-
 /// Rewrite an emitted identifier that collides with a Rust keyword so the
 /// generated code compiles. A reserved name gains a trailing underscore
 /// (`type` → `type_`, `Self` → `Self_`).
@@ -249,7 +179,7 @@ fn is_reserved_rust_name(s: &str) -> bool {
 pub fn mangle_reserved(name: String) -> String {
     let trailing = name.len() - name.trim_end_matches('_').len();
     let stem = &name[..name.len() - trailing];
-    if is_reserved_rust_name(stem) {
+    if ipe_intern::is_rust_keyword(stem) {
         let mut mangled = String::with_capacity(name.len() + 1);
         mangled.push_str(&name);
         mangled.push('_');
@@ -611,11 +541,15 @@ mod tests {
 
     #[test]
     fn reserved_names_get_a_trailing_underscore() {
-        for kw in [
-            "type", "fn", "match", "self", "Self", "crate", "super", "become", "priv", "typeof",
-            "unsized", "virtual", "macro", "gen", "async", "await", "dyn", "true", "false",
-        ] {
-            assert_eq!(super::mangle_reserved(kw.to_owned()), format!("{kw}_"));
+        for kw in ipe_intern::RUST_KEYWORDS {
+            assert_eq!(super::mangle_reserved((*kw).to_owned()), format!("{kw}_"));
+        }
+    }
+
+    #[test]
+    fn weak_keyword_field_names_keep_their_wire_spelling() {
+        for name in ["union", "macro_rules", "raw", "safe"] {
+            assert_eq!(super::mangle_reserved(name.to_owned()), name);
         }
     }
 
@@ -646,12 +580,9 @@ mod tests {
 
         let mut images: BTreeMap<String, String> = BTreeMap::new();
         let mut inputs: Vec<String> = Vec::new();
-        for kw in [
-            "type", "fn", "match", "self", "Self", "crate", "super", "become", "priv", "gen",
-            "async", "await", "dyn", "true", "false", "loop", "move",
-        ] {
+        for kw in ipe_intern::RUST_KEYWORDS {
             // The keyword, plus its 0..=3-underscore shadows.
-            inputs.push(kw.to_owned());
+            inputs.push((*kw).to_owned());
             inputs.push(format!("{kw}_"));
             inputs.push(format!("{kw}__"));
             inputs.push(format!("{kw}___"));

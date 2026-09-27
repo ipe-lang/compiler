@@ -11,8 +11,11 @@
 //! lowering / not-yet-supported (`IPE-L*`), plus the target/secret gates.
 //!
 //! Compile-only: every fixture is ill-formed, so there is nothing to run — no
-//! oracle / `IPE_E2E` gate. Each test returns early when the embedded runtime
-//! cannot be located (the pipeline needs the compiled stdlib source).
+//! oracle / `IPE_E2E` gate. Each test fails loudly (never skips) when the
+//! embedded runtime or scratch dir is unavailable (the pipeline needs the
+//! compiled stdlib source).
+
+mod support;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -30,8 +33,8 @@ const fn false_marker() -> bool {
 
 /// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed
 /// by `name`, returning the entry path (or `None` if scratch setup fails — the
-/// caller then skips). The scratch dir lives in the test crate's
-/// `CARGO_TARGET_TMPDIR`, never the repo tree.
+/// caller must fail loudly, never skip). The scratch dir lives in the test
+/// crate's `CARGO_TARGET_TMPDIR`, never the repo tree.
 fn write_entry(name: &str, source: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite")
@@ -53,21 +56,15 @@ enum Outcome {
     /// Compilation SUCCEEDED (a potential SEAL hole for a malformed input) or
     /// failed for a non-pipeline reason (I/O, usage). Carries a description.
     Accepted(String),
-    /// Runtime / scratch unavailable — the caller skips.
-    Skip,
 }
 
 fn compile(name: &str, source: &str, target: Target) -> Outcome {
-    let Some(entry) = write_entry(name, source) else {
-        return Outcome::Skip;
-    };
+    let entry = crate::support::expect_scratch_entry(name, write_entry(name, source));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return Outcome::Skip;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     let options = BuildOptions {
         target,
         ..BuildOptions::default()
@@ -82,16 +79,12 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
 /// Like [`compile`] but with the production flag set — simulates `ipe release`
 /// so the `Debug.*` gate (IPE-L0140) fires without spawning a real release build.
 fn compile_production(name: &str, source: &str) -> Outcome {
-    let Some(entry) = write_entry(name, source) else {
-        return Outcome::Skip;
-    };
+    let entry = crate::support::expect_scratch_entry(name, write_entry(name, source));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-prod-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return Outcome::Skip;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     let options = BuildOptions {
         production: true,
         ..BuildOptions::default()
@@ -109,7 +102,6 @@ fn compile_production(name: &str, source: &str) -> Outcome {
 #[track_caller]
 fn assert_rejected_production(name: &str, source: &str, expected: &str) {
     match compile_production(name, source) {
-        Outcome::Skip => {}
         Outcome::Rejected(got) => assert_eq!(
             got, expected,
             "{name}: expected {expected}, got {got} — rejected for the WRONG reason"
@@ -128,21 +120,15 @@ fn compile_project(name: &str, files: &[(&str, &str)]) -> Outcome {
         .join(name);
     let _ = std::fs::remove_dir_all(&dir);
     let src = dir.join("src");
-    if std::fs::create_dir_all(&src).is_err() {
-        return Outcome::Skip;
-    }
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
     for (fname, contents) in files {
-        if std::fs::write(src.join(fname), contents).is_err() {
-            return Outcome::Skip;
-        }
+        crate::support::expect_scratch_step(name, std::fs::write(src.join(fname), contents));
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-proj-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return Outcome::Skip;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     let entry = src.join("Main.ipe");
     match ipe::build_with_sibling_discovery(&entry, &out, &runtime) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
@@ -169,7 +155,6 @@ fn fail_accepted(name: &str, expected: &str, how: &str) {
 #[track_caller]
 fn assert_rejected_on(name: &str, source: &str, expected: &str, target: Target) {
     match compile(name, source, target) {
-        Outcome::Skip => {}
         Outcome::Rejected(got) => assert_eq!(
             got, expected,
             "{name}: expected {expected}, got {got} — a rejection for the WRONG reason"
@@ -197,7 +182,6 @@ fn assert_rejected_wasm(name: &str, source: &str, expected: &str) {
 #[track_caller]
 fn assert_compiles(name: &str, source: &str) {
     match compile(name, source, Target::Native) {
-        Outcome::Skip => {}
         Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
         Outcome::Accepted(how) => assert!(
             false_marker(),
@@ -1017,31 +1001,21 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
         .join("negsuite-ce")
         .join(name);
     let _ = std::fs::remove_dir_all(&dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return Outcome::Skip;
-    }
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&dir));
     for (rel, contents) in extra {
         let path = dir.join(rel);
-        if let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_err()
-        {
-            return Outcome::Skip;
+        if let Some(parent) = path.parent() {
+            crate::support::expect_scratch_step(name, std::fs::create_dir_all(parent));
         }
-        if std::fs::write(&path, contents).is_err() {
-            return Outcome::Skip;
-        }
+        crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
     }
     let entry = dir.join("Main.ipe");
-    if std::fs::write(&entry, source).is_err() {
-        return Outcome::Skip;
-    }
+    crate::support::expect_scratch_step(name, std::fs::write(&entry, source));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-ce-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return Outcome::Skip;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
@@ -1053,7 +1027,6 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
 #[track_caller]
 fn assert_rejected_with_files(name: &str, source: &str, extra: &[(&str, &str)], expected: &str) {
     match compile_with_files(name, source, extra) {
-        Outcome::Skip => {}
         Outcome::Rejected(got) => assert_eq!(
             got, expected,
             "{name}: expected {expected}, got {got} — a rejection for the WRONG reason"
@@ -1158,7 +1131,6 @@ fn custom_element_ctor_present_file_lowers_and_compiles() {
         )],
     );
     match outcome {
-        Outcome::Skip => {}
         Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
         other => assert!(
             false_marker(),
@@ -1278,25 +1250,26 @@ fn custom_element_ctor_windows_rooted_path_rejected_at_canon() {
 fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     use std::path::PathBuf;
 
+    let name = "custom_element_symlink_escape";
     let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("negsuite-ce-symlink");
     let _ = std::fs::remove_dir_all(&base);
     let project = base.join("project");
     let outside = base.join("outside");
     // The out-of-project directory and a real file inside it (the escape target).
-    if std::fs::create_dir_all(&outside).is_err()
-        || std::fs::write(
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&outside));
+    crate::support::expect_scratch_step(
+        name,
+        std::fs::write(
             outside.join("evil.js"),
             "export function mount(host, emit) { return {}; }\n",
-        )
-        .is_err()
-        || std::fs::create_dir_all(&project).is_err()
-    {
-        return; // scratch unavailable — skip, like the shared harness
-    }
+        ),
+    );
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&project));
     // In-tree `js` is a SYMLINK to the outside directory.
-    if std::os::unix::fs::symlink(&outside, project.join("js")).is_err() {
-        return;
-    }
+    crate::support::expect_scratch_step(
+        name,
+        std::os::unix::fs::symlink(&outside, project.join("js")),
+    );
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
          editor : CustomElement Int String\n\
@@ -1304,14 +1277,10 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
          main = 1\n"
     );
     let entry = project.join("Main.ipe");
-    if std::fs::write(&entry, &src).is_err() {
-        return;
-    }
+    crate::support::expect_scratch_step(name, std::fs::write(&entry, &src));
     let out = base.join("out");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     let outcome = match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
@@ -1319,7 +1288,6 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     };
     let _ = std::fs::remove_dir_all(&base);
     match outcome {
-        Outcome::Skip => {}
         Outcome::Rejected(got) => assert_eq!(
             got, "IPE-N0044",
             "custom_element_symlink_escape: expected IPE-N0044 (containment), got {got}"
@@ -1376,7 +1344,6 @@ fn custom_element_widget_program_ipe_accepts() {
         )],
     );
     match outcome {
-        Outcome::Skip => {}
         Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
         other => assert!(
             false_marker(),
@@ -1405,7 +1372,6 @@ fn canon_duplicate_qualifier() {
             ),
         ],
     ) {
-        Outcome::Skip => {}
         Outcome::Rejected(got) => assert_eq!(
             got, "IPE-N0027",
             "canon_dup_qualifier: expected IPE-N0027, got {got} — WRONG reason"
@@ -2519,7 +2485,6 @@ fn release_accepts_dead_debug_explain() {
          main =\n    Io.println \"ok\"\n"
     );
     match compile_production("release_accepts_dead_debug_explain", &src) {
-        Outcome::Skip => {}
         Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
         Outcome::Accepted(how) => assert!(
             false_marker(),

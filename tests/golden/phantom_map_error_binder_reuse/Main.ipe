@@ -1,0 +1,25 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Result
+import Ipe.String
+
+-- A phantom-typed binder reused twice. `Result.mapError` over an `Err` leaves
+-- the `Ok` payload type unconstrained, and `e` is read by two calls.
+isErr r =
+    case r of
+        Ok _ -> False
+        Err _ -> True
+
+label failed =
+    if failed then
+        "err"
+    else
+        "ok"
+
+main =
+    let
+        e =
+            Result.mapError String.length (Err "boom")
+    in
+    Io.println (label (isErr e) ++ " " ++ label (isErr e))

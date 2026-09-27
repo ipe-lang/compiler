@@ -30,7 +30,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn polymorphic_msg_helper_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_polymorphic_msg_helper_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_polymorphic_msg_helper_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -52,7 +52,7 @@ fn polymorphic_msg_helper_emits() {
 fn polymorphic_msg_helper_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_polymorphic_msg_helper_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_polymorphic_msg_helper_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

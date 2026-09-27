@@ -1,7 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Run the language server over stdio.
 
   ipe lsp
-

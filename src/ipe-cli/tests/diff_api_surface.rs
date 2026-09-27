@@ -13,7 +13,7 @@ use ipe::api_surface::{DiffError, extract_tree};
 
 /// A fresh temp package directory tagged unique to this test binary + name.
 fn temp_pkg(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "ipe-diff-{}-{}-{}",
         std::process::id(),
         tag,

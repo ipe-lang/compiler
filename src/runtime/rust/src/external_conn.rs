@@ -30,6 +30,7 @@
 
 use super::IpeResult;
 use crate::core::{IpeTask, ok_res, str_err};
+use crate::db::{DbConnectError, DbUrl, VettedPool};
 use crate::dsn::{Dsn, DsnDriver};
 use crate::ssrf::VettedDial;
 
@@ -67,19 +68,12 @@ impl std::fmt::Debug for ExternalConnection {
 /// `open` calls cannot exhaust a foreign server's connection limit.
 const EXTERNAL_POOL_MAX_CONNECTIONS: u32 = 8;
 
-/// Build a structural, credential-free connect error. The sqlx `Display` can
-/// embed the connection string (host, and on some drivers the password); this
-/// funnels only the error CATEGORY into the Ipê `Error`, never the URL or a
-/// credential.
-fn connect_err<E: From<String>>(e: &sqlx::Error) -> E {
-    let category = match e {
-        sqlx::Error::Io(_) => "external connect: I/O error reaching host",
-        sqlx::Error::Tls(_) => "external connect: TLS negotiation failed",
-        sqlx::Error::PoolTimedOut => "external connect: pool acquisition timed out",
-        sqlx::Error::Configuration(_) => "external connect: invalid connection configuration",
-        _ => "external connect: connection failed",
-    };
-    str_err(category)
+/// The Ipê `Error` for a refused external connect.
+///
+/// A [`DbConnectError`] holds no driver payload, so this never carries the URL
+/// or a credential.
+fn connect_err<E: From<String>>(refused: &DbConnectError) -> E {
+    str_err(&format!("external connect: {refused}"))
 }
 
 /// Open an external connection from a parsed, validated [`Dsn`]. The `Dsn` is a
@@ -87,42 +81,38 @@ fn connect_err<E: From<String>>(e: &sqlx::Error) -> E {
 /// host for a network driver, secure TLS posture, no control-character
 /// components); this step performs the network/file act of dialing it.
 ///
-/// Fail-closed: an unreachable host, a refused connection, a bad password, or a
-/// TLS failure all surface as a typed `Err` that carries no credential. The pool
-/// is independent (never a shared URL-keyed cache) and bounded.
+/// Fail-closed: the dial goes through [`VettedPool::connect`], so an SSRF-denied
+/// host, an unreachable host, a refused connection, a bad password, a TLS
+/// failure, or an engine below its version floor all surface as a typed `Err`
+/// that carries no credential. The pool is independent (never a shared
+/// URL-keyed cache) and bounded.
 async fn open_external<E: Send + From<String> + 'static>(
     dsn: Dsn,
 ) -> IpeResult<E, ExternalConnection> {
-    let driver = dsn.driver();
-    let url = dsn.connection_url();
-    match driver {
+    let url = match DbUrl::parse(&dsn.connection_url()) {
+        Ok(url) => url,
+        Err(refused) => return IpeResult::Err(connect_err(&refused)),
+    };
+    match dsn.driver() {
         DsnDriver::Postgres => {
-            // The `Dsn` parse boundary enforces syntax and TLS; the connect step
-            // owns the SSRF host policy. Gate the host:port before dialing so a
-            // `postgres://169.254.169.254/db` or loopback DSN is denied here, not
-            // allowed to reach the network driver.
-            let host = dsn.host().to_owned();
-            let port = dsn.port();
-            if let Err(e) = VettedDial::for_host(&host, port) {
-                return IpeResult::Err(str_err(&format!("external connect: {e}")));
-            }
-            match sqlx::postgres::PgPoolOptions::new()
-                .max_connections(EXTERNAL_POOL_MAX_CONNECTIONS)
-                .connect(&url)
-                .await
+            // Defence in depth: the host the `Dsn` parse boundary extracted is
+            // gated here, and `VettedPool::connect` independently gates every
+            // host its own parse of the URL finds. A `DsnHost` is proven not to
+            // be part of the DSN's credentials, so the refusal may name it.
+            if let Err(refusal) =
+                VettedDial::for_configured_host(dsn.host().configured(), dsn.port()).await
             {
-                Ok(pool) => ok_res(ExternalConnection::Postgres(pool)),
-                Err(e) => IpeResult::Err(connect_err(&e)),
+                return IpeResult::Err(str_err(&format!("external connect: {refusal}")));
+            }
+            match VettedPool::<sqlx::Postgres>::connect(&url, EXTERNAL_POOL_MAX_CONNECTIONS).await {
+                Ok(vetted) => ok_res(ExternalConnection::Postgres(vetted.into_pool())),
+                Err(refused) => IpeResult::Err(connect_err(&refused)),
             }
         }
         DsnDriver::Sqlite => {
-            match sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(EXTERNAL_POOL_MAX_CONNECTIONS)
-                .connect(&url)
-                .await
-            {
-                Ok(pool) => ok_res(ExternalConnection::Sqlite(pool)),
-                Err(e) => IpeResult::Err(connect_err(&e)),
+            match VettedPool::<sqlx::Sqlite>::connect(&url, EXTERNAL_POOL_MAX_CONNECTIONS).await {
+                Ok(vetted) => ok_res(ExternalConnection::Sqlite(vetted.into_pool())),
+                Err(refused) => IpeResult::Err(connect_err(&refused)),
             }
         }
     }
@@ -197,49 +187,78 @@ mod tests {
     /// Parse a Postgres DSN and check the SSRF gate that `open_external` would
     /// apply — without attempting any real network dial.  Mirrors the guard
     /// logic inserted before `PgPoolOptions::connect`.
-    fn pg_ssrf_blocked(dsn_str: &str) -> bool {
+    async fn pg_ssrf_blocked(dsn_str: &str) -> bool {
         match dsn_parse::<String>(dsn_str.to_string()) {
             IpeResult::Ok(dsn) if dsn.driver() == DsnDriver::Postgres => {
-                VettedDial::for_host(dsn.host(), dsn.port()).is_err()
+                VettedDial::for_configured_host(dsn.host().configured(), dsn.port())
+                    .await
+                    .is_err()
             }
             _ => false,
         }
     }
 
-    #[test]
-    fn open_external_ssrf_blocks_loopback_postgres_when_deny_private_on() {
+    #[tokio::test]
+    async fn open_external_ssrf_blocks_loopback_postgres_when_deny_private_on() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
         assert!(
-            pg_ssrf_blocked("postgres://127.0.0.1:5432/db"),
+            pg_ssrf_blocked("postgres://127.0.0.1:5432/db").await,
             "loopback Postgres DSN must be blocked by the SSRF gate"
         );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn open_external_ssrf_blocks_link_local_postgres_when_deny_private_on() {
+    #[tokio::test]
+    async fn open_external_ssrf_blocks_link_local_postgres_when_deny_private_on() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
         assert!(
-            pg_ssrf_blocked("postgres://169.254.169.254:5432/db"),
+            pg_ssrf_blocked("postgres://169.254.169.254:5432/db").await,
             "link-local Postgres DSN must be blocked by the SSRF gate"
         );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn open_external_ssrf_error_is_not_a_connect_or_timeout_error_for_loopback() {
+    #[tokio::test]
+    async fn open_external_ssrf_error_is_not_a_connect_or_timeout_error_for_loopback() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
         let dsn = match dsn_parse::<String>("postgres://127.0.0.1:5432/db".to_string()) {
             IpeResult::Ok(d) => d,
             IpeResult::Err(e) => panic!("DSN parse failed: {e}"),
         };
-        let err =
-            VettedDial::for_host(dsn.host(), dsn.port()).expect_err("loopback must be blocked");
+        let err = VettedDial::for_configured_host(dsn.host().configured(), dsn.port())
+            .await
+            .expect_err("loopback must be blocked");
         assert!(
-            err.contains("blocked"),
+            matches!(err, crate::ssrf::SsrfRefusal::Blocked { .. }),
             "SSRF block must identify as 'blocked', not a connect/TLS error: {err}"
         );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
+    }
+
+    /// A clean DSN's refusal names its proven host and no credential.
+    #[tokio::test]
+    async fn a_clean_dsn_refusal_names_its_host_and_no_credential() {
+        use crate::ssrf::DialPolicy;
+        use crate::ssrf::test_resolvers::NoDns;
+        let parsed =
+            dsn_parse::<String>("postgres://admin:s3cr3t-pw@127.0.0.1:5432/app".to_owned());
+        assert!(matches!(parsed, IpeResult::Ok(_)), "a clean DSN must parse");
+        let IpeResult::Ok(dsn) = parsed else {
+            return;
+        };
+        let refused = VettedDial::for_configured_host_with(
+            DialPolicy::DenyPrivate,
+            &NoDns,
+            dsn.host().configured(),
+            dsn.port(),
+        )
+        .await;
+        assert!(refused.is_err(), "loopback must be refused");
+        let shown = refused.map_or_else(|e| format!("{e} {e:?}"), |_| String::new());
+        assert!(shown.contains("127.0.0.1"), "{shown}");
+        for secret in ["admin", "s3cr3t"] {
+            assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+        }
     }
 
     #[test]
@@ -253,15 +272,18 @@ mod tests {
         };
         assert_eq!(dsn.driver(), DsnDriver::Sqlite);
         // SQLite host is empty; VettedDial is only called for Postgres — gate not applied.
-        assert!(dsn.host().is_empty(), "sqlite DSN must have empty host");
+        assert!(
+            dsn.host().as_str().is_empty(),
+            "sqlite DSN must have empty host"
+        );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn open_external_ssrf_passes_private_when_deny_private_off() {
+    #[tokio::test]
+    async fn open_external_ssrf_passes_private_when_deny_private_off() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "0") };
         assert!(
-            !pg_ssrf_blocked("postgres://127.0.0.1:5432/db"),
+            !pg_ssrf_blocked("postgres://127.0.0.1:5432/db").await,
             "guard off must not block private host (dev workflow)"
         );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };

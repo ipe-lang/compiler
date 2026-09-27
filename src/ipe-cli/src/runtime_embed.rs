@@ -16,9 +16,9 @@
 //!
 //! # `IPE_HOME`
 //! The materialized runtime lives under `IPE_HOME`, resolved once:
-//! 1. `$IPE_HOME` — explicit override.
-//! 2. `$XDG_DATA_HOME/ipe` — the XDG data root, when set.
-//! 3. `$HOME/.ipe` — the default.
+//! 1. `$IPE_HOME` — explicit override; refused unless absolute.
+//! 2. `$XDG_DATA_HOME/ipe` — the XDG data root, when absolute.
+//! 3. `$HOME/.ipe` — the default, when `HOME` is absolute.
 //!
 //! Nothing is ever written outside the resolved `IPE_HOME`.
 
@@ -138,22 +138,31 @@ fn verify(root: &Path) -> Result<Option<ResolvedRuntime>, CliError> {
 /// [`materialize`] creates it under the runtime subdirectory as needed.
 ///
 /// # Errors
-/// [`CliError::RuntimeHomeUnknown`] when no override, no `XDG_DATA_HOME`, and no
-/// `HOME` are set — there is no directory to materialize into.
+/// - [`CliError::EnvDirNotAbsolute`] when `IPE_HOME` is set but not absolute.
+/// - [`CliError::RuntimeHomeUnknown`] when no override, no absolute
+///   `XDG_DATA_HOME`, and no absolute home are set — there is no directory to
+///   materialize into.
 pub fn ipe_home() -> Result<PathBuf, CliError> {
-    if let Some(dir) = std::env::var_os("IPE_HOME") {
-        return Ok(PathBuf::from(dir));
+    ipe_home_from(
+        std::env::var_os("IPE_HOME"),
+        std::env::var_os("XDG_DATA_HOME"),
+        crate::env_dir::home(),
+    )
+}
+
+/// Resolve `IPE_HOME` from the raw override, raw `XDG_DATA_HOME`, and the home.
+fn ipe_home_from(
+    ipe_home: Option<std::ffi::OsString>,
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    if let Some(dir) = crate::env_dir::explicit_override("IPE_HOME", ipe_home)? {
+        return Ok(dir);
     }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        let xdg = PathBuf::from(xdg);
-        if xdg.is_absolute() {
-            return Ok(xdg.join("ipe"));
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".ipe"));
-    }
-    Err(CliError::RuntimeHomeUnknown)
+    crate::env_dir::absolute(xdg_data_home)
+        .map(|xdg| xdg.join("ipe"))
+        .or_else(|| home.map(|h| h.join(".ipe")))
+        .ok_or(CliError::RuntimeHomeUnknown)
 }
 
 /// Rewrite the embedded manifest's `version.workspace = true` into a concrete
@@ -630,5 +639,40 @@ mod tests {
                 "[package]\nname = \"ipe-runtime-rust\"\nversion = \"{COMPILER_VERSION}\"\nedition = \"2024\"\n"
             )
         );
+    }
+
+    #[test]
+    fn ipe_home_uses_an_absolute_override() {
+        let got = ipe_home_from(
+            Some("/opt/ipe".into()),
+            Some("/xdg".into()),
+            Some("/home/u".into()),
+        );
+        assert!(matches!(got, Ok(p) if p == std::path::Path::new("/opt/ipe")));
+    }
+
+    #[test]
+    fn ipe_home_refuses_a_relative_or_empty_override() {
+        for raw in ["", "ipe", "./ipe"] {
+            let got = ipe_home_from(Some(raw.into()), None, Some("/home/u".into()));
+            assert!(
+                matches!(got, Err(CliError::EnvDirNotAbsolute { var: "IPE_HOME" })),
+                "IPE_HOME={raw:?} must be refused: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipe_home_skips_a_relative_xdg_data_home() {
+        let got = ipe_home_from(None, Some("rel".into()), Some("/home/u".into()));
+        assert!(matches!(got, Ok(p) if p == std::path::Path::new("/home/u/.ipe")));
+        let got = ipe_home_from(None, Some("/xdg".into()), Some("/home/u".into()));
+        assert!(matches!(got, Ok(p) if p == std::path::Path::new("/xdg/ipe")));
+    }
+
+    #[test]
+    fn ipe_home_refuses_without_any_absolute_home() {
+        let got = ipe_home_from(None, Some("rel".into()), None);
+        assert!(matches!(got, Err(CliError::RuntimeHomeUnknown)));
     }
 }

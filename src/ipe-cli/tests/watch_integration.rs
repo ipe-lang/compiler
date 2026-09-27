@@ -68,7 +68,7 @@ fn server_fixture_hardcoded_port(body: &str) -> String {
 const BROKEN_SOURCE: &str = "module Main exposing (main)\n\nmain =\n    let x = 1\n";
 
 fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
-    let base = std::env::temp_dir().join(format!(
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "watch_e2e_{tag}_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()

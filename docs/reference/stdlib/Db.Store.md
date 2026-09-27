@@ -1031,6 +1031,22 @@ Example:
             |> Store.limit 10
             |> Store.toList conn
 
+## `where`
+
+```ipe
+where : Cond a -> Query a -> Query a
+```
+
+`where cond q` — restrict `q` to the rows matching `cond`. Applying `where`
+more than once AND-joins the predicates, so a pipeline of `where` clauses
+reads as a conjunction.
+
+Example:
+
+    Store.query store
+        |> Store.where (Store.eq .status "active")
+        |> Store.where (Store.eq .active True)
+
 ## `eq`
 
 ```ipe

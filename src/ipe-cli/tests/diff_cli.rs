@@ -17,7 +17,7 @@ mod support;
 
 /// A fresh temp package directory, unique per test.
 fn temp_pkg(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-diffcli-{}-{}-{}",
         std::process::id(),
         tag,
@@ -146,6 +146,49 @@ fn cli_diff_check_rejects_an_underbump() {
     assert!(
         stderr.contains("0.2.0"),
         "the error names the required floor; got:\n{stderr}"
+    );
+}
+
+/// Run `ipe diff check` over two trees with the given version arguments.
+fn diff_check(tag: &str, old_v: &str, new_v: &str) -> std::process::Output {
+    let old = temp_pkg(&format!("{tag}-old"));
+    let new = temp_pkg(&format!("{tag}-new"));
+    write_lib(&old, V1);
+    write_lib(&new, V2_BREAKING);
+    Command::new(support::ipe_bin())
+        .arg("diff")
+        .arg("check")
+        .arg(&old)
+        .arg(&new)
+        .arg(old_v)
+        .arg(new_v)
+        .output()
+        .expect("run ipe diff check")
+}
+
+#[test]
+fn cli_diff_check_refuses_a_build_metadata_version() {
+    // `1.0.0+b` clears the floor by precedence yet the index refuses it, so no
+    // bump verdict is issued for it.
+    for (old_v, new_v) in [("0.1.0", "1.0.0+b"), ("0.1.0+b", "1.0.0")] {
+        let out = diff_check("chk-build", old_v, new_v);
+        assert!(!out.status.success(), "{old_v} -> {new_v} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("build metadata"),
+            "the refusal names build metadata; got:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn cli_diff_check_refuses_a_malformed_version() {
+    let out = diff_check("chk-malformed", "0.1.0", "1.0");
+    assert!(!out.status.success(), "a malformed version is refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not a valid semantic version"),
+        "the refusal names the malformed value; got:\n{stderr}"
     );
 }
 

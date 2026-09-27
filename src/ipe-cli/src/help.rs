@@ -1,10 +1,11 @@
 //! The `ipe` help system — a data-driven renderer for the top-level help
 //! screen and every per-command `--help` page.
 //!
-//! One table ([`COMMANDS`]) holds each command's synopsis, argument description,
-//! and option list; the top-level screen groups them into [`SECTIONS`]. Both the
-//! overview and the per-command pages render from that one source, so a command
-//! or flag is described once.
+//! One table ([`COMMANDS`]) binds each command to its handler and its `.md` help
+//! page ([`crate::help_page`]): the page holds the synopsis, argument
+//! description, and option list; `help/index.md` groups the commands into the
+//! overview's sections. Both the overview and the per-command pages render from
+//! those pages, so a command or flag is described once, in Markdown.
 //!
 //! Colour is opt-in per output stream: ANSI escapes are emitted only when the
 //! destination is a terminal and `NO_COLOR` is unset. Piped or redirected
@@ -18,21 +19,12 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use crate::CliError;
-use crate::style::{Palette, REPO_URL, gutter, report_bugs_footer};
+use crate::help_page::{self, CommandText, SectionText};
+use crate::style::{Palette, gutter};
 
 /// A command's dispatch handler: it receives the arguments after the command
 /// name and runs the command.
 pub(crate) type Handler = fn(&[String]) -> Result<(), CliError>;
-
-/// A single command option: the flag form (e.g. `[--out <dir>]`, keeping its
-/// `[]` optional syntax) and a one-line description.
-struct Opt {
-    /// The flag as it appears in a synopsis, including its `[]` and any value
-    /// placeholder.
-    flag: &'static str,
-    /// A one-line description of what the flag does.
-    desc: &'static str,
-}
 
 /// A command's registry entry: the single source of truth binding a command's
 /// name and help metadata to the handler that runs it. Because the dispatcher
@@ -43,33 +35,15 @@ pub(crate) struct Command {
     name: &'static str,
     /// The handler that runs the command, given the arguments after its name.
     run: Handler,
-    /// A one-line description of the command, shown at the top of the command's
-    /// own `--help` page.
-    summary: &'static str,
-    /// The positional arguments, rendered inline after the name on the synopsis
-    /// line (e.g. `[<path>]`). Empty when the command takes none.
-    args: &'static str,
-    /// A one-line, plain-English description of the positional argument, shown
-    /// under `Arguments:` on the command's `--help` page. Empty when there is no
-    /// positional argument to explain.
-    args_desc: &'static str,
-    /// The optional flags, listed with descriptions on the command's `--help`
-    /// page.
-    options: &'static [Opt],
+    /// The command's `.md` help page (`help/<name>.md`): summary, synopsis,
+    /// arguments, options. See [`crate::help_page`].
+    page: &'static str,
     /// Whether the command is withheld from the top-level `ipe --help` screen.
-    /// A hidden command is still fully dispatchable (its `--help` page renders,
-    /// it runs) but is not listed among the [`SECTIONS`], so a command whose
-    /// only outcome today is a manual-step message is not advertised as a
-    /// finished feature. A hidden command belongs to no section.
+    ///
+    /// A hidden command is still fully dispatchable (its `--help` page renders, it runs) but is not
+    /// listed among the overview's sections, so a command whose only outcome today is a manual-step
+    /// message is not advertised as a finished feature. A hidden command belongs to no section.
     hidden: bool,
-}
-
-/// A titled group of commands on the top-level screen.
-struct Section {
-    /// The section heading (e.g. `Development`).
-    title: &'static str,
-    /// The command names in this section, in display order.
-    commands: &'static [&'static str],
 }
 
 /// A command group: a named node (e.g. `dev`) that owns a set of member
@@ -87,9 +61,8 @@ struct Section {
 pub(crate) struct Group {
     /// The group name (e.g. `dev`).
     name: &'static str,
-    /// A one-line description shown on the group's subpage and the top-level
-    /// screen.
-    summary: &'static str,
+    /// The group's `.md` page (`help/<name>.md`), holding its one-line summary.
+    page: &'static str,
     /// The member subcommand names, in display order. Each names a [`Command`]
     /// in [`COMMANDS`].
     members: &'static [&'static str],
@@ -102,7 +75,7 @@ pub(crate) struct Group {
 /// build cannot be expressed.
 const GROUPS: &[Group] = &[Group {
     name: "dev",
-    summary: "The development inner loop — build, run, and watch with Debug.* on and no jail.",
+    page: include_str!("../help/dev.md"),
     members: &["build", "run", "watch"],
 }];
 
@@ -156,7 +129,7 @@ pub fn is_grouped_command(name: &str) -> bool {
 /// A flag entry exposed to coverage surfaces: the flag synopsis and its
 /// one-line description, both taken directly from [`COMMANDS`].
 ///
-/// Distinct from the private [`Opt`] so the coverage module can read the table
+/// Distinct from [`crate::help_page::Opt`] so the coverage module can read the table
 /// without coupling to the private render types.
 #[derive(Clone, Debug)]
 pub struct FlagSpec {
@@ -190,9 +163,10 @@ pub struct CommandSpec {
     pub options: Vec<FlagSpec>,
 }
 
-/// A top-level help section, projected from [`SECTIONS`] for the CLI reference
-/// generator. The command names are in display order and each names a
-/// [`CommandSpec`] entry (or a [`GroupSpec`]).
+/// A top-level help section, projected from `help/index.md` for the CLI reference generator.
+///
+/// The command names are in display order and each names a [`CommandSpec`] entry (or a
+/// [`GroupSpec`]).
 #[derive(Clone, Debug)]
 pub struct SectionSpec {
     /// The section heading (e.g. `"Development"`).
@@ -222,48 +196,40 @@ pub struct GroupSpec {
 pub fn all_command_specs() -> Vec<CommandSpec> {
     COMMANDS
         .iter()
-        .map(|c| CommandSpec {
-            name: c.name,
-            summary: c.summary,
-            args: c.args,
-            args_desc: c.args_desc,
-            // Where the command's primary artifact lands. A native `build` copies
-            // the runnable binary into the project's `out/bin/` within the build
-            // invocation, so it is findable even when a shared `CARGO_TARGET_DIR`
-            // holds cargo's own output outside the project.
-            output_desc: match c.name {
-                "build" => {
-                    "a native build lands the runnable binary at `out/bin/<project-name>` under \
-                     the project (copied there within the build), so it is findable even when a \
-                     shared `CARGO_TARGET_DIR` places cargo's own output outside the project."
-                }
-                _ => "",
-            },
-            hidden: c.hidden,
-            options: c
-                .options
-                .iter()
-                .map(|o| FlagSpec {
-                    flag: o.flag,
-                    desc: o.desc,
-                })
-                .collect(),
+        .map(|c| {
+            let text = c.text();
+            CommandSpec {
+                name: c.name,
+                summary: text.summary,
+                args: text.args,
+                args_desc: text.args_desc,
+                output_desc: text.output_desc,
+                hidden: c.hidden,
+                options: text
+                    .options
+                    .iter()
+                    .map(|o| FlagSpec {
+                        flag: o.flag,
+                        desc: o.desc,
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
 
-/// Every top-level help section, projected from the canonical [`SECTIONS`] table.
+/// Every top-level help section, projected from `help/index.md`.
 ///
 /// The CLI reference generator reads this instead of the private table so the
 /// section grouping in `docs/reference/cli.md` cannot drift from the top-level
 /// `ipe --help` screen.
 #[must_use]
 pub fn all_section_specs() -> Vec<SectionSpec> {
-    SECTIONS
-        .iter()
+    help_page::sections()
+        .into_iter()
         .map(|s| SectionSpec {
             title: s.title,
-            commands: s.commands.to_vec(),
+            commands: s.commands,
         })
         .collect()
 }
@@ -276,713 +242,194 @@ pub fn all_group_specs() -> Vec<GroupSpec> {
         .iter()
         .map(|g| GroupSpec {
             name: g.name,
-            summary: g.summary,
+            summary: g.summary(),
             members: g.members.to_vec(),
         })
         .collect()
 }
 
-/// Every `ipe` command, each described exactly once.
+/// Every `ipe` command, each bound to its handler and its `.md` help page.
 const COMMANDS: &[Command] = &[
     Command {
         name: "init",
         run: crate::init::run_init,
-        summary: "Scaffold a new Ipê project.",
-        args: "[<directory>] [<shape>] [<runtime>]",
-        args_desc: "directory: where to scaffold (`.` or omitted → the current directory). \
-                    shape: script | tui | cli | server | web (default web) — picks the template. \
-                    runtime (web only): served (default) | solo — seeds the default delivery. \
-                    Host and target are delivery choices, chosen later at build/release. On a TTY \
-                    an omitted positional is prompted; a re-run reconciles (creates only missing \
-                    files) and refuses a shape that conflicts with the existing `main`.",
-        options: &[
-            Opt {
-                flag: "[--shape <shape>]",
-                desc: "select the shape without a positional (script|tui|cli|server|web)",
-            },
-            Opt {
-                flag: "[--force]",
-                desc: "overwrite a non-empty target directory",
-            },
-            Opt {
-                flag: "[--lib]",
-                desc: "scaffold a library package (exposedModules) instead of an application",
-            },
-        ],
+        page: include_str!("../help/init.md"),
         hidden: false,
     },
     Command {
         name: "build",
         run: crate::run_build,
-        summary: "Compile a program to a native or WebAssembly artifact.",
-        args: "[<path>] [<shape>] [<runtime>] [<host>] [<target>]",
-        args_desc: "path: a source file, a project directory, or a package.ipe (default: the \
-                    current project). shape is derived from `main` and, if written, only \
-                    cross-checked. runtime/host apply to `web` only: `web` = served (served is \
-                    the unnamed default, never written), `web solo` = self-contained browser client, and \
-                    a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the \
-                    app bundle for that host (a fast dev bundle; `release web <host>` produces the \
-                    production distributable). With no delivery args, `build` builds the \
-                    default delivery — the fast one-artifact inner loop; `release` builds every \
-                    declared delivery. Delivery args select a subset or override for this \
-                    invocation only and never edit package.ipe.",
-        options: &[
-            Opt {
-                flag: "[--out <dir>]",
-                desc: "put build output under <dir> (default: out/ in the project)",
-            },
-            Opt {
-                flag: "[--runtime <dir>]",
-                desc: "vendor the Ipê runtime from <dir>",
-            },
-            Opt {
-                flag: "[--emit-ir]",
-                desc: "also emit the intermediate representation",
-            },
-            Opt {
-                flag: "[--fix]",
-                desc: "apply machine-applicable fixes before building",
-            },
-            Opt {
-                flag: "[--accept-risks]",
-                desc: "accept every disclosed .Unsafe escape-hatch import and proceed without prompting",
-            },
-            Opt {
-                flag: "[--static]",
-                desc: "produce a statically linked binary",
-            },
-            Opt {
-                flag: "[--target <triple|wasm|wasi>]",
-                desc: "cross-compile to <triple>, the browser (`wasm`), or co-located \
-                       WebAssembly/WASI (`wasi`, a wasm32-wasip1 module for a Direct script)",
-            },
-            Opt {
-                flag: "[--emit-permissions <ios|macos|android>]",
-                desc: "read-only: print the OS-permission declarations the app's accepted web \
-                       capabilities derive on the platform, and build nothing",
-            },
-            Opt {
-                flag: "[--allocator <auto|system|dlmalloc|talc|mimalloc>]",
-                desc: "select the global allocator (default: auto)",
-            },
-            Opt {
-                flag: "[--allow-slow-allocator]",
-                desc: "permit an allocator known to be slow for the target",
-            },
-            Opt {
-                flag: "[--cfree]",
-                desc: "build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)",
-            },
-            Opt {
-                flag: "[--debugger]",
-                desc: "compile the in-app time-travelling debugger overlay into the built app",
-            },
-            Opt {
-                flag: "[-q|--quiet]",
-                desc: "suppress progress chatter; only warnings and errors",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "emit each diagnostic as a stable JSON object (one per line) instead of the human layout",
-            },
-        ],
+        page: include_str!("../help/build.md"),
         hidden: false,
     },
     Command {
         name: "eject",
         run: crate::run_eject,
-        summary: "Emit a self-contained Rust project with a tree-shaken runtime.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[
-            Opt {
-                flag: "--out <dir>",
-                desc: "write the standalone project to <dir>, which must be absent or empty and outside out/, .ipe/ and any other ipe-owned tree (required)",
-            },
-            Opt {
-                flag: "[--runtime <dir>]",
-                desc: "vendor the Ipê runtime source from <dir>",
-            },
-        ],
+        page: include_str!("../help/eject.md"),
         hidden: false,
     },
     Command {
         name: "release",
         run: crate::run_release,
-        summary: "Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.",
-        args: "[<path>] [<shape>] [<runtime>] [<host>]",
-        args_desc: "A source file, a project directory, or a package.ipe (default: the current \
-                    project). shape/runtime/host are the delivery grammar shared with `build`: a \
-                    `desktop`/`ios`/`android` host lays out the production app bundle for that host \
-                    (a self-contained desktop bundle, or a native mobile system-webview shell). \
-                    With no delivery args, `release` builds every delivery declared in \
-                    package.ipe (`build` builds only the default one). Signing is release-time env, \
-                    never in package.ipe.",
-        options: &[
-            Opt {
-                flag: "[--out <dir>]",
-                desc: "put the artifact under <dir>/release/ (default: out/ in the project)",
-            },
-            Opt {
-                flag: "[--target wasm|<triple>]",
-                desc: "produce a browser bundle (`wasm`) or a musl-static binary for <triple> (default: x86_64-unknown-linux-musl)",
-            },
-            Opt {
-                flag: "[--emit-permissions <ios|macos|android>]",
-                desc: "read-only: print the OS-permission declarations the app's accepted web \
-                       capabilities derive on the platform, and build nothing",
-            },
-            Opt {
-                flag: "[--runtime <dir>]",
-                desc: "vendor the Ipê runtime source from <dir>",
-            },
-            Opt {
-                flag: "[--bundle]",
-                desc: "native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)",
-            },
-            Opt {
-                flag: "[--embed]",
-                desc: "native-bearing only: default single self-jailing binary (app + profile fused into wrapper)",
-            },
-            Opt {
-                flag: "[--capabilities] [--plain|--json]",
-                desc: "print the inferred capability model for the app without building",
-            },
-        ],
+        page: include_str!("../help/release.md"),
         hidden: false,
     },
     Command {
         name: "type-check",
         run: crate::run_type_check,
-        summary: "Type-check a program without building or running it.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[Opt {
-            flag: "[--json]",
-            desc: "emit each diagnostic as a stable JSON object (one per line) on stderr; \
-                   success is the shared JSON envelope on stdout",
-        }],
+        page: include_str!("../help/type-check.md"),
         hidden: false,
     },
     Command {
         name: "test",
         run: crate::run_test,
-        summary: "Build and run the project's tests/Main.ipe, reporting pass/fail.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[Opt {
-            flag: "[--json]",
-            desc: "emit a compact {\"result\":…} verdict on stdout (non-zero exit on a failing case)",
-        }],
+        page: include_str!("../help/test.md"),
         hidden: false,
     },
     Command {
         name: "verify",
         run: crate::run_verify,
-        summary: "Run the whole project gate: format, type-check, build, then test.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[Opt {
-            flag: "[--json]",
-            desc: "emit a compact gate verdict on stdout ({\"result\":…}; non-zero exit at the first failing stage)",
-        }],
+        page: include_str!("../help/verify.md"),
         hidden: false,
     },
     Command {
         name: "run",
         run: crate::run_run,
-        summary: "Compile a program and run the resulting binary.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[
-            Opt {
-                flag: "[--out <dir>]",
-                desc: "put build output under <dir> (default: out/ in the project)",
-            },
-            Opt {
-                flag: "[--runtime <dir>]",
-                desc: "vendor the Ipê runtime from <dir>",
-            },
-            Opt {
-                flag: "[--static]",
-                desc: "produce a statically linked binary",
-            },
-            Opt {
-                flag: "[--target <triple>]",
-                desc: "cross-compile to <triple>",
-            },
-            Opt {
-                flag: "[--allocator <auto|system|dlmalloc|talc|mimalloc>]",
-                desc: "select the global allocator (default: auto)",
-            },
-            Opt {
-                flag: "[--allow-slow-allocator]",
-                desc: "permit an allocator known to be slow for the target",
-            },
-            Opt {
-                flag: "[--cfree]",
-                desc: "build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)",
-            },
-            Opt {
-                flag: "[--accept-risks]",
-                desc: "accept every disclosed .Unsafe escape-hatch import and proceed without prompting",
-            },
-            Opt {
-                flag: "[--debugger]",
-                desc: "compile the in-app time-travelling debugger overlay into the run app",
-            },
-            Opt {
-                flag: "[--record]",
-                desc: "cli/worker apps: record the TEA session to out/session.ipelog (one plain `<msg> => <model>` line per step) and, when its Msg is encodable, a replayable out/session.ipemsgs",
-            },
-            Opt {
-                flag: "[--replay [<log>]]",
-                desc: "cli/worker apps: re-fold a recorded session (default: out/session.ipemsgs) from init with no Cmd fired, printing each step and the final model; a log from a changed program is refused. A plain trace (.ipelog, the default when no typed log was recorded, e.g. a Msg carrying a Secret) is shown instead, labelled, with every control character stripped and nothing re-run",
-            },
-            Opt {
-                flag: "[-q|--quiet]",
-                desc: "suppress progress chatter; only warnings and errors",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "emit each diagnostic as a stable JSON object (one per line) instead of the human layout",
-            },
-            Opt {
-                flag: "[-- <args>...]",
-                desc: "forward <args> to the compiled program",
-            },
-        ],
+        page: include_str!("../help/run.md"),
         hidden: false,
     },
     Command {
         name: "exec",
         run: crate::run_exec,
-        summary: "Run a built artifact, jailing native-bearing code to its embedded capability floor.",
-        args: "[<artifact-dir>]",
-        args_desc: "The build output directory to run (defaults to out/rust). A native-bearing \
-                    artifact is confined to its embedded capability floor; a pure Ipê artifact runs \
-                    directly.",
-        options: &[Opt {
-            flag: "[-- <args>...]",
-            desc: "forward <args> to the artifact",
-        }],
+        page: include_str!("../help/exec.md"),
         hidden: false,
     },
     Command {
         name: "watch",
         run: crate::run_watch,
-        summary: "Rebuild and re-run a program on every source change.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[
-            Opt {
-                flag: "[--out <dir>]",
-                desc: "put build output under <dir> (default: out/ in the project)",
-            },
-            Opt {
-                flag: "[--runtime <dir>]",
-                desc: "vendor the Ipê runtime from <dir>",
-            },
-            Opt {
-                flag: "[--port <n>]",
-                desc: "serve on port <n> (default: 8000)",
-            },
-            Opt {
-                flag: "[--debugger]",
-                desc: "compile the in-app time-travelling debugger overlay into the served app",
-            },
-            Opt {
-                flag: "[--reset-state]",
-                desc: "force every returning session to a fresh init instead of preserving prior state",
-            },
-            Opt {
-                flag: "[-q|--quiet]",
-                desc: "suppress progress chatter; only warnings and errors",
-            },
-        ],
+        page: include_str!("../help/watch.md"),
         hidden: false,
     },
     Command {
         name: "fix",
         run: crate::run_fix,
-        summary: "Apply the compiler's machine-applicable fixes to a source file.",
-        args: "<path>",
-        args_desc: "The source file to fix.",
-        options: &[Opt {
-            flag: "[--yes]",
-            desc: "apply every fix without per-edit confirmation",
-        }],
+        page: include_str!("../help/fix.md"),
         hidden: false,
     },
     Command {
         name: "fmt",
         run: crate::fmt::run_fmt,
-        summary: "Format Ipê source files.",
-        args: "[<path>]",
-        args_desc: "A file or directory to format (`.` for the current directory).",
-        options: &[
-            Opt {
-                flag: "[--check]",
-                desc: "report unformatted files without rewriting them",
-            },
-            Opt {
-                flag: "[--check --json|--plain]",
-                desc: "with --check, emit the unformatted file list as JSON ({\"unformatted\":[…]}) or one path per line",
-            },
-            Opt {
-                flag: "[--stdin]",
-                desc: "format stdin to stdout (for editors and pipes); excludes <path>",
-            },
-        ],
+        page: include_str!("../help/fmt.md"),
         hidden: false,
     },
     Command {
         name: "lint",
         run: crate::lint::run_lint,
-        summary: "Run extensible static analysis over Ipê source (idiom, consistency, safety-by-convention).",
-        args: "[<path>]",
-        args_desc: "A source file or a project directory to lint. Defaults to the current project.",
-        options: &[
-            Opt {
-                flag: "[--fix]",
-                desc: "apply every machine-applicable (semantics-preserving) fix instead of only reporting",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "emit findings as a JSON array ({\"schema\":\"ipe.cli.lint/1\",\"findings\":[…]}); exit non-zero when the gate trips",
-            },
-            Opt {
-                flag: "[--plain]",
-                desc: "print one finding per line flush-left (rule:file:line:col: message), no decoration",
-            },
-        ],
+        page: include_str!("../help/lint.md"),
         hidden: false,
     },
     Command {
         name: "clean",
         run: crate::clean::run_clean,
-        summary: "Remove the project's ipe-owned build output (out/, .ipe/).",
-        args: "",
-        args_desc: "",
-        options: &[
-            Opt {
-                flag: "[--json]",
-                desc: "emit the result as JSON ({\"schema\":\"ipe.cli.clean/1\",\"removed\":[…]})",
-            },
-            Opt {
-                flag: "[--plain]",
-                desc: "print one removed path per line, flush-left",
-            },
-        ],
+        page: include_str!("../help/clean.md"),
         hidden: false,
     },
+    // Editing a package.ipe `Package.dependencies` list is not yet
+    // automated, so `add`/`remove` today only report the manual step. Kept
+    // dispatchable (and documented) but withheld from the top-level screen
+    // until the manifest-source rewrite lands.
     Command {
         name: "add",
         run: crate::pkg::run_add,
-        summary: "Add an Ipê package dependency (resolution ships with the index).",
-        args: "<package>",
-        args_desc: "The package name, optionally `@version`.",
-        options: &[],
-        // Editing a package.ipe `Package.dependencies` list is not yet
-        // automated, so `add`/`remove` today only report the manual step. Kept
-        // dispatchable (and documented) but withheld from the top-level screen
-        // until the manifest-source rewrite lands.
+        page: include_str!("../help/add.md"),
         hidden: true,
     },
     Command {
         name: "remove",
         run: crate::pkg::run_remove,
-        summary: "Remove an Ipê package dependency.",
-        args: "<package>",
-        args_desc: "The package name.",
-        options: &[],
-        // See `add`: withheld from the top-level screen until the manifest-source
-        // rewrite lands; still dispatchable and documented.
+        page: include_str!("../help/remove.md"),
         hidden: true,
     },
     Command {
         name: "rust",
         run: crate::ffi::run_rust,
-        summary: "Manage Rust crates as foreign-function dependencies.",
-        args: "<add|remove|install> [<args>...]",
-        args_desc: "The action to run (add / remove / install) and its arguments.",
-        options: &[
-            Opt {
-                flag: "[--features <a,b>]",
-                desc: "add: enable the listed crate features",
-            },
-            Opt {
-                flag: "[--yes]",
-                desc: "add/install: skip the trust-summary confirmation prompt",
-            },
-            Opt {
-                flag: "[--allow-build-scripts]",
-                desc: "add/install: permit the crates' build scripts to run",
-            },
-            Opt {
-                flag: "[--verbose]",
-                desc: "add/install: show the full raw inspector log on failure",
-            },
-        ],
+        page: include_str!("../help/rust.md"),
         hidden: false,
     },
     Command {
         name: "package",
         run: crate::run_package,
-        summary: "Audit a package against the Tier-1 quality gate, publish it to the index, \
-                  validate an index entry file, or run the index CI's authoritative \
-                  receiving gate on a submitted entry.",
-        args: "<audit|audit-entry|publish|validate-entry> [<path>]",
-        args_desc: "The subcommand and its path: `audit`/`publish` take the project directory \
-                    or `package.ipe` (defaults to the current project); `validate-entry` takes a \
-                    `packages/<name>.toml` entry file (schema check only); `audit-entry` takes \
-                    the same entry file and runs the full index CI receiving gate: schema, \
-                    fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every \
-                    new version.",
-        options: &[
-            Opt {
-                flag: "[--index <dir|repo>]",
-                desc: "audit: read the previous published version from this index checkout; \
-                       publish: the index repo the PR targets",
-            },
-            Opt {
-                flag: "[--json|--plain]",
-                desc: "audit: emit a compact certify verdict on stdout ({\"package\":…,\"certified\":…}; \
-                       non-zero exit on a failing audit)",
-            },
-            Opt {
-                flag: "[--dry-run]",
-                desc: "publish: print the computed entry and intended PR, touch no network",
-            },
-            Opt {
-                flag: "[--source <url>]",
-                desc: "publish: the source URL to pin (overrides the git remote)",
-            },
-            Opt {
-                flag: "[--rev <sha>]",
-                desc: "publish: the revision to pin (overrides the committed HEAD)",
-            },
-            Opt {
-                flag: "[--fork <owner>]",
-                desc: "publish: the owner of your index fork to push to (defaults to the source \
-                       owner)",
-            },
-        ],
+        page: include_str!("../help/package.md"),
         hidden: false,
     },
     Command {
         name: "login",
         run: crate::login::run_login,
-        summary: "Authorize ipe with GitHub (device flow) and store a publish token.",
-        args: "",
-        args_desc: "",
-        options: &[
-            Opt {
-                flag: "[--status]",
-                desc: "report whether a token is stored",
-            },
-            Opt {
-                flag: "[--logout]",
-                desc: "remove the stored token",
-            },
-        ],
+        page: include_str!("../help/login.md"),
         hidden: false,
     },
     Command {
         name: "capabilities",
         run: crate::run_capabilities,
-        summary: "Report the security capabilities a program exercises, inferred from its code.",
-        args: "[<path>]",
-        args_desc: "A source file, a project directory, or a package.ipe. Defaults to the current project.",
-        options: &[
-            Opt {
-                flag: "[--plain]",
-                desc: "print the bare capability names, one per line, flush-left",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "print the capability set as a stable JSON envelope for jq",
-            },
-        ],
+        page: include_str!("../help/capabilities.md"),
         hidden: false,
     },
     Command {
         name: "diff",
         run: crate::diff::run_diff,
-        summary: "Compare two package versions' public APIs and report the required semver bump.",
-        args: "<old> <new>  |  check <old> <new> <old-version> <new-version>",
-        args_desc: "The two package paths to compare — the old version first, then the new. \
-                    `check`: also reject a new version that does not clear the required bump \
-                    (`--check <old-version> <new-version>` is a deprecated alias).",
-        options: &[
-            Opt {
-                flag: "[--plain]",
-                desc: "print flush-left change / bump records for grep/awk",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "print the report as a stable JSON object for jq",
-            },
-        ],
+        page: include_str!("../help/diff.md"),
         hidden: false,
     },
     Command {
         name: "doc",
         run: crate::doc::run_doc,
-        summary: "Look up documentation, generate API docs (docs.json + Markdown + HTML), query the stdlib, list modules, preview, or check coverage.",
-        args: "[list | serve | check | <key> | <Module.Name>] [<path>]",
-        args_desc: "Without a subcommand: generate docs.json + renderings for the project and stdlib. \
-                    `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), \
-                    module (List), language construct (case), or CLI command (version). \
-                    `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). \
-                    `serve`: build the HTML site and preview it on loopback. \
-                    `check`: verify doc-comment coverage for project modules (stdlib is exempt). \
-                    `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).",
-        options: &[
-            Opt {
-                flag: "[--out <dir>]",
-                desc: "write the documentation to <dir> (default: doc/); generate only",
-            },
-            Opt {
-                flag: "[--write-format markdown|json|html|all]",
-                desc: "which renderings to write beside docs.json (default: all); generate only",
-            },
-            Opt {
-                flag: "[--port <n>]",
-                desc: "pin the serve port (default: an auto-selected free one); serve only",
-            },
-            Opt {
-                flag: "[--plain]",
-                desc: "bare output, one entry per line; list and <module> only",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "machine-readable JSON output; list and <module> only",
-            },
-        ],
+        page: include_str!("../help/doc.md"),
         hidden: false,
     },
     Command {
         name: "lsp",
         run: crate::lsp::run_lsp,
-        summary: "Run the language server over stdio.",
-        args: "",
-        args_desc: "",
-        options: &[],
+        page: include_str!("../help/lsp.md"),
         hidden: false,
     },
     Command {
         name: "upgrade",
         run: crate::run_upgrade,
-        summary: "Self-update ipe to the latest release (re-runs the installer).",
-        args: "",
-        args_desc: "",
-        options: &[
-            Opt {
-                flag: "[--check]",
-                desc: "report whether an upgrade is available, never install",
-            },
-            Opt {
-                flag: "[--check --exit-code]",
-                desc: "exit 10 = available, 0 = up-to-date, 2 = feed unreachable",
-            },
-            Opt {
-                flag: "[--yes|-y]",
-                desc: "skip the confirmation prompt (implied by non-TTY stdout)",
-            },
-            Opt {
-                flag: "[--dry-run]",
-                desc: "print the installer command without running it",
-            },
-            Opt {
-                flag: "[--plain]",
-                desc: "print one terse status line, flush-left (never prompts)",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "print the status as JSON (never prompts)",
-            },
-        ],
+        page: include_str!("../help/upgrade.md"),
         hidden: false,
     },
     Command {
         name: "health",
         run: crate::health::run_health,
-        summary: "Diagnose the build environment and offer consent-gated setup.",
-        args: "",
-        args_desc: "",
-        options: &[
-            Opt {
-                flag: "[--yes|-y]",
-                desc: "apply every suggested fix without prompting (for CI / provisioning)",
-            },
-            Opt {
-                flag: "[--plain]",
-                desc: "print one status record per line, flush-left (never mutates)",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "print the report as JSON for jq (never mutates)",
-            },
-        ],
+        page: include_str!("../help/health.md"),
         hidden: false,
     },
     Command {
         name: "version",
         run: crate::run_version,
-        summary: "Print the ipe version.",
-        args: "",
-        args_desc: "",
-        options: &[
-            Opt {
-                flag: "[--plain]",
-                desc: "print the bare version string, flush-left",
-            },
-            Opt {
-                flag: "[--json]",
-                desc: "print the version as a stable JSON envelope for jq",
-            },
-        ],
+        page: include_str!("../help/version.md"),
         hidden: false,
     },
 ];
 
-/// The top-level screen's command groups, in display order. Every command
-/// appears in exactly one section.
-const SECTIONS: &[Section] = &[
-    Section {
-        title: "Development",
-        commands: &["init", "dev", "release", "exec"],
-    },
-    Section {
-        title: "Quality",
-        commands: &["type-check", "lint", "test", "verify"],
-    },
-    Section {
-        title: "Package authoring",
-        commands: &["login", "package"],
-    },
-    Section {
-        title: "Foreign-function interface (FFI)",
-        commands: &["rust"],
-    },
-    Section {
-        title: "Tools",
-        commands: &[
-            "doc",
-            "fmt",
-            "lsp",
-            "clean",
-            "health",
-            "capabilities",
-            "diff",
-            "fix",
-            "eject",
-            "upgrade",
-            "version",
-        ],
-    },
-];
+impl Command {
+    /// The command's parsed help page.
+    fn text(&self) -> CommandText {
+        help_page::parse_command_page(self.name, self.page).0
+    }
+}
+
+impl Group {
+    /// The group's one-line summary.
+    fn summary(&self) -> &'static str {
+        help_page::summary_of(self.page)
+    }
+}
+
+/// The overview's sections, in display order (from `help/index.md`).
+fn sections() -> Vec<SectionText> {
+    help_page::sections()
+}
 
 /// Look up a command's help entry by name.
 fn find(name: &str) -> Option<&'static Command> {
@@ -1019,7 +466,7 @@ pub(crate) fn handler(name: &str) -> Option<(&'static str, Handler)> {
 /// `ipe doc <command>` resolves from the same SSOT as `ipe <command> --help`.
 #[must_use]
 pub fn command_summary(name: &str) -> Option<&'static str> {
-    find(name).map(|c| c.summary)
+    find(name).map(|c| c.text().summary)
 }
 
 /// Render a command's full help as Markdown, or `None` when `name` is unknown.
@@ -1034,21 +481,28 @@ pub fn command_doc_markdown(name: &str) -> Option<String> {
     find(name).map(render_command_markdown)
 }
 
-/// Render one command's help page as Markdown from its [`Command`] entry.
+/// Render one command's help page as Markdown from its parsed `.md` page, with
+/// shared flags expanded in place.
 fn render_command_markdown(cmd: &Command) -> String {
+    let text = cmd.text();
     let mut out = String::new();
-    let _ = writeln!(out, "{}\n", cmd.summary);
+    let _ = writeln!(out, "{}\n", text.summary);
     let _ = write!(out, "```\nipe {}", cmd.name);
-    if !cmd.args.is_empty() {
-        let _ = write!(out, " {}", cmd.args);
+    if !text.args.is_empty() {
+        let _ = write!(out, " {}", text.args);
     }
     out.push_str("\n```\n");
-    if !cmd.args_desc.is_empty() {
-        let _ = writeln!(out, "\n## Arguments\n\n{}", cmd.args_desc);
+    if !text.args_desc.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## {}\n\n{}",
+            help_page::arguments_heading(),
+            text.args_desc
+        );
     }
-    if !cmd.options.is_empty() {
-        out.push_str("\n## Options\n\n");
-        for opt in cmd.options {
+    if !text.options.is_empty() {
+        let _ = writeln!(out, "\n## {}\n", help_page::options_heading());
+        for opt in &text.options {
             let _ = writeln!(out, "- `{}` — {}", opt.flag, opt.desc);
         }
     }
@@ -1085,11 +539,12 @@ pub fn group(name: &str, stream: &impl IsTerminal) -> Option<String> {
 fn render_group(g: &Group, p: &Palette) -> String {
     let mut out = String::new();
     out.push('\n');
-    let _ = writeln!(out, "{}{}{}", p.dim, g.summary, p.reset);
+    let _ = writeln!(out, "{}{}{}", p.dim, g.summary(), p.reset);
     out.push('\n');
     let _ = writeln!(out, "{}ipe {} <verb>{}", p.yellow, g.name, p.reset);
     out.push('\n');
-    out.push_str("Verbs:\n");
+    out.push_str(crate::text::verbs_label());
+    out.push('\n');
     let name_w = g
         .members
         .iter()
@@ -1103,43 +558,42 @@ fn render_group(g: &Group, p: &Palette) -> String {
         let _ = writeln!(
             out,
             "  {}ipe {} {}{}{:pad$}  {}{}{}",
-            p.yellow, g.name, cmd.name, p.reset, "", p.dim, cmd.summary, p.reset,
+            p.yellow,
+            g.name,
+            cmd.name,
+            p.reset,
+            "",
+            p.dim,
+            cmd.text().summary,
+            p.reset,
         );
     }
     out.push('\n');
     gutter(&out)
 }
 
-/// The synopsis line for `cmd`: `ipe <name>` in yellow, then its arguments
-/// inline in plain text.
-fn command_line(cmd: &Command, p: &Palette) -> String {
-    let mut line = format!("{}ipe {}{}", p.yellow, cmd.name, p.reset);
-    if !cmd.args.is_empty() {
+/// The synopsis line for command `name`: `ipe <name>` in yellow, then its
+/// arguments inline in plain text.
+fn command_line(name: &str, args: &str, p: &Palette) -> String {
+    let mut line = format!("{}ipe {name}{}", p.yellow, p.reset);
+    if !args.is_empty() {
         line.push(' ');
-        line.push_str(cmd.args);
+        line.push_str(args);
     }
     line
 }
 
-/// Render the top-level overview: the header, then every command grouped by
-/// section.
+/// Render the top-level overview: every command grouped by section. The
+/// product header and the bug footer come from the screen frame
+/// ([`crate::screen`]).
 fn render_top_level(p: &Palette) -> String {
-    let version = env!("CARGO_PKG_VERSION");
     let mut out = String::new();
-
-    // Header: the product name in soft yellow, the URL dimmed.
-    out.push('\n');
-    let _ = writeln!(
-        out,
-        "{}Ipê language{} - v{version} - {}{REPO_URL}{}",
-        p.yellow, p.reset, p.dim, p.reset
-    );
 
     // The full list: every command by section, each shown as a ready-to-run
     // `ipe <command> --help`. The `--help` suffix aligns into one column within
     // the section (names padded to the section's widest) so the lines read as a
     // tidy block the reader can copy verbatim.
-    for section in SECTIONS {
+    for section in &sections() {
         out.push('\n');
         let _ = writeln!(out, "{}{}{}", p.bold, section.title, p.reset);
         // A section entry names either a command or a group; both render as a
@@ -1152,7 +606,7 @@ fn render_top_level(p: &Palette) -> String {
             .map(|n| n.len())
             .max()
             .unwrap_or(0);
-        for &name in section.commands {
+        for &name in &section.commands {
             // A hidden command is never listed, even if a section still names it.
             if find(name).is_some_and(|c| c.hidden) {
                 continue;
@@ -1170,17 +624,12 @@ fn render_top_level(p: &Palette) -> String {
         }
     }
 
-    // Footer: where to report bugs. The repository link already sits in the
-    // header, so it is not repeated here.
-    out.push('\n');
-    let _ = writeln!(out, "{}{}{}", p.dim, report_bugs_footer(), p.reset);
-    out.push('\n');
     gutter(&out)
 }
 
 /// Emit the full command grammar as a compact JSON object (schema `"ipe.cli.help/1"`).
 ///
-/// The payload is a pure read-only view over [`COMMANDS`] and [`SECTIONS`] —
+/// The payload is a pure read-only view over [`COMMANDS`] and the `.md` pages —
 /// the same data the human screen and the dispatch table read — so the JSON
 /// grammar cannot drift from what the CLI accepts. The schema tag (`"schema"`)
 /// lets a consumer fail closed on a breaking change: additive new fields are
@@ -1203,7 +652,7 @@ pub fn help_json() -> String {
     use crate::cli_args::json;
     let version = env!("CARGO_PKG_VERSION");
 
-    let sections_arr: Vec<String> = SECTIONS
+    let sections_arr: Vec<String> = sections()
         .iter()
         .map(|s| {
             let cmds = s
@@ -1221,7 +670,8 @@ pub fn help_json() -> String {
     let commands_arr: Vec<String> = COMMANDS
         .iter()
         .map(|c| {
-            let opts: Vec<String> = c
+            let text = c.text();
+            let opts: Vec<String> = text
                 .options
                 .iter()
                 .map(|o| {
@@ -1233,9 +683,9 @@ pub fn help_json() -> String {
                 .collect();
             json::object(&[
                 ("name", json::string(c.name)),
-                ("summary", json::string(c.summary)),
-                ("args", json::string(c.args)),
-                ("args_desc", json::string(c.args_desc)),
+                ("summary", json::string(text.summary)),
+                ("args", json::string(text.args)),
+                ("args_desc", json::string(text.args_desc)),
                 (
                     "hidden",
                     if c.hidden {
@@ -1259,7 +709,7 @@ pub fn help_json() -> String {
                 .collect::<Vec<_>>();
             json::object(&[
                 ("name", json::string(g.name)),
-                ("summary", json::string(g.summary)),
+                ("summary", json::string(g.summary())),
                 ("members", json::array(&members)),
             ])
         })
@@ -1283,7 +733,8 @@ pub fn help_json() -> String {
 pub fn command_json(name: &str) -> Option<String> {
     use crate::cli_args::json;
     let c = find(name)?;
-    let opts: Vec<String> = c
+    let text = c.text();
+    let opts: Vec<String> = text
         .options
         .iter()
         .map(|o| {
@@ -1296,9 +747,9 @@ pub fn command_json(name: &str) -> Option<String> {
     let obj = json::object(&[
         ("schema", json::string("ipe.cli.help/1")),
         ("name", json::string(c.name)),
-        ("summary", json::string(c.summary)),
-        ("args", json::string(c.args)),
-        ("args_desc", json::string(c.args_desc)),
+        ("summary", json::string(text.summary)),
+        ("args", json::string(text.args)),
+        ("args_desc", json::string(text.args_desc)),
         (
             "hidden",
             if c.hidden {
@@ -1321,22 +772,23 @@ pub fn command_json(name: &str) -> Option<String> {
 /// `Options:` bodies carry a further two-space indent so they read as nested
 /// under their heading.
 fn render_command(cmd: &Command, p: &Palette) -> String {
+    let text = cmd.text();
     let mut out = String::new();
     out.push('\n');
-    let _ = writeln!(out, "{}{}{}", p.dim, cmd.summary, p.reset);
+    let _ = writeln!(out, "{}{}{}", p.dim, text.summary, p.reset);
     out.push('\n');
-    out.push_str(&command_line(cmd, p));
+    out.push_str(&command_line(cmd.name, text.args, p));
     out.push('\n');
-    if !cmd.args_desc.is_empty() {
+    if !text.args_desc.is_empty() {
         out.push('\n');
-        out.push_str("Arguments:\n");
-        let _ = writeln!(out, "  {}{}{}", p.dim, cmd.args_desc, p.reset);
+        let _ = writeln!(out, "{}:", help_page::arguments_heading());
+        let _ = writeln!(out, "  {}{}{}", p.dim, text.args_desc, p.reset);
     }
-    if !cmd.options.is_empty() {
+    if !text.options.is_empty() {
         out.push('\n');
-        out.push_str("Options:\n");
-        let width = cmd.options.iter().map(|o| o.flag.len()).max().unwrap_or(0);
-        for opt in cmd.options {
+        let _ = writeln!(out, "{}:", help_page::options_heading());
+        let width = text.options.iter().map(|o| o.flag.len()).max().unwrap_or(0);
+        for opt in &text.options {
             let _ = writeln!(
                 out,
                 "  {:<width$}  {}{}{}",
@@ -1355,7 +807,7 @@ mod tests {
     #[test]
     fn plain_top_level_names_every_command_and_section() {
         let plain = render_top_level(&Palette::PLAIN);
-        for section in SECTIONS {
+        for section in &sections() {
             assert!(
                 plain.contains(section.title),
                 "missing section {}",
@@ -1413,19 +865,74 @@ mod tests {
         for cmd in COMMANDS {
             let page = render_command(cmd, &Palette::PLAIN);
             assert!(page.contains(&format!("ipe {}", cmd.name)));
-            assert!(page.contains(cmd.summary));
+            assert!(page.contains(cmd.text().summary));
+        }
+    }
+
+    /// Every embedded `.md` page keeps the page shape.
+    ///
+    /// A summary, a synopsis naming its own command, one-line paragraphs,
+    /// well-formed options, and only shared flags `help/flags.md` defines.
+    #[test]
+    fn every_help_page_parses_without_defects() {
+        for cmd in COMMANDS {
+            let (_, defects) = help_page::parse_command_page(cmd.name, cmd.page);
+            assert!(defects.is_empty(), "help/{}.md: {defects:?}", cmd.name);
+        }
+        for g in GROUPS {
+            assert!(!g.summary().is_empty(), "help/{}.md has no summary", g.name);
+        }
+    }
+
+    /// Every `.md` under `help/` is embedded.
+    ///
+    /// Each is a command page, a group page, the shared flags, or the overview
+    /// layout — no orphan text a dev could edit to no effect.
+    #[test]
+    fn every_help_md_file_is_embedded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("help");
+        let entries = std::fs::read_dir(&dir);
+        assert!(entries.is_ok(), "cannot read {}", dir.display());
+        for entry in entries.into_iter().flatten().flatten() {
+            let path = entry.path();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            assert!(
+                is_command(stem) || is_group(stem) || stem == "index" || stem == "flags",
+                "help/{stem}.md is not embedded by any command, group, or page"
+            );
+        }
+    }
+
+    /// The terminal page renders the `.md` wording verbatim: the summary line,
+    /// the synopsis, and every option's flag and description.
+    #[test]
+    fn the_terminal_page_carries_the_md_wording() {
+        for cmd in COMMANDS {
+            let text = cmd.text();
+            let page = render_command(cmd, &Palette::PLAIN);
+            let first_line = cmd.page.lines().next().unwrap_or_default();
+            assert_eq!(text.summary, first_line.trim(), "help/{}.md", cmd.name);
+            assert!(page.contains(first_line.trim()), "{page}");
+            for opt in &text.options {
+                assert!(
+                    page.contains(opt.flag) && page.contains(opt.desc),
+                    "`ipe {} --help` omits {opt:?}",
+                    cmd.name
+                );
+            }
         }
     }
 
     #[test]
     fn commands_with_an_argument_describe_it() {
         for cmd in COMMANDS {
-            if cmd.args_desc.is_empty() {
+            let text = cmd.text();
+            if text.args_desc.is_empty() {
                 continue;
             }
             let page = render_command(cmd, &Palette::PLAIN);
             assert!(
-                page.contains("Arguments:") && page.contains(cmd.args_desc),
+                page.contains("Arguments:") && page.contains(text.args_desc),
                 "missing argument description for {}",
                 cmd.name
             );
@@ -1435,11 +942,11 @@ mod tests {
     #[test]
     fn section_commands_show_an_aligned_help_suffix() {
         let plain = render_top_level(&Palette::PLAIN);
-        for section in SECTIONS {
+        for section in &sections() {
             // Every command line in a section carries a copy-pasteable `--help`,
             // and within the section the `--help` column is vertically aligned.
             let mut help_columns = Vec::new();
-            for &name in section.commands {
+            for &name in &section.commands {
                 let needle = format!("ipe {name} ");
                 let col = plain
                     .lines()
@@ -1465,8 +972,8 @@ mod tests {
     #[test]
     fn sections_reference_only_known_nodes() {
         // A section entry names either a top-level command or a group node.
-        for section in SECTIONS {
-            for &name in section.commands {
+        for section in &sections() {
+            for &name in &section.commands {
                 assert!(
                     is_command(name) || is_group(name),
                     "section lists unknown node {name}"
@@ -1478,9 +985,9 @@ mod tests {
     #[test]
     fn every_command_appears_in_exactly_one_section_or_group() {
         for cmd in COMMANDS {
-            let in_sections = SECTIONS
+            let in_sections = sections()
                 .iter()
-                .flat_map(|s| s.commands)
+                .flat_map(|s| s.commands.iter())
                 .filter(|&&n| n == cmd.name)
                 .count();
             // A visible command is advertised exactly once — either directly in a
@@ -1528,9 +1035,9 @@ mod tests {
     #[test]
     fn every_group_appears_in_exactly_one_section() {
         for g in GROUPS {
-            let count = SECTIONS
+            let count = sections()
                 .iter()
-                .flat_map(|s| s.commands)
+                .flat_map(|s| s.commands.iter())
                 .filter(|&&n| n == g.name)
                 .count();
             assert_eq!(
@@ -1652,7 +1159,7 @@ mod tests {
         let Some(cmd) = COMMANDS.iter().find(|c| c.name == command) else {
             return;
         };
-        for opt in cmd.options {
+        for opt in &cmd.text().options {
             let takes_value = opt.flag.contains('<');
             for tok in advertised_flag_tokens(opt.flag) {
                 let mut argv = vec![tok.clone()];
@@ -1703,7 +1210,7 @@ mod tests {
             );
         }
         // Every section title must appear.
-        for section in SECTIONS {
+        for section in &sections() {
             assert!(
                 json.contains(section.title),
                 "section {} missing from help_json",

@@ -110,10 +110,7 @@ fn built_code(root: &Path, name: &str) -> (Result<(), CliError>, PathBuf) {
     let entry = fixture_entry(root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime();
-    let Ok(runtime) = runtime else {
-        return (Ok(()), out); // resolver unavailable in this environment — skip below
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     (ipe::build(&entry, &out, &runtime), out)
 }
 
@@ -125,9 +122,6 @@ fn built_code(root: &Path, name: &str) -> (Result<(), CliError>, PathBuf) {
 #[test]
 fn result_and_map_fn_payload_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "result_and_map_fn_payload");
     assert!(
         built.is_ok(),
@@ -152,9 +146,6 @@ fn result_and_map_fn_payload_accepted() {
 #[test]
 fn maybe_and_map_fn_payload_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "maybe_and_map_fn_payload");
     assert!(
         built.is_ok(),
@@ -192,9 +183,6 @@ fn maybe_and_map_fn_payload_accepted() {
 #[test]
 fn let_bound_fn_payload_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "let_bound_fn_payload");
     assert!(
         built.is_ok(),
@@ -220,9 +208,6 @@ fn let_bound_fn_payload_accepted() {
 #[test]
 fn let_bound_maybe_fn_payload_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "let_bound_maybe_fn_payload");
     assert!(
         built.is_ok(),
@@ -248,9 +233,6 @@ fn let_bound_maybe_fn_payload_accepted() {
 #[test]
 fn ctor_decl_fn_payload_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "ctor_decl_fn_payload");
     assert!(
         built.is_ok(),
@@ -276,9 +258,6 @@ fn ctor_decl_fn_payload_accepted() {
 #[test]
 fn fn_extracted_called_twice_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "fn_extracted_called_twice");
     assert!(
         built.is_ok(),
@@ -331,9 +310,6 @@ fn fn_extracted_called_twice_accepted() {
 ///   passing this assertion).
 fn assert_hof_curried_rejected(name: &str) {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, _out) = built_code(&root, name);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -413,16 +389,14 @@ fn and_map_record_field_extraction_stays_gated() {
 #[test]
 fn and_map_cross_module_annotated_wrapper_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let entry = fixture_src_entry(&root, "and_map_cross_module_wrapper_accepted");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_wrapper_accepted_emit");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = crate::support::expect_runtime(
+        "and_map_cross_module_wrapper_accepted",
+        ipe::resolve_runtime(),
+    );
     let built = ipe::build_with_sibling_discovery(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -442,16 +416,14 @@ fn and_map_cross_module_annotated_wrapper_accepted() {
 #[test]
 fn and_map_forwarder_curried_is_ipe_t0014() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let entry = fixture_src_entry(&root, "and_map_forwarder_curried_is_t0014");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_forwarder_curried_is_t0014_emit");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = crate::support::expect_runtime(
+        "and_map_forwarder_curried_is_t0014",
+        ipe::resolve_runtime(),
+    );
     let built = ipe::build_with_sibling_discovery(&entry, &out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -477,9 +449,6 @@ fn and_map_forwarder_curried_is_ipe_t0014() {
 #[test]
 fn lambda_param_reuse_gated() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, _out) = built_code(&root, "lambda_param_reuse_gated");
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -498,9 +467,6 @@ fn lambda_param_reuse_gated() {
 #[test]
 fn lambda_param_call_twice_accepted() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, "lambda_param_call_twice_accepted");
     assert!(
         built.is_ok(),
@@ -528,9 +494,6 @@ fn lambda_param_call_twice_accepted() {
 #[test]
 fn fn_carrier_reuse_gated() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, _out) = built_code(&root, "fn_carrier_reuse_gated");
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -551,9 +514,6 @@ fn fn_carrier_reuse_gated() {
 /// concrete `Fun` found at a forwarder's own external call site).
 fn assert_rejected_t0014(name: &str) {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, _out) = built_code(&root, name);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -572,9 +532,6 @@ fn assert_rejected_t0014(name: &str) {
 /// whose absence let attempts 1-4 ship exit-0-then-cargo-fail bugs.
 fn assert_accepted_runs(name: &str, expected_stdout: &str) {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, out) = built_code(&root, name);
     assert!(built.is_ok(), "{name}: must be accepted, got: {built:?}");
 
@@ -659,16 +616,14 @@ fn and_map_untyped_double_forwarder_arity1_accepted() {
 #[test]
 fn and_map_cross_module_untyped_forwarder_curried_rejected() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let entry = fixture_src_entry(&root, "and_map_cross_module_untyped_forwarder_curried");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("l0114_and_map_cross_module_untyped_forwarder_curried_emit");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = crate::support::expect_runtime(
+        "and_map_cross_module_untyped_forwarder_curried",
+        ipe::resolve_runtime(),
+    );
     let built = ipe::build_with_sibling_discovery(&entry, &out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -797,9 +752,6 @@ fn dict_fn_dispatch_accepted() {
 #[test]
 fn list_fn_member_stays_gated() {
     let root = repo_root();
-    if ipe::resolve_runtime().is_err() {
-        return;
-    }
     let (built, _out) = built_code(&root, "list_fn_member_gated");
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),

@@ -265,7 +265,9 @@ mod engine {
         builder
             .preopened_dir(scratch, ".", DirPerms::all(), FilePerms::all())
             .map_err(|e| CliError::WasiRunFailed {
-                detail: format!("could not preopen the scoped scratch dir: {e}"),
+                detail: crate::style::TerminalSafe::sanitize(&format!(
+                    "could not preopen the scoped scratch dir: {e}"
+                )),
             })?;
         if matches!(
             FsGrant::from_profile(profile),
@@ -274,7 +276,9 @@ mod engine {
             builder
                 .preopened_dir(working_tree, "/work", DirPerms::all(), FilePerms::all())
                 .map_err(|e| CliError::WasiRunFailed {
-                    detail: format!("could not preopen the working tree: {e}"),
+                    detail: crate::style::TerminalSafe::sanitize(&format!(
+                        "could not preopen the working tree: {e}"
+                    )),
                 })?;
         }
 
@@ -322,7 +326,9 @@ mod engine {
         // returns, so nothing persists past the run.
         let scratch = crate::scratch::ScratchDir::new("ipe-wasi-run").map_err(|e| {
             CliError::WasiRunFailed {
-                detail: format!("could not create the scoped scratch dir: {e}"),
+                detail: crate::style::TerminalSafe::sanitize(&format!(
+                    "could not create the scoped scratch dir: {e}"
+                )),
             }
         })?;
 
@@ -334,21 +340,25 @@ mod engine {
         let mut config = Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| CliError::WasiRunFailed {
-            detail: format!("could not build the wasmtime engine: {e}"),
+            detail: crate::style::TerminalSafe::sanitize(&format!(
+                "could not build the wasmtime engine: {e}"
+            )),
         })?;
 
         let module =
             Module::from_file(&engine, module_file).map_err(|e| CliError::WasiRunFailed {
-                detail: format!(
+                detail: crate::style::TerminalSafe::sanitize(&format!(
                     "could not load the module at {}: {e}",
                     module_file.display()
-                ),
+                )),
             })?;
 
         let mut linker: Linker<HostState> = Linker::new(&engine);
         preview1::add_to_linker_sync(&mut linker, |s: &mut HostState| &mut s.wasi).map_err(
             |e| CliError::WasiRunFailed {
-                detail: format!("could not wire the WASI preview1 imports: {e}"),
+                detail: crate::style::TerminalSafe::sanitize(&format!(
+                    "could not wire the WASI preview1 imports: {e}"
+                )),
             },
         )?;
 
@@ -374,14 +384,18 @@ mod engine {
             linker
                 .instantiate(&mut store, &module)
                 .map_err(|e| CliError::WasiRunFailed {
-                    detail: format!("could not instantiate the module: {e}"),
+                    detail: crate::style::TerminalSafe::sanitize(&format!(
+                        "could not instantiate the module: {e}"
+                    )),
                 })?;
 
         // A wasip1 command module exports `_start` with signature `() -> ()`.
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| CliError::WasiRunFailed {
-                detail: format!("the module has no wasip1 `_start` entry point: {e}"),
+                detail: crate::style::TerminalSafe::sanitize(&format!(
+                    "the module has no wasip1 `_start` entry point: {e}"
+                )),
             })?;
 
         match start.call(&mut store, ()) {
@@ -403,7 +417,9 @@ mod engine {
                     };
                 }
                 Err(CliError::WasiRunFailed {
-                    detail: format!("the module trapped during execution: {trap}"),
+                    detail: crate::style::TerminalSafe::sanitize(&format!(
+                        "the module trapped during execution: {trap}"
+                    )),
                 })
             }
         }

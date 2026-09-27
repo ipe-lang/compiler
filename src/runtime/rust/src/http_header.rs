@@ -38,6 +38,7 @@ pub(crate) fn canonical_header(k: &str) -> String {
 /// `http`) from a `host[:port]` authority string, if present. Any other
 /// scheme (or an authority without that exact suffix) passes through
 /// unchanged.
+#[cfg(feature = "server")]
 fn strip_default_port<'a>(authority: &'a str, scheme: &str) -> &'a str {
     let suffix = match scheme {
         "https" => ":443",
@@ -65,6 +66,7 @@ fn strip_default_port<'a>(authority: &'a str, scheme: &str) -> &'a str {
 /// caller fails CLOSED on a mismatch — over-rejecting, never under-
 /// rejecting), not a vulnerability; still worth normalizing correctly rather
 /// than leaving three copies of the same raw-string-compare gap.
+#[cfg(feature = "server")]
 pub(crate) fn origin_host_mismatch(origin: &str, host: &str) -> bool {
     if host.is_empty() {
         return false;
@@ -77,7 +79,9 @@ pub(crate) fn origin_host_mismatch(origin: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_header, origin_host_mismatch};
+    use super::canonical_header;
+    #[cfg(feature = "server")]
+    use super::origin_host_mismatch;
 
     /// Well-formed header names — byte-identical to
     /// `textproto.CanonicalMIMEHeaderKey`.
@@ -117,6 +121,7 @@ mod tests {
 
     /// Baseline: same host, no port anywhere — same-origin (browsers'
     /// common case for both headers).
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_same_origin_no_ports() {
         assert!(!origin_host_mismatch("https://example.com", "example.com"));
@@ -124,6 +129,7 @@ mod tests {
 
     /// Cross-origin host — must still be flagged regardless of the port
     /// normalization added by this fix.
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_different_host_is_flagged() {
         assert!(origin_host_mismatch(
@@ -135,6 +141,7 @@ mod tests {
     /// The bug this fix closes: `https://example.com` (implicit :443) vs
     /// `Host: example.com:443` (explicit) is the SAME origin. Pre-fix (raw
     /// string compare) this was a false-positive mismatch.
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_normalizes_explicit_default_https_port() {
         assert!(!origin_host_mismatch(
@@ -144,6 +151,7 @@ mod tests {
     }
 
     /// Same bug, `http`/`:80` side.
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_normalizes_explicit_default_http_port() {
         assert!(!origin_host_mismatch(
@@ -155,6 +163,7 @@ mod tests {
     /// A NON-default explicit port must still compare as a mismatch when the
     /// other side omits it — normalization only strips the SCHEME-IMPLIED
     /// default port, not arbitrary ports.
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_nondefault_port_still_flagged() {
         assert!(origin_host_mismatch(
@@ -169,6 +178,7 @@ mod tests {
 
     /// Empty Host header → never a mismatch (matches every call site's own
     /// pre-existing `!host.is_empty()` guard — nothing to compare against).
+    #[cfg(feature = "server")]
     #[test]
     fn origin_host_mismatch_empty_host_is_never_flagged() {
         assert!(!origin_host_mismatch("https://evil.example", ""));

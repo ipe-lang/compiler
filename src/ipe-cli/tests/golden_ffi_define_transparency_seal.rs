@@ -129,7 +129,8 @@ fn define_transparency_emits_the_conversion_seam() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_define_transparency");
+    let tmp =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_define_transparency");
     assert!(
         write_project(&tmp),
         "must write the fixture project + FFI cache"
@@ -191,7 +192,8 @@ fn define_transparency_emitted_crate_builds_and_runs() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_define_transparency_e2e");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipec_ffi_define_transparency_e2e");
     assert!(
         write_project(&tmp),
         "must write the fixture project + FFI cache"
@@ -291,7 +293,8 @@ fn value_struct_marshal_refuses_a_mismatched_record_shape() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_value_struct_mismatch");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipec_ffi_value_struct_mismatch");
     assert!(
         write_mismatched_project(&tmp),
         "must write the mismatched-record fixture project + FFI cache"

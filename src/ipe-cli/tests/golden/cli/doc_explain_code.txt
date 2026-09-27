@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   IPE-L0131  [diagnostic]
 
   # IPE-L0131: a row-polymorphic record annotation is not yet emittable

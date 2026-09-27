@@ -236,7 +236,7 @@ async fn email_post_json<E: From<String>>(
     .await
     {
         Ok(b) => b,
-        Err(e) => return Err(e.into()),
+        Err(refusal) => return Err(format!("http: {refusal}").into()),
     };
     let client = match builder.build() {
         Ok(c) => c,
@@ -743,18 +743,24 @@ async fn send_smtp<E: From<String>>(cfg: &SmtpConfig, m: &EmailMessage) -> IpeRe
     };
     // SSRF guard — same policy as the reqwest (HTTP POST) path that attaches the
     // bearer token: if a private/loopback host slipped through the operator config,
-    // deny before lettre resolves and dials. Credentials (cfg.user / cfg.pass) must
-    // not ride an unguarded channel to a metadata or loopback endpoint.
-    if let Err(e) = crate::ssrf::VettedDial::for_host(&cfg.host, port) {
-        return IpeResult::Err(format!("email.send/Smtp: {e}").into());
-    }
+    // deny before lettre dials. Credentials (cfg.user / cfg.pass) must not ride an
+    // unguarded channel to a metadata or loopback endpoint. Under deny-private the
+    // transport dials the vetted address, never the name (a second resolution
+    // could rebind to an internal host); the certificate is still verified
+    // against `cfg.host`, which `TlsParameters` carries.
+    let configured = crate::ssrf::ConfiguredHost::from_config(cfg.host.clone());
+    let vetted = match crate::ssrf::VettedDial::for_configured_host(&configured, port).await {
+        Ok(vetted) => vetted,
+        Err(refusal) => return IpeResult::Err(format!("email.send/Smtp: {refusal}").into()),
+    };
     // Explicit transport deadline matching the reqwest path's 30s bound, so a
     // stalled SMTP peer (STARTTLS handshake is multi-round-trip) can't hold the
     // task open on lettre's default timeout.
-    let mut tb = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host)
-        .port(port)
-        .tls(tls_policy)
-        .timeout(Some(std::time::Duration::from_secs(30)));
+    let mut tb =
+        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(vetted.dial_host(&cfg.host))
+            .port(port)
+            .tls(tls_policy)
+            .timeout(Some(std::time::Duration::from_secs(30)));
     if !cfg.user.is_empty() {
         // Reveal the sealed password ONLY here, at the AUTH step — the plaintext
         // is moved straight into lettre's `Credentials` and is never logged or
@@ -987,7 +993,7 @@ mod tests {
     /// bypassing the actual SMTP dial.  The guard must fire before
     /// `builder_dangerous` is reached, so the error text identifies the
     /// SSRF block string, not a connection / TLS error.
-    fn smtp_ssrf_result(host: &str) -> IpeResult<String, String> {
+    async fn smtp_ssrf_result(host: &str) -> IpeResult<String, String> {
         // Construct a minimal SmtpConfig with an in-range port (25) so the
         // port-range check passes and only the SSRF gate is the discriminator.
         let cfg = SmtpConfig {
@@ -996,20 +1002,21 @@ mod tests {
             user: String::new(),
             pass: crate::secret::secret_from_string(String::new()),
         };
-        // VettedDial::for_host mirrors the guard in email_send_smtp exactly.
-        // We test at this layer rather than driving the full async fn so the
-        // test is pure (no network, no tokio runtime required).
+        // VettedDial::for_configured_host mirrors the guard in email_send_smtp exactly.
+        // We test at this layer rather than driving the full send so the test
+        // dials nothing (IP literals are decided without a lookup).
         let port_u16 = u16::try_from(cfg.port).unwrap_or(25);
-        match crate::ssrf::VettedDial::for_host(&cfg.host, port_u16) {
+        let configured = crate::ssrf::ConfiguredHost::from_config(cfg.host.clone());
+        match crate::ssrf::VettedDial::for_configured_host(&configured, port_u16).await {
             Err(e) => IpeResult::Err(format!("email.send/Smtp: {e}")),
             Ok(_) => IpeResult::Ok("gate-passed".into()),
         }
     }
 
-    #[test]
-    fn smtp_ssrf_blocks_loopback_when_deny_private_on() {
+    #[tokio::test]
+    async fn smtp_ssrf_blocks_loopback_when_deny_private_on() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        let r = smtp_ssrf_result("127.0.0.1");
+        let r = smtp_ssrf_result("127.0.0.1").await;
         assert!(
             matches!(r, IpeResult::Err(ref e) if e.contains("blocked")),
             "loopback SMTP host must be blocked: {r:?}"
@@ -1017,10 +1024,10 @@ mod tests {
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn smtp_ssrf_blocks_link_local_when_deny_private_on() {
+    #[tokio::test]
+    async fn smtp_ssrf_blocks_link_local_when_deny_private_on() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        let r = smtp_ssrf_result("169.254.169.254");
+        let r = smtp_ssrf_result("169.254.169.254").await;
         assert!(
             matches!(r, IpeResult::Err(ref e) if e.contains("blocked")),
             "link-local SMTP host must be blocked: {r:?}"
@@ -1028,16 +1035,26 @@ mod tests {
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn smtp_ssrf_error_class_matches_http_path_for_same_private_host() {
+    #[tokio::test]
+    async fn smtp_ssrf_error_class_matches_http_path_for_same_private_host() {
         // The SMTP and HTTP (reqwest) paths must return the same error CLASS
         // (both contain "blocked") for the same private host, proving parity.
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        let smtp_err = match smtp_ssrf_result("10.0.0.1") {
+        let smtp_err = match smtp_ssrf_result("10.0.0.1").await {
             IpeResult::Err(e) => e,
             IpeResult::Ok(_) => panic!("expected SSRF block for 10.0.0.1"),
         };
-        let http_err = crate::ssrf::ssrf_check_url("http://10.0.0.1/").unwrap_err();
+        let http_err = crate::http_client::ssrf_apply_with(
+            reqwest::Client::builder(),
+            "http://10.0.0.1/",
+            crate::http_client::RedirectPolicy::NoRedirects,
+            crate::ssrf::DialPolicy::DenyPrivate,
+            crate::http_client::VettingResolver::system(),
+        )
+        .await
+        .err()
+        .map(|refusal| refusal.to_string())
+        .unwrap_or_default();
         assert!(
             smtp_err.contains("blocked"),
             "SMTP error must contain 'blocked': {smtp_err}"
@@ -1049,12 +1066,12 @@ mod tests {
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
     }
 
-    #[test]
-    fn smtp_ssrf_passes_private_when_deny_private_off() {
+    #[tokio::test]
+    async fn smtp_ssrf_passes_private_when_deny_private_off() {
         unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "0") };
         // Guard off: loopback is a pass (dev/relay workflow).
         assert!(
-            matches!(smtp_ssrf_result("127.0.0.1"), IpeResult::Ok(_)),
+            matches!(smtp_ssrf_result("127.0.0.1").await, IpeResult::Ok(_)),
             "guard off must not block private host"
         );
         unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };

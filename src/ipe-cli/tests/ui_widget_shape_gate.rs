@@ -29,7 +29,8 @@ fn compile_with_files(
     source: &str,
     extra: &[(&str, &str)],
 ) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::env::temp_dir().join(format!("ui_widget_gate_{test_name}_ipe"));
+    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ui_widget_gate_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(&ipe_dir)?;
     for (rel, contents) in extra {
@@ -42,7 +43,8 @@ fn compile_with_files(
     let entry = ipe_dir.join("Main.ipe");
     std::fs::write(&entry, source)?;
 
-    let out_dir = std::env::temp_dir().join(format!("ui_widget_gate_{test_name}_out"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ui_widget_gate_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;

@@ -113,13 +113,13 @@ main =
 "#;
 
 fn ok_out_dir() -> PathBuf {
-    std::env::temp_dir().join("i180_init_reads_req_path_out")
+    crate::support::scratch_root().join("i180_init_reads_req_path_out")
 }
 
 /// Compile a fixture into its own out dir; `None` (skip) when the runtime
 /// cannot be resolved.
 fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Option<Result<(), ipe::CliError>> {
-    let ipe_dir = std::env::temp_dir().join(format!("i180_{tag}_ipe"));
+    let ipe_dir = crate::support::scratch_root().join(format!("i180_{tag}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(&ipe_dir).ok()?;
     let entry = ipe_dir.join("Main.ipe");
@@ -162,7 +162,7 @@ fn live_init_reads_req_path_field() {
 /// `WebReq` — the prescriptive scheme, fail-closed at ipe time.
 #[test]
 fn live_init_unit_is_rejected() {
-    let out = std::env::temp_dir().join("i180_init_unit_out");
+    let out = crate::support::scratch_root().join("i180_init_unit_out");
     let Some(result) = compile(LIVE_INIT_UNIT_REJECTED, "init_unit", &out) else {
         return;
     };
@@ -182,7 +182,7 @@ fn live_init_unit_is_rejected() {
 /// which is false; the runtime always passes `WebReq`.
 #[test]
 fn live_init_poly_var_is_rejected() {
-    let out = std::env::temp_dir().join("i180_init_poly_out");
+    let out = crate::support::scratch_root().join("i180_init_poly_out");
     let Some(result) = compile(LIVE_INIT_POLY_REJECTED, "init_poly", &out) else {
         return;
     };
@@ -209,7 +209,7 @@ fn live_init_reads_req_path_cargo_builds() {
     if std::env::var("IPE_E2E").is_err() {
         return;
     }
-    let out = std::env::temp_dir().join("i180_init_reads_req_path_e2e_out");
+    let out = crate::support::scratch_root().join("i180_init_reads_req_path_e2e_out");
     let Some(result) = compile(LIVE_INIT_READS_REQ_PATH, "reads_req_path_e2e", &out) else {
         return;
     };

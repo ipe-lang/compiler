@@ -152,7 +152,8 @@ fn program_using_ipe_test_resolves_and_type_checks() -> TestResult {
 /// otherwise-empty directory so any emission would be unmistakable.
 #[test]
 fn check_writes_no_emitted_project() -> TestResult {
-    let dir = std::env::temp_dir().join(format!("ipe_check_no_emit_{}", std::process::id()));
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_check_no_emit_{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("Main.ipe");
     std::fs::copy(fixture("well_typed.ipe"), &src)?;
@@ -194,7 +195,7 @@ fn build_stderr(entry: &Path) -> Option<String> {
     let out = Command::new(support::ipe_bin())
         .args(["build", &entry.to_string_lossy()])
         .arg("--out")
-        .arg(std::env::temp_dir().join(format!("ipe_caret_build_{}", std::process::id())))
+        .arg(crate::support::scratch_root().join(format!("ipe_caret_build_{}", std::process::id())))
         .env("IPE_RUNTIME_DIR", &runtime)
         .output()
         .ok()?;
@@ -308,7 +309,7 @@ fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
         // pins the non-zero exit. Skip the build-artifact assertion.
         return Ok(());
     };
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe_t0018_no_emit_{}_{}",
         std::process::id(),
         "closed_union"

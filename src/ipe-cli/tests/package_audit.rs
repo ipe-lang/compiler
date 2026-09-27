@@ -18,7 +18,7 @@ mod support;
 
 /// A fresh, unique temp package directory with a `src/` subdir.
 fn temp_pkg(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-audit-test-{}-{}-{}",
         std::process::id(),
         tag,
@@ -225,7 +225,11 @@ fn write_widget_package_with_main(pkg: &Path, manifest: &str, main: &str) {
 /// An empty index checkout root (no `packages/` entries) — used when a package
 /// has no published predecessor, so the enforced-semver check skips.
 fn empty_index(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe-audit-index-{}-{}", std::process::id(), tag));
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe-audit-index-{}-{}",
+        std::process::id(),
+        tag
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("packages")).expect("create index packages dir");
     dir
@@ -656,10 +660,13 @@ package =\n\
 /// A native package whose committed `.ipe/cache/ffi` is a symlink to an
 /// out-of-tree directory REJECTS with `NativeBindingRegen` — the out-of-tree
 /// target is never deleted or written through.
+// Planting a symlink needs `std::os::unix::fs::symlink`; Windows symlink
+// creation is privilege-gated.
+#[cfg(unix)]
 #[test]
 fn intermediate_symlink_in_cache_path_rejects_and_does_not_delete_out_of_tree() {
     // Set up a victim directory outside the package tree.
-    let victim = std::env::temp_dir().join(format!(
+    let victim = crate::support::scratch_root().join(format!(
         "ipe-audit-symlink-victim-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -717,6 +724,9 @@ fn intermediate_symlink_in_cache_path_rejects_and_does_not_delete_out_of_tree() 
 
 /// A package whose `.ipe/cache/ffi/rust` LEAF is a symlink (not an
 /// intermediate component) also REJECTS with `NativeBindingRegen`.
+// Planting a symlink needs `std::os::unix::fs::symlink`; Windows symlink
+// creation is privilege-gated.
+#[cfg(unix)]
 #[test]
 fn leaf_symlink_in_cache_path_rejects() {
     let pkg = temp_pkg("leaf-symlink");
@@ -731,7 +741,7 @@ fn leaf_symlink_in_cache_path_rejects() {
     let cache_ffi = pkg.join(".ipe").join("cache").join("ffi");
     std::fs::create_dir_all(&cache_ffi).expect("create .ipe/cache/ffi");
     // Point the leaf at /tmp itself — an always-present target.
-    std::os::unix::fs::symlink(std::env::temp_dir(), cache_ffi.join("rust"))
+    std::os::unix::fs::symlink(crate::support::scratch_root(), cache_ffi.join("rust"))
         .expect("create leaf symlink .ipe/cache/ffi/rust -> temp_dir");
 
     let index = empty_index("leaf-symlink");

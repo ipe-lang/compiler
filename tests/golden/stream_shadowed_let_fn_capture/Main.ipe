@@ -1,0 +1,26 @@
+module Main exposing (main)
+
+-- A `Stream.stream` handler that captures a function bound by a plain `let`
+-- which shadows a fn parameter of the same name. The inner binder is itself
+-- promotable, so the capture rides the `Arc` fn carrier and the emitted crate
+-- builds.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+import Ipe.String as String
+
+mk : (String -> String) -> Server.Request -> Task Error Server.Response
+mk f _ =
+    let
+        f =
+            \s -> String.append s "\n"
+    in
+    Stream.stream "text/plain; charset=utf-8"
+        (\writer ->
+            Stream.emit (f "tick") writer
+                |> Task.andThen (\_ -> Stream.finish writer)
+        )
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" (mk (\s -> s)) ]

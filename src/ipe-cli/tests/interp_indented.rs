@@ -36,7 +36,7 @@ fn golden_entry(name: &str) -> PathBuf {
 #[test]
 fn interp_indented_compiles() {
     let entry = golden_entry("m_interp_indented");
-    let out = std::env::temp_dir().join("ipec_m_interp_indented");
+    let out = crate::support::scratch_root().join("ipec_m_interp_indented");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = ipe::resolve_runtime().expect("runtime must resolve");
     let built = ipe::build(&entry, &out, &runtime);
@@ -56,7 +56,7 @@ fn interp_indented_runs() {
         return;
     }
     let entry = golden_entry("m_interp_indented");
-    let out = std::env::temp_dir().join("ipec_m_interp_indented_e2e");
+    let out = crate::support::scratch_root().join("ipec_m_interp_indented_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = ipe::resolve_runtime().expect("runtime must resolve");
     ipe::build(&entry, &out, &runtime).expect("build must succeed");

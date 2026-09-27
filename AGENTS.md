@@ -40,6 +40,11 @@ Acyclic chain of crates; most changes touch one stage.
   `src/compiler/{sandbox,ffi,watch}`; `src/lsp/*`.
 - `src/stdlib` = `.ipe` stdlib · `src/runtime/rust` = what the backend emits into
   · `src/ipe-cli` = the `ipe` binary.
+- **CLI output:** human screens render through `ipe::screen` (one frame:
+  header, gutter, semantic `Tone`, bug footer on errors); machine output
+  (`--json`/`--plain`) through `screen::emit_machine`, never framed. Help and
+  usage text lives in `src/ipe-cli/help/*.md` (`help_page`) — edit the `.md`,
+  never a Rust string. `tests/raw_print_ratchet.rs` pins raw prints.
 - **Four type reps, in order:** `TypeAnnotation` → `Type` → `Ty` → `IrType`.
   Confusing one for another is the classic early mistake.
 

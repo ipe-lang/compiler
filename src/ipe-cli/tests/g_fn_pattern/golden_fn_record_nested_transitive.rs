@@ -54,7 +54,7 @@ fn nested_transitive_end_to_end_prints_twenty_seven() {
     }
     let root = repo_root();
     let entry = example_entry(&root);
-    let out = std::env::temp_dir().join("ipec_fn_record_nested_transitive_e2e");
+    let out = crate::support::scratch_root().join("ipec_fn_record_nested_transitive_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

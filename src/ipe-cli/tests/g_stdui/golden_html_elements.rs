@@ -35,7 +35,7 @@ fn html_element_family_renders_correct_tags() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("html_elements");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m7_html_elements_e2e");
+    let out = crate::support::scratch_root().join("ipec_m7_html_elements_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime().expect("runtime must resolve for E2E");

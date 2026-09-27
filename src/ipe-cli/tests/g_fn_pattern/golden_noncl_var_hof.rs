@@ -72,7 +72,7 @@ fn a1_noncl_var_task_and_then_compiles() {
         .join("golden")
         .join("noncl_var_hof")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i149_noncl_var_hof_e2e");
+    let out = crate::support::scratch_root().join("ipec_i149_noncl_var_hof_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

@@ -34,7 +34,7 @@ fn fixture(root: &Path, dir: &str) -> PathBuf {
 fn assert_rejects_l0107(dir: &str) {
     let root = repo_root();
     let entry = fixture(&root, dir);
-    let out = std::env::temp_dir().join(format!("ipec_{dir}"));
+    let out = crate::support::scratch_root().join(format!("ipec_{dir}"));
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;

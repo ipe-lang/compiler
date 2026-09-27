@@ -1,0 +1,19 @@
+module Main exposing (main)
+
+-- A partially applied `Stream.stream`: the handler reaches the kernel as a
+-- bare function parameter with no copyable form, so ipe refuses it
+-- (IPE-L0152) rather than emit a clone of a `Box<dyn Fn>`.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+
+exportHandler : Server.Request -> Task Error Server.Response
+exportHandler _ =
+    let
+        streamText = Stream.stream "text/plain; charset=utf-8"
+    in
+    streamText (\writer -> Stream.finish writer)
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" exportHandler ]

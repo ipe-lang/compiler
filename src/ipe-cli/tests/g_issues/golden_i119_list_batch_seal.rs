@@ -32,7 +32,7 @@ fn compile_golden(name: &str) -> PathBuf {
         .join("golden")
         .join(name)
         .join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

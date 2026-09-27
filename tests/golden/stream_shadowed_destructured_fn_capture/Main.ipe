@@ -1,0 +1,27 @@
+module Main exposing (main)
+
+-- A `Stream.stream` handler that captures a function bound by a tuple
+-- destructure which SHADOWS a promotable fn parameter of the same name. The
+-- inner `f` is a destructure-bound `Box<dyn Fn>`; it must not inherit the outer
+-- parameter's `Arc` promotion, so ipe refuses the capture (IPE-L0126) rather
+-- than emit a `.clone()` cargo rejects.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+import Ipe.String as String
+
+mk : (String -> String) -> Server.Request -> Task Error Server.Response
+mk f _ =
+    let
+        ( f, word ) =
+            ( \s -> String.append s "\n", "tick" )
+    in
+    Stream.stream "text/plain; charset=utf-8"
+        (\writer ->
+            Stream.emit (f word) writer
+                |> Task.andThen (\_ -> Stream.finish writer)
+        )
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" (mk (\s -> s)) ]

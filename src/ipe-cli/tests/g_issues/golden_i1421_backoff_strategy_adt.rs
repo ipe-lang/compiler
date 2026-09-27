@@ -25,7 +25,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn backoff_strategy_adt_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i1421_backoff_strategy_emit");
+    let out = crate::support::scratch_root().join("ipec_i1421_backoff_strategy_emit");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
@@ -47,7 +47,7 @@ fn backoff_strategy_adt_emits() {
 fn backoff_strategy_adt_builds_and_runs() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i1421_backoff_strategy_e2e");
+    let out = crate::support::scratch_root().join("ipec_i1421_backoff_strategy_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;

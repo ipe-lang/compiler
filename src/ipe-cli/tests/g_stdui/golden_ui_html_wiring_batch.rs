@@ -58,7 +58,7 @@ fn build_run_ui_html_wiring_batch() -> (PathBuf, crate::support::RunOutcome) {
         .join("golden")
         .join("ui_html_wiring_batch");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_ui_html_wiring_batch_e2e");
+    let out = crate::support::scratch_root().join("ipec_ui_html_wiring_batch_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

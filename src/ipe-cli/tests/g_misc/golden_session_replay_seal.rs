@@ -58,7 +58,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
         .join("golden")
         .join("console_app_seal")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_session_replay_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_session_replay_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -91,7 +91,8 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
     );
     let Ok(exe) = exe else { return };
 
-    let logs = std::env::temp_dir().join(format!("ipe_session_replay_{}", std::process::id()));
+    let logs =
+        crate::support::scratch_root().join(format!("ipe_session_replay_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&logs);
     assert!(std::fs::create_dir_all(&logs).is_ok(), "make log dir");
     let trace = logs.join("session.ipelog");

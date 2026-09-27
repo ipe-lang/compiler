@@ -1,0 +1,24 @@
+module Main exposing (main)
+
+-- A `Stream.stream` handler supplied through `|>`, capturing a `String`
+-- local. The piped spine lowers as the saturated call, so the capture gate
+-- sees the handler and the emitted crate cargo-builds.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+import Ipe.String as String
+
+exportHandler : Server.Request -> Task Error Server.Response
+exportHandler _ =
+    let
+        header = String.append "id," "name\n"
+    in
+    (\writer ->
+        Stream.emit header writer
+            |> Task.andThen (\_ -> Stream.finish writer)
+    )
+        |> Stream.stream "text/csv; charset=utf-8"
+
+main =
+    Server.listen 8099 [ Server.get "/export.csv" exportHandler ]

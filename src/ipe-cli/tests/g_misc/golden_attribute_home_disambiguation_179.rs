@@ -53,7 +53,7 @@ fn build_run_attribute_home_179() -> crate::support::RunOutcome {
         .join("golden")
         .join("attribute_home_disambiguation_179");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_attribute_home_179_e2e");
+    let out = crate::support::scratch_root().join("ipec_attribute_home_179_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

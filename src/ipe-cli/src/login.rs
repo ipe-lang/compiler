@@ -66,7 +66,9 @@ pub fn run_login(rest: &[String]) -> Result<(), CliError> {
                     "not logged in — run `ipe login` to authorize".to_owned()
                 }
             };
-            print!("{}", crate::style::frame(&crate::style::gutter(&message)));
+            crate::screen::Screen::new(crate::screen::Stream::Stdout)
+                .line(crate::screen::Tone::Text, &message)
+                .emit();
             Ok(())
         }
         Some("--logout") if rest.len() == 1 => logout(),
@@ -135,28 +137,37 @@ pub fn stored_token() -> Option<PublishToken> {
 fn run_device_flow() -> Result<(), CliError> {
     let device = request_device_code()?;
 
-    print!(
-        "{}",
-        crate::style::frame(&crate::style::gutter(&format!(
-            "To authorize ipe, visit:\n  {}\nand enter the code:  {}",
-            device.verification_uri.as_str(),
-            device.user_code
-        )))
-    );
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(
+            crate::screen::Tone::Text,
+            &format!(
+                "To authorize ipe, visit:\n  {}\nand enter the code:  {}",
+                device.verification_uri.as_str(),
+                device.user_code
+            ),
+        )
+        .emit();
     if open_in_browser(device.verification_uri.as_str()) {
-        eprintln!("{}", crate::style::gutter("(opened your browser)"));
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            "(opened your browser)",
+        );
     }
-    eprintln!("{}", crate::style::gutter("Waiting for authorization …"));
+    crate::screen::chatter(
+        crate::screen::Stream::Stderr,
+        crate::screen::Tone::Text,
+        "Waiting for authorization …",
+    );
 
     let token = poll_for_token(&device)?;
     let path = store_token(&token)?;
-    print!(
-        "{}",
-        crate::style::frame(&crate::style::gutter(&format!(
-            "Logged in. Token stored at {}",
-            path.display()
-        )))
-    );
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(
+            crate::screen::Tone::Text,
+            &format!("Logged in. Token stored at {}", path.display()),
+        )
+        .emit();
     Ok(())
 }
 
@@ -217,11 +228,8 @@ fn request_device_code() -> Result<DeviceGrant, CliError> {
     let device_code = str_field(&json, "device_code")?;
     let user_code = str_field(&json, "user_code")?;
     let verification_uri_raw = str_field(&json, "verification_uri")?;
-    let verification_uri = VerificationUri::parse(&verification_uri_raw).ok_or_else(|| {
-        login_error(
-            "GitHub returned a verification URL that is not https on github.com — refusing to open it",
-        )
-    })?;
+    let verification_uri = VerificationUri::parse(&verification_uri_raw)
+        .ok_or_else(|| login_error(crate::text::login_verification_url_refused()))?;
     // GitHub returns these as JSON numbers; default to safe values if absent.
     let interval = json
         .get("interval")
@@ -255,7 +263,7 @@ fn poll_for_token(device: &DeviceGrant) -> Result<PublishToken, CliError> {
         let now = Instant::now();
         if now >= deadline {
             return Err(login_error(
-                "the authorization code expired before you approved it — run `ipe login` again",
+                crate::text::login_code_expired_before_approval(),
             ));
         }
         let remaining = deadline.saturating_duration_since(now);
@@ -270,7 +278,7 @@ fn poll_for_token(device: &DeviceGrant) -> Result<PublishToken, CliError> {
         )?;
         if let Some(token) = json.get("access_token").and_then(serde_json::Value::as_str) {
             return PublishToken::parse(token)
-                .ok_or_else(|| login_error("GitHub returned a token with unexpected characters"));
+                .ok_or_else(|| login_error(crate::text::login_token_malformed()));
         }
         match json.get("error").and_then(serde_json::Value::as_str) {
             // Not authorized yet — keep waiting at the current cadence.
@@ -287,18 +295,14 @@ fn poll_for_token(device: &DeviceGrant) -> Result<PublishToken, CliError> {
                     .min(MAX_POLL_INTERVAL_SECS);
             }
             Some("access_denied") => {
-                return Err(login_error("authorization was denied on GitHub"));
+                return Err(login_error(crate::text::login_denied()));
             }
             Some("expired_token") => {
-                return Err(login_error(
-                    "the authorization code expired — run `ipe login` again",
-                ));
+                return Err(login_error(crate::text::login_code_expired()));
             }
-            Some(other) => return Err(login_error(&format!("GitHub reported `{other}`"))),
+            Some(other) => return Err(login_error(&crate::text::login_github_reported(&other))),
             None => {
-                return Err(login_error(
-                    "GitHub's response had neither a token nor a recognised status",
-                ));
+                return Err(login_error(crate::text::login_response_unrecognised()));
             }
         }
     }
@@ -358,30 +362,23 @@ fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<serde_json::Value, Cl
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            login_error(&format!(
-                "could not run `curl` (needed for the GitHub OAuth request): {e}"
-            ))
-        })?;
+        .map_err(|e| login_error(&crate::text::login_curl_unavailable(&e)))?;
     // Write the body to curl's stdin, then close it so curl proceeds. A write
     // failure means curl never receives the body; the wait below surfaces the
     // resulting error.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(body.as_bytes());
     }
-    let output = child.wait_with_output().map_err(|e| {
-        login_error(&format!(
-            "the OAuth request to GitHub failed while waiting for curl: {e}"
-        ))
-    })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| login_error(&crate::text::login_curl_wait_failed(&e)))?;
     if !output.status.success() {
-        return Err(login_error(&format!(
-            "the OAuth request to GitHub failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        return Err(login_error(&crate::text::login_request_failed(
+            &String::from_utf8_lossy(&output.stderr).trim(),
         )));
     }
     serde_json::from_slice(&output.stdout)
-        .map_err(|e| login_error(&format!("could not parse GitHub's response as JSON: {e}")))
+        .map_err(|e| login_error(&crate::text::login_response_not_json(&e)))
 }
 
 /// The full curl argument vector for a `post_form` call. The body is NOT among
@@ -408,16 +405,14 @@ fn str_field(json: &serde_json::Value, key: &str) -> Result<String, CliError> {
     json.get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| login_error(&format!("GitHub's response was missing `{key}`")))
+        .ok_or_else(|| login_error(&crate::text::login_response_missing(&key)))
 }
 
 /// The token file path (`$XDG_CONFIG_HOME/ipe/token`, else `~/.config/ipe/token`).
-/// `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+/// `None` only when neither `XDG_CONFIG_HOME` nor the home names an absolute path.
 fn token_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("ipe").join("token"))
+    crate::env_dir::ambient_home("XDG_CONFIG_HOME", ".config")
+        .map(|base| base.join("ipe").join("token"))
 }
 
 /// The three distinguishable login states `--status` reports. A token file that
@@ -447,12 +442,10 @@ fn token_status() -> TokenStatus {
 /// written, so there is no window where the token is readable by other users.
 /// On non-Unix the containing profile directory is the protection layer.
 fn store_token(token: &PublishToken) -> Result<PathBuf, CliError> {
-    let path = token_path().ok_or_else(|| {
-        login_error("could not determine a config directory (set HOME or XDG_CONFIG_HOME)")
-    })?;
+    let path = token_path().ok_or_else(|| login_error(crate::text::login_config_dir_unknown()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| login_error(&format!("could not create {}: {e}", parent.display())))?;
+            .map_err(|e| login_error(&crate::text::login_create_failed(&parent.display(), &e)))?;
     }
     write_token_atomic(&path, token.as_str())?;
     Ok(path)
@@ -489,51 +482,49 @@ fn write_token_atomic(path: &std::path::Path, token: &str) -> Result<(), CliErro
         .create_new(true)
         .mode(0o600)
         .open(&tmp_path)
-        .map_err(|e| login_error(&format!("could not create {}: {e}", tmp_path.display())))?;
+        .map_err(|e| login_error(&crate::text::login_create_failed(&tmp_path.display(), &e)))?;
     let write_result = writeln!(file, "{token}")
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all());
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(login_error(&format!(
-            "could not write {}: {e}",
-            tmp_path.display()
+        return Err(login_error(&crate::text::login_write_failed(
+            &tmp_path.display(),
+            &e,
         )));
     }
     drop(file);
     std::fs::rename(&tmp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
-        login_error(&format!(
-            "could not move the token into place at {}: {e}",
-            path.display()
-        ))
+        login_error(&crate::text::login_move_failed(&path.display(), &e))
     })
 }
 
 #[cfg(not(unix))]
 fn write_token_atomic(path: &std::path::Path, token: &str) -> Result<(), CliError> {
     std::fs::write(path, format!("{token}\n"))
-        .map_err(|e| login_error(&format!("could not write {}: {e}", path.display())))
+        .map_err(|e| login_error(&crate::text::login_write_failed(&path.display(), &e)))
 }
 
 /// Remove the stored token.
 fn logout() -> Result<(), CliError> {
     let Some(path) = token_path().filter(|p| p.exists()) else {
-        print!(
-            "{}",
-            crate::style::frame(&crate::style::gutter("not logged in — nothing to remove"))
-        );
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(
+                crate::screen::Tone::Text,
+                "not logged in — nothing to remove",
+            )
+            .emit();
         return Ok(());
     };
     std::fs::remove_file(&path)
-        .map_err(|e| login_error(&format!("could not remove {}: {e}", path.display())))?;
-    print!(
-        "{}",
-        crate::style::frame(&crate::style::gutter(&format!(
-            "logged out — removed {}",
-            path.display()
-        )))
-    );
+        .map_err(|e| login_error(&crate::text::login_remove_failed(&path.display(), &e)))?;
+    crate::screen::Screen::new(crate::screen::Stream::Stdout)
+        .line(
+            crate::screen::Tone::Text,
+            &format!("logged out — removed {}", path.display()),
+        )
+        .emit();
     Ok(())
 }
 

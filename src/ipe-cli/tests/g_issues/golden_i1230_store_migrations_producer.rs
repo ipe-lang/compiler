@@ -39,7 +39,7 @@ fn store_migrations_producer_runs_and_matches() {
     let root = crate::support::repo_root();
     let dir = fixture_dir(&root);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{GOLDEN}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

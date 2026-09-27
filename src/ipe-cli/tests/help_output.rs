@@ -415,3 +415,35 @@ fn dev_verbs_stay_dispatchable_bare_as_dev_posture_aliases() {
         );
     }
 }
+
+/// The one frame for an error: the product header leads and every line sits in
+/// the gutter. A user error (here, misuse) never invites a bug report — the
+/// report-bugs footer is for ipe's own faults only.
+#[test]
+fn a_user_error_screen_is_framed_without_the_bug_footer() {
+    let r = run(&["build", "--definitely-not-a-flag"]);
+    assert!(!r.ok);
+    let header = format!(
+        "\n  Ipê language - v{} - https://github.com/arthurmaciel/ipe-lang\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(r.stderr.starts_with(&header), "header leads:\n{}", r.stderr);
+    assert!(
+        !r.stderr.contains("please report"),
+        "a user error carries no bug footer:\n{}",
+        r.stderr
+    );
+    for line in r.stderr.lines().filter(|l| !l.is_empty()) {
+        assert!(line.starts_with("  "), "line outside the gutter: {line:?}");
+    }
+    assert!(!r.stderr.contains('\x1b'), "NO_COLOR error is plain");
+}
+
+/// `--help --json` is machine output: no frame, no header, flush JSON.
+#[test]
+fn help_json_is_never_framed() {
+    let r = run(&["--help", "--json"]);
+    assert!(r.ok);
+    assert!(r.stdout.starts_with('{'), "flush JSON:\n{}", r.stdout);
+    assert!(!r.stdout.contains("Ipê language - v"), "no frame header");
+}

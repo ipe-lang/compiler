@@ -89,6 +89,7 @@ use std::time::{Duration, Instant};
 use ipe_intern::Interner;
 
 use crate::project;
+use crate::text;
 use crate::{CliError, write_emitted_project};
 
 /// A lifecycle notification from a running watch session.
@@ -253,7 +254,7 @@ enum WatchRole {
 /// is guaranteed absorbed.
 pub const SIGTERM_TEARDOWN_MARKER: &str = "[ipe watch] SIGTERM received; shutting down";
 
-/// `text` is already-sanitised [`TerminalSafe`], mirroring [`crate::style::error_banner`]:
+/// `text` is already-sanitised [`TerminalSafe`], mirroring [`crate::screen::error_screen`]:
 /// the line's own gutter/colour escapes are the only control bytes the output may
 /// carry. Callers construct it via [`crate::style::TerminalSafe::sanitize`] at the
 /// message boundary, so an unsanitised watch message is unrepresentable here.
@@ -278,6 +279,14 @@ fn watch_line(text: &crate::style::TerminalSafe, role: WatchRole) -> String {
         format!("{}{colour}{glyph}{reset} ", crate::style::GUTTER)
     };
     format!("{prefix}{text}")
+}
+
+/// Write one [`watch_line`] to stderr as progress chatter.
+fn emit_watch_line(text: &crate::style::TerminalSafe, role: WatchRole) {
+    crate::screen::chatter_styled(
+        crate::screen::Stream::Stderr,
+        &format!("{}\n", watch_line(text, role)),
+    );
 }
 
 /// Per-phase wall-clock timing for ONE rebuild cycle, printed to stderr as a
@@ -394,7 +403,9 @@ impl RebuildTimings {
             total.as_secs_f64() * 1000.0,
             residual.as_secs_f64() * 1000.0,
         );
-        eprint!("\n{}\n", crate::style::gutter(&body));
+        crate::screen::Screen::new(crate::screen::Stream::Stderr)
+            .line(crate::screen::Tone::Aux, &body)
+            .emit();
     }
 }
 
@@ -445,12 +456,10 @@ pub(crate) fn resolve_project_sources(
         match project::manifest_in_dir(entry) {
             Some(manifest) => Some(manifest),
             None if project::has_only_legacy_toml(entry) => {
-                return Err(CliError::Usage(project::LEGACY_TOML_HINT));
+                return Err(CliError::Usage(text::legacy_toml_hint()));
             }
             None => {
-                return Err(CliError::Usage(
-                    "directory supplied but no package.ipe found inside it",
-                ));
+                return Err(CliError::Usage(text::watch_dir_no_manifest()));
             }
         }
     } else {
@@ -463,10 +472,10 @@ pub(crate) fn resolve_project_sources(
         let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
         for m in &discovered {
             let src = crate::io_bounded::read_to_string_capped(
-                &m.path,
+                m.path(),
                 crate::io_bounded::SOURCE_READ_CAP,
             )?;
-            sources.insert(m.module_path.clone(), (m.path.clone(), src));
+            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
         }
         let cargo_name = ipe_backend_rust::sanitize_cargo_name(&manifest.name);
         // The entry defaults to `["Main"]`; a `programs` manifest routes its
@@ -513,26 +522,26 @@ pub(crate) fn resolve_project_sources(
     let mut discovered = project::discover_modules(src_root)?;
     if !discovered
         .iter()
-        .any(|m| m.module_path == entry_module_path)
+        .any(|m| m.module_path() == entry_module_path)
     {
-        discovered.push(project::DiscoveredModule {
-            path: entry.to_path_buf(),
-            module_path: entry_module_path.clone(),
-        });
+        discovered.push(project::DiscoveredModule::user(
+            entry.to_path_buf(),
+            entry_module_path.clone(),
+        ));
     }
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     for m in &discovered {
-        if m.module_path == entry_module_path {
+        if m.module_path() == entry_module_path {
             sources.insert(
                 entry_module_path.clone(),
                 (entry.to_path_buf(), source.clone()),
             );
         } else {
             let src = crate::io_bounded::read_to_string_capped(
-                &m.path,
+                m.path(),
                 crate::io_bounded::SOURCE_READ_CAP,
             )?;
-            sources.insert(m.module_path.clone(), (m.path.clone(), src));
+            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
         }
     }
     Ok(ResolvedProject {
@@ -796,16 +805,13 @@ fn run_inner(
     let scope = ipe_watch::WatchScope::build(&root_dir, &entry_dir)
         .map_err(|e| CliError::UsageOwned(e.to_string()))?;
     if !opts.quiet {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(&format!(
-                    "[ipe watch] watching {} ({} source files)",
-                    scope.root().display(),
-                    scope.file_count()
-                )),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(&format!(
+                "[ipe watch] watching {} ({} source files)",
+                scope.root().display(),
+                scope.file_count()
+            )),
+            WatchRole::Info,
         );
     }
 
@@ -879,15 +885,12 @@ fn run_inner(
                 }
             }
         })
-        .map_err(|e| CliError::UsageOwned(format!("watch: cannot start filesystem watcher: {e}")))?
+        .map_err(|e| CliError::UsageOwned(text::watch_start_failed(&e)))?
     };
     for w in scope.roots_to_watch() {
         notify::Watcher::watch(&mut watcher, w.as_path(), notify::RecursiveMode::Recursive)
             .map_err(|e| {
-                CliError::UsageOwned(format!(
-                    "watch: cannot watch {}: {e}",
-                    w.as_path().display()
-                ))
+                CliError::UsageOwned(text::watch_path_failed(&w.as_path().display(), &e))
             })?;
     }
 
@@ -946,23 +949,17 @@ fn run_inner(
                 // test) can wait for this line as an explicit ack rather than
                 // guessing a delay. Not `--quiet`-gated: a shutdown-on-signal
                 // notice is a load-bearing operational fact, not chatter.
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(SIGTERM_TEARDOWN_MARKER),
-                        WatchRole::Info,
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(SIGTERM_TEARDOWN_MARKER),
+                    WatchRole::Info,
                 );
                 let _ = evt_tx.send(OrchestratorEvent::Shutdown);
             }) {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(&format!(
-                            "[ipe watch] warning: could not install SIGTERM handler: {e}"
-                        )),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(&format!(
+                        "[ipe watch] warning: could not install SIGTERM handler: {e}"
+                    )),
+                    WatchRole::Info,
                 );
             }
         }
@@ -1116,12 +1113,9 @@ fn run_inner(
                 let resolved = match resolve_project_sources(&opts.entry, None) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!(
-                            "{}",
-                            watch_line(
-                                &crate::style::TerminalSafe::sanitize(&format!("[ipe watch] {e}")),
-                                WatchRole::Failure
-                            )
+                        emit_watch_line(
+                            &crate::style::TerminalSafe::sanitize(&format!("[ipe watch] {e}")),
+                            WatchRole::Failure,
                         );
                         // This cycle's `generation` bump and cargo-kill
                         // already happened above, so without a scheduled
@@ -1144,14 +1138,11 @@ fn run_inner(
                 let ffi_prep = match crate::ffi::prepare_ffi(&mut sources, &resolved.blame_path) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!(
-                            "{}",
-                            watch_line(
-                                &crate::style::TerminalSafe::sanitize(&format!(
-                                    "[ipe watch] FFI catalog error: {e}"
-                                )),
-                                WatchRole::Failure
-                            )
+                        emit_watch_line(
+                            &crate::style::TerminalSafe::sanitize(&format!(
+                                "[ipe watch] FFI catalog error: {e}"
+                            )),
+                            WatchRole::Failure,
                         );
                         continue;
                     }
@@ -1302,8 +1293,9 @@ fn run_inner(
                         // report sits inset, not just the header), a blank line
                         // below to set it off from the next watch line. Light
                         // yellow, not red — the last-good binary stays up.
-                        let p = crate::style::Palette::for_stream(&std::io::stderr());
-                        eprint!("\n{}\n", compile_failed_frame(&msg, p));
+                        let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
+                        let frame = compile_failed_frame(&msg, screen.palette());
+                        screen.guttered(&frame).emit();
                         emit(opts, WatchEvent::CompileFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
@@ -1498,14 +1490,11 @@ fn run_inner(
                             None,
                             false,
                         ) {
-                            eprintln!(
-                                "{}",
-                                watch_line(
-                                    &crate::style::TerminalSafe::sanitize(&format!(
-                                        "[ipe watch] failed to write emitted project: {e}"
-                                    )),
-                                    WatchRole::Failure
-                                )
+                            emit_watch_line(
+                                &crate::style::TerminalSafe::sanitize(&format!(
+                                    "[ipe watch] failed to write emitted project: {e}"
+                                )),
+                                WatchRole::Failure,
                             );
                             continue;
                         }
@@ -1528,25 +1517,19 @@ fn run_inner(
                         // milliseconds by the time this line prints.
                         if !opts.quiet {
                             if generation == 1 {
-                                eprintln!(
-                                    "{}",
-                                    watch_line(
-                                        &crate::style::TerminalSafe::sanitize(
-                                            "[ipe watch] building (first run — compiling \
-                                         dependencies, this is the slow one)…"
-                                        ),
-                                        WatchRole::Info
-                                    )
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(
+                                        "[ipe watch] building (first run — compiling \
+                                         dependencies, this is the slow one)…",
+                                    ),
+                                    WatchRole::Info,
                                 );
                             } else {
-                                eprintln!(
-                                    "{}",
-                                    watch_line(
-                                        &crate::style::TerminalSafe::sanitize(
-                                            "[ipe watch] change detected — rebuilding…"
-                                        ),
-                                        WatchRole::Info
-                                    )
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(
+                                        "[ipe watch] change detected — rebuilding…",
+                                    ),
+                                    WatchRole::Info,
                                 );
                             }
                         }
@@ -1569,14 +1552,11 @@ fn run_inner(
                             opts.quiet,
                         ) {
                             Ok(child) => cargo_child = Some(child),
-                            Err(e) => eprintln!(
-                                "{}",
-                                watch_line(
-                                    &crate::style::TerminalSafe::sanitize(&format!(
-                                        "[ipe watch] cannot start cargo build: {e}"
-                                    )),
-                                    WatchRole::Failure
-                                )
+                            Err(e) => emit_watch_line(
+                                &crate::style::TerminalSafe::sanitize(&format!(
+                                    "[ipe watch] cannot start cargo build: {e}"
+                                )),
+                                WatchRole::Failure,
                             ),
                         }
                     }
@@ -1598,15 +1578,12 @@ fn run_inner(
                         emit(opts, WatchEvent::CargoKilled { generation: g });
                     }
                     CargoOutcome::Red(msg) => {
-                        eprintln!(
-                            "{}",
-                            watch_line(
-                                &crate::style::TerminalSafe::sanitize(&format!(
-                                    "[ipe watch] cargo build failed (last-good binary stays \
+                        emit_watch_line(
+                            &crate::style::TerminalSafe::sanitize(&format!(
+                                "[ipe watch] cargo build failed (last-good binary stays \
                                      up):\n{msg}"
-                                )),
-                                WatchRole::Failure
-                            )
+                            )),
+                            WatchRole::Failure,
                         );
                         emit(opts, WatchEvent::CargoFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
@@ -1628,22 +1605,16 @@ fn run_inner(
                         // asked for that port and it is unavailable.
                         if proxy.is_none() && opts.bluegreen && current_binds_http {
                             let bound = ipe_watch::DevProxy::bind(opts.port).map_err(|e| {
-                                CliError::UsageOwned(format!(
-                                    "watch: cannot bind the blue-green proxy on port {}: {e}",
-                                    opts.port
-                                ))
+                                CliError::UsageOwned(text::watch_proxy_bind_failed(&opts.port, &e))
                             })?;
                             if !opts.quiet {
-                                eprintln!(
-                                    "{}",
-                                    watch_line(
-                                        &crate::style::TerminalSafe::sanitize(&format!(
-                                            "[ipe watch] blue-green proxy holding port {} \
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(&format!(
+                                        "[ipe watch] blue-green proxy holding port {} \
                                              (rebuilds cut over with no dropped connection)",
-                                            opts.port
-                                        )),
-                                        WatchRole::Info
-                                    )
+                                        opts.port
+                                    )),
+                                    WatchRole::Info,
                                 );
                             }
                             proxy = Some(bound);
@@ -1661,15 +1632,12 @@ fn run_inner(
                             let internal_port = match free_loopback_port() {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    eprintln!(
-                                        "{}",
-                                        watch_line(
-                                            &crate::style::TerminalSafe::sanitize(&format!(
-                                                "[ipe watch] cannot allocate an internal port for \
+                                    emit_watch_line(
+                                        &crate::style::TerminalSafe::sanitize(&format!(
+                                            "[ipe watch] cannot allocate an internal port for \
                                                  the blue-green cutover: {e}"
-                                            )),
-                                            WatchRole::Failure
-                                        )
+                                        )),
+                                        WatchRole::Failure,
                                     );
                                     // The green binary is already built, but the
                                     // cutover can't proceed without an internal
@@ -1791,7 +1759,9 @@ fn run_inner(
                             && !url_announced
                             && outcome_is_running(&outcome)
                         {
-                            eprint!("{}", open_url_block(opts.port));
+                            crate::screen::Screen::new(crate::screen::Stream::Stderr)
+                                .guttered(&open_url_block(opts.port))
+                                .emit();
                             url_announced = true;
                         }
                         emit(
@@ -2086,29 +2056,23 @@ fn push_appearance_patches(
         .to_string();
         if !matches!(post_hot_appearance(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] appearance hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] appearance hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] appearance edit hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] appearance edit hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2259,29 +2223,23 @@ fn push_control_appearance(
         );
         if !applied {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] tui appearance hot-swap failed — falling back to a \
-                             full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] tui appearance hot-swap failed — falling back to a \
+                             full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] tui appearance edit hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] tui appearance edit hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2306,29 +2264,23 @@ fn push_transition_patches(
         .to_string();
         if !matches!(post_hot_transition(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] transition hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] transition hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] update-arm edit hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] update-arm edit hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2383,29 +2335,23 @@ fn push_msg_set_patches(
         .to_string();
         if !matches!(post_hot_msg(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] Msg-set hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] Msg-set hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] added Msg variant hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] added Msg variant hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2430,29 +2376,23 @@ fn push_sub_patches(
         .to_string();
         if !matches!(post_hot_subs(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] subscription hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] subscription hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] subscriptions edit hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] subscriptions edit hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2542,29 +2482,23 @@ fn push_init_patches(
         .to_string();
         if !matches!(post_hot_init(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] init hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] init hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] init edit hot-swapped for new sessions (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] init edit hot-swapped for new sessions (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2625,29 +2559,23 @@ fn push_wiring_patches(
         .to_string();
         if !matches!(post_hot_wiring(port, token, &body), Ok(true)) {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize(
-                            "[ipe watch] wiring hot-swap push failed — falling back to a \
-                         full rebuild"
-                        ),
-                        WatchRole::Info
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize(
+                        "[ipe watch] wiring hot-swap push failed — falling back to a \
+                         full rebuild",
+                    ),
+                    WatchRole::Info,
                 );
             }
             return false;
         }
     }
     if !quiet && !patches.is_empty() {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] update-arm Cmd wiring hot-swapped (no rebuild)"
-                ),
-                WatchRole::Info
-            )
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] update-arm Cmd wiring hot-swapped (no rebuild)",
+            ),
+            WatchRole::Info,
         );
     }
     true
@@ -2846,16 +2774,13 @@ fn post_to_watch_status(port: u16, token: &str, body: &str) -> std::io::Result<(
 /// unused error channel.
 fn warn_if_memory_store() {
     if std::env::var("IPE_WEB_STORE").as_deref() == Ok("memory") {
-        eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(
-                    "[ipe watch] warning: IPE_WEB_STORE=memory is set — session state will NOT \
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(
+                "[ipe watch] warning: IPE_WEB_STORE=memory is set — session state will NOT \
                  survive a watch-triggered restart. Unset it (watch defaults to a file-backed \
-                 store) or set IPE_WEB_STORE=file explicitly to keep your session across rebuilds."
-                ),
-                WatchRole::Info
-            )
+                 store) or set IPE_WEB_STORE=file explicitly to keep your session across rebuilds.",
+            ),
+            WatchRole::Info,
         );
     }
 }
@@ -2890,55 +2815,43 @@ fn report_restart_outcome(outcome: &ipe_watch::RestartOutcome, quiet: bool) {
     match outcome {
         ipe_watch::RestartOutcome::Spawned => {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize("[ipe watch] app started"),
-                        WatchRole::Success
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize("[ipe watch] app started"),
+                    WatchRole::Success,
                 );
             }
         }
         ipe_watch::RestartOutcome::UnchangedBinary => {}
         ipe_watch::RestartOutcome::Restarted => {
             if !quiet {
-                eprintln!(
-                    "{}",
-                    watch_line(
-                        &crate::style::TerminalSafe::sanitize("[ipe watch] app reloaded"),
-                        WatchRole::Success
-                    )
+                emit_watch_line(
+                    &crate::style::TerminalSafe::sanitize("[ipe watch] app reloaded"),
+                    WatchRole::Success,
                 );
             }
         }
-        ipe_watch::RestartOutcome::RespawnedLastGood { broken } => eprintln!(
-            "{}",
-            watch_line(
-                &crate::style::TerminalSafe::sanitize(&format!(
-                    "[ipe watch] new binary failed its readiness probe ({}); kept the previous \
+        ipe_watch::RestartOutcome::RespawnedLastGood { broken } => emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(&format!(
+                "[ipe watch] new binary failed its readiness probe ({}); kept the previous \
                      last-good binary running instead",
-                    broken.display()
-                )),
-                WatchRole::Failure
-            )
+                broken.display()
+            )),
+            WatchRole::Failure,
         ),
         ipe_watch::RestartOutcome::NothingRunning {
             broken,
             last_good_error,
         } => {
-            eprintln!(
-                "{}",
-                watch_line(
-                    &crate::style::TerminalSafe::sanitize(&format!(
-                        "[ipe watch] new binary failed its readiness probe ({}); no previous \
+            emit_watch_line(
+                &crate::style::TerminalSafe::sanitize(&format!(
+                    "[ipe watch] new binary failed its readiness probe ({}); no previous \
                          last-good binary could be brought up{}",
-                        broken.display(),
-                        last_good_error
-                            .as_ref()
-                            .map_or_else(String::new, |e| format!(" ({e})"))
-                    )),
-                    WatchRole::Failure
-                )
+                    broken.display(),
+                    last_good_error
+                        .as_ref()
+                        .map_or_else(String::new, |e| format!(" ({e})"))
+                )),
+                WatchRole::Failure,
             );
         }
     }
@@ -3216,7 +3129,7 @@ fn read_all(pipe: Option<impl std::io::Read>) -> String {
 /// [`crate::read_progress_chunk`] so carriage-return progress-bar frames flow
 /// through without buffering until the next newline.
 fn relay_and_capture_stderr(pipe: Option<impl std::io::Read>) -> String {
-    use std::io::{BufReader, Write as _};
+    use std::io::BufReader;
     let mut captured = String::new();
     let Some(reader) = pipe else { return captured };
     let mut reader = BufReader::new(reader);
@@ -3226,8 +3139,7 @@ fn relay_and_capture_stderr(pipe: Option<impl std::io::Read>) -> String {
         match crate::read_progress_chunk(&mut reader, &mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
-                eprint!("{chunk}");
-                let _ = std::io::stderr().flush();
+                crate::screen::emit_machine(crate::screen::Stream::Stderr, &chunk);
                 captured.push_str(&chunk);
             }
         }

@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 # span-locations gives real 1-based line numbers outside a proc-macro context.
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# The syntax tree decides test-only exemption per node, so an attribute can
+# never reach past the item, arm, field, or statement it decorates.
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lib]
 path = "src/lib.rs"

@@ -57,13 +57,17 @@ fn sample_entry() -> String {
 fn version_default_is_human_and_guttered() {
     let r = run(&["version"]);
     assert!(r.ok);
-    // Human form is framed (leading newline) and guttered (two-space indent).
-    // The frame opens with a blank line, so the first non-blank line is `  ipe …`.
-    assert!(
+    // Human form is a screen like every other: a blank line, the guttered
+    // product header, then the guttered (two-space indent) `ipe …` line.
+    let mut lines = r.stdout.lines().filter(|l| !l.trim().is_empty());
+    assert_eq!(
+        lines.next(),
+        Some(format!("  {}", ipe::style::header_line(env!("CARGO_PKG_VERSION"))).as_str()),
+        "human version must open with the product header: {:?}",
         r.stdout
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .is_some_and(|l| l.starts_with("  ipe ")),
+    );
+    assert!(
+        lines.next().is_some_and(|l| l.starts_with("  ipe ")),
         "human version must be guttered: {:?}",
         r.stdout
     );
@@ -365,7 +369,7 @@ fn a_repeated_format_flag_is_rejected() {
 /// Write two tiny package trees — the second adds an exposed value, a compatible
 /// change — and return their paths for a `diff` in report mode.
 fn compatible_pkg_pair(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!(
+    let base = crate::support::scratch_root().join(format!(
         "ipe-fmt-diff-{}-{tag}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -447,7 +451,7 @@ fn diff_json_is_a_stable_object() {
 /// blank line (the frame).
 #[test]
 fn init_human_output_is_guttered_and_framed() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::support::scratch_root().join(format!(
         "ipe-148-init-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -566,7 +570,7 @@ fn check_success_output_is_guttered_and_framed() {
 #[test]
 fn login_status_not_logged_in_is_guttered() {
     // Run with a temp HOME so no stored token is found.
-    let tmp = std::env::temp_dir().join(format!(
+    let tmp = crate::support::scratch_root().join(format!(
         "ipe-login-status-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -618,8 +622,8 @@ fn login_status_not_logged_in_is_guttered() {
 #[test]
 fn upgrade_no_prebuilt_renders_message_without_help() {
     let err = ipe::CliError::UpgradeNoPrebuilt {
-        version: "v9.9.9".to_owned(),
-        platform: "linux-x64".to_owned(),
+        version: ipe::style::TerminalSafe::sanitize("v9.9.9"),
+        platform: ipe::style::TerminalSafe::sanitize("linux-x64"),
     };
     let msg = err.to_string();
     // The message names the version and platform.
@@ -697,9 +701,15 @@ fn remove_unknown_flag_is_rejected() {
 fn unknown_command_screen_is_fully_guttered() {
     let r = run(&["frobnicate"]);
     assert!(!r.ok, "an unknown command must exit non-zero");
+    let header = format!(
+        "\n  {}\n",
+        ipe::style::header_line(env!("CARGO_PKG_VERSION"))
+    );
     assert!(
-        r.stderr.starts_with("  unknown command `frobnicate`"),
-        "the advice line must be guttered, got:\n{}",
+        r.stderr
+            .strip_prefix(&header)
+            .is_some_and(|rest| rest.starts_with("  unknown command `frobnicate`")),
+        "the product header, then the guttered advice line, must open the screen, got:\n{}",
         r.stderr
     );
     for line in r.stderr.lines().filter(|l| !l.is_empty()) {
@@ -752,7 +762,7 @@ fn doc_list_json_is_compact() {
 /// is listed (exit non-zero). Both are byte-compact.
 #[test]
 fn fmt_check_json_emits_compact_verdict() {
-    let dir = std::env::temp_dir().join(format!("ipe-fmt-json-{}", std::process::id()));
+    let dir = crate::support::scratch_root().join(format!("ipe-fmt-json-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let file = dir.join("Main.ipe");
 

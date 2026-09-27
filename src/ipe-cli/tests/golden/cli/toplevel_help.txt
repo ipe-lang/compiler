@@ -2,7 +2,6 @@ exit: 0
 ---
 
   Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
-
   Development
     ipe init     --help
     ipe dev      --help
@@ -36,4 +35,3 @@ exit: 0
     ipe version       --help
 
   If you find any bugs, please report them at https://github.com/arthurmaciel/ipe-lang/issues.
-

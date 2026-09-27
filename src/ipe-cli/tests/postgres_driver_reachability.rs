@@ -45,7 +45,8 @@ main =
 /// verbatim (empty string → no extra field at all, i.e. the default driver).
 #[allow(clippy::expect_used)]
 fn write_project(test_name: &str, database_stage: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipec_pg_reachability_{test_name}"));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipec_pg_reachability_{test_name}"));
     let _ = fs::remove_dir_all(&dir);
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create src/");
@@ -137,7 +138,7 @@ fn postgres_driver_project_cargo_builds() {
     // scratch dir so a bare local run stays hermetic.
     let target = e2e_support::child_shared_target_from_env().map_or_else(
         || {
-            std::env::temp_dir()
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
                 .join("r_class7")
                 .join("postgres_driver_cargo_build")
         },

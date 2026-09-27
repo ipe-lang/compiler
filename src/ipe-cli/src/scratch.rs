@@ -420,38 +420,34 @@ mod tests {
             .parent()
             .map(|p| p.join("ipe-wrapper").join("src"));
 
-        let mut rs_files: Vec<std::path::PathBuf> = Vec::new();
-        collect_rs_files(&cli_src, &mut rs_files);
-        if let Some(w) = &wrapper_src {
-            collect_rs_files(w, &mut rs_files);
-        }
-
-        for path in &rs_files {
-            // The sanctioned scratch modules are the one place `temp_dir()` may
-            // be joined (behind exclusive-create + entropy).
-            if path.file_name().and_then(|n| n.to_str()) == Some("scratch.rs") {
-                continue;
+        for src_root in std::iter::once(cli_src).chain(wrapper_src) {
+            let mut rs_files: Vec<std::path::PathBuf> = Vec::new();
+            collect_rs_files(&src_root, &mut rs_files);
+            for path in &rs_files {
+                // The sanctioned scratch modules are the one place `temp_dir()`
+                // may be joined (behind exclusive-create + entropy).
+                if path.file_name().and_then(|n| n.to_str()) == Some("scratch.rs") {
+                    continue;
+                }
+                // An out-of-line test module carries no inline `#[cfg(test)]`
+                // marker for the region tracker, so a confirmed one is exempt
+                // whole; an unconfirmed one stays in scope.
+                let is_test_module = path
+                    .strip_prefix(&src_root)
+                    .is_ok_and(|rel| panic_scan::is_verified_test_path(&src_root, rel));
+                if is_test_module {
+                    continue;
+                }
+                // An unread file is unaudited, not clean.
+                let source = std::fs::read_to_string(path);
+                assert!(
+                    source.is_ok(),
+                    "cannot read {}: {source:?} — an unread file cannot be audited",
+                    path.display()
+                );
+                let Ok(source) = source else { return };
+                assert_predictable_temp_free(path, &source);
             }
-            // A `tests.rs` file — or a `mod.rs` whose immediate parent directory
-            // is `tests/` — is a `#[cfg(test)] mod tests;` unit: entirely test
-            // code, whose `temp_dir()` joins are the exempt test-helper form. The
-            // in-file test-region tracker keys on an inline `#[cfg(test)]`/`mod
-            // tests` marker, which a standalone module file does not carry, so
-            // exempt it by name (as `scratch.rs` is).
-            let file_name = path.file_name().and_then(|n| n.to_str());
-            let parent_dir_name = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str());
-            if file_name == Some("tests.rs")
-                || (file_name == Some("mod.rs") && parent_dir_name == Some("tests"))
-            {
-                continue;
-            }
-            let Ok(source) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            assert_predictable_temp_free(path, &source);
         }
     }
 

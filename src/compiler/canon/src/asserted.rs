@@ -7,6 +7,8 @@
 //! `Rust.Ffi.call "path"` into a reference to the generated definition). This
 //! module is their single source; neither derives a name any other way.
 
+use ipe_intern::is_rust_keyword;
+
 /// The dotted module every asserted binding lives in. Driver-generated with
 /// [`crate::ModuleOrigin::FfiInterface`]; the resolver rewrites user call
 /// sites into references to its definitions.
@@ -38,70 +40,6 @@ pub const RUST_FFI_CONST_MEMBER: &str = "const";
 /// still refuses any installed crate claiming the prefix — the prefix is what
 /// classifies a lowered foreign call as asserted, so it must be unforgeable.
 pub const ASSERTED_WRAPPER_PREFIX: &str = "ipe_asserted_";
-
-/// Whether `s` is a Rust keyword — a strict, reserved, or weak keyword that
-/// cannot appear as a bare path segment. A segment matching one of these would
-/// be spliced verbatim into generated Rust and fail to parse, so the asserted
-/// path is refused at ipe time.
-fn is_rust_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        // Strict keywords.
-        "as" | "break"
-            | "const"
-            | "continue"
-            | "crate"
-            | "dyn"
-            | "else"
-            | "enum"
-            | "extern"
-            | "false"
-            | "fn"
-            | "for"
-            | "if"
-            | "impl"
-            | "in"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "pub"
-            | "ref"
-            | "return"
-            | "self"
-            | "Self"
-            | "static"
-            | "struct"
-            | "super"
-            | "trait"
-            | "true"
-            | "type"
-            | "unsafe"
-            | "use"
-            | "where"
-            | "while"
-            // 2018+ strict keywords.
-            | "async"
-            | "await"
-            | "gen"
-            // Reserved for future use.
-            | "abstract"
-            | "become"
-            | "box"
-            | "do"
-            | "final"
-            | "macro"
-            | "override"
-            | "priv"
-            | "try"
-            | "typeof"
-            | "unsized"
-            | "virtual"
-            | "yield"
-    )
-}
 
 /// A validated `crate::path::function` target of an asserted call.
 ///
@@ -148,6 +86,11 @@ impl AssertedPath {
                     "`{seg}` is not a plain Rust path segment (letters, digits, `_`; \
                      no generics or spaces)"
                 ));
+            }
+            // A lone `_` is the wildcard token, not an identifier; spliced into
+            // the shim it would not parse as a path segment.
+            if *seg == "_" {
+                return Err("`_` is not an identifier and cannot be a path segment".to_owned());
             }
             // A segment spelled as a Rust keyword is spliced raw into the
             // generated shim (`::sha2::match(...)`), which cargo cannot parse.
@@ -537,6 +480,34 @@ fn fnv1a64(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::AssertedPath;
+
+    #[test]
+    fn every_ssot_keyword_is_rejected_as_a_path_segment() {
+        for kw in ipe_intern::RUST_KEYWORDS {
+            let raw = format!("some_crate::{kw}");
+            let err = AssertedPath::parse(&raw).err().unwrap_or_default();
+            assert!(
+                err.contains("Rust keyword"),
+                "{kw} should be rejected as a Rust keyword, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn weak_keyword_union_is_a_legal_path_segment() {
+        assert!(AssertedPath::parse("geo::union").is_ok());
+    }
+
+    #[test]
+    fn a_lone_underscore_segment_is_refused() {
+        for raw in ["_::frobnicate", "some_crate::_", "some_crate::_::f"] {
+            let err = AssertedPath::parse(raw).err().unwrap_or_default();
+            assert!(
+                err.contains("`_` is not an identifier"),
+                "{raw} should be refused, got: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_plain_two_segment_path_parses() {

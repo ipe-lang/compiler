@@ -185,8 +185,9 @@ pub fn resolve_refusal(
     // Recorded consent: warn loudly, in red, and proceed unconfined.
     // Route through the style palette so the warning honours use_color / NO_COLOR
     // and never leaks ANSI escapes into piped or redirected stderr.
-    let p = crate::style::Palette::for_stream(&std::io::stderr());
-    eprint!("{}", override_warning(p, &names.join(", ")));
+    let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
+    let warning = override_warning(screen.palette(), &names.join(", "));
+    screen.guttered(&warning).emit();
     Ok(true)
 }
 
@@ -396,13 +397,9 @@ const FLOOR_REFERENCE: &str = "    // Retain the embedded capability floor (keep
 /// that a linker would collect).
 fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     const ANCHOR: &str = "fn main() {\n";
-    let idx = src.find(ANCHOR).ok_or_else(|| {
-        CliError::UsageOwned(
-            "ipe build: the emitted `fn main` anchor is absent, so the capability floor cannot be \
-             retained past linker GC — refusing to write an unenforceable artifact"
-                .to_owned(),
-        )
-    })?;
+    let idx = src
+        .find(ANCHOR)
+        .ok_or_else(|| CliError::UsageOwned(crate::text::run_main_anchor_absent().to_owned()))?;
     let insert_at = idx + ANCHOR.len();
     let mut out = String::with_capacity(src.len() + FLOOR_REFERENCE.len());
     out.push_str(&src[..insert_at]);
@@ -452,9 +449,9 @@ pub fn load_and_verify_artifact(
         crate::io_bounded::SMALL_FILE_READ_CAP,
     )?;
     let profile = run_jail::parse_profile(&profile_text).map_err(|e| {
-        CliError::UsageOwned(format!(
-            "{}: {e} — refusing to run (a profile that does not parse is not honored)",
-            RunJailDefect::ProfileWeakerThanFloor.code().as_str()
+        CliError::UsageOwned(crate::text::run_profile_unparsable(
+            &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
+            &e,
         ))
     })?;
 
@@ -466,10 +463,8 @@ pub fn load_and_verify_artifact(
         source: e,
     })?;
     let floor = run_jail::scan_capfloor(&binary).ok_or_else(|| {
-        CliError::UsageOwned(format!(
-            "{}: the binary carries no readable capability floor — refusing to run an artifact \
-             whose floor cannot be verified",
-            RunJailDefect::ProfileWeakerThanFloor.code().as_str()
+        CliError::UsageOwned(crate::text::run_floor_unreadable(
+            &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
         ))
     })?;
 

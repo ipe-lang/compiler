@@ -62,7 +62,9 @@ impl super::stringify::IpeStringify for Url {
 pub fn url_from_string<E: From<String>>(s: String) -> IpeResult<E, Url> {
     match UrlCrate::parse(&s) {
         Ok(u) => IpeResult::Ok(Url(u)),
-        Err(e) => IpeResult::Err(format!("Ipe.Url: not a valid absolute URL: {s:?} ({e})").into()),
+        // The input is not echoed: an unparseable URL may hold credentials the
+        // parser never separated from the rest of the text.
+        Err(e) => IpeResult::Err(format!("Ipe.Url: not a valid absolute URL ({e})").into()),
     }
 }
 
@@ -79,6 +81,79 @@ pub fn url_to_string(u: Url) -> String {
 #[must_use]
 pub fn url_scheme(u: Url) -> String {
     u.0.scheme().to_string()
+}
+
+/// The schemes an error message may name.
+///
+/// `user:password@host` parses with the user name as its scheme, so a scheme
+/// outside this well-known set is withheld rather than echoed.
+const NAMEABLE_SCHEMES: [&str; 22] = [
+    "http",
+    "https",
+    "ws",
+    "wss",
+    "ftp",
+    "ftps",
+    "sftp",
+    "file",
+    "data",
+    "blob",
+    "about",
+    "javascript",
+    "mailto",
+    "tel",
+    "gopher",
+    "dict",
+    "ldap",
+    "ldaps",
+    "ssh",
+    "telnet",
+    "postgres",
+    "postgresql",
+];
+
+/// Stands in for a scheme that may be a user name or token.
+const WITHHELD_SCHEME: &str = "<withheld: may be a user name>";
+
+/// A URL's scheme as an error message may show it.
+///
+/// Holds no text read from the URL: only one of [`NAMEABLE_SCHEMES`] is named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemeShown {
+    /// A well-known scheme.
+    Known(&'static str),
+    /// A scheme that may be part of the URL's credentials.
+    Withheld,
+}
+
+impl SchemeShown {
+    /// `scheme`, when it is well known; else withheld.
+    #[must_use]
+    pub fn of(scheme: &str) -> Self {
+        NAMEABLE_SCHEMES
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(scheme))
+            .map_or(Self::Withheld, Self::Known)
+    }
+}
+
+impl std::fmt::Display for SchemeShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(scheme) => write!(f, "{scheme:?}"),
+            Self::Withheld => f.write_str(WITHHELD_SCHEME),
+        }
+    }
+}
+
+/// `Ipe.Url`'s private `schemeShown : Url -> String` — the scheme as an error
+/// message may show it.
+///
+/// Backs `Ipe.Url.checkScheme`'s refusal, so the Ipê surface and the runtime's
+/// outbound refusals name the same schemes and withhold the rest.
+#[must_use]
+pub fn url_scheme_shown(u: Url) -> String {
+    SchemeShown::of(u.0.scheme()).to_string()
 }
 
 /// `Ipe.Url.host : Url -> Maybe String` — the host component (a registered name
@@ -237,7 +312,8 @@ fn scheme_colon_before_slash(s: &str) -> bool {
 #[must_use]
 pub fn url_relative<E: From<String>>(raw: String) -> IpeResult<E, UrlRelative> {
     let reject = |why: &str| -> IpeResult<E, UrlRelative> {
-        IpeResult::Err(format!("Ipe.Url: unsafe relative reference {raw:?} ({why})").into())
+        // The input is not echoed: a refused reference may carry userinfo.
+        IpeResult::Err(format!("Ipe.Url: unsafe relative reference ({why})").into())
     };
     // ── String-level guards (fail-closed on presence, never strip). ──
     if raw.is_empty() {
@@ -438,6 +514,58 @@ mod tests {
     // pin that here so a `url`-crate change that stopped normalising would break
     // the build, not silently open a `JavaScript:` / `ja\tvascript:` bypass at
     // every href/link/share sink.
+
+    /// A user name parsed as the scheme is withheld; a well-known scheme is
+    /// named, quoted, whatever its case.
+    #[test]
+    fn scheme_shown_names_only_a_well_known_scheme() {
+        for raw in ["admin:s3cr3t@host", "apikey123:x@api.example", "ADMIN:pw@h"] {
+            let shown = url_scheme_shown(parse(raw));
+            assert_eq!(shown, WITHHELD_SCHEME, "{raw:?}");
+            for secret in ["admin", "ADMIN", "s3cr3t", "apikey123", "pw"] {
+                assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+            }
+        }
+        for (raw, shown) in [
+            ("javascript:alert(1)", "\"javascript\""),
+            ("FTP://files.example/", "\"ftp\""),
+            ("https://example.com/", "\"https\""),
+        ] {
+            assert_eq!(url_scheme_shown(parse(raw)), shown, "{raw:?}");
+        }
+    }
+
+    /// A refused string is never echoed: it may hold credentials the parser
+    /// never separated from the rest of the text.
+    #[test]
+    fn refusals_never_echo_the_input() {
+        for raw in [
+            "http://admin:s3cr3t@exa mple.com/",
+            "http://admin:s3cr3t@[bad/x",
+        ] {
+            let refused = url_from_string::<String>(raw.to_owned());
+            assert!(matches!(refused, IpeResult::Err(_)), "{raw:?}");
+            let IpeResult::Err(shown) = refused else {
+                continue;
+            };
+            for secret in ["admin", "s3cr3t"] {
+                assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+            }
+        }
+        for raw in [
+            "//admin:s3cr3t@evil.example/",
+            "https://admin:s3cr3t@evil.example/",
+        ] {
+            let refused = url_relative::<String>(raw.to_owned());
+            assert!(matches!(refused, IpeResult::Err(_)), "{raw:?}");
+            let IpeResult::Err(shown) = refused else {
+                continue;
+            };
+            for secret in ["admin", "s3cr3t", "evil.example"] {
+                assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+            }
+        }
+    }
 
     #[test]
     fn scheme_is_lowercased() {

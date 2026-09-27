@@ -18,7 +18,7 @@ use ipe::lockfile::Lockfile;
 use ipe::resolve::{self, hash_source_tree};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "ipe-add-resolve-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -112,7 +112,14 @@ fn read_manifest(proj: &Path) -> String {
 fn add_resolves_verifies_and_locks() {
     let source = fixture_source("ok");
     let sha = hash_source_tree(&source).expect("hash source");
-    let index = fixture_index("ok", "http-extras", "1.2.0", &source, &sha, "[\"network\"]");
+    let index = fixture_index(
+        "ok",
+        "http-extras",
+        "1.2.0",
+        &source,
+        sha.as_str(),
+        "[\"network\"]",
+    );
     let proj = scaffold_project("ok");
 
     let req = "^1".parse().expect("valid req");
@@ -123,7 +130,7 @@ fn add_resolves_verifies_and_locks() {
     let locked = lock
         .packages()
         .iter()
-        .find(|p| p.name == "http-extras")
+        .find(|p| p.name.as_str() == "http-extras")
         .expect("locked");
     assert_eq!(locked.version.to_string(), "1.2.0");
     assert_eq!(locked.sha256, sha);
@@ -183,7 +190,7 @@ fn add_resolves_a_rev_held_alive_only_by_a_tag() {
     let locked = lock
         .packages()
         .iter()
-        .find(|p| p.name == "http-extras")
+        .find(|p| p.name.as_str() == "http-extras")
         .expect("locked");
     assert_eq!(
         locked.sha256, sha,
@@ -232,7 +239,7 @@ fn add_rejects_a_hash_mismatch() {
 fn add_then_remove_leaves_both_files_clean() {
     let source = fixture_source("cycle");
     let sha = hash_source_tree(&source).expect("hash");
-    let index = fixture_index("cycle", "json-tools", "0.4.0", &source, &sha, "[]");
+    let index = fixture_index("cycle", "json-tools", "0.4.0", &source, sha.as_str(), "[]");
     let proj = scaffold_project("cycle");
 
     let req = "^0.4".parse().expect("valid req");
@@ -273,7 +280,7 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
         "http-extras",
         "1.2.0",
         &source,
-        &sha,
+        sha.as_str(),
         "[\"network\"]",
     );
     let proj = temp_dir("proj-block");
@@ -329,7 +336,7 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
 
     // An index add that COLLIDES with the author-written escape is refused —
     // the escape is never converted to / overwritten by an index entry.
-    let esc_index = fixture_index("esc", "locallib", "0.1.0", &source, &sha, "[]");
+    let esc_index = fixture_index("esc", "locallib", "0.1.0", &source, sha.as_str(), "[]");
     let req3 = "^0.1".parse().expect("req3");
     let err = resolve::resolve_and_add(&proj, "locallib", &req3, &esc_index)
         .expect_err("adding an index dep over an escape name must be refused");

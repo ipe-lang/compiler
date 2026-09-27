@@ -16,7 +16,8 @@ use ipe_ir::Capability;
 
 /// Write a throwaway project rooted at a unique temp dir and return its root.
 fn scratch_project(name: &str, main_src: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!("ipe_unsafe_ack_{name}"));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_unsafe_ack_{name}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("src"))?;
     fs::write(

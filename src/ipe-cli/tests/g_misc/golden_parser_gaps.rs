@@ -85,7 +85,7 @@ fn assert_single_oracle(name: &str) {
     }
     let dir = golden_dir(name);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let built = ipe::build(&entry, &out, &runtime());
@@ -122,7 +122,7 @@ fn qualtype_project_builds_and_prints_42() {
     }
     let name = "mm_qualtype";
     let dir = golden_dir(name);
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let built = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
@@ -154,7 +154,7 @@ fn intdiv_by_zero_aborts_exit_101() {
     let name = "intdiv_divzero";
     let dir = golden_dir(name);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     // Codegen succeeds — the failure is a *runtime* classification, not a
@@ -201,7 +201,7 @@ fn diag_code(err: &ipe::CliError) -> Option<ipe_diagnostics::Code> {
 fn unterminated_blockcomment_is_ipe_p0017() {
     let name = "blockcomment_unterminated";
     let entry = golden_dir(name).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let res = ipe::build(&entry, &out, &runtime());
@@ -218,7 +218,7 @@ fn unterminated_blockcomment_is_ipe_p0017() {
 fn unknown_module_in_annotation_is_ipe_n0004() {
     let name = "mm_neg_qualtype_unknownmod";
     let dir = golden_dir(name);
-    let out = std::env::temp_dir().join(format!("ipec_{name}"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let res = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());

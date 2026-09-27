@@ -34,7 +34,8 @@ fn runtime() -> PathBuf {
 
 #[allow(clippy::expect_used)]
 fn write_project(test_name: &str, main_ipe: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe_db_row_marker_{test_name}"));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_db_row_marker_{test_name}"));
     let _ = fs::remove_dir_all(&dir);
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create src/");

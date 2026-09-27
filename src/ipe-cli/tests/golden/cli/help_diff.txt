@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Compare two package versions' public APIs and report the required semver bump.
 
   ipe diff <old> <new>  |  check <old> <new> <old-version> <new-version>
@@ -11,4 +12,3 @@ exit: 0
   Options:
     [--plain]  print flush-left change / bump records for grep/awk
     [--json]   print the report as a stable JSON object for jq
-

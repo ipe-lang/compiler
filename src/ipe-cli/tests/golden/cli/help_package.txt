@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Audit a package against the Tier-1 quality gate, publish it to the index, validate an index entry file, or run the index CI's authoritative receiving gate on a submitted entry.
 
   ipe package <audit|audit-entry|publish|validate-entry> [<path>]
@@ -15,4 +16,3 @@ exit: 0
     [--source <url>]      publish: the source URL to pin (overrides the git remote)
     [--rev <sha>]         publish: the revision to pin (overrides the committed HEAD)
     [--fork <owner>]      publish: the owner of your index fork to push to (defaults to the source owner)
-

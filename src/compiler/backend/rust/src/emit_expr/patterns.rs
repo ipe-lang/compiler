@@ -3,6 +3,7 @@ use super::{
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
+use ipe_ir::free_vars::pat_has_str_guard_slot;
 
 /// Render `s` as a Rust double-quoted string literal: escape `\` and `"` (the
 /// two characters that would otherwise terminate or corrupt the literal). The
@@ -782,38 +783,6 @@ pub fn pat_contains_alias_in_arm(pat: &Pat) -> bool {
     }
 }
 
-/// Does this arm pattern carry a string-literal (`Pat::Str`) leaf anywhere in a
-/// BY-VALUE-matched position (a tuple element, a ctor / record payload, or an
-/// alias inner)? On the whole-scrutinee by-value path a `Pat::Str` is a `&str`
-/// pattern against an owned `String` field (E0308); the emitter instead binds
-/// the field and checks equality in a match guard
-/// (`render_arm_pat_alias_safe`'s `guards` accumulator — mirrors the reference's
-/// `renderPatGuarded`). This detects when that guard path is needed so the
-/// alias-free / str-free fast path stays byte-identical for every other arm.
-///
-/// A `Pat::Slice` prefix/rest is deliberately NOT recursed: a slice column
-/// reaches the reference-style LIST mode (matched by reference), never the
-/// by-value renderer, and the lowerer keeps a list / cons tuple column
-/// fail-closed on the variable-scrutinee path (IPE-L0115), so no `Pat::Str`
-/// under a slice can reach here.
-pub fn pat_contains_str_in_arm(pat: &Pat) -> bool {
-    match pat {
-        Pat::Str(_) => true,
-        Pat::Alias(inner, _) => pat_contains_str_in_arm(inner),
-        Pat::Tuple(elems) => elems.iter().any(pat_contains_str_in_arm),
-        Pat::Ctor { args, .. } => args.iter().any(pat_contains_str_in_arm),
-        Pat::Record(fields) => fields.iter().any(|(_, p)| pat_contains_str_in_arm(p)),
-        // An or-pattern carries a by-value string leaf iff any alternative does.
-        Pat::Or(alts) => alts.iter().any(pat_contains_str_in_arm),
-        Pat::Var(_)
-        | Pat::Wildcard
-        | Pat::Int(_)
-        | Pat::Bool(_)
-        | Pat::Char(_)
-        | Pat::Slice { .. } => false,
-    }
-}
-
 /// Render a BY-VALUE (whole-scrutinee, non-str, non-list) match-arm
 /// sub-pattern, routing any [`Pat::Alias`] through the SAME "bind the whole,
 /// destructure the inner shape from a CLONE" strategy
@@ -842,7 +811,10 @@ pub fn render_arm_pat_alias_safe(
     // byte-identical renderer. A `Pat::Str` in a by-value position would render
     // as a `&str` literal pattern against an owned `String` field (E0308), so
     // its presence forces the guard walk below even when there is no alias.
-    if !pat_contains_alias_in_arm(pat) && !pat_contains_str_in_arm(pat) {
+    // `pat_has_str_guard_slot` is the one classifier the lowerer's move gate
+    // (`PartialMove::of_pattern`) shares, so a guard slot minted here is always
+    // counted there as a move of its part.
+    if !pat_contains_alias_in_arm(pat) && !pat_has_str_guard_slot(pat) {
         return render_pat(ctx, pat);
     }
     match pat {
@@ -961,7 +933,7 @@ pub fn render_arm_pat_alias_safe(
         // this same alias-safe renderer (its clone-split prelude binds the
         // shared names) and joins with ` | `.
         Pat::Or(alts) => {
-            if alts.iter().any(pat_contains_str_in_arm) {
+            if alts.iter().any(pat_has_str_guard_slot) {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::render_arm_pat_alias_safe",
                     detail: "a by-value string-literal leaf inside an or-pattern \

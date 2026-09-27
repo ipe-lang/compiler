@@ -362,20 +362,15 @@ fn member_carrier(ipe: &str, rust: &str) -> Option<ScalarCarrier> {
     }
 }
 
-/// Lowercase-led names that can never be a member name: every Rust keyword
-/// (a rendered `value.match` would not parse) and every Ipê keyword (the
-/// record field would not parse Ipê-side). [`RustIdent`] checks charset only,
-/// so the keyword gate lives here at the classification.
-const RESERVED_MEMBER_NAMES: &[&str] = &[
-    // Rust keywords (strict + reserved).
-    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
-    "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
-    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
-    "return", "self", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
-    "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
-    // Ipê keywords not already covered above.
-    "alias", "case", "exposing", "import", "module", "of", "port", "then",
-];
+/// `true` when `name` can never be a member name.
+///
+/// Refuses every Rust keyword (a rendered `value.match` would not parse) and
+/// every Ipê keyword (the lexer's own table — the record field would not parse
+/// Ipê-side). [`RustIdent`] checks charset only, so the keyword gate lives here
+/// at the classification.
+fn is_reserved_member_name(name: &str) -> bool {
+    ipe_intern::is_rust_keyword(name) || ipe_parse::is_keyword(name)
+}
 
 /// Validate one named member (a struct field or a struct-variant member).
 fn named_member(context: &str, m: &WireTypeMember) -> Result<ForeignMember, String> {
@@ -390,7 +385,7 @@ fn named_member(context: &str, m: &WireTypeMember) -> Result<ForeignMember, Stri
             "{context} member `{name}` is not lowercase-led (required of an Ipê record field)"
         ));
     }
-    if RESERVED_MEMBER_NAMES.contains(&name.as_str()) {
+    if is_reserved_member_name(name.as_str()) {
         return Err(format!("{context} member `{name}` is a reserved keyword"));
     }
     let carrier = member_carrier(&m.ty, &m.rust_type).ok_or_else(|| {
@@ -610,7 +605,7 @@ pub fn classify_define_struct(def: &StructDef) -> Result<TransparentType, String
                 "field `{fname}` is not lowercase-led (required of an Ipê record field)"
             ));
         }
-        if RESERVED_MEMBER_NAMES.contains(&fname.as_str()) {
+        if is_reserved_member_name(fname.as_str()) {
             return Err(format!("field `{fname}` is a reserved keyword"));
         }
         let carrier = identity_scalar(&format!("field `{fname}`"), carrier)?;
@@ -694,6 +689,16 @@ pub fn classify_define_enum(def: &EnumDef) -> Result<TransparentType, String> {
 #[allow(clippy::panic, reason = "test assertions")]
 mod tests {
     use super::*;
+
+    /// Every lexer keyword and every Rust keyword is a reserved member name.
+    #[test]
+    fn every_keyword_is_a_reserved_member_name() {
+        for kw in ipe_parse::KEYWORDS.iter().chain(ipe_intern::RUST_KEYWORDS) {
+            assert!(is_reserved_member_name(kw), "{kw:?} not reserved");
+        }
+        assert!(is_reserved_member_name("foreign"));
+        assert!(!is_reserved_member_name("port"));
+    }
 
     fn decode_types(v: &serde_json::Value) -> Vec<WireForeignType> {
         serde_json::from_value(v.clone()).expect("wire decode")
@@ -971,6 +976,23 @@ mod tests {
         let keyword =
             StructDef::parse("Kw", &[("case".to_owned(), "i64".to_owned())], &[]).expect("parses");
         assert!(classify_define_struct(&keyword).is_err());
+        // A reserved Rust keyword field cannot render as `value.try`.
+        for kw in ["try", "gen"] {
+            let rust_kw =
+                StructDef::parse("Kw", &[(kw.to_owned(), "i64".to_owned())], &[]).expect("parses");
+            let err = classify_define_struct(&rust_kw).err().unwrap_or_default();
+            assert!(
+                err.contains("reserved keyword"),
+                "{kw} field should be refused, got: {err:?}"
+            );
+        }
+        // The weak keyword `union` is a legal field name.
+        let weak = StructDef::parse("Span", &[("union".to_owned(), "i64".to_owned())], &[])
+            .expect("parses");
+        assert!(
+            classify_define_struct(&weak).is_ok(),
+            "`union` is a legal Rust field name"
+        );
         // The placeholder-shaped enum spells the opaque-handle declaration.
         let placeholder =
             EnumDef::parse("Marker", &[("Marker".to_owned(), vec![])], &[]).expect("parses");

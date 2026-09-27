@@ -44,7 +44,7 @@ fn poly_fn_attr_list_ipec_and_cargo_zero() {
         .join("golden")
         .join("poly_fn_attr_list")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i139_poly_fn_attr_list_e2e");
+    let out = crate::support::scratch_root().join("ipec_i139_poly_fn_attr_list_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

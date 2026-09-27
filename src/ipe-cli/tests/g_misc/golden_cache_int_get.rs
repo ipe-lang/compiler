@@ -34,7 +34,7 @@ fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
 #[test]
 fn cache_int_get_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_cache_int_get_emit");
+    let out = crate::support::scratch_root().join("ipec_cache_int_get_emit");
     let Some(built) = built(&root, &out) else {
         return;
     };
@@ -51,7 +51,7 @@ fn cache_int_get_emits() {
 #[test]
 fn cache_int_get_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_cache_int_get_e2e");
+    let out = crate::support::scratch_root().join("ipec_cache_int_get_e2e");
     let Some(built) = built(&root, &out) else {
         return;
     };

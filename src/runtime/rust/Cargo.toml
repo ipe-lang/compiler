@@ -233,7 +233,12 @@ uuid = { version = "1", features = ["v4", "v7", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
 # Browser sink (`wasm` module, feature `wasm-client`). Pinned exact
 # wasm-bindgen: the emitted-project glue is produced by the wasm-bindgen CLI,
-# which requires a byte-matching crate version.
+# which requires a byte-matching crate version. THIS is the canonical
+# wasm-bindgen version spelling — the emitted-project manifest templates and
+# the CLI's install-instructions message each repeat it (a `Cargo.toml`
+# dependency table can't `include!`/import a version from elsewhere), and
+# `ipe_backend_rust::project`'s `wasm_bindgen_version_matches_the_runtime_pin`
+# test fails the build the instant one of those copies drifts from this line.
 wasm-bindgen = { version = "=0.2.126", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
@@ -401,7 +406,9 @@ json = ["dep:serde_json", "serde"]
 # the `Decimal` newtype.
 # `crypto-core`: `db.rs` SHA-256s the `_ipe_migrations` ledger checksum (a
 # cross-backend byte-exact contract).
-db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
+# `tokio/net`: the `ssrf` gate resolves a Postgres host through
+# `tokio::net::lookup_host` (non-blocking, deadline-bounded).
+db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
 # `db-sqlite` / `db-postgres`: config.rs alias selectors. Only the emitter ever
 # enables one, and it selects exactly one (SEAL-checked) — the standalone crate
 # links both sqlx drivers regardless (see `db`). The `compile_error!` in
@@ -466,10 +473,10 @@ server = ["tokio", "tokio/net", "tokio/sync", "axum", "tower-http", "tower", "fu
 # re-exports as `reqwest::Url`); `url` is behind the `url` feature.
 # `serde`: `http_stream.rs` derives Serialize/Deserialize on its SSE event
 # wire types.
-http_client = ["tokio", "reqwest", "futures-util", "url", "random", "serde", "encoding"]
+# `tokio/net`: the `ssrf` gate resolves hosts through `tokio::net::lookup_host`.
+http_client = ["tokio", "tokio/net", "reqwest", "futures-util", "url", "random", "serde", "encoding"]
 # `http_client`: email.rs reuses `http_client::ssrf_apply` for outbound-request
-# SSRF hardening; ws_client.rs reuses `http_client::ssrf_validate_url` +
-# `ssrf_pinned_ws_addr`. Both need the http_client module present. (`sha2` is a
+# SSRF hardening, so it needs the http_client module present. (`sha2` is a
 # non-optional base dep now.)
 # `crypto-core`: `email.rs` HMAC-SHA-256s the SMTP auth.
 # `secret`: `email.rs` takes the SMTP password as a `crate::secret::Secret`, so
@@ -615,6 +622,11 @@ wasm-client = [
 regex = "1"
 serde_json = "1"
 sha2 = "0.10"
+# `tests/no_ungated_dial.rs` parses the dial-site sources into a syntax tree, so
+# `#[cfg(test)]`, comments, and strings are classified by the parser rather
+# than by a text scanner.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
 
 # `wasm-bindgen-test` drives the headless-browser test harness (`tests/
 # wasm_*` files, `#[wasm_bindgen_test]`) — meaningless on native, so it is
@@ -657,6 +669,9 @@ pbkdf2 = "0.12"
 # (it now backs the front-door concurrency-cap layer, not only the test-only
 # `ServiceExt::oneshot`). The `server` unit tests reach it through that feature.
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
+# A fake TLS PostgreSQL server proves the pinned relay keeps SNI and
+# certificate host-name verification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

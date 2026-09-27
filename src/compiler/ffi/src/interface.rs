@@ -20,12 +20,6 @@ use crate::emit::{opaque_names_in, transparent_type_decl, wrapper_ipe_signature}
 use crate::pkginfo::{FnInfo, PkgInfo};
 use crate::transparency::TransparentType;
 
-/// Ipê keywords that can never be a binding name in the generated module.
-const IPE_KEYWORDS: &[&str] = &[
-    "module", "import", "exposing", "type", "alias", "let", "in", "case", "of", "if", "then",
-    "else", "as", "port",
-];
-
 /// One binding included in the interface module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceBinding {
@@ -314,13 +308,12 @@ fn foreign_reserved_collision(f: &FnInfo) -> Option<String> {
         .find(|b| ipe_canon::is_user_type_declaration_forbidden(b))
 }
 
-/// `true` when `name` is a well-formed Ipê value identifier the generated
-/// module may bind: lowercase-led, alphanumeric/underscore, not a keyword.
+/// `true` when `name` is an Ipê value identifier the generated module may bind.
+///
+/// The name must lex as one plain identifier token (ASCII shape, not a
+/// keyword — the lexer's own table) and be lowercase-led.
 fn valid_ipe_value_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_alphanumeric() || c == '_')
-        && !IPE_KEYWORDS.contains(&name)
+    ipe_parse::is_identifier(name) && name.starts_with(|c: char| c.is_ascii_lowercase())
 }
 
 /// The classification's transparent set narrowed to the names this interface
@@ -1329,6 +1322,36 @@ pub fn render_module(
 mod tests {
     use super::*;
     use crate::pkginfo::PkgInfo;
+
+    /// Every lexer keyword is refused as a binding name — `foreign`/`do`
+    /// included — so a foreign binding can never emit an unparseable module.
+    #[test]
+    fn every_ipe_keyword_is_refused_as_a_binding_name() {
+        for kw in ipe_parse::KEYWORDS {
+            assert!(!valid_ipe_value_name(kw), "keyword {kw:?} accepted");
+        }
+    }
+
+    /// Non-ASCII names the lexer would not tokenize as one identifier are
+    /// refused; non-keywords like `alias`/`port` are admitted.
+    #[test]
+    fn binding_name_charset_is_the_lexer_ascii_set() {
+        for bad in [
+            "caf\u{e9}",
+            "\u{e9}t\u{e9}",
+            "x\u{0301}",
+            "n\u{b2}",
+            "\u{ff58}",
+            "Upper",
+            "_x",
+            "",
+        ] {
+            assert!(!valid_ipe_value_name(bad), "{bad:?} accepted");
+        }
+        for good in ["alias", "port", "where", "major_field", "x1"] {
+            assert!(valid_ipe_value_name(good), "{good:?} refused");
+        }
+    }
 
     fn pkg() -> PkgInfo {
         let doc = serde_json::json!({

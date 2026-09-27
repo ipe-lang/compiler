@@ -328,7 +328,6 @@ type alias Build =
     , static : Bool
     , target : Target
     , allocator : Allocator
-    , allowSlowAllocator : Bool
     , cFree : Bool
     }
 

@@ -535,9 +535,10 @@ pub fn evaluate_advisories(
             )));
         }
         // low/medium: warn, continue scanning.
-        eprintln!(
-            "{}",
-            crate::style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::UserError,
+            &format!(
                 "warning: dependency `{pkg_name}` v{locked_version} matches {}-severity advisory \
                  {} — {}{}\n  \
                  Upgrade to satisfy the advisory; this version is currently allowed \
@@ -550,7 +551,7 @@ pub fn evaluate_advisories(
                     .map(|v| format!(" Fixed in: {v}."))
                     .unwrap_or_default(),
                 adv.severity,
-            ))
+            ),
         );
     }
     Ok(())

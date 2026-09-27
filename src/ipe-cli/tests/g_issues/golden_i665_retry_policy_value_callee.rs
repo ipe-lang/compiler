@@ -56,7 +56,7 @@ fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
 #[test]
 fn retry_policy_value_callee_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_retry_policy_value_callee_emit");
+    let out = crate::support::scratch_root().join("ipec_retry_policy_value_callee_emit");
     let Some(built) = built(&root, &out) else {
         return; // resolver unavailable — skip, matches the other goldens
     };
@@ -75,7 +75,7 @@ fn retry_policy_value_callee_emits() {
 #[test]
 fn retry_policy_value_callee_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_retry_policy_value_callee_e2e");
+    let out = crate::support::scratch_root().join("ipec_retry_policy_value_callee_e2e");
     let Some(built) = built(&root, &out) else {
         return;
     };
@@ -116,7 +116,7 @@ fn retry_policy_value_callee_builds_and_runs() {
 fn retry_policy_shape_nearmiss_rejects() {
     let root = repo_root();
     let entry = fixture_entry_named(&root, "retry_policy_shape_nearmiss");
-    let out = std::env::temp_dir().join("ipec_retry_policy_shape_nearmiss");
+    let out = crate::support::scratch_root().join("ipec_retry_policy_shape_nearmiss");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return; // resolver unavailable — skip, matches the other goldens

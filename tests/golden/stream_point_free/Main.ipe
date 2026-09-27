@@ -1,0 +1,18 @@
+module Main exposing (main)
+
+-- A point-free `Stream.stream`: the kernel is reified as a function value,
+-- so its handler has no copyable form and ipe refuses it (IPE-L0152).
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+
+exportHandler : Server.Request -> Task Error Server.Response
+exportHandler _ =
+    let
+        streamWith = Stream.stream
+    in
+    streamWith "text/plain; charset=utf-8" (\writer -> Stream.finish writer)
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" exportHandler ]

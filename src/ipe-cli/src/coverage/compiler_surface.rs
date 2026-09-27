@@ -10,8 +10,9 @@
 //! - `tested` — the crate has at least one `#[test]` attribute anywhere in its
 //!   `src/` or `tests/` trees, signalling standing tests.
 //! - `no-panic` — no `unwrap()`, `expect(`, `panic!(`, or `.index(` appears in
-//!   production code (source lines outside `#[cfg(test)]` / `mod tests { … }`
-//!   blocks) within `src/`.
+//!   production code within `src/`: source lines outside `#[cfg(test)]` /
+//!   `mod tests { … }` blocks, in files that are not a confirmed out-of-line
+//!   test module ([`panic_scan::is_verified_test_path`]).
 //! - `documented` — `src/lib.rs` opens with at least one `//!` inner doc line.
 //!
 //! `staleness` was considered but dropped: measuring whether test coverage has

@@ -506,22 +506,14 @@ pub fn reconcile_override(
 /// The typed, fail-closed refusal naming each override permission with no backing
 /// accepted axis, and the remedy.
 fn unbacked_permission_refusal(platform: Platform, unbacked: &[&String]) -> CliError {
-    let mut body = format!(
-        "the packaged {} manifest declares OS permission(s) the app has not accepted\n",
-        platform.as_str()
-    );
-    for name in unbacked {
-        body.push_str("  = ");
-        body.push_str(name);
-        body.push('\n');
-    }
-    body.push_str(
-        "  = an OS permission is DERIVED from the app's `accepts` set, never hand-added; a \n\
-         \x20   permission with no backing accepted web capability cannot ship. Grant the backing \n\
-         \x20   capability after review by adding the axis to `accepts = [ … ]` under \n\
-         \x20   [capabilities] in package.ipe, or remove the permission from the override.\n",
-    );
-    CliError::UsageOwned(format!("error[IPE-P0001]: {body}"))
+    let header = crate::text::permission_consent_header(&platform.as_str());
+    let lines: Vec<String> = std::iter::once(header)
+        .chain(unbacked.iter().map(|name| crate::text::consent_item(name)))
+        .chain(std::iter::once(
+            crate::text::permission_consent_remedy().to_owned(),
+        ))
+        .collect();
+    CliError::UsageOwned(lines.join("\n"))
 }
 
 /// A structured, per-axis view of a derivation for the CLI surface — which web

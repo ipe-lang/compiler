@@ -157,7 +157,7 @@ fn db_wrapper_empty_params_165_cargo_builds_and_runs() {
         .join("db_wrapper_empty_params_165")
         .join("src")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_db_wrapper_empty_params_165_e2e");
+    let out = crate::support::scratch_root().join("ipec_db_wrapper_empty_params_165_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

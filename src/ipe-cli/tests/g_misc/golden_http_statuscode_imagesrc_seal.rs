@@ -51,7 +51,7 @@ fn built_imagesrc(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> 
 #[test]
 fn statuscode_seal_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_statuscode_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_statuscode_seal_emit");
     let Some(built) = built_statuscode(&root, &out) else {
         return;
     };
@@ -66,7 +66,7 @@ fn statuscode_seal_emits() {
 #[test]
 fn statuscode_seal_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_statuscode_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_statuscode_seal_e2e");
     let Some(built) = built_statuscode(&root, &out) else {
         return;
     };
@@ -105,7 +105,7 @@ fn statuscode_seal_builds_and_runs() {
 #[test]
 fn imagesrc_seal_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_imagesrc_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_imagesrc_seal_emit");
     let Some(built) = built_imagesrc(&root, &out) else {
         return;
     };
@@ -122,7 +122,7 @@ fn imagesrc_seal_emits() {
 #[test]
 fn imagesrc_seal_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_imagesrc_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_imagesrc_seal_e2e");
     let Some(built) = built_imagesrc(&root, &out) else {
         return;
     };

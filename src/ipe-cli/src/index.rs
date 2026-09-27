@@ -8,9 +8,10 @@
 //! [`semver::VersionReq`].
 //!
 //! Parse, don't validate: an entry file is read into a typed [`IndexEntry`] whose
-//! versions are [`semver::Version`] and whose capabilities are [`Capability`], so
-//! a malformed version or an unknown capability name is a hard error at read
-//! time, never a resolution-time surprise.
+//! versions are [`PublishedVersion`]s and whose capabilities are [`Capability`],
+//! so a malformed version, a version carrying build metadata, or an unknown
+//! capability name is a hard error at read time, never a resolution-time
+//! surprise.
 //!
 //! [`SourceUrl`] and [`CommitId`] are typed newtypes that gate the two
 //! publisher-controlled fields. An unvalidated string can never reach the `git`
@@ -24,6 +25,7 @@ use ipe_ir::Capability;
 
 use crate::CliError;
 use crate::package_name::PackageName;
+use crate::published_version::{PublishedVersion, require_successor};
 use crate::publisher::{AttestedActor, BlessedPublisher, SelfDeclaredPublisher};
 use crate::signing::SignatureBundle;
 
@@ -33,7 +35,9 @@ use crate::signing::SignatureBundle;
 /// `file://`) and bare absolute paths (a leading `/`). Any value that begins
 /// with `-` (option injection) or contains `::` (git transport helpers such as
 /// `ext::` or `fd::`, the real RCE vector) is rejected at parse time so a
-/// malicious index entry can never reach the `git` subprocess.
+/// malicious index entry can never reach the `git` subprocess. A control
+/// character or `"` is rejected too, so a URL can never break out of the quoted,
+/// line-oriented files (`ipe.lock`, index entries) it is recorded in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceUrl(String);
 
@@ -42,8 +46,9 @@ impl SourceUrl {
     /// injection-shaped values.
     ///
     /// Accepted: `https://`, `git://`, `ssh://`, `file://`, and bare absolute
-    /// paths (starting with `/`). Rejected: a leading `-` (git flag injection)
-    /// or `::` anywhere (transport-helper execution, the RCE vector).
+    /// paths (starting with `/`). Rejected: a leading `-` (git flag injection),
+    /// `::` anywhere (transport-helper execution, the RCE vector), and any
+    /// control character or `"` (a field break-out where the URL is recorded).
     ///
     /// # Errors
     /// [`CliError::Resolve`] when the value is not an accepted source form.
@@ -56,7 +61,8 @@ impl SourceUrl {
         // Fail closed: absent proof the transport is safe, reject.
         // `-`-leading values would be parsed as git flags; `::` introduces
         // transport helpers (e.g. `ext::`) that execute arbitrary commands.
-        if !allowed || raw.starts_with('-') || raw.contains("::") {
+        let breaks_out = raw.chars().any(|c| c.is_control() || c == '"');
+        if !allowed || raw.starts_with('-') || raw.contains("::") || breaks_out {
             return Err(CliError::Resolve(format!(
                 "package `{pkg}`: `source` must be an https://, git://, ssh://, or file:// URL \
                  (or a bare absolute path), got: {raw:?}"
@@ -262,6 +268,14 @@ impl Sha256Hex {
         Ok(Self(raw.to_owned()))
     }
 
+    /// Hash the source tree at `root`, as the resolver verifies it.
+    ///
+    /// # Errors
+    /// The path and I/O error of the first entry that cannot be read.
+    pub fn of_tree(root: &Path) -> Result<Self, (PathBuf, std::io::Error)> {
+        crate::cache::hash_tree(root).map(Self)
+    }
+
     /// The validated 64-hex digest string, compared against a freshly-computed
     /// tree hash at verify-before-trust time.
     #[must_use]
@@ -299,15 +313,15 @@ pub struct IndexEntry {
 /// or being written to the lockfile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryVersion {
-    /// The exact published version.
-    pub version: semver::Version,
+    /// The exact published version (never carrying build metadata).
+    pub version: PublishedVersion,
     /// The source repository URL, validated at parse time.
     pub source: SourceUrl,
     /// The immutable commit SHA pinned at publish time.
     pub rev: PinnedRev,
     /// The sha256 of the source tree at `rev`. A fetched tree is trusted only
     /// when its hash equals this (verify-before-trust, in `crate::resolve`).
-    pub sha256: String,
+    pub sha256: Sha256Hex,
     /// The capability set the publisher declared for this version, surfaced for
     /// consent at `ipe add`.
     pub capabilities: BTreeSet<Capability>,
@@ -496,10 +510,7 @@ pub fn validate_entry_file(path: &Path) -> Result<IndexEntry, CliError> {
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            CliError::UsageOwned(format!(
-                "{} is not a `packages/<name>.toml` entry file — the file stem names the package",
-                path.display()
-            ))
+            CliError::UsageOwned(crate::text::index_entry_path_invalid(&path.display()))
         })?;
     let text =
         crate::io_bounded::read_to_string_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP)?;
@@ -533,42 +544,49 @@ pub const MAX_ENTRY_VERSIONS: usize = 1024;
 ///   version — granted only when `attested` (the admission workflow's
 ///   authenticated PR author) proves the claimed publisher is blessed, never on
 ///   the entry's self-declared `publisher` alone.
+/// - **Monotonicity** — every version new to the submission (absent from the
+///   baseline) must exceed every baseline version, prereleases included, so a
+///   release never goes backwards and the enforced-semver predecessor is always
+///   the greatest published release below it.
 /// - **Source continuity** — a package name is bound to one source repository.
 ///   The established source is the baseline's first published version's source
 ///   (on first publish, the submitted entry's own first version fixes it); a
 ///   version pointing elsewhere is a name-squat and is refused.
 ///
+/// Build metadata never reaches this check: an entry's versions are
+/// [`PublishedVersion`]s, refused at read time when they carry a `+…` suffix.
+///
 /// # Errors
-/// [`CliError::UsageOwned`] naming the exact rule that refused the entry.
+/// [`CliError::VersionRefused`] when a new version does not exceed every
+/// baseline version; [`CliError::UsageOwned`] naming the exact rule otherwise.
 pub fn admission_precheck(
     submitted: &IndexEntry,
     baseline: Option<&IndexEntry>,
     attested: Option<&AttestedActor>,
 ) -> Result<(), CliError> {
     if submitted.versions.len() > MAX_ENTRY_VERSIONS {
-        return Err(CliError::UsageOwned(format!(
-            "ipe package audit-entry: `{}` lists {} versions, exceeding the {MAX_ENTRY_VERSIONS} \
-             per-entry ceiling — a single submission cannot carry this many versions.",
-            submitted.name,
-            submitted.versions.len()
-        )));
+        return Err(CliError::UsageOwned(
+            crate::text::index_entry_too_many_versions(
+                &submitted.name,
+                &submitted.versions.len(),
+                &MAX_ENTRY_VERSIONS,
+            ),
+        ));
     }
 
-    let baseline_by_version: std::collections::BTreeMap<&semver::Version, &EntryVersion> = baseline
-        .map(|e| e.versions.iter().map(|v| (&v.version, v)).collect())
-        .unwrap_or_default();
+    let baseline_by_version: std::collections::BTreeMap<&PublishedVersion, &EntryVersion> =
+        baseline
+            .map(|e| e.versions.iter().map(|v| (&v.version, v)).collect())
+            .unwrap_or_default();
 
     // Immutability: an existing version NUMBER must match the published row exactly.
     for version in &submitted.versions {
         if let Some(&prior) = baseline_by_version.get(&version.version)
             && prior != version
         {
-            return Err(CliError::UsageOwned(format!(
-                "ipe package audit-entry: `{}` version {} is already published and immutable, \
-                 but the submitted entry rewrites it (source, rev, sha256, or capabilities \
-                 differ). A published version must never be rewritten — publish a new version.",
-                submitted.name, version.version
-            )));
+            return Err(CliError::UsageOwned(
+                crate::text::index_entry_version_rewritten(&submitted.name, &version.version),
+            ));
         }
     }
 
@@ -592,24 +610,36 @@ pub fn admission_precheck(
             .as_ref()
             .is_ok_and(|blessed| blessed.vouches_for(&submitted.publisher));
     if !reset_allowed {
-        let reset_refusal = if reserved_name {
-            blessing.as_ref().err().map_or_else(String::new, |refusal| {
-                format!(" The reserved smoke-namespace reset is refused: {refusal}.")
-            })
-        } else {
-            String::new()
-        };
-        let submitted_versions: std::collections::BTreeSet<&semver::Version> =
+        let reset_refusal = blessing.as_ref().err().filter(|_| reserved_name);
+        let submitted_versions: std::collections::BTreeSet<&PublishedVersion> =
             submitted.versions.iter().map(|v| &v.version).collect();
         for baseline_version in baseline_by_version.keys() {
             if !submitted_versions.contains(*baseline_version) {
-                return Err(CliError::UsageOwned(format!(
-                    "ipe package audit-entry: `{}` drops the published version {baseline_version}, \
-                     but the index is append-only: a published version must never be removed. \
-                     Publish a new version instead.{reset_refusal}",
-                    submitted.name
+                return Err(CliError::UsageOwned(reset_refusal.map_or_else(
+                    || crate::text::index_entry_version_dropped(&submitted.name, baseline_version),
+                    |refusal| {
+                        crate::text::index_entry_version_dropped_reset_refused(
+                            &submitted.name,
+                            baseline_version,
+                            refusal,
+                        )
+                    },
                 )));
             }
+        }
+    }
+
+    // Monotonicity: each submitted version absent from the baseline is checked
+    // against the greatest baseline version and refused unless strictly above it.
+    // Versions carried over from the baseline are covered by the immutability
+    // check above. This holds for the reserved reset too: a reset may drop
+    // history but never go below the greatest version it drops. The map is
+    // ordered, so its last key is the greatest baseline version.
+    let greatest_published = baseline_by_version.keys().next_back().copied();
+    for version in &submitted.versions {
+        if !baseline_by_version.contains_key(&version.version) {
+            require_successor(greatest_published, &version.version)
+                .map_err(|refusal| refusal.for_package(&submitted.name))?;
         }
     }
 
@@ -622,14 +652,11 @@ pub fn admission_precheck(
     if let Some(expected_source) = established_source {
         for version in &submitted.versions {
             if version.source.as_str() != expected_source {
-                return Err(CliError::UsageOwned(format!(
-                    "ipe package audit-entry: `{}` version {} declares source `{}`, but this \
-                     package's established source is `{}`. A package name is bound to one source \
-                     repository; a version pointing elsewhere is a name-squat and is refused.",
-                    submitted.name,
-                    version.version,
-                    version.source.as_str(),
-                    expected_source
+                return Err(CliError::UsageOwned(crate::text::index_entry_source_moved(
+                    &submitted.name,
+                    &version.version,
+                    &version.source.as_str(),
+                    &expected_source,
                 )));
             }
         }
@@ -650,7 +677,7 @@ pub fn resolve_version<'a>(
     entry
         .versions
         .iter()
-        .filter(|v| req.matches(&v.version))
+        .filter(|v| req.matches(v.version.as_semver()))
         .max_by(|a, b| a.version.cmp(&b.version))
         .ok_or_else(|| {
             let available: Vec<String> = entry
@@ -847,16 +874,14 @@ fn parse_entry_version_json(name: &str, raw: &serde_json::Value) -> Result<Entry
     };
 
     let version_str = field("version")?;
-    let version = semver::Version::parse(version_str)
-        .map_err(|e| malformed(format!("`{version_str}` is not a valid version: {e}")))?;
+    let version =
+        PublishedVersion::parse(version_str).map_err(|refusal| refusal.for_package(name))?;
     // Parse-don't-validate: the same typed boundaries the TOML path uses. A
     // moving or injection-shaped value can never reach `git` from the JSON path
     // either.
     let source = SourceUrl::parse(name, field("source")?)?;
     let rev = PinnedRev::from_full_sha(name, field("rev")?)?;
-    let sha256 = Sha256Hex::parse(name, field("sha256")?)?
-        .as_str()
-        .to_owned();
+    let sha256 = Sha256Hex::parse(name, field("sha256")?)?;
 
     // `capabilities` is an optional array of strings; absent means none. An
     // unknown capability name is a hard error, never a silently-dropped effect.
@@ -920,11 +945,8 @@ impl RawVersion {
             ))
         };
         let version_str = self.version.ok_or_else(|| missing("version"))?;
-        let version = semver::Version::parse(&version_str).map_err(|e| {
-            CliError::Resolve(format!(
-                "package `{name}`: `{version_str}` is not a valid version: {e}"
-            ))
-        })?;
+        let version =
+            PublishedVersion::parse(&version_str).map_err(|refusal| refusal.for_package(name))?;
         let raw_source = self.source.ok_or_else(|| missing("source"))?;
         let raw_rev = self.rev.ok_or_else(|| missing("rev"))?;
         let raw_sha256 = self.sha256.ok_or_else(|| missing("sha256"))?;
@@ -934,7 +956,7 @@ impl RawVersion {
         let rev = PinnedRev::from_full_sha(name, &raw_rev)?;
         // A malformed content hash is refused here, at the cheap structural gate,
         // not deferred to a fetch-time mismatch.
-        let sha256 = Sha256Hex::parse(name, &raw_sha256)?.as_str().to_owned();
+        let sha256 = Sha256Hex::parse(name, &raw_sha256)?;
         let capabilities = parse_capabilities(name, self.capabilities.as_deref())?;
         // A present `signature` is parsed into a typed bundle; a malformed one is
         // a hard error, never a silently-dropped field. Absent = unsigned.
@@ -1219,6 +1241,19 @@ mod tests {
     fn source_url_rejects_fd_transport() {
         let err = SourceUrl::parse("p", "fd::4").unwrap_err();
         assert!(format!("{err}").contains("https://"), "{err}");
+    }
+
+    #[test]
+    fn source_url_rejects_a_field_break_out() {
+        for raw in [
+            "https://h/r\"\nsha256 = \"0",
+            "https://h/r\nrev = \"x\"",
+            "https://h/r\u{1b}[2J",
+            "/abs/r\"",
+        ] {
+            let err = SourceUrl::parse("p", raw).unwrap_err();
+            assert!(!err.to_string().contains('\n'), "{err:?}");
+        }
     }
 
     // --- CommitId parse-boundary tests ---

@@ -29,7 +29,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn retry_policy_exact_shape_user_record_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i979_exact_shape_emit");
+    let out = crate::support::scratch_root().join("ipec_i979_exact_shape_emit");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
@@ -53,7 +53,7 @@ fn retry_policy_exact_shape_user_record_emits() {
 fn retry_policy_exact_shape_user_record_builds_and_runs() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i979_exact_shape_e2e");
+    let out = crate::support::scratch_root().join("ipec_i979_exact_shape_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;

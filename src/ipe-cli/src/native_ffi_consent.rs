@@ -155,13 +155,13 @@ pub fn gate(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        disclosures.push(format!("`Rust.{krate}` crossed by {via}"));
+        disclosures.push(crate::text::native_ffi_crossing(&krate, &via));
     }
     if disclosures.is_empty() {
         // Fail-closed: the axis is inferred (a reachable module crosses into
         // native code through the link-fold) but no scanned source attributes it
         // to a crate — refuse stating exactly that, rather than dropping the axis.
-        disclosures.push("a native crossing the build could not attribute to a crate".to_owned());
+        disclosures.push(crate::text::native_ffi_crossing_unattributed().to_owned());
     }
     Err(refusal(&disclosures))
 }
@@ -169,21 +169,17 @@ pub fn gate(
 /// The typed, fail-closed refusal naming each ungranted native crossing, its
 /// disclosing crate/module(s), and the remedy.
 fn refusal(disclosures: &[String]) -> CliError {
-    let mut body =
-        String::from("this program crosses into native `Rust.` code the app has not granted\n");
-    for item in disclosures {
-        body.push_str("  = ");
-        body.push_str(item);
-        body.push('\n');
-    }
-    body.push_str(
-        "  = a native crossing is granted ONLY by the top-level app's package.ipe; a dependency \n\
-         \x20   crosses but cannot self-authorise. Its true effects are opaque to Ipê and \n\
-         \x20   contained at run by the OS jail, but the crossing itself needs the consumer's \n\
-         \x20   consent. Grant it after review by adding `native-ffi` to `declared = [ … ]` under \n\
-         \x20   [capabilities] in package.ipe, or drop the dependency.\n",
-    );
-    CliError::UsageOwned(format!("error[IPE-S0003]: {body}"))
+    let lines: Vec<String> = std::iter::once(crate::text::native_ffi_consent_header().to_owned())
+        .chain(
+            disclosures
+                .iter()
+                .map(|item| crate::text::consent_item(item)),
+        )
+        .chain(std::iter::once(
+            crate::text::native_ffi_consent_remedy().to_owned(),
+        ))
+        .collect();
+    CliError::UsageOwned(lines.join("\n"))
 }
 
 #[cfg(test)]

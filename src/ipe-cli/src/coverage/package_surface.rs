@@ -16,7 +16,8 @@
 //! # Columns
 //!
 //! - **pinned-and-hashed** (security) — the lockfile entry carries a non-local
-//!   revision and a non-empty sha256: the two integrity anchors the resolver
+//!   revision; its sha256 is a well-formed digest by construction (parsed at
+//!   `Lockfile::read`). These are the two integrity anchors the resolver
 //!   verifies on every fetch. A path-escape dep has no lockfile pin
 //!   ([`Cell::NotApplicable`]); any other dep without a lockfile entry is a hole.
 //! - **semver-satisfied** — for an index Ipê dep, the locked version satisfies
@@ -41,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::coverage::contract::{AspectCheck, Cell, Surface};
-use crate::lockfile::{LockedRev, Lockfile};
+use crate::lockfile::{LockedOrigin, Lockfile};
 use crate::project::{IpeDep, ProjectManifest, RustDep};
 
 // ── item type ─────────────────────────────────────────────────────────────────
@@ -176,17 +177,18 @@ fn lockfile_by_name(lf: &Lockfile) -> BTreeMap<&str, &crate::lockfile::LockedDep
 // ── column: pinned-and-hashed ─────────────────────────────────────────────────
 
 /// Column **pinned-and-hashed**: the lockfile entry for this dep carries a
-/// non-local revision and a non-empty sha256 — the reproducibility and
+/// non-local revision and a well-formed sha256 — the reproducibility and
 /// tamper-detection anchors from ADR 0007.
 ///
 /// - Path-escape Ipê dep → [`Cell::NotApplicable`] (no lockfile pin exists by
 ///   design; the path dep's integrity is the working-tree content).
 /// - Native Rust crate → [`Cell::NotApplicable`] (cargo's own lock owns native
 ///   crate pins; `ipe.lock` does not track them).
-/// - Index or git-escape Ipê dep with a lockfile entry carrying a pinned rev and
-///   a non-empty sha256 → [`Cell::Ok`].
-/// - Index or git-escape Ipê dep absent from the lockfile, or with a `Local` rev
-///   or an empty sha256 → [`Cell::Hole`].
+/// - Index or git-escape Ipê dep with a lockfile entry → [`Cell::Ok`]: its
+///   [`LockedOrigin`] carries a pinned rev and its sha256 is a parsed digest, so
+///   a missing or malformed anchor never reaches this column.
+/// - Index or git-escape Ipê dep absent from the lockfile, or locked with a path
+///   origin (a `local` rev) → [`Cell::Hole`].
 pub struct PinnedAndHashedColumn {
     project_root: PathBuf,
 }
@@ -228,18 +230,13 @@ impl AspectCheck<PackageItem> for PinnedAndHashedColumn {
             ));
         };
 
-        match &locked.rev {
-            LockedRev::Local => Cell::Hole(format!(
+        match &locked.origin {
+            LockedOrigin::Path { .. } => Cell::Hole(format!(
                 "`{}` is locked with a `local` rev — a local-path dep cannot \
                  provide the immutable SHA the pinned-and-hashed guarantee requires",
                 item.name,
             )),
-            LockedRev::Pinned(_) if locked.sha256.is_empty() => Cell::Hole(format!(
-                "`{}` is locked with a pinned rev but has an empty sha256 — \
-                 re-run `ipe add {}` to record the content hash",
-                item.name, item.name,
-            )),
-            LockedRev::Pinned(_) => Cell::Ok,
+            LockedOrigin::Index { .. } | LockedOrigin::Git { .. } => Cell::Ok,
         }
     }
 }
@@ -287,7 +284,7 @@ impl AspectCheck<PackageItem> for SemverSatisfiedColumn {
             );
         };
 
-        if req.matches(&locked.version) {
+        if req.matches(locked.version.as_semver()) {
             Cell::Ok
         } else {
             Cell::Hole(format!(

@@ -50,18 +50,12 @@ impl TypeSearchError {
     #[must_use]
     pub fn into_cli_error(self) -> CliError {
         match self {
-            Self::UnparseableQuery { query, detail } => CliError::UsageOwned(format!(
-                "ipe doc --type: `{query}` is not a valid type expression\n\
-                 \n\
-                 {detail}\n\
-                 \n\
-                 Hint: use Ipê type syntax, e.g. `List a -> (a -> b) -> List b`"
-            )),
-            Self::NoMatches { query } => CliError::UsageOwned(format!(
-                "ipe doc --type: no symbols match `{query}`\n\
-                 \n\
-                 Try a broader query or `ipe doc list` to browse modules."
-            )),
+            Self::UnparseableQuery { query, detail } => {
+                CliError::UsageOwned(crate::text::doc_type_invalid_query(&query, &detail))
+            }
+            Self::NoMatches { query } => {
+                CliError::UsageOwned(crate::text::doc_type_no_match_hint(&query))
+            }
         }
     }
 }

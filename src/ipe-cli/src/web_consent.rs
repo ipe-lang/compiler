@@ -123,15 +123,13 @@ pub fn gate(
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                ungranted.push(format!("`{wire}` disclosed by {via}"));
+                ungranted.push(crate::text::web_consent_disclosure(&wire, &via));
             }
             None => {
                 // Fail-closed: the axis is inferred (a reachable module discloses
                 // it through the link-fold) but no scanned source attributes it —
                 // refuse stating exactly that, rather than dropping the axis.
-                ungranted.push(format!(
-                    "`{wire}` disclosed by a module the build could not attribute"
-                ));
+                ungranted.push(crate::text::web_consent_disclosure_unattributed(&wire));
             }
         }
     }
@@ -144,19 +142,13 @@ pub fn gate(
 /// The typed, fail-closed refusal naming each ungranted web axis, its disclosing
 /// module(s), and the remedy.
 fn refusal(ungranted: &[String]) -> CliError {
-    let mut body =
-        String::from("this program reaches a browser web capability the app has not granted\n");
-    for item in ungranted {
-        body.push_str("  = ");
-        body.push_str(item);
-        body.push('\n');
-    }
-    body.push_str(
-        "  = a web capability is granted ONLY by the top-level app's package.ipe; a dependency \n\
-         \x20   discloses but cannot self-authorise. Grant it after review by adding the axis to \n\
-         \x20   `accept = [ … ]` under [capabilities] in package.ipe, or drop the dependency.\n",
-    );
-    CliError::UsageOwned(format!("error[IPE-S0002]: {body}"))
+    let lines: Vec<String> = std::iter::once(crate::text::web_consent_header().to_owned())
+        .chain(ungranted.iter().map(|item| crate::text::consent_item(item)))
+        .chain(std::iter::once(
+            crate::text::web_consent_remedy().to_owned(),
+        ))
+        .collect();
+    CliError::UsageOwned(lines.join("\n"))
 }
 
 #[cfg(test)]

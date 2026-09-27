@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use crate::CliError;
+use crate::text;
 
 /// `ipe add <package>[@<req>]` — add an Ipê package dependency.
 ///
@@ -25,7 +26,7 @@ use crate::CliError;
 pub fn run_add(rest: &[String]) -> Result<(), CliError> {
     let (name, req) = parse_add_arg(rest)?;
     let project_root = project_root()?;
-    crate::resolve::resolve_and_add(&project_root, name, &req, &crate::resolve::index_root())
+    crate::resolve::resolve_and_add(&project_root, name, &req, &crate::resolve::index_root()?)
 }
 
 /// `ipe remove <package>` — remove an Ipê package dependency from both
@@ -57,11 +58,9 @@ fn project_root() -> Result<PathBuf, CliError> {
         return Ok(cwd);
     }
     if crate::project::has_only_legacy_toml(&cwd) {
-        return Err(CliError::Usage(crate::project::LEGACY_TOML_HINT));
+        return Err(CliError::Usage(text::legacy_toml_hint()));
     }
-    Err(CliError::Usage(
-        "ipe add/remove: no `package.ipe` in the current directory (run inside an Ipê project)",
-    ))
+    Err(CliError::Usage(text::pkg_no_manifest()))
 }
 
 /// Parse `ipe add`'s single argument into a package name and a version
@@ -75,15 +74,11 @@ fn parse_add_arg(rest: &[String]) -> Result<(&str, semver::VersionReq), CliError
     let arg = package_arg(rest, "add")?;
     let (name, req_str) = arg.split_once('@').map_or((arg, "*"), |(n, r)| (n, r));
     if name.is_empty() {
-        return Err(CliError::UsageOwned(
-            "usage: ipe add <package>[@<version>]".to_owned(),
-        ));
+        return Err(CliError::UsageOwned(text::pkg_usage(&"add")));
     }
-    let req = req_str.parse::<semver::VersionReq>().map_err(|e| {
-        CliError::UsageOwned(format!(
-            "ipe add: `{req_str}` is not a valid version requirement: {e}"
-        ))
-    })?;
+    let req = req_str
+        .parse::<semver::VersionReq>()
+        .map_err(|e| CliError::UsageOwned(text::pkg_invalid_requirement(&req_str, &e)))?;
     Ok((name, req))
 }
 
@@ -100,8 +95,6 @@ fn package_arg<'a>(rest: &'a [String], command: &str) -> Result<&'a str, CliErro
     match rest {
         [one] if one.starts_with('-') => Err(crate::cli_args::usage_unknown_flag(command, one)),
         [one] => Ok(one.as_str()),
-        _ => Err(CliError::UsageOwned(format!(
-            "usage: ipe {command} <package>[@<version>]"
-        ))),
+        _ => Err(CliError::UsageOwned(text::pkg_usage(&command))),
     }
 }

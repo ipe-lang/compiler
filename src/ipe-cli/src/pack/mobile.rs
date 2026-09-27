@@ -908,14 +908,14 @@ pub fn materialise(
     root.ensure_dir()?;
 
     for file in &layout.files {
-        let entry =
+        let out_file =
             dist.path_to(Path::new(&layout.root_name).join(rel_to_native(&file.rel_path)))?;
         match &file.content {
-            ShellContent::Generated(text) => entry.write(text.as_bytes())?,
-            ShellContent::Asset(src) => entry.copy_from(src)?,
+            ShellContent::Generated(text) => out_file.write(text.as_bytes())?,
+            ShellContent::Asset(src) => out_file.copy_from(src)?,
             ShellContent::Icon => {
                 if let Some(src) = icon {
-                    entry.copy_from(src)?;
+                    out_file.copy_from(src)?;
                 }
             }
         }

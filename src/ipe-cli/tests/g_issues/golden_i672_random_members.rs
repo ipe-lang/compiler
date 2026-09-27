@@ -30,7 +30,7 @@ fn random_members_ipec_cargo_and_run_zero() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("random_members");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_random_members_e2e");
+    let out = crate::support::scratch_root().join("ipec_random_members_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

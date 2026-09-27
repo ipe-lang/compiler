@@ -8,10 +8,11 @@ Ipe.Db.Dsn — a typed, opaque database connection descriptor
 (parse-don't-validate,).
 
 `Dsn` is opaque and reserved: the ONLY ways to obtain one are `parse` (from a
-full DSN URL string) and `build` (from typed parts). Both run the SAME
-fail-closed validators in the runtime kernel, so a `Dsn` value is a proof that
-the descriptor passed every check — an invalid DSN is a typed `Err`, never a
-silently-accepted, re-injectable value.
+full DSN URL string) and `build` (from typed parts). Both enforce the same
+fail-closed invariants in the runtime kernel (`parse` on URL text, `build` on
+literal parts), so a `Dsn` value is a proof that the descriptor passed every
+check — an invalid DSN is a typed `Err`, never a silently-accepted,
+re-injectable value.
 
 The descriptor's password is a `Secret`: it is never rendered, logged, or
 returned as a plain `String`. There is no password accessor; the only display
@@ -42,8 +43,15 @@ parse : String -> Result Error Dsn
 `parse raw` — THE seal from a full DSN URL string. Returns `Err` on any
 invalid shape: an unparseable string, an unknown driver, a missing host for a
 network driver, an out-of-range port, an explicit `sslmode=disable`, an unknown
-`sslmode`, a smuggled/duplicated credential parameter, or a control-character
-component. The password is captured as a `Secret`.
+`sslmode`, a smuggled/duplicated credential parameter, a control-character
+component, or a PostgreSQL user name or password that may run past the URL's
+authority. An `@` anywhere after the host (in the path or a query value) is
+refused the same way; write it as `%40`. The user name, password, and database
+are percent-decoded, so `user` and `database` return the decoded text. The
+password is captured as a `Secret`; a password with no user name, and a DSN
+longer than 4096 bytes, are rejected. A sqlite DSN names its file by everything
+after `sqlite:`, `sqlite://`, or `file:`, percent-decoded; credentials, any
+query but `mode=rwc`, and a file name starting `file:` are rejected.
 
 ## `build`
 
@@ -51,10 +59,19 @@ component. The password is captured as a `Secret`.
 build :
 ```
 
-`build parts` — THE seal from typed parts, running the SAME validators as
-`parse`. Preferred over `parse` when the parts are already structured (there is
-no string to mis-escape). The `password` is a `Secret` on the way in; `Disable`
-TLS and an out-of-range port are rejected.
+`build parts` — THE seal from typed parts, enforcing the invariants `parse`
+does on literal parts. Preferred over `parse` when the parts are already
+structured (there is no string to mis-escape). The `password` is a `Secret` on
+the way in; `Disable`
+TLS and an out-of-range port are rejected. The `database`, `user`, and
+`password` are taken literally and percent-encoded into the connection URL, so a
+`?`, `&`, `#`, `@`, `/`, or `%` in them cannot add a parameter such as `sslmode`.
+Each is capped at 512 bytes, and a `password` needs a `user`.
+A sqlite `database` is a literal file name, opened create-if-missing, and no
+character in it can change how the file is opened; `:memory:` is the
+in-memory database, and a name starting `file:` is rejected.
+The `host` must be a host name or IP literal (IPv6 in brackets); one holding a
+URL delimiter is rejected.
 
 ## `driver`
 
@@ -71,6 +88,18 @@ host : Dsn -> String
 ```
 
 `host dsn` — the host component (`""` for a file-backed sqlite descriptor).
+
+## `port`
+
+```ipe
+port : Dsn -> Maybe Port
+```
+
+`port dsn` — the network port as a validated `Ipe.Net.Port`, or `Nothing`
+for a file-backed sqlite descriptor (which has no port; the kernel returns the
+`0` sentinel, which `Net.fromInt` rejects, yielding `Nothing`).  A network
+descriptor always carries a `1..65535` port, so `Net.fromInt` re-proves the
+range the kernel already enforced at construction.
 
 ## `database`
 

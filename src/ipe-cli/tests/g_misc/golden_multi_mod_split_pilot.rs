@@ -155,7 +155,7 @@ fn end_to_end_builds_and_prints_seeded_count() {
     let fixture = fixture_dir();
     // Build OUTSIDE the workspace tree (an emitted project under the
     // workspace target/ is rejected by cargo as a non-member package).
-    let out = std::env::temp_dir().join("ipec_multi_mod_split_pilot_e2e");
+    let out = crate::support::scratch_root().join("ipec_multi_mod_split_pilot_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());

@@ -61,7 +61,7 @@ fn css_opacity_refinement_e2e_output_matches_expected() {
 
     let dir = fixture_dir();
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_css_opacity_refinement_e2e");
+    let out = crate::support::scratch_root().join("ipec_css_opacity_refinement_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();

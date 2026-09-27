@@ -11,7 +11,7 @@ use std::path::Path;
 
 use ipe_lsp_server::{LoadError, LoadedFile, LoadedProject, ProjectLoader};
 
-use crate::{CliError, project, watch};
+use crate::{CliError, project, text, watch};
 
 struct DriverLoader;
 
@@ -74,7 +74,7 @@ impl ProjectLoader for DriverLoader {
 /// failure; never for a compile diagnostic (those flow to the editor).
 pub fn run_lsp(rest: &[String]) -> Result<(), CliError> {
     if !rest.is_empty() {
-        return Err(CliError::Usage("ipe lsp takes no arguments"));
+        return Err(CliError::Usage(text::lsp_takes_no_arguments()));
     }
-    ipe_lsp_server::run_stdio(&DriverLoader).map_err(|e| CliError::UsageOwned(format!("lsp: {e}")))
+    ipe_lsp_server::run_stdio(&DriverLoader).map_err(|e| CliError::UsageOwned(text::lsp_failed(&e)))
 }

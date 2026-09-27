@@ -41,7 +41,7 @@ fn record_ctor_end_to_end_field_order() {
         .join("golden")
         .join("record_ctor")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m82_record_ctor_e2e");
+    let out = crate::support::scratch_root().join("ipec_m82_record_ctor_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -175,7 +175,7 @@ fn seal_fn_field_alias_builds_and_runs() {
         .join("golden")
         .join("record_ctor_fn_field")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m82_record_ctor_fn_field_e2e");
+    let out = crate::support::scratch_root().join("ipec_m82_record_ctor_fn_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -256,7 +256,7 @@ fn seal_opaque_field_alias_builds_and_runs() {
         .join("golden")
         .join("record_ctor_opaque_field")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m82_record_ctor_opaque_field_e2e");
+    let out = crate::support::scratch_root().join("ipec_m82_record_ctor_opaque_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -317,7 +317,7 @@ fn record_ctor_cross_module_end_to_end() {
         .join("golden")
         .join("record_ctor_xmod")
         .join("package.ipe");
-    let out = std::env::temp_dir().join("ipec_m82_record_ctor_xmod_e2e");
+    let out = crate::support::scratch_root().join("ipec_m82_record_ctor_xmod_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

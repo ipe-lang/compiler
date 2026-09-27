@@ -47,7 +47,13 @@ const EXCLUDED_DIR_NAMES: &[&str] = &[
 /// silently clamping) anything that doesn't resolve inside the root,
 /// including a symlink that points outside it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WatchedPath(PathBuf);
+pub struct WatchedPath {
+    /// The canonical path itself.
+    path: PathBuf,
+    /// The canonical project root `path` is confined to — kept so exclusion
+    /// is judged only on the components BELOW it.
+    root: PathBuf,
+}
 
 impl WatchedPath {
     /// Canonicalise `candidate` (resolving symlinks) and confine it to
@@ -62,7 +68,10 @@ impl WatchedPath {
         let canon_root = std::fs::canonicalize(root).ok()?;
         let canon_candidate = std::fs::canonicalize(candidate).ok()?;
         if canon_candidate.starts_with(&canon_root) {
-            Some(Self(canon_candidate))
+            Some(Self {
+                path: canon_candidate,
+                root: canon_root,
+            })
         } else {
             None
         }
@@ -89,7 +98,10 @@ impl WatchedPath {
         let file_name = candidate.file_name()?;
         let rejoined = parent_canon.join(file_name);
         if rejoined.starts_with(&canon_root) {
-            Some(Self(rejoined))
+            Some(Self {
+                path: rejoined,
+                root: canon_root,
+            })
         } else {
             None
         }
@@ -97,29 +109,44 @@ impl WatchedPath {
 
     #[must_use]
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 
     #[must_use]
     pub fn into_path_buf(self) -> PathBuf {
-        self.0
+        self.path
+    }
+
+    /// Whether this path lies under a generated/vendor directory BELOW its
+    /// project root. The root's own ancestors never count: a project living at
+    /// `~/work/out/app` or `…/target/tmp/app` is watched like any other, while
+    /// `<root>/target/…` and `<root>/out/…` stay excluded.
+    #[must_use]
+    pub fn under_excluded_dir(&self) -> bool {
+        self.path
+            .strip_prefix(&self.root)
+            .map_or(true, rel_under_excluded_dir)
     }
 }
 
-/// Whether a directory name (the LAST component of a path) names one of the
-/// generated/vendor directories a confined watch excludes.
-#[must_use]
-pub fn is_excluded_dir_name(name: &str) -> bool {
+/// Whether a directory name names one of the generated/vendor directories a
+/// confined watch excludes.
+fn is_excluded_dir_name(name: &str) -> bool {
     EXCLUDED_DIR_NAMES.contains(&name)
 }
 
-/// Whether ANY component of `path` names an excluded directory — a path
-/// nested arbitrarily deep under `target/` or `.git/` is excluded regardless
-/// of its own leaf name.
-#[must_use]
-pub fn under_excluded_dir(path: &Path) -> bool {
-    path.components()
+/// Whether any component of a ROOT-RELATIVE path names an excluded directory
+/// — a path nested arbitrarily deep under `target/` or `.git/` is excluded
+/// regardless of its own leaf name.
+fn rel_under_excluded_dir(rel: &Path) -> bool {
+    rel.components()
         .any(|c| c.as_os_str().to_str().is_some_and(is_excluded_dir_name))
+}
+
+/// Whether `path` lies under an excluded directory below `root`. A path not
+/// under `root` is not judged here — confinement rejects it.
+fn under_excluded_dir_below(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(rel_under_excluded_dir)
 }
 
 /// The strict allowlist a confined watch observes, resolved once at watch
@@ -245,7 +272,7 @@ impl WatchScope {
         // the watcher into an unbounded event source later.
         let mut file_count = 0usize;
         for w in &roots_to_watch {
-            count_source_files(w.as_path(), &mut file_count)?;
+            count_source_files(&canon_root, w.as_path(), &mut file_count)?;
             if file_count > MAX_WATCHED_FILES {
                 return Err(ScopeError::TooManyFiles {
                     found: file_count,
@@ -293,7 +320,9 @@ impl WatchScope {
     /// gate — no ad-hoc `canonicalize`/`starts_with` duplication that could drift.
     #[must_use]
     pub fn is_relevant(&self, path: &Path) -> bool {
-        if under_excluded_dir(path) {
+        // Cheap pre-filter on the raw event path (no syscall), so an
+        // excluded-dir storm is dropped before canonicalisation.
+        if under_excluded_dir_below(&self.root, path) {
             return false;
         }
         let Some(confined) = WatchedPath::confine(&self.root, path)
@@ -301,6 +330,11 @@ impl WatchScope {
         else {
             return false;
         };
+        // Re-judged on the canonical path: an in-root symlink resolving into
+        // `<root>/target/` must not slip past the raw-path pre-filter.
+        if confined.under_excluded_dir() {
+            return false;
+        }
         is_watchable_leaf(self.tests_root.as_deref(), confined.as_path())
     }
 }
@@ -352,7 +386,7 @@ fn is_manifest_file(path: &Path) -> bool {
 /// moment `count` exceeds [`MAX_WATCHED_FILES`] — the caller re-checks and
 /// converts that into a hard [`ScopeError::TooManyFiles`], so a pathological
 /// tree cannot make this walk itself unbounded.
-fn count_source_files(dir: &Path, count: &mut usize) -> Result<(), ScopeError> {
+fn count_source_files(root: &Path, dir: &Path, count: &mut usize) -> Result<(), ScopeError> {
     if dir.is_file() {
         if is_source_file(dir) && !is_manifest_file(dir) {
             *count += 1;
@@ -372,7 +406,7 @@ fn count_source_files(dir: &Path, count: &mut usize) -> Result<(), ScopeError> {
             source,
         })?;
         let path = entry.path();
-        if under_excluded_dir(&path) {
+        if under_excluded_dir_below(root, &path) {
             continue;
         }
         let file_type = entry.file_type().map_err(|source| ScopeError::Io {
@@ -380,7 +414,7 @@ fn count_source_files(dir: &Path, count: &mut usize) -> Result<(), ScopeError> {
             source,
         })?;
         if file_type.is_dir() {
-            count_source_files(&path, count)?;
+            count_source_files(root, &path, count)?;
         } else if is_source_file(&path) && !is_manifest_file(&path) {
             *count += 1;
         }
@@ -464,6 +498,93 @@ mod tests {
         assert_eq!(scope.file_count(), 1);
         assert!(!scope.is_relevant(&target.join("build.rs")));
         assert!(scope.is_relevant(&src.join("Main.ipe")));
+    }
+
+    /// A project at `<base>/<ancestor…>/app` with `src/Main.ipe`, plus decoy
+    /// sources under the project's OWN `target/` and `out/`.
+    fn project_under(tag: &str, ancestors: &[&str]) -> (PathBuf, PathBuf) {
+        let mut root = tmp_dir(tag);
+        for a in ancestors {
+            root = root.join(a);
+        }
+        let root = root.join("app");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("Main.ipe"),
+            "module Main exposing (main)\nmain = 1\n",
+        )
+        .unwrap();
+        for excluded in ["target", "out"] {
+            let dir = root.join(excluded);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("x.ipe"), "module X exposing (x)\nx = 1\n").unwrap();
+        }
+        (root, src)
+    }
+
+    fn assert_watched_despite_ancestors(tag: &str, ancestors: &[&str]) {
+        let (root, src) = project_under(tag, ancestors);
+        let scope = WatchScope::build(&root, &root).unwrap();
+        // Only src/Main.ipe: the root's own `target/`/`out/` stay excluded.
+        assert_eq!(scope.file_count(), 1, "ancestors {ancestors:?}");
+        assert!(scope.is_relevant(&src.join("Main.ipe")));
+        assert!(!scope.is_relevant(&root.join("target").join("x.ipe")));
+        assert!(!scope.is_relevant(&root.join("out").join("x.ipe")));
+
+        let nested = WatchScope::build(&root, &src).unwrap();
+        assert_eq!(nested.file_count(), 1, "ancestors {ancestors:?}");
+        assert!(nested.is_relevant(&src.join("Main.ipe")));
+    }
+
+    #[test]
+    fn project_under_an_ancestor_named_target_is_watched() {
+        assert_watched_despite_ancestors("anc_target", &["target", "tmp"]);
+    }
+
+    #[test]
+    fn project_under_an_ancestor_named_out_is_watched() {
+        assert_watched_despite_ancestors("anc_out", &["out"]);
+    }
+
+    #[test]
+    fn project_under_every_excluded_ancestor_name_is_watched() {
+        assert_watched_despite_ancestors("anc_all", EXCLUDED_DIR_NAMES);
+    }
+
+    #[test]
+    fn root_level_excluded_dirs_are_never_counted_or_relevant() {
+        let (root, _src) = project_under("root_excl", &[]);
+        let scope = WatchScope::build(&root, &root).unwrap();
+        assert_eq!(scope.file_count(), 1);
+        for excluded in ["target", "out"] {
+            let deep = root.join(excluded).join("nested");
+            fs::create_dir_all(&deep).unwrap();
+            fs::write(deep.join("y.ipe"), "module Y exposing (y)\ny = 1\n").unwrap();
+            assert!(!scope.is_relevant(&deep.join("y.ipe")), "{excluded}");
+        }
+    }
+
+    #[test]
+    fn in_root_symlink_into_target_is_not_relevant() {
+        let (root, src) = project_under("symlink_target", &[]);
+        let link = src.join("Linked.ipe");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("target").join("x.ipe"), &link).unwrap();
+            let scope = WatchScope::build(&root, &root).unwrap();
+            // Raw path is `src/Linked.ipe`; canonical is `target/x.ipe`.
+            assert!(!scope.is_relevant(&link));
+        }
+    }
+
+    #[test]
+    fn watched_path_exclusion_ignores_root_ancestors() {
+        let (root, src) = project_under("wp_excl", &["out", "target"]);
+        let main = WatchedPath::confine(&root, &src.join("Main.ipe")).unwrap();
+        assert!(!main.under_excluded_dir());
+        let decoy = WatchedPath::confine(&root, &root.join("out").join("x.ipe")).unwrap();
+        assert!(decoy.under_excluded_dir());
     }
 
     #[test]

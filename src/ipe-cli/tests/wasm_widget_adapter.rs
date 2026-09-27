@@ -73,14 +73,16 @@ const EDITOR_JS: &str = "export function mount(host, emit) {\n  return { onState
 
 /// Emit the widget app for the `WasmClient` target to a temp dir (no `cargo`).
 fn emit_wasm(test_name: &str) -> Result<std::path::PathBuf, BoxError> {
-    let ipe_dir = std::env::temp_dir().join(format!("wasm_widget_{test_name}_ipe"));
+    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("wasm_widget_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(ipe_dir.join("js"))?;
     std::fs::write(ipe_dir.join("js/editor.js"), EDITOR_JS)?;
     let entry = ipe_dir.join("Main.ipe");
     std::fs::write(&entry, WIDGET_APP)?;
 
-    let out_dir = std::env::temp_dir().join(format!("wasm_widget_{test_name}_out"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("wasm_widget_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;

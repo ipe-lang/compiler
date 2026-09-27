@@ -287,15 +287,10 @@ pub struct WebViewWindow {
 /// [reserved]: https://doc.rust-lang.org/reference/keywords.html
 #[must_use]
 pub fn sanitize_cargo_name(name: &str) -> String {
-    const RESERVED: &[&str] = &[
-        "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
-        "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "if", "impl", "in",
-        "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
-        "return", "self", "Self", "static", "struct", "super", "trait", "true", "try", "type",
-        "typeof", "union", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
-        // Toolchain binary name.
-        "ipe",
-    ];
+    // Non-keyword names that still get the suffix: the toolchain binary name
+    // (a crate named `ipe` would shadow the CLI on `$PATH`) and the weak
+    // keyword `union`, kept conservative for a crate name.
+    const EXTRA_SUFFIXED: &[&str] = &["ipe", "union"];
 
     // Names Cargo forbids as a binary target because they collide with its
     // build-directory names — the emitted crate has no `[[bin]]` override, so
@@ -333,10 +328,13 @@ pub fn sanitize_cargo_name(name: &str) -> String {
         return "ipe-app".to_owned();
     }
 
-    // Step 6: reserved Rust keywords, the `ipe` toolchain name, and Cargo's
+    // Step 6: reserved Rust keywords, the extra suffixed names, and Cargo's
     // forbidden binary-target names get `-app` appended to keep the emitted
     // crate buildable.
-    if RESERVED.contains(&result.as_str()) || CARGO_FORBIDDEN_BIN.contains(&result.as_str()) {
+    if ipe_intern::is_rust_keyword(&result)
+        || EXTRA_SUFFIXED.contains(&result.as_str())
+        || CARGO_FORBIDDEN_BIN.contains(&result.as_str())
+    {
         result.push_str("-app");
     }
 
@@ -2491,6 +2489,18 @@ impl<'a> EmitCtx<'a> {
         self.uses_http || self.uses_email
     }
 
+    /// `true` when the emitted crate reaches the `ssrf` runtime module — so
+    /// `project::assemble_project_files` declares it and adds tokio's `"net"`
+    /// feature, which its resolver (`tokio::net::lookup_host`) needs.
+    ///
+    /// Reached by every surface that dials a network host: the HTTP client
+    /// ([`Self::reaches_http_client`]), the WebSocket client, and the database.
+    /// This is the single source of truth shared by the `mod.rs` append and the
+    /// manifest augmenter, so the module is never declared without the feature.
+    pub(crate) const fn reaches_ssrf(&self) -> bool {
+        self.reaches_http_client() || self.uses_websocket || self.uses_db
+    }
+
     /// `true` when the emitted crate reaches the `jwt` runtime module — so
     /// `project::assemble_project_files` declares it and adds the `jsonwebtoken`
     /// dependency.
@@ -2738,7 +2748,7 @@ impl<'a> EmitCtx<'a> {
     /// `http_client.rs` targets a typed `crate::url::Url`), the WebSocket
     /// client ([`Self::uses_websocket`], whose `ws_client.rs` calls
     /// `::url::Url::parse`), or the Db surface ([`Self::uses_db`], whose
-    /// `db.rs::build_pool` applies the SSRF host gate via `::url::Url::parse`
+    /// `db.rs::VettedPool::connect` applies the SSRF host gate via `::url::Url::parse`
     /// and `ssrf.rs` parses URLs with `url::Url`). The shared `ssrf` validators
     /// (`use url::Url`) are declared exactly when any of these is, so this union
     /// covers them too. This is the single source of truth shared by the manifest
@@ -5655,6 +5665,19 @@ mod sanitize_cargo_name_tests {
         assert_eq!(sanitize_cargo_name("mod"), "mod-app");
         assert_eq!(sanitize_cargo_name("fn"), "fn-app");
         assert_eq!(sanitize_cargo_name("ipe"), "ipe-app");
+        assert_eq!(sanitize_cargo_name("union"), "union-app");
+    }
+
+    #[test]
+    fn every_ssot_keyword_gets_suffix() {
+        for kw in ipe_intern::RUST_KEYWORDS {
+            let lower = kw.to_ascii_lowercase();
+            assert_eq!(
+                sanitize_cargo_name(kw),
+                format!("{lower}-app"),
+                "{kw} should get the -app suffix"
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,8 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn server_view_msg_defaulting_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i1329_server_view_msg_defaulting_seal_emit");
+    let out =
+        crate::support::scratch_root().join("ipec_i1329_server_view_msg_defaulting_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -61,7 +62,7 @@ fn server_view_msg_defaulting_emits() {
 fn server_view_msg_defaulting_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i1329_server_view_msg_defaulting_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_i1329_server_view_msg_defaulting_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

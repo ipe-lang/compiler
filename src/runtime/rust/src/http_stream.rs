@@ -111,7 +111,7 @@ pub fn http_stream_open<E: From<String> + Send + 'static>(
             reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30));
         let builder = match crate::http_client::ssrf_apply(builder, &req.url, req.redirects).await {
             Ok(b) => b,
-            Err(msg) => return IpeResult::Err(msg.into()),
+            Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
         };
         let client = match builder.build() {
             Ok(c) => c,
@@ -133,7 +133,7 @@ pub fn http_stream_open<E: From<String> + Send + 'static>(
             // target URL / request headers / bearer / API key. Route through the
             // correlation-id redaction helper: raw detail → server log under a ref
             // id; Ipê sees only a fixed generic message.
-            Err(e) => return IpeResult::Err(ipe_error_from_foreign(e)),
+            Err(e) => return IpeResult::Err(crate::http_client::redacted_transport_error(e)),
         };
         // HTTP error statuses (4xx/5xx) still surface as a stream — the body may
         // carry the error payload the caller wants to read. Mirrors Http.get
@@ -196,7 +196,9 @@ where
                     }
                 }
                 // [B8] redact the foreign reqwest read error (see open above).
-                Some(Err(e)) => break IpeResult::Err(ipe_error_from_foreign(e)),
+                Some(Err(e)) => {
+                    break IpeResult::Err(crate::http_client::redacted_transport_error(e));
+                }
                 None => break IpeResult::Ok(()),
             }
         }
@@ -295,7 +297,9 @@ where
                         }
                         Some(Err(e)) => {
                             // [B8] redact the foreign reqwest read error (see open above).
-                            emit(to_msg(ChunkEvent::Errored(ipe_error_from_foreign(e))));
+                            emit(to_msg(ChunkEvent::Errored(
+                                crate::http_client::redacted_transport_error(e),
+                            )));
                             break;
                         }
                         None => {

@@ -10,6 +10,9 @@ ipe_diagnostics = { path = "../diagnostics" }
 ipe_canon = { path = "../canon" }
 ipe_intern = { path = "../intern" }
 ipe_kernels = { path = "../kernels" }
+# Keyword table + identifier charset: the lexer is the single source of truth
+# for which names the generated interface module may bind.
+ipe_parse = { path = "../parse" }
 # The asserted-call surface (`Rust.Ffi.call`) parses the author's annotation
 # straight from the source AST — never from re-rendered text.
 ipe_syntax = { path = "../syntax" }

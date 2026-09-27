@@ -58,7 +58,8 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
         return;
     }
 
-    let dir = std::env::temp_dir().join("ipe_build_registry_unreachable_e2e");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipe_build_registry_unreachable_e2e");
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
     let entry = dir.join("Main.ipe");

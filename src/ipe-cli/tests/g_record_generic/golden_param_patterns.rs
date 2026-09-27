@@ -114,7 +114,7 @@ fn end_to_end_builds_and_prints_one_hundred_twelve() {
     }
     let root = repo_root();
     let entry = fixture_dir(&root).join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_l0105_param_patterns_e2e");
+    let out = crate::support::scratch_root().join("ipec_l0105_param_patterns_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

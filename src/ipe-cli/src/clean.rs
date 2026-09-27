@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use crate::CliError;
 use crate::cli_args::{self, OutputFormat};
+use crate::screen::{self, Screen, Stream, Tone};
 use crate::style;
+use crate::text;
 
 /// A directory `clean` may remove.
 ///
@@ -133,11 +135,9 @@ fn project_root() -> Result<PathBuf, CliError> {
     let cwd = PathBuf::from(".");
     if crate::project::manifest_in_dir(&cwd).is_none() {
         if crate::project::has_only_legacy_toml(&cwd) {
-            return Err(CliError::Usage(crate::project::LEGACY_TOML_HINT));
+            return Err(CliError::Usage(text::legacy_toml_hint()));
         }
-        return Err(CliError::UsageOwned(
-            "clean: no package.ipe here — run it from an Ipê project root".to_owned(),
-        ));
+        return Err(CliError::UsageOwned(text::clean_no_manifest().to_owned()));
     }
     std::fs::canonicalize(&cwd).map_err(|e| CliError::Io {
         path: cwd,
@@ -152,79 +152,62 @@ fn project_root() -> Result<PathBuf, CliError> {
 /// refused, its target untouched; an `out/` without ipe's ownership marker is
 /// refused untouched; and a removal never follows a symlink met inside the tree.
 ///
+/// Every act goes through held directory handles: the candidate is
+/// opened relative to the held root without following a link, the marker is
+/// read and the tree emptied through that handle, and the final removal
+/// re-proves the name still names it — a level swapped for a link mid-walk is
+/// refused, its target untouched.
+///
 /// # Errors
 /// [`CliError::OutputRefused`] for a symlink or an unmarked `out/`;
 /// [`CliError::Io`] on a stat or remove failure.
 fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String>, CliError> {
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{EntryKind, HeldDir, level_held};
     let name = generated.name;
     let candidate = root.join(name);
-    if !is_real_dir(&candidate)? {
+    let Some(root_dir) = HeldDir::open_following(root)? else {
         return Ok(Vec::new());
+    };
+    let os_name = std::ffi::OsStr::new(name);
+    match root_dir.kind_of(os_name)? {
+        EntryKind::Symlink => return Err(OutputRefusal::Symlink(candidate).into()),
+        EntryKind::Absent | EntryKind::Other => return Ok(Vec::new()),
+        EntryKind::Directory => {}
     }
+    let Some(dir) = root_dir.child(os_name)? else {
+        return Ok(Vec::new());
+    };
+    level_held(dir.path());
     match generated.proof {
         Proof::Marker => {
-            if !crate::output_dir::has_marker(&candidate)? {
-                return Err(crate::output_dir::OutputRefusal::NotIpeOwned(candidate).into());
+            if !dir.has_marker()? {
+                return Err(OutputRefusal::NotIpeOwned(candidate).into());
             }
-            remove_tree(&candidate)?;
+            root_dir.remove_proven(os_name, dir)?;
             Ok(vec![format!("{name}/")])
         }
         Proof::Namespace(entries) => {
             let mut removed = Vec::new();
             for entry in entries {
-                let path = candidate.join(entry);
-                if is_real_dir(&path)? {
-                    remove_tree(&path)?;
-                    removed.push(format!("{name}/{entry}/"));
+                let os_entry = std::ffi::OsStr::new(entry);
+                match dir.kind_of(os_entry)? {
+                    EntryKind::Directory => {
+                        dir.remove_entry(os_entry)?;
+                        removed.push(format!("{name}/{entry}/"));
+                    }
+                    EntryKind::Symlink => {
+                        return Err(OutputRefusal::Symlink(candidate.join(entry)).into());
+                    }
+                    EntryKind::Absent | EntryKind::Other => {}
                 }
             }
-            if is_empty(&candidate)? {
-                std::fs::remove_dir(&candidate).map_err(|e| CliError::Io {
-                    path: candidate,
-                    source: e,
-                })?;
+            if root_dir.remove_empty_dir(os_name, dir)? {
                 return Ok(vec![format!("{name}/")]);
             }
             Ok(removed)
         }
     }
-}
-
-/// Whether `path` is a directory, never following a link.
-///
-/// `false` when absent or a plain file (ipe never removes one it does not own).
-///
-/// # Errors
-/// [`CliError::OutputRefused`] for a symlink; [`CliError::Io`] on a stat failure.
-fn is_real_dir(path: &Path) -> Result<bool, CliError> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(CliError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        }),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            Err(crate::output_dir::OutputRefusal::Symlink(path.to_path_buf()).into())
-        }
-        Ok(meta) => Ok(meta.is_dir()),
-    }
-}
-
-/// Whether the directory `dir` has no entries.
-fn is_empty(dir: &Path) -> Result<bool, CliError> {
-    let mut entries = std::fs::read_dir(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    Ok(entries.next().is_none())
-}
-
-/// Remove the directory tree `dir`; `remove_dir_all` never follows a symlink in it.
-fn remove_tree(dir: &Path) -> Result<(), CliError> {
-    std::fs::remove_dir_all(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })
 }
 
 /// Print the removal result in the requested format.
@@ -238,24 +221,24 @@ fn print_summary(removed: &[String], format: OutputFormat) {
         Json => {
             use crate::cli_args::json;
             let items: Vec<String> = removed.iter().map(|s| json::string(s)).collect();
-            println!(
-                "{}",
-                json::object(&[
-                    ("schema", json::string("ipe.cli.clean/1")),
-                    ("removed", json::array(&items)),
-                ])
-            );
+            let payload = json::object(&[
+                ("schema", json::string("ipe.cli.clean/1")),
+                ("removed", json::array(&items)),
+            ]);
+            screen::emit_machine(Stream::Stdout, &format!("{payload}\n"));
         }
         Plain => {
+            let mut lines = String::new();
             for dir in removed {
-                println!("{dir}");
+                lines.push_str(dir);
+                lines.push('\n');
             }
+            screen::emit_machine(Stream::Stdout, &lines);
         }
         Human => {
-            let p = style::Palette::for_stream(&std::io::stdout());
-            // A completed clean is a success: its glyph and green tint come from
-            // the style SSOT, not a per-site glyph/colour pairing.
-            let (glyph, tint) = style::Outcome::Success.glyph_and_tint(p);
+            // A completed clean is a success: its glyph and tone come from the
+            // style SSOT, not a per-site glyph/colour pairing.
+            let glyph = style::outcome_glyph(style::Outcome::Success);
             let mut body = String::new();
             if removed.is_empty() {
                 body.push_str("Nothing to clean — no generated output found.\n");
@@ -267,10 +250,9 @@ fn print_summary(removed: &[String], format: OutputFormat) {
                 let noun = if n == 1 { "directory" } else { "directories" };
                 let _ = writeln!(body, "\nCleaned {n} generated {noun}.");
             }
-            print!(
-                "{}",
-                style::frame(&style::gutter(&format!("{tint}{body}{}", p.reset)))
-            );
+            Screen::new(Stream::Stdout)
+                .line(Tone::Success, &body)
+                .emit();
         }
     }
 }
@@ -278,6 +260,7 @@ fn print_summary(removed: &[String], format: OutputFormat) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_dir::test_links::plant_link;
 
     const OUT: &Generated = &Generated {
         name: "out",
@@ -343,11 +326,8 @@ mod tests {
 
     /// A generated name that is a symlink escaping the project root is refused,
     /// and the escape target is left intact — the delete never leaves the root.
-    #[cfg(unix)]
     #[test]
     fn refuses_a_symlink_escaping_the_root() {
-        use std::os::unix::fs::symlink;
-
         let base = std::env::temp_dir().join(format!("ipe_clean_escape_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("project");
@@ -358,7 +338,7 @@ mod tests {
         let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
 
         // `out` inside the project is a symlink to the outside directory.
-        symlink(&outside, root.join("out")).expect("make escaping symlink");
+        plant_link(&outside, &root.join("out"));
 
         let result = remove_generated_dir(&real_root, OUT);
         assert!(
@@ -376,11 +356,8 @@ mod tests {
     /// Planted symlinks in a marked `out/` are removed as links.
     ///
     /// Neither target is followed or touched.
-    #[cfg(unix)]
     #[test]
     fn removes_planted_links_without_following_them() {
-        use std::os::unix::fs::symlink;
-
         let base = std::env::temp_dir().join(format!("ipe_clean_planted_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("project");
@@ -390,8 +367,11 @@ mod tests {
         std::fs::write(outside.join("keep.txt"), b"do not delete").expect("write victim");
         let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
         crate::output_dir::OwnedDir::claim(&real_root.join("out")).expect("claim out");
-        symlink(&outside, real_root.join("out").join("rust")).expect("dir link");
-        symlink(outside.join("keep.txt"), real_root.join("out").join("bin")).expect("file link");
+        plant_link(&outside, &real_root.join("out").join("rust"));
+        plant_link(
+            &outside.join("keep.txt"),
+            &real_root.join("out").join("bin"),
+        );
 
         let removed = remove_generated_dir(&real_root, OUT).expect("remove must succeed");
         assert_eq!(removed, ["out/"]);
@@ -456,11 +436,8 @@ mod tests {
     }
 
     /// A symlinked cache entry is refused, never followed.
-    #[cfg(unix)]
     #[test]
     fn refuses_a_symlinked_cache_entry() {
-        use std::os::unix::fs::symlink;
-
         let base = std::env::temp_dir().join(format!("ipe_clean_ns_link_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("project");
@@ -468,7 +445,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".ipe")).expect("make .ipe");
         std::fs::create_dir_all(&outside).expect("make outside");
         std::fs::write(outside.join("keep.txt"), b"do not delete").expect("write victim");
-        symlink(&outside, root.join(".ipe").join("cache")).expect("link");
+        plant_link(&outside, &root.join(".ipe").join("cache"));
         let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
 
         let result = remove_generated_dir(&real_root, DOT_IPE);
@@ -481,6 +458,106 @@ mod tests {
             "the link target survives"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An `out/` swapped for a link after clean held it is refused, the link's target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_an_out_dir_swapped_for_a_link_mid_walk() {
+        let base = std::env::temp_dir().join(format!("ipe_clean_swap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("project");
+        let victim = base.join("precious");
+        std::fs::create_dir_all(&root).expect("make root");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        std::fs::write(victim.join("keep.txt"), "keep").expect("write victim");
+        let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
+        let out = real_root.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        std::fs::write(out.join("generated.rs"), "gen").expect("generated file");
+        let (level, target) = (out.clone(), victim.clone());
+        let mut swap = Some(move || {
+            std::fs::rename(&level, level.with_extension("aside")).expect("move out aside");
+            std::os::unix::fs::symlink(&target, &level).expect("plant link");
+        });
+        crate::output_dir::held::set_level_hook(Some(Box::new(move |held: &Path| {
+            if held == out
+                && let Some(swap) = swap.take()
+            {
+                swap();
+            }
+        })));
+        let result = remove_generated_dir(&real_root, OUT);
+        crate::output_dir::held::set_level_hook(None);
+        assert!(
+            matches!(result, Err(CliError::OutputRefused(_))),
+            "a swapped-in link must be refused, got: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(victim.join("keep.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "the link target must be left untouched"
+        );
+        assert!(
+            real_root.join("out").is_symlink(),
+            "the planted link is not removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An `out/` emptied and junctioned in place after clean held it is refused, the target untouched.
+    ///
+    /// A held level cannot be renamed on this platform, only turned into a
+    /// junction once empty.
+    #[cfg(windows)]
+    #[test]
+    fn refuses_an_out_dir_junctioned_in_place_mid_walk() {
+        let base = std::env::temp_dir().join(format!("ipe_clean_junction_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("project");
+        let victim = base.join("precious");
+        std::fs::create_dir_all(&root).expect("make root");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        std::fs::write(victim.join("keep.txt"), "keep").expect("write victim");
+        let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
+        let out = real_root.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        std::fs::write(out.join("generated.rs"), "gen").expect("generated file");
+        let (level, target) = (out.clone(), victim.clone());
+        let mut swap = Some(move || {
+            for entry in std::fs::read_dir(&level).expect("list out") {
+                std::fs::remove_file(entry.expect("out entry").path()).expect("empty out");
+            }
+            crate::output_dir::test_links::junction_in_place(&level, &target);
+        });
+        crate::output_dir::held::set_level_hook(Some(Box::new(move |held: &Path| {
+            if held == out
+                && let Some(swap) = swap.take()
+            {
+                swap();
+            }
+        })));
+        let result = remove_generated_dir(&real_root, OUT);
+        crate::output_dir::held::set_level_hook(None);
+        assert!(
+            result.is_err(),
+            "a junctioned out/ must be refused, got: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(victim.join("keep.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "the junction target must be left untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            1,
+            "nothing is removed from the junction target"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

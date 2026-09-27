@@ -103,7 +103,7 @@ fn i198_cargo_builds_and_runs() {
 
     let root = repo_root();
     let entry = entry_path(&root);
-    let out = std::env::temp_dir().join("ipec_i198_decoder_payload_mapper_e2e");
+    let out = crate::support::scratch_root().join("ipec_i198_decoder_payload_mapper_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

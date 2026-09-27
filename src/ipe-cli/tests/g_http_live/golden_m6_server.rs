@@ -51,7 +51,7 @@ fn server_request_accessor_emit_inserts_clone() {
         .join("golden")
         .join("server_request_accessors")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m6_server_request_accessors");
+    let out = crate::support::scratch_root().join("ipec_m6_server_request_accessors");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

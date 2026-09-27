@@ -60,11 +60,30 @@ jobs:
   # the required-check context. On any code PR (or push/schedule/merge_group) the
   # gate is `code == 'true'` and all proofs run at full strictness.
   changes:
+    # Unique context: a required `changes` shared with ci.yml would be ambiguous.
+    name: admission-changes
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      release_only: ${{ steps.release.outputs.release_only }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The tested merge commit and its base parent, for the release-only diff.
+          fetch-depth: 2
+      # `release_only` — true only for a same-repo PR whose changed files are all
+      # release-please version metadata (see .github/ci/release_only.py). Keyed on
+      # the diff, never the branch name, so no PR can opt itself out of a tier.
+      - name: Classify release-only PR
+        id: release
+        # A classifier crash leaves the output unset, so every tier runs.
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/ci/release_only.py
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -103,19 +122,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes]
-    # Skip on a maintainer-authored release-please PR (a version/CHANGELOG bump only):
-    # the OS-sandbox behaviour cannot change from a version-number bump, and the same
-    # commit's proof already ran on the code PR that introduced it. Keyed on
-    # `author_association == 'OWNER'` (a fork PR cannot be OWNER), so the
-    # untrusted-author full-run clause below is preserved — a fork naming its branch
-    # `release-please--…` still runs the full proof.
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
       (
       needs.changes.outputs.code == 'true'
       || github.event_name != 'pull_request'
       || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-      && !(github.event.pull_request.author_association == 'OWNER' && startsWith(github.head_ref, 'release-please--'))
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
       - uses: actions/checkout@v5
@@ -151,19 +167,16 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     needs: [changes]
-    # Skip on a maintainer-authored release-please PR (a version/CHANGELOG bump only):
-    # the OS-sandbox behaviour cannot change from a version-number bump, and the same
-    # commit's proof already ran on the code PR that introduced it. Keyed on
-    # `author_association == 'OWNER'` (a fork PR cannot be OWNER), so the
-    # untrusted-author full-run clause below is preserved — a fork naming its branch
-    # `release-please--…` still runs the full proof.
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
       (
       needs.changes.outputs.code == 'true'
       || github.event_name != 'pull_request'
       || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-      && !(github.event.pull_request.author_association == 'OWNER' && startsWith(github.head_ref, 'release-please--'))
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
       - uses: actions/checkout@v5
@@ -198,19 +211,16 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     needs: [changes]
-    # Skip on a maintainer-authored release-please PR (a version/CHANGELOG bump only):
-    # the OS-sandbox behaviour cannot change from a version-number bump, and the same
-    # commit's proof already ran on the code PR that introduced it. Keyed on
-    # `author_association == 'OWNER'` (a fork PR cannot be OWNER), so the
-    # untrusted-author full-run clause below is preserved — a fork naming its branch
-    # `release-please--…` still runs the full proof.
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
       (
       needs.changes.outputs.code == 'true'
       || github.event_name != 'pull_request'
       || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-      && !(github.event.pull_request.author_association == 'OWNER' && startsWith(github.head_ref, 'release-please--'))
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
       - uses: actions/checkout@v5
@@ -248,19 +258,16 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     needs: [changes]
-    # Skip on a maintainer-authored release-please PR (a version/CHANGELOG bump only):
-    # the OS-sandbox behaviour cannot change from a version-number bump, and the same
-    # commit's proof already ran on the code PR that introduced it. Keyed on
-    # `author_association == 'OWNER'` (a fork PR cannot be OWNER), so the
-    # untrusted-author full-run clause below is preserved — a fork naming its branch
-    # `release-please--…` still runs the full proof.
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
       (
       needs.changes.outputs.code == 'true'
       || github.event_name != 'pull_request'
       || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-      && !(github.event.pull_request.author_association == 'OWNER' && startsWith(github.head_ref, 'release-please--'))
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
       - uses: actions/checkout@v5
@@ -356,19 +363,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    # Skip on a maintainer-authored release-please PR (a version/CHANGELOG bump only):
-    # the OS-sandbox behaviour cannot change from a version-number bump, and the same
-    # commit's proof already ran on the code PR that introduced it. Keyed on
-    # `author_association == 'OWNER'` (a fork PR cannot be OWNER), so the
-    # untrusted-author full-run clause below is preserved — a fork naming its branch
-    # `release-please--…` still runs the full proof.
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
       (
       needs.changes.outputs.code == 'true'
       || github.event_name != 'pull_request'
       || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
-      && !(github.event.pull_request.author_association == 'OWNER' && startsWith(github.head_ref, 'release-please--'))
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
       - uses: actions/checkout@v5

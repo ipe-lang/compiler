@@ -54,7 +54,7 @@ fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<
 #[test]
 fn mixed_arm_entry_point_wraps_to_ipetask() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_mixed_arm_task_run_elision_signature");
+    let out = crate::support::scratch_root().join("ipec_mixed_arm_task_run_elision_signature");
     let (built, main_rs) = built_main_rs(&root, &out);
     assert!(
         built.is_ok(),
@@ -94,7 +94,7 @@ fn mixed_arm_entry_point_wraps_to_ipetask() {
 #[test]
 fn mixed_arm_entry_point_wraps_via_task_from_result() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_mixed_arm_task_run_elision_wrap_shape");
+    let out = crate::support::scratch_root().join("ipec_mixed_arm_task_run_elision_wrap_shape");
     let (built, main_rs) = built_main_rs(&root, &out);
     assert!(
         built.is_ok(),
@@ -119,7 +119,7 @@ fn mixed_arm_entry_point_wraps_via_task_from_result() {
 #[test]
 fn mixed_arm_task_run_elision_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_mixed_arm_task_run_elision_e2e");
+    let out = crate::support::scratch_root().join("ipec_mixed_arm_task_run_elision_e2e");
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
     };

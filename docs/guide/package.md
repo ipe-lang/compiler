@@ -118,7 +118,6 @@ build =
     , static = False             -- link a fully-static musl binary
     , target = HostTarget        -- HostTarget | Cross "<triple>"
     , allocator = AutoAlloc      -- AutoAlloc | System | Dlmalloc | Talc | Mimalloc
-    , allowSlowAllocator = False
     , cFree = False              -- link no C code
     }
 ```
@@ -142,7 +141,7 @@ package =
         , accepts = [ JsPort Geolocation ]
         }
     , wasm = On { mode = Solo }
-    , build = { database = Postgres, static = False, target = HostTarget, allocator = AutoAlloc, allowSlowAllocator = False, cFree = False }
+    , build = { database = Postgres, static = False, target = HostTarget, allocator = AutoAlloc, cFree = False }
     , delivery =
         { ships = [ binary, soloAndroid, soloIos ]
         , desktop = { title = "My App", width = 1200, height = 800 }

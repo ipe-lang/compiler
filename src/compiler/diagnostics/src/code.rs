@@ -68,26 +68,120 @@ impl Code {
         self.0
     }
 
-    /// The [`Family`] this code belongs to, derived from the family letter — the
-    /// byte at index 4 of the `"IPE-X…"` wire string (`I`,`P`,`E`,`-`, then the
-    /// letter). Matched with a bounds-checked slice pattern (never an unchecked
-    /// `[4]` index) so a malformed wire string — impossible for a taxonomy
-    /// constant, but the field is a `&'static str` — yields [`Family::Internal`]
-    /// rather than panicking: fail-closed to the "report a bug" family. `const`
-    /// so the family chokepoints in `Diagnostic::code`'s helpers evaluate at
-    /// build time.
+    /// The [`Family`] this code belongs to, derived from its family letter.
+    ///
+    /// The letter is the byte at index 4 of the `"IPE-X…"` wire string (`I`,`P`,`E`,`-`, then the
+    /// letter) — looked up in [`FAMILIES`], the one letter↔family table.
+    /// Matched with a bounds-checked slice pattern (never an unchecked `[4]`
+    /// index) so a malformed wire string — impossible for a taxonomy constant,
+    /// but the field is a `&'static str` — yields [`Family::Internal`] rather
+    /// than panicking: fail-closed to the "report a bug" family. `const` so the
+    /// family chokepoints in `Diagnostic::code`'s helpers evaluate at build time.
     #[must_use]
     pub const fn family(self) -> Family {
-        match *self.0.as_bytes() {
-            [b'I', b'P', b'E', b'-', b'P', ..] => Family::Parse,
-            [b'I', b'P', b'E', b'-', b'N', ..] => Family::Name,
-            [b'I', b'P', b'E', b'-', b'T', ..] => Family::Type,
-            [b'I', b'P', b'E', b'-', b'L', ..] => Family::Lower,
-            [b'I', b'P', b'E', b'-', b'F', ..] => Family::Ffi,
-            [b'I', b'P', b'E', b'-', b'S', ..] => Family::Security,
-            [b'I', b'P', b'E', b'-', b'E', ..] => Family::Environment,
-            _ => Family::Internal,
+        let [b'I', b'P', b'E', b'-', letter, ..] = *self.0.as_bytes() else {
+            return Family::Internal;
+        };
+        let mut rest: &[FamilyRow] = &FAMILIES;
+        while let [row, tail @ ..] = rest {
+            if row.letter == letter as char {
+                return row.family;
+            }
+            rest = tail;
         }
+        Family::Internal
+    }
+}
+
+/// One row of the family table: a [`Family`], the letter its codes carry after
+/// `IPE-`, and a one-line description of what the family covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FamilyRow {
+    /// The family.
+    pub family: Family,
+    /// The letter after `IPE-` in every code of the family.
+    pub letter: char,
+    /// What the family covers, one line.
+    pub summary: &'static str,
+}
+
+/// The single letter↔family table, in display order.
+///
+/// [`Code::family`] reads it to classify a code and [`Family::letter`] /
+/// [`Family::summary`] read it to describe a family, so the prefix letters and
+/// the families cannot drift apart.
+pub const FAMILIES: [FamilyRow; 8] = [
+    FamilyRow {
+        family: Family::Parse,
+        letter: 'P',
+        summary: "parsing — the source is not valid Ipê syntax",
+    },
+    FamilyRow {
+        family: Family::Name,
+        letter: 'N',
+        summary: "name resolution — an unknown, ambiguous, or misplaced name, import, or module",
+    },
+    FamilyRow {
+        family: Family::Type,
+        letter: 'T',
+        summary: "type checking — the program's types do not fit together",
+    },
+    FamilyRow {
+        family: Family::Lower,
+        letter: 'L',
+        summary: "lowering — a construct the compiler does not support yet",
+    },
+    FamilyRow {
+        family: Family::Ffi,
+        letter: 'F',
+        summary: "foreign bindings (FFI) — Rust crates bound into Ipê and the sandbox that hosts them",
+    },
+    FamilyRow {
+        family: Family::Security,
+        letter: 'S',
+        summary: "security consent — an effect or escape hatch that needs your explicit approval",
+    },
+    FamilyRow {
+        family: Family::Environment,
+        letter: 'E',
+        summary: "environment — the network, the package registry, or the host system",
+    },
+    INTERNAL_ROW,
+];
+
+/// The internal family's row — also the fail-closed answer for a family
+/// lookup that cannot miss.
+const INTERNAL_ROW: FamilyRow = FamilyRow {
+    family: Family::Internal,
+    letter: 'I',
+    summary: "internal — a compiler bug; please report it",
+};
+
+impl Family {
+    /// This family's row in [`FAMILIES`].
+    const fn row(self) -> FamilyRow {
+        let mut rest: &[FamilyRow] = &FAMILIES;
+        while let [row, tail @ ..] = rest {
+            if row.family as u8 == self as u8 {
+                return *row;
+            }
+            rest = tail;
+        }
+        // Every variant has a row (pinned by `every_family_has_exactly_one_row`);
+        // the internal row is the fail-closed answer for an impossible miss.
+        INTERNAL_ROW
+    }
+
+    /// The letter after `IPE-` in this family's codes.
+    #[must_use]
+    pub const fn letter(self) -> char {
+        self.row().letter
+    }
+
+    /// What this family covers, one line.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        self.row().summary
     }
 }
 
@@ -542,6 +636,10 @@ code! {
     /// let-bound, or passed as a value); it is legal only as a saturated one-argument
     /// call so every argument passes the committed-literal seal gate
     IPE_L0151 = "IPE-L0151", "`Secret.fromString` must be applied directly to its argument", "IPE-L0151";
+    /// a kernel whose handler the backend re-wraps per call (`Stream.stream`) was
+    /// referenced point-free or partially applied; the re-wrap needs the handler
+    /// in hand, so the kernel is legal only as a saturated call
+    IPE_L0152 = "IPE-L0152", "a handler-wrapping kernel must be applied to all its arguments", "IPE-L0152";
     /// `Ui.cells` (a terminal character-grid builder) was used in a Cli
     /// (`Cli.tea`) program. A Cli view returns `String` (line output),
     /// so a character grid has no denotation there. Use `Tui.tea` for
@@ -632,6 +730,42 @@ mod tests {
             assert!(seen.insert(c.as_str()), "{} duplicated", c.as_str());
         }
         assert_eq!(seen.len(), ALL_CODES.len());
+    }
+
+    /// The family table is a bijection: every family has exactly one row, every
+    /// letter names one family, and each family reads its own row back.
+    #[test]
+    fn every_family_has_exactly_one_row() {
+        let all = [
+            Family::Parse,
+            Family::Name,
+            Family::Type,
+            Family::Lower,
+            Family::Ffi,
+            Family::Security,
+            Family::Environment,
+            Family::Internal,
+        ];
+        for family in all {
+            let rows = FAMILIES.iter().filter(|r| r.family == family).count();
+            assert_eq!(rows, 1, "{family:?} has {rows} rows");
+            assert!(!family.summary().is_empty(), "{family:?} has no summary");
+        }
+        let mut letters = std::collections::BTreeSet::new();
+        for row in FAMILIES {
+            assert!(letters.insert(row.letter), "letter {} repeats", row.letter);
+            assert_eq!(row.family.letter(), row.letter);
+        }
+    }
+
+    /// A code's letter after `IPE-` is its family's letter — the classifier and
+    /// the description read the same table.
+    #[test]
+    fn every_code_letter_is_its_family_letter() {
+        for &c in ALL_CODES {
+            let letter = c.as_str().chars().nth(4);
+            assert_eq!(letter, Some(c.family().letter()), "{}", c.as_str());
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn immutable_update_drops_immutable_column_from_set() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_db_store_immutable_update_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_db_store_immutable_update_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -82,7 +82,7 @@ fn immutable_update_drops_immutable_column_from_set() {
 fn immutable_update_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_db_store_immutable_update_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_db_store_immutable_update_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

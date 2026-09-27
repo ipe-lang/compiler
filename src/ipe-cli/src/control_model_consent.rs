@@ -60,17 +60,11 @@ fn refusal(derived: ControlModel, entry_module: &str) -> CliError {
     // capitalised constructor the manifest `acceptsControl` list expects.
     let model = derived.word();
     let ctor = control_model_ctor(derived);
-    let body = format!(
-        "`{entry_module}` runs the `{model}` control model, which the declared \
-         `acceptsControl` set does not cover\n\
-         \x20 = the package opted into control-model consent by declaring `acceptsControl`, \n\
-         \x20   so that set must cover the program's actual control model; it does not \n\
-         \x20   list `{model}`, so the declared acceptance is stale. \n\
-         \x20 = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]` \n\
-         \x20   under [capabilities] in package.ipe, or switch the entry to a listed \n\
-         \x20   control model.\n",
-    );
-    CliError::UsageOwned(format!("error[IPE-S0004]: {body}"))
+    CliError::UsageOwned(crate::text::control_model_consent_refusal(
+        &entry_module,
+        &model,
+        &ctor,
+    ))
 }
 
 /// The `Ipe.Package` constructor spelling for a control model — the capitalised

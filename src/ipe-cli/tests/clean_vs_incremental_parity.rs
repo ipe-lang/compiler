@@ -54,10 +54,7 @@ fn prepared(user: &UserSources) -> (PreparedSources, BTreeSet<Vec<String>>) {
         .collect();
     let mut discovered: Vec<project::DiscoveredModule> = sources
         .iter()
-        .map(|(p, (path, _))| project::DiscoveredModule {
-            path: path.clone(),
-            module_path: p.clone(),
-        })
+        .map(|(p, (path, _))| project::DiscoveredModule::user(path.clone(), p.clone()))
         .collect();
     let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
     (sources, injected)
@@ -256,12 +253,15 @@ fn assert_parity(label: &str, warm: &CompileOutcome, cold: &CompileOutcome) {
 /// `None` when the directory holds no `Main` module.
 fn fixture_user_sources(dir: &Path) -> Option<UserSources> {
     let discovered = project::discover_modules(dir).ok()?;
-    if !discovered.iter().any(|m| m.module_path == entry_path()) {
+    if !discovered.iter().any(|m| m.module_path() == entry_path()) {
         return None;
     }
     let mut user = UserSources::new();
     for m in discovered {
-        user.insert(m.module_path, std::fs::read_to_string(&m.path).ok()?);
+        user.insert(
+            m.module_path().to_vec(),
+            std::fs::read_to_string(m.path()).ok()?,
+        );
     }
     Some(user)
 }

@@ -417,6 +417,8 @@ app code.
 | `Config` | `Ipe.Config` | Typed TOML/YAML/JSON decoders mirroring `Ipe.Json.Decode`'s shape — `string`/`int`/`float`/`bool`/`nullable`/`field`/`at`/`list`/`succeed`/`fail`/`map`/`andThen`. `decodeToml`/`decodeYaml`/`decodeJson` + `loadFromFile`. |
 | `ToString` | `Ipe.ToString` | `fromInt`/`fromFloat`/`fromBool`/`fromTime` route to canonical kernels — default to `ToString.fromInt n` over memorising per-type kernels. |
 
+**Outbound dial rule** (`Http`, `WebSocket` client): a URL with `\` anywhere, or `@` in its path or fragment, is refused — write `@` as `%40`; an `@` in the query is allowed, but an error for that URL then withholds the host.
+
 ### Diverging
 
 `System.exit : Int -> a` — process termination, polymorphic return.
@@ -1150,8 +1152,7 @@ ipe release src/Main.ipe           # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
 ipe dev build|run … --static       # fully-static musl single binary (dlmalloc
                                    #  default; --target <triple> --allocator
-                                   #  <auto|system|dlmalloc|talc|mimalloc>
-                                   #  --allow-slow-allocator)
+                                   #  <auto|system|dlmalloc|talc|mimalloc>)
 ipe dev watch src/Main.ipe         # file-watch rebuild + restart (bare `ipe watch` too)
 ipe type-check src/Main.ipe        # type-check only — no build, no run, no emit
 ipe fmt src/Main.ipe               # opinionated formatter (run after editing .ipe/.ipei)

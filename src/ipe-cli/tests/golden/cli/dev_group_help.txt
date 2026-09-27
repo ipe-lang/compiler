@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   The development inner loop — build, run, and watch with Debug.* on and no jail.
 
   ipe dev <verb>
@@ -9,4 +10,3 @@ exit: 0
     ipe dev build  Compile a program to a native or WebAssembly artifact.
     ipe dev run    Compile a program and run the resulting binary.
     ipe dev watch  Rebuild and re-run a program on every source change.
-

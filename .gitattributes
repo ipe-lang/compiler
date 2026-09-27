@@ -1,15 +1,10 @@
-# Golden fixtures are byte-exact LF sources. The Rust backend embeds
-# tests/golden/basics/main.rs via include_str! and slices its preamble at "\n"
-# anchors, and every golden test compares emitted bytes against these files. A
-# Windows checkout with autocrlf must never rewrite them to CRLF, or the anchor
-# splice fails (IPE-I0203: golden anchor not found) and byte compares diverge.
-tests/golden/** text eol=lf
-
-# The Rust backend embeds its emit templates via include_str! and splices them
-# at "\n" anchors (e.g. "// USER TYPES\n" in main.rs). A Windows autocrlf
-# checkout that rewrote them to CRLF makes the anchor search fail (IPE-I0203:
-# golden anchor not found), so pin the whole templates tree to LF.
-src/compiler/backend/rust/templates/** text eol=lf
+# Every text file is LF on every platform. Sources embedded via include_str!
+# (goldens, emit templates, text/messages.md) are parsed at "\n" anchors and
+# byte-compared; a Windows autocrlf checkout that rewrote any of them to CRLF
+# breaks those parses (IPE-I0203 golden anchor not found, the text catalog's
+# const agreement check) and every byte compare. One repo-wide rule closes the
+# class for every present and future embedded file.
+* text=auto eol=lf
 
 # Binary artifact classes. Marking these `binary` (= `-text -diff`) stops git
 # from attempting line-ending normalization, text diffs, or three-way merges on

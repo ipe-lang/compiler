@@ -310,22 +310,13 @@ impl ReleaseOutcome {
 /// The duplicate-entry rejection, naming the repeated delivery and the fix.
 fn duplicate_entry(entry: ShipEntry) -> CliError {
     let words = describe_entry(entry);
-    CliError::UsageOwned(format!(
-        "package.ipe declares `{words}` twice in `ships`. A delivery is shipped once; \
-         a repeated entry is a confused manifest, not a request for two copies. \
-         Remove the duplicate.",
-    ))
+    CliError::UsageOwned(crate::text::ships_repeated(&words))
 }
 
 /// The web-entry-on-non-web-shape rejection, in the pedagogical two-axis voice.
 fn web_entry_on_non_web(pinned: Shape, entry: ShipEntry) -> CliError {
     let words = describe_entry(entry);
-    CliError::UsageOwned(format!(
-        "package.ipe declares `{words}`, but `main` is a `{shape}` app. The web hosts \
-         (desktop, solo, solo ios, …) carry a self-contained web client; a `{shape}` app \
-         ships as a binary. Remove the entry, or change `main` to a `Web.tea` entry.",
-        shape = pinned.word(),
-    ))
+    CliError::UsageOwned(crate::text::ships_shape_mismatch(&words, &pinned.word()))
 }
 
 /// The CLI delivery words a ship entry stands for, for a diagnostic. The

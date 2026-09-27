@@ -2,9 +2,11 @@
 //! (parse-don't-validate).
 //!
 //! The ONLY way to obtain a `Dsn` is through [`dsn_parse`] (from a URL string) or
-//! [`dsn_build`] (from typed parts); both run the SAME validators, so a `Dsn`
-//! value is a proof that the connection descriptor passed every fail-closed
-//! check. There is no un-parsed way to construct one.
+//! [`dsn_build`] (from typed parts). Both enforce the same invariants on what
+//! they admit — known driver, bounded control-free parts, in-range port, no
+//! cleartext transport, no password without a user name — so a `Dsn` value is
+//! a proof that the connection descriptor passed every fail-closed check.
+//! There is no un-parsed way to construct one.
 //!
 //! A `Dsn` deliberately stores its password as a [`Secret`], never a plain
 //! `String`: the descriptor's most sensitive field cannot be `Debug`-printed,
@@ -26,6 +28,7 @@
 
 use super::IpeResult;
 use crate::secret::{Secret, secret_from_string};
+use crate::ssrf::{ConfiguredHost, UnambiguousUrl};
 
 /// The closed set of drivers the runtime can describe. Exactly the two sqlx
 /// drivers the `db` feature links (`sqlite`, `postgres`); a driver the runtime
@@ -48,6 +51,221 @@ pub enum TlsMode {
     Disable,
 }
 
+/// A DSN's network host, proven not to be part of its credentials.
+///
+/// Built only inside this module: by [`dsn_parse`] from the host of a URL it
+/// first proves unambiguous (`UnambiguousUrl`), by [`dsn_build`] from a host
+/// part holding no URL delimiter, or empty for file-backed SQLite. It carries a
+/// [`ConfiguredHost`], the only host an SSRF refusal names, so a refusal for a
+/// DSN's host can never echo part of its user name or password.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DsnHost(ConfiguredHost);
+
+impl DsnHost {
+    /// No network host: a file-backed SQLite descriptor.
+    const fn none() -> Self {
+        Self(ConfiguredHost::from_config(String::new()))
+    }
+
+    /// The host of `url`, whose userinfo is proven unambiguous.
+    fn of_url(url: &UnambiguousUrl) -> Option<Self> {
+        url.host().map(Self)
+    }
+
+    /// A host given as its own part, parsed as a host name or IP literal.
+    ///
+    /// Refused when it holds a character that would end or split a URL
+    /// authority it is written into, or a port. Kept in the form the URL
+    /// parser writes it, so the SSRF gate vets the host the driver dials.
+    fn of_part(host: &str) -> Option<Self> {
+        if host.contains(['@', '/', '?', '#', '\\', '%']) {
+            return None;
+        }
+        ::url::Host::parse(host)
+            .ok()
+            .map(|parsed| Self(ConfiguredHost::from_config(parsed.to_string())))
+    }
+
+    /// The host as an SSRF refusal may name it.
+    pub(crate) const fn configured(&self) -> &ConfiguredHost {
+        &self.0
+    }
+
+    /// The host text (`""` for file-backed SQLite).
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// A PostgreSQL user name or database name.
+///
+/// Holds its decoded text and reaches a connection URL only percent-encoded
+/// ([`DsnPart::encoded`]), so no character in it can end the component it sits
+/// in and add URL syntax such as a `sslmode` parameter. A user name is
+/// credential-adjacent, so it has no derived (early-exit) equality.
+#[derive(Clone, Debug)]
+struct DsnPart(String);
+
+impl DsnPart {
+    /// A part written percent-encoded in a URL, held decoded.
+    fn of_encoded(encoded: &str) -> Option<Self> {
+        let decoded = percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .ok()?;
+        Self::of_text(decoded.into_owned())
+    }
+
+    /// A part given as its own literal text.
+    fn of_text(text: String) -> Option<Self> {
+        text_ok(&text).then_some(Self(text))
+    }
+
+    /// The text as held.
+    const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The text percent-encoded for a URL component.
+    fn encoded(&self) -> String {
+        percent_encode(&self.0)
+    }
+}
+
+/// `text` with every byte but an ASCII letter or digit percent-encoded.
+fn percent_encode(text: &str) -> String {
+    percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// The bytes a SQLite file name is percent-encoded for in its connection URL.
+///
+/// The driver's URL reader cuts the path at the first `?`, strips repeated
+/// `sqlite:` prefixes, and percent-decodes the rest, so every byte but an
+/// ASCII letter, digit, `/`, `.`, `-`, `_` or `~` is encoded: `?`, `:` and `%`
+/// cannot act, and a URL parser finds no userinfo, port, or query in the path.
+const SQLITE_PATH_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The SQLite file name of the in-memory database.
+const SQLITE_MEMORY: &str = ":memory:";
+
+/// The SQLite database a DSN opens.
+///
+/// Built only by [`SqliteDb::of_name`], so a file name never starts with
+/// `file:` (which SQLite would read as a URI whose parameters choose the open
+/// mode) and is never `:memory:`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SqliteDb {
+    /// SQLite's private in-memory database, named `:memory:`.
+    Memory,
+    /// A database file, held as its literal file name.
+    File(String),
+}
+
+impl SqliteDb {
+    /// The database a literal file name opens.
+    ///
+    /// `:memory:` names the in-memory database; a name starting `file:` is
+    /// refused.
+    fn of_name(name: String) -> Option<Self> {
+        if !text_ok(&name) || name.starts_with("file:") {
+            None
+        } else if name == SQLITE_MEMORY {
+            Some(Self::Memory)
+        } else {
+            Some(Self::File(name))
+        }
+    }
+
+    /// The database named by the text of a SQLite DSN after its scheme.
+    ///
+    /// Read as a single scheme, one optional `//`, and the path up to the
+    /// first `?`, percent-decoded. The only query admitted is `mode=rwc`, the
+    /// mode the connection pins.
+    fn of_dsn_rest(rest: &str) -> Result<Self, DsnReject> {
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let pinned_only = ::url::form_urlencoded::parse(query.as_bytes())
+            .all(|(key, value)| key == "mode" && value == "rwc");
+        if !pinned_only {
+            return Err(DsnReject::ConflictingParameter);
+        }
+        if path.len() > MAX_COMPONENT_LEN {
+            return Err(DsnReject::InvalidComponent);
+        }
+        percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .ok()
+            .and_then(|name| Self::of_name(name.into_owned()))
+            .ok_or(DsnReject::InvalidComponent)
+    }
+
+    /// The literal file name (`:memory:` for the in-memory database).
+    const fn name(&self) -> &str {
+        match self {
+            Self::Memory => SQLITE_MEMORY,
+            Self::File(name) => name.as_str(),
+        }
+    }
+
+    /// The connection URL the driver opens.
+    ///
+    /// A file is opened `mode=rwc` (created when missing), its name
+    /// percent-encoded so the driver decodes it back exactly and no character
+    /// in it adds or overrides a parameter.
+    fn connection_url(&self) -> String {
+        match self {
+            Self::Memory => format!("sqlite:{SQLITE_MEMORY}"),
+            Self::File(name) => format!(
+                "sqlite://{}?mode=rwc",
+                percent_encoding::utf8_percent_encode(name, SQLITE_PATH_ENCODE)
+            ),
+        }
+    }
+}
+
+/// A connection's credentials: a user name and, optionally, its password.
+///
+/// A password is held only beside the user name it belongs to, so a password
+/// with no user name has no representation.
+#[derive(Clone, Debug)]
+struct Credentials {
+    user: DsnPart,
+    /// `None` when the password is empty.
+    password: Option<Secret>,
+}
+
+impl Credentials {
+    /// The credentials of an optional user name and a literal password.
+    ///
+    /// `None` when both are empty. A password longer than
+    /// [`MAX_COMPONENT_LEN`] bytes, or one with no user name, is refused.
+    fn of_parts(user: Option<DsnPart>, password: Secret) -> Result<Option<Self>, DsnReject> {
+        if password.byte_len() > MAX_COMPONENT_LEN {
+            return Err(DsnReject::InvalidComponent);
+        }
+        let password = (password.byte_len() > 0).then_some(password);
+        match (user, password) {
+            (Some(user), password) => Ok(Some(Self { user, password })),
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(DsnReject::PasswordWithoutUser),
+        }
+    }
+}
+
+/// What a DSN connects to, per driver.
+#[derive(Clone, Debug)]
+enum DsnTarget {
+    /// A PostgreSQL database name.
+    Postgres(DsnPart),
+    /// A SQLite database.
+    Sqlite(SqliteDb),
+}
+
 /// `Ipe.Db.Dsn`'s opaque, validated descriptor. Every field is the result of a
 /// fail-closed parse; the password is a [`Secret`] so the struct cannot leak it.
 ///
@@ -57,12 +275,10 @@ pub enum TlsMode {
 /// rendered through its explicit redacted form.
 #[derive(Clone)]
 pub struct Dsn {
-    driver: DsnDriver,
-    host: String,
+    target: DsnTarget,
+    host: DsnHost,
     port: u16,
-    database: String,
-    user: String,
-    password: Secret,
+    credentials: Option<Credentials>,
     tls: TlsMode,
 }
 
@@ -73,12 +289,10 @@ impl std::fmt::Debug for Dsn {
     /// non-secret shape, never the credential.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsn")
-            .field("driver", &self.driver)
+            .field("target", &self.target)
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("database", &self.database)
-            .field("user", &self.user)
-            .field("password", &self.password)
+            .field("credentials", &self.credentials)
             .field("tls", &self.tls)
             .finish()
     }
@@ -97,6 +311,9 @@ enum DsnReject {
     UnknownSslMode,
     ConflictingParameter,
     InvalidComponent,
+    AmbiguousUserinfo,
+    PasswordWithoutUser,
+    TooLong,
 }
 
 impl DsnReject {
@@ -112,6 +329,13 @@ impl DsnReject {
             Self::UnknownSslMode => "Ipe.Db.Dsn: unknown sslmode",
             Self::ConflictingParameter => "Ipe.Db.Dsn: conflicting or misplaced parameter",
             Self::InvalidComponent => "Ipe.Db.Dsn: invalid DSN component",
+            Self::PasswordWithoutUser => "Ipe.Db.Dsn: a password needs a user name",
+            Self::TooLong => "Ipe.Db.Dsn: DSN exceeds the length limit",
+            Self::AmbiguousUserinfo => {
+                "Ipe.Db.Dsn: the user name or password may run past the URL's authority: \
+                 percent-encode `/`, `?`, `#`, `@` and `\\` in them, and write `@` \
+                 elsewhere as `%40`"
+            }
         }
     }
 }
@@ -121,9 +345,12 @@ fn reject<E: From<String>>(r: DsnReject) -> IpeResult<E, Dsn> {
 }
 
 /// A generous-but-bounded length cap for any single DSN component (host, user,
-/// database). Guards the oversize-allocation vector without rejecting any real
-/// identifier.
+/// password, database). Guards the oversize-allocation vector without
+/// rejecting any real identifier.
 const MAX_COMPONENT_LEN: usize = 512;
+
+/// The length cap, in bytes, of a whole DSN string given to [`dsn_parse`].
+const MAX_DSN_LEN: usize = 4096;
 
 /// True when `s` is safe to carry as a DSN component: no control characters, no
 /// embedded null, no leading/trailing/interior whitespace, and within the length
@@ -131,14 +358,19 @@ const MAX_COMPONENT_LEN: usize = 512;
 /// control byte is rejected too. Rejecting whitespace and control bytes closes the
 /// injection/smuggling vector before any component is trusted.
 fn component_ok(s: &str) -> bool {
-    if s.is_empty() || s.len() > MAX_COMPONENT_LEN {
-        return false;
-    }
     // Validate the decoded bytes: a `%0a` in the raw form decodes to a newline, a
     // control byte the raw scan would miss. Lossy UTF-8 is fine here — we only
     // ever REJECT on a control/whitespace byte, never trust the decoded value.
-    let decoded = percent_encoding::percent_decode_str(s).decode_utf8_lossy();
-    !decoded.chars().any(|c| c.is_control() || c.is_whitespace())
+    s.len() <= MAX_COMPONENT_LEN
+        && text_ok(&percent_encoding::percent_decode_str(s).decode_utf8_lossy())
+}
+
+/// True when `s`, taken literally, is non-empty, within the length bound, and
+/// free of control characters and whitespace.
+fn text_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_COMPONENT_LEN
+        && !s.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// True when `s` names the Postgres driver.
@@ -201,10 +433,21 @@ fn tls_from_query(url: &::url::Url) -> Result<TlsMode, DsnReject> {
 /// Fails closed on all of: an unparseable string; an unknown driver scheme; a
 /// missing host for a network driver; an out-of-range/non-numeric port; an
 /// explicit `sslmode=disable`; an unknown `sslmode`; a credential or duplicated
-/// security key smuggled into the query; and a control-character/oversized
-/// component. The password is captured as a `Secret`, never a plain `String`.
+/// security key smuggled into the query; a PostgreSQL URL whose user name or
+/// password may run past its authority (`crate::ssrf::userinfo_is_ambiguous`);
+/// and a control-character/oversized component. The password is captured as a
+/// `Secret`, never a plain `String`.
+///
+/// A SQLite DSN names its file as [`SqliteDb::of_dsn_rest`] reads it;
+/// credentials, any query but `mode=rwc`, and a file name starting `file:` are
+/// refused. A password with no user name, a password over
+/// [`MAX_COMPONENT_LEN`] bytes, and a DSN over [`MAX_DSN_LEN`] bytes are
+/// refused.
 #[must_use]
 pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
+    if s.len() > MAX_DSN_LEN {
+        return reject(DsnReject::TooLong);
+    }
     let parsed = match ::url::Url::parse(&s) {
         Ok(u) => u,
         Err(_) => return reject(DsnReject::Unparseable),
@@ -226,57 +469,85 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
 
     // Sqlite is a local file driver: the "host" is empty and the database is the
     // file path. Postgres is a network driver: a host is mandatory.
-    let (host, port, database) = match driver {
+    let (host, port, target) = match driver {
         DsnDriver::Postgres => {
-            let Some(host) = parsed.host_str() else {
+            // A credential holding an unencoded `/`, `?`, `#` or `\` ends the
+            // authority early, so the parser would read part of it as the host.
+            let Some(url) = UnambiguousUrl::of_parsed(&s, parsed.clone()) else {
+                return reject(DsnReject::AmbiguousUserinfo);
+            };
+            let Some(host) = DsnHost::of_url(&url) else {
                 return reject(DsnReject::MissingHost);
             };
-            if !component_ok(host) {
+            if !component_ok(host.as_str()) {
                 return reject(DsnReject::InvalidComponent);
             }
             // Postgres' well-known default; an omitted port is not an error.
             let port = parsed.port().unwrap_or(5432);
-            let database = parsed.path().trim_start_matches('/').to_owned();
-            if !component_ok(&database) {
+            let Some(database) = DsnPart::of_encoded(parsed.path().trim_start_matches('/')) else {
                 return reject(DsnReject::InvalidComponent);
-            }
-            (host.to_owned(), port, database)
+            };
+            (host, port, DsnTarget::Postgres(database))
         }
         DsnDriver::Sqlite => {
-            // A file-backed sqlite DSN has no network host and no port. The file
-            // path is the database; validate it as a component.
-            let path = parsed.path().trim_start_matches('/');
-            if !component_ok(path) {
-                return reject(DsnReject::InvalidComponent);
+            // A file-backed sqlite DSN has no network host, port, or
+            // credentials; everything after the scheme names the database.
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return reject(DsnReject::ConflictingParameter);
             }
-            (String::new(), 0, path.to_owned())
+            let rest = s.split_once(':').map_or("", |(_, rest)| rest);
+            match SqliteDb::of_dsn_rest(rest) {
+                Ok(db) => (DsnHost::none(), 0, DsnTarget::Sqlite(db)),
+                Err(r) => return reject(r),
+            }
         }
     };
 
-    let user = parsed.username().to_owned();
     // The username may legitimately be empty (sqlite, or a Postgres DSN relying on
     // a default role); when present it must be a clean component.
-    if !user.is_empty() && !component_ok(&user) {
-        return reject(DsnReject::InvalidComponent);
-    }
+    let user = match parsed.username() {
+        "" => None,
+        encoded => {
+            let Some(user) = DsnPart::of_encoded(encoded) else {
+                return reject(DsnReject::InvalidComponent);
+            };
+            Some(user)
+        }
+    };
 
-    let password = secret_from_string(parsed.password().unwrap_or("").to_owned());
+    // Held decoded, as the user name is, so the connection URL encodes it once.
+    let Ok(password) =
+        percent_encoding::percent_decode_str(parsed.password().unwrap_or("")).decode_utf8()
+    else {
+        return reject(DsnReject::InvalidComponent);
+    };
+    let password = secret_from_string(password.into_owned());
+    let credentials = match Credentials::of_parts(user, password) {
+        Ok(credentials) => credentials,
+        Err(r) => return reject(r),
+    };
 
     IpeResult::Ok(Dsn {
-        driver,
+        target,
         host,
         port,
-        database,
-        user,
-        password,
+        credentials,
         tls,
     })
 }
 
-/// `Ipe.Db.Dsn.build` — THE seal from typed parts. Runs the SAME component,
-/// port, and TLS validators as [`dsn_parse`], so structured input cannot bypass
-/// the parser. `driver`/`tls` arrive already as closed tags; `port` is validated
+/// `Ipe.Db.Dsn.build` — THE seal from typed parts.
+///
+/// Enforces the invariants [`dsn_parse`] does, on literal parts rather than
+/// URL text: the host is parsed as a host name or IP literal, the other parts
+/// must be bounded and control-free, a password needs a user name, and a
+/// SQLite descriptor takes no host or credentials. `driver`/`tls` arrive
+/// already as closed tags; `port` is validated
 /// into `1..=65535` (no narrowing cast); `password` is a `Secret` on the way in.
+/// The database name, user name, and password are taken literally: the
+/// connection URL percent-encodes them, so none of them can add URL syntax. A
+/// SQLite database is a file name, `:memory:` for the in-memory database; one
+/// starting `file:` is refused.
 ///
 /// The driver/TLS tags are passed as their small-integer discriminants
 /// (`0 = Postgres`, `1 = Sqlite`; `0 = Require`, `1 = Prefer`, `2 = Disable`),
@@ -319,37 +590,54 @@ pub fn dsn_build<E: From<String>>(
         },
     };
 
-    match driver {
+    let host = match driver {
         DsnDriver::Postgres => {
             if !component_ok(&host) {
                 return reject(DsnReject::InvalidComponent);
             }
+            let Some(host) = DsnHost::of_part(&host) else {
+                return reject(DsnReject::InvalidComponent);
+            };
+            host
         }
         DsnDriver::Sqlite => {
             // Sqlite has no network host; a non-empty host is a misuse.
             if !host.is_empty() {
                 return reject(DsnReject::InvalidComponent);
             }
+            DsnHost::none()
         }
-    }
-    if !component_ok(&database) {
+    };
+    let target = match driver {
+        DsnDriver::Postgres => DsnPart::of_text(database).map(DsnTarget::Postgres),
+        DsnDriver::Sqlite => SqliteDb::of_name(database).map(DsnTarget::Sqlite),
+    };
+    let Some(target) = target else {
         return reject(DsnReject::InvalidComponent);
-    }
-    if !user.is_empty() && !component_ok(&user) {
+    };
+    let user = if user.is_empty() {
+        None
+    } else {
+        let Some(user) = DsnPart::of_text(user) else {
+            return reject(DsnReject::InvalidComponent);
+        };
+        Some(user)
+    };
+    let credentials = match Credentials::of_parts(user, password) {
+        Ok(credentials) => credentials,
+        Err(r) => return reject(r),
+    };
+    if driver == DsnDriver::Sqlite && credentials.is_some() {
+        // A SQLite file is opened with no credentials; a user name or password
+        // for one is a misuse.
         return reject(DsnReject::InvalidComponent);
     }
 
     IpeResult::Ok(Dsn {
-        driver,
-        host: if driver == DsnDriver::Sqlite {
-            String::new()
-        } else {
-            host
-        },
+        target,
+        host,
         port: port_u16,
-        database,
-        user,
-        password,
+        credentials,
         tls,
     })
 }
@@ -357,14 +645,25 @@ pub fn dsn_build<E: From<String>>(
 impl Dsn {
     /// The driver this descriptor names, for the connect step's dialect
     /// selection. Crate-internal: only the external-connection module reads it.
-    pub(crate) fn driver(&self) -> DsnDriver {
-        self.driver
+    pub(crate) const fn driver(&self) -> DsnDriver {
+        match &self.target {
+            DsnTarget::Postgres(_) => DsnDriver::Postgres,
+            DsnTarget::Sqlite(_) => DsnDriver::Sqlite,
+        }
     }
 
-    /// The network host this descriptor names. Empty string for file-backed
-    /// SQLite (no network host). Crate-internal: used by the connect step to
-    /// apply the SSRF host gate before dialing.
-    pub(crate) fn host(&self) -> &str {
+    /// The database name or SQLite file name.
+    fn database(&self) -> &str {
+        match &self.target {
+            DsnTarget::Postgres(database) => database.as_str(),
+            DsnTarget::Sqlite(db) => db.name(),
+        }
+    }
+
+    /// The network host this descriptor names. Empty for file-backed SQLite
+    /// (no network host). Crate-internal: used by the connect step to apply
+    /// the SSRF host gate before dialing.
+    pub(crate) const fn host(&self) -> &DsnHost {
         &self.host
     }
 
@@ -379,22 +678,15 @@ impl Dsn {
     /// The result is a live credential-bearing string; it is handed straight to
     /// the sqlx connector and dropped, never logged or returned to Ipê.
     ///
-    /// For Postgres the TLS posture is folded into an `sslmode` query so the
-    /// parsed secure default (`Require`/`Prefer`) survives the round-trip;
-    /// `Disable` is unrepresentable (the parse/build path rejected it). For
-    /// Sqlite the database field is the file path and `mode=rwc` is appended so a
-    /// missing file is created, matching the app-local opener's behaviour.
+    /// For Postgres the user name, password, and database are percent-encoded,
+    /// so the only query is the `sslmode` written here: the TLS posture is
+    /// folded into it so the parsed secure default (`Require`/`Prefer`) survives
+    /// the round-trip; `Disable` is unrepresentable (the parse/build path
+    /// rejected it). For Sqlite see [`SqliteDb::connection_url`].
     pub(crate) fn connection_url(&self) -> String {
-        match self.driver {
-            DsnDriver::Sqlite => {
-                if self.database.contains(':') {
-                    self.database.clone()
-                } else {
-                    format!("sqlite://{}?mode=rwc", self.database)
-                }
-            }
-            DsnDriver::Postgres => {
-                let password = crate::secret::secret_reveal(self.password.clone());
+        match &self.target {
+            DsnTarget::Sqlite(db) => db.connection_url(),
+            DsnTarget::Postgres(database) => {
                 let sslmode = match self.tls {
                     TlsMode::Require => "require",
                     TlsMode::Prefer => "prefer",
@@ -403,31 +695,21 @@ impl Dsn {
                     TlsMode::Disable => "require",
                 };
                 let mut url = String::from("postgres://");
-                if !self.user.is_empty() {
-                    url.push_str(
-                        &percent_encoding::utf8_percent_encode(
-                            &self.user,
-                            percent_encoding::NON_ALPHANUMERIC,
-                        )
-                        .to_string(),
-                    );
-                    if !password.is_empty() {
+                if let Some(credentials) = &self.credentials {
+                    url.push_str(&credentials.user.encoded());
+                    if let Some(password) = &credentials.password {
                         url.push(':');
-                        url.push_str(
-                            &percent_encoding::utf8_percent_encode(
-                                &password,
-                                percent_encoding::NON_ALPHANUMERIC,
-                            )
-                            .to_string(),
-                        );
+                        url.push_str(&percent_encode(&crate::secret::secret_reveal(
+                            password.clone(),
+                        )));
                     }
                     url.push('@');
                 }
-                url.push_str(&self.host);
+                url.push_str(self.host.as_str());
                 url.push(':');
                 url.push_str(&self.port.to_string());
                 url.push('/');
-                url.push_str(&self.database);
+                url.push_str(&database.encoded());
                 url.push_str("?sslmode=");
                 url.push_str(sslmode);
                 url
@@ -441,7 +723,7 @@ impl Dsn {
 /// re-tags. Non-secret; safe to read.
 #[must_use]
 pub fn dsn_driver(d: Dsn) -> i64 {
-    match d.driver {
+    match d.driver() {
         DsnDriver::Postgres => 0,
         DsnDriver::Sqlite => 1,
     }
@@ -451,7 +733,7 @@ pub fn dsn_driver(d: Dsn) -> i64 {
 /// file-backed sqlite descriptor). Non-secret.
 #[must_use]
 pub fn dsn_host(d: Dsn) -> String {
-    d.host
+    d.host.as_str().to_owned()
 }
 
 /// `Ipe.Db.Dsn.port : Dsn -> Int` — the port (`0` for sqlite). Non-secret.
@@ -464,14 +746,19 @@ pub fn dsn_port(d: Dsn) -> i64 {
 /// Non-secret.
 #[must_use]
 pub fn dsn_database(d: Dsn) -> String {
-    d.database
+    match d.target {
+        DsnTarget::Postgres(database) => database.0,
+        DsnTarget::Sqlite(SqliteDb::File(name)) => name,
+        DsnTarget::Sqlite(SqliteDb::Memory) => SQLITE_MEMORY.to_owned(),
+    }
 }
 
 /// `Ipe.Db.Dsn.user : Dsn -> String` — the connection user (`""` when none).
 /// Non-secret.
 #[must_use]
 pub fn dsn_user(d: Dsn) -> String {
-    d.user
+    d.credentials
+        .map_or_else(String::new, |credentials| credentials.user.0)
 }
 
 /// `Ipe.Db.Dsn.tls : Dsn -> TlsMode` — the transport posture as its discriminant
@@ -492,7 +779,7 @@ pub fn dsn_tls(d: Dsn) -> i64 {
 /// display path a `Dsn` has.
 #[must_use]
 pub fn dsn_redacted(d: Dsn) -> String {
-    let driver = match d.driver {
+    let driver = match d.driver() {
         DsnDriver::Postgres => "postgres",
         DsnDriver::Sqlite => "sqlite",
     };
@@ -503,16 +790,19 @@ pub fn dsn_redacted(d: Dsn) -> String {
     };
     // The `Secret`'s own `IpeStringify` yields the redacted placeholder; use it so
     // there is exactly one redaction convention.
-    let user_part = if d.user.is_empty() {
-        String::new()
-    } else {
-        format!("{}@", d.user)
-    };
-    match d.driver {
-        DsnDriver::Sqlite => format!("{driver}://{}", d.database),
+    let user_part = d
+        .credentials
+        .as_ref()
+        .map_or_else(String::new, |credentials| {
+            format!("{}@", credentials.user.as_str())
+        });
+    match d.driver() {
+        DsnDriver::Sqlite => format!("{driver}://{}", d.database()),
         DsnDriver::Postgres => format!(
             "{driver}://{user_part}{}:{}/{} (tls={tls}, password=[redacted])",
-            d.host, d.port, d.database
+            d.host.as_str(),
+            d.port,
+            d.database()
         ),
     }
 }
@@ -591,6 +881,485 @@ mod tests {
         assert!(parse_err("postgres://h:5432/d%0aevil").contains("invalid DSN component"));
     }
 
+    /// A credential holding an unencoded `?`, `#`, or `/` ends the authority
+    /// early, so the parser reads part of it as the host (`admin` here, port
+    /// `8`). Such a DSN is refused at the parse, so no `Dsn` exists to resolve
+    /// or dial, and the refusal names neither that host nor the user name.
+    #[test]
+    fn rejects_userinfo_running_past_the_authority() {
+        for dsn in [
+            "postgres://admin:8/s3cr3t?pw@db.example/app",
+            "postgres://admin:8/s3cr3t#pw@db.example/app",
+            "postgres://admin:8/s3cr3t-pw@db.example/app",
+            "postgres://admin@s3cr3t/pw@db.example/app",
+            "postgres://db.example/app?application_name=admin@s3cr3t",
+        ] {
+            let parsed = dsn_parse::<String>(dsn.to_owned());
+            assert!(
+                matches!(parsed, IpeResult::Err(_)),
+                "{dsn:?} must be refused"
+            );
+            let IpeResult::Err(e) = parsed else {
+                continue;
+            };
+            assert_eq!(e, DsnReject::AmbiguousUserinfo.message(), "{dsn:?}");
+            for shown in [e.clone(), format!("{e:?}")] {
+                for secret in ["admin", "s3cr3t", "db.example"] {
+                    assert!(
+                        !shown.contains(secret),
+                        "{dsn:?} leaked {secret:?}: {shown}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clean DSN is admitted with the host after its last `@`: a
+    /// percent-encoded `@`, or a raw `@` inside the authority, stays in the
+    /// password.
+    #[test]
+    fn admits_a_clean_dsn_with_its_host() {
+        for (dsn, host) in [
+            (
+                "postgres://admin:s3cr3t-pw@db.example:6432/app",
+                "db.example",
+            ),
+            ("postgres://admin:s3cr%40t@db.example/app", "db.example"),
+            ("postgres://admin:s3cr@3t@db.example/app", "db.example"),
+            ("postgres://[::1]:5432/app", "[::1]"),
+        ] {
+            let parsed = dsn_parse::<String>(dsn.to_owned());
+            assert!(matches!(parsed, IpeResult::Ok(_)), "{dsn:?} must parse");
+            let IpeResult::Ok(d) = parsed else {
+                continue;
+            };
+            assert_eq!(d.host().as_str(), host, "{dsn:?}");
+        }
+    }
+
+    /// A built host holding a URL delimiter or a port would split the authority
+    /// the connection URL writes it into, so it is refused.
+    #[test]
+    fn build_rejects_a_host_holding_a_url_delimiter() {
+        for host in [
+            "admin@db.example",
+            "db.example/x",
+            "db?x",
+            "db#x",
+            "db\\x",
+            "db%2Fx",
+            "db.example:6543",
+            "::1",
+            "db x",
+            "",
+        ] {
+            let built = dsn_build::<String>(
+                0,
+                host.into(),
+                5432,
+                "d".into(),
+                "u".into(),
+                secret_from_string("p".into()),
+                0,
+            );
+            assert!(
+                matches!(built, IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{host:?} must be refused"
+            );
+        }
+    }
+
+    /// The password `d` holds, revealed.
+    fn revealed_password(d: Dsn) -> Option<String> {
+        d.credentials
+            .and_then(|credentials| credentials.password)
+            .map(crate::secret::secret_reveal)
+    }
+
+    /// A password with no user name is refused, built or parsed; an empty
+    /// password beside a user name is none.
+    #[test]
+    fn password_without_user_is_refused() {
+        let built = dsn_build::<String>(
+            0,
+            "db.example".into(),
+            5432,
+            "app".into(),
+            String::new(),
+            secret_from_string("pw".into()),
+            0,
+        );
+        assert!(
+            matches!(built, IpeResult::Err(ref e) if e.contains("a password needs a user name"))
+        );
+        assert!(
+            parse_err("postgres://:pw@db.example/app").contains("a password needs a user name")
+        );
+        let d = parse_ok("postgres://reader:@db.example/app");
+        assert_eq!(dsn_user(d.clone()), "reader");
+        assert_eq!(revealed_password(d.clone()), None);
+        assert!(
+            d.connection_url()
+                .starts_with("postgres://reader@db.example:5432/")
+        );
+        let sqlite = dsn_build::<String>(
+            1,
+            String::new(),
+            0,
+            "app.db".into(),
+            "reader".into(),
+            secret_from_string(String::new()),
+            0,
+        );
+        assert!(matches!(sqlite, IpeResult::Err(ref e) if e.contains("invalid DSN component")));
+    }
+
+    /// A built password and a parsed DSN are bounded; one byte past each cap
+    /// is refused.
+    #[test]
+    fn password_and_dsn_lengths_are_capped() {
+        let build_with = |password: String| {
+            dsn_build::<String>(
+                0,
+                "db.example".into(),
+                5432,
+                "app".into(),
+                "reader".into(),
+                secret_from_string(password),
+                0,
+            )
+        };
+        assert!(matches!(
+            build_with("p".repeat(MAX_COMPONENT_LEN)),
+            IpeResult::Ok(_)
+        ));
+        assert!(matches!(
+            build_with("p".repeat(MAX_COMPONENT_LEN + 1)),
+            IpeResult::Err(ref e) if e.contains("invalid DSN component")
+        ));
+        let prefix = "postgres://reader@db.example/app?application_name=";
+        let at_cap = format!("{prefix}{}", "a".repeat(MAX_DSN_LEN - prefix.len()));
+        assert!(matches!(
+            dsn_parse::<String>(at_cap.clone()),
+            IpeResult::Ok(_)
+        ));
+        assert!(parse_err(&format!("{at_cap}a")).contains("exceeds the length limit"));
+        let long_password = format!(
+            "postgres://reader:{}@db.example/app",
+            "p".repeat(MAX_COMPONENT_LEN + 1)
+        );
+        assert!(parse_err(&long_password).contains("invalid DSN component"));
+    }
+
+    /// The connection URL `d` dials, read back by the `Dsn` parser and by the
+    /// driver.
+    fn reread(d: &Dsn) -> (Option<Dsn>, Option<sqlx::postgres::PgConnectOptions>) {
+        let url = d.connection_url();
+        let reparsed = match dsn_parse::<String>(url.clone()) {
+            IpeResult::Ok(d) => Some(d),
+            IpeResult::Err(_) => None,
+        };
+        (reparsed, url.parse().ok())
+    }
+
+    /// Parts that would carry URL syntax if written into the connection URL
+    /// as they are.
+    const URL_SYNTAX_PARTS: [&str; 8] = [
+        "app?sslmode=disable&x",
+        "app#?sslmode=disable",
+        "app/x?sslmode=disable",
+        "a@b?sslmode=disable",
+        "a:b@evil.example/x?sslmode=disable",
+        "%3Fsslmode%3Ddisable",
+        "50%off",
+        "app&sslmode=disable",
+    ];
+
+    /// A built database name, user name, or password holding URL syntax stays
+    /// inside its component: the connection URL keeps `sslmode=require` for
+    /// both the `Dsn` parser and the driver, and each part reads back exactly.
+    #[test]
+    fn build_parts_cannot_inject_url_syntax() {
+        for part in URL_SYNTAX_PARTS {
+            for slot in 0..3 {
+                let pick = |i: usize, other: &'static str| if slot == i { part } else { other };
+                let built = dsn_build::<String>(
+                    0,
+                    "db.example".into(),
+                    5432,
+                    pick(0, "app").into(),
+                    pick(1, "reader").into(),
+                    secret_from_string(pick(2, "pw").into()),
+                    0,
+                );
+                assert!(matches!(built, IpeResult::Ok(_)), "{part:?} in slot {slot}");
+                let IpeResult::Ok(d) = built else {
+                    continue;
+                };
+                let (reparsed, options) = reread(&d);
+                assert!(options.is_some(), "{part:?} in slot {slot}: driver parse");
+                let Some(options) = options else {
+                    continue;
+                };
+                assert!(
+                    matches!(options.get_ssl_mode(), sqlx::postgres::PgSslMode::Require),
+                    "{part:?} in slot {slot} downgraded the driver's TLS"
+                );
+                assert_eq!(options.get_host(), "db.example", "{part:?} in slot {slot}");
+                assert_eq!(options.get_database(), Some(pick(0, "app")));
+                assert_eq!(options.get_username(), pick(1, "reader"));
+                assert!(reparsed.is_some(), "{part:?} in slot {slot}: Dsn reparse");
+                let Some(reparsed) = reparsed else {
+                    continue;
+                };
+                assert_eq!(dsn_tls(reparsed.clone()), 0, "{part:?} in slot {slot}");
+                assert_eq!(reparsed.host().as_str(), "db.example");
+                assert_eq!(dsn_database(reparsed.clone()), pick(0, "app"));
+                assert_eq!(dsn_user(reparsed.clone()), pick(1, "reader"));
+                assert_eq!(revealed_password(reparsed).as_deref(), Some(pick(2, "pw")));
+            }
+        }
+    }
+
+    /// Weird-but-legal names survive `build` then `parse` with their TLS mode.
+    #[test]
+    fn build_then_parse_keeps_the_tls_mode() {
+        for (tls_tag, name) in [
+            (0, "app-v2.prod_db"),
+            (1, "caf\u{e9}"),
+            (0, "100%"),
+            (1, "a+b=c;d,e"),
+            (0, "[x]{y}"),
+        ] {
+            let built = dsn_build::<String>(
+                0,
+                "db.example".into(),
+                6432,
+                name.into(),
+                name.into(),
+                secret_from_string(name.into()),
+                tls_tag,
+            );
+            assert!(matches!(built, IpeResult::Ok(_)), "{name:?}");
+            let IpeResult::Ok(d) = built else {
+                continue;
+            };
+            let (reparsed, _) = reread(&d);
+            assert!(reparsed.is_some(), "{name:?}");
+            let Some(reparsed) = reparsed else {
+                continue;
+            };
+            assert_eq!(dsn_tls(reparsed.clone()), tls_tag, "{name:?}");
+            assert_eq!(dsn_port(reparsed.clone()), 6432);
+            assert_eq!(dsn_database(reparsed.clone()), name);
+            assert_eq!(dsn_user(reparsed), name);
+        }
+    }
+
+    /// A parsed user name, password, and database are held decoded, so the
+    /// connection URL encodes them exactly once.
+    #[test]
+    fn parse_then_connect_keeps_encoded_parts() {
+        let d = parse_ok("postgres://re%40der:s3cr%40t@db.example/my%3Fdb");
+        assert_eq!(dsn_user(d.clone()), "re@der");
+        assert_eq!(dsn_database(d.clone()), "my?db");
+        let (_, options) = reread(&d);
+        assert!(options.is_some());
+        let Some(options) = options else {
+            return;
+        };
+        assert_eq!(options.get_username(), "re@der");
+        assert_eq!(options.get_database(), Some("my?db"));
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Require
+        ));
+        assert_eq!(revealed_password(d).as_deref(), Some("s3cr@t"));
+    }
+
+    /// A parsed part that decodes to invalid UTF-8 or a control character is
+    /// refused.
+    #[test]
+    fn parse_rejects_undecodable_parts() {
+        for dsn in [
+            "postgres://u%ff@db.example/app",
+            "postgres://u:p%ff@db.example/app",
+            "postgres://db.example/a%ff",
+            "postgres://u%0a@db.example/app",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{dsn:?} must be refused"
+            );
+        }
+    }
+
+    // ── SQLite ───────────────────────────────────────────────────────────────
+
+    /// A SQLite `Dsn` built from the file name `name`.
+    fn sqlite_build(name: &str) -> IpeResult<String, Dsn> {
+        dsn_build::<String>(
+            1,
+            String::new(),
+            0,
+            name.into(),
+            String::new(),
+            secret_from_string(String::new()),
+            0,
+        )
+    }
+
+    /// The options the driver reads from `d`'s connection URL.
+    fn sqlite_options(d: &Dsn) -> Option<sqlx::sqlite::SqliteConnectOptions> {
+        d.connection_url().parse().ok()
+    }
+
+    /// Whether the driver opens `options` as its private in-memory database,
+    /// which it names `file:sqlx-in-memory-<n>`.
+    fn sqlite_in_memory(options: &sqlx::sqlite::SqliteConnectOptions) -> bool {
+        options
+            .get_filename()
+            .to_str()
+            .is_some_and(|name| name.starts_with("file:sqlx-in-memory-"))
+    }
+
+    /// Whether `url` opens a file `mode=rwc` with no other parameter.
+    fn pins_rwc_only(url: &str) -> bool {
+        url.matches('?').count() == 1 && url.ends_with("?mode=rwc")
+    }
+
+    /// File names that would carry URL syntax or a SQLite special name if
+    /// written into the connection URL as they are.
+    const SQLITE_SYNTAX_NAMES: [&str; 11] = [
+        "x?mode=memory",
+        "app.db?mode=ro&cache=shared",
+        "a#x",
+        "a#x?vfs=memdb",
+        "%41",
+        "%3Amemory%3A",
+        "a:b",
+        "sqlite:x.db",
+        "u:p@x.db",
+        "/abs/p?q#r.db",
+        "//x/caf\u{e9}[1].db",
+    ];
+
+    /// A built SQLite file name opens that very file `mode=rwc`, for the
+    /// driver and the pooled opener, and reads back through the `Dsn` parser.
+    #[test]
+    fn built_sqlite_names_open_the_named_file() {
+        for name in SQLITE_SYNTAX_NAMES
+            .into_iter()
+            .chain(["data/app.db", "/abs/app.db"])
+        {
+            let built = sqlite_build(name);
+            assert!(matches!(built, IpeResult::Ok(_)), "{name:?}");
+            let IpeResult::Ok(d) = built else {
+                continue;
+            };
+            let url = d.connection_url();
+            assert!(pins_rwc_only(&url), "{name:?}: {url}");
+            let options = sqlite_options(&d);
+            assert!(options.is_some(), "{name:?}: driver parse of {url}");
+            let Some(options) = options else {
+                continue;
+            };
+            assert_eq!(options.get_filename(), std::path::Path::new(name));
+            assert!(!sqlite_in_memory(&options), "{name:?}");
+            assert!(
+                crate::db::DbUrl::parse(&url).is_ok_and(|db| db.is_shared_sqlite_file()),
+                "{name:?}: pooled opener of {url}"
+            );
+            let reparsed = dsn_parse::<String>(url.clone());
+            assert!(
+                matches!(reparsed, IpeResult::Ok(ref r) if dsn_database(r.clone()) == name),
+                "{name:?}: Dsn reparse of {url}"
+            );
+        }
+    }
+
+    /// `:memory:` names SQLite's private in-memory database, built or parsed.
+    #[test]
+    fn sqlite_memory_opens_in_memory() {
+        let built = sqlite_build(":memory:");
+        let parsed = dsn_parse::<String>("sqlite::memory:".to_owned());
+        for d in [built, parsed] {
+            assert!(matches!(d, IpeResult::Ok(_)));
+            let IpeResult::Ok(d) = d else {
+                continue;
+            };
+            assert_eq!(dsn_database(d.clone()), ":memory:");
+            assert_eq!(d.connection_url(), "sqlite::memory:");
+            let options = sqlite_options(&d);
+            assert!(options.as_ref().is_some_and(sqlite_in_memory));
+            assert!(
+                crate::db::DbUrl::parse(&d.connection_url())
+                    .is_ok_and(|db| !db.is_shared_sqlite_file())
+            );
+        }
+    }
+
+    /// A SQLite DSN names the file the driver opens: the text after the
+    /// scheme and an optional `//`, percent-decoded.
+    #[test]
+    fn parse_reads_sqlite_names_as_the_driver_opens_them() {
+        for (dsn, name) in [
+            ("sqlite://data/app.db", "data/app.db"),
+            ("sqlite:///abs/app.db", "/abs/app.db"),
+            ("sqlite://app.db?mode=rwc", "app.db"),
+            ("sqlite:app.db", "app.db"),
+            ("file:data/app.db", "data/app.db"),
+            ("sqlite:a%3Fb%23c%25.db", "a?b#c%.db"),
+        ] {
+            let parsed = parse_ok(dsn);
+            assert_eq!(dsn_database(parsed.clone()), name, "{dsn:?}");
+            assert_eq!(dsn_driver(parsed.clone()), 1, "{dsn:?}");
+            let options = sqlite_options(&parsed);
+            assert_eq!(
+                options.as_ref().map(|o| o.get_filename().to_path_buf()),
+                Some(std::path::PathBuf::from(name)),
+                "{dsn:?}"
+            );
+            assert!(pins_rwc_only(&parsed.connection_url()), "{dsn:?}");
+        }
+    }
+
+    /// A SQLite DSN or file name that would choose the open mode or another
+    /// option is refused.
+    #[test]
+    fn sqlite_option_overrides_are_refused() {
+        for dsn in [
+            "sqlite:x.db?mode=memory",
+            "sqlite://x.db?mode=ro",
+            "sqlite://x.db?mode=rwc&cache=shared",
+            "sqlite://x.db#y?vfs=memdb",
+            "sqlite://x.db?sslmode=require",
+            "sqlite://u:p@x.db",
+            "sqlite::memory:?cache=shared",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("conflicting or misplaced parameter")),
+                "{dsn:?} must be refused"
+            );
+        }
+        for dsn in [
+            "sqlite:file:x.db",
+            "sqlite:file%3Ax.db?mode=rwc",
+            "sqlite:%ff",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{dsn:?} must be refused"
+            );
+        }
+        for name in ["file:x.db", "file::memory:?cache=shared", "", "a\nb"] {
+            assert!(
+                matches!(sqlite_build(name), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
     // ── Secure defaults ──────────────────────────────────────────────────────
 
     #[test]
@@ -646,6 +1415,31 @@ mod tests {
             ),
             IpeResult::Err(_)
         ));
+    }
+
+    /// A built host is held as the URL parser writes it, the form the SSRF gate
+    /// vets and the driver dials.
+    #[test]
+    fn build_holds_the_parsed_host() {
+        for (host, held) in [
+            ("DB.Example", "db.example"),
+            ("[::1]", "[::1]"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            let built = dsn_build::<String>(
+                0,
+                host.into(),
+                5432,
+                "d".into(),
+                "u".into(),
+                secret_from_string("p".into()),
+                0,
+            );
+            assert!(
+                matches!(built, IpeResult::Ok(ref d) if d.host().as_str() == held),
+                "{host:?}"
+            );
+        }
     }
 
     #[test]

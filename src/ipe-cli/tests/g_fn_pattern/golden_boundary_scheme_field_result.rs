@@ -143,7 +143,7 @@ fn class1_field_result_cargo_builds_and_runs() {
         .join("boundary_scheme_field_result")
         .join("src")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_class1_boundary_scheme_field_result_e2e");
+    let out = crate::support::scratch_root().join("ipec_class1_boundary_scheme_field_result_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

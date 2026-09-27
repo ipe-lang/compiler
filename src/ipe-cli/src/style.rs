@@ -22,11 +22,21 @@ use std::io::IsTerminal;
 /// and mirrored by the installer.
 pub const REPO_URL: &str = "https://github.com/arthurmaciel/ipe-lang";
 
-/// The "report bugs" footer phrase, ending in `{REPO_URL}/issues.`. One
-/// call site formats it; the installer mirrors the rendered text.
+/// The lead phrase of the "report bugs" footer, before the issues URL.
+pub const REPORT_BUGS_PHRASE: &str = "If you find any bugs, please report them at ";
+
+/// The issue tracker URL the "report bugs" footer points at.
+#[must_use]
+pub fn issues_url() -> String {
+    format!("{REPO_URL}/issues")
+}
+
+/// The "report bugs" footer, `{REPORT_BUGS_PHRASE}{issues_url()}.`, unstyled.
+///
+/// The installer mirrors the rendered text; the CLI renderer paints the same two parts.
 #[must_use]
 pub fn report_bugs_footer() -> String {
-    format!("If you find any bugs, please report them at {REPO_URL}/issues.")
+    format!("{REPORT_BUGS_PHRASE}{}.", issues_url())
 }
 
 /// The product header line, `Ipê language - v{version} - {REPO_URL}`.
@@ -177,6 +187,12 @@ pub struct Palette {
     pub green: &'static str,
     /// A plain red, for failure emphasis.
     pub red: &'static str,
+    /// A light red (ANSI bright red), for an internal (ipe-side) error.
+    pub light_red: &'static str,
+    /// A light orange (256-colour 215), for a user-side error.
+    pub orange: &'static str,
+    /// A soft white (256-colour 252), for common text.
+    pub white: &'static str,
     /// A bold weight, for section titles and headers.
     pub bold: &'static str,
     /// Resets all attributes.
@@ -193,6 +209,9 @@ impl Palette {
         dim: "\x1b[38;5;244m",
         green: "\x1b[38;5;114m",
         red: "\x1b[31m",
+        light_red: "\x1b[91m",
+        orange: "\x1b[38;5;215m",
+        white: "\x1b[38;5;252m",
         bold: "\x1b[1m",
         reset: "\x1b[0m",
     };
@@ -204,6 +223,9 @@ impl Palette {
         dim: "",
         green: "",
         red: "",
+        light_red: "",
+        orange: "",
+        white: "",
         bold: "",
         reset: "",
     };
@@ -248,28 +270,33 @@ pub fn sandbox_override_warning(p: &Palette, override_env: &str, axes: &str) -> 
     )))
 }
 
-/// The version banner printed at the start of `ipe build`, `ipe run`, and
-/// `ipe watch` in human (default) output mode — NOT under `--plain`, `--json`,
-/// or `--quiet`.
+/// The product header that opens every human screen.
 ///
-/// Includes a leading blank line, the 2-space gutter, and the URL so it is
-/// immediately identifiable in a session. Coloured when `use_color` is true for
-/// stderr; plain otherwise.
+/// A leading blank line, then `Ipê language - vN.N.N - <repo>` in the gutter —
+/// the name light yellow, the version light green, the URL dim gray. Never
+/// shown under `--plain`, `--json`, or `--quiet`.
+///
+/// Coloured when `use_color` is true; plain otherwise. [`crate::screen`] owns
+/// when it is printed (once per process).
 #[must_use]
 pub fn command_header(use_color: bool) -> String {
     let version = env!("CARGO_PKG_VERSION");
     let p = Palette::select(use_color);
     format!(
-        "\n{GUTTER}{}{}{} - v{} - {}{}{}\n",
-        p.yellow, "Ipê language", p.reset, version, p.dim, REPO_URL, p.reset,
+        "\n{GUTTER}{y}Ipê language{r} - {g}v{version}{r} - {d}{REPO_URL}{r}\n",
+        y = p.bright_yellow,
+        g = p.green,
+        d = p.dim,
+        r = p.reset,
     )
 }
 
-/// Print the version banner to stderr, respecting the terminal / `NO_COLOR`
-/// state of stderr. Called at the start of human-mode commands.
+/// Print the product header to stderr (once per process), respecting the terminal / `NO_COLOR`
+/// state of stderr.
+///
+/// Called at the start of human-mode commands so the header leads their progress chatter.
 pub fn print_command_header() {
-    let colored = use_color(&std::io::stderr());
-    eprint!("{}", command_header(colored));
+    crate::screen::emit_header(crate::screen::Stream::Stderr);
 }
 
 /// Text that has been proven safe to write to a terminal.
@@ -359,47 +386,13 @@ impl std::fmt::Display for TerminalSafe {
     }
 }
 
-/// The short-diagnostic error banner: a soft-yellow block that leads with the
-/// product name and version, then the error message, both guttered and framed.
-///
-/// A failed command is not an alarm — the last-good state (a prior build, the
-/// running app) usually survives — so the banner is a calm soft yellow, never
-/// red. No `ipe: ` prefix: the product-name header identifies the source, so the
-/// prefix only added noise that scrolled away with the message. Coloured when
-/// `color` is on, plain (empty escapes) otherwise, so one shape serves both.
-///
-/// The message is already-sanitised [`TerminalSafe`]: the banner's own escapes
-/// (yellow/reset) are the only control bytes the output may carry.
-#[must_use]
-pub fn error_banner(message: &TerminalSafe, color: bool) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let p = Palette::select(color);
-    let body = format!(
-        "{y}Ipê lang - {version}{r}\n\n{y}{message}{r}",
-        y = p.yellow,
-        r = p.reset,
-    );
-    frame(&gutter(&body))
-}
-
-/// Print [`error_banner`] to stderr, respecting the terminal / `NO_COLOR` state
-/// of stderr. The one place short CLI diagnostics render their final screen.
-///
-/// The untrusted message is parsed into [`TerminalSafe`] HERE, once, at the
-/// boundary — every deeper renderer sees only the sanitised form.
-pub fn print_error_banner(message: &str) {
-    let colored = use_color(&std::io::stderr());
-    let safe = TerminalSafe::sanitize(message);
-    eprint!("{}", error_banner(&safe, colored));
-}
-
 /// A framed, guttered status line: a leading success/failure glyph, then the
 /// message. `ok` picks the green check or the red cross; `color` toggles ANSI.
 ///
 /// The one way a human-mode command reports a completed step — replacing a bare
 /// left-flush spinner line with `<glyph> <message>` plus the 2-space gutter.
 ///
-/// The message is already-sanitised [`TerminalSafe`], mirroring [`error_banner`]:
+/// The message is already-sanitised [`TerminalSafe`], mirroring [`crate::screen::Screen::line`]:
 /// the line's own glyph/colour escapes are the only control bytes the output may
 /// carry, so a message routed here can never smuggle ANSI or control bytes to the
 /// terminal.
@@ -501,33 +494,34 @@ mod tests {
     }
 
     #[test]
-    fn error_banner_leads_with_versioned_product_name_then_message() {
-        let b = error_banner(&TerminalSafe::sanitize("no such file `Main.ipe`"), false);
-        // Framed: one blank edge each side.
-        assert!(b.starts_with('\n') && b.ends_with('\n'), "framed banner");
-        // No `ipe: ` prefix survives.
-        assert!(!b.contains("ipe: "), "the ipe: prefix is gone");
-        // The product name and crate version lead.
-        assert!(b.contains("Ipê lang - "), "product name present");
+    fn command_header_paints_name_version_and_url_in_their_roles() {
+        let h = command_header(true);
+        let c = &Palette::COLOR;
+        let version = env!("CARGO_PKG_VERSION");
         assert!(
-            b.contains(env!("CARGO_PKG_VERSION")),
-            "crate version present"
+            h.contains(&format!("{}Ipê language{}", c.bright_yellow, c.reset)),
+            "name is light yellow: {h:?}"
         );
-        // The message follows, guttered.
-        assert!(b.contains("  no such file `Main.ipe`"), "message present");
-        // Header sits above the message.
-        let header_at = b.find("Ipê lang").expect("header present");
-        let msg_at = b.find("no such file").expect("message present");
-        assert!(header_at < msg_at, "header above message");
-        // Plain variant carries no ANSI.
-        assert!(!b.contains('\x1b'), "plain banner has no ANSI");
+        assert!(
+            h.contains(&format!("{}v{version}{}", c.green, c.reset)),
+            "version is light green: {h:?}"
+        );
+        assert!(
+            h.contains(&format!("{}{REPO_URL}{}", c.dim, c.reset)),
+            "URL is dim gray: {h:?}"
+        );
+        assert_eq!(
+            command_header(false),
+            format!("\n  Ipê language - v{version} - {REPO_URL}\n")
+        );
     }
 
     #[test]
-    fn error_banner_colour_mode_is_soft_yellow_not_red() {
-        let b = error_banner(&TerminalSafe::sanitize("boom"), true);
-        assert!(b.contains(Palette::COLOR.yellow), "soft yellow applied");
-        assert!(!b.contains(Palette::COLOR.red), "never the alarming red");
+    fn report_bugs_footer_is_phrase_then_issues_url() {
+        assert_eq!(
+            report_bugs_footer(),
+            format!("{REPORT_BUGS_PHRASE}{REPO_URL}/issues.")
+        );
     }
 
     /// A hostile error message laced with ANSI escapes and control bytes is
@@ -547,17 +541,6 @@ mod tests {
         // The CSI colour codes are removed whole, leaving only the visible text;
         // layout whitespace (tab, newline) is preserved.
         assert_eq!(s, "redmoveddone\ttab\nline");
-    }
-
-    /// The escaped banner is safe end to end: sanitising the message before it
-    /// reaches [`error_banner`] means the only ANSI in the rendered output is the
-    /// banner's own soft-yellow framing, never a byte the message smuggled in.
-    #[test]
-    fn error_banner_message_cannot_inject_ansi_in_plain_mode() {
-        let hostile = "boom\u{1b}[2J\u{1b}[1;1H";
-        let b = error_banner(&TerminalSafe::sanitize(hostile), false);
-        assert!(!b.contains('\x1b'), "plain banner carries no ANSI: {b:?}");
-        assert!(b.contains("boom"), "the visible text survives");
     }
 
     #[test]

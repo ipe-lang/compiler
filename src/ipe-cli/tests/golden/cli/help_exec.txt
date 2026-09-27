@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Run a built artifact, jailing native-bearing code to its embedded capability floor.
 
   ipe exec [<artifact-dir>]
@@ -10,4 +11,3 @@ exit: 0
 
   Options:
     [-- <args>...]  forward <args> to the artifact
-

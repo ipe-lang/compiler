@@ -145,7 +145,8 @@ fn release_target_twice_is_usage_error() {
 #[test]
 fn release_no_project_returns_usage_error() {
     let dir = {
-        let d = std::env::temp_dir().join("ipe_release_test_empty");
+        let d =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_release_test_empty");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -186,7 +187,8 @@ fn release_pure_app_parse_is_accepted() {
 #[test]
 fn release_unsupported_native_target_is_usage_error() {
     let dir = {
-        let d = std::env::temp_dir().join("ipe_release_test_bad_triple");
+        let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("ipe_release_test_bad_triple");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(

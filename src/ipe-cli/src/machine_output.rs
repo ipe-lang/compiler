@@ -19,7 +19,7 @@
 //! audited place:
 //!
 //! * **No human banner in a machine stream.** The soft-yellow `Ipê lang` error
-//!   banner ([`crate::style::error_banner`]) is human furniture; it must never
+//!   banner ([`crate::screen::error_screen`]) is human furniture; it must never
 //!   reach a `--json` / `--plain` consumer. A machine failure renders through
 //!   [`machine_error`], never the banner.
 //! * **No raw internal string.** A machine error carries only the error's
@@ -146,7 +146,7 @@ impl<'a> MachineOutput<'a> {
 /// [`crate::CliError::DiagnosticJsonEmitted`] so the process exits non-zero with
 /// nothing more printed.
 ///
-/// [`error_banner`]: crate::style::error_banner
+/// [`error_banner`]: crate::screen::error_screen
 #[must_use]
 pub fn machine_error(format: OutputFormat, command: &str, kind: &str, message: &str) -> String {
     // Sanitise first: the Display text is trusted furniture, but a diagnostic can

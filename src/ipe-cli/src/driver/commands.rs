@@ -8,19 +8,13 @@ use super::{
     runtime_dep_from_env, single_file_cargo_name_from_env,
 };
 use crate::output_dir::{OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::style::TerminalSafe;
 use crate::{
-    ALL_CODES, BTreeMap, Diagnostic, Interner, Path, PathBuf, Write, build_plan, cli_args,
-    delivery, explain_page, ffi, fs, help, io_bounded, native_ffi_consent, package_manifest,
-    project, run_sandbox, runtime_embed, style, title, toolchain, unsafe_ack, wasi_run, watch,
+    ALL_CODES, BTreeMap, Diagnostic, Interner, Path, PathBuf, build_plan, cli_args, delivery,
+    explain_page, ffi, fs, help, io_bounded, native_ffi_consent, package_manifest, project,
+    run_sandbox, runtime_embed, screen, style, text, title, toolchain, unsafe_ack, wasi_run, watch,
     web_consent,
 };
-
-/// The misuse reason shown when `build` / `run` / `watch` are invoked with no
-/// entry and none can be discovered. Just the reason — the command's own
-/// `--help` page (appended by [`CliError::CommandUsage`]) carries the synopsis
-/// and options, so this never re-lists them.
-pub const NO_ENTRY: &str = "nothing to build here — pass a source file or run inside a project (a \
-     package.ipe, or a src/Main.ipe)";
 
 /// A request for help asks for output, not an error: it prints to stdout and
 /// exits successfully. Returned by [`intercept_help`] so [`run_cli`] can honour
@@ -45,7 +39,7 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     // No arguments, or a leading bare help token: the top-level screen.
     match args.split_first() {
         None => {
-            print!("{}", help::top_level(&std::io::stdout()));
+            show_top_level_help();
             return Some(HelpRequest);
         }
         Some((first, rest)) if is_help_flag(first) => {
@@ -60,10 +54,8 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
                 let named_json = rest_no_json
                     .first()
                     .and_then(|c| help::command_json(c.as_str()));
-                match named_json {
-                    Some(json) => print!("{json}"),
-                    None => print!("{}", help::help_json()),
-                }
+                let json = named_json.unwrap_or_else(help::help_json);
+                screen::emit_machine(screen::Stream::Stdout, &json);
             } else {
                 // `help <name>` / `--help <name>`: that command's page, a
                 // group's subpage, or the top-level screen — in that order.
@@ -72,8 +64,8 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
                         .or_else(|| help::group(c.as_str(), &std::io::stdout()))
                 });
                 match named {
-                    Some(page) => print!("{page}"),
-                    None => print!("{}", help::top_level(&std::io::stdout())),
+                    Some(page) => show_help_page(&page),
+                    None => show_top_level_help(),
                 }
             }
             return Some(HelpRequest);
@@ -93,11 +85,11 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     {
         if has_json(rest) {
             if let Some(json) = help::command_json(verb) {
-                print!("{json}");
+                screen::emit_machine(screen::Stream::Stdout, &json);
                 return Some(HelpRequest);
             }
         } else if let Some(page) = help::command(verb, &std::io::stdout()) {
-            print!("{page}");
+            show_help_page(&page);
             return Some(HelpRequest);
         }
     }
@@ -114,7 +106,7 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
         && (rest.is_empty() || (rest.first().is_some_and(|a| is_help_flag(a))))
         && let Some(page) = help::group(first, &std::io::stdout())
     {
-        print!("{page}");
+        show_help_page(&page);
         return Some(HelpRequest);
     }
 
@@ -125,15 +117,32 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     {
         if has_json(rest) {
             if let Some(json) = help::command_json(cmd) {
-                print!("{json}");
+                screen::emit_machine(screen::Stream::Stdout, &json);
                 return Some(HelpRequest);
             }
         } else if let Some(page) = help::command(cmd, &std::io::stdout()) {
-            print!("{page}");
+            show_help_page(&page);
             return Some(HelpRequest);
         }
     }
     None
+}
+
+/// Print a rendered help page (already guttered and styled for stdout) in the
+/// screen frame on stdout.
+fn show_help_page(page: &str) {
+    let mut out = screen::Screen::new(screen::Stream::Stdout);
+    out.guttered(page);
+    out.emit();
+}
+
+/// Print the top-level overview in the screen frame on stdout, closed by the
+/// bug footer.
+fn show_top_level_help() {
+    let mut out = screen::Screen::new(screen::Stream::Stdout);
+    out.guttered(&help::top_level(&std::io::stdout()))
+        .with_bug_footer();
+    out.emit();
 }
 
 /// Parse `argv` (excluding the program name) and run the requested command.
@@ -156,7 +165,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     let Some((cmd, rest)) = args.split_first() else {
         // A bare `ipe` (no command) carries an empty token and just shows help.
         return Err(CliError::UnknownCommand {
-            attempted: String::new(),
+            attempted: TerminalSafe::sanitize(""),
         });
     };
     // `ipe explain` has been folded into `ipe doc`. Print a pointer and
@@ -170,14 +179,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     // the old command at its delivery-grammar equivalent rather than failing with
     // a bare unknown-command.
     if cmd == "pack" {
-        return Err(CliError::UsageOwned(
-            "ipe pack has been retired — app bundling is now the delivery grammar. \
-             Use `ipe build web desktop` / `ipe build web ios` / `ipe build web android` for a \
-             fast dev bundle, or `ipe release web desktop|ios|android` for a production \
-             distributable. For the OS-permission dry-run, use `ipe build --emit-permissions \
-             <ios|macos|android>`."
-                .to_owned(),
-        ));
+        return Err(CliError::UsageOwned(text::pack_retired().to_owned()));
     }
     // A command group (`ipe dev <verb> …`) dispatches to the member verb's own
     // handler — the grouped and bare forms run the same code, so a verb under
@@ -190,7 +192,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
             // above — but handled totally rather than assumed away.
             return Err(CliError::UnknownGroupSub {
                 group,
-                attempted: String::new(),
+                attempted: TerminalSafe::sanitize(""),
             });
         };
         return match help::handler(verb.as_str()) {
@@ -202,7 +204,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
             // command through the group is refused so the namespace stays honest.
             _ => Err(CliError::UnknownGroupSub {
                 group,
-                attempted: verb.clone(),
+                attempted: TerminalSafe::sanitize(verb),
             }),
         };
     }
@@ -216,7 +218,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
         // an explicit `--help`, this is not a request, so it exits non-zero. The
         // typed token is kept so a near-miss can be suggested.
         None => Err(CliError::UnknownCommand {
-            attempted: cmd.clone(),
+            attempted: TerminalSafe::sanitize(cmd),
         }),
     }
 }
@@ -233,9 +235,12 @@ pub fn with_help_on_misuse(
     match result {
         Err(CliError::Usage(reason)) => Err(CliError::CommandUsage {
             command,
-            reason: reason.to_owned(),
+            reason: TerminalSafe::sanitize(reason),
         }),
-        Err(CliError::UsageOwned(reason)) => Err(CliError::CommandUsage { command, reason }),
+        Err(CliError::UsageOwned(reason)) => Err(CliError::CommandUsage {
+            command,
+            reason: TerminalSafe::sanitize(&reason),
+        }),
         other => other,
     }
 }
@@ -258,9 +263,9 @@ pub fn default_entry() -> Result<String, CliError> {
         return Ok("src/Main.ipe".to_owned());
     }
     if project::has_only_legacy_toml(std::path::Path::new(".")) {
-        return Err(CliError::Usage(project::LEGACY_TOML_HINT));
+        return Err(CliError::Usage(text::legacy_toml_hint()));
     }
-    Err(CliError::Usage(NO_ENTRY))
+    Err(CliError::Usage(text::no_entry()))
 }
 
 /// `ipe watch [<path>]` — rebuild and re-run on every source change
@@ -388,7 +393,7 @@ pub fn resolve_delivery(
         &positionals.tokens,
         wants_static,
     )
-    .map_err(|e| CliError::UsageOwned(format!("ipe {command}: {e}")))
+    .map_err(|e| CliError::UsageOwned(text::command_refusal(&command, &e)))
 }
 
 /// Route an entry argument to its `package.ipe`, when one governs it.
@@ -402,11 +407,9 @@ pub fn discover_manifest(entry_path: &Path) -> Result<Option<PathBuf>, CliError>
             return Ok(Some(manifest));
         }
         if project::has_only_legacy_toml(entry_path) {
-            return Err(CliError::Usage(project::LEGACY_TOML_HINT));
+            return Err(CliError::Usage(text::legacy_toml_hint()));
         }
-        Err(CliError::Usage(
-            "directory supplied but no package.ipe found inside it",
-        ))
+        Err(CliError::Usage(text::watch_dir_no_manifest()))
     } else {
         Ok(find_manifest_for_ipe_file(entry_path))
     }
@@ -445,12 +448,11 @@ pub fn resolve_static_plan(
             // The design's explicit opt-in notice: the C cost is acknowledged,
             // never silent. Human mode only — machine streams must stay
             // furniture-free (see #2590).
-            eprintln!(
-                "{}",
-                style::gutter(
-                    "note: mimalloc adds a C toolchain and unsafe FFI, vendors C source, and \
-                     freezes it into the artifact for CVE-rebuild purposes; chosen explicitly."
-                )
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                "note: mimalloc adds a C toolchain and unsafe FFI, vendors C source, and \
+                     freezes it into the artifact for CVE-rebuild purposes; chosen explicitly.",
             );
         }
     }
@@ -493,16 +495,16 @@ impl CompileTarget {
     /// not a separate biconditional — is the live gate at every callsite. The
     /// WASI cell admits ONLY the sealed `Direct`/`Script` floor; every non-viable
     /// shape (TEA/Server/Web) is refused there fail-closed.
-    const fn engine_triple(self) -> (delivery::Engine, delivery::TargetTriple) {
+    const fn engine_triple(self) -> (delivery::Engine, Option<delivery::TargetTriple>) {
         match self {
-            Self::Native => (delivery::Engine::Native, delivery::TargetTriple::Host),
+            Self::Native => (delivery::Engine::Native, None),
             Self::WasmClient => (
                 delivery::Engine::WasmClient,
-                delivery::TargetTriple::BrowserWasm,
+                Some(delivery::TargetTriple::BrowserWasm),
             ),
             Self::WasmWasi => (
                 delivery::Engine::WasmWasi,
-                delivery::TargetTriple::Wasm32Wasip1,
+                Some(delivery::TargetTriple::Wasm32Wasip1),
             ),
         }
     }
@@ -577,7 +579,7 @@ pub fn run_build(rest: &[String]) -> Result<(), CliError> {
                     "entry": success.entry,
                     "out": success.out_dir.to_string_lossy(),
                 });
-                println!("{json}");
+                screen::emit_machine(screen::Stream::Stdout, &format!("{json}\n"));
             }
             // Human progress line already printed inside run_build_body.
             Ok(())
@@ -622,7 +624,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             // to the source reader (which would fail with a raw "Is a directory").
             let ir_entry = resolve_analysis_entry(&entry_path)?;
             let tree = emit_ir_text(&ir_entry)?;
-            print!("{tree}");
+            screen::emit_machine(screen::Stream::Stdout, &tree);
             return Ok(BuildSuccess {
                 entry,
                 out_dir: PathBuf::new(),
@@ -679,12 +681,13 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     };
     if show_progress {
         style::print_command_header();
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            &format!(
                 "{} building {entry}",
                 style::outcome_glyph(style::Outcome::Step)
-            ))
+            ),
         );
     }
 
@@ -740,7 +743,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let (engine, triple) = compile_target.engine_triple();
     delivery
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::UsageOwned(format!("ipe build: {e}")))?;
+        .map_err(|e| CliError::UsageOwned(text::command_refusal(&"build", &e)))?;
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
@@ -836,13 +839,14 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             || out_dir.display().to_string(),
             |p| p.display().to_string(),
         );
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Success,
+            &format!(
                 "{} built → {}",
                 style::outcome_glyph(style::Outcome::Success),
                 destination
-            ))
+            ),
         );
     }
     Ok(BuildSuccess { entry, out_dir })
@@ -967,9 +971,8 @@ fn copy_native_artifact(
     src.push("debug");
     src.push(&bin_name);
     if !src.is_file() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe build: expected binary at {} — cargo build succeeded but the binary is missing",
-            src.display()
+        return Err(CliError::UsageOwned(text::build_binary_missing(
+            &src.display(),
         )));
     }
     let dest = bin_dir.path_to(&friendly)?;
@@ -1019,10 +1022,11 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     // a non-empty catalog means at least one `Rust.` binding is in scope.
     if !ffi::load_catalog_for(&entry_path)?.is_empty() {
         return Err(CliError::EjectUnsupported {
-            reason: "this program binds a foreign Rust crate (FFI). Eject vendors only the \
-                     embedded runtime source, so it cannot produce a self-contained project for \
-                     a program that pulls external crates — build it with `ipe build` instead"
-                .to_owned(),
+            reason: TerminalSafe::sanitize(
+                "this program binds a foreign Rust crate (FFI). Eject vendors only the \
+                 embedded runtime source, so it cannot produce a self-contained project for \
+                 a program that pulls external crates — build it with `ipe build` instead",
+            ),
         });
     }
 
@@ -1041,10 +1045,11 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     let manifest_wasm: Option<&project::WasmConfig> = manifest_parsed.as_ref().map(|m| &m.wasm);
     if resolve_compile_target(cli_args::WasmKind::None, manifest_wasm).is_wasm() {
         return Err(CliError::EjectUnsupported {
-            reason: "eject produces a native Cargo project; a wasm target has a separate \
-                     bundling step — use `ipe build --target wasm` (browser) or \
-                     `ipe build --target wasi` (wasm32-wasip1)"
-                .to_owned(),
+            reason: TerminalSafe::sanitize(
+                "eject produces a native Cargo project; a wasm target has a separate \
+                 bundling step — use `ipe build --target wasm` (browser) or \
+                 `ipe build --target wasi` (wasm32-wasip1)",
+            ),
         });
     }
 
@@ -1076,12 +1081,13 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
         std::io::stderr().is_terminal()
     };
     if show_progress {
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            &format!(
                 "{} ejecting {entry}",
                 style::outcome_glyph(style::Outcome::Step)
-            ))
+            ),
         );
     }
 
@@ -1101,14 +1107,15 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     let out_dir = target.release_to_user()?;
 
     if show_progress {
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Success,
+            &format!(
                 "{} ejected → {} (self-contained; `cd {} && cargo build`)",
                 style::outcome_glyph(style::Outcome::Success),
                 out_dir.display(),
                 out_dir.display()
-            ))
+            ),
         );
     }
     Ok(())
@@ -1235,7 +1242,7 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     let (engine, triple) = compile_target.engine_triple();
     bundle_delivery_resolved
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::UsageOwned(format!("ipe release: {e}")))?;
+        .map_err(|e| CliError::UsageOwned(text::command_refusal(&"release", &e)))?;
 
     if wasm_target {
         // Browser/wasm production path.
@@ -1250,12 +1257,13 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
             std::io::stderr().is_terminal()
         };
         if show_progress {
-            eprintln!(
-                "{}",
-                style::gutter(&format!(
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                &format!(
                     "{} releasing {entry} (wasm)",
                     style::outcome_glyph(style::Outcome::Step)
-                ))
+                ),
             );
         }
 
@@ -1296,13 +1304,14 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         )?;
         bundle_wasm(&out_dir)?;
         if show_progress {
-            eprintln!(
-                "{}",
-                style::gutter(&format!(
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Success,
+                &format!(
                     "{} released → {}/www/",
                     style::outcome_glyph(style::Outcome::Success),
                     out_dir.display()
-                ))
+                ),
             );
         }
         return Ok(());
@@ -1340,12 +1349,13 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         let out_dir = output.area_path(&[OutputArea::Release, OutputArea::Rust])?;
 
         if show_progress {
-            eprintln!(
-                "{}",
-                style::gutter(&format!(
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                &format!(
                     "{} releasing {entry}",
                     style::outcome_glyph(style::Outcome::Step)
-                ))
+                ),
             );
         }
 
@@ -1399,9 +1409,8 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
             .join("release")
             .join(&bin_name);
         if !bin_path.is_file() {
-            return Err(CliError::UsageOwned(format!(
-                "ipe release: expected binary at {} — cargo build succeeded but binary is missing",
-                bin_path.display()
+            return Err(CliError::UsageOwned(text::release_binary_missing(
+                &bin_path.display(),
             )));
         }
         // Copy the binary from the cargo target dir into the release area so the
@@ -1414,13 +1423,14 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         #[cfg(unix)]
         set_executable(&dest)?;
         if show_progress {
-            eprintln!(
-                "{}",
-                style::gutter(&format!(
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Success,
+                &format!(
                     "{} released → {}",
                     style::outcome_glyph(style::Outcome::Success),
                     dest.display()
-                ))
+                ),
             );
         }
         return Ok(());
@@ -1430,12 +1440,13 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     let output = resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
 
     if show_progress {
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            &format!(
                 "{} releasing {entry}",
                 style::outcome_glyph(style::Outcome::Step)
-            ))
+            ),
         );
     }
 
@@ -1492,9 +1503,8 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         .join("release")
         .join(&release_bin_name);
     if !app_binary.is_file() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe release: expected app binary at {} — cargo build succeeded but binary is missing",
-            app_binary.display()
+        return Err(CliError::UsageOwned(text::release_app_binary_missing(
+            &app_binary.display(),
         )));
     }
     let profile_src = app_out.join("ipe.profile");
@@ -1577,29 +1587,28 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         // Post-build report: how the binary is linked, where it landed, and the
         // capability model it will enforce.
         let cap_names: Vec<&'static str> = resolved.union().iter().map(|c| c.as_str()).collect();
-        eprint!(
-            "{}",
-            release_bundle_report(&artifact, &cap_names, args.mode)
+        screen::chatter_styled(
+            screen::Stream::Stderr,
+            &release_bundle_report(&artifact, &cap_names, args.mode),
         );
         match args.mode {
-            cli_args::ReleaseMode::Embed => eprintln!(
-                "{}",
-                style::gutter(&format!(
-                    "{} released → {} (single self-jailing binary; \
-                     run `--capabilities` to audit)",
+            cli_args::ReleaseMode::Embed => crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Success,
+                &format!(
+                    "{} {}",
                     style::outcome_glyph(style::Outcome::Success),
-                    artifact.display()
-                ))
+                    text::release_embedded(&artifact.display())
+                ),
             ),
-            cli_args::ReleaseMode::Bundle => eprintln!(
-                "{}",
-                style::gutter(&format!(
-                    "{} released (bundle) → {} (run `./ipe-wrapper -- <args>`; \
-                     WARNING: ipe-app can be run directly, bypassing the sandbox — \
-                     prefer embed mode for production)",
+            cli_args::ReleaseMode::Bundle => crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Success,
+                &format!(
+                    "{} {}",
                     style::outcome_glyph(style::Outcome::Success),
-                    artifact.display()
-                ))
+                    text::release_bundled(&artifact.display())
+                ),
             ),
         }
     }
@@ -1619,9 +1628,9 @@ pub fn run_release_capabilities(
     };
     let resolved = run_sandbox::resolve_for_run(manifest_parsed.as_ref(), manifest, entry_path)?;
     let names: Vec<&'static str> = resolved.union().iter().map(|c| c.as_str()).collect();
-    print!(
-        "{}",
-        render_capabilities(&names, format, &std::io::stdout())
+    screen::emit_report(
+        format,
+        &render_capabilities(&names, format, &std::io::stdout()),
     );
     Ok(())
 }
@@ -1678,9 +1687,7 @@ pub fn find_workspace_root() -> Result<PathBuf, CliError> {
             Some(p) => candidate = p,
             None => {
                 return Err(CliError::UsageOwned(
-                    "ipe release: cannot locate workspace root (no Cargo.toml with [workspace] \
-                     found in any parent directory)"
-                        .to_owned(),
+                    text::release_workspace_root_unknown().to_owned(),
                 ));
             }
         }
@@ -1827,8 +1834,7 @@ fn build_emitted_project_core(
             }
             // Forward this chunk live so the user sees cargo's progress as it
             // happens; also accumulate it for a failure diagnostic.
-            eprint!("{line}");
-            let _ = std::io::stderr().flush();
+            screen::emit_machine(screen::Stream::Stderr, &line);
             captured.push_str(&line);
         }
     }
@@ -1850,7 +1856,7 @@ fn build_emitted_project_core(
     Err(CliError::EmittedBuildFailed {
         what,
         code: status.code().unwrap_or(1),
-        stderr: captured,
+        stderr: TerminalSafe::sanitize(&captured),
         runtime,
     })
 }
@@ -1890,7 +1896,7 @@ fn lock_emitted_dependencies(
     Err(CliError::EmittedBuildFailed {
         what: "the emitted crate's dependency lockfile",
         code: output.status.code().unwrap_or(1),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr: TerminalSafe::sanitize(&String::from_utf8_lossy(&output.stderr)),
         runtime: None,
     })
 }
@@ -1964,8 +1970,8 @@ pub fn terminal_width(stream: &impl std::os::fd::AsFd) -> Option<u16> {
 /// for enriching an error message, never a gate.
 pub fn runtime_context_for_message() -> Option<RuntimeContext> {
     runtime_embed::resolve().ok().map(|r| RuntimeContext {
-        root: r.root().to_path_buf(),
-        version: r.version().to_owned(),
+        root: TerminalSafe::sanitize(&r.root().display().to_string()),
+        version: TerminalSafe::sanitize(r.version()),
     })
 }
 
@@ -2001,6 +2007,14 @@ pub fn format_artifact_size(bytes: u64) -> String {
         format!("{}.{} KiB", tenths / 10, tenths % 10)
     }
 }
+
+/// The `wasm-bindgen-cli` version that matches the runtime's pinned `wasm-bindgen` crate.
+///
+/// `src/runtime/rust/Cargo.toml`'s `wasm-bindgen` dependency line is the
+/// canonical spelling of this version; `ipe_backend_rust::project`'s
+/// `wasm_bindgen_version_matches_the_runtime_pin` test fails the build the
+/// instant this constant drifts from it.
+const WASM_BINDGEN_VERSION: &str = "0.2.126";
 
 /// Run the three post-emit bundle steps for `--target wasm`:
 /// 1. `cargo build --target wasm32-unknown-unknown --release` (THE SEAL cross-target)
@@ -2080,10 +2094,9 @@ pub fn bundle_wasm(out_dir: &Path) -> Result<(), CliError> {
         })?;
     if !wb_status.success() {
         let code = wb_status.code().unwrap_or(1);
-        return Err(CliError::UsageOwned(format!(
-            "wasm-bindgen failed (exit {code}); ensure wasm-bindgen-cli {ver} is installed: \
-             cargo install wasm-bindgen-cli --version {ver}",
-            ver = "0.2.126"
+        return Err(CliError::UsageOwned(text::wasm_bindgen_failed(
+            &code,
+            &WASM_BINDGEN_VERSION,
         )));
     }
 
@@ -2103,26 +2116,28 @@ pub fn bundle_wasm(out_dir: &Path) -> Result<(), CliError> {
     {
         // wasm-opt found but failed — non-fatal; the unoptimised bundle
         // is still correct. Log and continue.
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            &format!(
                 "note: wasm-opt exited {}; bundle is unoptimised but functional",
                 status.code().unwrap_or(1)
-            ))
+            ),
         );
     }
 
     let bundle_size = format_artifact_size(artifact_size_bytes(&bg_wasm)?);
     let www = out_dir.join("www");
-    eprintln!(
-        "{}",
-        style::gutter(&format!(
+    crate::screen::chatter(
+        crate::screen::Stream::Stderr,
+        crate::screen::Tone::Text,
+        &format!(
             "wasm bundle ready at {www}/\n\
              bundle size: {bundle_size} ({bg})\n\
              serve with: python3 -m http.server -d {www} 8080",
             www = www.display(),
             bg = bg_wasm.display(),
-        ))
+        ),
     );
     Ok(())
 }
@@ -2177,14 +2192,15 @@ pub fn bundle_wasi(out_dir: &Path) -> Result<PathBuf, CliError> {
     // by construction, immune to any target-dir divergence.
     let module = wasi_artifact_path(&messages, out_dir)?;
     let module_size = format_artifact_size(artifact_size_bytes(&module)?);
-    eprintln!(
-        "{}",
-        style::gutter(&format!(
+    crate::screen::chatter(
+        crate::screen::Stream::Stderr,
+        crate::screen::Tone::Text,
+        &format!(
             "wasm32-wasip1 module ready at {module}\n\
              module size: {module_size}\n\
              run with: wasmtime {module}",
             module = module.display(),
-        ))
+        ),
     );
     Ok(module)
 }
@@ -2236,10 +2252,8 @@ fn wasi_artifact_path(messages: &str, out_dir: &Path) -> Result<PathBuf, CliErro
         }
     }
 
-    Err(CliError::UsageOwned(format!(
-        "the wasm32-wasip1 build reported no `.wasm` artifact for {} — cargo's \
-         JSON message stream carried no `compiler-artifact` naming the module",
-        out_dir.display(),
+    Err(CliError::UsageOwned(text::wasi_artifact_missing(
+        &out_dir.display(),
     )))
 }
 
@@ -2314,15 +2328,12 @@ pub fn gate_session(
         delivery::Shape::Web => Some("a web app"),
     };
     if let Some(name) = shape_name {
-        return Err(CliError::UsageOwned(format!(
-            "ipe run {flag}: {name} has no recordable session — recording and replay \
-             capture the update loop of a `Cli.tea` or `Worker.tea` app"
+        return Err(CliError::UsageOwned(text::session_no_recordable(
+            &flag, &name,
         )));
     }
     if compile_target.is_wasm() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe run {flag}: works on a native run only — drop `--target wasi`"
-        )));
+        return Err(CliError::UsageOwned(text::session_native_only(&flag)));
     }
     Ok(())
 }
@@ -2341,10 +2352,7 @@ pub fn gate_session_capabilities(
     resolved: &run_sandbox::ResolvedCapabilities,
 ) -> Result<(), CliError> {
     if run_sandbox::is_native_bearing(&resolved.union()) {
-        return Err(CliError::UsageOwned(format!(
-            "ipe run {flag}: a native-bearing program runs jailed, where the session log \
-             cannot be reached — record and replay a pure Ipê build of the app"
-        )));
+        return Err(CliError::UsageOwned(text::session_jailed(&flag)));
     }
     Ok(())
 }
@@ -2390,11 +2398,9 @@ pub fn resolve_session_plan(
             if is_regular_file(&trace) {
                 return Ok(SessionPlan::ShowTrace(trace));
             }
-            Err(CliError::UsageOwned(format!(
-                "ipe run --replay: no session log at {} or trace at {} — record one with \
-                 `ipe run --record`",
-                typed.display(),
-                trace.display()
+            Err(CliError::UsageOwned(text::replay_no_default_log(
+                &typed.display(),
+                &trace.display(),
             )))
         }
     }
@@ -2407,9 +2413,8 @@ pub fn resolve_session_plan(
 /// is a regular file.
 pub fn replay_plan(path: PathBuf) -> Result<SessionPlan, CliError> {
     if !is_regular_file(&path) {
-        return Err(CliError::UsageOwned(format!(
-            "ipe run --replay: no session log at {} — record one with `ipe run --record`",
-            path.display()
+        return Err(CliError::UsageOwned(text::replay_log_missing(
+            &path.display(),
         )));
     }
     if is_session_trace(&path) {
@@ -2481,6 +2486,7 @@ pub fn load_session_trace(path: &Path) -> Result<String, CliError> {
 /// # Errors
 /// As [`load_session_trace`]; [`CliError::Io`] when stdout cannot be written.
 pub fn show_session_trace(path: &Path) -> Result<(), CliError> {
+    use std::io::Write as _;
     let rendered = load_session_trace(path)?;
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -2594,12 +2600,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     };
     if show_progress {
         style::print_command_header();
-        eprintln!(
-            "{}",
-            style::gutter(&format!(
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::Text,
+            &format!(
                 "{} building {entry}",
                 style::outcome_glyph(style::Outcome::Step)
-            ))
+            ),
         );
     }
 
@@ -2638,7 +2645,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let (engine, triple) = compile_target.engine_triple();
     delivery
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::UsageOwned(format!("ipe run: {e}")))?;
+        .map_err(|e| CliError::UsageOwned(text::command_refusal(&"run", &e)))?;
 
     // `ipe run --target wasi` EXECUTES the emitted module under embedded
     // wasmtime; fail closed BEFORE any emit or build when no engine is linked
@@ -2893,9 +2900,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // (main.rs) prints it to stderr and exits 1.
         if !status.success() {
             let code = status.code().unwrap_or(1);
-            return Err(CliError::UsageOwned(format!(
-                "{bin_name} exited with code {code}"
-            )));
+            return Err(CliError::UsageOwned(text::program_exited(&bin_name, &code)));
         }
         Ok(())
     }
@@ -2931,9 +2936,8 @@ pub fn run_exec(rest: &[String]) -> Result<(), CliError> {
         .first()
         .map_or_else(|| PathBuf::from("out").join("rust"), PathBuf::from);
     if !dir.is_dir() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe exec: no artifact directory at {}",
-            dir.display()
+        return Err(CliError::UsageOwned(text::exec_no_artifact_dir(
+            &dir.display(),
         )));
     }
 
@@ -2946,10 +2950,7 @@ pub fn run_exec(rest: &[String]) -> Result<(), CliError> {
     bin.push("debug");
     bin.push(&exec_bin_name);
     if !bin.is_file() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe exec: no built binary at {} — run `ipe build` first",
-            bin.display()
-        )));
+        return Err(CliError::UsageOwned(text::exec_no_binary(&bin.display())));
     }
 
     let app_args_os: Vec<std::ffi::OsString> =
@@ -2960,10 +2961,8 @@ pub fn run_exec(rest: &[String]) -> Result<(), CliError> {
     if run_sandbox::artifact_is_native(&bin)? {
         let profile_path = dir.join("ipe.profile");
         if !profile_path.is_file() {
-            return Err(CliError::UsageOwned(format!(
-                "ipe exec: {} embeds a capability floor but carries no ipe.profile — the artifact \
-                 is incomplete or tampered; refusing to run native code without its jail profile",
-                bin.display()
+            return Err(CliError::UsageOwned(text::exec_profile_missing(
+                &bin.display(),
             )));
         }
         // Strictly parse the profile and verify it against the embedded floor.
@@ -3015,9 +3014,9 @@ pub fn run_exec(rest: &[String]) -> Result<(), CliError> {
                 source: e,
             })?;
         if !status.success() {
-            return Err(CliError::UsageOwned(format!(
-                "{exec_bin_name} exited with code {}",
-                status.code().unwrap_or(1)
+            return Err(CliError::UsageOwned(text::program_exited(
+                &exec_bin_name,
+                &status.code().unwrap_or(1),
             )));
         }
         Ok(())
@@ -3106,21 +3105,17 @@ pub fn cargo_target_directory(crate_dir: &Path) -> Result<PathBuf, CliError> {
             source: e,
         })?;
     if !output.status.success() {
-        return Err(CliError::UsageOwned(format!(
-            "cargo metadata failed in {}: {}",
-            crate_dir.display(),
-            String::from_utf8_lossy(&output.stderr)
+        return Err(CliError::UsageOwned(text::cargo_metadata_failed(
+            &crate_dir.display(),
+            &String::from_utf8_lossy(&output.stderr),
         )));
     }
-    let meta: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
-        CliError::UsageOwned(format!("cargo metadata emitted unparseable JSON: {e}"))
-    })?;
+    let meta: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| CliError::UsageOwned(text::cargo_metadata_unparsable(&e)))?;
     meta.get("target_directory")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            CliError::UsageOwned("cargo metadata reported no target_directory".to_owned())
-        })
+        .ok_or_else(|| CliError::UsageOwned(text::cargo_metadata_no_target_dir().to_owned()))
 }
 
 /// `ipe explain` has been folded into `ipe doc`.
@@ -3129,16 +3124,7 @@ pub fn cargo_target_directory(crate_dir: &Path) -> Result<PathBuf, CliError> {
 /// error so the dispatcher shows the `ipe doc` help page. The command is no
 /// longer advertised; the COMMANDS registry entry was removed.
 pub fn run_explain(_rest: &[String]) -> Result<(), CliError> {
-    Err(CliError::UsageOwned(
-        "`ipe explain` has moved: use `ipe doc <key>` instead\n\
-         \n\
-         Examples:\n\
-           ipe doc IPE-L0107   look up a diagnostic code\n\
-           ipe doc case        look up a language construct\n\
-           ipe doc List.map    look up a stdlib symbol\n\
-           ipe doc version     look up a command"
-            .to_owned(),
-    ))
+    Err(CliError::UsageOwned(text::explain_moved().to_owned()))
 }
 
 /// `ipe fix <path>` — apply machine-applicable fixes to the source file.
@@ -3479,7 +3465,7 @@ pub fn build_source_graph(entry: &Path) -> Result<SourceGraph, CliError> {
         .get(&collected.entry_module_path)
         .copied()
     else {
-        return Err(CliError::Usage("internal: entry module not in source map"));
+        return Err(CliError::Usage(text::internal_entry_not_in_source_map()));
     };
 
     Ok(SourceGraph {
@@ -3513,7 +3499,7 @@ pub fn user_sources_for_unsafe_scan(
             .iter()
             .map(|d| {
                 crate::io_bounded::read_to_string_capped(
-                    &d.path,
+                    d.path(),
                     crate::io_bounded::SOURCE_READ_CAP,
                 )
             })
@@ -3729,10 +3715,10 @@ pub fn named_sources_for_web_scan(
         let mut out = Vec::with_capacity(discovered.len());
         for m in &discovered {
             let src = crate::io_bounded::read_to_string_capped(
-                &m.path,
+                m.path(),
                 crate::io_bounded::SOURCE_READ_CAP,
             )?;
-            out.push((m.module_path.join("."), src));
+            out.push((m.module_path().join("."), src));
         }
         return Ok(out);
     }

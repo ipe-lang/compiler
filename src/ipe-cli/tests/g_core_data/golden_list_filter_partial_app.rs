@@ -68,7 +68,7 @@ fn list_filter_partial_app_compiles() {
     // CARGO_TARGET_TMPDIR copy above is fine for the compile-only check but
     // `crate::support::build_and_run_emitted` wants a dedicated directory it can
     // freely rewrite the manifest of).
-    let e2e_out = std::env::temp_dir().join("ipec_i161_list_filter_partial_app_e2e");
+    let e2e_out = crate::support::scratch_root().join("ipec_i161_list_filter_partial_app_e2e");
     let _ = std::fs::remove_dir_all(&e2e_out);
 
     let runtime = ipe::resolve_runtime();

@@ -17,7 +17,9 @@
 //!   symlinks (a cloned repository may force-add `out/`), so every product write,
 //!   copy, prune and removal takes an [`OwnedPath`] and re-checks each level as it
 //!   creates it; the final file is always replaced by a rename, never written
-//!   through.
+//!   through. Each level is held open and the next opened through it without
+//!   following a link, so a level swapped for a link between the check and the
+//!   act cannot redirect it.
 //! - [`OutputRoot`] — the CLI's output root (`<project>/out`, or `--out <dir>`),
 //!   additionally proven disjoint from the project's sources and from every
 //!   [`ReservedName`] directory (version-control metadata, any ipe cache
@@ -32,7 +34,9 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
-use crate::{CliError, io_err};
+use crate::{CliError, io_err, text};
+
+pub(crate) mod held;
 
 /// The file whose presence marks a directory as ipe-owned.
 pub const OWNERSHIP_MARKER: &str = ".ipe-output";
@@ -138,10 +142,18 @@ pub enum OutputRefusal {
         /// The ipe-owned tree that contains it.
         owner: PathBuf,
     },
-    /// A not-yet-existing tail of the path contains `..`.
+    /// A `..` of the path does not climb out of an existing directory that is not a link.
     ///
-    /// Where such a path lands cannot be proven before it is created.
+    /// Only out of such a directory do the lexical and the real parent agree on
+    /// every platform; a `..` over a missing level, a file, a link, or the root
+    /// has no landing point that can be proven.
     ParentTraversal(PathBuf),
+    /// The path names no single absolute place on every platform.
+    ///
+    /// A Windows drive-relative path (`C:x`) depends on a per-drive working
+    /// directory, and a `/` inside a verbatim (`\\?\`) component is a separator
+    /// on some platforms and part of a name on others.
+    Unplaceable(PathBuf),
     /// An ejected project must go to a fresh (absent or empty) directory.
     ///
     /// The result is handed to the user, so nothing already there may be replaced.
@@ -155,97 +167,59 @@ pub enum OutputRefusal {
         /// The project root it escapes.
         root: PathBuf,
     },
+    /// An owned directory's path now names a different directory than the one claimed.
+    Replaced(PathBuf),
+    /// A directory tree nests deeper than a walk over it is allowed to descend.
+    TooDeep {
+        /// The level at which the walk stopped.
+        path: PathBuf,
+        /// The deepest nesting the walk descends.
+        limit: usize,
+    },
+    /// A directory on the path is a Windows reparse point ipe cannot see through.
+    ///
+    /// A cloud-sync folder, a mount point, or a deduplicated directory may
+    /// lead anywhere, so ipe refuses to act inside one.
+    ReparsePoint(PathBuf),
 }
 
 impl std::fmt::Display for OutputRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Symlink(p) => write!(
-                f,
-                "{} is a symbolic link — ipe never writes or deletes through one; \
-                 remove it or point --out at a real directory",
-                p.display()
-            ),
-            Self::NotADirectory(p) => write!(f, "{} exists and is not a directory", p.display()),
-            Self::NotIpeOwned(p) => write!(
-                f,
-                "{} already holds files ipe did not create (no `{OWNERSHIP_MARKER}` marker); \
-                 ipe never overwrites them — remove the directory yourself or choose another --out",
-                p.display()
-            ),
-            Self::ProjectRoot(p) => write!(
-                f,
-                "{} is the project root — build output goes in a separate directory \
-                 (the default is `out/`)",
-                p.display()
-            ),
-            Self::ContainsProject { out, project } => write!(
-                f,
-                "{} contains the project at {} — build output must not enclose your sources",
-                out.display(),
-                project.display()
-            ),
-            Self::InsideSources { out, sources } => write!(
-                f,
-                "{} is inside the source root {} — build output must stay out of your sources",
-                out.display(),
-                sources.display()
-            ),
-            Self::UnresolvedSources(p) => write!(
-                f,
-                "the source root {} cannot be resolved — ipe cannot prove the output stays \
-                 out of your sources; create it or fix `package.ipe`",
-                p.display()
-            ),
-            Self::InsideIpeOwned { out, owner } => write!(
-                f,
-                "{} is inside {}, which ipe owns and may delete (`ipe clean`) — an ejected \
-                 project must live outside ipe's output and cache; choose another --out",
-                out.display(),
-                owner.display()
-            ),
+        let message = match self {
+            Self::Symlink(p) => text::output_symlink(&p.display()),
+            Self::NotADirectory(p) => text::output_not_a_directory(&p.display()),
+            Self::NotIpeOwned(p) => text::output_not_ipe_owned(&p.display(), &OWNERSHIP_MARKER),
+            Self::ProjectRoot(p) => text::output_project_root(&p.display()),
+            Self::ContainsProject { out, project } => {
+                text::output_contains_project(&out.display(), &project.display())
+            }
+            Self::InsideSources { out, sources } => {
+                text::output_inside_sources(&out.display(), &sources.display())
+            }
+            Self::UnresolvedSources(p) => text::output_unresolved_sources(&p.display()),
+            Self::InsideIpeOwned { out, owner } => {
+                text::output_inside_ipe_owned(&out.display(), &owner.display())
+            }
             Self::InsideReservedDir {
                 out,
                 reserved: ReservedName::Vcs,
-            } => write!(
-                f,
-                "{} is inside a `.git` directory — build output must stay out of version-control \
-                 metadata; choose another --out",
-                out.display()
-            ),
+            } => text::output_inside_vcs(&out.display()),
             Self::InsideReservedDir {
                 out,
                 reserved: ReservedName::CacheNamespace,
-            } => write!(
-                f,
-                "{} is inside a `{CACHE_NAMESPACE_DIR}` directory, whose contents ipe deletes \
-                 by name (`ipe clean`) in whichever project holds it — output must stay out \
-                 of every ipe cache namespace; choose another --out",
-                out.display()
-            ),
-            Self::ParentTraversal(p) => write!(
-                f,
-                "{} has a `..` in a part that does not exist yet — name the directory directly",
-                p.display()
-            ),
-            Self::NotFresh(p) => write!(
-                f,
-                "{} is not empty — eject writes a new project, so point --out at an absent \
-                 or empty directory",
-                p.display()
-            ),
-            Self::UnsafeComponent(p) => write!(
-                f,
-                "{} is not a plain relative path — refusing to write it",
-                p.display()
-            ),
-            Self::OutsideProject { path, root } => write!(
-                f,
-                "{} resolves outside the project at {} — a directory walk never rewrites it",
-                path.display(),
-                root.display()
-            ),
-        }
+            } => text::output_inside_cache_namespace(&out.display(), &CACHE_NAMESPACE_DIR),
+            Self::ParentTraversal(p) => text::output_parent_traversal(&p.display()),
+            Self::Unplaceable(p) => text::output_unplaceable(&p.display()),
+            Self::NotFresh(p) => text::output_not_fresh(&p.display()),
+            Self::UnsafeComponent(p) => text::output_unsafe_component(&p.display()),
+            Self::OutsideProject { path, root } => {
+                text::output_outside_project(&path.display(), &root.display())
+            }
+            Self::Replaced(p) => text::output_replaced(&p.display()),
+            Self::TooDeep { path, limit } => text::output_too_deep(&path.display(), limit),
+            Self::ReparsePoint(p) => text::output_reparse_point(&p.display()),
+        };
+        f.write_str(&message)
     }
 }
 
@@ -257,9 +231,14 @@ impl From<OutputRefusal> for CliError {
 
 /// A directory proven ipe-owned: not a symlink, and carrying the marker.
 ///
-/// The only constructor is [`OwnedDir::claim`].
+/// The only constructor is [`OwnedDir::claim`]. It also records the
+/// directory's identity (device and inode, or volume and file index): every [`OwnedPath`] operation
+/// refuses to act once the path names a different directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedDir(PathBuf);
+pub struct OwnedDir {
+    path: PathBuf,
+    id: held::DirId,
+}
 
 impl OwnedDir {
     /// Claim `path` for ipe output.
@@ -275,18 +254,13 @@ impl OwnedDir {
     /// [`CliError::OutputRefused`] on a refusal; [`CliError::Io`] on a
     /// filesystem failure.
     pub fn claim(path: &Path) -> Result<Self, CliError> {
-        if check_claimable(path)? {
-            adopt(path)?;
-        } else {
-            create_marked(path)?;
-        }
-        Ok(Self(path.to_path_buf()))
+        claim_owned(path)
     }
 
     /// The owned directory's path.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 
     /// Claim the owned subdirectory `name`, a single plain path component.
@@ -297,7 +271,7 @@ impl OwnedDir {
     pub fn child(&self, name: &str) -> Result<Self, CliError> {
         let mut parts = Path::new(name).components();
         match (parts.next(), parts.next()) {
-            (Some(Component::Normal(_)), None) => Self::claim(&self.0.join(name)),
+            (Some(Component::Normal(_)), None) => self.claim_child(name),
             _ => Err(OutputRefusal::UnsafeComponent(PathBuf::from(name)).into()),
         }
     }
@@ -305,14 +279,53 @@ impl OwnedDir {
     /// A product path `rel` below this directory, checked level by level.
     ///
     /// `rel` must be plain names only. Every level that already exists is
-    /// lstat'd: a symlink anywhere — an intermediate directory or the final
-    /// entry — is refused, as is a non-directory where a directory is needed.
+    /// checked without following a link: a symlink anywhere — an intermediate
+    /// directory or the final entry — is refused, as is a non-directory where a
+    /// directory is needed.
     ///
     /// # Errors
     /// [`CliError::OutputRefused`] on a refusal; [`CliError::Io`] on a
     /// filesystem failure.
     pub fn path_to(&self, rel: impl AsRef<Path>) -> Result<OwnedPath, CliError> {
-        let rel = rel.as_ref();
+        let owned = self.owned_path(rel.as_ref())?;
+        owned.check()?;
+        Ok(owned)
+    }
+
+    /// Unlink the non-directory entry `rel` below this directory.
+    ///
+    /// `rel` must be plain names only, and every directory above the entry is
+    /// checked as [`OwnedDir::path_to`] checks it. A symlink at `rel` itself is
+    /// removed as the link it is, never followed. An absent entry is already
+    /// removed.
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] on a refusal; [`CliError::Io`] on a
+    /// filesystem failure, a directory at `rel` included.
+    pub fn unlink(&self, rel: impl AsRef<Path>) -> Result<(), CliError> {
+        self.owned_path(rel.as_ref())?.unlink()
+    }
+
+    /// Claim the plain-named subdirectory `name` through this directory's held handle.
+    fn claim_child(&self, name: &str) -> Result<Self, CliError> {
+        let parent = held::HeldDir::open(&self.path)?.ok_or_else(|| {
+            io_err(
+                &self.path,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            )
+        })?;
+        if parent.id()? != self.id {
+            return Err(OutputRefusal::Replaced(self.path.clone()).into());
+        }
+        let dir = claim_in(&parent, std::ffi::OsStr::new(name))?;
+        Ok(Self {
+            path: self.path.join(name),
+            id: dir.id()?,
+        })
+    }
+
+    /// The [`OwnedPath`] for `rel`, refused unless it is one or more plain names.
+    fn owned_path(&self, rel: &Path) -> Result<OwnedPath, CliError> {
         let mut parts: Vec<std::ffi::OsString> = Vec::new();
         for component in rel.components() {
             match component {
@@ -328,35 +341,69 @@ impl OwnedDir {
         if parts.is_empty() {
             return Err(OutputRefusal::UnsafeComponent(rel.to_path_buf()).into());
         }
-        let owned = OwnedPath {
-            root: self.0.clone(),
+        Ok(OwnedPath {
+            root: self.path.clone(),
+            root_id: self.id,
             parts,
-        };
-        owned.walk(Walk::Check)?;
-        Ok(owned)
+        })
     }
 }
 
-/// How far an [`OwnedPath`] walk goes and whether it creates missing levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Walk {
-    /// Check every existing level, final entry included; create nothing.
-    Check,
-    /// Create the missing directories above the final entry.
-    CreateParents,
-    /// Create the missing directories, the final entry included.
-    CreateAll,
+/// Claim `path` through held directory handles.
+fn claim_owned(path: &Path) -> Result<OwnedDir, CliError> {
+    let dir = claim_held(path)?;
+    Ok(OwnedDir {
+        path: path.to_path_buf(),
+        id: dir.id()?,
+    })
+}
+
+/// Claim `path` as [`OwnedDir::claim`] does, returning the claimed directory's handle.
+///
+/// Each directory ipe creates or adopts is opened relative to its held parent
+/// without following a link, and is marked or adopted through that handle. An
+/// existing ancestor is left as it is. The recursion is bounded by the path's
+/// component count.
+fn claim_held(path: &Path) -> Result<held::HeldDir, CliError> {
+    if let Some(dir) = held::HeldDir::open(path)? {
+        dir.adopt()?;
+        return Ok(dir);
+    }
+    let Some(name) = path.file_name() else {
+        return Err(OutputRefusal::ParentTraversal(path.to_path_buf()).into());
+    };
+    let parent_path = path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = match held::HeldDir::open_following(parent_path)? {
+        Some(parent) => parent,
+        None => claim_held(parent_path)?,
+    };
+    claim_in(&parent, name)
+}
+
+/// Claim the entry `name` of the held `parent`: created and marked when absent, else adopted.
+fn claim_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::HeldDir, CliError> {
+    let (dir, created) = parent.create_child(name)?;
+    if created {
+        dir.write_marker()?;
+    } else {
+        dir.adopt()?;
+    }
+    Ok(dir)
 }
 
 /// A path under an [`OwnedDir`] with no symlink at any level.
 ///
 /// Built only by [`OwnedDir::path_to`]. Every operation re-walks the levels
-/// (lstat, never following a link) before it touches the filesystem, and a
-/// final file is always replaced through an exclusively created temp file and a
-/// rename, so a symlink planted at the target is replaced, never written through.
+/// before it touches the filesystem, never following a link. The walk
+/// holds each level open and opens the next through it, the root is proven
+/// to be the directory that was claimed, and every create, rename, and unlink
+/// names one entry of a held directory — a level swapped for a link after the
+/// check cannot redirect the act. A final file is always replaced through an
+/// exclusively created temp file and a rename, so it is never written through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedPath {
     root: PathBuf,
+    root_id: held::DirId,
     parts: Vec<std::ffi::OsString>,
 }
 
@@ -367,48 +414,6 @@ impl OwnedPath {
         let mut full = self.root.clone();
         full.extend(&self.parts);
         full
-    }
-
-    /// Lstat each level below the root, creating missing directories as `mode` asks.
-    fn walk(&self, mode: Walk) -> Result<(), CliError> {
-        let mut current = self.root.clone();
-        let last = self.parts.len().saturating_sub(1);
-        for (index, part) in self.parts.iter().enumerate() {
-            current.push(part);
-            let is_last = index == last;
-            let wants_dir = !is_last || mode == Walk::CreateAll;
-            let creates = match mode {
-                Walk::Check => false,
-                Walk::CreateParents => !is_last,
-                Walk::CreateAll => true,
-            };
-            match std::fs::symlink_metadata(&current) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if !creates {
-                        return Ok(());
-                    }
-                    match std::fs::create_dir(&current) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            reject_link_or_file(&current, true)?;
-                        }
-                        Err(e) => return Err(io_err(&current, e)),
-                    }
-                }
-                Err(e) => return Err(io_err(&current, e)),
-                Ok(_) => reject_link_or_file(&current, wants_dir)?,
-            }
-        }
-        Ok(())
-    }
-
-    /// Create the directory itself (and every missing level above it).
-    ///
-    /// # Errors
-    /// [`CliError::OutputRefused`] for a symlink or file on the way;
-    /// [`CliError::Io`] on a filesystem failure.
-    pub fn ensure_dir(&self) -> Result<(), CliError> {
-        self.walk(Walk::CreateAll)
     }
 
     /// Replace the file with `contents`, atomically.
@@ -434,6 +439,80 @@ impl OwnedPath {
             std::io::copy(&mut reader, file).map(|_| ())
         })
     }
+}
+
+/// The directory holding an [`OwnedPath`]'s final entry, with that entry's name.
+type HeldParent<'a> = (held::HeldDir, &'a std::ffi::OsStr);
+
+impl OwnedPath {
+    /// Hold the root, proven to be the directory that was claimed.
+    ///
+    /// `Ok(None)` when absent.
+    fn held_root(&self) -> Result<Option<held::HeldDir>, CliError> {
+        let Some(root) = held::HeldDir::open(&self.root)? else {
+            return Ok(None);
+        };
+        if root.id()? != self.root_id {
+            return Err(OutputRefusal::Replaced(self.root.clone()).into());
+        }
+        held::level_held(&self.root);
+        Ok(Some(root))
+    }
+
+    /// Hold the directory above the final entry, creating missing levels when `create`.
+    ///
+    /// `Ok(None)` when the root, or (without `create`) a level, is absent.
+    fn held_parent(&self, create: bool) -> Result<Option<HeldParent<'_>>, CliError> {
+        let Some((last, above)) = self.parts.split_last() else {
+            return Err(OutputRefusal::UnsafeComponent(self.path()).into());
+        };
+        let Some(mut dir) = self.held_root()? else {
+            return Ok(None);
+        };
+        for part in above {
+            let next = if create {
+                Some(dir.create_child(part)?.0)
+            } else {
+                dir.child(part)?
+            };
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            held::level_held(next.path());
+            dir = next;
+        }
+        Ok(Some((dir, last.as_os_str())))
+    }
+
+    /// Hold the directory above the final entry, creating every missing level.
+    fn created_parent(&self) -> Result<HeldParent<'_>, CliError> {
+        self.held_parent(true)?.ok_or_else(|| {
+            io_err(
+                &self.root,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            )
+        })
+    }
+
+    /// Check every existing level, final entry included; create nothing.
+    fn check(&self) -> Result<(), CliError> {
+        match self.held_parent(false)? {
+            Some((dir, name)) if dir.kind_of(name)? == held::EntryKind::Symlink => {
+                Err(OutputRefusal::Symlink(self.path()).into())
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// Create the directory itself (and every missing level above it).
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] for a symlink or file on the way;
+    /// [`CliError::Io`] on a filesystem failure.
+    pub fn ensure_dir(&self) -> Result<(), CliError> {
+        let (dir, name) = self.created_parent()?;
+        dir.create_child(name).map(|_| ())
+    }
 
     /// Remove the entry — a whole directory tree or a single file.
     ///
@@ -443,18 +522,14 @@ impl OwnedPath {
     /// [`CliError::OutputRefused`] for a symlink on the way; [`CliError::Io`] on a
     /// filesystem failure.
     pub fn remove(&self) -> Result<(), CliError> {
-        self.walk(Walk::Check)?;
-        let full = self.path();
-        match std::fs::symlink_metadata(&full) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&full, e)),
-            Ok(meta) if meta.file_type().is_symlink() => Err(OutputRefusal::Symlink(full).into()),
-            // `remove_dir_all` never follows a symlink met inside the tree.
-            Ok(meta) if meta.is_dir() => {
-                std::fs::remove_dir_all(&full).map_err(|e| io_err(&full, e))
-            }
-            Ok(_) => std::fs::remove_file(&full).map_err(|e| io_err(&full, e)),
-        }
+        self.held_parent(false)?
+            .map_or(Ok(()), |(dir, name)| dir.remove_entry(name))
+    }
+
+    /// Unlink the non-directory final entry; a symlink is removed, never followed.
+    fn unlink(&self) -> Result<(), CliError> {
+        self.held_parent(false)?
+            .map_or(Ok(()), |(dir, name)| dir.unlink(name))
     }
 
     /// Fill an exclusively created sibling temp file, then rename it over the target.
@@ -463,54 +538,65 @@ impl OwnedPath {
         permissions: Option<std::fs::Permissions>,
         fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     ) -> Result<(), CliError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        self.walk(Walk::CreateParents)?;
-        let target = self.path();
-        let parent = target.parent().unwrap_or(&self.root).to_path_buf();
-        let name = target
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let tmp = parent.join(format!(
-            ".{name}.ipe-tmp.{}.{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .and_then(|mut file| {
-                fill(&mut file)?;
-                if let Some(permissions) = permissions {
-                    file.set_permissions(permissions)?;
-                }
-                Ok(())
-            });
-        if let Err(e) = written {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            return Err(io_err(&tmp, e));
+        let (dir, name) = self.created_parent()?;
+        dir.write_file(name, permissions, fill)
+    }
+
+    /// Whether the entry is a regular file holding exactly `contents`.
+    ///
+    /// The file is read through the held directory above it, never through a
+    /// link; an absent entry does not hold them.
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] for a symlink on the way, the entry itself
+    /// included; [`CliError::Io`] on a filesystem failure.
+    pub fn holds(&self, contents: &[u8]) -> Result<bool, CliError> {
+        let Some((dir, name)) = self.held_parent(false)? else {
+            return Ok(false);
+        };
+        if dir.kind_of(name)? == held::EntryKind::Symlink {
+            return Err(OutputRefusal::Symlink(self.path()).into());
         }
-        if let Err(e) = std::fs::rename(&tmp, &target) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(io_err(&target, e));
-        }
-        Ok(())
+        Ok(dir.holds_contents(name, contents))
+    }
+
+    /// Unlink every file under this directory whose path relative to the owned root `keep` rejects.
+    ///
+    /// The walk holds each level open and descends relative to it, so a level
+    /// swapped for a link mid-walk is refused, never followed; a link inside the
+    /// tree is judged and removed as the link it is. Directories are kept. An
+    /// absent directory has nothing to prune.
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] for a symlink on the way, or with
+    /// [`OutputRefusal::TooDeep`] past `max_depth`; [`CliError::Io`] on a
+    /// filesystem failure.
+    pub fn prune_files(
+        &self,
+        keep: impl Fn(&Path) -> bool,
+        max_depth: usize,
+    ) -> Result<(), CliError> {
+        let Some((parent, name)) = self.held_parent(false)? else {
+            return Ok(());
+        };
+        let Some(dir) = parent.child(name)? else {
+            return Ok(());
+        };
+        held::level_held(dir.path());
+        let mut rel: PathBuf = self.parts.iter().collect();
+        dir.prune(&mut rel, &keep, 0, max_depth)
     }
 }
 
-/// Refuse a symlink at `path`, and a non-directory when `wants_dir`.
-fn reject_link_or_file(path: &Path, wants_dir: bool) -> Result<(), CliError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| io_err(path, e))?;
-    if meta.file_type().is_symlink() {
-        return Err(OutputRefusal::Symlink(path.to_path_buf()).into());
-    }
-    if wants_dir && !meta.is_dir() {
-        return Err(OutputRefusal::NotADirectory(path.to_path_buf()).into());
-    }
-    Ok(())
+/// A process-unique suffix (`<pid>.<n>`) for a temp file name.
+fn temp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The canonical `path`, proven to lie under the canonical `root`.
@@ -562,40 +648,6 @@ fn check_claimable(path: &Path) -> Result<bool, CliError> {
     }
 }
 
-/// Mark an existing claimable directory (see [`check_claimable`]).
-fn adopt(path: &Path) -> Result<(), CliError> {
-    if has_marker(path)? {
-        Ok(())
-    } else {
-        write_marker(path)
-    }
-}
-
-/// Create `path` and each missing ancestor, marking every directory created here.
-///
-/// An existing ancestor is left as it is; a level that appears concurrently is
-/// re-checked as an existing one. The recursion is bounded by the path's
-/// component count.
-fn create_marked(path: &Path) -> Result<(), CliError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && !check_exists(parent)?
-    {
-        create_marked(parent)?;
-    }
-    match std::fs::create_dir(path) {
-        Ok(()) => write_marker(path),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if check_claimable(path)? {
-                adopt(path)
-            } else {
-                Err(io_err(path, e))
-            }
-        }
-        Err(e) => Err(io_err(path, e)),
-    }
-}
-
 fn check_exists(path: &Path) -> Result<bool, CliError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -625,36 +677,6 @@ pub fn has_marker(dir: &Path) -> Result<bool, CliError> {
         .read_to_end(&mut head)
         .map_err(|e| io_err(&marker, e))?;
     Ok(head.starts_with(MARKER_HEADER.as_bytes()))
-}
-
-/// Write the marker atomically through a uniquely named temp file and a rename.
-///
-/// A concurrent claimer never reads a half-written marker. The temp name
-/// (`.ipe-output.<pid>.<n>.tmp`) is the one other name [`is_empty_dir`]
-/// tolerates, so a claim in flight never makes the directory look user-owned.
-fn write_marker(dir: &Path) -> Result<(), CliError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let marker = dir.join(OWNERSHIP_MARKER);
-    let tmp = dir.join(format!(
-        "{OWNERSHIP_MARKER}.{}.{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut file| file.write_all(MARKER_TEXT.as_bytes()));
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_err(&tmp, e));
-    }
-    if let Err(e) = std::fs::rename(&tmp, &marker) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_err(&marker, e));
-    }
-    Ok(())
 }
 
 /// Whether `name` is the marker or an in-flight marker temp file.
@@ -790,7 +812,12 @@ impl ProjectPaths {
 /// an owned root). The areas themselves are created — and marked — only when a
 /// product is written, so a refused or failed build leaves no directory behind.
 #[derive(Debug, Clone)]
-pub struct OutputRoot(PathBuf);
+pub struct OutputRoot {
+    /// The absolute root path.
+    path: ProvenOutPath,
+    /// The project the root was proven disjoint from, proven again at claim time.
+    project: ProjectPaths,
+}
 
 impl OutputRoot {
     /// Resolve the output root from `--out <dir>` or the default `out/`.
@@ -809,11 +836,12 @@ impl OutputRoot {
             || project.default_base.join(DEFAULT_OUTPUT_DIR),
             PathBuf::from,
         );
-        let checked = check_disjoint(&raw, project)?.absolute;
-        if check_claimable(&checked)? {
-            adopt(&checked)?;
-        }
-        Ok(Self(checked))
+        let checked = check_disjoint(&raw, project)?;
+        adopt_checked(&checked)?;
+        Ok(Self {
+            path: checked.absolute,
+            project: project.clone(),
+        })
     }
 
     /// Resolve a fresh directory for a project handed to the user (`ipe eject`).
@@ -833,17 +861,18 @@ impl OutputRoot {
         let checked = check_disjoint(&raw, project)?;
         check_outside_default_output(&raw, &checked, project)?;
         check_no_marked_ancestor(&raw, &checked.resolved)?;
-        check_fresh(&raw, &checked.absolute)?;
+        check_fresh(&raw, checked.absolute.as_path())?;
         Ok(HandoverRoot {
             raw,
             path: checked.absolute,
+            project: project.clone(),
         })
     }
 
     /// The root directory itself.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.0
+        self.path.as_path()
     }
 
     /// The path of a (possibly nested) product area, e.g. `release/rust`.
@@ -855,7 +884,7 @@ impl OutputRoot {
     /// # Errors
     /// [`CliError::OutputRefused`] for an unclaimable existing level.
     pub fn area_path(&self, areas: &[OutputArea]) -> Result<PathBuf, CliError> {
-        let mut path = self.0.clone();
+        let mut path = self.path.as_path().to_path_buf();
         for area in areas {
             path.push(area.dir_name());
             check_claimable(&path)?;
@@ -868,16 +897,50 @@ impl OutputRoot {
     /// # Errors
     /// As [`OutputRoot::area_path`] and [`OwnedDir::claim`].
     pub fn claim_area(&self, areas: &[OutputArea]) -> Result<OwnedDir, CliError> {
-        OwnedDir::claim(&self.area_path(areas)?)
+        self.area_path(areas)?;
+        let mut dir = self.claim()?;
+        for area in areas {
+            dir = dir.child(area.dir_name())?;
+        }
+        Ok(dir)
     }
 
     /// Claim the root itself for writing now.
     ///
+    /// The disjointness proof is taken again on the held handle of the
+    /// deepest existing level, and every missing level is created and marked
+    /// through the handle above it — a level swapped after the proof cannot
+    /// redirect the claim into the project.
+    ///
     /// # Errors
-    /// As [`OwnedDir::claim`].
+    /// As [`OutputRoot::resolve`] and [`OwnedDir::claim`].
     pub fn claim(&self) -> Result<OwnedDir, CliError> {
-        OwnedDir::claim(&self.0)
+        let checked = check_disjoint(self.path.as_path(), &self.project)?;
+        let anchor = checked.anchor;
+        held::level_held(anchor.dir.path());
+        if anchor.tail.is_empty() {
+            anchor.dir.adopt()?;
+        }
+        let mut dir = anchor.dir;
+        for name in &anchor.tail {
+            dir = claim_in(&dir, name)?;
+            held::level_held(dir.path());
+        }
+        Ok(OwnedDir {
+            path: checked.absolute.0,
+            id: dir.id()?,
+        })
     }
+}
+
+/// Mark the proven output when it already exists, refusing a link or user territory.
+///
+/// Absent is left absent.
+fn adopt_checked(checked: &Disjoint) -> Result<(), CliError> {
+    if checked.anchor.tail.is_empty() {
+        checked.anchor.dir.adopt()?;
+    }
+    Ok(())
 }
 
 /// A fresh destination for a tree handed over to the user, proven outside ipe's trees.
@@ -888,14 +951,16 @@ pub struct HandoverRoot {
     /// The path as the user named it, for refusals.
     raw: PathBuf,
     /// The absolute path to claim.
-    path: PathBuf,
+    path: ProvenOutPath,
+    /// The project the destination was proven disjoint from.
+    project: ProjectPaths,
 }
 
 impl HandoverRoot {
     /// The destination directory.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.path.as_path()
     }
 
     /// Claim the destination for writing, marking it and no ancestor.
@@ -906,19 +971,49 @@ impl HandoverRoot {
     /// marked ancestor, an absent or empty destination — are proven again here,
     /// at the moment of creation.
     ///
+    /// Every proof is taken on held handles: the disjointness proof on
+    /// the deepest existing level, the marker search on the directories above it
+    /// reached through `..` of that handle, and each missing level is created
+    /// through the handle above it — a level swapped mid-walk cannot redirect
+    /// the claim.
+    ///
     /// # Errors
     /// [`CliError::OutputRefused`] on a refusal; [`CliError::Io`] on a
     /// filesystem failure.
     pub fn claim(&self) -> Result<HandoverDir, CliError> {
-        let resolved = resolve_through_existing(&self.path)
-            .ok_or_else(|| OutputRefusal::ParentTraversal(self.raw.clone()))?;
-        check_no_reserved_component(&self.raw, &resolved)?;
-        check_no_marked_ancestor(&self.raw, &resolved)?;
-        check_fresh(&self.raw, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            create_unmarked_dirs(parent)?;
+        let checked = check_disjoint(self.path.as_path(), &self.project)?;
+        check_outside_default_output(&self.raw, &checked, &self.project)?;
+        let anchor = checked.anchor;
+        check_no_marked_ancestor_held(&self.raw, &anchor)?;
+        held::level_held(anchor.dir.path());
+        let dir = match anchor.tail.split_last() {
+            None => anchor.dir,
+            Some((last, above)) => {
+                let mut dir = anchor.dir;
+                for name in above {
+                    dir = dir.create_child(name)?.0;
+                    held::level_held(dir.path());
+                    if dir.has_marker()? {
+                        return Err(OutputRefusal::InsideIpeOwned {
+                            out: self.raw.clone(),
+                            owner: dir.path().to_path_buf(),
+                        }
+                        .into());
+                    }
+                }
+                let (dir, _) = dir.create_child(last)?;
+                held::level_held(dir.path());
+                dir
+            }
+        };
+        if !dir.is_empty()? {
+            return Err(OutputRefusal::NotFresh(self.raw.clone()).into());
         }
-        OwnedDir::claim(&self.path).map(HandoverDir)
+        dir.adopt()?;
+        Ok(HandoverDir(OwnedDir {
+            path: checked.absolute.0,
+            id: dir.id()?,
+        }))
     }
 }
 
@@ -944,13 +1039,8 @@ impl HandoverDir {
     /// # Errors
     /// [`CliError::Io`] when the marker cannot be removed.
     pub fn release_to_user(self) -> Result<PathBuf, CliError> {
-        let OwnedDir(dir) = self.0;
-        let marker = dir.join(OWNERSHIP_MARKER);
-        match std::fs::remove_file(&marker) {
-            Ok(()) => Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(dir),
-            Err(e) => Err(io_err(&marker, e)),
-        }
+        self.0.unlink(OWNERSHIP_MARKER)?;
+        Ok(self.0.path)
     }
 }
 
@@ -972,9 +1062,10 @@ fn check_outside_default_output(
     checked: &Disjoint,
     project: &ProjectPaths,
 ) -> Result<(), CliError> {
-    let default_out = absolutize(&project.default_base.join(DEFAULT_OUTPUT_DIR))?;
-    let owner = resolve_through_existing(&default_out)
-        .ok_or_else(|| OutputRefusal::ParentTraversal(default_out.clone()))?;
+    let default_raw = project.default_base.join(DEFAULT_OUTPUT_DIR);
+    let default_out = prove_parent_steps(&default_raw)?;
+    let owner = resolve_through_existing(default_out.as_path())
+        .ok_or_else(|| OutputRefusal::ParentTraversal(default_raw.clone()))?;
     if starts_with(&checked.resolved, &owner) {
         return Err(OutputRefusal::InsideIpeOwned {
             out: raw.to_path_buf(),
@@ -1023,33 +1114,35 @@ fn check_no_marked_ancestor(raw: &Path, resolved: &Path) -> Result<(), CliError>
     Ok(())
 }
 
-/// Create `dir` and each missing ancestor as plain directories, marking none.
+/// Refuse a handover destination with an ipe-marked directory above its held anchor.
 ///
-/// The deepest existing level must be a directory; a level that appears
-/// concurrently must be a real directory, never a symlink. The walk is bounded
-/// by the path's component count.
-fn create_unmarked_dirs(dir: &Path) -> Result<(), CliError> {
-    let mut missing: Vec<&Path> = Vec::new();
-    for level in dir.ancestors() {
-        if level.as_os_str().is_empty() {
-            break;
+/// The directories above are reached through `..` of the held handles, and each
+/// must still be the one its canonical path names — a level swapped mid-walk is
+/// refused with [`OutputRefusal::Replaced`]. Bounded by the anchor's component
+/// count.
+fn check_no_marked_ancestor_held(raw: &Path, anchor: &Anchor) -> Result<(), CliError> {
+    let marked = |owner: &Path| -> CliError {
+        OutputRefusal::InsideIpeOwned {
+            out: raw.to_path_buf(),
+            owner: owner.to_path_buf(),
         }
-        if check_exists(level)? {
-            if !level.is_dir() {
-                return Err(OutputRefusal::NotADirectory(level.to_path_buf()).into());
-            }
-            break;
-        }
-        missing.push(level);
+        .into()
+    };
+    if !anchor.tail.is_empty() && anchor.dir.has_marker()? {
+        return Err(marked(&anchor.real));
     }
-    for level in missing.into_iter().rev() {
-        match std::fs::create_dir(level) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                reject_link_or_file(level, true)?;
-            }
-            Err(e) => return Err(io_err(level, e)),
+    let mut level = anchor.dir.parent()?;
+    for owner in anchor.real.ancestors().skip(1) {
+        let Some(dir) = level else {
+            return Err(OutputRefusal::Replaced(raw.to_path_buf()).into());
+        };
+        if dir.has_marker()? {
+            return Err(marked(owner));
         }
+        level = dir.parent()?;
+    }
+    if level.is_some() {
+        return Err(OutputRefusal::Replaced(raw.to_path_buf()).into());
     }
     Ok(())
 }
@@ -1058,26 +1151,218 @@ fn create_unmarked_dirs(dir: &Path) -> Result<(), CliError> {
 #[derive(Debug)]
 struct Disjoint {
     /// The absolute path to claim.
-    absolute: PathBuf,
+    absolute: ProvenOutPath,
     /// The path with its existing part canonicalised.
     resolved: PathBuf,
+    /// The held deepest existing level the proof was taken on.
+    anchor: Anchor,
+}
+
+/// The deepest existing level of an output path, held open.
+#[derive(Debug)]
+struct Anchor {
+    /// The held level.
+    dir: held::HeldDir,
+    /// Its canonical path, proven to name `dir` when the proof was taken.
+    real: PathBuf,
+    /// The missing levels below it, outermost first.
+    tail: Vec<std::ffi::OsString>,
+}
+
+/// An absolute output path with no `..` or `.` component.
+///
+/// Built only by [`prove_parent_steps_from`], the one place a requested path is
+/// made absolute: a relative request is walked on from the working directory,
+/// component by component, and each `..` is resolved there, lexically, once
+/// the level it climbs out of is proven an existing directory that is not a
+/// link. No `Path::join`/`push` ever sees a requested `..` or `.` (onto a
+/// Windows verbatim `\\?\` base it collapses them unproven), and no later walk
+/// meets a `..` for a platform to interpret its own way (Windows collapses
+/// `..` lexically, POSIX follows the real parent).
+#[derive(Debug, Clone)]
+struct ProvenOutPath(PathBuf);
+
+impl ProvenOutPath {
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Make `raw` absolute against the working directory, resolving every `..`.
+///
+/// As [`prove_parent_steps_from`] with the working directory, read only for a
+/// relative `raw`.
+///
+/// # Errors
+/// As [`prove_parent_steps_from`]; [`CliError::Io`] when the working
+/// directory cannot be read.
+fn prove_parent_steps(raw: &Path) -> Result<ProvenOutPath, CliError> {
+    if raw.is_absolute() {
+        return prove_parent_steps_from(raw, Path::new(""));
+    }
+    let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
+    prove_parent_steps_from(raw, &cwd)
+}
+
+/// Make `raw` absolute against `cwd`, resolving every `..` out of a proven plain directory.
+///
+/// The components of `cwd` (all of it for a relative `raw`, only its drive
+/// for a Windows rooted `\x`, none for an absolute `raw`) and of `raw` are
+/// walked as one sequence; nothing is joined before the walk, so every `..`
+/// the user wrote reaches the proof whatever form `cwd` takes. A `..` is
+/// honoured only when the level it climbs out of exists as a directory that
+/// is not a link, reached through the already resolved levels above it; the
+/// level is then popped. Out of such a level the lexical and the real parent
+/// are the same directory, so the result names on every platform what POSIX
+/// would. A `..` over a missing level, a file, a link, or the root is
+/// refused. Bounded by the component count.
+///
+/// # Errors
+/// [`OutputRefusal::ParentTraversal`] for an unproven `..`;
+/// [`OutputRefusal::Unplaceable`] for a path that does not name one absolute
+/// place: a Windows drive-relative `C:x`, a rooted `\x` against a working
+/// directory with no drive, or a component that is not one plain name where
+/// it lands (a `/` inside a verbatim `\\?\` component, an `a:b` that Windows
+/// reads as a drive); [`CliError::Io`] when a level cannot be inspected.
+fn prove_parent_steps_from(raw: &Path, cwd: &Path) -> Result<ProvenOutPath, CliError> {
+    let traversal = || -> CliError { OutputRefusal::ParentTraversal(raw.to_path_buf()).into() };
+    let unplaceable = || -> CliError { OutputRefusal::Unplaceable(raw.to_path_buf()).into() };
+    let base = if raw.is_absolute() {
+        Path::new("")
+    } else {
+        match raw.components().next() {
+            Some(Component::Prefix(_)) => return Err(unplaceable()),
+            Some(Component::RootDir) => drive_of(cwd).ok_or_else(unplaceable)?,
+            Some(Component::CurDir | Component::ParentDir | Component::Normal(_)) | None => cwd,
+        }
+    };
+    let mut proven = PathBuf::new();
+    for component in base.components().chain(raw.components()) {
+        match component {
+            Component::Prefix(_) | Component::RootDir => proven.push(component),
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                if !is_one_name(name) {
+                    return Err(unplaceable());
+                }
+                proven.push(name);
+            }
+            Component::ParentDir => {
+                if proven.file_name().is_none() {
+                    return Err(traversal());
+                }
+                match held::HeldDir::open(&proven) {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(CliError::OutputRefused(_)) => return Err(traversal()),
+                    Err(e) => return Err(e),
+                }
+                if !proven.pop() {
+                    return Err(traversal());
+                }
+            }
+        }
+    }
+    if !proven.is_absolute() {
+        return Err(unplaceable());
+    }
+    Ok(ProvenOutPath(proven))
+}
+
+/// The drive prefix of `cwd`, the base of a Windows rooted `\x`.
+fn drive_of(cwd: &Path) -> Option<&Path> {
+    match cwd.components().next() {
+        Some(prefix @ Component::Prefix(_)) => Some(Path::new(prefix.as_os_str())),
+        Some(
+            Component::RootDir | Component::CurDir | Component::ParentDir | Component::Normal(_),
+        )
+        | None => None,
+    }
+}
+
+/// Whether `name` reads back as exactly itself, one plain component.
+///
+/// A name that reads as more — a `/` split by a non-verbatim parse, an `a:b`
+/// Windows takes for a drive prefix that would replace the path it is pushed
+/// onto — does not extend that path by one level.
+fn is_one_name(name: &std::ffi::OsStr) -> bool {
+    let mut parts = Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(only)), None) => only == name,
+        _ => false,
+    }
+}
+
+/// Hold the deepest existing level of `proven`, whose final component is never a link.
+///
+/// The missing tail holds plain names only (a [`ProvenOutPath`] has no `..`).
+/// The canonical path of the held level is proven to name that very directory,
+/// so a swap between the lookup and the hold is refused.
+fn hold_deepest_existing(raw: &Path, proven: &ProvenOutPath) -> Result<Anchor, CliError> {
+    let traversal = || OutputRefusal::ParentTraversal(raw.to_path_buf());
+    let mut tail = Vec::new();
+    let mut current = proven.as_path();
+    let mut found = held::HeldDir::open(current)?;
+    let dir = loop {
+        if let Some(dir) = found {
+            break dir;
+        }
+        match current.components().next_back() {
+            Some(Component::Normal(name)) => tail.push(name.to_os_string()),
+            Some(
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_),
+            )
+            | None => {
+                return Err(traversal().into());
+            }
+        }
+        current = current.parent().ok_or_else(traversal)?;
+        found = held::HeldDir::open_following(current)?;
+    };
+    tail.reverse();
+    let real = canonical_of_held(raw, &dir)?;
+    Ok(Anchor { dir, real, tail })
+}
+
+/// The canonical path of the held `dir`, proven to name that very directory.
+///
+/// # Errors
+/// [`OutputRefusal::Replaced`] when the path now names another directory;
+/// [`CliError::Io`] when it cannot be resolved.
+fn canonical_of_held(raw: &Path, dir: &held::HeldDir) -> Result<PathBuf, CliError> {
+    let real = std::fs::canonicalize(dir.path()).map_err(|e| io_err(dir.path(), e))?;
+    if dir.is_at(&real)? {
+        Ok(real)
+    } else {
+        Err(OutputRefusal::Replaced(raw.to_path_buf()).into())
+    }
+}
+
+/// The resolved form of `proven`: its deepest existing level canonicalised, the rest appended.
+fn resolve_anchored(raw: &Path, proven: &ProvenOutPath) -> Result<(PathBuf, Anchor), CliError> {
+    let anchor = hold_deepest_existing(raw, proven)?;
+    let mut resolved = anchor.real.clone();
+    resolved.extend(&anchor.tail);
+    Ok((resolved, anchor))
 }
 
 /// Prove `raw` does not overlap `project`, returning the absolute path to claim.
 ///
-/// The final component must not be a symlink, and no component of the resolved
-/// path may be a [`ReservedName`]. Overlap is decided on resolved
-/// paths: the deepest existing ancestor is canonicalised and the not-yet-
-/// existing tail appended, which must hold no `..`. Comparisons are made both
-/// exactly and case-folded, so a case-insensitive filesystem cannot slip a
-/// differently cased spelling of the project past them (fail closed).
+/// Every `..` is first resolved out of a proven plain directory
+/// ([`prove_parent_steps`]). The final component must not be a symlink, and no
+/// component of the resolved path may be a [`ReservedName`]. Overlap is decided
+/// on resolved paths: the deepest existing ancestor is canonicalised and the
+/// not-yet-existing tail appended. Comparisons are made both exactly and
+/// case-folded, so a case-insensitive filesystem cannot slip a differently
+/// cased spelling of the project past them (fail closed).
 fn check_disjoint(raw: &Path, project: &ProjectPaths) -> Result<Disjoint, CliError> {
-    let absolute = absolutize(raw)?;
-    if std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.file_type().is_symlink()) {
+    let absolute = prove_parent_steps(raw)?;
+    if std::fs::symlink_metadata(absolute.as_path()).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(OutputRefusal::Symlink(raw.to_path_buf()).into());
     }
-    let resolved = resolve_through_existing(&absolute)
-        .ok_or_else(|| OutputRefusal::ParentTraversal(raw.to_path_buf()))?;
+    let (resolved, anchor) = resolve_anchored(raw, &absolute)?;
     check_no_reserved_component(raw, &resolved)?;
     let project_root =
         std::fs::canonicalize(&project.root).map_err(|e| io_err(&project.root, e))?;
@@ -1102,7 +1387,11 @@ fn check_disjoint(raw: &Path, project: &ProjectPaths) -> Result<Disjoint, CliErr
             .into());
         }
     }
-    Ok(Disjoint { absolute, resolved })
+    Ok(Disjoint {
+        absolute,
+        resolved,
+        anchor,
+    })
 }
 
 /// Case-fold a path for the case-insensitive half of an overlap comparison.
@@ -1118,14 +1407,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Whether `path` lies under `base`, exactly or case-folded.
 fn starts_with(path: &Path, base: &Path) -> bool {
     path.starts_with(base) || folded(path).starts_with(folded(base))
-}
-
-fn absolutize(path: &Path) -> Result<PathBuf, CliError> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
-    Ok(cwd.join(path))
 }
 
 /// Canonicalise the deepest existing ancestor of `path` and append the rest.
@@ -1157,6 +1438,9 @@ fn resolve_through_existing(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::test_links::junction_in_place;
+    use super::test_links::plant_link;
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1164,6 +1448,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("make scratch");
         std::fs::canonicalize(&dir).expect("canonicalize scratch")
+    }
+
+    /// `base` followed by `segments` as the user spells them (a relative
+    /// request for an empty `base`): each segment is appended as text after
+    /// [`std::path::MAIN_SEPARATOR`], never through
+    /// `Path::join`, which on Windows collapses a `..` or `.` joined onto a
+    /// verbatim `\\?\` base before the proof under test ever sees it.
+    fn spelled(base: &Path, segments: &[&str]) -> PathBuf {
+        let mut raw = base.as_os_str().to_os_string();
+        for segment in segments {
+            let ends_in_separator = raw
+                .as_encoded_bytes()
+                .last()
+                .is_some_and(|byte| std::path::is_separator(char::from(*byte)));
+            if !raw.is_empty() && !ends_in_separator {
+                raw.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            raw.push(segment);
+        }
+        PathBuf::from(raw)
     }
 
     /// A manifest-shaped project: `<base>/proj/{package.ipe,src/Main.ipe}`.
@@ -1219,7 +1523,7 @@ mod tests {
     fn project_root_is_refused() {
         let base = scratch("root");
         let proj = project(&base);
-        for raw in [proj.root.clone(), proj.root.join(".")] {
+        for raw in [proj.root.clone(), spelled(&proj.root, &["."])] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::ProjectRoot(_))),
@@ -1259,7 +1563,7 @@ mod tests {
     fn ancestor_of_the_project_is_refused() {
         let base = scratch("ancestor");
         let proj = project(&base);
-        for raw in [base.clone(), proj.root.join("src").join("..").join("..")] {
+        for raw in [base.clone(), spelled(&proj.root, &["src", "..", ".."])] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
             assert!(
                 matches!(
@@ -1278,7 +1582,7 @@ mod tests {
     fn dot_dot_through_a_missing_tail_is_refused() {
         let base = scratch("dotdot");
         let proj = project(&base);
-        let raw = base.join("missing").join("..").join("elsewhere");
+        let raw = spelled(&base, &["missing", "..", "elsewhere"]);
         let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
         assert!(
             matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
@@ -1287,7 +1591,318 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn dot_dot_over_a_missing_level_is_refused_at_any_depth() {
+        let base = scratch("dotdot-deep");
+        let proj = project(&base);
+        let existing = base.join("existing");
+        std::fs::create_dir_all(&existing).expect("make existing");
+        for raw in [
+            spelled(&existing, &["missing", "..", "elsewhere"]),
+            spelled(&existing, &["missing", "..", "..", "x"]),
+            spelled(&existing, &["missing", ".."]),
+            spelled(&existing, &["..", "missing", "..", "x"]),
+        ] {
+            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+                "--out {} must be refused, got {result:?}",
+                raw.display()
+            );
+        }
+        assert!(!existing.join("elsewhere").exists(), "nothing created");
+        assert!(!base.join("x").exists(), "nothing created");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dot_dot_out_of_a_file_is_refused() {
+        let base = scratch("dotdot-file");
+        let proj = project(&base);
+        std::fs::write(base.join("file"), "keep").expect("write file");
+        let raw = spelled(&base, &["file", "..", "elsewhere"]);
+        let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+            "a `..` out of a file must be refused, got {result:?}"
+        );
+        assert!(!base.join("elsewhere").exists(), "nothing created");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dot_dot_out_of_a_link_is_refused() {
+        let base = scratch("dotdot-link");
+        let proj = project(&base);
+        let victim = base.join("victim").join("inner");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let link = base.join("link");
+        plant_link(&victim, &link);
+        let raw = spelled(&link, &["..", "elsewhere"]);
+        let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+            "a `..` out of a link must be refused, got {result:?}"
+        );
+        assert!(
+            !base.join("elsewhere").exists(),
+            "nothing created beside the link"
+        );
+        assert!(
+            !base.join("victim").join("elsewhere").exists(),
+            "nothing created beside the link target"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dot_dot_out_of_a_plain_existing_level_is_honoured() {
+        let base = scratch("dotdot-plain");
+        let proj = project(&base);
+        std::fs::create_dir_all(base.join("existing")).expect("make existing");
+        let raw = spelled(&base, &["existing", "..", "elsewhere"]);
+        let out = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj)
+            .expect("a `..` out of a plain directory is honoured");
+        assert_eq!(out.path(), base.join("elsewhere"), "the `..` is resolved");
+        out.claim().expect("claim root");
+        assert!(
+            base.join("elsewhere").is_dir(),
+            "claimed at the real parent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `..` out of a link is refused even when a `..` out of a plain level
+    /// below the link was proven first.
+    #[test]
+    fn dot_dot_out_of_a_link_past_a_proven_level_is_refused() {
+        let base = scratch("dotdot-link-deep");
+        let proj = project(&base);
+        let victim = base.join("victim").join("inner");
+        std::fs::create_dir_all(victim.join("x")).expect("make victim");
+        let link = base.join("link");
+        plant_link(&victim, &link);
+        let raw = spelled(&link, &["x", "..", "..", "elsewhere"]);
+        let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+            "--out {} must be refused, got {result:?}",
+            raw.display()
+        );
+        assert!(
+            !base.join("elsewhere").exists(),
+            "nothing at the lexical parent"
+        );
+        assert!(
+            !base.join("victim").join("elsewhere").exists(),
+            "nothing at the real parent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_trailing_dot_dot_resolves_only_out_of_a_plain_level() {
+        let base = scratch("dotdot-trailing");
+        let proj = project(&base);
+        let existing = base.join("existing");
+        OutputRoot::resolve(Some(&existing.to_string_lossy()), &proj)
+            .and_then(|root| root.claim())
+            .expect("claim the output root");
+        std::fs::create_dir_all(existing.join("sub")).expect("make sub");
+        let raw = spelled(&existing, &["sub", ".."]);
+        let out = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj)
+            .expect("a trailing `..` out of a plain directory is honoured");
+        assert_eq!(out.path(), existing, "the trailing `..` is resolved");
+
+        let victim = base.join("victim").join("inner");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let link = base.join("link");
+        plant_link(&victim, &link);
+        for raw in [
+            spelled(&link, &[".."]),
+            spelled(&existing, &["missing", ".."]),
+        ] {
+            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+                "--out {} must be refused, got {result:?}",
+                raw.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cur_dir_beside_dot_dot_changes_nothing() {
+        let base = scratch("dotdot-curdir");
+        let proj = project(&base);
+        let existing = base.join("existing");
+        std::fs::create_dir_all(existing.join("sub")).expect("make sub");
+        let raw = spelled(&existing, &[".", "sub", ".", "..", ".", "elsewhere"]);
+        let out = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj)
+            .expect("`.` beside a proven `..` is honoured");
+        assert_eq!(out.path(), existing.join("elsewhere"));
+
+        let raw = spelled(&existing, &[".", "missing", ".", "..", "x"]);
+        let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+            "--out {} must be refused, got {result:?}",
+            raw.display()
+        );
+        assert!(!existing.join("x").exists(), "nothing created");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dot_dot_at_the_root_is_refused() {
+        let base = scratch("dotdot-root");
+        let proj = project(&base);
+        let root = base.ancestors().last().expect("a root").to_path_buf();
+        for raw in [spelled(&root, &[".."]), spelled(&root, &["..", "x"])] {
+            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+                "--out {} must be refused, got {result:?}",
+                raw.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A relative request is walked on from the working directory component
+    /// by component: its `..` reaches the proof whatever form the working
+    /// directory takes, never collapsed by a join first.
+    #[test]
+    fn a_relative_dot_dot_is_proven_against_the_working_directory() {
+        let base = scratch("dotdot-relative");
+        let victim = base.join("victim").join("inner");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        plant_link(&victim, &base.join("link"));
+        std::fs::create_dir_all(base.join("existing")).expect("make existing");
+        for segments in [
+            &["link", "..", "x"][..],
+            &["link", ".."][..],
+            &["missing", "..", "x"][..],
+            &[".", "link", ".", "..", "x"][..],
+        ] {
+            let raw = spelled(Path::new(""), segments);
+            let result = prove_parent_steps_from(&raw, &base);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+                "--out {} against {} must be refused, got {result:?}",
+                raw.display(),
+                base.display()
+            );
+        }
+        let raw = spelled(Path::new(""), &["existing", "..", "x"]);
+        let proven = prove_parent_steps_from(&raw, &base).expect("a plain `..` is honoured");
+        assert_eq!(proven.as_path(), base.join("x"), "the `..` is resolved");
+        assert!(!base.join("x").exists(), "the proof creates nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A relative request against a verbatim `\\?\` working directory:
+    /// `Path::join` there would collapse `link\..` to the working directory
+    /// unproven; the walk refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn a_relative_dot_dot_against_a_verbatim_working_directory_is_proven() {
+        let base = scratch("dotdot-verbatim-cwd");
+        let verbatim = if base.to_string_lossy().starts_with(r"\\?\") {
+            base.clone()
+        } else {
+            PathBuf::from(format!(r"\\?\{}", base.display()))
+        };
+        let victim = base.join("victim").join("inner");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        plant_link(&victim, &base.join("link"));
+        std::fs::create_dir_all(base.join("existing")).expect("make existing");
+        for raw in [PathBuf::from(r"link\..\x"), PathBuf::from(r"missing\..\x")] {
+            assert_eq!(
+                verbatim.join(&raw),
+                verbatim.join("x"),
+                "a join onto the verbatim base collapses {} unproven",
+                raw.display()
+            );
+            let result = prove_parent_steps_from(&raw, &verbatim);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
+                "--out {} against {} must be refused, got {result:?}",
+                raw.display(),
+                verbatim.display()
+            );
+        }
+        let raw = PathBuf::from(r"existing\..\x");
+        let proven = prove_parent_steps_from(&raw, &verbatim).expect("a plain `..` is honoured");
+        assert_eq!(proven.as_path(), verbatim.join("x"), "the `..` is resolved");
+        for raw in [PathBuf::from(r"existing\a:b"), PathBuf::from(r"C:x")] {
+            let result = prove_parent_steps_from(&raw, &verbatim);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
+                "--out {} against {} must be refused, got {result:?}",
+                raw.display(),
+                verbatim.display()
+            );
+        }
+        let drive = drive_of(&verbatim).expect("the working directory has a drive");
+        let rooted = prove_parent_steps_from(Path::new(r"\x"), &verbatim)
+            .expect("a rooted request lands on the working directory's drive");
+        assert_eq!(
+            rooted.as_path(),
+            PathBuf::from(format!(r"{}\x", drive.display())),
+            "a rooted request keeps only the working directory's drive"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A drive-relative path and a `/` inside a verbatim component name no
+    /// single place on disk.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_relative_or_verbatim_slash_out_is_unplaceable() {
+        use std::path::Prefix;
+        let base = scratch("unplaceable");
+        let proj = project(&base);
+        std::fs::create_dir_all(base.join("existing")).expect("make existing");
+        let drive = base
+            .components()
+            .next()
+            .and_then(|first| match first {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(char::from(letter)),
+                    Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(_)
+                    | Prefix::UNC(..) => None,
+                },
+                Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir
+                | Component::Normal(_) => None,
+            })
+            .expect("scratch sits on a drive");
+        let verbatim = if base.to_string_lossy().starts_with(r"\\?\") {
+            base.clone()
+        } else {
+            PathBuf::from(format!(r"\\?\{}", base.display()))
+        };
+        for raw in [
+            PathBuf::from(format!(r"{drive}:..\x")),
+            PathBuf::from(format!(r"{drive}:x")),
+            PathBuf::from(format!(r"{}\existing/..\x", verbatim.display())),
+        ] {
+            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
+            assert!(
+                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
+                "--out {} must be refused, got {result:?}",
+                raw.display()
+            );
+        }
+        assert!(!base.join("x").exists(), "nothing created");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn symlinked_out_dir_is_refused_and_its_target_untouched() {
         let base = scratch("symlink");
@@ -1296,7 +1911,7 @@ mod tests {
         std::fs::create_dir_all(&victim).expect("make victim");
         std::fs::write(victim.join("keep.txt"), "keep").expect("write victim file");
         let link = base.join("link");
-        std::os::unix::fs::symlink(&victim, &link).expect("make symlink");
+        plant_link(&victim, &link);
 
         let result = OutputRoot::resolve(Some(&link.to_string_lossy()), &proj);
         assert!(
@@ -1313,7 +1928,7 @@ mod tests {
         // both by the CLI area check and by the emit-level claim.
         let out = OutputRoot::resolve(None, &proj).expect("default out");
         out.claim().expect("claim root");
-        std::os::unix::fs::symlink(&victim, out.path().join("rust")).expect("plant area link");
+        plant_link(&victim, &out.path().join("rust"));
         let area = out.area_path(&[OutputArea::Rust]);
         assert!(
             matches!(
@@ -1427,7 +2042,6 @@ mod tests {
     ///
     /// A cloned repository can plant a directory symlink and a file symlink;
     /// no product write, copy or removal follows them.
-    #[cfg(unix)]
     #[test]
     fn owned_paths_never_follow_planted_symlinks() {
         let base = scratch("planted");
@@ -1438,8 +2052,8 @@ mod tests {
         std::fs::write(&victim_file, "keep").expect("victim file");
 
         let out = OwnedDir::claim(&base.join("out")).expect("claim out");
-        std::os::unix::fs::symlink(&victim_dir, out.path().join("src")).expect("dir link");
-        std::os::unix::fs::symlink(&victim_file, out.path().join("app")).expect("file link");
+        plant_link(&victim_dir, &out.path().join("src"));
+        plant_link(&victim_file, &out.path().join("app"));
 
         let refused = |r: Result<OwnedPath, CliError>| {
             matches!(r, Err(CliError::OutputRefused(OutputRefusal::Symlink(_))))
@@ -1459,7 +2073,7 @@ mod tests {
 
         // A symlink planted after validation is replaced by the rename, not followed.
         let late = out.path_to("late.bin").expect("late path");
-        std::os::unix::fs::symlink(&victim_file, out.path().join("late.bin")).expect("late link");
+        plant_link(&victim_file, &out.path().join("late.bin"));
         let wrote = late.write(b"payload");
         assert!(
             matches!(
@@ -1625,7 +2239,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[cfg(unix)]
     #[test]
     fn walk_containment_refuses_a_symlink_out_of_the_project() {
         let base = scratch("contain");
@@ -1633,7 +2246,7 @@ mod tests {
         let outside = base.join("outside.ipe");
         std::fs::write(&outside, "module X\n").expect("outside file");
         let link = proj.root.join("src").join("Link.ipe");
-        std::os::unix::fs::symlink(&outside, &link).expect("make link");
+        plant_link(&outside, &link);
         let result = contained_in(&proj.root, &link);
         assert!(
             matches!(
@@ -1767,7 +2380,6 @@ mod tests {
     }
 
     /// A handover claim re-checks reserved names through a symlink planted after `fresh`.
-    #[cfg(unix)]
     #[test]
     fn handover_claim_rechecks_a_reserved_name_planted_after_fresh() {
         let base = scratch("handover_reserved_race");
@@ -1777,7 +2389,7 @@ mod tests {
         let link = base.join("later");
         let fresh =
             OutputRoot::fresh(&link.join("app").to_string_lossy(), &proj).expect("fresh target");
-        std::os::unix::fs::symlink(&sibling_cache, &link).expect("plant symlink");
+        plant_link(&sibling_cache, &link);
         let result = fresh.claim();
         assert!(
             matches!(
@@ -1889,5 +2501,955 @@ mod tests {
         );
         assert!(!elsewhere.exists(), "a refusal writes nothing");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Arm the level hook to run `swap` once, when the walk holds `at`.
+    fn swap_when_held(at: PathBuf, swap: impl FnOnce() + 'static) {
+        let mut swap = Some(swap);
+        super::held::set_level_hook(Some(Box::new(move |held: &Path| {
+            if held == at
+                && let Some(swap) = swap.take()
+            {
+                swap();
+            }
+        })));
+    }
+
+    /// Move the entry `level` aside and plant a link to `target` in its place.
+    fn swap_for_link(level: &Path, target: &Path) {
+        std::fs::rename(level, level.with_extension("aside")).expect("move level aside");
+        plant_link(target, level);
+    }
+
+    /// A level swapped for a link after the walk held its parent is refused.
+    ///
+    /// Every level below the owned root is swapped in turn — each intermediate
+    /// directory and the final file — for writes, copies and removals alike, and
+    /// the link's target is never touched.
+    #[test]
+    fn a_level_swapped_for_a_link_mid_walk_is_refused() {
+        let base = scratch("swap_ahead");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let victim_file = victim.join("f.txt");
+        std::fs::write(&victim_file, "keep").expect("victim file");
+        let levels: [&[&str]; 3] = [&["a"], &["a", "b"], &["a", "b", "f.txt"]];
+        for (index, level) in levels.iter().enumerate() {
+            for op in ["write", "copy", "remove"] {
+                let out = OwnedDir::claim(&base.join(format!("out_{index}_{op}"))).expect("claim");
+                let target = out.path_to("a/b/f.txt").expect("target path");
+                target.write(b"old").expect("first write");
+                let swapped = level
+                    .iter()
+                    .fold(out.path().to_path_buf(), |p, n| p.join(n));
+                let held_parent = swapped.parent().expect("parent").to_path_buf();
+                let link_target = if level.len() == 3 {
+                    victim_file.clone()
+                } else {
+                    victim.clone()
+                };
+                swap_when_held(held_parent, move || swap_for_link(&swapped, &link_target));
+                let result = match op {
+                    "write" => target.write(b"payload"),
+                    "copy" => target.copy_from(&victim_file),
+                    _ => target.remove(),
+                };
+                super::held::set_level_hook(None);
+                assert!(
+                    matches!(
+                        result,
+                        Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+                    ),
+                    "{op} at level {level:?} refuses the swapped-in link, got {result:?}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&victim_file).ok().as_deref(),
+                    Some("keep"),
+                    "{op} at level {level:?} leaves the link target untouched"
+                );
+                assert_eq!(
+                    std::fs::read_dir(&victim).expect("read victim").count(),
+                    1,
+                    "{op} at level {level:?} creates nothing in the link target"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held level renamed away and replaced by a link keeps the act in the held directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_level_swapped_behind_the_walk_is_never_followed() {
+        let base = scratch("swap_behind");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let target = out.path_to("a/b/f.txt").expect("target path");
+        target.write(b"old").expect("first write");
+        let level = out.path().join("a");
+        let (from, to) = (level.clone(), victim.clone());
+        swap_when_held(level.clone(), move || swap_for_link(&from, &to));
+        let wrote = target.write(b"new");
+        super::held::set_level_hook(None);
+        assert!(
+            wrote.is_ok(),
+            "the write lands in the held directory, got {wrote:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(level.with_extension("aside").join("b").join("f.txt"))
+                .ok()
+                .as_deref(),
+            Some("new"),
+            "the write went through the held handle"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            0,
+            "nothing reaches the link target"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held level cannot be renamed away while the walk holds it, so the act stays in it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_level_cannot_be_swapped_behind_the_walk() {
+        let base = scratch("swap_behind_held");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let target = out.path_to("a/b/f.txt").expect("target path");
+        target.write(b"old").expect("first write");
+        let level = out.path().join("a");
+        let renamed = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = std::rc::Rc::clone(&renamed);
+        let from = level.clone();
+        swap_when_held(level.clone(), move || {
+            seen.set(Some(
+                std::fs::rename(&from, from.with_extension("aside")).is_ok(),
+            ));
+        });
+        let wrote = target.write(b"new");
+        super::held::set_level_hook(None);
+        assert_eq!(
+            renamed.get(),
+            Some(false),
+            "a held level refuses the rename"
+        );
+        assert!(
+            wrote.is_ok(),
+            "the write lands in the held directory, got {wrote:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(level.join("b").join("f.txt"))
+                .ok()
+                .as_deref(),
+            Some("new"),
+            "the write went through the held level"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An owned root replaced after the claim is refused, even when re-marked.
+    #[test]
+    fn a_replaced_owned_root_is_refused() {
+        let base = scratch("root_replaced");
+        let out_path = base.join("out");
+        let out = OwnedDir::claim(&out_path).expect("claim out");
+        let target = out.path_to("f.txt").expect("target path");
+        // Kept alive so the replacement cannot reuse the claimed inode.
+        std::fs::rename(&out_path, base.join("out.old")).expect("move root aside");
+        let impostor = OwnedDir::claim(&out_path).expect("re-claim a new root");
+        std::fs::write(impostor.path().join("keep.txt"), "keep").expect("impostor file");
+
+        let wrote = target.write(b"payload");
+        assert!(
+            matches!(
+                wrote,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "a write refuses the replaced root, got {wrote:?}"
+        );
+        let checked = out.path_to("keep.txt");
+        assert!(
+            matches!(
+                checked,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "a removal's path refuses the replaced root, got {checked:?}"
+        );
+        let child = out.child("rust");
+        assert!(
+            matches!(
+                child,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "a child claim refuses the replaced root, got {child:?}"
+        );
+        assert!(
+            impostor.path().join("keep.txt").is_file(),
+            "the impostor's contents survive"
+        );
+
+        std::fs::remove_dir_all(&out_path).expect("remove impostor");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        plant_link(&victim, &out_path);
+        let wrote = target.write(b"payload");
+        assert!(
+            matches!(
+                wrote,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "a root swapped for a link is refused, got {wrote:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            0,
+            "nothing reaches the link target"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A proven removal whose entry now names another directory is refused, the impostor untouched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_proven_refuses_an_entry_replaced_after_it_was_held() {
+        let base = scratch("remove_proven_swap");
+        let name = std::ffi::OsStr::new("doomed");
+        let doomed = base.join(name);
+        std::fs::create_dir_all(doomed.join("inner")).expect("make doomed");
+        let parent = super::held::HeldDir::open(&base)
+            .expect("open base")
+            .expect("base exists");
+        let child = parent
+            .child(name)
+            .expect("open doomed")
+            .expect("doomed exists");
+        // Kept alive so the impostor cannot reuse the held inode.
+        let aside = base.join("doomed.aside");
+        std::fs::rename(&doomed, &aside).expect("move doomed aside");
+        std::fs::create_dir(&doomed).expect("plant impostor");
+        std::fs::write(doomed.join("keep.txt"), "keep").expect("impostor file");
+
+        let removed = parent.remove_proven(name, child);
+        assert!(
+            matches!(
+                removed,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "the replaced entry is refused, got {removed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(doomed.join("keep.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "the impostor's contents survive"
+        );
+        assert_eq!(
+            std::fs::read_dir(&doomed).expect("read impostor").count(),
+            1,
+            "the impostor gains and loses nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(&aside).expect("read held").count(),
+            0,
+            "the clear went through the held handle"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held directory is removed only when empty; a non-empty one is kept, untouched, without error.
+    #[test]
+    fn remove_empty_dir_keeps_a_non_empty_held_entry_and_removes_an_empty_one() {
+        let base = scratch("remove_empty_held");
+        let full = std::ffi::OsStr::new("full");
+        let empty = std::ffi::OsStr::new("empty");
+        std::fs::create_dir(base.join(full)).expect("make full");
+        std::fs::write(base.join(full).join("keep.txt"), "keep").expect("user file");
+        std::fs::create_dir(base.join(empty)).expect("make empty");
+        let parent = super::held::HeldDir::open(&base)
+            .expect("open base")
+            .expect("base exists");
+
+        let held_full = parent.child(full).expect("open full").expect("full exists");
+        let kept = parent.remove_empty_dir(full, held_full);
+        assert!(
+            matches!(kept, Ok(false)),
+            "a non-empty directory is kept, got {kept:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join(full).join("keep.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "its contents survive"
+        );
+
+        let held_empty = parent
+            .child(empty)
+            .expect("open empty")
+            .expect("empty exists");
+        let removed = parent.remove_empty_dir(empty, held_empty);
+        assert!(
+            matches!(removed, Ok(true)),
+            "an empty directory is removed, got {removed:?}"
+        );
+        assert!(!base.join(empty).exists(), "the empty directory is gone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An empty-directory removal whose entry now names another directory is refused, the impostor untouched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_empty_dir_refuses_an_entry_replaced_after_it_was_held() {
+        let base = scratch("remove_empty_swap");
+        let name = std::ffi::OsStr::new("doomed");
+        let doomed = base.join(name);
+        std::fs::create_dir(&doomed).expect("make doomed");
+        let parent = super::held::HeldDir::open(&base)
+            .expect("open base")
+            .expect("base exists");
+        let child = parent
+            .child(name)
+            .expect("open doomed")
+            .expect("doomed exists");
+        // Kept alive so the impostor cannot reuse the held inode.
+        let aside = base.join("doomed.aside");
+        std::fs::rename(&doomed, &aside).expect("move doomed aside");
+        std::fs::create_dir(&doomed).expect("plant empty impostor");
+
+        let removed = parent.remove_empty_dir(name, child);
+        assert!(
+            matches!(
+                removed,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "the replaced entry is refused, got {removed:?}"
+        );
+        assert!(doomed.is_dir(), "the impostor survives");
+        assert!(aside.is_dir(), "the held directory is not removed by name");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held level whose path now names another directory is refused, the impostor untouched.
+    #[cfg(unix)]
+    #[test]
+    fn an_anchor_replaced_after_it_was_held_is_refused() {
+        let base = scratch("anchor_replaced");
+        let level = base.join("level");
+        std::fs::create_dir(&level).expect("make level");
+        let dir = super::held::HeldDir::open(&level)
+            .expect("open level")
+            .expect("level exists");
+        // Kept alive so the impostor cannot reuse the held inode.
+        std::fs::rename(&level, base.join("level.aside")).expect("move level aside");
+        std::fs::create_dir(&level).expect("plant impostor");
+        std::fs::write(level.join("keep.txt"), "keep").expect("impostor file");
+
+        let proven = canonical_of_held(&level, &dir);
+        assert!(
+            matches!(
+                proven,
+                Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+            ),
+            "the replaced anchor is refused, got {proven:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(level.join("keep.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "the impostor's contents survive"
+        );
+        assert_eq!(
+            std::fs::read_dir(&level).expect("read impostor").count(),
+            1,
+            "the impostor gains nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held entry cannot be renamed away, so a proven removal clears exactly it.
+    #[cfg(windows)]
+    #[test]
+    fn remove_proven_clears_a_held_entry_that_cannot_be_replaced() {
+        let base = scratch("remove_proven_held");
+        let name = std::ffi::OsStr::new("doomed");
+        let doomed = base.join(name);
+        std::fs::create_dir_all(doomed.join("inner")).expect("make doomed");
+        let parent = super::held::HeldDir::open(&base)
+            .expect("open base")
+            .expect("base exists");
+        let child = parent
+            .child(name)
+            .expect("open doomed")
+            .expect("doomed exists");
+        assert!(
+            std::fs::rename(&doomed, base.join("doomed.aside")).is_err(),
+            "a held entry refuses the rename"
+        );
+        let removed = parent.remove_proven(name, child);
+        assert!(
+            removed.is_ok(),
+            "the held entry is removed, got {removed:?}"
+        );
+        assert!(!doomed.exists(), "the held entry is gone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held anchor cannot be renamed away, so its canonical path stays proven.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_anchor_cannot_be_replaced() {
+        let base = scratch("anchor_held");
+        let level = base.join("level");
+        std::fs::create_dir(&level).expect("make level");
+        let dir = super::held::HeldDir::open(&level)
+            .expect("open level")
+            .expect("level exists");
+        assert!(
+            std::fs::rename(&level, base.join("level.aside")).is_err(),
+            "a held anchor refuses the rename"
+        );
+        let proven = canonical_of_held(&level, &dir);
+        assert!(proven.is_ok(), "the held anchor is proven, got {proven:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A junction planted at `--out` is refused and its target untouched.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_out_dir_is_refused_and_its_target_untouched() {
+        let base = scratch("junction_out");
+        let proj = project(&base);
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        std::fs::write(victim.join("keep.txt"), "keep").expect("write victim file");
+        let link = base.join("link");
+        std::fs::create_dir(&link).expect("make link dir");
+        junction_in_place(&link, &victim);
+
+        let result = OutputRoot::resolve(Some(&link.to_string_lossy()), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::Symlink(_))),
+            "a junctioned --out must be refused, got {result:?}"
+        );
+        let claim = OwnedDir::claim(&link);
+        assert!(
+            matches!(
+                claim,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "the emit-level claim refuses the junction too, got {claim:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            1,
+            "nothing is written through the junction"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held level emptied and junctioned in place mid-walk never leads an act out.
+    ///
+    /// Sharing modes stop a held level being renamed, not being turned into a
+    /// junction once empty; writes, copies and removals alike stay out of the
+    /// junction's target, which holds a file of the very name being acted on.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_level_junctioned_in_place_mid_walk_never_leads_out() {
+        let base = scratch("junction_held");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let victim_file = victim.join("f.txt");
+        std::fs::write(&victim_file, "keep").expect("victim file");
+        let source = base.join("source.txt");
+        std::fs::write(&source, "payload").expect("copy source");
+        for op in ["write", "copy", "remove"] {
+            let out = OwnedDir::claim(&base.join(format!("out_{op}"))).expect("claim");
+            let target = out.path_to("a/f.txt").expect("target path");
+            target.write(b"old").expect("first write");
+            let level = out.path().join("a");
+            let (at, to) = (level.clone(), victim.clone());
+            swap_when_held(level, move || {
+                std::fs::remove_file(at.join("f.txt")).expect("empty the level");
+                junction_in_place(&at, &to);
+            });
+            let result = match op {
+                "write" => target.write(b"payload"),
+                "copy" => target.copy_from(&source),
+                _ => target.remove(),
+            };
+            super::held::set_level_hook(None);
+            if op != "remove" {
+                assert!(
+                    result.is_err(),
+                    "{op} into a junctioned level is refused, got {result:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&victim_file).ok().as_deref(),
+                Some("keep"),
+                "{op} leaves the junction target's file untouched"
+            );
+            assert_eq!(
+                std::fs::read_dir(&victim).expect("read victim").count(),
+                1,
+                "{op} creates nothing in the junction target"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `..` walk above a held anchor disagreeing with its canonical ancestors is refused.
+    ///
+    /// The anchor's parent is moved deeper (the walk outlasts the ancestors)
+    /// and shallower (the walk runs out first); neither move is written to.
+    #[cfg(unix)]
+    #[test]
+    fn a_marked_ancestor_walk_over_a_moved_anchor_is_refused() {
+        let base = scratch("ancestor_moved");
+        let moves: [(&str, &[&str]); 2] = [("deeper", &["x", "y", "b"]), ("shallower", &["b"])];
+        for (label, to) in moves {
+            let root = base.join(label);
+            let anchor_path = root.join("a").join("b").join("c");
+            std::fs::create_dir_all(&anchor_path).expect("make anchor");
+            let proven = prove_parent_steps(&anchor_path).expect("prove anchor");
+            let anchor = hold_deepest_existing(&anchor_path, &proven).expect("hold anchor");
+            let relocated = to.iter().fold(root.clone(), |p, n| p.join(n));
+            std::fs::create_dir_all(relocated.parent().expect("moved parent")).expect("make above");
+            std::fs::rename(root.join("a").join("b"), &relocated).expect("move anchor parent");
+
+            let checked = check_no_marked_ancestor_held(&anchor_path, &anchor);
+            assert!(
+                matches!(
+                    checked,
+                    Err(CliError::OutputRefused(OutputRefusal::Replaced(_)))
+                ),
+                "an anchor moved {label} is refused, got {checked:?}"
+            );
+            assert_eq!(
+                std::fs::read_dir(relocated.join("c"))
+                    .expect("read anchor")
+                    .count(),
+                0,
+                "the anchor moved {label} gains nothing"
+            );
+            assert!(
+                !relocated.join(OWNERSHIP_MARKER).exists(),
+                "the parent moved {label} is never marked"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Whether `dir` holds an entry whose name starts with `prefix` and contains `infix`.
+    #[cfg(unix)]
+    fn holds_temp(dir: &Path, prefix: &str, infix: &str) -> bool {
+        std::fs::read_dir(dir).expect("read dir").any(|entry| {
+            let name = entry.expect("dir entry").file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(prefix) && name.contains(infix)
+        })
+    }
+
+    /// A removal descends at most `MAX_REMOVE_DEPTH` levels; a deeper tree is refused, typed.
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_tree_deeper_than_the_ceiling() {
+        let base = scratch("remove_depth");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let limit = super::held::MAX_REMOVE_DEPTH;
+
+        let mut deepest_allowed = out.path().join("ok");
+        for _ in 1..limit {
+            deepest_allowed.push("d");
+        }
+        std::fs::create_dir_all(&deepest_allowed).expect("make tree at the ceiling");
+        std::fs::write(deepest_allowed.join("f.txt"), "x").expect("leaf file");
+        let removed = out.path_to("ok").expect("path").remove();
+        assert!(
+            removed.is_ok(),
+            "a tree at the ceiling is removed, got {removed:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(out.path().join("ok")).is_err(),
+            "the tree at the ceiling is gone"
+        );
+
+        let mut too_deep = out.path().join("deep");
+        for _ in 0..limit {
+            too_deep.push("d");
+        }
+        std::fs::create_dir_all(&too_deep).expect("make tree past the ceiling");
+        std::fs::write(too_deep.join("f.txt"), "x").expect("leaf file");
+        let refused = out.path_to("deep").expect("path").remove();
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::OutputRefused(OutputRefusal::TooDeep { limit: l, .. })) if l == limit
+            ),
+            "a tree past the ceiling is refused, got {refused:?}"
+        );
+        assert!(
+            too_deep.join("f.txt").is_file(),
+            "nothing past the ceiling is removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A marker whose rename fails (a directory holds its name) leaves no temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_marker_rename_removes_its_temp_file() {
+        let base = scratch("marker_tmp");
+        let dir = base.join("out");
+        std::fs::create_dir_all(dir.join(OWNERSHIP_MARKER)).expect("directory at the marker name");
+        let claimed = OwnedDir::claim(&dir);
+        assert!(
+            matches!(claimed, Err(CliError::Io { .. })),
+            "the rename over a directory fails, got {claimed:?}"
+        );
+        assert!(
+            !holds_temp(&dir, &format!("{OWNERSHIP_MARKER}."), ".tmp"),
+            "no `{OWNERSHIP_MARKER}.*.tmp` survives the failed rename"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A file write whose rename fails (a directory holds its name) leaves no temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_file_rename_removes_its_temp_file() {
+        let base = scratch("write_tmp");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        std::fs::create_dir_all(out.path().join("f.txt")).expect("directory at the file name");
+        let wrote = out.path_to("f.txt").expect("path").write(b"payload");
+        assert!(
+            matches!(wrote, Err(CliError::Io { .. })),
+            "the rename over a directory fails, got {wrote:?}"
+        );
+        assert!(
+            !holds_temp(out.path(), ".f.txt.", ".ipe-tmp."),
+            "no `.f.txt.ipe-tmp.*` survives the failed rename"
+        );
+        assert!(
+            out.path().join("f.txt").is_dir(),
+            "the directory at the name is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `OwnedDir::unlink` removes a planted link as a link and refuses a linked level above it.
+    #[test]
+    fn unlink_removes_links_never_their_targets() {
+        let base = scratch("unlink");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let victim_file = victim.join("f.txt");
+        std::fs::write(&victim_file, "keep").expect("victim file");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        plant_link(&victim_file, &out.path().join("f.txt"));
+        plant_link(&victim, &out.path().join("d"));
+
+        out.unlink("f.txt").expect("unlink the link");
+        assert!(
+            std::fs::symlink_metadata(out.path().join("f.txt")).is_err(),
+            "the link is gone"
+        );
+        out.unlink("absent.txt")
+            .expect("an absent entry is already removed");
+        let through = out.unlink("d/f.txt");
+        assert!(
+            matches!(
+                through,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "an unlink below a linked level is refused, got {through:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_file).ok().as_deref(),
+            Some("keep"),
+            "the link target survives"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An existing ancestor swapped for a link after the claim held it keeps the claim in the held directory.
+    #[cfg(unix)]
+    #[test]
+    fn output_claim_through_an_ancestor_swapped_mid_walk_never_follows_it() {
+        let base = scratch("claim_swap");
+        let proj = project(&base);
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let anchor = base.join("root");
+        std::fs::create_dir_all(&anchor).expect("make anchor");
+        let out_path = anchor.join("mid").join("out");
+        let out = OutputRoot::resolve(Some(&out_path.to_string_lossy()), &proj).expect("resolve");
+        let (from, to) = (anchor.clone(), victim.clone());
+        swap_when_held(anchor.clone(), move || swap_for_link(&from, &to));
+        let claimed = out.claim();
+        super::held::set_level_hook(None);
+        assert!(
+            claimed.is_ok(),
+            "the claim lands in the held anchor, got {claimed:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            0,
+            "nothing reaches the link target"
+        );
+        assert!(
+            anchor
+                .with_extension("aside")
+                .join("mid")
+                .join("out")
+                .is_dir(),
+            "the claim went through the held handle"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A handover whose anchor is swapped for a link mid-claim never creates through the link.
+    #[cfg(unix)]
+    #[test]
+    fn handover_claim_through_an_ancestor_swapped_mid_walk_never_follows_it() {
+        let base = scratch("handover_swap");
+        let proj = project(&base);
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        let anchor = base.join("root");
+        std::fs::create_dir_all(&anchor).expect("make anchor");
+        let target = anchor.join("mid").join("app");
+        let fresh = OutputRoot::fresh(&target.to_string_lossy(), &proj).expect("fresh target");
+        let (from, to) = (anchor.clone(), victim.clone());
+        swap_when_held(anchor.clone(), move || swap_for_link(&from, &to));
+        let claimed = fresh.claim();
+        super::held::set_level_hook(None);
+        assert!(
+            claimed.is_ok(),
+            "the claim lands in the held anchor, got {claimed:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&victim).expect("read victim").count(),
+            0,
+            "nothing reaches the link target"
+        );
+        assert!(
+            anchor
+                .with_extension("aside")
+                .join("mid")
+                .join("app")
+                .is_dir(),
+            "the claim went through the held handle"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A claim whose held anchor is emptied and junctioned in place never creates through it.
+    ///
+    /// Both an output claim and a handover claim are driven; the held anchor
+    /// cannot be renamed, only turned into a junction while still empty.
+    #[cfg(windows)]
+    #[test]
+    fn a_claim_through_an_anchor_junctioned_mid_walk_never_follows_it() {
+        let base = scratch("claim_junction");
+        let proj = project(&base);
+        for kind in ["output", "handover"] {
+            let victim = base.join(format!("victim_{kind}"));
+            std::fs::create_dir_all(&victim).expect("make victim");
+            let anchor = base.join(format!("root_{kind}"));
+            std::fs::create_dir_all(&anchor).expect("make anchor");
+            let target = anchor.join("mid").join("out");
+            let raw = target.to_string_lossy();
+            let (at, to) = (anchor.clone(), victim.clone());
+            let claimed = if kind == "output" {
+                let out = OutputRoot::resolve(Some(&raw), &proj).expect("resolve");
+                swap_when_held(anchor, move || junction_in_place(&at, &to));
+                out.claim().map(|_| ())
+            } else {
+                let fresh = OutputRoot::fresh(&raw, &proj).expect("fresh target");
+                swap_when_held(anchor, move || junction_in_place(&at, &to));
+                fresh.claim().map(|_| ())
+            };
+            super::held::set_level_hook(None);
+            assert!(
+                claimed.is_err(),
+                "a {kind} claim into a junctioned anchor is refused, got {claimed:?}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&victim).expect("read victim").count(),
+                0,
+                "a {kind} claim creates nothing in the junction target"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A level swapped for a link before the content comparison reads is refused.
+    #[test]
+    fn holds_refuses_a_level_swapped_for_a_link_mid_walk() {
+        let base = scratch("holds_swap");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        std::fs::write(victim.join("f.txt"), "same").expect("victim file");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let target = out.path_to("a/f.txt").expect("target path");
+        target.write(b"same").expect("first write");
+        assert!(
+            target.holds(b"same").expect("holds"),
+            "unswapped content matches"
+        );
+        let level = out.path().join("a");
+        swap_when_held(out.path().to_path_buf(), move || {
+            swap_for_link(&level, &victim);
+        });
+        let result = target.holds(b"same");
+        super::held::set_level_hook(None);
+        assert!(
+            matches!(
+                result,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "a swapped-in link is refused, not read through, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pruned level swapped for a link mid-walk is removed as a link, its target untouched.
+    #[test]
+    fn prune_never_follows_a_level_swapped_for_a_link_mid_walk() {
+        let base = scratch("prune_swap");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).expect("make victim");
+        std::fs::write(victim.join("orphan.rs"), "keep").expect("victim file");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        out.path_to("src/a/orphan.rs")
+            .expect("orphan path")
+            .write(b"stale")
+            .expect("write orphan");
+        let src = out.path_to("src").expect("src path");
+        let level = out.path().join("src").join("a");
+        let (from, to) = (level.clone(), victim.clone());
+        swap_when_held(out.path().join("src"), move || swap_for_link(&from, &to));
+        let pruned = src.prune_files(|_| false, 8);
+        super::held::set_level_hook(None);
+        assert!(
+            pruned.is_ok(),
+            "the link is pruned as a link, got {pruned:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(victim.join("orphan.rs"))
+                .ok()
+                .as_deref(),
+            Some("keep"),
+            "the link target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&level).is_err(),
+            "the swapped-in link itself is pruned"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Link-planting helpers shared by the tests of every module that walks owned trees.
+#[cfg(test)]
+pub mod test_links {
+    use std::path::Path;
+
+    /// Plant a symbolic link at `link` pointing to `target`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the link cannot be created (a test-setup failure).
+    #[cfg(unix)]
+    pub fn plant_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("plant link");
+    }
+
+    /// Plant a symbolic link at `link` pointing to `target`, a directory or file link to match it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the link cannot be created (a test-setup failure).
+    #[cfg(windows)]
+    pub fn plant_link(target: &Path, link: &Path) {
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link).expect("plant dir link");
+        } else {
+            std::os::windows::fs::symlink_file(target, link).expect("plant file link");
+        }
+    }
+
+    /// Sets a mount-point reparse point on an existing empty directory.
+    ///
+    /// It needs only write-attributes access, which a sharing-denied rename or
+    /// delete does not block: exactly what an attacker can do to a held level.
+    #[cfg(windows)]
+    const JUNCTION_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class IpeJunction {
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] input, int inputSize, IntPtr output, int outputSize, out int returned, IntPtr overlapped);
+public static void Set(string at, string to) {
+    byte[] sub = Encoding.Unicode.GetBytes("\\??\\" + to);
+    byte[] print = Encoding.Unicode.GetBytes(to);
+    int paths = sub.Length + 2 + print.Length + 2;
+    byte[] buf = new byte[16 + paths];
+    BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);
+    BitConverter.GetBytes((ushort)(8 + paths)).CopyTo(buf, 4);
+    BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+    BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);
+    BitConverter.GetBytes((ushort)print.Length).CopyTo(buf, 14);
+    sub.CopyTo(buf, 16);
+    print.CopyTo(buf, 16 + sub.Length + 2);
+    using (SafeFileHandle h = CreateFileW(at, 0x100, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+        if (h.IsInvalid) { throw new Win32Exception(); }
+        int returned;
+        if (!DeviceIoControl(h, 0x000900A4, buf, buf.Length, IntPtr.Zero, 0, out returned, IntPtr.Zero)) {
+            throw new Win32Exception();
+        }
+    }
+}
+}
+'@
+[IpeJunction]::Set($env:IPE_JUNCTION_AT, $env:IPE_JUNCTION_TO)
+"#;
+
+    /// Turn the empty directory `at` into a junction to `target`, in place.
+    #[cfg(windows)]
+    pub fn junction_in_place(at: &Path, target: &Path) {
+        let plain = |path: &Path| {
+            path.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_owned()
+        };
+        let script: Vec<u8> = JUNCTION_SCRIPT
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, script);
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+            .env("IPE_JUNCTION_AT", plain(at))
+            .env("IPE_JUNCTION_TO", plain(target))
+            .status()
+            .expect("run powershell");
+        assert!(
+            status.success(),
+            "junction {} -> {}",
+            at.display(),
+            target.display()
+        );
     }
 }

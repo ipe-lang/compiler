@@ -62,7 +62,7 @@ fn server_fixture(body: &str) -> String {
 const RED_BUILD_SOURCE: &str = "module Main exposing (main)\n\nmain = definitelyNotBound\n";
 
 fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
-    let base = std::env::temp_dir().join(format!(
+    let base = crate::support::scratch_root().join(format!(
         "watch_sigterm_{tag}_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()
@@ -91,7 +91,7 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
 /// build; the shared target's object cache is all that matters here.
 #[cfg(target_os = "linux")]
 fn warm_server_fixture_deps() -> Result<(), BoxError> {
-    let warm_dir = std::env::temp_dir().join(format!(
+    let warm_dir = crate::support::scratch_root().join(format!(
         "watch_sigterm_warm_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()

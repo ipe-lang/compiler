@@ -30,7 +30,7 @@ use ipe_intern::Interner;
 pub use config::{ConfigError, LintConfig, Suppressions, read_lint_config};
 pub use finding::{Finding, Fix, Severity, SigFix};
 pub use registry::{RULES, RuleInfo, is_known, lookup};
-pub use render::render_finding;
+pub use render::{LineRole, render_finding, render_finding_lines};
 
 /// One module handed to the linter: its dotted path and its source text.
 #[derive(Clone, Debug)]

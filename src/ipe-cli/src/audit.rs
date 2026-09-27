@@ -60,8 +60,10 @@ use ipe_ir::Capability;
 use crate::CliError;
 use crate::cli_args::OutputFormat;
 use crate::project::{self, ProjectManifest};
+use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::scratch::ScratchDir;
+use crate::text;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
 /// the check that rejected lets the diagnostic say exactly which gate failed.
@@ -323,7 +325,7 @@ pub fn run_audit_as(
     let effective_advisory_db: Option<PathBuf> = if no_advisory_db {
         None
     } else {
-        Some(advisory_db_override.unwrap_or_else(crate::resolve::index_root))
+        Some(advisory_db_override.map_or_else(crate::resolve::index_root, Ok)?)
     };
 
     let outcome = audit_gate(
@@ -343,15 +345,12 @@ pub fn run_audit_as(
         // (the format parse already rejected `--plain --json` together).
         OutputFormat::Human | OutputFormat::Plain => match outcome {
             Ok((tier2, disclosure)) => {
-                print!(
-                    "{}",
-                    crate::style::frame(&crate::style::gutter(&passing_summary(
-                        &name,
-                        &version,
-                        &tier2,
-                        &disclosure
-                    )))
-                );
+                crate::screen::Screen::new(crate::screen::Stream::Stdout)
+                    .line(
+                        crate::screen::Tone::Text,
+                        &passing_summary(&name, &version, &tier2, &disclosure),
+                    )
+                    .emit();
                 Ok(())
             }
             Err(err) => Err(err),
@@ -434,7 +433,10 @@ fn emit_audit_json(
     version: &str,
     outcome: &Result<(crate::audit_native::Tier2Outcome, Disclosure), CliError>,
 ) -> Result<(), CliError> {
-    println!("{}", audit_verdict_json(name, version, outcome));
+    crate::screen::emit_machine(
+        crate::screen::Stream::Stdout,
+        &format!("{}\n", audit_verdict_json(name, version, outcome)),
+    );
 
     match outcome {
         Ok(_) => Ok(()),
@@ -565,57 +567,58 @@ fn parse_audit_args(rest: &[String]) -> Result<AuditArgs, CliError> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--index" => {
-                let value = it
-                    .next()
-                    .ok_or(CliError::Usage("ipe package audit: --index needs a value"))?;
+                let value = it.next().ok_or_else(|| {
+                    CliError::UsageOwned(text::flag_needs_value(&"package audit", &"--index"))
+                })?;
                 if index.is_some() {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --index given more than once",
-                    ));
+                    return Err(CliError::UsageOwned(text::flag_repeated(
+                        &"package audit",
+                        &"--index",
+                    )));
                 }
                 index = Some(PathBuf::from(value));
             }
             "--advisory-db" => {
-                let value = it.next().ok_or(CliError::Usage(
-                    "ipe package audit: --advisory-db needs a value",
-                ))?;
+                let value = it.next().ok_or_else(|| {
+                    CliError::UsageOwned(text::flag_needs_value(&"package audit", &"--advisory-db"))
+                })?;
                 if advisory_db.is_some() {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --advisory-db given more than once",
-                    ));
+                    return Err(CliError::UsageOwned(text::flag_repeated(
+                        &"package audit",
+                        &"--advisory-db",
+                    )));
                 }
                 if no_advisory_db {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --advisory-db and --no-advisory-db are mutually exclusive",
-                    ));
+                    return Err(CliError::Usage(text::audit_advisory_db_exclusive()));
                 }
                 advisory_db = Some(PathBuf::from(value));
             }
             "--no-advisory-db" => {
                 if no_advisory_db {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --no-advisory-db given more than once",
-                    ));
+                    return Err(CliError::UsageOwned(text::flag_repeated(
+                        &"package audit",
+                        &"--no-advisory-db",
+                    )));
                 }
                 if advisory_db.is_some() {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --advisory-db and --no-advisory-db are mutually exclusive",
-                    ));
+                    return Err(CliError::Usage(text::audit_advisory_db_exclusive()));
                 }
                 no_advisory_db = true;
             }
             "--publisher" => {
-                let value = it.next().ok_or(CliError::Usage(
-                    "ipe package audit: --publisher needs a value",
-                ))?;
+                let value = it.next().ok_or_else(|| {
+                    CliError::UsageOwned(text::flag_needs_value(&"package audit", &"--publisher"))
+                })?;
                 if publisher.is_some() {
-                    return Err(CliError::Usage(
-                        "ipe package audit: --publisher given more than once",
-                    ));
+                    return Err(CliError::UsageOwned(text::flag_repeated(
+                        &"package audit",
+                        &"--publisher",
+                    )));
                 }
                 publisher = Some(SelfDeclaredPublisher::parse(value).map_err(|refusal| {
-                    CliError::UsageOwned(format!(
-                        "ipe package audit: --publisher {value:?} is not a GitHub login: {refusal}"
+                    CliError::UsageOwned(text::audit_publisher_not_login(
+                        &format!("{value:?}"),
+                        &refusal,
                     ))
                 })?);
             }
@@ -626,9 +629,7 @@ fn parse_audit_args(rest: &[String]) -> Result<AuditArgs, CliError> {
             }
             positional => {
                 if path.is_some() {
-                    return Err(CliError::Usage(
-                        "ipe package audit: expected a single <path> argument",
-                    ));
+                    return Err(CliError::Usage(text::audit_single_path()));
                 }
                 path = Some(PathBuf::from(positional));
             }
@@ -653,12 +654,12 @@ fn set_format(slot: &mut Option<OutputFormat>, requested: OutputFormat) -> Resul
             *slot = Some(requested);
             Ok(())
         }
-        Some(existing) if *existing == requested => Err(CliError::Usage(
-            "ipe package audit: an output-format flag was given more than once",
-        )),
-        Some(_) => Err(CliError::Usage(
-            "ipe package audit: --plain and --json are mutually exclusive",
-        )),
+        Some(existing) if *existing == requested => {
+            Err(CliError::Usage(text::audit_format_repeated()))
+        }
+        Some(_) => Err(CliError::UsageOwned(text::plain_json_exclusive(
+            &"package audit",
+        ))),
     }
 }
 
@@ -842,12 +843,10 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
             return Ok(manifest);
         }
         if crate::project::has_only_legacy_toml(path) {
-            return Err(CliError::Usage(crate::project::LEGACY_TOML_HINT));
+            return Err(CliError::Usage(text::legacy_toml_hint()));
         }
-        return Err(CliError::UsageOwned(format!(
-            "ipe package audit: no `package.ipe` in `{}` — the gate audits a publishable Ipê \
-             package, which needs a manifest",
-            path.display()
+        return Err(CliError::UsageOwned(text::audit_no_manifest(
+            &path.display(),
         )));
     }
     if path.file_name().and_then(|n| n.to_str()) == Some(crate::package_manifest::PACKAGE_IPE)
@@ -855,9 +854,8 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     {
         return Ok(path.to_path_buf());
     }
-    Err(CliError::UsageOwned(format!(
-        "ipe package audit: `{}` is neither an Ipê project directory nor a package.ipe",
-        path.display()
+    Err(CliError::UsageOwned(text::audit_not_a_package(
+        &path.display(),
     )))
 }
 
@@ -985,7 +983,7 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
 ///
 /// # Errors
 /// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`] when
-/// the file does not lex as Rust tokens.
+/// the file does not parse as Rust.
 fn first_hit(file: &Path) -> Result<Option<LocatedHit>, CliError> {
     let src =
         crate::io_bounded::read_to_string_capped(file, crate::io_bounded::FFI_CACHE_READ_CAP)?;
@@ -993,7 +991,7 @@ fn first_hit(file: &Path) -> Result<Option<LocatedHit>, CliError> {
         reject(
             Check::Provenance,
             format!(
-                "emitted `{}` does not lex as Rust tokens — the no-panic audit cannot attest \
+                "emitted `{}` does not parse as Rust — the no-panic audit cannot attest \
                  its content; the file is refused rather than admitted",
                 file.display()
             ),
@@ -1069,14 +1067,16 @@ fn capability_consistency(
             // Surfaced loudly per §1b: a package the user consents to as crossing
             // into opaque native code, whose true effect set cannot be inferred
             // from Ipê alone beyond the `native-ffi` marker itself.
-            print!(
-                "{}",
-                crate::style::frame(&crate::style::gutter(&format!(
-                    "package audit: note — `{}` exercises the `native-ffi` capability; its \
+            crate::screen::Screen::new(crate::screen::Stream::Stdout)
+                .line(
+                    crate::screen::Tone::Text,
+                    &format!(
+                        "package audit: note — `{}` exercises the `native-ffi` capability; its \
                      native effects cannot be inferred from Ipê alone.",
-                    prepared.manifest.name
-                )))
-            );
+                        prepared.manifest.name
+                    ),
+                )
+                .emit();
         }
         return Ok(());
     }
@@ -1272,9 +1272,10 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
 ///
 /// # Errors
 /// [`CliError::PackageAudit`] on an under-bump or a missing manifest version;
+/// [`CliError::VersionRefused`] when the manifest version carries build metadata;
 /// [`CliError::Diff`] when a tree cannot be diffed; resolution errors otherwise.
 fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(), CliError> {
-    let Some(new_version) = prepared.manifest.version.clone() else {
+    let Some(manifest_version) = prepared.manifest.version.clone() else {
         return Err(reject(
             Check::Semver,
             "the manifest declares no `version = \"…\"` — the enforced-semver check needs a \
@@ -1282,6 +1283,8 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
                 .to_owned(),
         ));
     };
+    let new_version = PublishedVersion::from_semver(manifest_version)
+        .map_err(|refusal| refusal.for_package(&prepared.manifest.name))?;
 
     // A prerelease (`X.Y.Z-<pre>`) is, by semver §9, explicitly unstable and
     // exempt from the compatibility guarantee a release version carries. Range
@@ -1289,51 +1292,58 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
     // semantics) never resolves a prerelease for a non-prerelease requirement, so
     // no consumer on a stable range can even see one — enforcing an API-bump on it
     // would only reject a normal iteration (`X.Y.Z-a` → `X.Y.Z-b`) that harms no
-    // one. Monotonicity is still guaranteed independently: `admission_precheck`'s
-    // immutability check forbids rewriting a published version, and the successor
-    // must exceed every published one. So a prerelease clears this check by being
-    // a prerelease, never by an API delta.
-    if !new_version.pre.is_empty() {
-        print!(
-            "{}",
-            crate::style::frame(&crate::style::gutter(&format!(
-                "package audit: `{}` {new_version} is a prerelease — exempt from the \
+    // one. Monotonicity is still guaranteed independently: `admission_precheck`
+    // forbids rewriting a published version and refuses a successor that does not
+    // exceed every published one (prereleases included). So a prerelease clears
+    // this check by being a prerelease, never by an API delta.
+    if new_version.is_prerelease() {
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(
+                crate::screen::Tone::Text,
+                &format!(
+                    "package audit: `{}` {new_version} is a prerelease — exempt from the \
                  enforced-semver API-compatibility bump (semver §9: a prerelease is unstable \
                  and is not resolved by a stable version requirement).",
-                prepared.manifest.name
-            )))
-        );
+                    prepared.manifest.name
+                ),
+            )
+            .emit();
         return Ok(());
     }
 
-    let index_root = index_root.map_or_else(crate::resolve::index_root, Path::to_path_buf);
+    let index_root =
+        index_root.map_or_else(crate::resolve::index_root, |root| Ok(root.to_path_buf()))?;
     // Absent ⇒ a first submission; no predecessor to enforce.
     // Unreadable ⇒ fail closed: a corrupt predecessor must not silently pass
     // as "first version" — propagate the error so the gate refuses.
     let Some(entry) =
         crate::index::read_entry_lookup(&index_root, &prepared.manifest.name).absent_or_err()?
     else {
-        print!(
-            "{}",
-            crate::style::frame(&crate::style::gutter(&format!(
-                "package audit: `{}` has no previously published version in the index — \
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(
+                crate::screen::Tone::Text,
+                &format!(
+                    "package audit: `{}` has no previously published version in the index — \
                  skipping the enforced-semver check (first version).",
-                prepared.manifest.name
-            )))
-        );
+                    prepared.manifest.name
+                ),
+            )
+            .emit();
         return Ok(());
     };
 
     let Some(previous) = stable_baseline(&entry.versions, &new_version) else {
-        print!(
-            "{}",
-            crate::style::frame(&crate::style::gutter(&format!(
-                "package audit: `{}` has no published stable version below {new_version} — \
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(
+                crate::screen::Tone::Text,
+                &format!(
+                    "package audit: `{}` has no published stable version below {new_version} — \
                  skipping the enforced-semver check (first stable version; a prerelease \
                  carries no compatibility promise to diff against).",
-                prepared.manifest.name
-            )))
-        );
+                    prepared.manifest.name
+                ),
+            )
+            .emit();
         return Ok(());
     };
 
@@ -1350,8 +1360,12 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
         .manifest_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let report =
-        crate::diff::check_semver_bump(&baseline, &new_tree, &previous.version, &new_version)?;
+    let report = crate::diff::check_semver_bump(
+        &baseline,
+        &new_tree,
+        previous.version.as_semver(),
+        new_version.as_semver(),
+    )?;
     if report.satisfied {
         Ok(())
     } else {
@@ -1373,11 +1387,11 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
 /// is none (a first stable version).
 fn stable_baseline<'a>(
     versions: &'a [crate::index::EntryVersion],
-    new_version: &semver::Version,
+    new_version: &PublishedVersion,
 ) -> Option<&'a crate::index::EntryVersion> {
     versions
         .iter()
-        .filter(|v| v.version.pre.is_empty() && v.version < *new_version)
+        .filter(|v| !v.version.is_prerelease() && v.version < *new_version)
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
@@ -1505,13 +1519,12 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
             // index CI — always installs it, so advisory/bans enforcement is
             // never actually skipped there. Locally, skip that scan with a loud
             // warning; the lockfile hash-integrity half still runs.
-            eprintln!(
-                "{}",
-                crate::style::gutter(
-                    "warning: supply-chain advisory scan skipped — cargo-deny is not installed \
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                "warning: supply-chain advisory scan skipped — cargo-deny is not installed \
                      (`cargo install cargo-deny`). The package index enforces it; lockfile hash \
-                     integrity is still verified."
-                )
+                     integrity is still verified.",
             );
             verify_locked_dependency_hashes(prepared)
         }
@@ -1575,13 +1588,12 @@ fn advisory_check(prepared: &Prepared, advisory_db: Option<&Path>) -> Result<(),
     let Some(db_root) = advisory_db else {
         // Explicit opt-out via --no-advisory-db.  Warn loudly; the check is
         // on by default and omitting --no-advisory-db is the safe path.
-        eprintln!(
-            "{}",
-            crate::style::gutter(
-                "warning: advisory-database check explicitly skipped via --no-advisory-db. \
+        crate::screen::chatter(
+            crate::screen::Stream::Stderr,
+            crate::screen::Tone::UserError,
+            "warning: advisory-database check explicitly skipped via --no-advisory-db. \
                  Remove --no-advisory-db to re-enable the default check against the registry \
-                 advisory database."
-            )
+                 advisory database.",
         );
         return Ok(());
     };
@@ -1605,14 +1617,11 @@ fn advisory_check_with_base(
 ) -> Result<(), CliError> {
     let lockfile = crate::lockfile::Lockfile::read(&prepared.manifest.root)?;
     for dep in lockfile.packages() {
-        // The lockfile is re-read from disk here, an independent trust boundary
-        // from the resolver that wrote it: a hand-edited `ipe.lock` can carry a
-        // `name` the resolver would never emit (e.g. `../../x`), and that name
-        // flows into a registry URL segment and an advisory-DB path join. Parse
-        // it once, here, into the typed `PackageName` — a single non-traversing
-        // path component by construction — so no raw name reaches either sink.
-        let name = crate::package_name::PackageName::parse(&dep.name)?;
-        check_one_dep_advisories(db_root, &name, &dep.version, base_url)?;
+        // `Lockfile::read` parses each `name` into a `PackageName` — a single
+        // non-traversing path component by construction — so a hand-edited
+        // `ipe.lock` name never reaches the registry URL segment or the
+        // advisory-DB path join raw.
+        check_one_dep_advisories(db_root, &dep.name, dep.version.as_semver(), base_url)?;
     }
     Ok(())
 }
@@ -1648,13 +1657,14 @@ fn check_one_dep_advisories(
             crate::advisory::evaluate_advisories(name, version, &advisories)
         }
         crate::registry::PagesAdvisoryOutcome::Unreachable => {
-            eprintln!(
-                "{}",
-                crate::style::gutter(&format!(
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!(
                     "warning: the registry advisory database was unreachable over HTTP for \
                      `{name}` — falling back to the local advisory checkout. Advisory coverage \
                      is only as fresh as that checkout."
-                ))
+                ),
             );
             crate::advisory::check_dep_advisories(db_root, name, version)
         }
@@ -1755,7 +1765,10 @@ fn reserved_namespace_ownership(
     standing: PublisherStanding<'_>,
 ) -> Result<(), CliError> {
     let modules = crate::project::discover_modules(&prepared.manifest.src_root)?;
-    let module_paths: Vec<&[String]> = modules.iter().map(|m| m.module_path.as_slice()).collect();
+    let module_paths: Vec<&[String]> = modules
+        .iter()
+        .map(crate::project::DiscoveredModule::module_path)
+        .collect();
     reserved_namespace_verdict(&prepared.manifest.name, &module_paths, standing)
 }
 
@@ -1865,6 +1878,7 @@ const fn reject(check: Check, message: String) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::published_version::VersionRefusal;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| (*x).to_owned()).collect()
@@ -2788,6 +2802,34 @@ mod tests {
         );
     }
 
+    /// A published version from a literal the test knows is valid.
+    #[allow(clippy::expect_used)] // test fixture: the literal is a valid published version
+    fn published(raw: &str) -> PublishedVersion {
+        PublishedVersion::parse(raw).expect("valid published version")
+    }
+
+    /// A manifest version carrying build metadata is refused by the enforced-semver
+    /// check before any index read, prerelease or release alike: `+meta` never
+    /// names a publishable version.
+    #[test]
+    fn enforced_semver_refuses_build_metadata() {
+        let index_root = make_test_dir("semver-build-metadata");
+        for raw in ["1.0.0+b", "0.0.0-smoke.2+sha.abc"] {
+            let mut prepared = make_prepared(&index_root.join("proj"));
+            prepared.manifest.version = Some(raw.parse().expect("valid semver with build"));
+            let result = enforced_semver(&prepared, Some(&index_root));
+            assert!(
+                matches!(
+                    &result,
+                    Err(CliError::VersionRefused { refusal, .. })
+                        if matches!(**refusal, VersionRefusal::BuildMetadata { .. })
+                ),
+                "{raw} must be refused for build metadata: {result:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&index_root);
+    }
+
     /// Write a one-package index at `index_root` publishing `versions` of
     /// `test-pkg`.
     fn write_index_versions(index_root: &std::path::Path, versions: &[&str]) {
@@ -2841,9 +2883,9 @@ mod tests {
             .expect("entry present");
         let _ = std::fs::remove_dir_all(&index_root);
 
-        let new_version = semver::Version::new(0, 1, 1);
+        let new_version = published("0.1.1");
         let baseline = stable_baseline(&entry.versions, &new_version).expect("a stable baseline");
-        assert_eq!(baseline.version, semver::Version::new(0, 1, 0));
+        assert_eq!(baseline.version, published("0.1.0"));
 
         let with_export = |names: &[&str]| {
             let mut module = crate::api_surface::ModuleApi::default();
@@ -2856,8 +2898,13 @@ mod tests {
         };
         let stable_api = with_export(&["f", "g"]);
         let rc_api = with_export(&["f"]);
-        let report = crate::diff::report(&stable_api, &rc_api, &baseline.version, &new_version)
-            .expect("floor does not overflow");
+        let report = crate::diff::report(
+            &stable_api,
+            &rc_api,
+            baseline.version.as_semver(),
+            new_version.as_semver(),
+        )
+        .expect("floor does not overflow");
         assert_eq!(report.floor, semver::Version::new(0, 2, 0));
         assert!(
             !report.satisfied,
@@ -2865,7 +2912,7 @@ mod tests {
         );
 
         assert!(
-            stable_baseline(&entry.versions, &semver::Version::new(0, 0, 9)).is_none(),
+            stable_baseline(&entry.versions, &published("0.0.9")).is_none(),
             "no release below the new version is a first stable version"
         );
     }
@@ -2910,7 +2957,7 @@ mod tests {
              version = \"{version}\"\n\
              source = \"https://github.com/example/{pkg_name}\"\n\
              rev = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
-             sha256 = \"deadbeef\"\n\
+             sha256 = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n\
              kind = \"index\"\n"
         );
         std::fs::write(project_root.join("ipe.lock"), content).expect("write ipe.lock");

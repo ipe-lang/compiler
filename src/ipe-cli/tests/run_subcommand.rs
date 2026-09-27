@@ -54,7 +54,7 @@ fn run_unknown_flag_returns_usage_error() {
         matches!(
             &result,
             Err(ipe::CliError::CommandUsage { command, reason })
-                if *command == "run" && reason.contains("--bogus-flag")
+                if *command == "run" && reason.as_str().contains("--bogus-flag")
         ),
         "expected a `run` command-usage error naming the offending flag, got: {result:?}"
     );
@@ -92,7 +92,7 @@ fn run_subcommand_builds_and_executes_hello_program() {
     };
 
     // Write the source file into a temp directory.
-    let dir = std::env::temp_dir().join("ipec_run_subcommand_e2e");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
     let _ = fs::remove_dir_all(&dir);
     let entry = dir.join("Main.ipe");
     let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
@@ -168,7 +168,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
     };
 
     // --- Case 1: single-file build (no manifest) → name must be "ipe-app" ---
-    let dir = std::env::temp_dir().join("ipe_run_bin_name_e2e");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_bin_name_e2e");
     let _ = fs::remove_dir_all(&dir);
     let entry = dir.join("Main.ipe");
     let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
@@ -295,7 +295,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
         return;
     };
 
-    let dir = std::env::temp_dir().join("ipe_run_no_cargo_e2e");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_no_cargo_e2e");
     let _ = fs::remove_dir_all(&dir);
     let entry = dir.join("Main.ipe");
     let empty_home = dir.join("empty-home");

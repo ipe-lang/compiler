@@ -171,6 +171,15 @@ wasmtime-wasi = { version = "35", default-features = false, features = ["preview
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs", "termios"] }
 
+# Held output-directory handles read a handle's volume serial number and file
+# index (`GetFileInformationByHandle`) through a safe wrapper, and open entries
+# relative to a held directory handle (`NtCreateFile` with a root directory)
+# through cap-primitives, so the Windows side acts through handles with no
+# `unsafe` of our own. cap-primitives is already in the dependency graph.
+[target.'cfg(windows)'.dependencies]
+cap-primitives = "3.4.6"
+winapi-util = "0.1"
+
 [dev-dependencies]
 # Build + run plumbing shared by the golden E2E tests (tests/support/mod.rs).
 # `cargo build --message-format=json` parsing that locates the produced binary

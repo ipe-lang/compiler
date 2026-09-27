@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Rebuild and re-run a program on every source change.
 
   ipe watch [<path>]
@@ -15,4 +16,3 @@ exit: 0
     [--debugger]       compile the in-app time-travelling debugger overlay into the served app
     [--reset-state]    force every returning session to a fresh init instead of preserving prior state
     [-q|--quiet]       suppress progress chatter; only warnings and errors
-

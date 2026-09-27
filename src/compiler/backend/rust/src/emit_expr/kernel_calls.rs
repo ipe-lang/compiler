@@ -1880,6 +1880,14 @@ pub fn emit_tea_call(
     }
 }
 
+// The `StreamStream` arm re-wraps argument 1: the lowerer's non-`Clone`
+// capture gate reads the same index, so a drift breaks the build.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the re-wrapped handler index drifts from the lowerer's capture-gate index, the capture-clone SEAL invariant [ledger #boundary]
+const _: () = assert!(matches!(
+    KernelFn::StreamStream.capture_cloned_handler_arg(),
+    Some(1)
+));
+
 /// Build the capture-clone prologue for the `StreamStream` re-wrap closure.
 ///
 /// The `StreamStream` arm wraps the handler in `move |_x| (handler)(_x)` to
@@ -1896,11 +1904,12 @@ pub fn emit_tea_call(
 /// `v` the handler captures, spliced INSIDE the wrapper body: the box moves the
 /// fresh shadowing clones, the wrapper keeps its originals for the next call.
 /// Same shape as the `TaskSeq` clone-capture prologue, applied at
-/// an emit-synthesized closure. Every captured free local is `Clone`: an
-/// enclosing value (`Clone` by its carrier type), a `let`-bound handler
-/// promoted to `SharedLambda` (`Arc`, `Clone` — `StreamStream` is in
-/// `requires_sync_capture`), or a `Copy` leaf (whose `.clone()` is a bitwise
-/// copy).
+/// an emit-synthesized closure. Every captured free local is `Clone` by a
+/// lowerer guarantee, not an assumption here: `StreamStream` names this handler
+/// in `KernelFn::capture_cloned_handler_arg`, and the lowerer classifies each of
+/// its captures (`Copy` leaf, `Clone` carrier, or a pure-`Fun` binder promoted
+/// to the `Arc` carrier — `StreamStream` is in `requires_sync_capture`) and
+/// refuses a non-`Clone` one (a destructure-bound `Box<dyn Fn>`) with IPE-L0126.
 pub fn stream_handler_capture_prologue(ctx: &EmitCtx, handler: &Expr) -> DResult<String> {
     let mut captured = std::collections::BTreeSet::new();
     collect_free_vars(handler, &mut captured);

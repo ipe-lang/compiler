@@ -25,7 +25,11 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("gen-cli-docs: {e}");
+            ipe::screen::chatter(
+                ipe::screen::Stream::Stderr,
+                ipe::screen::Tone::UserError,
+                &format!("gen-cli-docs: {e}"),
+            );
             ExitCode::FAILURE
         }
     }

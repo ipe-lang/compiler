@@ -79,7 +79,7 @@ fn built_app_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<S
 #[test]
 fn runtime_shape_literals_emit_nominal_structs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_runtime_shape_fold_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_runtime_shape_fold_seal_emit");
     let (built, app_rs) = built_app_rs(&root, &out);
     assert!(
         built.is_ok(),
@@ -115,7 +115,7 @@ fn runtime_shape_literals_emit_nominal_structs() {
 #[test]
 fn runtime_shape_fold_seal_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_runtime_shape_fold_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_runtime_shape_fold_seal_e2e");
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
     };

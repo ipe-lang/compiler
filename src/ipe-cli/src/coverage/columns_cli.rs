@@ -221,7 +221,7 @@ fn is_coverage_file(path: &Path) -> bool {
 /// flags (the check applies once per command, not per flag). Currently a
 /// source-level scan over `src/ipe-cli/src/`.
 pub struct NotAdvertisedUnimplementedColumn {
-    stubs: Arc<BTreeSet<String>>,
+    stubs: Arc<StubScan>,
 }
 
 impl NotAdvertisedUnimplementedColumn {
@@ -246,17 +246,19 @@ impl AspectCheck<CliItem> for NotAdvertisedUnimplementedColumn {
 
     fn check(&self, item: &CliItem) -> Cell {
         match item {
-            CliItem::Subcommand { name, .. } => {
-                if self.stubs.contains(*name) {
-                    Cell::Hole(format!(
-                        "`ipe {name}` is advertised in the help table but its handler \
-                         contains `todo!()` or `unimplemented!()` — implement it or \
-                         remove it from COMMANDS"
-                    ))
-                } else {
-                    Cell::Ok
-                }
-            }
+            CliItem::Subcommand { name, .. } => match self.stubs.as_ref() {
+                StubScan::Unreadable { file, error } => Cell::Hole(format!(
+                    "`ipe {name}` cannot be cleared of `todo!()` / `unimplemented!()`: \
+                     production source {} is unreadable ({error})",
+                    file.display()
+                )),
+                StubScan::Scanned(stubs) if stubs.contains(*name) => Cell::Hole(format!(
+                    "`ipe {name}` is advertised in the help table but its handler \
+                     contains `todo!()` or `unimplemented!()` — implement it or \
+                     remove it from COMMANDS"
+                )),
+                StubScan::Scanned(_) => Cell::Ok,
+            },
             CliItem::Flag { .. } => Cell::not_applicable(
                 "a flag, not a subcommand — the not-advertised-unimplemented check applies \
                  to subcommand handlers",
@@ -266,51 +268,64 @@ impl AspectCheck<CliItem> for NotAdvertisedUnimplementedColumn {
 }
 
 /// Scan `src/ipe-cli/src/` for commands whose handler files contain
-/// `todo!()` or `unimplemented!()`, returning the set of those command names.
+/// `todo!()` or `unimplemented!()`; an unreadable source fails the scan closed.
 ///
 /// The heuristic: for each command `name`, if the combined source of
 /// `src/ipe-cli/src/` contains a `run_<name>` symbol next to `todo!()` or
 /// `unimplemented!()`, the command is a stub. A global file-level scan is used
 /// because a Rust function body can span many lines and the probe is for ANY
 /// such macro in ANY production source file — test files are excluded.
-fn scan_stub_commands() -> Arc<BTreeSet<String>> {
-    static STUBS: OnceLock<Arc<BTreeSet<String>>> = OnceLock::new();
-    STUBS
-        .get_or_init(|| {
-            let src_root = workspace_path("src/ipe-cli/src");
-            let mut stub_commands = BTreeSet::new();
+fn scan_stub_commands() -> Arc<StubScan> {
+    static STUBS: OnceLock<Arc<StubScan>> = OnceLock::new();
+    STUBS.get_or_init(|| Arc::new(scan_stub_sources())).clone()
+}
 
-            // Collect every Rust production source file (not tests/).
-            let files: Vec<PathBuf> = rs_files_under(&src_root)
-                .into_iter()
-                .filter(|p| {
-                    let s = p.to_string_lossy().replace('\\', "/");
-                    !s.contains("/tests/") && !s.contains("coverage/")
-                })
-                .collect();
+/// Outcome of scanning the CLI production sources for stubbed handlers.
+#[derive(Debug)]
+enum StubScan {
+    /// Every production source was read; these commands are stubs.
+    Scanned(BTreeSet<String>),
+    /// A production source could not be read, so no command can be cleared.
+    Unreadable {
+        file: PathBuf,
+        error: std::io::Error,
+    },
+}
 
-            // For each command registered in the help table, check whether any
-            // production source file near its handler contains the stub macros.
-            for spec in crate::help::all_command_specs() {
-                let handler_name = format!("run_{}", spec.name.replace('-', "_"));
-                for path in &files {
-                    let Ok(src) = std::fs::read_to_string(path) else {
-                        continue;
-                    };
-                    // A file must contain the handler name AND a stub macro to
-                    // count — prevents false positives from comments or unrelated
-                    // functions.
-                    if src.contains(&handler_name)
-                        && (src.contains("todo!()") || src.contains("unimplemented!()"))
-                    {
-                        stub_commands.insert(spec.name.to_owned());
-                        break;
-                    }
-                }
-            }
-            Arc::new(stub_commands)
-        })
-        .clone()
+/// Read every CLI production source once and name the stubbed commands.
+fn scan_stub_sources() -> StubScan {
+    let src_root = workspace_path("src/ipe-cli/src");
+
+    // Every Rust production source file: confirmed test modules and the
+    // coverage probes themselves are excluded.
+    let mut sources = Vec::new();
+    for path in rs_files_under(&src_root) {
+        let excluded = path.strip_prefix(&src_root).is_ok_and(|rel| {
+            panic_scan::is_verified_test_path(&src_root, rel) || rel.starts_with("coverage")
+        });
+        if excluded {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(src) => sources.push(src),
+            Err(error) => return StubScan::Unreadable { file: path, error },
+        }
+    }
+
+    // A file must contain the handler name AND a stub macro to count —
+    // prevents false positives from comments or unrelated functions.
+    let mut stub_commands = BTreeSet::new();
+    for spec in crate::help::all_command_specs() {
+        let handler_name = format!("run_{}", spec.name.replace('-', "_"));
+        let stubbed = sources.iter().any(|src| {
+            src.contains(&handler_name)
+                && (src.contains("todo!()") || src.contains("unimplemented!()"))
+        });
+        if stubbed {
+            stub_commands.insert(spec.name.to_owned());
+        }
+    }
+    StubScan::Scanned(stub_commands)
 }
 
 // ── shared utilities ──────────────────────────────────────────────────────────

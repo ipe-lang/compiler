@@ -74,7 +74,7 @@ fn end_to_end_builds_and_prints_fifty_one() {
 
     let root = repo_root();
     let entry = example_entry(&root);
-    let out = std::env::temp_dir().join("ipec_m1_firstclass_e2e");
+    let out = crate::support::scratch_root().join("ipec_m1_firstclass_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

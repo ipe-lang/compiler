@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Self-update ipe to the latest release (re-runs the installer).
 
   ipe upgrade
@@ -12,4 +13,3 @@ exit: 0
     [--dry-run]            print the installer command without running it
     [--plain]              print one terse status line, flush-left (never prompts)
     [--json]               print the status as JSON (never prompts)
-

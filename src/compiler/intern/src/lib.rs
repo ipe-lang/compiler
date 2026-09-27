@@ -3,6 +3,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use ipe_diagnostics::{DResult, Diagnostic};
 
+mod rust_keywords;
+pub use rust_keywords::{RUST_KEYWORDS, is_rust_keyword};
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Symbol(u32);
 

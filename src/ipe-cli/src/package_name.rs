@@ -101,9 +101,10 @@ impl PackageName {
     /// Build the typed rejection for a name that is not a safe path component.
     fn reject(raw: &str, why: &str) -> CliError {
         CliError::Resolve(format!(
-            "`{raw}` is not a valid package name: {why} — a name is joined into a \
+            "`{}` is not a valid package name: {why} — a name is joined into a \
              filesystem path, so it must be a single portable path component \
-             (matching `[a-z0-9]([a-z0-9]|-[a-z0-9])*`)"
+             (matching `[a-z0-9]([a-z0-9]|-[a-z0-9])*`)",
+            raw.escape_debug()
         ))
     }
 }
@@ -219,6 +220,14 @@ mod tests {
     #[test]
     fn rejects_control_char() {
         PackageName::parse("foo\0bar").expect_err("NUL must be rejected");
+    }
+
+    #[test]
+    fn rejection_escapes_the_raw_name() {
+        let err = PackageName::parse("a\u{1b}[2Jb\n").expect_err("control bytes are rejected");
+        let msg = err.to_string();
+        assert!(!msg.contains('\u{1b}') && !msg.contains('\n'), "{msg:?}");
+        assert!(msg.contains("a\\u{1b}[2Jb\\n"), "{msg:?}");
     }
 
     #[test]

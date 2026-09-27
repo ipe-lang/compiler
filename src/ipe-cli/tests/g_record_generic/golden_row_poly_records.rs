@@ -114,7 +114,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
     }
 
     let entry = golden_dir("row_poly_subset_access").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_subset_access_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_subset_access_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -198,7 +198,7 @@ fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
     }
 
     let entry = golden_dir("row_poly_subset_pattern").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_subset_pattern_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_subset_pattern_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -421,7 +421,7 @@ fn accessor_cargo_builds_and_prints_names() {
     }
 
     let entry = golden_dir("row_poly_accessor").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_accessor_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_accessor_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -518,7 +518,7 @@ fn row_poly_greet_cargo_builds_and_prints_both() {
     }
 
     let entry = golden_dir("row_poly_greet").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_greet_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_greet_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -613,7 +613,7 @@ fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
     }
 
     let entry = golden_dir("row_poly_task_seq_row_read").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_task_seq_row_read_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_task_seq_row_read_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -801,7 +801,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
     }
 
     let entry = golden_dir("row_poly_accessor_two_shapes").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_accessor_two_shapes_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_accessor_two_shapes_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -897,7 +897,7 @@ fn row_poly_multi_cargo_builds_and_prints_both() {
     }
 
     let entry = golden_dir("row_poly_multi").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_row_poly_multi_e2e");
+    let out = crate::support::scratch_root().join("ipec_row_poly_multi_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -977,7 +977,7 @@ fn row_poly_passthrough_cargo_builds_and_runs() {
 
     let name = "row_poly_passthrough";
     let entry = golden_dir(name).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -1070,7 +1070,7 @@ fn row_poly_update_cargo_builds_and_runs() {
 
     let name = "row_poly_update";
     let entry = golden_dir(name).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -1140,7 +1140,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
 
     let name = "row_poly_map_update";
     let entry = golden_dir(name).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

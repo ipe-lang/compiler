@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Type-check a program without building or running it.
 
   ipe type-check [<path>]
@@ -10,4 +11,3 @@ exit: 0
 
   Options:
     [--json]  emit each diagnostic as a stable JSON object (one per line) on stderr; success is the shared JSON envelope on stdout
-

@@ -38,7 +38,7 @@ fn authed_store_query_emits_byte_identical() {
         .join("golden")
         .join(GOLDEN)
         .join("main.rs");
-    let out = std::env::temp_dir().join("ipec_authed_store_query_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_authed_store_query_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -64,7 +64,7 @@ fn authed_store_query_emits_byte_identical() {
 fn authed_store_query_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_authed_store_query_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_authed_store_query_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

@@ -88,20 +88,25 @@ fn cli_error_code(err: &crate::CliError) -> Option<ipe_diagnostics::Code> {
 /// class of symbols the language deliberately refuses a point-free reference — an
 /// accessor/spec builder that reads its column from a `.field` at compile time
 /// ([`IPE_L0146`]), a committed-literal seal that must see its argument
-/// ([`IPE_L0151`]) — or the reference cannot be monomorphized because an unused
+/// ([`IPE_L0151`]), a handler-wrapping kernel that must see its handler
+/// ([`IPE_L0152`]) — or the reference cannot be monomorphized because an unused
 /// binding leaves the value fully polymorphic ([`IPE_L0102`]). In each the
 /// diagnostic is provoked by the probe form, not by a gap in the symbol's own
 /// lowering, so the column reports the symbol inapplicable rather than a false
 /// hole. This is exactly the "the resolver refuses to pass point-free" /
 /// "fully-polymorphic value with no determinable concrete type" case the columns'
-/// contracts name.
+/// contracts name. A non-`Clone` handler capture ([`IPE_L0126`]) is NOT in this
+/// class: it is a property of the program, so it stays a hole.
 #[must_use]
 pub fn is_probe_form_limitation(outcome: &StageOutcome) -> bool {
-    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0151};
+    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0151, IPE_L0152};
     matches!(
         outcome,
         StageOutcome::Failed { code: Some(code), .. }
-            if *code == IPE_L0102 || *code == IPE_L0146 || *code == IPE_L0151
+            if *code == IPE_L0102
+                || *code == IPE_L0146
+                || *code == IPE_L0151
+                || *code == IPE_L0152
     )
 }
 
@@ -488,5 +493,52 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
             code: None,
             message: format!("ipe run exited non-zero: {stderr}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StageOutcome, is_probe_form_limitation};
+
+    fn failed_with(code: ipe_diagnostics::Code) -> StageOutcome {
+        StageOutcome::Failed {
+            code: Some(code),
+            message: String::new(),
+        }
+    }
+
+    /// Every point-free refusal the language imposes by design is a probe-form limitation.
+    #[test]
+    fn point_free_refusals_are_probe_form_limitations() {
+        for code in [
+            ipe_diagnostics::IPE_L0102,
+            ipe_diagnostics::IPE_L0146,
+            ipe_diagnostics::IPE_L0151,
+            ipe_diagnostics::IPE_L0152,
+        ] {
+            assert!(
+                is_probe_form_limitation(&failed_with(code)),
+                "{} must classify as a probe-form limitation",
+                code.as_str()
+            );
+        }
+    }
+
+    /// A non-`Clone` capture refusal is a genuine hole, never masked as a probe-form limitation.
+    #[test]
+    fn non_clone_capture_is_not_a_probe_form_limitation() {
+        assert!(!is_probe_form_limitation(&failed_with(
+            ipe_diagnostics::IPE_L0126
+        )));
+    }
+
+    /// A success or a code-less failure is never a probe-form limitation.
+    #[test]
+    fn ok_and_codeless_failure_are_not_probe_form_limitations() {
+        assert!(!is_probe_form_limitation(&StageOutcome::Ok));
+        assert!(!is_probe_form_limitation(&StageOutcome::Failed {
+            code: None,
+            message: String::new(),
+        }));
     }
 }

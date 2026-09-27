@@ -315,32 +315,52 @@ fn char_width(c: char) -> u32 {
     u32::try_from(c.len_utf8()).unwrap_or(1)
 }
 
-const fn is_ident_start(c: char) -> bool {
+/// Whether `c` may begin an identifier (ASCII letter or `_`).
+#[must_use]
+pub const fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-const fn is_ident_continue(c: char) -> bool {
+/// Whether `c` may continue an identifier (ASCII alphanumeric or `_`).
+#[must_use]
+pub const fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-pub fn keyword(text: &str) -> Option<Tok> {
-    match text {
-        "module" => Some(Tok::Module),
-        "import" => Some(Tok::Import),
-        "exposing" => Some(Tok::Exposing),
-        "as" => Some(Tok::As),
-        "type" => Some(Tok::Type),
-        "foreign" => Some(Tok::Foreign),
-        "case" => Some(Tok::Case),
-        "of" => Some(Tok::Of),
-        "let" => Some(Tok::Let),
-        "in" => Some(Tok::In),
-        "if" => Some(Tok::If),
-        "then" => Some(Tok::Then),
-        "else" => Some(Tok::Else),
-        "do" => Some(Tok::Do),
-        _ => None,
-    }
+/// Declares the reserved-word table once.
+///
+/// Both the name list and the text-to-token recogniser derive from the one
+/// invocation below, so the two cannot drift.
+macro_rules! keywords {
+    ($($text:literal => $tok:ident),* $(,)?) => {
+        /// Every reserved word, in declaration order.
+        pub const KEYWORDS: &[&str] = &[$($text),*];
+
+        /// The keyword token `text` spells, or `None` for a non-keyword.
+        pub fn keyword(text: &str) -> Option<Tok> {
+            match text {
+                $($text => Some(Tok::$tok),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+keywords! {
+    "module" => Module,
+    "import" => Import,
+    "exposing" => Exposing,
+    "as" => As,
+    "type" => Type,
+    "foreign" => Foreign,
+    "case" => Case,
+    "of" => Of,
+    "let" => Let,
+    "in" => In,
+    "if" => If,
+    "then" => Then,
+    "else" => Else,
+    "do" => Do,
 }
 
 /// Lex `src` into tokens, or fail with a typed diagnostic.

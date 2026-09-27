@@ -45,7 +45,7 @@ fn distinct_functions_folding_to_the_same_rust_name_both_emit() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_aud08_function_name_collision");
+    let tmp = crate::support::scratch_root().join("ipec_aud08_function_name_collision");
     let wrote = write_project(
         &tmp,
         &[
@@ -102,7 +102,7 @@ fn distinct_functions_with_distinct_rust_names_are_accepted() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("ipec_aud08_function_name_collision_control");
+    let tmp = crate::support::scratch_root().join("ipec_aud08_function_name_collision_control");
     let wrote = write_project(
         &tmp,
         &[

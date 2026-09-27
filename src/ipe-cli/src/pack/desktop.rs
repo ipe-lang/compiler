@@ -337,11 +337,9 @@ fn reject_traversing_bundle_root(
     if single_normal {
         return Ok(());
     }
-    Err(super::super::CliError::UsageOwned(format!(
-        "package.ipe: name `{display_name}` cannot be a macOS bundle directory — a bundle root \
-         must be a single path component, but this name introduces a path separator, a `..` \
-         traversal, or an absolute path. Choose a name without `/`, `\\`, or `..`."
-    )))
+    Err(super::super::CliError::UsageOwned(
+        crate::text::bundle_name_not_a_component(&display_name),
+    ))
 }
 
 /// The per-OS icon file a bundle carries, derived from the single source icon.
@@ -661,19 +659,19 @@ pub fn materialise(
     bundle_root.ensure_dir()?;
 
     for file in &layout.files {
-        let entry =
+        let out_file =
             dist.path_to(Path::new(&layout.root_name).join(rel_to_native(&file.rel_path)))?;
         match &file.content {
-            BundleContent::Generated(text) => entry.write(text.as_bytes())?,
+            BundleContent::Generated(text) => out_file.write(text.as_bytes())?,
             BundleContent::AppBinary => {
-                entry.copy_from(binary)?;
-                make_executable(&entry.path())?;
+                out_file.copy_from(binary)?;
+                make_executable(&out_file.path())?;
             }
             BundleContent::Icon => {
                 // Present only when the layout carries an icon, which the layout
                 // builder emits only when a source icon was given.
                 if let Some(src) = icon {
-                    entry.copy_from(src)?;
+                    out_file.copy_from(src)?;
                 }
             }
         }

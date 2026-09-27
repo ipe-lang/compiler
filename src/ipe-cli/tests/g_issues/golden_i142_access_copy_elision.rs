@@ -34,7 +34,7 @@ fn emit_fixture(out_name: &str) -> String {
         .join("golden")
         .join("copy_field_no_clone")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join(out_name);
+    let out = crate::support::scratch_root().join(out_name);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -114,7 +114,7 @@ fn copy_field_no_clone_compiles_and_runs() {
     }
 
     let _ = emit_fixture("ipec_i142_copy_field_no_clone_e2e");
-    let out = std::env::temp_dir().join("ipec_i142_copy_field_no_clone_e2e");
+    let out = crate::support::scratch_root().join("ipec_i142_copy_field_no_clone_e2e");
 
     let outcome = crate::support::build_and_run_emitted("copy_field_no_clone", &out);
     assert_eq!(

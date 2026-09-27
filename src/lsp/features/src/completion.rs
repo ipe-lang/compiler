@@ -172,7 +172,7 @@ pub fn completions(
 
     drop(interner);
 
-    for kw in KEYWORDS {
+    for kw in ipe_parse::KEYWORDS {
         items.push(keyword_item(kw));
     }
 
@@ -565,41 +565,11 @@ fn keyword_item(label: &'static str) -> CompletionItem {
     }
 }
 
-/// Ipê keywords offered at every cursor position. Every entry is a real
-/// reserved word per the lexer's own table (`ipe_parse::is_keyword`);
-/// `completion_keywords_match_the_lexer` pins the two against drift.
-const KEYWORDS: &[&str] = &[
-    "module", "import", "exposing", "as", "type", "foreign", "case", "of", "let", "in", "if",
-    "then", "else", "do",
-];
-
 #[cfg(test)]
 mod tests {
     use ipe_db::{IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
 
-    use super::{Candidate, CandidateKind, KEYWORDS, completions, render_candidates};
-
-    /// Every completion keyword must be a real reserved word per the lexer's own
-    /// table — no invented entry (a past list offered `alias`, which is not a
-    /// keyword) and no drift from the lexer SSOT.
-    #[test]
-    fn completion_keywords_match_the_lexer() {
-        for kw in KEYWORDS {
-            assert!(
-                ipe_parse::is_keyword(kw),
-                "completion offers {kw:?}, which is not a lexer keyword"
-            );
-        }
-        for kw in [
-            "module", "import", "exposing", "as", "type", "foreign", "case", "of", "let", "in",
-            "if", "then", "else", "do",
-        ] {
-            assert!(
-                KEYWORDS.contains(&kw),
-                "completion is missing the keyword {kw:?}"
-            );
-        }
-    }
+    use super::{Candidate, CandidateKind, completions, render_candidates};
 
     fn file(db: &IpeDatabase, path: &[&str], text: &str) -> SourceFile {
         SourceFile::new(

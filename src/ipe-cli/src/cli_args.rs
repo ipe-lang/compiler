@@ -13,9 +13,9 @@
 //! `run_fmt` consume the typed value; the scattered ad-hoc checks they used to
 //! carry are folded into these parses.
 
-use crate::CliError;
 use crate::build_plan::{AllocatorChoice, StaticRequestLayer};
-use crate::delivery::{DeliveryError, DeliveryTokens, Shape};
+use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetTriple};
+use crate::{CliError, text};
 pub use ipe_backend_rust::static_build::StaticTriple;
 
 /// The delivery positionals a `build` / `run` / `watch` tail may carry after the
@@ -67,7 +67,7 @@ fn take_delivery_positionals(
 /// refusals are pedagogical lessons, carried verbatim behind the command prefix.
 #[must_use]
 fn delivery_usage(command: &str, err: &DeliveryError) -> CliError {
-    CliError::UsageOwned(format!("ipe {command}: {err}"))
+    CliError::UsageOwned(text::command_refusal(&command, err))
 }
 
 /// The one phrasing for "a command was given a flag it does not recognise".
@@ -78,23 +78,21 @@ fn delivery_usage(command: &str, err: &DeliveryError) -> CliError {
 /// Always backticks (never `Debug`/`{:?}` straight quotes), always the prefix.
 #[must_use]
 pub fn usage_unknown_flag(command: &str, flag: &str) -> CliError {
-    CliError::UsageOwned(format!("ipe {command}: unknown flag `{flag}`"))
+    CliError::UsageOwned(text::unknown_flag(&command, &flag))
 }
 
 /// The one phrasing for "a parent command was given a subcommand it does not
 /// recognise", naming the accepted set so the fix is obvious.
 #[must_use]
 pub fn usage_unknown_subcommand(command: &str, sub: &str, expected: &str) -> CliError {
-    CliError::UsageOwned(format!(
-        "ipe {command}: unknown subcommand `{sub}` (expected {expected})"
-    ))
+    CliError::UsageOwned(text::unknown_subcommand(&command, &sub, &expected))
 }
 
 /// The one phrasing for "a command that takes no positional was given one, or a
 /// single-positional command was given a second".
 #[must_use]
 pub fn usage_unexpected_argument(command: &str, arg: &str) -> CliError {
-    CliError::UsageOwned(format!("ipe {command}: unexpected argument `{arg}`"))
+    CliError::UsageOwned(text::unexpected_argument(&command, &arg))
 }
 
 /// How a data-producing command renders its result.
@@ -247,12 +245,10 @@ pub(crate) fn consume_format_flag(
             *slot = Some(requested);
             Ok(true)
         }
-        Some(existing) if *existing == requested => Err(CliError::UsageOwned(format!(
-            "ipe {command}: {flag} given more than once"
-        ))),
-        Some(_) => Err(CliError::UsageOwned(format!(
-            "ipe {command}: --plain and --json are mutually exclusive"
-        ))),
+        Some(existing) if *existing == requested => {
+            Err(CliError::UsageOwned(text::flag_repeated(&command, &flag)))
+        }
+        Some(_) => Err(CliError::UsageOwned(text::plain_json_exclusive(&command))),
     }
 }
 
@@ -339,9 +335,7 @@ pub fn single_positional_with_format<'a>(
 /// [`CliError::UsageOwned`] when `slot` already holds a value.
 fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str, command: &str) -> Result<(), CliError> {
     if slot.is_some() {
-        return Err(CliError::UsageOwned(format!(
-            "ipe {command}: {flag} given more than once"
-        )));
+        return Err(CliError::UsageOwned(text::flag_repeated(&command, &flag)));
     }
     *slot = Some(value);
     Ok(())
@@ -352,11 +346,9 @@ fn set_session(slot: &mut SessionMode, mode: SessionMode) -> Result<(), CliError
     if let Some(first) = slot.flag() {
         let second = mode.flag().unwrap_or(first);
         return Err(CliError::UsageOwned(if first == second {
-            format!("ipe run: {first} given more than once")
+            text::flag_repeated(&"run", &first)
         } else {
-            format!(
-                "ipe run: {first} and {second} cannot be combined — record a session, then replay it"
-            )
+            text::session_flags_exclusive(&first, &second)
         }));
     }
     *slot = mode;
@@ -375,7 +367,7 @@ fn take_value(
 ) -> Result<String, CliError> {
     it.next()
         .cloned()
-        .ok_or_else(|| CliError::UsageOwned(format!("ipe {command}: {flag} needs a value")))
+        .ok_or_else(|| CliError::UsageOwned(text::flag_needs_value(&command, &flag)))
 }
 
 /// Take the leading positional entry, if any: the first token, but ONLY when it
@@ -412,9 +404,7 @@ fn is_delivery_word(token: &str) -> bool {
 /// without touching the real filesystem.
 fn shadowing_note(word: &str, exists: impl FnOnce(&str) -> bool) -> Option<String> {
     if is_delivery_word(word) && exists(word) {
-        Some(format!(
-            "note: a path `{word}` exists but bare `{word}` selects the delivery; write `./{word}` to build that path"
-        ))
+        Some(text::delivery_word_shadows_path(&word))
     } else {
         None
     }
@@ -435,7 +425,11 @@ fn take_leading_entry_path(
         Some(first) if !first.starts_with('-') && !is_delivery_word(first) => it.next().cloned(),
         Some(first) => {
             if let Some(note) = shadowing_note(first, |w| std::path::Path::new(w).exists()) {
-                eprintln!("{note}");
+                crate::screen::chatter(
+                    crate::screen::Stream::Stderr,
+                    crate::screen::Tone::Aux,
+                    &note,
+                );
             }
             None
         }
@@ -463,18 +457,47 @@ fn take_delivery_words(it: &mut std::iter::Peekable<std::slice::Iter<'_, String>
 /// layer. Each value flag is rejected on a second occurrence; the boolean flags
 /// are idempotent (a repeat is harmless and stays accepted).
 ///
-/// This carries `--target` as a raw string still (its closed form is
-/// [`crate::build_plan::StaticTriple`], resolved during static-plan resolution
-/// together with the env / `package.ipe` layers), but `--allocator` is parsed into
-/// the closed [`AllocatorChoice`] enum at this boundary so an out-of-set name
+/// `--target` is parsed into the closed [`TargetTriple`] set and `--allocator`
+/// into the closed [`AllocatorChoice`] at this boundary, so an out-of-set value
 /// can never reach resolution.
 #[derive(Default)]
 struct StaticFlags {
     static_flag: bool,
-    target: Option<String>,
+    target: Option<TargetTriple>,
     allocator: Option<AllocatorChoice>,
-    allow_slow_allocator: bool,
     c_free: bool,
+}
+
+/// Parse a raw `--target` value into the shared [`TargetTriple`] set.
+///
+/// `build`, `run`, and `release` share this one vocabulary (parse, don't
+/// validate): the browser bundle, the portable WASI module, or a supported
+/// musl-static triple. An out-of-set value is refused here, with the same
+/// message for every command; what a command cannot do with an in-set target
+/// (`run` has no process to execute for `wasm`, `release` produces no `wasi`
+/// module) is that command's own typed refusal.
+///
+/// # Errors
+/// [`CliError::UsageOwned`] naming every supported value when `raw` is outside
+/// the vocabulary.
+pub fn parse_target(raw: &str) -> Result<TargetTriple, CliError> {
+    TargetTriple::from_flag(raw).ok_or_else(|| {
+        CliError::UsageOwned(text::unsupported_target(
+            &raw,
+            &StaticTriple::SUPPORTED.join(", "),
+        ))
+    })
+}
+
+/// The WASM flavour an optional `--target` selects ([`WasmKind::None`] for a
+/// native triple or no target).
+#[must_use]
+pub const fn wasm_kind_of(target: Option<TargetTriple>) -> WasmKind {
+    match target {
+        Some(TargetTriple::BrowserWasm) => WasmKind::Client,
+        Some(TargetTriple::Wasm32Wasip1) => WasmKind::Wasi,
+        Some(TargetTriple::Native(_)) | None => WasmKind::None,
+    }
 }
 
 impl StaticFlags {
@@ -493,19 +516,16 @@ impl StaticFlags {
     ) -> Result<bool, CliError> {
         match flag {
             "--static" => self.static_flag = true,
-            "--target" => set_once(
-                &mut self.target,
-                take_value(it, "--target", command)?,
-                "--target",
-                command,
-            )?,
+            "--target" => {
+                let target = parse_target(&take_value(it, "--target", command)?)?;
+                set_once(&mut self.target, target, "--target", command)?;
+            }
             "--allocator" => {
                 let raw = take_value(it, "--allocator", command)?;
                 let choice = AllocatorChoice::parse(&raw)
                     .map_err(|refusal| CliError::UsageOwned(refusal.to_string()))?;
                 set_once(&mut self.allocator, choice, "--allocator", command)?;
             }
-            "--allow-slow-allocator" => self.allow_slow_allocator = true,
             "--cfree" => self.c_free = true,
             _ => return Ok(false),
         }
@@ -516,9 +536,13 @@ impl StaticFlags {
     fn layer(self) -> StaticRequestLayer {
         StaticRequestLayer {
             static_build: self.static_flag.then_some(true),
-            target: self.target,
+            // Only a native triple enters static resolution; a WASM target is
+            // its own axis, routed before this layer is built.
+            target: match self.target {
+                Some(TargetTriple::Native(triple)) => Some(triple.as_str().to_owned()),
+                Some(TargetTriple::BrowserWasm | TargetTriple::Wasm32Wasip1) | None => None,
+            },
             allocator: self.allocator,
-            allow_slow_allocator: self.allow_slow_allocator.then_some(true),
             c_free: self.c_free.then_some(true),
         }
     }
@@ -545,18 +569,6 @@ pub enum WasmKind {
 }
 
 impl WasmKind {
-    /// Classify a raw `--target` value into its WASM flavour. Only the two
-    /// pseudo-triple words (`wasm`, `wasi`) are WASM targets; every other value
-    /// (a real static-link triple, or `None`) is [`WasmKind::None`].
-    #[must_use]
-    pub fn classify(target: Option<&str>) -> Self {
-        match target {
-            Some("wasm") => Self::Client,
-            Some("wasi") => Self::Wasi,
-            _ => Self::None,
-        }
-    }
-
     /// Whether this is a WASM target at all (either flavour) — the axis that
     /// does not compose with the native static-link flags.
     #[must_use]
@@ -598,7 +610,7 @@ pub enum BuildMode {
         /// cannot also apply.
         wasm: WasmKind,
         /// The native static-request layer (`--static` / `--target <triple>` /
-        /// `--allocator` / `--allow-slow-allocator`). Empty under a WASM target.
+        /// `--allocator`). Empty under a WASM target.
         static_layer: StaticRequestLayer,
     },
 }
@@ -647,10 +659,9 @@ pub struct BuildArgs {
 ///
 /// Rejects, at this single boundary: `--emit-ir` combined with any
 /// emit-affecting flag (`--out` / `--static` / `--target` / `--allocator` /
-/// `--allow-slow-allocator` / `--cfree`); `--target wasm` combined with
-/// `--static` / `--allocator` / `--allow-slow-allocator` / `--cfree`
-/// (native-only flags); a duplicate value flag; an allocator name outside the
-/// closed set; and an unknown flag.
+/// `--cfree`); `--target wasm` combined with `--static` / `--allocator` /
+/// `--cfree` (native-only flags); a duplicate value flag; a target or allocator
+/// outside its closed set; and an unknown flag.
 ///
 /// # Errors
 /// [`CliError::Usage`] / [`CliError::UsageOwned`] naming the exact problem.
@@ -710,24 +721,14 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
     // `--target wasm`/`--target wasi` is a compilation-target axis, not a
     // static-link triple; it never enters static-request resolution and does not
     // compose with the native static flags.
-    let wasm = WasmKind::classify(static_flags.target.as_deref());
+    let wasm = wasm_kind_of(static_flags.target);
     if wasm.is_wasm() && (static_flags.static_flag || static_flags.allocator.is_some()) {
-        return Err(CliError::UsageOwned(format!(
-            "--static / --allocator are native-target flags; they do not compose with --target {}",
-            wasm.word(),
-        )));
-    }
-    if wasm.is_wasm() && static_flags.allow_slow_allocator {
-        return Err(CliError::UsageOwned(format!(
-            "--allow-slow-allocator is a native-target flag; it does not compose with --target {}",
-            wasm.word(),
+        return Err(CliError::UsageOwned(text::static_flags_with_wasm(
+            &wasm.word(),
         )));
     }
     if wasm.is_wasm() && static_flags.c_free {
-        return Err(CliError::UsageOwned(format!(
-            "--cfree is a native-target flag; it does not compose with --target {}",
-            wasm.word(),
-        )));
+        return Err(CliError::UsageOwned(text::cfree_with_wasm(&wasm.word())));
     }
 
     let mode = if emit_ir {
@@ -735,26 +736,19 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
         // meaningless with it. Reject rather than silently ignore (the old early
         // return dropped them without a word).
         if out.is_some() {
-            return Err(CliError::Usage("--emit-ir does not compose with --out"));
+            return Err(CliError::Usage(text::emit_ir_with_out()));
         }
         if static_flags.static_flag {
-            return Err(CliError::Usage("--emit-ir does not compose with --static"));
+            return Err(CliError::Usage(text::emit_ir_with_static()));
         }
         if static_flags.target.is_some() {
-            return Err(CliError::Usage("--emit-ir does not compose with --target"));
+            return Err(CliError::Usage(text::emit_ir_with_target()));
         }
         if static_flags.allocator.is_some() {
-            return Err(CliError::Usage(
-                "--emit-ir does not compose with --allocator",
-            ));
-        }
-        if static_flags.allow_slow_allocator {
-            return Err(CliError::Usage(
-                "--emit-ir does not compose with --allow-slow-allocator",
-            ));
+            return Err(CliError::Usage(text::emit_ir_with_allocator()));
         }
         if static_flags.c_free {
-            return Err(CliError::Usage("--emit-ir does not compose with --cfree"));
+            return Err(CliError::Usage(text::emit_ir_with_cfree()));
         }
         BuildMode::EmitIr
     } else if wasm.is_wasm() {
@@ -944,24 +938,14 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     // wasmtime, so it composes with none of the native static-link flags — the
     // same non-composition `ipe build` enforces (they lower to a native triple
     // that a wasm target has no use for).
-    let wasm = WasmKind::classify(static_flags.target.as_deref());
+    let wasm = wasm_kind_of(static_flags.target);
     match wasm {
         WasmKind::Client => {
-            return Err(CliError::Usage(
-                "ipe run builds and executes a native binary; --target wasm has no native \
-                 artifact to run — use `ipe build --target wasm` to produce a browser bundle",
-            ));
+            return Err(CliError::Usage(text::run_wasm_target()));
         }
         WasmKind::Wasi => {
-            if static_flags.static_flag
-                || static_flags.allocator.is_some()
-                || static_flags.allow_slow_allocator
-                || static_flags.c_free
-            {
-                return Err(CliError::Usage(
-                    "--static / --allocator / --allow-slow-allocator / --cfree are native-target \
-                     flags; they do not compose with --target wasi",
-                ));
+            if static_flags.static_flag || static_flags.allocator.is_some() || static_flags.c_free {
+                return Err(CliError::Usage(text::run_wasi_native_flags()));
             }
         }
         WasmKind::None => {}
@@ -1041,9 +1025,7 @@ pub fn parse_eject(rest: &[String]) -> Result<EjectArgs, CliError> {
         }
     }
 
-    let out = out.ok_or(CliError::Usage(
-        "ipe eject: --out <dir> is required (the directory to write the standalone project to)",
-    ))?;
+    let out = out.ok_or_else(|| CliError::Usage(text::eject_out_required()))?;
 
     Ok(EjectArgs {
         entry,
@@ -1055,8 +1037,9 @@ pub fn parse_eject(rest: &[String]) -> Result<EjectArgs, CliError> {
 /// Where `ipe release` sends its output artifact: a browser bundle or a
 /// statically-linked native binary for a specific rustc target triple.
 ///
-/// Constructed exclusively through [`ReleaseTarget::parse`], so the `"wasm"`
-/// sentinel cannot leak past the CLI boundary.
+/// Constructed exclusively through [`ReleaseTarget::from_target`] over the
+/// shared [`TargetTriple`] set, so the `"wasm"` sentinel cannot leak past the
+/// CLI boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseTarget {
     /// `--target wasm`: emit a browser/Wasm bundle.
@@ -1067,30 +1050,23 @@ pub enum ReleaseTarget {
 }
 
 impl ReleaseTarget {
-    /// Parse the raw `--target` value (or its absence) into a typed variant.
+    /// The release destination for a parsed `--target` (or its absence).
     ///
-    /// `None` → the default native triple. `Some("wasm")` → [`Self::Wasm`].
-    /// `Some(triple)` → [`Self::Native`] when the triple is in the supported
-    /// set; anything else is an error that names the supported values.
+    /// `None` → the default native triple; [`TargetTriple::BrowserWasm`] →
+    /// [`Self::Wasm`]; [`TargetTriple::Native`] → [`Self::Native`].
     ///
     /// # Errors
     ///
-    /// [`CliError::UsageOwned`] when the triple string is not in the supported
-    /// set.
-    pub fn parse(raw: Option<&str>) -> Result<Self, CliError> {
-        match raw {
-            None => Ok(Self::Native(
-                ipe_backend_rust::static_build::StaticTriple::default(),
-            )),
-            Some("wasm") => Ok(Self::Wasm),
-            Some(t) => ipe_backend_rust::static_build::StaticTriple::parse(t)
-                .map(Self::Native)
-                .ok_or_else(|| {
-                    CliError::UsageOwned(format!(
-                        "ipe release: unsupported target `{t}`; supported: wasm, {}",
-                        ipe_backend_rust::static_build::StaticTriple::SUPPORTED.join(", ")
-                    ))
-                }),
+    /// [`CliError::UsageOwned`] for [`TargetTriple::Wasm32Wasip1`]: a release
+    /// produces a browser bundle or a native binary, never a WASI module.
+    pub fn from_target(target: Option<TargetTriple>) -> Result<Self, CliError> {
+        match target {
+            None => Ok(Self::Native(StaticTriple::default())),
+            Some(TargetTriple::BrowserWasm) => Ok(Self::Wasm),
+            Some(TargetTriple::Native(triple)) => Ok(Self::Native(triple)),
+            Some(TargetTriple::Wasm32Wasip1) => {
+                Err(CliError::UsageOwned(text::release_no_wasi().to_owned()))
+            }
         }
     }
 }
@@ -1155,7 +1131,7 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
-    let mut target: Option<String> = None;
+    let mut target: Option<TargetTriple> = None;
     let mut format: Option<OutputFormat> = None;
     let mut emit_permissions: Option<String> = None;
     let mut saw_embed = false;
@@ -1179,12 +1155,10 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
                 "--runtime",
                 "release",
             )?,
-            "--target" => set_once(
-                &mut target,
-                take_value(&mut it, "--target", "release")?,
-                "--target",
-                "release",
-            )?,
+            "--target" => {
+                let parsed = parse_target(&take_value(&mut it, "--target", "release")?)?;
+                set_once(&mut target, parsed, "--target", "release")?;
+            }
             "--emit-permissions" => set_once(
                 &mut emit_permissions,
                 take_value(&mut it, "--emit-permissions", "release")?,
@@ -1202,9 +1176,7 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
 
     if saw_embed && saw_bundle {
         return Err(CliError::UsageOwned(
-            "ipe release: --embed and --bundle are mutually exclusive (embed is the default \
-             single self-jailing binary; --bundle is the multi-file opt-out)"
-                .to_owned(),
+            text::release_embed_bundle_exclusive().to_owned(),
         ));
     }
 
@@ -1214,7 +1186,7 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
         ReleaseMode::Embed
     };
 
-    let target = ReleaseTarget::parse(target.as_deref())?;
+    let target = ReleaseTarget::from_target(target)?;
 
     Ok(ReleaseArgs {
         entry,
@@ -1321,13 +1293,9 @@ pub fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
 /// [`CliError::UsageOwned`] on a non-numeric value or on `0`.
 pub fn parse_port(value: &str, command: &str) -> Result<u16, CliError> {
     match value.parse::<u16>() {
-        Ok(0) => Err(CliError::UsageOwned(format!(
-            "ipe {command}: --port 0 is not a real port; omit --port to auto-select a free one"
-        ))),
+        Ok(0) => Err(CliError::UsageOwned(text::port_zero(&command))),
         Ok(port) => Ok(port),
-        Err(_) => Err(CliError::UsageOwned(format!(
-            "ipe {command}: --port `{value}` is not a port number (1-65535)"
-        ))),
+        Err(_) => Err(CliError::UsageOwned(text::port_invalid(&command, &value))),
     }
 }
 
@@ -1359,7 +1327,7 @@ pub fn parse_fix(rest: &[String]) -> Result<FixArgs, CliError> {
             positional => set_once(&mut entry, positional.to_owned(), "<path>", "fix")?,
         }
     }
-    let entry = entry.ok_or(CliError::Usage("usage: ipe fix <path> [--yes]"))?;
+    let entry = entry.ok_or_else(|| CliError::Usage(text::fix_usage()))?;
     Ok(FixArgs { entry, auto })
 }
 
@@ -1433,9 +1401,7 @@ pub fn parse_health(rest: &[String]) -> Result<HealthArgs, CliError> {
     }
     let format = format.unwrap_or_default();
     if assume_yes && format != OutputFormat::Human {
-        return Err(CliError::Usage(
-            "ipe health: --yes does not compose with --plain / --json (a data form never mutates)",
-        ));
+        return Err(CliError::Usage(text::health_yes_with_format()));
     }
     Ok(HealthArgs { format, assume_yes })
 }
@@ -1494,27 +1460,21 @@ pub fn parse_fmt(rest: &[String]) -> Result<FmtMode, CliError> {
             }
             positional => {
                 if path.is_some() {
-                    return Err(CliError::Usage("fmt: expected a single <path> argument"));
+                    return Err(CliError::Usage(text::fmt_single_path()));
                 }
                 path = Some(positional.to_owned());
             }
         }
     }
     if stdin && path.is_some() {
-        return Err(CliError::Usage(
-            "fmt: --stdin and a <path> argument are mutually exclusive",
-        ));
+        return Err(CliError::Usage(text::fmt_stdin_and_path()));
     }
     let format = format.unwrap_or_default();
     if format != OutputFormat::Human && stdin {
-        return Err(CliError::Usage(
-            "fmt: --plain / --json do not compose with --stdin (it already writes to stdout)",
-        ));
+        return Err(CliError::Usage(text::fmt_format_with_stdin()));
     }
     if format != OutputFormat::Human && !check {
-        return Err(CliError::Usage(
-            "fmt: --plain / --json report the unformatted files of a --check scan; pass --check",
-        ));
+        return Err(CliError::Usage(text::fmt_format_needs_check()));
     }
     if stdin {
         if check {
@@ -1648,7 +1608,6 @@ mod tests {
         assert!(parse_build(&s(&["--emit-ir", "--static"])).is_err());
         assert!(parse_build(&s(&["--emit-ir", "--target", "wasm"])).is_err());
         assert!(parse_build(&s(&["--emit-ir", "--allocator", "dlmalloc"])).is_err());
-        assert!(parse_build(&s(&["--emit-ir", "--allow-slow-allocator"])).is_err());
     }
 
     #[test]
@@ -1666,7 +1625,6 @@ mod tests {
     fn build_wasm_rejects_native_static_flags() {
         assert!(parse_build(&s(&["--target", "wasm", "--static"])).is_err());
         assert!(parse_build(&s(&["--target", "wasm", "--allocator", "dlmalloc"])).is_err());
-        assert!(parse_build(&s(&["--target", "wasm", "--allow-slow-allocator"])).is_err());
     }
 
     #[test]
@@ -1675,7 +1633,6 @@ mod tests {
         // not compose with it, symmetric with `--target wasm`.
         assert!(parse_build(&s(&["--target", "wasi", "--static"])).is_err());
         assert!(parse_build(&s(&["--target", "wasi", "--allocator", "dlmalloc"])).is_err());
-        assert!(parse_build(&s(&["--target", "wasi", "--allow-slow-allocator"])).is_err());
         assert!(parse_build(&s(&["--target", "wasi", "--cfree"])).is_err());
     }
 
@@ -1787,6 +1744,72 @@ mod tests {
         assert!(a.bin_args.is_empty());
     }
 
+    /// `--allow-slow-allocator` is not a flag: an explicit
+    /// `--allocator system` is the choice itself.
+    #[test]
+    fn allow_slow_allocator_is_an_unknown_flag() {
+        type Parser = fn(&[String]) -> Result<(), CliError>;
+        let parsers: [Parser; 2] = [|a| parse_build(a).map(|_| ()), |a| parse_run(a).map(|_| ())];
+        for parse in parsers {
+            let err = parse(&s(&["--allow-slow-allocator"]));
+            assert!(
+                matches!(&err, Err(e) if e.to_string().contains("unknown flag")),
+                "{err:?}"
+            );
+            assert!(parse(&s(&["--static", "--allocator", "system"])).is_ok());
+        }
+    }
+
+    /// `build`, `run`, and `release` share one `--target` vocabulary.
+    ///
+    /// An in-set value parses for all three, and an out-of-set value is refused
+    /// by all three with the same message. The only per-command refusals are
+    /// semantic — `run` has no process to execute for `wasm`, and `release`
+    /// produces no `wasi` module — and each names why.
+    #[test]
+    fn build_run_and_release_share_the_target_vocabulary() {
+        let in_set = [
+            "wasm",
+            "wasi",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ];
+        for value in in_set {
+            assert!(parse_target(value).is_ok(), "{value}");
+            assert!(
+                parse_build(&s(&["--target", value])).is_ok(),
+                "build {value}"
+            );
+            let run = parse_run(&s(&["--target", value]));
+            let release = parse_release(&s(&["--target", value]));
+            match value {
+                "wasm" => assert!(
+                    matches!(&run, Err(e) if e.to_string().contains("no native artifact")),
+                    "run wasm is a semantic refusal"
+                ),
+                _ => assert!(run.is_ok(), "run {value}"),
+            }
+            match value {
+                "wasi" => assert!(
+                    matches!(&release, Err(e) if e.to_string().contains("does not produce a WASI module")),
+                    "release wasi is a semantic refusal"
+                ),
+                _ => assert!(release.is_ok(), "release {value}"),
+            }
+        }
+        for value in ["x86_64-apple-darwin", "bogus", "WASM", ""] {
+            let expected = parse_target(value).map(|_| ()).map_err(|e| e.to_string());
+            assert!(expected.is_err(), "{value} is out of set");
+            for got in [
+                parse_build(&s(&["--target", value])).map(|_| ()),
+                parse_run(&s(&["--target", value])).map(|_| ()),
+                parse_release(&s(&["--target", value])).map(|_| ()),
+            ] {
+                assert_eq!(got.map_err(|e| e.to_string()), expected, "{value}");
+            }
+        }
+    }
+
     #[test]
     fn run_wasm_target_rejected() {
         assert!(matches!(
@@ -1811,7 +1834,6 @@ mod tests {
         assert!(parse_run(&s(&["--target", "wasi", "--static"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--allocator", "dlmalloc"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--cfree"])).is_err());
-        assert!(parse_run(&s(&["--target", "wasi", "--allow-slow-allocator"])).is_err());
     }
 
     #[test]

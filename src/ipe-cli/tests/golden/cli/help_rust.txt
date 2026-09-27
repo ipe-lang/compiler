@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Manage Rust crates as foreign-function dependencies.
 
   ipe rust <add|remove|install> [<args>...]
@@ -13,4 +14,3 @@ exit: 0
     [--yes]                  add/install: skip the trust-summary confirmation prompt
     [--allow-build-scripts]  add/install: permit the crates' build scripts to run
     [--verbose]              add/install: show the full raw inspector log on failure
-

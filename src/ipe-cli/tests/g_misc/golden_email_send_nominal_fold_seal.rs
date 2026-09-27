@@ -91,7 +91,7 @@ fn built_app_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<S
 #[test]
 fn email_literals_emit_runtime_structs_and_provider_variant() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_email_send_nominal_fold_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_email_send_nominal_fold_seal_emit");
     let (built, app_rs) = built_app_rs(&root, &out);
     assert!(
         built.is_ok(),
@@ -131,7 +131,7 @@ fn email_literals_emit_runtime_structs_and_provider_variant() {
 #[test]
 fn email_send_nominal_fold_seal_builds() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_email_send_nominal_fold_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_email_send_nominal_fold_seal_e2e");
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
     };

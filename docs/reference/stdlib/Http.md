@@ -12,6 +12,11 @@ the URL, enforces the SSRF guard, body cap, timeout floor, and error
 redaction. These records are transport DTOs carried to that boundary;
 downstream code MUST NOT re-validate.
 
+Dial rule: a URL with `\` anywhere, or `@` in its path or fragment, is
+refused (its credentials could run into the host) — write `@` as `%40`.
+An `@` in the query is allowed, but an error for that URL then withholds
+the host.
+
 Request TARGETS are the typed `Ipe.Url.Url`, not a raw `String` — at EVERY
 entry point. The one-shot senders `get` / `post` take a `Url`; the primary
 constructor `defaultRequest` and the retarget setter `withUrl` take an

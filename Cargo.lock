@@ -1656,7 +1656,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-support"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
@@ -2974,9 +2974,10 @@ checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
 
 [[package]]
 name = "ipe"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "cap-primitives",
  "e2e-support",
  "getrandom 0.3.4",
  "hex",
@@ -3017,6 +3018,7 @@ dependencies = [
  "ureq",
  "wasmtime",
  "wasmtime-wasi",
+ "winapi-util",
 ]
 
 [[package]]
@@ -3030,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "ipe-runtime-rust"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3059,6 +3061,7 @@ dependencies = [
  "md-5",
  "pbkdf2 0.12.2",
  "percent-encoding",
+ "proc-macro2",
  "proptest",
  "redis",
  "regex",
@@ -3066,6 +3069,7 @@ dependencies = [
  "rsa",
  "rust_decimal",
  "rustix 1.1.4",
+ "rustls",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -3074,6 +3078,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "subtle",
+ "syn 2.0.118",
  "tao",
  "tinyvec",
  "tokio",
@@ -3096,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "ipe-wasm"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3114,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_annotate"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3128,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_ir",
@@ -3138,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend_rust"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "e2e-support",
  "ipe-runtime-rust",
@@ -3155,11 +3160,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_bindgen"
-version = "0.2.6"
+version = "0.3.0"
 
 [[package]]
 name = "ipe_canon"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3170,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_db"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3189,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_diagnostics"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_path_core",
  "unicode-width",
@@ -3197,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_docs"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_annotate",
  "ipe_diagnostics",
@@ -3210,12 +3215,13 @@ dependencies = [
 
 [[package]]
 name = "ipe_ffi"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
  "ipe_intern",
  "ipe_kernels",
+ "ipe_parse",
  "ipe_syntax",
  "proc-macro2",
  "serde",
@@ -3224,7 +3230,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_fmt"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3234,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_intern"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "serde",
@@ -3243,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_ir"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3254,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_kernels"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_intern",
  "ipe_parse",
@@ -3265,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lint"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3276,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lower"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3289,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_features"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_annotate",
  "ipe_canon",
@@ -3307,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_server"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "ipe_db",
@@ -3325,7 +3331,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_parse"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3334,11 +3340,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_path_core"
-version = "0.2.6"
+version = "0.3.0"
 
 [[package]]
 name = "ipe_sandbox"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_kernels",
@@ -3349,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_stdlib"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_intern",
@@ -3360,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_syntax"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3368,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_types"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3380,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_watch"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "notify",
  "sha2 0.10.9",
@@ -3389,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_wrapper"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_kernels",
  "ipe_sandbox",
@@ -4570,6 +4576,7 @@ name = "panic-scan"
 version = "0.0.0"
 dependencies = [
  "proc-macro2",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -4805,7 +4812,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playground-jail-runner"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe_sandbox",
  "serde",
@@ -5401,14 +5408,14 @@ dependencies = [
 
 [[package]]
 name = "regen-cli-transcripts"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "ipe",
 ]
 
 [[package]]
 name = "regen-goldens"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "e2e-support",
  "ipe",

@@ -80,6 +80,8 @@ mod golden_multi_mod_split_pilot;
 mod golden_parametric_aliases;
 #[path = "g_misc/golden_parser_gaps.rs"]
 mod golden_parser_gaps;
+#[path = "g_misc/golden_phantom_binder_reuse.rs"]
+mod golden_phantom_binder_reuse;
 #[path = "g_misc/golden_region_seal.rs"]
 mod golden_region_seal;
 #[path = "g_misc/golden_secret.rs"]

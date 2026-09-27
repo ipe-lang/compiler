@@ -891,65 +891,223 @@ pub struct FuzzyMatch<'a> {
     pub score: u32,
 }
 
-/// Rank all entries in `bundle` against `query` by a case-insensitive fuzzy
-/// score over key and title. Returns candidates with score > 0, ordered
-/// highest score first.
+/// The score of an exact key match — the one score that names the entry the
+/// query asked for rather than a neighbour of it.
+pub const EXACT_SCORE: u32 = 1000;
+
+/// The most suggestions a miss lists: enough to cover a bare name shared by a
+/// few modules, few enough to read at a glance.
+pub const SUGGESTION_LIMIT: usize = 8;
+
+/// The longest query (in characters) the edit-distance tiers consider.
 ///
-/// No panics and no raw indexing. An empty bundle returns an empty vec.
+/// Longer input still ranks by exact, prefix, substring, and token match; the bound keeps a pasted
+/// blob from buying an unbounded distance computation.
+const DISTANCE_QUERY_CAP: usize = 64;
+
+/// Rank all entries in `bundle` against `query`, case-insensitively.
+///
+/// Matches each entry's key, the key's last `.` segment (a bare member name),
+/// and its title.
+///
+/// Tiers, best first: exact key ([`EXACT_SCORE`]); exact last segment; prefix;
+/// exact or prefix title; substring; every query word a word of the key or
+/// title; then a small edit distance (a typo). Returns the matching entries,
+/// best first, ties broken by kind then key so the order is deterministic.
+/// An entry that matches no tier is left out — see [`nearest`] for the
+/// always-non-empty fallback.
 #[must_use]
 pub fn fuzzy_rank<'a>(bundle: &'a DocBundle, query: &str) -> Vec<FuzzyMatch<'a>> {
-    let q = query.to_ascii_lowercase();
+    let q = query.trim().to_lowercase();
     let mut results: Vec<FuzzyMatch<'a>> = bundle
         .all_entries()
         .filter_map(|entry| {
             let score = score_entry(entry, &q);
-            if score > 0 {
-                Some(FuzzyMatch { entry, score })
-            } else {
-                None
-            }
+            (score > 0).then_some(FuzzyMatch { entry, score })
         })
         .collect();
-    results.sort_by_key(|m| std::cmp::Reverse(m.score));
+    results.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.entry.kind.cmp(&b.entry.kind))
+            .then_with(|| a.entry.key.cmp(&b.entry.key))
+    });
     results
 }
 
-/// Compute the fuzzy score of a query against one entry.
-fn score_entry(entry: &DocEntry, query_lower: &str) -> u32 {
-    let key_lower = entry.key.to_ascii_lowercase();
-    let title_lower = entry.title.to_ascii_lowercase();
-    if key_lower == query_lower {
-        return 1000;
-    }
-    if key_lower.starts_with(query_lower) {
-        return 800;
-    }
-    if title_lower == query_lower {
-        return 750;
-    }
-    if title_lower.starts_with(query_lower) {
-        return 600;
-    }
-    subsequence_score(query_lower, &key_lower).max(subsequence_score(query_lower, &title_lower))
+/// The `limit` entries closest to `query` by edit distance, closest first.
+///
+/// Distance is over key, last segment, and title — the fallback that makes a
+/// miss never a dead end. Non-empty whenever the bundle is.
+#[must_use]
+pub fn nearest<'a>(bundle: &'a DocBundle, query: &str, limit: usize) -> Vec<FuzzyMatch<'a>> {
+    let q: String = query
+        .trim()
+        .to_lowercase()
+        .chars()
+        .take(DISTANCE_QUERY_CAP)
+        .collect();
+    let mut scored: Vec<(usize, &'a DocEntry)> = bundle
+        .all_entries()
+        .map(|entry| (entry_distance(entry, &q), entry))
+        .collect();
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.kind.cmp(&b.1.kind))
+            .then_with(|| a.1.key.cmp(&b.1.key))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(distance, entry)| FuzzyMatch {
+            entry,
+            score: u32::try_from(distance).map_or(0, |d| 100_u32.saturating_sub(d)),
+        })
+        .collect()
 }
 
-/// Greedy subsequence match: count how many characters of `query` appear in
-/// order in `target`, returning a score proportional to the fraction matched.
-/// Returns 0 when no character matches.
-fn subsequence_score(query: &str, target: &str) -> u32 {
-    let mut t_iter = target.chars();
-    let mut matched: u32 = 0;
-    let mut total: u32 = 0;
-    for qc in query.chars() {
-        total = total.saturating_add(1);
-        if t_iter.any(|tc| tc == qc) {
-            matched += 1;
-        }
-    }
-    if matched == 0 || total == 0 {
+/// The last `.` segment of a key (`Ipe.Time.unixMillis` → `unixMillis`), or the
+/// whole key when it has none.
+fn last_segment(key: &str) -> &str {
+    key.rsplit_once('.').map_or(key, |(_, last)| last)
+}
+
+/// The words of `text`: its alphanumeric runs.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+}
+
+/// The smallest edit distance from `query` (already lowercased and capped) to
+/// the entry's key, last segment, or title.
+fn entry_distance(entry: &DocEntry, query: &str) -> usize {
+    let key = entry.key.to_lowercase();
+    let title = entry.title.to_lowercase();
+    [
+        crate::driver::levenshtein(query, &key),
+        crate::driver::levenshtein(query, last_segment(&key)),
+        crate::driver::levenshtein(query, &title),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(usize::MAX)
+}
+
+/// Compute the tiered score of a lowercased query against one entry (0 = no
+/// match).
+fn score_entry(entry: &DocEntry, query: &str) -> u32 {
+    if query.is_empty() {
         return 0;
     }
-    matched * 400 / total
+    let key = entry.key.to_lowercase();
+    let member = last_segment(&key);
+    let title = entry.title.to_lowercase();
+    if key == query {
+        return EXACT_SCORE;
+    }
+    if member == query {
+        return 950;
+    }
+    if key.starts_with(query) || member.starts_with(query) {
+        return 800;
+    }
+    if title == query {
+        return 750;
+    }
+    if title.starts_with(query) {
+        return 600;
+    }
+    if key.contains(query) || title.contains(query) {
+        return 500;
+    }
+    let mut query_words = words(query).peekable();
+    if query_words.peek().is_some()
+        && query_words.all(|w| words(&key).chain(words(&title)).any(|kw| kw == w))
+    {
+        return 450;
+    }
+    let length = query.chars().count();
+    if length > DISTANCE_QUERY_CAP {
+        return 0;
+    }
+    let threshold = (length / 3).max(1);
+    let distance =
+        crate::driver::levenshtein(query, &key).min(crate::driver::levenshtein(query, member));
+    if distance <= threshold {
+        let penalty = u32::try_from(distance).map_or(u32::MAX, |d| d.saturating_mul(40));
+        return 300_u32.saturating_sub(penalty).max(1);
+    }
+    0
+}
+
+/// One suggestion for a documentation miss: the exact command that shows the
+/// entry, and the entry's title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSuggestion {
+    /// The `ipe doc …` argument that opens the entry exactly.
+    pub key: String,
+    /// The entry's kind, for the reader's orientation.
+    pub kind: DocKind,
+    /// The entry's human title.
+    pub title: String,
+}
+
+impl DocSuggestion {
+    /// The suggestion for `entry`: a module or symbol by its own key (`ipe doc`
+    /// resolves both directly), any other kind by its `kind:key` reference.
+    #[must_use]
+    pub fn for_entry(entry: &DocEntry) -> Self {
+        let key = match entry.kind {
+            DocKind::Module | DocKind::Symbol => entry.key.clone(),
+            DocKind::Diagnostic
+            | DocKind::Construct
+            | DocKind::Idiom
+            | DocKind::Topic
+            | DocKind::Guide
+            | DocKind::Cli => format!("{}:{}", entry.kind.prefix(), entry.key),
+        };
+        Self {
+            key,
+            kind: entry.kind,
+            title: entry.title.clone(),
+        }
+    }
+}
+
+/// The lines listing `suggestions` under the doc-miss header, keys in one column.
+#[must_use]
+pub fn suggestion_lines(suggestions: &[DocSuggestion]) -> Vec<String> {
+    let width = suggestions
+        .iter()
+        .map(|s| s.key.chars().count())
+        .max()
+        .unwrap_or(0);
+    suggestions
+        .iter()
+        .map(|s| {
+            let key = format!("{:width$}", s.key);
+            crate::text::cli_doc_suggestion_line(&key, &s.title, &s.kind)
+        })
+        .collect()
+}
+
+/// The suggestions for a query that named no entry.
+///
+/// The ranked matches, or — when nothing matches any tier — the nearest entries
+/// by edit distance, so a miss always offers somewhere to go. At most
+/// [`SUGGESTION_LIMIT`].
+#[must_use]
+pub fn suggestions_for(bundle: &DocBundle, query: &str) -> Vec<DocSuggestion> {
+    let ranked = fuzzy_rank(bundle, query);
+    let chosen = if ranked.is_empty() {
+        nearest(bundle, query, SUGGESTION_LIMIT)
+    } else {
+        ranked.into_iter().take(SUGGESTION_LIMIT).collect()
+    };
+    chosen
+        .iter()
+        .map(|m| DocSuggestion::for_entry(m.entry))
+        .collect()
 }
 
 // == Tests ====================================================================
@@ -1267,6 +1425,66 @@ mod tests {
             "ambiguous query returns multiple: {:?}",
             results.iter().map(|r| &r.entry.key).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn fuzzy_rank_matches_a_bare_member_name() {
+        let mut bundle = DocBundle::empty();
+        for key in ["Ipe.Time.unixMillis", "Ipe.Time.now", "Ipe.List.map"] {
+            let inserted = bundle.insert(
+                DocKind::Symbol,
+                key.to_owned(),
+                key.to_owned(),
+                String::new(),
+            );
+            assert!(inserted.is_ok(), "{inserted:?}");
+        }
+        let results = fuzzy_rank(&bundle, "unixmillis");
+        assert!(
+            matches!(results.first(), Some(m) if m.entry.key == "Ipe.Time.unixMillis"),
+            "{:?}",
+            results.iter().map(|r| &r.entry.key).collect::<Vec<_>>()
+        );
+        let typo = fuzzy_rank(&bundle, "unixMilis");
+        assert!(
+            matches!(typo.first(), Some(m) if m.entry.key == "Ipe.Time.unixMillis"),
+            "a one-letter typo still finds the member"
+        );
+    }
+
+    #[test]
+    fn a_miss_always_suggests_the_nearest_entries() {
+        let bundle = bundle_with_select_entries();
+        assert!(fuzzy_rank(&bundle, "zzzzzzzzzzz").is_empty());
+        let suggestions = suggestions_for(&bundle, "zzzzzzzzzzz");
+        assert!(!suggestions.is_empty(), "never a dead end");
+        assert!(suggestions.len() <= SUGGESTION_LIMIT);
+    }
+
+    #[test]
+    fn suggestions_are_bounded_and_deterministic() {
+        let bundle = bundle_with_select_entries();
+        let first = suggestions_for(&bundle, "e");
+        assert!(first.len() <= SUGGESTION_LIMIT);
+        assert_eq!(first, suggestions_for(&bundle, "e"));
+    }
+
+    #[test]
+    fn a_suggestion_names_an_exact_lookup() {
+        let entry = DocEntry {
+            kind: DocKind::Topic,
+            key: "pipelines".to_owned(),
+            title: "Pipelines".to_owned(),
+            body: String::new(),
+            order: None,
+        };
+        assert_eq!(DocSuggestion::for_entry(&entry).key, "topic:pipelines");
+        let symbol = DocEntry {
+            kind: DocKind::Symbol,
+            key: "Ipe.List.map".to_owned(),
+            ..entry
+        };
+        assert_eq!(DocSuggestion::for_entry(&symbol).key, "Ipe.List.map");
     }
 
     // -- No-panic witness -----------------------------------------------------

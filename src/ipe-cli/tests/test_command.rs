@@ -52,7 +52,7 @@ fn unexpected_flag_is_misuse_and_shows_help() -> TestResult {
 /// the runner short-circuits before any build.
 #[test]
 fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestResult {
-    let dir = std::env::temp_dir().join(format!("ipe_test_none_{}", std::process::id()));
+    let dir = crate::support::scratch_root().join(format!("ipe_test_none_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
@@ -79,7 +79,7 @@ fn a_project_with_passing_tests_exits_zero_with_a_summary() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the passing-test E2E");
         return Ok(());
     }
-    let dir = std::env::temp_dir().join(format!("ipe_test_pass_{}", std::process::id()));
+    let dir = crate::support::scratch_root().join(format!("ipe_test_pass_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
@@ -110,7 +110,7 @@ fn a_project_with_a_failing_test_names_it_and_exits_non_zero() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the failing-test E2E");
         return Ok(());
     }
-    let dir = std::env::temp_dir().join(format!("ipe_test_fail_{}", std::process::id()));
+    let dir = crate::support::scratch_root().join(format!("ipe_test_fail_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("tests"))?;
     std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;

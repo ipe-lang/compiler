@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 /// A fresh, unique temp directory for one test (removed first if present).
 fn fresh_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe_init_test_{tag}"));
+    let dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ipe_init_test_{tag}"));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -157,6 +158,59 @@ fn init_unknown_flag_returns_usage_error() {
         ),
         "unknown flag must yield a command-usage error, got: {result:?}"
     );
+}
+
+/// Every application shape's fresh scaffold lints clean — no unused import, no
+/// other finding at the gate severity. Driven from `InitShape::ALL` so a newly
+/// added shape's template is swept into this proof by the same
+/// exhaustiveness guard that binds it into the scaffold-build SEAL.
+#[test]
+fn init_scaffold_is_lint_clean_for_every_shape() {
+    for shape in ipe::init::InitShape::ALL {
+        let dir = fresh_dir(&format!("lint_{}", shape.label()));
+        let target = dir.join("proj");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let init = ipe::run_cli(&[
+            "init".to_owned(),
+            target_str.clone(),
+            "--shape".to_owned(),
+            shape.label().to_owned(),
+        ]);
+        assert!(
+            init.is_ok(),
+            "[{}] init must succeed: {init:?}",
+            shape.label()
+        );
+
+        let linted = ipe::run_cli(&["lint".to_owned(), target_str]);
+        assert!(
+            linted.is_ok(),
+            "[{}] a fresh scaffold must lint clean, got: {linted:?}",
+            shape.label()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// The `--lib` scaffold also lints clean.
+#[test]
+fn init_lib_scaffold_is_lint_clean() {
+    let dir = fresh_dir("lint_lib");
+    let target = dir.join("libproj");
+    let target_str = target.to_string_lossy().into_owned();
+
+    let init = ipe::run_cli(&["init".to_owned(), target_str.clone(), "--lib".to_owned()]);
+    assert!(init.is_ok(), "init --lib must succeed: {init:?}");
+
+    let linted = ipe::run_cli(&["lint".to_owned(), target_str]);
+    assert!(
+        linted.is_ok(),
+        "a fresh library scaffold must lint clean, got: {linted:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// E2E (gated on `IPE_E2E=1`): scaffold, `ipe build`, and `cargo build` a fresh

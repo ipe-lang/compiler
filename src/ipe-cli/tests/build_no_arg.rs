@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 fn fresh_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("ipe_noarg_test_{tag}_{}_{n}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_noarg_test_{tag}_{}_{n}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir
 }

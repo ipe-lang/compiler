@@ -63,7 +63,8 @@ fn build_propagates_a_failed_emitted_cargo_build() {
         return;
     }
 
-    let dir = std::env::temp_dir().join("ipe_build_cargo_fail_e2e");
+    let dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_build_cargo_fail_e2e");
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
     let entry = dir.join("Main.ipe");

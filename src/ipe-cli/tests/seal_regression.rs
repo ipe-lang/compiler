@@ -23,6 +23,9 @@ use std::path::PathBuf;
 
 use ipe::CliError;
 
+#[path = "support/mod.rs"]
+mod support;
+
 /// A runtime `false` the optimiser cannot fold, so `assert!(false_marker(), …)`
 /// reads as a deliberate unconditional failure rather than a suspicious constant
 /// condition — keeps this file free of the `clippy::panic` deny.
@@ -58,13 +61,9 @@ fn out_dir(name: &str) -> PathBuf {
 /// the positive-SEAL companion to `negative_suite::assert_rejected`.
 #[track_caller]
 fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
-    let Some(entry) = write_single(name, source) else {
-        return; // scratch unavailable — skip
-    };
+    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
     let out = out_dir(name);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     match ipe::build(&entry, &out, &runtime) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
@@ -104,18 +103,26 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
     }
 }
 
-/// Emit `source` and return the emitted `src/main.rs` text, or `None` if
-/// scratch/runtime setup is unavailable (the test then skips its assertions).
-/// Used by the move-after-use SEAL tests to prove exactly WHICH reads clone —
-/// a behavioural pass alone cannot distinguish "cloned correctly" from
-/// "over-cloned", and over-cloning a single-use or `Copy` binding is an
-/// Efficiency regression the SEAL's cargo-green gate would silently accept.
-fn emit_main_rs(name: &str, source: &str) -> Option<String> {
-    let entry = write_single(name, source)?;
+/// Emit `source` and return the emitted `src/main.rs` text. Scratch setup,
+/// runtime resolution, and the build itself are all asserted to succeed —
+/// this is a well-formed fixture, so any failure here is a bug, not a
+/// reason to skip. Used by the move-after-use SEAL tests to prove exactly
+/// WHICH reads clone — a behavioural pass alone cannot distinguish "cloned
+/// correctly" from "over-cloned", and over-cloning a single-use or `Copy`
+/// binding is an Efficiency regression the SEAL's cargo-green gate would
+/// silently accept.
+fn emit_main_rs(name: &str, source: &str) -> String {
+    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
     let out = out_dir(name);
-    let runtime = ipe::resolve_runtime().ok()?;
-    ipe::build(&entry, &out, &runtime).ok()?;
-    std::fs::read_to_string(out.join("src").join("main.rs")).ok()
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let built = ipe::build(&entry, &out, &runtime);
+    assert!(built.is_ok(), "{name}: build failed: {built:?}");
+    let text = std::fs::read_to_string(out.join("src").join("main.rs"));
+    assert!(
+        text.is_ok(),
+        "{name}: failed to read emitted src/main.rs: {text:?}"
+    );
+    text.unwrap_or_default()
 }
 
 /// Assert that a multi-file project is ACCEPTED by `ipe` and — under `IPE_E2E` —
@@ -128,24 +135,16 @@ fn assert_accepted_project(name: &str, files: &[(&str, &str)], expected_stdout: 
         .join(name);
     let _ = std::fs::remove_dir_all(&dir);
     let src = dir.join("src");
-    if std::fs::create_dir_all(&src).is_err() {
-        return;
-    }
+    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
     for (fname, contents) in files {
         let path = src.join(fname);
-        if let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_err()
-        {
-            return;
+        if let Some(parent) = path.parent() {
+            crate::support::expect_scratch_step(name, std::fs::create_dir_all(parent));
         }
-        if std::fs::write(&path, contents).is_err() {
-            return;
-        }
+        crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
     }
     let out = out_dir(name);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
     let entry = src.join("Main.ipe");
     match ipe::build_with_sibling_discovery(&entry, &out, &runtime) {
         Ok(()) => {}
@@ -440,9 +439,7 @@ fn destructure_param_clone_is_minimal_not_over_cloned() {
         \x20       Nothing ->\n\
         \x20           sku ++ \" (no price)\"\n\
         main = Io.println (lineItem ( \"abc\", 2 ))\n";
-    let Some(emitted) = emit_main_rs("destructure_param_minimal_clone", src) else {
-        return; // scratch/runtime unavailable — skip
-    };
+    let emitted = emit_main_rs("destructure_param_minimal_clone", src);
     // Exactly one `.clone()` on `sku` — the non-final (scrutinee) read.
     let sku_clones = emitted.matches("sku.clone()").count();
     assert_eq!(
@@ -471,9 +468,7 @@ fn single_use_destructure_param_moves_without_clone() {
         shout ( word, _n ) =\n\
         \x20   String.toUpper word\n\
         main = Io.println (shout ( \"hi\", 0 ))\n";
-    let Some(emitted) = emit_main_rs("single_use_destructure_param", src) else {
-        return;
-    };
+    let emitted = emit_main_rs("single_use_destructure_param", src);
     assert!(
         !emitted.contains("word.clone()"),
         "a single-use String component was cloned — the last (only) use must \

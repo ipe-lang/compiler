@@ -6,6 +6,8 @@ mod support;
 
 #[path = "g_tuple/golden_alias_tuple.rs"]
 mod golden_alias_tuple;
+#[path = "g_tuple/golden_generic_tuple_param_binder.rs"]
+mod golden_generic_tuple_param_binder;
 #[path = "g_tuple/golden_tuple_annotations.rs"]
 mod golden_tuple_annotations;
 #[path = "g_tuple/golden_tuple_multiarm_case.rs"]

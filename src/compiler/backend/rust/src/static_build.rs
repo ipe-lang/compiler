@@ -102,9 +102,9 @@ impl StaticTriple {
 
 /// The allocator linked into a static artifact.
 ///
-/// `System` on musl is the acknowledged-cliff choice — representable here
-/// because the CLI's resolver only constructs it after the two-key
-/// acknowledgment (`--allow-slow-allocator` / `allowSlowAllocator`) passed.
+/// `System` is the target libc's malloc, constructed only from an explicit
+/// `--allocator system` / `allocator = System` (on musl it is slower on
+/// allocation-heavy work than the dlmalloc default).
 /// `talc` has no variant: it is refused at CLI parse-resolution (hosted talc
 /// needs an unsafe static arena — amendment A1), so an unsupported allocator
 /// is unrepresentable in a plan.

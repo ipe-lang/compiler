@@ -1,0 +1,107 @@
+module Main exposing (main)
+
+-- Regression anchor: user bindings that share the names of internal
+-- `Ipe.Db.Store` helpers and constructors never stand in for them.
+--
+-- `Store.primaryKey .slug` lowers to the `Ipe.Db.Store` `primaryKeyNamed`
+-- helper and `Store.eq .slug` to the Store `Compare OpEq` constructors, each
+-- resolved by its exact `Ipe.Db.Store` module home. This module declares its
+-- own `primaryKeyNamed` (a different signature) and a `Verdict` union with
+-- `Compare` / `OpEq` constructors; they stay distinct bindings, reached only
+-- where the program names them.
+--
+-- Pure checks (no DB connection):
+--   1. store-helper:ok — the accessor form builds `PRIMARY KEY` DDL.
+--   2. store-cond:ok   — the `Store.eq` leaves build Store `Cond` values.
+--   3. user-fn:7       — the user `primaryKeyNamed` runs only where called.
+--   4. user-ctor:ok    — the user `OpEq` constructor stays a `Verdict`.
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db.Store as Store
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+type alias Item =
+    { slug : String
+    , title : String
+    }
+
+
+blankItem : Item
+blankItem =
+    { slug = "", title = "" }
+
+
+itemCodec : Codec Item
+itemCodec =
+    Codec.auto blankItem
+
+
+type Verdict
+    = Compare
+    | OpEq
+
+
+primaryKeyNamed : Int -> String
+primaryKeyNamed n =
+    String.concat [ "user-fn:", String.fromInt n ]
+
+
+ddlLine : String
+ddlLine =
+    case Store.fromCodec "items" itemCodec of
+        Err _ ->
+            "store-helper:FAIL-codec"
+
+        Ok draft ->
+            case Store.createSql (Store.public (Store.primaryKey .slug draft)) of
+                Err _ ->
+                    "store-helper:FAIL-rejected"
+
+                Ok ddl ->
+                    if String.contains "PRIMARY KEY" ddl then
+                        "store-helper:ok"
+
+                    else
+                        String.concat [ "store-helper:FAIL-bad-ddl:", ddl ]
+
+
+conds : List (Store.Cond Item)
+conds =
+    List.map (\s -> Store.eq .slug s) [ "a", "b" ]
+
+
+condLine : String
+condLine =
+    if List.length conds == 2 then
+        "store-cond:ok"
+
+    else
+        "store-cond:FAIL"
+
+
+verdictLine : String
+verdictLine =
+    case OpEq of
+        OpEq ->
+            "user-ctor:ok"
+
+        Compare ->
+            "user-ctor:FAIL"
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ ddlLine
+            , condLine
+            , primaryKeyNamed 7
+            , verdictLine
+            ]
+        )

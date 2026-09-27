@@ -50,7 +50,7 @@ fn server_handler_lambda_boxes_with_arc_not_box() {
         .join("golden")
         .join("server_request_accessors")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_l0114_server_handler_arc");
+    let out = crate::support::scratch_root().join("ipec_l0114_server_handler_arc");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -106,7 +106,7 @@ fn ws_on_error_callback_boxes_with_arc_not_box() {
         .join("golden")
         .join("ws_onerror")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_l0114_ws_onerror_arc");
+    let out = crate::support::scratch_root().join("ipec_l0114_ws_onerror_arc");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

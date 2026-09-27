@@ -3,6 +3,10 @@
 // config.rs (generated at build time per package.ipe database driver).
 use super::json::{Decoder, JsonVal, decode_and_map, decode_err_str, decode_field, decode_ok};
 use super::*;
+use crate::ssrf::{
+    ConfiguredHost, DialPolicy, HostResolver, SsrfRefusal, SystemResolver, UnambiguousUrl,
+    UrlUnproven, VettedDial,
+};
 use sqlx::{Column, Row, TypeInfo};
 use std::collections::HashMap;
 
@@ -111,29 +115,6 @@ fn ipe_err<E: From<String> + Send>(e: &sqlx::Error) -> E {
         sqlx::Error::Decode(_) => str_err("db: decode error"),
         other => str_err(&format!("{other}")),
     }
-}
-
-/// Map a connect-time `sqlx::Error` to a credential-free typed error.
-///
-/// The connect path can carry the connection string — host, user, password —
-/// inside the `Configuration`, `Io`, and `Tls` payloads (a driver's `Display`
-/// may echo the URL it was handed). The message is therefore built from the
-/// error VARIANT alone; the payload is never formatted into it. A database error
-/// at connect (e.g. an authentication rejection) keeps `ipe_err`'s structural
-/// SQLSTATE-code path, which is already value-free.
-fn connect_err<E: From<String> + Send>(e: &sqlx::Error) -> E {
-    if e.as_database_error().is_some() {
-        return ipe_err(e);
-    }
-    let kind = match e {
-        sqlx::Error::Configuration(_) => "invalid connection configuration",
-        sqlx::Error::Io(_) => "connection I/O error",
-        sqlx::Error::Tls(_) => "TLS error",
-        sqlx::Error::PoolTimedOut => "connection pool timed out",
-        sqlx::Error::PoolClosed => "connection pool closed",
-        _ => "connection error",
-    };
-    str_err(&format!("db: {kind}"))
 }
 
 // ─── Transaction connection routing (task-local) ──────────────────────────────
@@ -1183,56 +1164,626 @@ fn check_engine_version(engine: DbEngine, raw: &str) -> Result<EngineVersion, En
     Ok(found)
 }
 
-/// Why [`enforce_engine_floor_on`] refused a pool.
-#[derive(Debug)]
-pub(crate) enum EngineFloorError {
-    /// The server answered, and its version is unsupported or unreadable.
-    Refused(EngineVersionError),
-    /// The version query itself failed.
-    Unreadable(sqlx::Error),
+/// A driver failure, classified from the `sqlx::Error` variant alone.
+///
+/// Holds no driver payload: a driver's message can echo the connection URL —
+/// host, user, password — so the payload is dropped here and can never reach a
+/// log line or an error value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DbFailure {
+    /// The server answered with an error; `code` is its SQLSTATE / driver code.
+    Database { code: Option<String> },
+    /// The connection options were rejected.
+    Configuration,
+    /// Reaching or talking to the server failed at the I/O layer.
+    Io,
+    /// TLS negotiation failed.
+    Tls,
+    /// No pooled connection became available in time.
+    PoolTimedOut,
+    /// The pool was already closed.
+    PoolClosed,
+    /// Any other driver failure.
+    Other,
 }
 
-/// Session stores surface `sqlx::Error`: a refusal travels as a
-/// `Configuration` error carrying the floor message; a failed query is
-/// passed through unchanged.
-impl From<EngineFloorError> for sqlx::Error {
-    fn from(e: EngineFloorError) -> Self {
+/// Longest SQLSTATE / driver code [`DbFailure`] keeps.
+const MAX_DB_FAILURE_CODE_LEN: usize = 16;
+
+impl DbFailure {
+    /// Classify `e`, keeping only its variant and a well-formed error code.
+    #[must_use]
+    pub fn of(e: &sqlx::Error) -> Self {
+        if let Some(dbe) = e.as_database_error() {
+            // A remote server picks the code; keep it only in the short
+            // alphanumeric shape SQLSTATE and SQLite result codes take.
+            let code = dbe
+                .code()
+                .filter(|c| {
+                    !c.is_empty()
+                        && c.len() <= MAX_DB_FAILURE_CODE_LEN
+                        && c.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+                .map(std::borrow::Cow::into_owned);
+            return Self::Database { code };
+        }
         match e {
-            EngineFloorError::Refused(refused) => Self::Configuration(Box::new(refused)),
-            EngineFloorError::Unreadable(query) => query,
+            sqlx::Error::Configuration(_) => Self::Configuration,
+            sqlx::Error::Io(_) => Self::Io,
+            sqlx::Error::Tls(_) => Self::Tls,
+            sqlx::Error::PoolTimedOut => Self::PoolTimedOut,
+            sqlx::Error::PoolClosed => Self::PoolClosed,
+            _ => Self::Other,
         }
     }
 }
 
-/// Read the connected server's version once and admit the pool only at or
-/// above its engine's floor. Shared by every pool the runtime opens — the
-/// `Ipe.Db` pool and the session-store pools — so each runs the gate before
-/// any other statement.
-pub(crate) async fn enforce_engine_floor_on<DB>(
-    pool: &sqlx::Pool<DB>,
-) -> Result<EngineVersion, EngineFloorError>
+impl std::fmt::Display for DbFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database { code: Some(code) } => write!(f, "database error [{code}]"),
+            Self::Database { code: None } => f.write_str("database error"),
+            Self::Configuration => f.write_str("invalid connection configuration"),
+            Self::Io => f.write_str("connection I/O error"),
+            Self::Tls => f.write_str("TLS error"),
+            Self::PoolTimedOut => f.write_str("connection pool timed out"),
+            Self::PoolClosed => f.write_str("connection pool closed"),
+            Self::Other => f.write_str("driver error"),
+        }
+    }
+}
+
+/// Why [`VettedPool::connect`] refused.
+///
+/// Credential-free by construction: no variant holds a driver error or any
+/// credential from the connection URL (a host refusal names only the host), so
+/// neither `Display` nor `Debug` can echo one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DbConnectError {
+    /// The URL did not parse, so what it opens cannot be vetted.
+    InvalidUrl,
+    /// A PostgreSQL URL's credentials may run past what the parser read as
+    /// its userinfo.
+    ///
+    /// An `@` outside the parsed authority, or any `\`, means a credential
+    /// may have held a `/`, `?`, `#`, or `\` and the parser read part of it
+    /// as the host (see `ssrf::userinfo_is_ambiguous`). The URL is refused,
+    /// and the text that would have been taken for a host is never echoed.
+    MisplacedUserinfo,
+    /// A PostgreSQL URL names more dial targets than the gate vets.
+    TooManyDialTargets {
+        /// The most targets one URL may name.
+        limit: usize,
+    },
+    /// The URL's scheme selects no engine the runtime supports.
+    ///
+    /// The scheme is not echoed: a malformed URL's scheme position can hold
+    /// its userinfo.
+    UnsupportedScheme,
+    /// The URL selects a different engine than the driver the pool opens with.
+    EngineMismatch {
+        /// The engine the URL's scheme selects.
+        url: DbEngine,
+        /// The engine the driver speaks.
+        driver: DbEngine,
+    },
+    /// The SSRF gate refused a target the URL dials.
+    HostRefused(crate::ssrf::SsrfRefusal),
+    /// The driver could not open the pool.
+    Unreachable(DbFailure),
+    /// The local relay that pins a TLS dial to its vetted address could not
+    /// be opened, so the dial is refused rather than unpinned.
+    RelayUnavailable,
+    /// The server's version query failed.
+    VersionUnreadable(DbFailure),
+    /// The engine is unsupported, or its version is unparseable or too old.
+    EngineRefused(EngineVersionError),
+}
+
+impl std::fmt::Display for DbConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl => f.write_str("db: invalid connection URL"),
+            Self::MisplacedUserinfo => f.write_str(
+                "db: the connection URL has an `@` or `\\` outside its user name and password; \
+                 percent-encode `@`, `/`, `?`, `#` and `\\` in the user name, password and \
+                 query values (as %40, %2F, %3F, %23, %5C)",
+            ),
+            Self::TooManyDialTargets { limit } => write!(
+                f,
+                "db: the connection URL names more than {limit} hosts to dial"
+            ),
+            Self::UnsupportedScheme => f.write_str(
+                "db: unsupported connection URL scheme (use sqlite:, file:, postgres: or \
+                 postgresql:)",
+            ),
+            Self::EngineMismatch { url, driver } => write!(
+                f,
+                "db: the connection URL selects {} but this build's driver is {}",
+                url.name(),
+                driver.name()
+            ),
+            Self::HostRefused(refusal) => write!(f, "db: {refusal}"),
+            Self::Unreachable(failure) | Self::VersionUnreadable(failure) => {
+                write!(f, "db: {failure}")
+            }
+            Self::EngineRefused(refused) => write!(f, "{refused}"),
+            Self::RelayUnavailable => f.write_str(
+                "db: the local relay to the pinned database address could not be opened",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DbConnectError {}
+
+#[cfg(unix)]
+impl From<crate::ssrf::RelayUnavailable> for DbConnectError {
+    fn from(crate::ssrf::RelayUnavailable: crate::ssrf::RelayUnavailable) -> Self {
+        Self::RelayUnavailable
+    }
+}
+
+/// Admit a pool only when its server's version is at or above its engine's floor.
+///
+/// Reads the version once. [`VettedPool::connect`] runs it on every pool it
+/// opens, before any other statement.
+async fn enforce_engine_floor_on<DB>(pool: &sqlx::Pool<DB>) -> Result<EngineVersion, DbConnectError>
 where
     DB: sqlx::Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
     (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
 {
-    let engine = DbEngine::for_driver::<DB>().map_err(EngineFloorError::Refused)?;
+    let engine = DbEngine::for_driver::<DB>().map_err(DbConnectError::EngineRefused)?;
     let raw: String = sqlx::query_scalar::<DB, String>(engine.version_query())
         .fetch_one(pool)
         .await
-        .map_err(EngineFloorError::Unreadable)?;
-    check_engine_version(engine, &raw).map_err(EngineFloorError::Refused)
+        .map_err(|e| DbConnectError::VersionUnreadable(DbFailure::of(&e)))?;
+    check_engine_version(engine, &raw).map_err(DbConnectError::EngineRefused)
 }
 
-/// [`enforce_engine_floor_on`] for the `Ipe.Db` pool, as a typed runtime
-/// error. A failed version query goes through [`connect_err`], so a driver
-/// message can never echo the connection URL.
-async fn enforce_engine_floor<E: From<String> + Send>(pool: &Db) -> Result<(), E> {
-    match enforce_engine_floor_on(pool).await {
-        Ok(_) => Ok(()),
-        Err(EngineFloorError::Refused(e)) => Err(str_err(&e.to_string())),
-        Err(EngineFloorError::Unreadable(e)) => Err(connect_err(&e)),
+/// Port a PostgreSQL URL dials when it names none.
+const POSTGRES_DEFAULT_PORT: u16 = 5432;
+
+/// The most dial targets one PostgreSQL URL may name.
+///
+/// Each target is resolved and vetted before the dial, so the count bounds
+/// the DNS work one connection URL can demand.
+const MAX_POSTGRES_DIAL_TARGETS: usize = 8;
+
+/// One place a PostgreSQL connection URL can make the driver dial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DialTarget {
+    /// A TCP host and port, read from a URL whose userinfo is unambiguous.
+    Tcp { host: ConfiguredHost, port: u16 },
+    /// A local Unix-domain socket directory.
+    Socket,
+    /// No host in the URL, so the driver picks one itself.
+    ///
+    /// It tries `PGHOSTADDR` / `PGHOST`, then a default socket directory, then
+    /// `localhost`.
+    DriverDefault,
+}
+
+/// Every target the PostgreSQL driver can dial for `url`, in resolution order.
+///
+/// The driver starts from its environment default, takes the URL authority
+/// host, then applies each `host` / `hostaddr` query parameter; a value
+/// starting with `/` (percent-encoded in the authority) selects a Unix socket,
+/// which the driver keeps even when a later parameter names a TCP host. The
+/// last entry is the target a plain resolution picks; every entry is returned
+/// so the gate can refuse the whole set rather than trust one reading of the
+/// driver's precedence. A URL naming no host yields exactly
+/// [`DialTarget::DriverDefault`].
+fn read_dial_targets(url: &UnambiguousUrl) -> Result<Vec<DialTarget>, DbConnectError> {
+    let parsed = url.url();
+    let mut port = parsed.port().unwrap_or(POSTGRES_DEFAULT_PORT);
+    let mut hosts: Vec<Option<ConfiguredHost>> = Vec::new();
+    let mut push_host = |host: Option<ConfiguredHost>| {
+        if hosts.len() >= MAX_POSTGRES_DIAL_TARGETS {
+            return Err(DbConnectError::TooManyDialTargets {
+                limit: MAX_POSTGRES_DIAL_TARGETS,
+            });
+        }
+        hosts.push(host);
+        Ok(())
+    };
+    if let Some(host) = url.host() {
+        let socket = host.as_str().starts_with("%2F") || host.as_str().starts_with("%2f");
+        push_host((!socket).then_some(host))?;
+    }
+    for (key, value) in parsed.query_pairs() {
+        match &*key {
+            "host" | "hostaddr" => {
+                let host = if value.starts_with('/') {
+                    None
+                } else {
+                    Some(url.query_host(&value).ok_or(DbConnectError::InvalidUrl)?)
+                };
+                push_host(host)?;
+            }
+            "port" => {
+                port = value.parse().map_err(|_| DbConnectError::InvalidUrl)?;
+            }
+            _ => {}
+        }
+    }
+    if hosts.is_empty() {
+        return Ok(vec![DialTarget::DriverDefault]);
+    }
+    Ok(hosts
+        .into_iter()
+        .map(|host| match host {
+            Some(host) => DialTarget::Tcp { host, port },
+            None => DialTarget::Socket,
+        })
+        .collect())
+}
+
+/// The scheme `url` names, or `None` when it names none.
+///
+/// A scheme is the text before the first `:` when it has the RFC 3986 shape
+/// (a letter, then letters, digits, `+`, `-` or `.`). A bare file path or
+/// SQLite's `:memory:` names none.
+fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once(':')?;
+    let mut chars = scheme.chars();
+    let shaped = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    shaped.then_some(scheme)
+}
+
+/// A SQLite connection URL, parsed into the options the driver opens.
+pub struct SqliteUrl {
+    options: sqlx::sqlite::SqliteConnectOptions,
+    /// A file every pool connection shares, as opposed to a private in-memory database.
+    shared_file: bool,
+}
+
+/// A PostgreSQL connection URL and every target it makes the driver dial.
+pub struct PostgresUrl {
+    url: UnambiguousUrl,
+    targets: Vec<DialTarget>,
+}
+
+impl PostgresUrl {
+    /// Read every dial target of `url`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::MisplacedUserinfo`] when the userinfo is ambiguous,
+    /// and [`DbConnectError::InvalidUrl`] when the targets cannot be read.
+    fn parse(url: &str) -> Result<Self, DbConnectError> {
+        let url = UnambiguousUrl::parse(url).map_err(|unproven| match unproven {
+            UrlUnproven::AmbiguousUserinfo => DbConnectError::MisplacedUserinfo,
+            UrlUnproven::Invalid => DbConnectError::InvalidUrl,
+        })?;
+        read_dial_targets(&url).map(|targets| Self { url, targets })
+    }
+}
+
+/// A database connection URL, parsed once into the engine it selects.
+///
+/// The engine a pool is opened with, the SSRF gate's dial targets, and the
+/// SQLite WAL setup all read this one value, so they cannot disagree.
+/// Holds the URL's credentials, so it has no `Debug` or `Display`.
+pub enum DbUrl {
+    /// `sqlite:` or `file:`, or a bare path naming no scheme.
+    Sqlite(SqliteUrl),
+    /// `postgres:` or `postgresql:`.
+    Postgres(PostgresUrl),
+}
+
+impl DbUrl {
+    /// Parse `url` into the engine its scheme selects.
+    ///
+    /// Schemes are matched exactly (lower-case), as the drivers read them.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::UnsupportedScheme`] for any other scheme, and
+    /// [`DbConnectError::InvalidUrl`] for a SQLite URL the driver cannot read
+    /// or a PostgreSQL URL whose dial targets cannot be read.
+    pub fn parse(url: &str) -> Result<Self, DbConnectError> {
+        match url_scheme(url) {
+            None | Some("sqlite" | "file") => Ok(Self::Sqlite(SqliteUrl {
+                options: url.parse().map_err(|_| DbConnectError::InvalidUrl)?,
+                shared_file: url_is_cacheable(url),
+            })),
+            Some("postgres" | "postgresql") => PostgresUrl::parse(url).map(Self::Postgres),
+            Some(_) => Err(DbConnectError::UnsupportedScheme),
+        }
+    }
+
+    /// The engine the URL selects.
+    #[must_use]
+    pub const fn engine(&self) -> DbEngine {
+        match self {
+            Self::Sqlite(_) => DbEngine::Sqlite,
+            Self::Postgres(_) => DbEngine::Postgres,
+        }
+    }
+
+    /// Whether the URL names a SQLite file every pool connection shares.
+    #[must_use]
+    pub const fn is_shared_sqlite_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(SqliteUrl {
+                shared_file: true,
+                ..
+            })
+        )
+    }
+
+    /// The refusal for a driver that speaks `driver` but was handed this URL.
+    const fn mismatch(&self, driver: DbEngine) -> DbConnectError {
+        DbConnectError::EngineMismatch {
+            url: self.engine(),
+            driver,
+        }
+    }
+}
+
+/// Admit one dial target under `policy`.
+///
+/// A TCP host goes through [`VettedDial::for_configured_host_with`]. A Unix socket
+/// reaches the local server exactly as loopback TCP does, and a driver default
+/// is unproven (it may resolve to `localhost`), so under deny-private both are
+/// refused; with the policy off they pass, as loopback TCP does.
+async fn vet_dial_target<R: HostResolver>(
+    target: &DialTarget,
+    policy: DialPolicy,
+    resolver: &R,
+) -> Result<VettedDial, DbConnectError> {
+    match (target, policy) {
+        (DialTarget::Tcp { host, port }, _) => {
+            VettedDial::for_configured_host_with(policy, resolver, host, *port)
+                .await
+                .map_err(DbConnectError::HostRefused)
+        }
+        (DialTarget::Socket, DialPolicy::DenyPrivate) => {
+            Err(DbConnectError::HostRefused(SsrfRefusal::LocalSocket))
+        }
+        (DialTarget::DriverDefault, DialPolicy::DenyPrivate) => {
+            Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget))
+        }
+        (DialTarget::Socket | DialTarget::DriverDefault, DialPolicy::AllowAll) => {
+            Ok(VettedDial::Unrestricted)
+        }
+    }
+}
+
+/// The PostgreSQL options `url` makes the driver dial, gated and pinned.
+///
+/// Every target from [`read_dial_targets`] must pass [`vet_dial_target`];
+/// a URL that does not parse is refused, since its targets cannot be proven
+/// safe. The options are then the driver's own reading of `url`. Under
+/// deny-private that reading must dial TCP, and its host is replaced by the
+/// vetted address, so the pool never resolves the name again: a later answer
+/// pointing at an internal host (DNS rebinding) is not dialled on this
+/// connect nor on any connection the pool opens afterwards.
+///
+/// A named host that may negotiate TLS keeps its name for SNI and certificate
+/// verification and is dialled through a `PinnedRelay` to the vetted address
+/// (see [`pin_postgres_options`]); the relay is returned alongside the options
+/// and must outlive every connection they open.
+async fn postgres_connect_options<R: HostResolver>(
+    url: &PostgresUrl,
+    policy: DialPolicy,
+    resolver: &R,
+    max_connections: u32,
+) -> Result<PinnedPgOptions, DbConnectError> {
+    let mut vetted = Vec::with_capacity(url.targets.len());
+    for target in &url.targets {
+        let dial = vet_dial_target(target, policy, resolver).await?;
+        vetted.push((target.clone(), dial));
+    }
+    let options: sqlx::postgres::PgConnectOptions = url
+        .url
+        .as_str()
+        .parse()
+        .map_err(|_| DbConnectError::InvalidUrl)?;
+    match policy {
+        DialPolicy::AllowAll => Ok((options, None)),
+        DialPolicy::DenyPrivate => {
+            pin_postgres_options(&url.url, options, &vetted, resolver, max_connections).await
+        }
+    }
+}
+
+/// Pin the dial of `options`, the driver's reading of `url`, to its vetted address.
+///
+/// Reuses the address a target in `vetted` already resolved to for the same
+/// host and port, so the name is resolved once; a host the target scan did not
+/// name is vetted here. A host `url` does not name is refused as unproven.
+///
+/// An IP-literal host, or any host under a mode that never negotiates TLS, is
+/// replaced by the vetted address. A named host that may negotiate TLS keeps
+/// its name, because the driver sends it as SNI and verifies the certificate
+/// against it; the driver instead dials the socket of a `PinnedRelay` that
+/// carries every connection to the vetted address, so no dial resolves the
+/// name again. Where no relay exists, `verify-full` on a named host is refused
+/// rather than silently weakened.
+async fn pin_postgres_options<R: HostResolver>(
+    url: &UnambiguousUrl,
+    options: sqlx::postgres::PgConnectOptions,
+    vetted: &[(DialTarget, VettedDial)],
+    resolver: &R,
+    max_connections: u32,
+) -> Result<PinnedPgOptions, DbConnectError> {
+    if options.get_socket().is_some() || options.get_host().starts_with('/') {
+        return Err(DbConnectError::HostRefused(SsrfRefusal::LocalSocket));
+    }
+    let host = options.get_host().to_owned();
+    let Some(named) = url.named_host(&host) else {
+        return Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget));
+    };
+    let port = options.get_port();
+    let literal = crate::ssrf::strip_ipv6_brackets(&host)
+        .parse::<std::net::IpAddr>()
+        .is_ok();
+    #[cfg(not(unix))]
+    let _no_relay_to_cap = max_connections;
+    #[cfg(not(unix))]
+    if !literal
+        && matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::VerifyFull
+        )
+    {
+        return Err(DbConnectError::HostRefused(
+            SsrfRefusal::UnpinnableTlsName { host: named },
+        ));
+    }
+    let known = vetted
+        .iter()
+        .find_map(|(target, dial)| match (target, dial) {
+            (DialTarget::Tcp { host: h, port: p }, VettedDial::Pinned(_))
+                if h.as_str() == host && *p == port =>
+            {
+                Some(*dial)
+            }
+            _ => None,
+        });
+    let dial = match known {
+        Some(dial) => dial,
+        None => {
+            VettedDial::for_configured_host_with(DialPolicy::DenyPrivate, resolver, &named, port)
+                .await
+                .map_err(DbConnectError::HostRefused)?
+        }
+    };
+    #[cfg(unix)]
+    if let VettedDial::Pinned(target) = dial
+        && !literal
+        && !matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Disable | sqlx::postgres::PgSslMode::Allow
+        )
+    {
+        let relay = crate::ssrf::PinnedRelay::open(target, port, max_connections)?;
+        let relayed = options.socket(relay.socket_dir());
+        return Ok((relayed, Some(relay)));
+    }
+    Ok((options.host(&dial.dial_host(&host)), None))
+}
+
+/// PostgreSQL options gated and pinned, with the relay their dials go through.
+type PinnedPgOptions = (
+    sqlx::postgres::PgConnectOptions,
+    Option<crate::ssrf::PinnedRelay>,
+);
+
+/// A driver whose connect options pass the SSRF gate before any dial.
+///
+/// [`VettedPool::connect`] obtains its options only through this trait, so
+/// which gate runs is decided by the driver type, never by reading the URL.
+pub trait GatedDial: sqlx::Database {
+    /// The options `url` makes the driver dial, admitted by the gate.
+    ///
+    /// A pinned dial that runs through a `PinnedRelay` leaves it in `relay`;
+    /// the relay must outlive every connection the options open. A URL
+    /// selecting another engine is refused with
+    /// [`DbConnectError::EngineMismatch`].
+    fn gated_connect_options(
+        url: &DbUrl,
+        max_connections: u32,
+        relay: &mut Option<crate::ssrf::PinnedRelay>,
+    ) -> impl std::future::Future<
+        Output = Result<<Self::Connection as sqlx::Connection>::Options, DbConnectError>,
+    > + Send;
+}
+
+impl GatedDial for sqlx::Sqlite {
+    /// SQLite opens a local file and dials no host.
+    async fn gated_connect_options(
+        url: &DbUrl,
+        _max_connections: u32,
+        _relay: &mut Option<crate::ssrf::PinnedRelay>,
+    ) -> Result<sqlx::sqlite::SqliteConnectOptions, DbConnectError> {
+        match url {
+            DbUrl::Sqlite(sqlite) => Ok(sqlite.options.clone()),
+            DbUrl::Postgres(_) => Err(url.mismatch(DbEngine::Sqlite)),
+        }
+    }
+}
+
+impl GatedDial for sqlx::Postgres {
+    /// Every target is vetted under the environment's policy and pinned.
+    async fn gated_connect_options(
+        url: &DbUrl,
+        max_connections: u32,
+        relay: &mut Option<crate::ssrf::PinnedRelay>,
+    ) -> Result<sqlx::postgres::PgConnectOptions, DbConnectError> {
+        match url {
+            DbUrl::Postgres(postgres) => {
+                let (options, pinned) = postgres_connect_options(
+                    postgres,
+                    DialPolicy::from_env(),
+                    &SystemResolver,
+                    max_connections,
+                )
+                .await?;
+                *relay = pinned;
+                Ok(options)
+            }
+            DbUrl::Sqlite(_) => Err(url.mismatch(DbEngine::Postgres)),
+        }
+    }
+}
+
+/// A database pool that passed every connect-time gate.
+///
+/// [`VettedPool::connect`] is its only constructor and the runtime's only way
+/// to open a pool from a caller-supplied connection URL: the `Ipe.Db` pool, an
+/// `Ipe.Db.Connection`, and the persistent session stores all go through it.
+/// It runs, in order: the driver's [`GatedDial`] gate (for PostgreSQL, the
+/// SSRF gate on every target the URL dials, with the dial pinned to the vetted
+/// address), a bounded connection cap, and the engine-version floor before any
+/// other statement. A relay the gate opened is held until the pool closes.
+/// Every failure is a [`DbConnectError`], which holds no driver payload, so no
+/// caller can log or return a connection URL a driver echoed. The runtime's
+/// own telemetry spill (`telemetry_spill.rs`, and the hub reading it) is not a
+/// caller-supplied URL: it opens a local SQLite file named by operator config,
+/// carrying no credential, directly.
+pub struct VettedPool<DB: sqlx::Database>(sqlx::Pool<DB>);
+
+impl<DB> VettedPool<DB>
+where
+    DB: GatedDial,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
+{
+    /// Open a pool of at most `max_connections` to `url` through every gate.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError`] when a gate refuses or the driver cannot connect.
+    pub async fn connect(url: &DbUrl, max_connections: u32) -> Result<Self, DbConnectError> {
+        let mut relay = None;
+        let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
+        let pool = sqlx::pool::PoolOptions::<DB>::new()
+            .max_connections(max_connections)
+            .connect_with(options)
+            .await
+            .map_err(|e| DbConnectError::Unreachable(DbFailure::of(&e)))?;
+        if let Err(refused) = enforce_engine_floor_on(&pool).await {
+            pool.close().await;
+            return Err(refused);
+        }
+        if let Some(relay) = relay {
+            relay.hold_until(pool.close_event());
+        }
+        Ok(Self(pool))
+    }
+
+    /// The admitted pool.
+    #[must_use]
+    pub fn into_pool(self) -> sqlx::Pool<DB> {
+        self.0
     }
 }
 
@@ -1240,36 +1791,18 @@ async fn enforce_engine_floor<E: From<String> + Send>(pool: &Db) -> Result<(), E
 /// readers alongside a single writer — plus a `busy_timeout` so lock contention
 /// WAITS (sound) instead of erroring with `SQLITE_BUSY`. Without WAL a shared pool
 /// serialises every statement on the rollback-journal lock (the contention that a
-/// naive cache-only change regressed). The PRAGMAs are a no-op for other drivers
-/// (guarded by the url scheme).
+/// naive cache-only change regressed). The PRAGMAs run only when the parsed URL
+/// selects a shared SQLite file, the same value that chose the driver's gate.
 async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E, Db> {
-    // Apply the SSRF host gate for any network-scheme URL before dialing.
-    // SQLite (file/sqlite/`:memory:`) carries no host and is exempt.
-    // `url::Url::parse` is the same parser sqlx uses internally, so the host
-    // extracted here is the host sqlx would dial.
-    if !url.starts_with("sqlite")
-        && !url.starts_with("file")
-        && !url.starts_with(':')
-        && let Ok(parsed) = ::url::Url::parse(url)
-        && let Some(host) = parsed.host_str()
-        && let Err(e) =
-            crate::ssrf::VettedDial::for_host(host, parsed.port_or_known_default().unwrap_or(5432))
-    {
-        return IpeResult::Err(str_err(&format!("db: {e}")));
-    }
-    let pool: Db = match sqlx::pool::PoolOptions::new()
-        .max_connections(max_pool_connections())
-        .connect(url)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return IpeResult::Err(connect_err(&e)),
+    let db_url = match DbUrl::parse(url) {
+        Ok(db_url) => db_url,
+        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
     };
-    if let Err(e) = enforce_engine_floor::<E>(&pool).await {
-        pool.close().await;
-        return IpeResult::Err(e);
-    }
-    if url.contains("sqlite") && url_is_cacheable(url) {
+    let pool: Db = match VettedPool::<DbDatabase>::connect(&db_url, max_pool_connections()).await {
+        Ok(vetted) => vetted.into_pool(),
+        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+    };
+    if db_url.is_shared_sqlite_file() {
         let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
         let _ = sqlx::query("PRAGMA busy_timeout=5000;")
             .execute(&pool)
@@ -4654,6 +5187,11 @@ pub fn db_insert_fields_returning<E: Send + From<String> + 'static, A: Send + 's
 mod tests {
     use super::*;
 
+    /// Every target `url` makes the driver dial, as [`PostgresUrl::parse`] reads them.
+    fn postgres_dial_targets(url: &str) -> Result<Vec<DialTarget>, DbConnectError> {
+        PostgresUrl::parse(url).map(|url| url.targets)
+    }
+
     #[test]
     fn url_is_cacheable_bare_memory_is_not_cacheable() {
         assert!(!url_is_cacheable(":memory:"));
@@ -4944,29 +5482,312 @@ mod tests {
         }
     }
 
+    const SECRET_URL: &str = "postgres://admin:s3cr3t-pw@db.internal:5432/prod";
+
+    /// Neither rendering of a connect refusal carries the password or user.
+    fn assert_credential_free(refused: &DbConnectError) {
+        for rendered in [refused.to_string(), format!("{refused:?}")] {
+            assert!(
+                !rendered.contains("s3cr3t-pw"),
+                "password leaked: {rendered}"
+            );
+            assert!(!rendered.contains("admin"), "user leaked: {rendered}");
+        }
+    }
+
+    /// A database error whose message AND code echo the connection URL, as a
+    /// hostile or careless driver/server could.
+    #[derive(Debug)]
+    struct EchoingDbError;
+
+    impl std::fmt::Display for EchoingDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(SECRET_URL)
+        }
+    }
+
+    impl std::error::Error for EchoingDbError {}
+
+    impl sqlx::error::DatabaseError for EchoingDbError {
+        fn message(&self) -> &str {
+            SECRET_URL
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(SECRET_URL))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// Every `sqlx::Error` shape that can carry the connection URL classifies to
+    /// a message built from its variant alone.
     #[test]
-    fn connect_err_never_echoes_connection_credentials() {
-        // A DB connection failure must never surface host/user/password. The
-        // connect path's `Configuration`/`Io`/`Tls` payloads can embed the
-        // connection URL, so the Ipê-visible message is built from the error
-        // variant alone.
-        let secret_url = "postgres://admin:s3cr3t-pw@db.internal:5432/prod";
+    fn db_failure_never_echoes_connection_credentials() {
+        let boxed = || -> sqlx::error::BoxDynError { SECRET_URL.into() };
+        let cases = [
+            (
+                sqlx::Error::Configuration(boxed()),
+                "db: invalid connection configuration",
+            ),
+            (
+                sqlx::Error::Io(std::io::Error::other(SECRET_URL)),
+                "db: connection I/O error",
+            ),
+            (sqlx::Error::Tls(boxed()), "db: TLS error"),
+            (
+                sqlx::Error::Protocol(SECRET_URL.to_string()),
+                "db: driver error",
+            ),
+            (
+                sqlx::Error::Database(Box::new(EchoingDbError)),
+                "db: database error",
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert!(
+                raw.to_string().contains("s3cr3t-pw"),
+                "the raw driver error must be the leaking form this guards: {raw}"
+            );
+            let refused = DbConnectError::Unreachable(DbFailure::of(&raw));
+            assert_credential_free(&refused);
+            assert_eq!(refused.to_string(), expected);
+            let unreadable = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+            assert_credential_free(&unreadable);
+        }
+    }
 
-        let cfg: String = connect_err(&sqlx::Error::Configuration(Box::<
-            dyn std::error::Error + Send + Sync,
-        >::from(
-            secret_url.to_string()
-        )));
-        assert!(!cfg.contains("s3cr3t-pw"), "password leaked: {cfg}");
-        assert!(!cfg.contains("admin"), "user leaked: {cfg}");
-        assert!(!cfg.contains("db.internal"), "host leaked: {cfg}");
-        assert_eq!(cfg, "db: invalid connection configuration");
+    /// A well-formed SQLSTATE survives classification; a malformed one is dropped.
+    #[test]
+    fn db_failure_keeps_only_well_formed_codes() {
+        #[derive(Debug)]
+        struct Coded(&'static str);
+        impl std::fmt::Display for Coded {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("coded")
+            }
+        }
+        impl std::error::Error for Coded {}
+        impl sqlx::error::DatabaseError for Coded {
+            fn message(&self) -> &str {
+                "coded"
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(std::borrow::Cow::Borrowed(self.0))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        let classify = |code| DbFailure::of(&sqlx::Error::Database(Box::new(Coded(code))));
+        assert_eq!(
+            classify("28P01"),
+            DbFailure::Database {
+                code: Some("28P01".to_string())
+            }
+        );
+        for malformed in ["", "28P01\n[forged] line", "0123456789abcdefX"] {
+            assert_eq!(classify(malformed), DbFailure::Database { code: None });
+        }
+    }
 
-        let io: String = connect_err(&sqlx::Error::Io(std::io::Error::other(
-            secret_url.to_string(),
-        )));
-        assert!(!io.contains("s3cr3t-pw"), "password leaked via Io: {io}");
-        assert_eq!(io, "db: connection I/O error");
+    /// A real PostgreSQL driver failure on a URL carrying credentials never
+    /// surfaces them: the refusal is either the SSRF gate's (host only) or the
+    /// driver's, classified.
+    #[tokio::test]
+    async fn vetted_pool_postgres_refusal_is_credential_free() {
+        let url = "postgres://admin:s3cr3t-pw@db.internal/prod?sslmode=s3cr3t-pw";
+        let refused = match DbUrl::parse(url) {
+            Ok(url) => VettedPool::<sqlx::Postgres>::connect(&url, 1).await.err(),
+            Err(refused) => Some(refused),
+        };
+        assert!(refused.is_some(), "an invalid sslmode must be refused");
+        if let Some(refused) = refused {
+            assert_credential_free(&refused);
+        }
+    }
+
+    /// A real SQLite driver failure never surfaces the path or options it was
+    /// handed.
+    #[tokio::test]
+    async fn vetted_pool_sqlite_refusal_is_credential_free() {
+        for url in [
+            "sqlite:///nonexistent-admin-s3cr3t-pw/x.db?mode=ro",
+            "sqlite://x.db?mode=s3cr3t-pw",
+        ] {
+            let refused = match DbUrl::parse(url) {
+                Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1).await.err(),
+                Err(refused) => Some(refused),
+            };
+            assert!(refused.is_some(), "{url:?} must be refused");
+            if let Some(refused) = refused {
+                assert_credential_free(&refused);
+            }
+        }
+    }
+
+    /// The bundled SQLite passes every gate and yields a usable pool.
+    #[tokio::test]
+    async fn vetted_pool_admits_the_bundled_sqlite() {
+        let vetted = match DbUrl::parse("sqlite::memory:") {
+            Ok(url) => VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+                .await
+                .map(|_| ()),
+            Err(refused) => Err(refused),
+        };
+        assert!(
+            vetted.is_ok(),
+            "bundled SQLite must connect: {:?}",
+            vetted.err()
+        );
+    }
+
+    /// The dial-target set covers the authority host, every `host` /
+    /// `hostaddr` query override, both socket forms, and the driver default.
+    #[test]
+    fn postgres_dial_targets_cover_every_dial_source() {
+        let tcp = |host: &str, port| DialTarget::Tcp {
+            host: ConfiguredHost::from_config(host.to_owned()),
+            port,
+        };
+        assert_eq!(
+            postgres_dial_targets("postgres://u:p@public.example/db?host=169.254.169.254"),
+            Ok(vec![
+                tcp("public.example", POSTGRES_DEFAULT_PORT),
+                tcp("169.254.169.254", POSTGRES_DEFAULT_PORT)
+            ])
+        );
+        assert_eq!(
+            postgres_dial_targets("postgres://public.example:6543/db?hostaddr=10.0.0.1&port=7000"),
+            Ok(vec![tcp("public.example", 7000), tcp("10.0.0.1", 7000)])
+        );
+        assert_eq!(
+            postgres_dial_targets("postgres:///db?host=/var/run/postgresql"),
+            Ok(vec![DialTarget::Socket])
+        );
+        assert_eq!(
+            postgres_dial_targets("postgres://%2Fvar%2Frun%2Fpostgresql/db"),
+            Ok(vec![DialTarget::Socket])
+        );
+        assert_eq!(
+            postgres_dial_targets("postgres://public.example/db?host=/tmp"),
+            Ok(vec![
+                tcp("public.example", POSTGRES_DEFAULT_PORT),
+                DialTarget::Socket
+            ])
+        );
+        for no_host in ["postgres:///db", "postgres:db"] {
+            assert_eq!(
+                postgres_dial_targets(no_host),
+                Ok(vec![DialTarget::DriverDefault]),
+                "{no_host:?} names no host"
+            );
+        }
+    }
+
+    /// A PostgreSQL URL whose dial targets cannot be read is refused before
+    /// any dial or lookup, under either policy.
+    #[tokio::test]
+    async fn postgres_unreadable_dial_targets_are_refused() {
+        for url in [
+            "not a url with s3cr3t-pw",
+            "postgres://public.example/db?port=s3cr3t-pw",
+            "postgres://public.example/db?port=70000",
+        ] {
+            for policy in [DialPolicy::DenyPrivate, DialPolicy::AllowAll] {
+                assert_eq!(
+                    pg_gate_with(url, policy, &NoDns).await.err(),
+                    Some(DbConnectError::InvalidUrl),
+                    "{url:?} under {policy:?}"
+                );
+            }
+        }
+    }
+
+    /// A credential holding an unencoded `/`, `?`, or `#` ends the authority
+    /// early, so the parser would read part of the userinfo as the host. Such
+    /// a URL is refused before any lookup, and the refusal names no part of it.
+    #[tokio::test]
+    async fn postgres_url_with_an_at_after_its_authority_is_refused() {
+        for url in [
+            "postgres://admin:5432/s3cr3t-pw@db.example",
+            "postgres://admin@s3cr3t/-pw@db.example",
+            "postgres://admin:s3cr3t?pw@db.example",
+            "postgres://admin#s3cr3t-pw@db.example",
+            "postgres://db.example/app?user=admin@s3cr3t-pw",
+            "postgres://admin\\s3cr3t-pw@db.example/app",
+            "postgres://db.example/app#admin@s3cr3t-pw",
+        ] {
+            for policy in [DialPolicy::DenyPrivate, DialPolicy::AllowAll] {
+                let refused = pg_gate_with(url, policy, &NoDns).await.err();
+                assert_eq!(
+                    refused,
+                    Some(DbConnectError::MisplacedUserinfo),
+                    "{url:?} under {policy:?}"
+                );
+                if let Some(refused) = refused {
+                    assert_credential_free(&refused);
+                    assert!(!refused.to_string().contains("s3cr3t"), "{refused}");
+                }
+            }
+        }
+    }
+
+    /// Only the authority's last `@` splits credentials from the host, so an
+    /// `@` inside the password is read, not refused.
+    #[test]
+    fn postgres_url_with_an_at_inside_its_authority_is_read() {
+        assert_eq!(
+            postgres_dial_targets("postgres://admin:s3cr@3t-pw@db.example:6432/app"),
+            Ok(vec![DialTarget::Tcp {
+                host: ConfiguredHost::from_config("db.example".to_owned()),
+                port: 6432,
+            }])
+        );
+    }
+
+    /// A URL naming more hosts than the gate vets is refused before any
+    /// lookup; the largest admitted count still parses.
+    #[test]
+    fn postgres_dial_targets_are_capped() {
+        let url_with = |hosts: usize| {
+            let params: Vec<String> = (0..hosts.saturating_sub(1))
+                .map(|i| format!("host=h{i}.example"))
+                .collect();
+            format!("postgres://db.example/app?{}", params.join("&"))
+        };
+        let too_many = DbConnectError::TooManyDialTargets {
+            limit: MAX_POSTGRES_DIAL_TARGETS,
+        };
+        assert_eq!(
+            postgres_dial_targets(&url_with(MAX_POSTGRES_DIAL_TARGETS)).map(|t| t.len()),
+            Ok(MAX_POSTGRES_DIAL_TARGETS)
+        );
+        assert_eq!(
+            postgres_dial_targets(&url_with(MAX_POSTGRES_DIAL_TARGETS + 1)),
+            Err(too_many.clone())
+        );
+        assert!(
+            DbUrl::parse(&url_with(MAX_POSTGRES_DIAL_TARGETS + 1)).is_err_and(|e| e == too_many)
+        );
     }
 
     #[test]
@@ -8490,69 +9311,689 @@ mod tests {
         );
     }
 
-    // ── build_pool SSRF guard tests ──────────────────────────────────────────
+    // ── VettedPool SSRF guard tests ───────────────────────────────────────────
     //
-    // The guard logic in `build_pool` uses `VettedDial::for_host` when the url
-    // scheme is a network driver.  These tests exercise the same gate at the
-    // `VettedDial` layer — no actual DB dial is attempted.
+    // These drive the real PostgreSQL gate `VettedPool::connect` runs before
+    // dialing, under an explicit policy and a stub resolver; no DB dial and no
+    // DNS lookup is attempted.
 
-    /// Returns true when the `build_pool` SSRF pre-check would block `url`
-    /// under the current deny-private setting.  Mirrors the guard logic exactly.
-    fn pool_ssrf_blocked(url: &str) -> bool {
-        if url.starts_with("sqlite") || url.starts_with("file") || url.starts_with(':') {
-            return false;
+    use crate::ssrf::BlockedRange;
+
+    use crate::ssrf::test_resolvers::{NoDns, PublicThenPrivate};
+
+    const REBIND_PUBLIC: std::net::IpAddr = PublicThenPrivate::PUBLIC;
+
+    /// The gate's verdict on `url` under `policy`, resolving through `resolver`.
+    async fn pg_gate_with<R: HostResolver>(
+        url: &str,
+        policy: DialPolicy,
+        resolver: &R,
+    ) -> Result<PinnedPgOptions, DbConnectError> {
+        postgres_connect_options(&PostgresUrl::parse(url)?, policy, resolver, 4).await
+    }
+
+    /// The gate's verdict on `url` under `policy`, with no DNS available.
+    async fn pg_gate(url: &str, policy: DialPolicy) -> Result<PinnedPgOptions, DbConnectError> {
+        pg_gate_with(url, policy, &NoDns).await
+    }
+
+    /// The refusal the gate gives `url` under deny-private, if any.
+    async fn pg_refusal(url: &str) -> Option<SsrfRefusal> {
+        match pg_gate(url, DialPolicy::DenyPrivate).await {
+            Err(DbConnectError::HostRefused(refusal)) => Some(refusal),
+            _ => None,
         }
-        if let Ok(parsed) = ::url::Url::parse(url)
-            && let Some(host) = parsed.host_str()
-        {
-            let port = parsed.port_or_known_default().unwrap_or(5432);
-            return crate::ssrf::VettedDial::for_host(host, port).is_err();
+    }
+
+    #[tokio::test]
+    async fn pg_gate_refuses_blocked_literal_hosts_under_deny_private() {
+        for (url, range) in [
+            ("postgres://127.0.0.1:5432/x", BlockedRange::Loopback),
+            ("postgres://[::1]:5432/x", BlockedRange::Loopback),
+            ("postgres://169.254.169.254:5432/x", BlockedRange::LinkLocal),
+            ("postgres://10.0.0.5/x", BlockedRange::Private),
+            ("postgres://0.0.0.0/x", BlockedRange::Reserved),
+        ] {
+            let refusal = pg_refusal(url).await;
+            assert!(
+                matches!(refusal, Some(SsrfRefusal::Blocked { range: r, .. }) if r == range),
+                "{url:?} must be refused as {range}: {refusal:?}"
+            );
         }
-        false
     }
 
-    #[test]
-    fn build_pool_ssrf_blocks_loopback_postgres_when_deny_private_on() {
-        unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        assert!(
-            pool_ssrf_blocked("postgres://127.0.0.1:5432/x"),
-            "loopback postgres URL must be blocked by the SSRF gate"
-        );
-        unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
+    /// A `host` / `hostaddr` query parameter overrides the authority host in
+    /// the driver, so the gate must refuse it even when the authority host is
+    /// public.
+    #[tokio::test]
+    async fn pg_gate_refuses_a_query_host_override_under_deny_private() {
+        for url in [
+            "postgres://8.8.8.8/x?host=169.254.169.254",
+            "postgres://8.8.8.8/x?hostaddr=127.0.0.1",
+        ] {
+            let refusal = pg_refusal(url).await;
+            assert!(
+                matches!(refusal, Some(SsrfRefusal::Blocked { .. })),
+                "{url:?}: {refusal:?}"
+            );
+        }
     }
 
-    #[test]
-    fn build_pool_ssrf_blocks_link_local_postgres_when_deny_private_on() {
-        unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        assert!(
-            pool_ssrf_blocked("postgres://169.254.169.254:5432/x"),
-            "link-local postgres URL must be blocked by the SSRF gate"
-        );
-        unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
+    /// A URL naming no host leaves the dial target to the driver, which may
+    /// pick `localhost`; under deny-private that unproven target is refused.
+    #[tokio::test]
+    async fn pg_gate_refuses_a_driver_default_target_under_deny_private() {
+        for url in ["postgres:///db", "postgres:db?user=admin"] {
+            assert_eq!(
+                pg_refusal(url).await,
+                Some(SsrfRefusal::UnprovenTarget),
+                "{url:?}"
+            );
+        }
     }
 
-    #[test]
-    fn build_pool_ssrf_does_not_block_sqlite_url() {
-        unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "1") };
-        assert!(
-            !pool_ssrf_blocked("sqlite:///app.db"),
-            "sqlite URL must bypass the network SSRF gate"
-        );
-        assert!(
-            !pool_ssrf_blocked("sqlite://:memory:"),
-            "in-memory sqlite must bypass the network SSRF gate"
-        );
-        unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
+    /// Options dialling a host the vetted URL does not name are refused as an
+    /// unproven target, before any lookup.
+    #[tokio::test]
+    async fn pin_refuses_options_for_a_host_the_url_does_not_name() {
+        let url = UnambiguousUrl::parse("postgres://8.8.8.8/x");
+        let options = "postgres://1.1.1.1/x".parse::<sqlx::postgres::PgConnectOptions>();
+        assert!(url.is_ok() && options.is_ok());
+        let (Ok(url), Ok(options)) = (url, options) else {
+            return;
+        };
+        let pinned = pin_postgres_options(&url, options, &[], &NoDns, 4).await;
+        assert!(matches!(
+            pinned,
+            Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget))
+        ));
     }
 
-    #[test]
-    fn build_pool_ssrf_passes_private_when_deny_private_off() {
-        unsafe { std::env::set_var("IPE_HTTP_DENY_PRIVATE", "0") };
-        assert!(
-            !pool_ssrf_blocked("postgres://127.0.0.1:5432/x"),
-            "guard off must not block private host (dev workflow)"
+    /// A Unix socket reaches the local server as loopback TCP does, so under
+    /// deny-private every socket spelling is refused.
+    #[tokio::test]
+    async fn pg_gate_refuses_unix_sockets_under_deny_private() {
+        for url in [
+            "postgres://%2Fvar%2Frun%2Fpostgresql/db",
+            "postgres:///db?host=/var/run/postgresql",
+            "postgres://8.8.8.8/db?host=/tmp",
+        ] {
+            assert_eq!(
+                pg_refusal(url).await,
+                Some(SsrfRefusal::LocalSocket),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// With the policy off, sockets, the driver default, and private hosts
+    /// pass unpinned, as in local development.
+    #[tokio::test]
+    async fn pg_gate_passes_local_targets_unpinned_when_the_policy_allows_all() {
+        for url in [
+            "postgres:///db",
+            "postgres://%2Fvar%2Frun%2Fpostgresql/db",
+            "postgres:///db?host=/var/run/postgresql",
+            "postgres://127.0.0.1:5432/x",
+            "postgres://db.internal/x",
+        ] {
+            let gated = pg_gate(url, DialPolicy::AllowAll).await;
+            assert!(gated.is_ok(), "{url:?} must pass: {:?}", gated.err());
+        }
+        let unpinned = pg_gate("postgres://db.internal/x", DialPolicy::AllowAll).await;
+        assert_eq!(
+            unpinned.map(|(o, relay)| (o.get_host().to_owned(), relay.is_none())),
+            Ok(("db.internal".to_owned(), true))
         );
-        unsafe { std::env::remove_var("IPE_HTTP_DENY_PRIVATE") };
+    }
+
+    /// A public IP-literal host is dialled as itself.
+    #[tokio::test]
+    async fn pg_gate_keeps_a_public_literal_host() {
+        let gated = pg_gate("postgres://u:p@1.1.1.1:6543/x", DialPolicy::DenyPrivate).await;
+        let gated =
+            gated.map(|(o, relay)| (o.get_host().to_owned(), o.get_port(), relay.is_none()));
+        assert_eq!(gated, Ok(("1.1.1.1".to_owned(), 6543, true)));
+    }
+
+    /// DNS rebinding: the named host is resolved once and the options the
+    /// pool keeps dial the vetted address, so the rebound (private) answer is
+    /// never dialled, not even by a connection the pool opens later.
+    #[tokio::test]
+    async fn pg_gate_pins_a_named_host_against_rebinding() {
+        let resolver = PublicThenPrivate::new();
+        let gated = pg_gate_with(
+            "postgres://u:p@rebind.example:5432/x?sslmode=disable",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await
+        .map(|(o, relay)| (o.get_host().to_owned(), o.get_port(), relay.is_none()));
+        assert_eq!(gated, Ok((REBIND_PUBLIC.to_string(), 5432, true)));
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "the name must be resolved exactly once"
+        );
+
+        // A fresh connect resolves again and meets the rebound answer.
+        let again = pg_gate_with(
+            "postgres://u:p@rebind.example:5432/x",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert!(
+            matches!(
+                again,
+                Err(DbConnectError::HostRefused(SsrfRefusal::Blocked {
+                    range: BlockedRange::Private,
+                    ..
+                }))
+            ),
+            "{again:?}"
+        );
+    }
+
+    /// Without a relay, a named host under `sslmode=verify-full` cannot be
+    /// pinned without losing the certificate's host-name check, so it is
+    /// refused; an IP literal under the same mode is pinned as itself.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn pg_gate_refuses_verify_full_on_a_named_host_under_deny_private() {
+        let resolver = PublicThenPrivate::new();
+        let refused = pg_gate_with(
+            "postgres://db.example/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert_eq!(
+            refused.err(),
+            Some(DbConnectError::HostRefused(
+                SsrfRefusal::UnpinnableTlsName {
+                    host: ConfiguredHost::from_config("db.example".to_owned())
+                }
+            ))
+        );
+        let literal = pg_gate(
+            "postgres://1.1.1.1/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+        )
+        .await;
+        assert!(literal.is_ok(), "{:?}", literal.err());
+    }
+
+    /// DNS rebinding under every mode that may negotiate TLS: the host keeps
+    /// its name for SNI and certificate verification, the driver dials the
+    /// relay socket, and the relay carries the dial to the address vetted by
+    /// the only lookup, so the rebound (private) answer is never dialled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pg_gate_relays_a_tls_named_host_to_its_vetted_address() {
+        for mode in [
+            "",
+            "?sslmode=prefer",
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+        ] {
+            let resolver = PublicThenPrivate::new();
+            let url = format!("postgres://u:p@rebind.example:5432/x{mode}");
+            let gated = pg_gate_with(&url, DialPolicy::DenyPrivate, &resolver).await;
+            assert!(gated.is_ok(), "{url:?}: {:?}", gated.as_ref().err());
+            let Ok((options, relay)) = gated else { return };
+            assert!(relay.is_some(), "{url:?} must dial through a relay");
+            let Some(relay) = relay else { return };
+            assert_eq!(options.get_host(), "rebind.example", "{url:?}");
+            assert_eq!(
+                options.get_socket().map(std::path::PathBuf::as_path),
+                Some(relay.socket_dir()),
+                "{url:?}"
+            );
+            assert_eq!(
+                relay.target().socket_addr(),
+                std::net::SocketAddr::new(REBIND_PUBLIC, 5432),
+                "{url:?}"
+            );
+            assert_eq!(
+                resolver.calls(),
+                1,
+                "{url:?}: the name must be resolved exactly once"
+            );
+        }
+    }
+
+    /// A relay that could not be opened refuses the dial as `RelayUnavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unavailable_relay_is_a_relay_unavailable_connect_error() {
+        assert!(matches!(
+            DbConnectError::from(crate::ssrf::RelayUnavailable),
+            DbConnectError::RelayUnavailable
+        ));
+    }
+
+    /// An IP-literal host under `sslmode=verify-full` is pinned as itself,
+    /// with no relay.
+    #[tokio::test]
+    async fn pg_gate_pins_a_literal_verify_full_host_without_a_relay() {
+        let literal = pg_gate(
+            "postgres://1.1.1.1/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+        )
+        .await
+        .map(|(o, relay)| (o.get_host().to_owned(), relay.is_none()));
+        assert_eq!(literal, Ok(("1.1.1.1".to_owned(), true)));
+    }
+
+    /// A named host resolving only to a private address is refused before any
+    /// relay opens, whatever the TLS mode.
+    #[tokio::test]
+    async fn pg_gate_refuses_a_private_named_tls_host_before_relaying() {
+        let resolver = PublicThenPrivate::new();
+        let first = pg_gate_with(
+            "postgres://rebind.example/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert!(
+            first.is_ok() || cfg!(not(unix)),
+            "{:?}",
+            first.as_ref().err()
+        );
+        let second = pg_gate_with(
+            "postgres://rebind.example/x?sslmode=verify-full",
+            DialPolicy::DenyPrivate,
+            &resolver,
+        )
+        .await;
+        assert!(
+            matches!(
+                second,
+                Err(DbConnectError::HostRefused(
+                    SsrfRefusal::Blocked {
+                        range: BlockedRange::Private,
+                        ..
+                    } | SsrfRefusal::UnpinnableTlsName { .. }
+                ))
+            ),
+            "{:?}",
+            second.err()
+        );
+    }
+
+    /// The test CA that signed [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    const PG_TLS_CA_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/ca.pem"
+    ));
+
+    /// A server certificate valid only for [`PG_TLS_HOST`].
+    #[cfg(unix)]
+    const PG_TLS_SERVER_PEM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.pem"
+    ));
+
+    /// The private key of [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    const PG_TLS_SERVER_KEY: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/pg_tls/server.key"
+    ));
+
+    /// The only name [`PG_TLS_SERVER_PEM`] is valid for.
+    #[cfg(unix)]
+    const PG_TLS_HOST: &str = "db.example.test";
+
+    /// What the fake TLS server saw of one client.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct TlsSeen {
+        /// The SNI name the client sent, if any.
+        sni: Option<String>,
+        /// Whether the TLS handshake completed.
+        handshaken: bool,
+    }
+
+    /// The fake server's TLS configuration, serving [`PG_TLS_SERVER_PEM`].
+    #[cfg(unix)]
+    fn pg_tls_server_config() -> Option<rustls::ServerConfig> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_slice_iter(PG_TLS_SERVER_PEM)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let key = PrivateKeyDer::from_pem_slice(PG_TLS_SERVER_KEY).ok()?;
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()
+    }
+
+    /// Answer one PostgreSQL `SSLRequest` on `listener` with TLS, then hang up.
+    #[cfg(unix)]
+    fn serve_one_pg_tls_client(listener: &std::net::TcpListener) -> Option<TlsSeen> {
+        use std::io::{Read, Write};
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+        let (mut tcp, _) = listener.accept().ok()?;
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok()?;
+        let mut request = [0_u8; 8];
+        tcp.read_exact(&mut request).ok()?;
+        if request != SSL_REQUEST {
+            return None;
+        }
+        tcp.write_all(b"S").ok()?;
+        let config = pg_tls_server_config()?;
+        let mut tls = rustls::ServerConnection::new(std::sync::Arc::new(config)).ok()?;
+        while tls.is_handshaking() {
+            if tls.complete_io(&mut tcp).is_err() {
+                break;
+            }
+        }
+        Some(TlsSeen {
+            sni: tls.server_name().map(str::to_owned),
+            handshaken: !tls.is_handshaking(),
+        })
+    }
+
+    /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
+    /// through a relay pinned to the server's address.
+    #[cfg(unix)]
+    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DbFailure>, Option<TlsSeen>) {
+        use sqlx::ConnectOptions;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "{:?}", listener.as_ref().err());
+        let Ok(listener) = listener else {
+            return (Err(DbFailure::Io), None);
+        };
+        let Ok(server) = listener.local_addr() else {
+            return (Err(DbFailure::Io), None);
+        };
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
+        });
+        let relay = crate::ssrf::PinnedRelay::open(
+            crate::ssrf::VettedAddr::assume_vetted_for_test(server),
+            5432,
+            4,
+        );
+        assert!(relay.is_ok(), "{:?}", relay.as_ref().err());
+        let Ok(relay) = relay else {
+            return (Err(DbFailure::Io), None);
+        };
+        let options = sqlx::postgres::PgConnectOptions::new()
+            .host(host)
+            .port(5432)
+            .socket(relay.socket_dir())
+            .username("ipe")
+            .database("ipe")
+            .ssl_mode(sqlx::postgres::PgSslMode::VerifyFull)
+            .ssl_root_cert_from_pem(PG_TLS_CA_PEM.to_vec());
+        let limit = std::time::Duration::from_secs(20);
+        let connected = tokio::time::timeout(limit, options.connect()).await;
+        let outcome = match connected {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(DbFailure::of(&e)),
+            Err(_) => Err(DbFailure::PoolTimedOut),
+        };
+        let seen = tokio::time::timeout(limit, seen_rx)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        (outcome, seen)
+    }
+
+    /// Through the relay, the driver sends the host name, not the pinned IP,
+    /// as SNI and completes a `verify-full` handshake against a certificate
+    /// valid only for that name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relayed_tls_dial_sends_the_host_name_and_verifies_it() {
+        let (_outcome, seen) = dial_pg_tls_through_relay(PG_TLS_HOST).await;
+        assert_eq!(
+            seen,
+            Some(TlsSeen {
+                sni: Some(PG_TLS_HOST.to_owned()),
+                handshaken: true,
+            })
+        );
+    }
+
+    /// Through the relay, a certificate that is not valid for the dialled
+    /// host name is refused by the driver before the handshake completes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
+        let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
+        assert!(
+            matches!(outcome, Err(DbFailure::Tls | DbFailure::Io)),
+            "{outcome:?}"
+        );
+        assert!(
+            seen.as_ref()
+                .is_some_and(|s| s.sni.as_deref() == Some("other.example.test") && !s.handshaken),
+            "{seen:?}"
+        );
+    }
+
+    /// An unresolvable named host is refused with the typed reason.
+    #[tokio::test]
+    async fn pg_gate_refuses_an_unresolvable_named_host() {
+        assert_eq!(
+            pg_refusal("postgres://nowhere.example/x").await,
+            Some(SsrfRefusal::Unresolvable {
+                host: crate::ssrf::HostShown::Named("nowhere.example".to_owned()),
+                kind: std::io::ErrorKind::NotFound,
+            })
+        );
+    }
+
+    /// SQLite dials no host: its gate only parses the URL.
+    #[tokio::test]
+    async fn sqlite_gate_consults_no_host() {
+        for url in ["sqlite:///app.db", "sqlite::memory:"] {
+            let parsed = DbUrl::parse(url);
+            assert!(parsed.is_ok(), "{url:?}: {:?}", parsed.err());
+            let Ok(parsed) = parsed else { return };
+            let gated =
+                <sqlx::Sqlite as GatedDial>::gated_connect_options(&parsed, 4, &mut None).await;
+            assert!(gated.is_ok(), "{url:?}: {:?}", gated.err());
+        }
+    }
+
+    // ── DbUrl: one parse decides the engine, the dial, and WAL ────────────────
+
+    /// The engine each scheme selects.
+    #[test]
+    fn db_url_selects_the_engine_by_scheme() {
+        for (url, engine) in [
+            ("sqlite://app.db?mode=rwc", DbEngine::Sqlite),
+            ("sqlite::memory:", DbEngine::Sqlite),
+            ("file:app.db", DbEngine::Sqlite),
+            ("app.db", DbEngine::Sqlite),
+            ("./data/app.db", DbEngine::Sqlite),
+            (":memory:", DbEngine::Sqlite),
+            ("postgres://u:p@db.example/app", DbEngine::Postgres),
+            ("postgresql://db.example/app", DbEngine::Postgres),
+            ("postgres:///app", DbEngine::Postgres),
+        ] {
+            assert!(
+                DbUrl::parse(url).is_ok_and(|parsed| parsed.engine() == engine),
+                "{url:?} must select {}",
+                engine.name()
+            );
+        }
+    }
+
+    /// A scheme selecting no supported engine is refused without echoing it,
+    /// since a malformed URL's scheme position can hold its userinfo.
+    #[test]
+    fn db_url_refuses_an_unsupported_scheme() {
+        for url in [
+            "mysql://admin:s3cr3t-pw@db.example/app",
+            "redis://db.example/",
+            "http://db.example/",
+            "SQLITE://app.db",
+            "Postgres://db.example/app",
+            "admin:s3cr3t-pw@db.example/app",
+        ] {
+            let refused = DbUrl::parse(url).err();
+            assert_eq!(refused, Some(DbConnectError::UnsupportedScheme), "{url:?}");
+            if let Some(refused) = refused {
+                assert_credential_free(&refused);
+            }
+        }
+    }
+
+    /// A PostgreSQL URL whose dial targets cannot be read is refused at the parse.
+    #[test]
+    fn db_url_refuses_an_unreadable_postgres_url() {
+        for url in [
+            "postgres://public.example/db?port=s3cr3t-pw",
+            "postgres://public.example/db?port=70000",
+        ] {
+            assert_eq!(
+                DbUrl::parse(url).err(),
+                Some(DbConnectError::InvalidUrl),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// A SQLite URL the driver cannot read is refused at the parse, as a
+    /// PostgreSQL one is, never reported as an unreachable server.
+    #[test]
+    fn db_url_refuses_an_unreadable_sqlite_url() {
+        for url in [
+            "sqlite://app.db?mode=bogus",
+            "sqlite://app.db?no_such_param=1",
+        ] {
+            assert_eq!(
+                DbUrl::parse(url).err(),
+                Some(DbConnectError::InvalidUrl),
+                "{url:?}"
+            );
+        }
+    }
+
+    /// A PostgreSQL URL's dial targets are read once, at the parse, and the
+    /// gate vets exactly those.
+    #[test]
+    fn db_url_carries_the_postgres_dial_targets() {
+        let parsed = DbUrl::parse("postgres://public.example/db?host=169.254.169.254");
+        let targets = match parsed {
+            Ok(DbUrl::Postgres(postgres)) => Some(postgres.targets),
+            _ => None,
+        };
+        assert_eq!(
+            targets,
+            Some(vec![
+                DialTarget::Tcp {
+                    host: ConfiguredHost::from_config("public.example".to_owned()),
+                    port: POSTGRES_DEFAULT_PORT,
+                },
+                DialTarget::Tcp {
+                    host: ConfiguredHost::from_config("169.254.169.254".to_owned()),
+                    port: POSTGRES_DEFAULT_PORT,
+                },
+            ])
+        );
+    }
+
+    /// Only a shared SQLite file gets the WAL setup: never a PostgreSQL URL
+    /// that merely mentions `sqlite`, never a private in-memory database.
+    #[test]
+    fn db_url_decides_wal_from_the_parsed_engine() {
+        for (url, wal) in [
+            ("sqlite://app.db?mode=rwc", true),
+            ("app.db", true),
+            ("file::memory:?cache=shared", true),
+            ("sqlite::memory:", false),
+            (":memory:", false),
+            ("postgres://db.example/sqlite", false),
+            ("postgres://db.example/app?application_name=sqlite", false),
+        ] {
+            assert!(
+                DbUrl::parse(url).is_ok_and(|parsed| parsed.is_shared_sqlite_file() == wal),
+                "{url:?}: WAL must be {wal}"
+            );
+        }
+    }
+
+    /// Each driver refuses a URL selecting the other engine, before any dial
+    /// or lookup.
+    #[tokio::test]
+    async fn gated_dial_refuses_a_url_for_the_other_engine() {
+        let postgres = DbUrl::parse("postgres://127.0.0.1/app");
+        assert!(postgres.is_ok(), "{:?}", postgres.as_ref().err());
+        let Ok(postgres) = postgres else { return };
+        assert_eq!(
+            <sqlx::Sqlite as GatedDial>::gated_connect_options(&postgres, 4, &mut None)
+                .await
+                .err(),
+            Some(DbConnectError::EngineMismatch {
+                url: DbEngine::Postgres,
+                driver: DbEngine::Sqlite,
+            })
+        );
+        let sqlite = DbUrl::parse("sqlite::memory:");
+        assert!(sqlite.is_ok(), "{:?}", sqlite.as_ref().err());
+        let Ok(sqlite) = sqlite else { return };
+        assert_eq!(
+            <sqlx::Postgres as GatedDial>::gated_connect_options(&sqlite, 4, &mut None)
+                .await
+                .err(),
+            Some(DbConnectError::EngineMismatch {
+                url: DbEngine::Sqlite,
+                driver: DbEngine::Postgres,
+            })
+        );
+    }
+
+    /// `build_pool` refuses an unsupported scheme and a URL for the other
+    /// engine, with the typed reason and no credential.
+    #[tokio::test]
+    async fn build_pool_refuses_urls_the_build_cannot_open() {
+        for (url, expected) in [
+            (
+                "mysql://admin:s3cr3t-pw@db.example/app",
+                DbConnectError::UnsupportedScheme,
+            ),
+            (
+                "postgres://admin:s3cr3t-pw@1.1.1.1/app",
+                DbConnectError::EngineMismatch {
+                    url: DbEngine::Postgres,
+                    driver: DbEngine::Sqlite,
+                },
+            ),
+        ] {
+            let refused = match build_pool::<String>(url).await {
+                IpeResult::Err(e) => Some(e),
+                IpeResult::Ok(_) => None,
+            };
+            assert_eq!(refused, Some(expected.to_string()), "{url:?}");
+        }
+    }
+
+    /// A PostgreSQL refusal displays under the `db:` prefix.
+    #[test]
+    fn host_refused_displays_under_the_db_prefix() {
+        let shown = DbConnectError::HostRefused(SsrfRefusal::LocalSocket).to_string();
+        assert_eq!(
+            shown,
+            "db: blocked: local socket dial target (IPE_HTTP_DENY_PRIVATE)"
+        );
     }
 
     // ── parse_order_clause ─────────────────────────────────────────────────────
@@ -9294,49 +10735,39 @@ mod tests {
         assert!(pool.is_ok(), "in-memory SQLite must connect");
         if let Ok(pool) = pool {
             pool.close().await;
-            assert!(matches!(
+            assert_eq!(
                 enforce_engine_floor_on(&pool).await,
-                Err(EngineFloorError::Unreadable(_))
-            ));
-        }
-    }
-
-    /// A refusal reaches a session store as a `Configuration` error that still
-    /// names the required floor; a failed query passes through unchanged.
-    #[test]
-    fn engine_floor_refusal_maps_to_a_configuration_error() {
-        for engine in ENGINES {
-            let floor = engine.version_floor();
-            let refused = EngineVersionError::BelowFloor {
-                engine,
-                found: one_step_below(floor),
-            };
-            let mapped = sqlx::Error::from(EngineFloorError::Refused(refused));
-            assert!(matches!(mapped, sqlx::Error::Configuration(_)));
-            assert!(
-                mapped.to_string().contains(&format!("{engine} >= {floor}")),
-                "store error {mapped} must name the required floor"
+                Err(DbConnectError::VersionUnreadable(DbFailure::PoolClosed))
             );
         }
-        assert!(matches!(
-            sqlx::Error::from(EngineFloorError::Unreadable(sqlx::Error::PoolClosed)),
-            sqlx::Error::PoolClosed
-        ));
     }
 
-    /// A failed version query on the `Ipe.Db` pool maps through `connect_err`:
-    /// the message is built from the error variant, never the driver payload.
-    #[tokio::test]
-    async fn engine_floor_query_failure_is_credential_free() {
-        let pool = sqlx::pool::PoolOptions::<DbDatabase>::new()
-            .connect("sqlite::memory:")
-            .await;
-        assert!(pool.is_ok(), "in-memory SQLite must connect");
-        if let Ok(pool) = pool {
-            pool.close().await;
-            let err = enforce_engine_floor::<String>(&pool).await;
-            assert_eq!(err, Err(connect_err::<String>(&sqlx::Error::PoolClosed)));
+    /// A floor refusal still names the required floor.
+    #[test]
+    fn engine_floor_refusal_names_the_required_floor() {
+        for engine in ENGINES {
+            let floor = engine.version_floor();
+            let refused = DbConnectError::EngineRefused(EngineVersionError::BelowFloor {
+                engine,
+                found: one_step_below(floor),
+            });
+            assert!(
+                refused
+                    .to_string()
+                    .contains(&format!("{engine} >= {floor}")),
+                "refusal {refused} must name the required floor"
+            );
         }
+    }
+
+    /// A failed version query renders from the error variant, never the
+    /// driver payload.
+    #[test]
+    fn engine_floor_query_failure_is_credential_free() {
+        let raw = sqlx::Error::Io(std::io::Error::other(SECRET_URL));
+        let refused = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+        assert_credential_free(&refused);
+        assert_eq!(refused.to_string(), "db: connection I/O error");
     }
 
     /// The floors are stated once, in their consts: no doc comment in this file

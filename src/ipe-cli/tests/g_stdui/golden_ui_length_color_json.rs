@@ -47,7 +47,7 @@ fn ui_length_color_and_json_value_render_end_to_end() {
         .join("golden")
         .join("ui_length_color_json");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m7_ui_length_color_json_e2e");
+    let out = crate::support::scratch_root().join("ipec_m7_ui_length_color_json_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

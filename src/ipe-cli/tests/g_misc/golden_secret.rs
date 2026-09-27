@@ -34,7 +34,7 @@ fn e2e_enabled() -> bool {
 fn compile_build_run(name: &str) -> crate::support::RunOutcome {
     let root = repo_root();
     let entry = golden_dir(&root, name).join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -267,7 +267,7 @@ fn all_secret_goldens_compile() {
         "m_secret_io_read",
     ] {
         let entry = golden_dir(&root, name).join("Main.ipe");
-        let out = std::env::temp_dir().join(format!("ipec_{name}_compileonly"));
+        let out = crate::support::scratch_root().join(format!("ipec_{name}_compileonly"));
         let _ = std::fs::remove_dir_all(&out);
         let Ok(runtime) = ipe::resolve_runtime() else {
             return;

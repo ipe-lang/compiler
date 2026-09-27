@@ -502,56 +502,10 @@ pub fn closure_handle_nominal(ref_name: &str) -> String {
 /// `r#` form, and Rust forbids them as field/variant/method names anyway.
 #[must_use]
 pub fn rust_safe_ident(s: &str) -> String {
-    let is_raw_escapable_keyword = matches!(
-        s,
-        "as" | "break"
-            | "const"
-            | "continue"
-            | "else"
-            | "enum"
-            | "extern"
-            | "false"
-            | "fn"
-            | "for"
-            | "if"
-            | "impl"
-            | "in"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "pub"
-            | "ref"
-            | "return"
-            | "static"
-            | "struct"
-            | "trait"
-            | "true"
-            | "type"
-            | "unsafe"
-            | "use"
-            | "where"
-            | "while"
-            | "async"
-            | "await"
-            | "dyn"
-            | "abstract"
-            | "become"
-            | "box"
-            | "do"
-            | "final"
-            | "macro"
-            | "override"
-            | "priv"
-            | "typeof"
-            | "unsized"
-            | "virtual"
-            | "yield"
-            | "try"
-            | "gen"
-    );
+    // `crate`/`self`/`Self`/`super` are Rust keywords too, but they reject the
+    // `r#` escape and pass through unchanged instead — see the doc above.
+    let is_raw_escapable_keyword =
+        ipe_intern::is_rust_keyword(s) && !matches!(s, "crate" | "self" | "Self" | "super");
     if is_raw_escapable_keyword {
         format!("r#{s}")
     } else {
@@ -646,6 +600,18 @@ mod tests {
         // foreign field/variant names).
         assert_eq!(rust_safe_ident("self"), "self");
         assert_eq!(rust_safe_ident("crate"), "crate");
+    }
+
+    #[test]
+    fn every_ssot_keyword_is_escaped_or_passed_through() {
+        for kw in ipe_intern::RUST_KEYWORDS {
+            let out = rust_safe_ident(kw);
+            if matches!(*kw, "crate" | "self" | "Self" | "super") {
+                assert_eq!(out, *kw, "{kw} must pass through unescaped");
+            } else {
+                assert_eq!(out, format!("r#{kw}"), "{kw} must be raw-escaped");
+            }
+        }
     }
 
     #[test]

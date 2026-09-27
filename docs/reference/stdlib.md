@@ -1452,9 +1452,10 @@ Ipe.Db.Dsn — a typed, opaque database connection descriptor
 | `Driver` | The closed set of drivers the runtime can describe — exactly the two the |
 | `TlsMode` | The transport-security posture. `Require` is the secure default when a DSN |
 | `parse` | `parse raw` — THE seal from a full DSN URL string. Returns `Err` on any |
-| `build` | `build parts` — THE seal from typed parts, running the SAME validators as |
+| `build` | `build parts` — THE seal from typed parts, enforcing the invariants `parse` |
 | `driver` | `driver dsn` — the descriptor's driver. |
 | `host` | `host dsn` — the host component (`""` for a file-backed sqlite descriptor). |
+| `port` | `port dsn` — the network port as a validated `Ipe.Net.Port`, or `Nothing` |
 | `database` | `database dsn` — the database name (or file path, for sqlite). |
 | `user` | `user dsn` — the connection user (`""` when none). |
 | `tls` | `tls dsn` — the descriptor's transport posture. |
@@ -1532,6 +1533,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `CompareOp` | A comparison operator carried by a query leaf. A typed ADT, not a stringly |
 | `Query` | A filtered, ordered, paginated read over a `Store a`, decoded through the |
 | `query` | `query store` — begin a read over `store` with no filter, ordering, or |
+| `where` | `where cond q` — restrict `q` to the rows matching `cond`. Applying `where` |
 | `eq` | `eq accessor value` — the rows where the record column named by the field |
 | `eqBy` | `eqBy codec accessor value` — the accessor-typed equality leaf for an ENUM |
 | `neq` | `neq accessor value` — the rows where the column named by `accessor` is |
@@ -3230,6 +3232,7 @@ Ipe.Url — typed, validated URLs.
 | `toString` | `toString url` — recover the serialized URL string. |
 | `scheme` | `scheme url` — the URL's scheme (`"https"`, `"http"`, …), always present. |
 | `host` | `host url` — the host component, or `Nothing` for a hostless scheme |
+| `port` | `port url` — the port with the scheme's known default applied |
 | `path` | `path url` — the path component. |
 | `query` | `query url` — the raw query string (without the leading `?`), or `Nothing`. |
 | `fragment` | `fragment url` — the fragment (without the leading `#`), or `Nothing`. |

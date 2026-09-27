@@ -41,7 +41,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -61,7 +61,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
 fn codec_shape_accepts_and_emits() {
     let root = repo_root();
     let entry = golden_dir(&root, "codec_shape").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_codec_shape_emit");
+    let out = crate::support::scratch_root().join("ipec_codec_shape_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -92,7 +92,7 @@ fn codec_shape() {
 fn codec_timestamp_role_rejects_raw_int() {
     let root = repo_root();
     let entry = golden_dir(&root, "codec_timestamp_role_reject").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_codec_timestamp_role_reject_emit");
+    let out = crate::support::scratch_root().join("ipec_codec_timestamp_role_reject_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

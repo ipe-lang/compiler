@@ -35,6 +35,18 @@ checks:
   - context: clippy
     disposition: gate
     producer: ci.yml
+  - context: runtime-feature-combos
+    disposition: gate
+    producer: ci.yml
+    guards: >-
+      Every runtime feature combination the emitter can select builds clean
+      under clippy (SEAL); path-gated, so a skip on a non-emit PR passes.
+  - context: windows-check
+    disposition: gate
+    producer: ci.yml
+    guards: >-
+      The Windows output-directory code compiles, so its held-handle,
+      reparse-point-refusing file operations ship rather than rot unbuilt.
   - context: quick-check
     disposition: gate
     producer: ci.yml
@@ -164,10 +176,6 @@ checks:
     disposition: nightly-gate
     producer: ci.yml
     guards: Security
-  - context: runtime-feature-combos
-    disposition: nightly-gate
-    producer: ci.yml
-    guards: SEAL
 
   # ── Cross-platform jail proofs — nightly-gate (Security §1) ───────────────
   # The Linux jail Tier-2 proofs — the containment gate CI produces on GitHub-
@@ -271,13 +279,25 @@ checks:
     owner: docs
     note: playground.yml build leg; playground-jail is the Security gate.
 
-  # ── Utility / non-status jobs (not gates; declared so drift stays quiet) ───
-  # `changes` (paths-filter fan-out), release automation, and the rerun helper
-  # are plumbing, not guarantees. Marked internal so the drift gate does not
-  # demand a gate/informational disposition for them.
+  # ── Path classifiers (gate) ──────────────────────────────────────────────
+  # Each workflow's paths-filter job. A failed or cancelled classifier SKIPS
+  # every job that `needs` it, and GitHub counts a skipped required check as
+  # passing — so the classifier is itself required: absent proof it ran, the
+  # merge is blocked (fail closed). Each carries a workflow-unique name so the
+  # required context resolves to exactly one producer.
   - context: changes
-    disposition: informational
+    disposition: gate
     producer: ci.yml
-    owner: infra
-    internal: true
-    note: paths-filter fan-out; not a guarantee.
+    guards: >-
+      Security — fail-closed path classification: a failed classifier cannot
+      skip every ci.yml tier into a passing required set.
+  - context: admission-changes
+    disposition: gate
+    producer: admission-sandbox.yml
+    guards: >-
+      Security — fail-closed path classification for the admission jail proofs.
+  - context: playground-changes
+    disposition: gate
+    producer: playground.yml
+    guards: >-
+      Security — fail-closed path classification for playground-jail.

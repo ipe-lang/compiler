@@ -163,7 +163,8 @@ fn rust_fn_resolves_without_import_rust_ffi() {
         \x20               Err _ -> Io.println \"err double\"\n\
         \x20       Err _ -> Io.println \"err shift\"\n";
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn_no_ffi_import");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipec_ffi_rust_fn_no_ffi_import");
     assert!(
         write_project(&tmp, main_no_ffi_import),
         "must write the fixture project + FFI cache"
@@ -200,7 +201,7 @@ fn rust_fn_emits_the_shared_exact_carrier_shim() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn");
     assert!(
         write_project(&tmp, MAIN_IPE),
         "must write the fixture project + FFI cache"
@@ -272,7 +273,8 @@ fn a_clamp_requiring_rust_fn_is_refused() {
         \x20   case clamped 1 of\n\
         \x20       Ok _ -> Io.println \"ok\"\n\
         \x20       Err _ -> Io.println \"err\"\n";
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn_clamp_refusal");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipec_ffi_rust_fn_clamp_refusal");
     assert!(write_project(&tmp, main), "must write the fixture project");
     let entry = tmp.join("src").join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_clamp_out");
@@ -305,7 +307,8 @@ fn a_malformed_rust_fn_is_refused() {
         \x20   case shifted 1 of\n\
         \x20       Ok _ -> Io.println \"ok\"\n\
         \x20       Err _ -> Io.println \"err\"\n";
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn_malformed");
+    let tmp =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn_malformed");
     assert!(write_project(&tmp, main), "must write the fixture project");
     let entry = tmp.join("src").join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_malformed_out");
@@ -338,7 +341,8 @@ fn a_rust_fn_on_an_uninstalled_crate_is_refused() {
         \x20   case ghost 1 of\n\
         \x20       Ok _ -> Io.println \"ok\"\n\
         \x20       Err _ -> Io.println \"err\"\n";
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn_uninstalled");
+    let tmp =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn_uninstalled");
     assert!(write_project(&tmp, main), "must write the fixture project");
     let entry = tmp.join("src").join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_uninstalled_out");
@@ -367,7 +371,7 @@ fn rust_fn_emitted_crate_builds_and_runs() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_rust_fn_e2e");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn_e2e");
     assert!(
         write_project(&tmp, MAIN_IPE),
         "must write the fixture project + FFI cache"

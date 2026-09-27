@@ -87,7 +87,8 @@ fn assert_relays_cargo_progress(subcommand: &str) {
         return;
     }
 
-    let dir = std::env::temp_dir().join(format!("ipe_{subcommand}_stream_progress_e2e"));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ipe_{subcommand}_stream_progress_e2e"));
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
     let entry = dir.join("Main.ipe");

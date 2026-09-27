@@ -6,6 +6,11 @@
 -- redaction. These records are transport DTOs carried to that boundary;
 -- downstream code MUST NOT re-validate.
 --
+-- Dial rule: a URL with `\` anywhere, or `@` in its path or fragment, is
+-- refused (its credentials could run into the host) — write `@` as `%40`.
+-- An `@` in the query is allowed, but an error for that URL then withholds
+-- the host.
+--
 -- Request TARGETS are the typed `Ipe.Url.Url`, not a raw `String` — at EVERY
 -- entry point. The one-shot senders `get` / `post` take a `Url`; the primary
 -- constructor `defaultRequest` and the retarget setter `withUrl` take an
@@ -172,7 +177,8 @@ methodToString =
 -- `https`. Any other scheme is a typed `Err` here, at the API layer, so a
 -- builder-constructed request is safe-by-construction EVEN when the runtime
 -- SSRF guard is off in dev. `Url.scheme` reads the already-parsed scheme; no
--- re-parse of a string.
+-- re-parse of a string. The refused scheme is not echoed: `user:password@host`
+-- parses with the user name as its scheme.
 narrowHttpScheme : Url -> Result Error Url
 narrowHttpScheme url =
     case Url.scheme url of
@@ -182,14 +188,8 @@ narrowHttpScheme url =
         "https" ->
             Ok url
 
-        other ->
-            Err
-                (Error.invalidInput
-                    ("Http: blocked: scheme \""
-                        ++ other
-                        ++ "\" is not http/https"
-                    )
-                )
+        _ ->
+            Err (Error.invalidInput "Http: blocked: the URL's scheme is not http/https")
 
 
 -- | The default request timeout applied by `defaultRequest`: 30 seconds,

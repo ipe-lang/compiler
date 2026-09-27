@@ -1,8 +1,6 @@
 # {name}
 
-An Ipê application scaffolded by `ipe init`. `src/Main.ipe` is a small
-[`Ipe.Web`](https://ipe-lang.org) counter — a Model holding a count, `Increment`
-and `Decrement` messages, and a two-button view — that serves its UI over HTTP.
+An Ipê application scaffolded by `ipe init`. `src/Main.ipe` is {description}
 
 Run it:
 
@@ -10,4 +8,4 @@ Run it:
 ipe run
 ```
 
-Then open http://localhost:8000 in a browser and click the buttons.
+{run_hint}

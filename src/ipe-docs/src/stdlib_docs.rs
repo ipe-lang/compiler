@@ -370,7 +370,9 @@ fn declaration_head(line: &str) -> Option<(String, Option<String>)> {
         .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
         .map_or(line.len(), |(i, _)| i);
     let name = &line[..ident_end];
-    if name.is_empty() || is_keyword(name) {
+    // A reserved word at column 0 never heads a value declaration; any other
+    // name (`port`, `where`) is an ordinary value, per the lexer's own table.
+    if name.is_empty() || ipe_parse::is_keyword(name) {
         return None;
     }
     let rest = line[ident_end..].trim_start();
@@ -511,17 +513,27 @@ fn is_section_rule(trimmed: &str) -> bool {
             .all(|c| c == '─' || c == '-' || c == '=' || c.is_whitespace())
 }
 
-/// Reserved words that can appear at column 0 but are not value declarations.
-fn is_keyword(word: &str) -> bool {
-    matches!(
-        word,
-        "module" | "import" | "type" | "port" | "foreign" | "exposing" | "as" | "where"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Non-keyword names such as `port`/`where` are documented values;
+    /// every lexer keyword at column 0 is never a declaration head.
+    #[test]
+    fn declaration_head_uses_the_lexer_keyword_table() {
+        for name in ["port", "where", "alias"] {
+            let line = format!("{name} : Int");
+            assert_eq!(
+                declaration_head(&line).map(|(n, _)| n).as_deref(),
+                Some(name),
+                "{name:?} must head a value declaration"
+            );
+        }
+        for kw in ipe_parse::KEYWORDS {
+            let line = format!("{kw} : Int");
+            assert!(declaration_head(&line).is_none(), "{kw:?} headed a decl");
+        }
+    }
 
     #[test]
     fn line_doc_and_signature_extracted() {

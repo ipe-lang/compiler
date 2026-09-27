@@ -69,14 +69,26 @@ pub fn try_literal_source_spans(src: &str) -> Option<Vec<Span>> {
     )
 }
 
+pub use lexer::{KEYWORDS, is_ident_continue, is_ident_start};
+
 /// Return `true` when `s` is a reserved keyword.
 ///
-/// Delegates to the lexer's own `keyword()` table — the single source of truth
-/// for keyword recognition across crate boundaries. Combine with a charset check
-/// to decide whether a string is a valid parse-position identifier.
+/// Delegates to the lexer's own keyword table ([`KEYWORDS`]) — the single
+/// source of truth for keyword recognition across crate boundaries.
 #[must_use]
 pub fn is_keyword(s: &str) -> bool {
     lexer::keyword(s).is_some()
+}
+
+/// Return `true` when `s` lexes as one plain identifier token.
+///
+/// The shape is `[A-Za-z_][A-Za-z0-9_]*` (ASCII only, per [`is_ident_start`]
+/// and [`is_ident_continue`]) and not a reserved keyword. Case class (value
+/// vs type) is left to the caller.
+#[must_use]
+pub fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue) && !is_keyword(s)
 }
 
 /// Parse a complete module from source text.
@@ -238,6 +250,53 @@ mod tests {
     use ipe_syntax::{Exposed, Exposing, Expr, Expr_, Pattern_, TypeAnnotation, Value};
 
     const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+
+    /// Every published keyword lexes as its keyword token, never an identifier.
+    #[test]
+    fn every_keyword_lexes_as_a_keyword_token() {
+        for kw in KEYWORDS {
+            assert!(is_keyword(kw), "{kw:?} is not recognised by `is_keyword`");
+            let expected = lexer::keyword(kw);
+            let toks = lexer::lex(kw);
+            assert!(toks.is_ok(), "{kw:?} must lex: {toks:?}");
+            let Ok(toks) = toks else { return };
+            assert!(
+                toks.iter().any(|t| expected.as_ref() == Some(&t.kind)),
+                "{kw:?} did not lex to its keyword token: {toks:?}"
+            );
+            assert!(
+                !toks.iter().any(|t| matches!(t.kind, lexer::Tok::Ident(_))),
+                "{kw:?} lexed as an identifier: {toks:?}"
+            );
+        }
+    }
+
+    /// `is_identifier` refuses every keyword, non-ASCII, and malformed shapes.
+    #[test]
+    fn is_identifier_refusals() {
+        for kw in KEYWORDS {
+            assert!(!is_identifier(kw), "keyword {kw:?} accepted as identifier");
+        }
+        for bad in [
+            "",
+            "1x",
+            "a-b",
+            "a.b",
+            "café",
+            "ação",
+            "é",
+            "x y",
+            "\u{ff58}",
+            "a\u{0301}",
+        ] {
+            assert!(!is_identifier(bad), "{bad:?} accepted as identifier");
+        }
+        for good in [
+            "x", "_x", "foo_bar1", "Foo", "alias", "port", "where", "doX",
+        ] {
+            assert!(is_identifier(good), "{good:?} refused as identifier");
+        }
+    }
 
     fn find_value<'a>(m: &'a Module, i: &Interner, name: &str) -> Option<&'a Value> {
         m.values

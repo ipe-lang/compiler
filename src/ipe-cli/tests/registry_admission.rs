@@ -30,15 +30,16 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ipe::index::{self, EntryVersion, IndexEntry, PinnedRev, SourceUrl};
+use ipe::index::{self, EntryVersion, IndexEntry, PinnedRev, Sha256Hex, SourceUrl};
 use ipe::lockfile::Lockfile;
+use ipe::published_version::{PublishedVersion, VersionRefusal};
 use ipe::publisher::{AttestedActor, SelfDeclaredPublisher};
 use ipe::resolve::{self, hash_source_tree};
 
 // ── temp / git helpers ──────────────────────────────────────────────────────
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "ipe-registry-admission-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
@@ -127,10 +128,10 @@ fn write_entry(tag: &str, name: &str, body: &str) -> PathBuf {
 /// parsing — the structural checks operate on already-typed entries).
 fn version(v: &str, source: &str, rev: &str) -> EntryVersion {
     EntryVersion {
-        version: semver::Version::parse(v).expect("valid version"),
+        version: PublishedVersion::parse(v).expect("valid version"),
         source: SourceUrl::parse("pkg", source).expect("valid source"),
         rev: PinnedRev::from_full_sha("pkg", rev).expect("valid rev"),
-        sha256: VALID_SHA.to_owned(),
+        sha256: Sha256Hex::parse("pkg", VALID_SHA).expect("valid digest"),
         capabilities: BTreeSet::new(),
         signature: None,
     }
@@ -169,7 +170,7 @@ fn schema_accepts_a_well_formed_entry() {
     let v = parsed.versions.first().expect("one version");
     assert_eq!(v.version.to_string(), "1.0.0");
     assert_eq!(v.rev.as_str().len(), 40);
-    assert_eq!(v.sha256.len(), 64);
+    assert_eq!(v.sha256.as_str().len(), 64);
 }
 
 #[test]
@@ -297,6 +298,81 @@ fn precheck_accepts_a_faithful_new_version() {
         .expect("a faithful new version passes");
 }
 
+/// Whether `err` is a typed version refusal for package `pkg` that `expected`
+/// accepts.
+fn is_version_refusal(err: &ipe::CliError, expected: fn(&VersionRefusal) -> bool) -> bool {
+    matches!(err, ipe::CliError::VersionRefused { package, refusal }
+        if package == "pkg" && expected(refusal))
+}
+
+const fn not_above_greatest(refusal: &VersionRefusal) -> bool {
+    matches!(refusal, VersionRefusal::NotAboveGreatest { .. })
+}
+
+const fn build_metadata(refusal: &VersionRefusal) -> bool {
+    matches!(refusal, VersionRefusal::BuildMetadata { .. })
+}
+
+#[test]
+fn schema_denies_build_metadata() {
+    // `1.0.0+b` and `1.0.0` share one semver precedence: the suffix would let an
+    // entry name a release twice, so the schema gate refuses it at read time.
+    for raw in ["1.0.0+b", "1.0.0-rc.1+sha.abc"] {
+        let body = format!(
+            "publisher = \"tester\"\n\n[[version]]\nversion = \"{raw}\"\n\
+             source = \"https://example.invalid/pkg\"\nrev = \"{VALID_REV}\"\n\
+             sha256 = \"{VALID_SHA}\"\ncapabilities = []\n"
+        );
+        let path = write_entry("build-metadata", "pkg", &body);
+        let err = index::validate_entry_file(&path).expect_err("build metadata must be denied");
+        assert!(
+            is_version_refusal(&err, build_metadata),
+            "{raw} must be refused for build metadata: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn precheck_denies_a_successor_below_the_greatest_published_version() {
+    // Monotonicity: a new version must exceed EVERY published one, not merely be
+    // absent from the baseline.
+    let src = "https://example.invalid/pkg";
+    let published = vec![
+        version("1.0.0", src, VALID_REV),
+        version("2.0.0", src, VALID_REV),
+    ];
+    let baseline = entry("pkg", published.clone());
+    for below in ["1.5.0", "0.9.0", "2.0.0-rc.1"] {
+        let mut versions = published.clone();
+        versions.push(version(below, src, VALID_REV));
+        let err = index::admission_precheck(&entry("pkg", versions), Some(&baseline), None)
+            .expect_err("a successor below the greatest must be denied");
+        assert!(
+            is_version_refusal(&err, not_above_greatest),
+            "{below} is below 2.0.0: {err:?}"
+        );
+        assert!(format!("{err}").contains("2.0.0"), "{err}");
+    }
+}
+
+#[test]
+fn precheck_accepts_the_greatest_successor_release_or_prerelease() {
+    // A release or a prerelease above every published version is a successor;
+    // the prerelease's exemption from the API bump lives in the audit, not here.
+    let src = "https://example.invalid/pkg";
+    let published = vec![
+        version("1.0.0", src, VALID_REV),
+        version("2.0.0", src, VALID_REV),
+    ];
+    let baseline = entry("pkg", published.clone());
+    for above in ["2.0.1", "3.0.0-rc.1"] {
+        let mut versions = published.clone();
+        versions.push(version(above, src, VALID_REV));
+        index::admission_precheck(&entry("pkg", versions), Some(&baseline), None)
+            .expect("a successor above the greatest passes");
+    }
+}
+
 #[test]
 fn precheck_denies_a_name_squat_via_divergent_source() {
     // The established source is the baseline's; a new version pointing elsewhere is
@@ -403,6 +479,33 @@ fn precheck_allows_a_reserved_blessed_reset_dropping_versions() {
     );
     index::admission_precheck(&submitted, Some(&baseline), Some(&attested(BLESSED)))
         .expect("a reserved + attested-blessed reset drops prior versions");
+}
+
+#[test]
+fn precheck_denies_a_reserved_blessed_reset_going_backwards() {
+    // The reset carve-out licenses dropping history, never regressing it: a
+    // reset to smoke.1 over a published smoke.2 is below the greatest baseline
+    // version and must be refused by the monotonicity check.
+    let src = "https://example.invalid/pkg";
+    let baseline = entry_with_publisher(
+        RESERVED_PROBE,
+        BLESSED,
+        vec![version("0.0.0-smoke.2", src, VALID_REV)],
+    );
+    let submitted = entry_with_publisher(
+        RESERVED_PROBE,
+        BLESSED,
+        vec![version("0.0.0-smoke.1", src, VALID_REV)],
+    );
+    let result = index::admission_precheck(&submitted, Some(&baseline), Some(&attested(BLESSED)));
+    let msg = match &result {
+        Err(err) => format!("{err}"),
+        Ok(()) => String::new(),
+    };
+    assert!(
+        msg.contains("not above the greatest published version 0.0.0-smoke.2"),
+        "a backwards reset must be refused by monotonicity: {result:?}"
+    );
 }
 
 /// The admission workflow's attestation of the authenticated PR author `login`.
@@ -515,7 +618,7 @@ fn precheck_denies_a_reserved_blessed_rewrite() {
 fn ephemeral_index_resolves_and_verifies_a_faithful_entry() {
     let source = fixture_source("e2e-ok");
     let sha = hash_source_tree(&source).expect("hash source");
-    let index = fixture_index("e2e-ok", "http-extras", "1.2.0", &source, &sha);
+    let index = fixture_index("e2e-ok", "http-extras", "1.2.0", &source, sha.as_str());
     let proj = scaffold_project("e2e-ok");
 
     let req = "^1".parse().expect("valid req");
@@ -525,7 +628,7 @@ fn ephemeral_index_resolves_and_verifies_a_faithful_entry() {
     let locked = lock
         .packages()
         .iter()
-        .find(|p| p.name == "http-extras")
+        .find(|p| p.name.as_str() == "http-extras")
         .expect("locked");
     assert_eq!(locked.version.to_string(), "1.2.0");
     assert_eq!(locked.sha256, sha, "the verified tree hash is locked");
@@ -569,7 +672,7 @@ fn ephemeral_index_rejects_a_tampered_tree() {
 /// the sha256 is the real content hash of the committed tree, so the
 /// fetch+integrity leg of `audit-entry` passes and the REJECT lands on the
 /// audit, not on schema or a hash mismatch.
-fn fixture_undeclared_network_package(tag: &str) -> (PathBuf, String) {
+fn fixture_undeclared_network_package(tag: &str) -> (PathBuf, Sha256Hex) {
     let repo = temp_dir(&format!("audit-src-{tag}"));
     std::fs::create_dir_all(repo.join("src")).expect("src dir");
     std::fs::write(
@@ -616,7 +719,13 @@ fn audit_entry_rejects_a_package_that_fails_the_tier1_audit() {
     // A well-formed entry whose sha256 is the source tree's real hash and whose
     // rev is the committed HEAD: schema + fetch + integrity all pass, so the ONLY
     // reachable rejection is the Tier-1 audit.
-    let index = fixture_index("audit-tier1", "leaky-entry-pkg", "1.0.0", &source, &sha);
+    let index = fixture_index(
+        "audit-tier1",
+        "leaky-entry-pkg",
+        "1.0.0",
+        &source,
+        sha.as_str(),
+    );
     let entry_path = index.join("packages").join("leaky-entry-pkg.toml");
 
     let out = Command::new(ipe_bin())
@@ -745,7 +854,7 @@ fn publish_dry_run_computes_a_correct_entry_offline() {
         "the pinned HEAD rev:\n{stdout}"
     );
     assert!(
-        stdout.contains(&expected_sha),
+        stdout.contains(expected_sha.as_str()),
         "the source tree sha256:\n{stdout}"
     );
     assert!(

@@ -24,6 +24,8 @@ use semver::Version;
 
 use crate::CliError;
 use crate::api_surface::{DiffError, ModuleApi, PublicApi, extract_tree};
+use crate::published_version::PublishedVersion;
+use crate::text;
 
 /// Whether a public-API delta breaks existing users.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -545,12 +547,16 @@ fn print_report(report: &SemverReport, format: crate::cli_args::OutputFormat) {
     let required = report.required.as_str();
     match format {
         Plain => {
+            use std::fmt::Write as _;
+
+            let mut out = String::new();
             for change in &report.changes {
                 // The Display form leads with indent + glyph; trim to a
                 // flush-left `<+|-|~> <detail>` record for a clean pipe.
-                println!("change\t{}", change.to_string().trim());
+                let _ = writeln!(out, "change\t{}", change.to_string().trim());
             }
-            println!("bump\t{compat}\t{required}\t{}", report.floor);
+            let _ = writeln!(out, "bump\t{compat}\t{required}\t{}", report.floor);
+            crate::screen::emit_machine(crate::screen::Stream::Stdout, &out);
         }
         Json => {
             let changes: Vec<String> = report
@@ -558,11 +564,14 @@ fn print_report(report: &SemverReport, format: crate::cli_args::OutputFormat) {
                 .iter()
                 .map(|c| format!("{:?}", c.to_string().trim()))
                 .collect();
-            println!(
-                "{{\"compatibility\":{compat:?},\"required\":{required:?},\
-                 \"floor\":{:?},\"changes\":[{}]}}",
-                report.floor.to_string(),
-                changes.join(","),
+            crate::screen::emit_machine(
+                crate::screen::Stream::Stdout,
+                &format!(
+                    "{{\"compatibility\":{compat:?},\"required\":{required:?},\
+                     \"floor\":{:?},\"changes\":[{}]}}\n",
+                    report.floor.to_string(),
+                    changes.join(","),
+                ),
             );
         }
         Human => {
@@ -582,7 +591,9 @@ fn print_report(report: &SemverReport, format: crate::cli_args::OutputFormat) {
                 "\nThis is a {compat} change — it requires at least a {required} bump (>= {}).\n",
                 report.floor,
             );
-            print!("{}", crate::style::gutter(&body));
+            crate::screen::Screen::new(crate::screen::Stream::Stdout)
+                .line(crate::screen::Tone::Text, &body)
+                .emit();
         }
     }
 }
@@ -603,7 +614,9 @@ fn print_report(report: &SemverReport, format: crate::cli_args::OutputFormat) {
 /// malformed version, [`CliError::Diff`] when a tree cannot be read/typechecked,
 /// or [`CliError::SemverRejected`] when the verify mode finds an under-bump.
 pub fn run_diff(rest: &[String]) -> Result<(), CliError> {
-    run_diff_with(rest, &mut |msg| eprintln!("{msg}"))
+    run_diff_with(rest, &mut |msg| {
+        crate::screen::chatter(crate::screen::Stream::Stderr, crate::screen::Tone::Aux, msg);
+    })
 }
 
 /// The stderr notice emitted when the deprecated `--check` alias is used.
@@ -613,8 +626,7 @@ const CHECK_DEPRECATION_NOTICE: &str =
 /// [`run_diff`] with the deprecation-notice sink injected, so a test can observe
 /// the alias notice without inspecting a process's stderr.
 fn run_diff_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<(), CliError> {
-    const USAGE: &str = "usage: ipe diff <old-path> <new-path>\n   \
-         or: ipe diff check <old-path> <new-path> <old-version> <new-version>";
+    let usage = || CliError::Usage(text::diff_usage());
 
     // Peel the deprecated `--check <old-version> <new-version>` alias FIRST, so
     // the shared format parse (which rejects any other unknown `-`-leading flag)
@@ -622,8 +634,8 @@ fn run_diff_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<(), Cl
     let mut check: Option<(String, String)> = None;
     let deflagged: Vec<String> = if let Some(pos) = rest.iter().position(|a| a == "--check") {
         notice(CHECK_DEPRECATION_NOTICE);
-        let old_v = rest.get(pos + 1).ok_or(CliError::Usage(USAGE))?.clone();
-        let new_v = rest.get(pos + 2).ok_or(CliError::Usage(USAGE))?.clone();
+        let old_v = rest.get(pos + 1).ok_or_else(usage)?.clone();
+        let new_v = rest.get(pos + 2).ok_or_else(usage)?.clone();
         check = Some((old_v, new_v));
         rest.iter()
             .enumerate()
@@ -656,16 +668,16 @@ fn run_diff_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<(), Cl
     // the two package paths.
     if verify_mode {
         if check.is_some() {
-            return Err(CliError::Usage(USAGE));
+            return Err(usage());
         }
         let [old_path, new_path, old_v, new_v] = positional.as_slice() else {
-            return Err(CliError::Usage(USAGE));
+            return Err(usage());
         };
         check = Some(((*old_v).to_owned(), (*new_v).to_owned()));
         positional = vec![old_path, new_path];
     }
     let [old_path, new_path] = positional.as_slice() else {
-        return Err(CliError::Usage(USAGE));
+        return Err(usage());
     };
     let old_tree = PathBuf::from(old_path);
     let new_tree = PathBuf::from(new_path);
@@ -744,7 +756,12 @@ impl ReportBaseline {
     }
 }
 
-/// Parse a semver version argument, mapping a malformed value to a usage error.
+/// Parse a `check` version argument as a publishable version.
+///
+/// A malformed value or one carrying build metadata is a usage error: the index
+/// would refuse that version at publish, so no bump verdict is issued for it.
 fn parse_version(raw: &str) -> Result<Version, CliError> {
-    Version::parse(raw).map_err(|_| CliError::UsageOwned(format!("diff: invalid version `{raw}`")))
+    PublishedVersion::parse(raw)
+        .map(|version| version.as_semver().clone())
+        .map_err(|refusal| CliError::UsageOwned(text::diff_invalid_version(&refusal)))
 }

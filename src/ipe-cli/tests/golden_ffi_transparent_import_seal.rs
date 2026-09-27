@@ -169,7 +169,8 @@ fn transparent_import_emits_the_conversion_seam() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_transparent_import");
+    let tmp =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_transparent_import");
     assert!(
         write_project(&tmp),
         "must write the fixture project + FFI cache"
@@ -235,7 +236,8 @@ fn transparent_import_emitted_crate_builds_and_runs() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_transparent_import_e2e");
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("ipec_ffi_transparent_import_e2e");
     assert!(
         write_project(&tmp),
         "must write the fixture project + FFI cache"

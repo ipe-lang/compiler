@@ -9,9 +9,10 @@ is a `Secret` with no accessor, so a descriptor cannot leak a credential.
 
 Three knots.
 
-- **`parse` and `build` are the only seals, and they run the same validators.**
+- **`parse` and `build` are the only seals, and they enforce the same invariants.**
   You obtain a `Dsn` from a full URL string (`Dsn.parse`) or from typed parts
-  (`Dsn.build`); both run the identical fail-closed checks in the runtime. An
+  (`Dsn.build`); both apply the same fail-closed rules in the runtime, `parse` to
+  URL text and `build` to literal parts. An
   unknown driver, an out-of-range port, an explicit `sslmode=disable`, a smuggled
   duplicate credential, or a control character is a typed `Err`, never a
   silently-accepted descriptor. A `Dsn` in hand is a proof, not a hope.

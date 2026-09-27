@@ -58,7 +58,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -163,7 +163,7 @@ fn http_response_fields() {
 fn http_default_request_emits_without_signature_consumer() {
     let root = repo_root();
     let entry = golden_dir(&root, "http_response_fields").join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_m5b_http_default_request_no_sig_emit");
+    let out = crate::support::scratch_root().join("ipec_m5b_http_default_request_no_sig_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

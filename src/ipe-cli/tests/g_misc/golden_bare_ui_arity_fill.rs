@@ -79,13 +79,13 @@ main =
 "#;
 
 fn html_app_out_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("bare_ui_{tag}_app_out"))
+    crate::support::scratch_root().join(format!("bare_ui_{tag}_app_out"))
 }
 
 /// Compile a fixture into its own out dir; `None` (skip) when the runtime
 /// cannot be resolved.
 fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Option<Result<(), ipe::CliError>> {
-    let ipe_dir = std::env::temp_dir().join(format!("bare_ui_{tag}_ipe"));
+    let ipe_dir = crate::support::scratch_root().join(format!("bare_ui_{tag}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(&ipe_dir).ok()?;
     let entry = ipe_dir.join("Main.ipe");
@@ -169,7 +169,7 @@ fn bare_html_view_emits_concrete_msg() {
 /// constructor, not just `Html`.
 #[test]
 fn bare_attribute_and_element_arity_fill() {
-    let out = std::env::temp_dir().join("bare_ui_attr_out");
+    let out = crate::support::scratch_root().join("bare_ui_attr_out");
     let Some(result) = compile(BARE_ATTRIBUTE_HELPER, "attr", &out) else {
         return;
     };

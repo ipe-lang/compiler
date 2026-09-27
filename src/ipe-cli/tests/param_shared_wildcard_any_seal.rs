@@ -23,7 +23,7 @@ fn runtime() -> PathBuf {
 
 #[allow(clippy::expect_used)]
 fn write_entry(test_name: &str, main_ipe: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ipe_param_any_seal_{test_name}"));
+    let dir = crate::support::scratch_root().join(format!("ipe_param_any_seal_{test_name}"));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create source dir");
     let entry = dir.join("Main.ipe");

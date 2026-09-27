@@ -32,7 +32,7 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
 fn rejection_code(golden: &str) -> Option<ipe_diagnostics::Code> {
     let root = repo_root();
     let entry = fixture_entry(&root, golden);
-    let out = std::env::temp_dir().join(format!("ipec_{golden}"));
+    let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime().ok()?;
@@ -47,7 +47,7 @@ fn rejection_code(golden: &str) -> Option<ipe_diagnostics::Code> {
 fn rejection_diagnostic(golden: &str) -> Option<Box<Diagnostic>> {
     let root = repo_root();
     let entry = fixture_entry(&root, golden);
-    let out = std::env::temp_dir().join(format!("ipec_{golden}"));
+    let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime().ok()?;

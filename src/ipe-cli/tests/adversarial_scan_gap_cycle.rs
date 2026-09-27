@@ -26,7 +26,8 @@ fn scan_invisible_cycle_must_not_panic_the_driver() {
         return;
     };
 
-    let tmp = std::env::temp_dir().join("ipec_review_scan_gap_cycle");
+    let tmp =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_review_scan_gap_cycle");
     let src = tmp.join("src");
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&src).expect("create src dir");

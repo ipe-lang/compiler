@@ -17,13 +17,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Compile `source` through `ipe::build`, returning the pipeline result. The
 /// emitted project is written to a per-test temp dir; `cargo` is never invoked.
 fn compile(test_name: &str, source: &str) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::env::temp_dir().join(format!("model_adm_{test_name}_ipe"));
+    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("model_adm_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(&ipe_dir)?;
     let entry = ipe_dir.join("Main.ipe");
     std::fs::write(&entry, source)?;
 
-    let out_dir = std::env::temp_dir().join(format!("model_adm_{test_name}_out"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
@@ -57,7 +59,8 @@ fn compile_with_widget_file(
     test_name: &str,
     source: &str,
 ) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::env::temp_dir().join(format!("model_adm_{test_name}_ipe"));
+    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("model_adm_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(ipe_dir.join("js"))?;
     std::fs::write(
@@ -67,7 +70,8 @@ fn compile_with_widget_file(
     let entry = ipe_dir.join("Main.ipe");
     std::fs::write(&entry, source)?;
 
-    let out_dir = std::env::temp_dir().join(format!("model_adm_{test_name}_out"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;

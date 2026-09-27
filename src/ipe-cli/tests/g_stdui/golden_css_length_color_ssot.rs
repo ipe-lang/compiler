@@ -82,7 +82,7 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
 
     let dir = golden_dir();
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_css_length_color_ssot_e2e");
+    let out = crate::support::scratch_root().join("ipec_css_length_color_ssot_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();

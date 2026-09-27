@@ -54,12 +54,12 @@ ipe release [<path>] [<shape>] [<runtime>] [<host>]
 **Flags:**
 
 - `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
-- `[--target wasm|<triple>]` — produce a browser bundle (`wasm`) or a musl-static binary for <triple> (default: x86_64-unknown-linux-musl)
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
 - `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 - `[--bundle]` — native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
 - `[--embed]` — native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
-- `[--capabilities] [--plain|--json]` — print the inferred capability model for the app without building
+- `[--capabilities|--show-profile] [--plain|--json]` — print the inferred capability model for the app without building
 
 ### `ipe exec`
 
@@ -198,7 +198,7 @@ Look up documentation, generate API docs (docs.json + Markdown + HTML), query th
 ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 ```
 
-**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), language construct (case), or CLI command (version). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
+**Arguments:** Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), or CLI command (version); a key that names nothing lists the closest matches of every kind. `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
 
 **Flags:**
 
@@ -301,7 +301,7 @@ ipe fix <path>
 
 **Flags:**
 
-- `[--yes]` — apply every fix without per-edit confirmation
+- `[--yes|-y]` — apply every fix without per-edit confirmation
 
 ### `ipe eject`
 
@@ -374,10 +374,9 @@ ipe build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 - `[--fix]` — apply machine-applicable fixes before building
 - `[--accept-risks]` — accept every disclosed .Unsafe escape-hatch import and proceed without prompting
 - `[--static]` — produce a statically linked binary
-- `[--target <triple|wasm|wasi>]` — cross-compile to <triple>, the browser (`wasm`), or co-located WebAssembly/WASI (`wasi`, a wasm32-wasip1 module for a Direct script)
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
-- `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto)
-- `[--allow-slow-allocator]` — permit an allocator known to be slow for the target
+- `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the built app
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
@@ -398,9 +397,8 @@ ipe run [<path>]
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary
-- `[--target <triple>]` — cross-compile to <triple>
-- `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto)
-- `[--allow-slow-allocator]` — permit an allocator known to be slow for the target
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
+- `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--accept-risks]` — accept every disclosed .Unsafe escape-hatch import and proceed without prompting
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the run app

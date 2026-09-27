@@ -29,7 +29,7 @@ fn draft_query_without_classification_is_rejected() {
     const GOLDEN: &str = "db_store_draft_query_rejected";
     let root = repo_root();
     let entry = fixture_entry(&root, GOLDEN);
-    let out = std::env::temp_dir().join("ipec_db_store_draft_query_rejected");
+    let out = crate::support::scratch_root().join("ipec_db_store_draft_query_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

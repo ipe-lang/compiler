@@ -111,7 +111,8 @@ fn plist_of(layout: &desktop::BundleLayout) -> String {
 #[cfg(unix)]
 #[test]
 fn materialise_refuses_planted_symlinks() {
-    let dir = std::env::temp_dir().join(format!("pack_desktop_symlink_{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pack_desktop_symlink_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let victim = dir.join("victim");
     std::fs::create_dir_all(&victim).expect("victim dir");
@@ -168,7 +169,7 @@ fn linux_bundle_is_materialised_end_to_end() {
         return;
     }
 
-    let dir = std::env::temp_dir().join("pack_desktop_linux_e2e");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pack_desktop_linux_e2e");
     let _ = std::fs::remove_dir_all(&dir);
     let src = dir.join("src");
     std::fs::create_dir_all(&src).expect("create project src dir");

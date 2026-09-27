@@ -170,6 +170,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 subtle = "2"
 zeroize = "1"
+# Pinned exact to match `src/runtime/rust/Cargo.toml`'s own `wasm-bindgen` pin
+# (the canonical spelling — see the `wasm_bindgen_version_matches_the_runtime_pin`
+# test below, which fails the build the instant this drifts from it).
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -764,7 +767,7 @@ const RUNTIME_MOD_RS_HTTP_CLIENT_APPEND: &str = "pub mod http_client;\npub use h
 ///
 /// `ssrf.rs` parses URLs with the `url` crate (unconditional base dep) and is
 /// reqwest-free. Its validators are consumed by the `http_client`, `ws_client`,
-/// and `db` modules (the latter calls `VettedDial::for_host` in `build_pool` and
+/// and `db` modules (the latter calls `VettedDial` in `VettedPool::connect` and
 /// `external_conn.rs` uses it unconditionally).
 ///
 /// Declared `pub` so that in the vendored emit model — where all runtime modules
@@ -2468,7 +2471,7 @@ const MOD_APPENDS: &[ModAppend] = &[
         append: RUNTIME_MOD_RS_HTTP_STREAM_APPEND,
     },
     ModAppend {
-        gate: |ctx| ctx.reaches_http_client() || ctx.uses_websocket || ctx.uses_db,
+        gate: |ctx| ctx.reaches_ssrf(),
         append: RUNTIME_MOD_RS_SSRF_APPEND,
     },
     // `db_dsn` after `ssrf`/`url` (`external_conn.rs` reaches both).
@@ -3098,6 +3101,16 @@ fn assemble_project_files(
         || ctx.uses_webview
     {
         tea_cargo_toml(&cargo_toml)?
+    } else {
+        cargo_toml
+    };
+    // SSRF gate: `ssrf.rs` resolves hosts through `tokio::net::lookup_host`, so
+    // the crate that declares the module (the same `reaches_ssrf` gate as its
+    // `mod.rs` append) declares tokio's `"net"` feature itself rather than
+    // relying on a transport crate to enable it. Runs after every step that
+    // anchors on an exact `tokio` line, so none of their anchors sees this edit.
+    let cargo_toml = if ctx.reaches_ssrf() {
+        ssrf_cargo_toml(&cargo_toml)?
     } else {
         cargo_toml
     };
@@ -3872,6 +3885,54 @@ fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
     result.push_str(&sqlx_line);
     result.push_str(step1.get(anchor_pos..).unwrap_or(""));
     Ok(result)
+}
+
+/// Add tokio's `"net"` feature to the manifest's `tokio` dependency line.
+///
+/// The `ssrf` runtime module resolves hosts through `tokio::net::lookup_host`.
+/// Idempotent: a line that already lists `"net"` (the server or live surface
+/// added it) is returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the manifest has no `tokio`
+/// dependency line with a feature list — a golden-drift invariant violation.
+fn ssrf_cargo_toml(base: &str) -> DResult<String> {
+    const NET: &str = "\"net\"";
+    let tokio_prefix = format!(
+        "{} = {{ version = \"{}\", features = [",
+        crate_specs::TOKIO.name,
+        crate_specs::TOKIO.version,
+    );
+    let bug = || Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::project::ssrf_cargo_toml",
+        detail: format!(
+            "Cargo.toml anchor {tokio_prefix:?} not found — golden drifted; the ssrf \
+             runtime module requires tokio \"net\""
+        ),
+    };
+    let list_start = base
+        .find(&tokio_prefix)
+        .map(|at| at + tokio_prefix.len())
+        .ok_or_else(bug)?;
+    let list_end = base
+        .get(list_start..)
+        .and_then(|rest| rest.find(']'))
+        .map(|len| list_start + len)
+        .ok_or_else(bug)?;
+    if base
+        .get(list_start..list_end)
+        .ok_or_else(bug)?
+        .contains(NET)
+    {
+        return Ok(base.to_owned());
+    }
+    let mut out = String::with_capacity(base.len() + NET.len() + 2);
+    out.push_str(base.get(..list_end).ok_or_else(bug)?);
+    out.push_str(", ");
+    out.push_str(NET);
+    out.push_str(base.get(list_end..).ok_or_else(bug)?);
+    Ok(out)
 }
 
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
@@ -5590,8 +5651,8 @@ mod tests {
         WASM_ABSENT_MODULE_PATHS, WASM_CARGO_TOML, WASM_PRESENT_OVERRIDES,
         async_runtime_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
         insert_wasi_linker_config, jwt_cargo_toml, runtime_bindings, server_cargo_toml,
-        shake_ffi_by_fn_ident, wasm_present_modules, wasm_runtime_bindings, web_cargo_toml,
-        wrapper_call_paths,
+        shake_ffi_by_fn_ident, ssrf_cargo_toml, wasm_present_modules, wasm_runtime_bindings,
+        web_cargo_toml, wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -5636,6 +5697,94 @@ mod tests {
                  (efficiency knob; drop it and the guard fails)"
             );
         }
+    }
+
+    /// The `tokio = { … }` dependency line of `manifest`.
+    fn tokio_line(manifest: &str) -> Option<&str> {
+        let prefix = format!("{} = {{", crate_specs::TOKIO.name);
+        manifest.lines().find(|l| l.starts_with(&prefix))
+    }
+
+    /// The quoted value immediately after the first occurrence of `anchor` in
+    /// `haystack`.
+    ///
+    /// Strips a leading `=` pin marker so an exact-pinned `"=X.Y.Z"` and a bare
+    /// `"X.Y.Z"` compare equal. `None` when `anchor` never opens a quoted value.
+    fn pinned_dependency_version<'a>(haystack: &'a str, anchor: &str) -> Option<&'a str> {
+        let (_, after_anchor) = haystack.split_once(anchor)?;
+        let (version, _) = after_anchor.split_once('"')?;
+        Some(version.trim_start_matches('='))
+    }
+
+    /// SSOT guard: the `wasm-bindgen` version is hand-spelled in four places.
+    ///
+    /// None of them can `include!`/import a Cargo dependency version from
+    /// another — two are real `Cargo.toml` dependency tables Cargo itself
+    /// parses at a different time than this compiler builds, and the CLI's
+    /// copy is a string literal in a separate crate's binary.
+    /// `src/runtime/rust/Cargo.toml` is the canonical spelling (the one pin
+    /// Cargo enforces for the runtime crate itself); this test fails the
+    /// instant any of the other three drifts from it.
+    #[test]
+    fn wasm_bindgen_version_matches_the_runtime_pin() {
+        const RUNTIME_CARGO_TOML: &str = include_str!("../../../../../src/runtime/rust/Cargo.toml");
+        const CLI_COMMANDS_RS: &str = include_str!("../../../../ipe-cli/src/driver/commands.rs");
+
+        let runtime_pin =
+            pinned_dependency_version(RUNTIME_CARGO_TOML, "wasm-bindgen = { version = \"")
+                .expect("src/runtime/rust/Cargo.toml must pin an exact wasm-bindgen version");
+        let dep_template_pin = pinned_dependency_version(CARGO_WASM_DEP_TOML, "wasm-bindgen = \"")
+            .expect("templates/Cargo.wasm-dep.toml must pin an exact wasm-bindgen version");
+        let monolithic_pin = pinned_dependency_version(WASM_CARGO_TOML, "wasm-bindgen = \"")
+            .expect("project.rs's WASM_CARGO_TOML must pin an exact wasm-bindgen version");
+        let cli_pin = pinned_dependency_version(CLI_COMMANDS_RS, "WASM_BINDGEN_VERSION: &str = \"")
+            .expect("ipe-cli must declare a WASM_BINDGEN_VERSION constant");
+
+        assert_eq!(
+            dep_template_pin, runtime_pin,
+            "templates/Cargo.wasm-dep.toml's wasm-bindgen pin has drifted from \
+             src/runtime/rust/Cargo.toml's"
+        );
+        assert_eq!(
+            monolithic_pin, runtime_pin,
+            "project.rs's WASM_CARGO_TOML wasm-bindgen pin has drifted from \
+             src/runtime/rust/Cargo.toml's"
+        );
+        assert_eq!(
+            cli_pin, runtime_pin,
+            "ipe-cli's WASM_BINDGEN_VERSION has drifted from \
+             src/runtime/rust/Cargo.toml's wasm-bindgen pin"
+        );
+    }
+
+    /// `ssrf_cargo_toml` adds tokio `"net"` to a line lacking it (the db-only
+    /// manifest), leaves a line that has it unchanged, and refuses a manifest
+    /// with no `tokio` line rather than silently shipping one without it.
+    #[test]
+    fn ssrf_toml_declares_tokio_net_exactly_once() {
+        let db = db_cargo_toml(
+            &async_runtime_cargo_toml(CARGO_TOML).expect("async base"),
+            DbDriver::Sqlite,
+        )
+        .expect("db manifest");
+        assert!(
+            tokio_line(&db).is_some_and(|l| !l.contains(r#""net""#)),
+            "the db-only base line must lack \"net\" for this test to bite: {db}"
+        );
+        let with_net = ssrf_cargo_toml(&db).expect("ssrf manifest");
+        let line = tokio_line(&with_net).unwrap_or_default();
+        assert_eq!(line.matches(r#""net""#).count(), 1, "{line}");
+        assert_eq!(
+            ssrf_cargo_toml(&with_net).expect("idempotent"),
+            with_net,
+            "a line already listing \"net\" must be unchanged"
+        );
+        let server = server_cargo_toml(&db).expect("server manifest");
+        assert_eq!(ssrf_cargo_toml(&server).expect("server + ssrf"), server);
+        assert!(
+            ssrf_cargo_toml(CARGO_TOML).is_err(),
+            "a manifest with no tokio line must be refused"
+        );
     }
 
     /// Helper: extract the `default = [...]` line from a manifest string.

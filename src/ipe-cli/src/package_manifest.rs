@@ -62,6 +62,7 @@ use crate::project::{
     MobileDelivery, Program, ProjectManifest, RustDep, ScreenOrientation, WasmConfig,
     is_denylisted_public_env_name,
 };
+use crate::text;
 
 /// The manifest filename read by this reader.
 pub const PACKAGE_IPE: &str = "package.ipe";
@@ -152,7 +153,6 @@ struct ManifestFields {
     static_build: Option<bool>,
     target: Option<String>,
     allocator: Option<crate::build_plan::AllocatorChoice>,
-    allow_slow_allocator: Option<bool>,
     c_free: Option<bool>,
     dependencies: BTreeMap<String, IpeDep>,
     rust_dependencies: BTreeMap<String, RustDep>,
@@ -171,9 +171,9 @@ impl ManifestFields {
     /// two remaining whole-manifest validations: `name` is required, and the
     /// source-root directory must exist.
     fn into_manifest(self, root: &Path) -> Result<ProjectManifest, CliError> {
-        let name = self.name.ok_or(CliError::Usage(
-            "package.ipe: missing a `name = \"…\"` field — a package must be named",
-        ))?;
+        let name = self
+            .name
+            .ok_or(CliError::Usage(text::package_manifest_name_required()))?;
         let src_rel_raw = self.src_rel.as_deref().unwrap_or("src");
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
@@ -182,9 +182,7 @@ impl ManifestFields {
             })?;
         let src_root = src_root_contained.resolved().to_path_buf();
         if !src_root.is_dir() {
-            return Err(CliError::Usage(
-                "package.ipe: the source root directory does not exist",
-            ));
+            return Err(CliError::Usage(text::package_manifest_src_root_missing()));
         }
         // The icon is an optional project-relative path resolved (and contained)
         // at parse time, so a packager consumes a validated path and can never be
@@ -212,7 +210,6 @@ impl ManifestFields {
                 static_build: self.static_build,
                 target: self.target,
                 allocator: self.allocator,
-                allow_slow_allocator: self.allow_slow_allocator,
                 c_free: self.c_free,
             },
             wasm: self.wasm,
@@ -244,9 +241,11 @@ impl Reader<'_> {
     /// panicking (totality).
     fn reject(&self, span: Span, reason: &str) -> CliError {
         let (line, col) = line_col(self.src, span.lo);
-        CliError::UsageOwned(format!(
-            "{}:{line}:{col}: {reason}",
-            self.manifest_path.display()
+        CliError::UsageOwned(text::located_refusal(
+            &self.manifest_path.display(),
+            &line,
+            &col,
+            &reason,
         ))
     }
 
@@ -303,9 +302,8 @@ impl Reader<'_> {
             }
         }
 
-        let package = package_value.ok_or(CliError::Usage(
-            "package.ipe: no top-level `package = …` binding found",
-        ))?;
+        let package =
+            package_value.ok_or(CliError::Usage(text::package_manifest_no_package_binding()))?;
         if !package.value.patterns.is_empty() {
             return Err(self.reject(
                 package.value.name.span,
@@ -410,16 +408,13 @@ impl Reader<'_> {
                 "static" => fields.static_build = Some(self.expect_bool(value)?),
                 "target" => fields.target = self.read_target(value)?,
                 "allocator" => fields.allocator = Some(self.read_allocator(value)?),
-                "allowSlowAllocator" => {
-                    fields.allow_slow_allocator = Some(self.expect_bool(value)?);
-                }
                 "cFree" => fields.c_free = Some(self.expect_bool(value)?),
                 other => {
                     return Err(self.reject(
                         fname.span,
                         &format!(
                             "`{other}` is not a build field — expected one of database, static, \
-                             target, allocator, allowSlowAllocator, cFree"
+                             target, allocator, cFree"
                         ),
                     ));
                 }
@@ -1668,9 +1663,6 @@ fn render_build(manifest: &ProjectManifest) -> Option<String> {
     if let Some(alloc) = static_layer.allocator {
         parts.push(format!("allocator = {}", allocator_ctor_name(alloc)));
     }
-    if let Some(b) = static_layer.allow_slow_allocator {
-        parts.push(format!("allowSlowAllocator = {}", bool_ctor(b)));
-    }
     if let Some(b) = static_layer.c_free {
         parts.push(format!("cFree = {}", bool_ctor(b)));
     }
@@ -1824,9 +1816,7 @@ fn edit_dependencies_list(
     };
 
     let Expr_::List(items) = &deps_expr.value else {
-        return Err(usage(
-            "package.ipe: `dependencies` must be a list literal `[ … ]` for `ipe add` to edit it",
-        ));
+        return Err(usage(text::package_manifest_deps_not_list()));
     };
 
     let existing = locate_dep_entry(items, &interner, name);
@@ -1835,12 +1825,7 @@ fn edit_dependencies_list(
         // `dep "…" "…"`; an escape is author-owned and never overwritten.
         (Some(entry), Some(found)) => {
             if found.is_escape() {
-                return Err(usage_owned(format!(
-                    "package.ipe: `{name}` is already a git/path escape dependency — `ipe add` \
-                     records only an index requirement and never rewrites an author-written \
-                     `depGit`/`depGitRev`/`depPath` entry. Edit the escape by hand, or remove it \
-                     first."
-                )));
+                return Err(usage_owned(text::pkg_add_escape_dependency(&name)));
             }
             Ok(splice(text, found.entry, entry))
         }
@@ -1865,13 +1850,10 @@ fn locate_package_record<'m>(
         .values
         .iter()
         .find(|v| interner.resolve(v.value.name.value) == Some("package"))
-        .ok_or_else(|| usage("package.ipe: no top-level `package = …` binding to edit"))?;
+        .ok_or_else(|| usage(text::package_manifest_no_package_binding_edit()))?;
     match &package.value.body.value {
         Expr_::Record(fields) => Ok(fields.as_slice()),
-        _ => Err(usage(
-            "package.ipe: the `package` value must be a record literal `{ … }` for `ipe add` to \
-             edit it",
-        )),
+        _ => Err(usage(text::package_manifest_package_not_record())),
     }
 }
 
@@ -2029,15 +2011,11 @@ fn insert_new_dependencies_field(
         .map_or(0, |(_, v)| v.span.hi as usize)
         .min(text.len());
     let Some(rel_close) = text.get(after_last..).and_then(|s| s.find('}')) else {
-        return Err(usage(
-            "package.ipe: could not locate the `package` record's closing `}` to add a dependency",
-        ));
+        return Err(usage(text::package_manifest_deps_brace_not_found()));
     };
     let close_idx = after_last + rel_close;
     let (Some(before), Some(after)) = (text.get(..close_idx), text.get(close_idx..)) else {
-        return Err(usage(
-            "package.ipe: the `package` record's closing `}` is out of range",
-        ));
+        return Err(usage(text::package_manifest_deps_brace_out_of_range()));
     };
     // Align the new field to the last field's indentation. Elm-style manifests
     // indent record fields and the closing brace to a common column; reuse the
@@ -2174,7 +2152,6 @@ mod tests {
              \x20       , static = True\n\
              \x20       , target = Cross \"x86_64-unknown-linux-musl\"\n\
              \x20       , allocator = Dlmalloc\n\
-             \x20       , allowSlowAllocator = False\n\
              \x20       , cFree = True\n\
              \x20       }}\n\
              \x20   }}\n"
@@ -2220,7 +2197,6 @@ mod tests {
             m.static_request.allocator,
             Some(crate::build_plan::AllocatorChoice::Dlmalloc)
         );
-        assert_eq!(m.static_request.allow_slow_allocator, Some(false));
         assert_eq!(m.static_request.c_free, Some(true));
 
         let cap_names: Vec<&str> = m.capabilities.iter().map(|c| c.as_str()).collect();
@@ -2639,6 +2615,18 @@ mod tests {
         let r = read(
             "reject_exposed_lower",
             &format!("{HEADER}package =\n    {{ name = \"x\", exposedModules = [ \"core\" ] }}\n"),
+        );
+        assert_rejected(&r);
+    }
+
+    /// A build field outside the closed set is refused, never ignored.
+    #[test]
+    fn reject_unknown_build_field() {
+        let r = read(
+            "reject_build_field",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", build = {{ allowSlowAllocator = True }} }}\n"
+            ),
         );
         assert_rejected(&r);
     }

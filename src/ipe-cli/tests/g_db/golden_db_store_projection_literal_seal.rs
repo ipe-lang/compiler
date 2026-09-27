@@ -28,7 +28,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn db_store_projection_literal_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_db_store_projection_literal_seal_emit");
+    let out = crate::support::scratch_root().join("ipec_db_store_projection_literal_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -49,7 +49,7 @@ fn db_store_projection_literal_emits() {
 fn db_store_projection_literal_seal_builds() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_db_store_projection_literal_seal_e2e");
+    let out = crate::support::scratch_root().join("ipec_db_store_projection_literal_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

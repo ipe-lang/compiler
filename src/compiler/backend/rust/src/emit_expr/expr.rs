@@ -7,9 +7,8 @@ use super::{
     emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template, emit_update,
-    expr_value_is_non_clone, float_literal, free_vars, indent_of, ir_type_is_definitely_copy,
-    op_str, render_type, rust_string_literal, scan_free_target, substitute_var,
-    swapped_container_clone_rewrite,
+    float_literal, free_vars, indent_of, inlined_let_body, ir_type_is_definitely_copy, op_str,
+    render_type, rust_string_literal, swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
 
@@ -164,14 +163,11 @@ pub fn emit_expr_at(
             // keep the let form so the compiler can share the computation.
             //
             // AUD-04: the multi-use count and the inline substitution both
-            // operate on the IR (`scan_free_target` / `substitute_var`), not on
+            // operate on the IR (`ipe_ir::let_inline::inlined_let_body`), not on
             // rendered Rust text — see those functions' doc comments for why
             // the old text-level passes could corrupt a string literal or a
             // record field name that happened to spell the same identifier.
-            let (occurrences, has_clonevar) = scan_free_target(body, *name);
-            let needs_inline = occurrences > 1 && expr_value_is_non_clone(value) && !has_clonevar;
-            if needs_inline {
-                let inlined_body = substitute_var((**body).clone(), *name, value);
+            if let Some(inlined_body) = inlined_let_body(*name, value, body) {
                 let inlined_s = emit_expr_at(ctx, &inlined_body, indent, child, generics)?;
                 Ok(format!("({{ {inlined_s} }})"))
             } else {
@@ -658,15 +654,31 @@ pub fn emit_expr_at(
             // (e.g. `view` and `update` both read `model.someField`).  The
             // audit's second half — last-use analysis to elide the clone on a
             // heap field's FINAL read — is explicitly deferred (spec §3.5).
+            //
+            // A field embedding a `Task` / `Cmd` / `Sub` effect carrier has no
+            // `Clone` impl, so its read is a MOVE out of the base. The lowerer's
+            // `IPE-L0135` gate admits it only where the move is linear (no later
+            // read of that field or of the whole base) and refuses it on a
+            // row-generic base, whose witness getter only borrows.
+            let moves = ipe_ir::ir_type_has_effect_carrier(field_ty);
             let base = emit_expr_at(ctx, record, indent, child, generics)?;
             // A field read on a row-generic parameter cannot name a struct field
             // (the concrete struct is unknown at emit time): it routes through the
             // field's witness getter `ipe_<field>()`, which rustc resolves to the
-            // monomorphised struct's field. Any other base keeps the ordinary
-            // struct-field read.
-            if let Expr::Var(sym) = record.as_ref()
+            // monomorphised struct's field. A cloned row receiver (`CloneVar`,
+            // from a deferred capture) routes the same way on the clone. Any
+            // other base keeps the ordinary struct-field read.
+            if let Expr::Var(sym) | Expr::CloneVar(sym) = record.as_ref()
                 && generics.is_row(*sym)
             {
+                if moves {
+                    return Err(Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::emit_expr_at",
+                        detail: "a move-only effect-carrier field read reached a borrowing \
+                                 row-generic witness getter"
+                            .to_string(),
+                    });
+                }
                 let getter = crate::naming::field_witness_getter_name(ctx.resolve_ident(*field)?);
                 if ir_type_is_definitely_copy(field_ty) {
                     // The getter borrows; a `Copy` field is copied out by deref.
@@ -675,7 +687,7 @@ pub fn emit_expr_at(
                 return Ok(format!("({base}).{getter}().clone()"));
             }
             let field = ctx.emit_ident(*field)?;
-            if ir_type_is_definitely_copy(field_ty) {
+            if moves || ir_type_is_definitely_copy(field_ty) {
                 Ok(format!("({base}).{field}"))
             } else {
                 Ok(format!("({base}).{field}.clone()"))

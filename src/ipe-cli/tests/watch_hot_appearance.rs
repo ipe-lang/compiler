@@ -391,7 +391,7 @@ fn web_fixture_grid(cols: &str, rows: &str) -> String {
 const E2E_HOT_SWAP_BUDGET: Duration = Duration::from_secs(90);
 
 fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
-    let base = std::env::temp_dir().join(format!(
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "watch_hot_{tag}_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()

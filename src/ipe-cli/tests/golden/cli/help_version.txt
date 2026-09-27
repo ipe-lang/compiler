@@ -1,6 +1,7 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Print the ipe version.
 
   ipe version
@@ -8,4 +9,3 @@ exit: 0
   Options:
     [--plain]  print the bare version string, flush-left
     [--json]   print the version as a stable JSON envelope for jq
-

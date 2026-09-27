@@ -40,8 +40,12 @@ impl AspectCheck<CompilerCrate> for TestedColumn {
 
 // ── no-panic ──────────────────────────────────────────────────────────────────
 
-/// Column **no-panic**: no `unwrap()`, `expect(`, `panic!(`, or `.index(` in
-/// production source (outside `#[cfg(test)]` / `mod tests { … }` blocks).
+/// Column **no-panic**: no `unwrap()`, `expect(`, `panic!(`, or `.index(` in production source.
+///
+/// Production source excludes inline `#[cfg(test)]` / `mod tests { … }` blocks
+/// and the out-of-line test modules [`panic_scan::is_verified_test_path`]
+/// confirms (a `tests/` directory or `tests.rs` declared `#[cfg(test)] mod
+/// tests;`); an unconfirmed test module stays in scope.
 ///
 /// Panics in production code violate the soundness principle: a well-typed Ipê
 /// program must never trigger a runtime failure in the generated Rust, and the
@@ -56,10 +60,22 @@ impl AspectCheck<CompilerCrate> for NoPanicColumn {
     fn check(&self, item: &CompilerCrate) -> Cell {
         let files = rust_files(&item.src_path);
         let mut violations: Vec<String> = Vec::new();
+        // An unread file is unaudited, not clean: it holes the crate.
+        let mut unreadable: Vec<String> = Vec::new();
 
         for path in &files {
-            let Ok(src) = std::fs::read_to_string(path) else {
+            let is_test_module = path
+                .strip_prefix(item.src_path.as_path())
+                .is_ok_and(|rel| panic_scan::is_verified_test_path(&item.src_path, rel));
+            if is_test_module {
                 continue;
+            }
+            let src = match std::fs::read_to_string(path) {
+                Ok(src) => src,
+                Err(error) => {
+                    unreadable.push(format!("{} ({error})", path.display()));
+                    continue;
+                }
             };
             let prod = prod_source(&src);
             if has_prod_panic(&prod) {
@@ -68,6 +84,14 @@ impl AspectCheck<CompilerCrate> for NoPanicColumn {
             }
         }
 
+        if !unreadable.is_empty() {
+            return Cell::Hole(format!(
+                "`{}` cannot be audited for panic-prone patterns: unreadable \
+                 production source: {}",
+                item.name,
+                unreadable.join(", ")
+            ));
+        }
         if violations.is_empty() {
             Cell::Ok
         } else {

@@ -86,7 +86,7 @@ fn errortostring_polymorphic_e2e() {
     }
     let root = repo_root();
     let entry = golden_entry(&root, "m_ipe_test_stringify");
-    let out = std::env::temp_dir().join("ipec_m_ipe_test_stringify_e2e");
+    let out = crate::support::scratch_root().join("ipec_m_ipe_test_stringify_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
@@ -124,7 +124,7 @@ fn eqshow_e2e() {
     }
     let root = repo_root();
     let entry = golden_entry(&root, "m_errortostring_eqshow");
-    let out = std::env::temp_dir().join("ipec_m_errortostring_eqshow_e2e");
+    let out = crate::support::scratch_root().join("ipec_m_errortostring_eqshow_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;

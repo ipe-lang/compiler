@@ -75,7 +75,7 @@ fn assert_e2e_output(fixture: &str, expect_contains: &str) {
         .join("golden")
         .join(fixture)
         .join("Main.ipe");
-    let out = std::env::temp_dir().join(format!("ipec_{fixture}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

@@ -37,7 +37,7 @@ fn console_app_glues_consecutive_renders_matching_go_oracle() {
         .join("golden")
         .join("console_app_view_separator");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i122_console_app_view_separator_e2e");
+    let out = crate::support::scratch_root().join("ipec_i122_console_app_view_separator_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

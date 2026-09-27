@@ -50,7 +50,7 @@ fn decoder_storage_reuse_emits_byte_identical() {
         .join("golden")
         .join(GOLDEN)
         .join("main.rs");
-    let out = std::env::temp_dir().join("ipec_i801_decoder_storage_reuse_emit");
+    let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -77,7 +77,7 @@ fn decoder_storage_reuse_emits_byte_identical() {
 fn decoder_storage_reuse_builds_and_runs() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i801_decoder_storage_reuse_e2e");
+    let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

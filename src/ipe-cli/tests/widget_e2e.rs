@@ -118,7 +118,8 @@ const COUNTER_JS: &str = "export function mount(host, emit) {\n\
 /// existence gate clears), build the emitted Rust project, and return the binary
 /// path.
 fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
-    let ipe_dir = std::env::temp_dir().join(format!("widget_e2e_{test_name}_ipe"));
+    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("widget_e2e_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
     std::fs::create_dir_all(ipe_dir.join("js")).map_err(|e| -> BoxError {
         format!("{test_name}: cannot create ipe source dir: {e}").into()
@@ -130,7 +131,8 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     std::fs::write(&entry, ipe_source)
         .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
-    let out_dir = std::env::temp_dir().join(format!("widget_e2e_{test_name}_emitted"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("widget_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime()
@@ -697,7 +699,8 @@ fn js_port_seal_legal_lowers_and_builds() -> Result<(), BoxError> {
     // The compile seal alone would pass even if the port calls were elided; the
     // emitted source must actually carry both transport arms. `cargo build` has
     // already succeeded, so the emitted tree exists and must contain them.
-    let out_dir = std::env::temp_dir().join("widget_e2e_js_port_seal_emitted");
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("widget_e2e_js_port_seal_emitted");
     let emitted = emitted_source(&out_dir);
     if !emitted.contains("js_send(") {
         return Err(format!(

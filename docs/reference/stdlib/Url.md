@@ -53,6 +53,15 @@ host : Url -> Maybe String
 `host url` — the host component, or `Nothing` for a hostless scheme
 (e.g. `mailto:`).
 
+## `port`
+
+```ipe
+port : Url -> Maybe Int
+```
+
+`port url` — the port with the scheme's known default applied
+(`https://x` → `443`), or `Nothing`.
+
 ## `path`
 
 ```ipe
@@ -99,10 +108,12 @@ SYNTACTIC parse seal: it legally carries ANY absolute scheme (`javascript:`,
 `data:`, `file:` are valid `Url` values), so an href/link/share sink that
 accepts arbitrary schemes is an injection surface. This narrows the already
 parsed scheme against `allowed`: an `Ok url` only when `Url.scheme url` is in
-the list, otherwise a typed `Err` naming the blocked scheme. The scheme read
-is the runtime-normalised (lowercased) value, so a `JavaScript:` cannot evade
-a lowercase allowlist. Absent proof the scheme is one a caller vetted, the
-URL is rejected — never silently dropped, never passed through.
+the list, otherwise a typed `Err` naming the blocked scheme when it is a
+well-known one (a user name can parse as the scheme, so any other is
+withheld). The scheme read is the runtime-normalised (lowercased) value, so a
+`JavaScript:` cannot evade a lowercase allowlist. Absent proof the scheme is
+one a caller vetted, the URL is rejected — never silently dropped, never
+passed through.
 
 ## `relative`
 

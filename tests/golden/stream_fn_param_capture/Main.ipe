@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+-- A `Stream.stream` handler that captures a function PARAMETER of the
+-- handler-constructing function. The emit re-wrap shadows every capture with a
+-- per-call clone, so the parameter must be carried as the `Arc` fn carrier
+-- (Clone), never a bare `Box<dyn Fn>` (no `clone` method). A listening server
+-- cannot run-to-exit: a successful cargo build is the acceptance.
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server.Stream as Stream
+import Ipe.Task as Task
+import Ipe.String as String
+
+mk : (String -> String) -> Server.Request -> Task Error Server.Response
+mk f _ =
+    Stream.stream "text/plain; charset=utf-8"
+        (\writer ->
+            Stream.emit (f "tick") writer
+                |> Task.andThen (\_ -> Stream.finish writer)
+        )
+
+main =
+    Server.listen 8099 [ Server.get "/ticks" (mk (\s -> String.append s "\n")) ]

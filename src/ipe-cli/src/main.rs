@@ -17,42 +17,14 @@ fn main() -> ExitCode {
         // non-zero WASI exit code; the guest owns the outcome, so propagate its
         // exact code (mirroring how a native run surfaces a child's exit).
         Err(err @ ipe::CliError::WasiRunExited { code }) => {
-            eprintln!("{err}");
+            ipe::screen::report_error(&err);
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
-        // These variants render their own complete screen — a full help page, a
-        // gate report, or a self-guttered environment message — so the
-        // soft-yellow error banner (which belongs to short one-line diagnostics)
-        // and the extra gutter are not applied; they print as-is. A command
-        // misuse leads with its own reason line before its help page.
-        Err(
-            err @ (ipe::CliError::UnknownCommand { .. }
-            | ipe::CliError::CommandUsage { .. }
-            | ipe::CliError::UnknownGroupSub { .. }
-            | ipe::CliError::DocCoverage(_)
-            | ipe::CliError::DocExamplesFailed(_)
-            | ipe::CliError::VerifyFailed { .. }
-            | ipe::CliError::TestFailed { .. }
-            | ipe::CliError::UpgradeNoPrebuilt { .. }
-            | ipe::CliError::ToolchainMissing(_)
-            | ipe::CliError::EmittedBuildFailed { .. }
-            | ipe::CliError::HealthCritical
-            | ipe::CliError::LintGateFailed
-            | ipe::CliError::EjectUnsupported { .. }
-            | ipe::CliError::UpgradeFeedUnreachable
-            // The WASI-run refusals gutter themselves (feature-off refusal, or a
-            // trap/instantiation failure), so they print as-is rather than under
-            // the one-line diagnostic banner.
-            | ipe::CliError::WasiRunFeatureDisabled
-            | ipe::CliError::WasiRunFailed { .. }
-            // The JSON was already written to stderr; nothing more to print.
-            | ipe::CliError::DiagnosticJsonEmitted),
-        ) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
+        // Every other failure renders through the one error frame: header,
+        // the error in its fault's tone (or its own complete screen), then the
+        // bug footer. An error that already wrote its output renders nothing.
         Err(err) => {
-            ipe::style::print_error_banner(&err.to_string());
+            ipe::screen::report_error(&err);
             ExitCode::FAILURE
         }
     }

@@ -43,7 +43,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 fn codec_enum_taggedunion_accepts_and_emits() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i807_codec_enum_taggedunion_emit");
+    let out = crate::support::scratch_root().join("ipec_i807_codec_enum_taggedunion_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -65,7 +65,7 @@ fn codec_enum_taggedunion_accepts_and_emits() {
 fn codec_enum_taggedunion_builds_and_runs() {
     let root = repo_root();
     let entry = fixture_entry(&root);
-    let out = std::env::temp_dir().join("ipec_i807_codec_enum_taggedunion_e2e");
+    let out = crate::support::scratch_root().join("ipec_i807_codec_enum_taggedunion_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

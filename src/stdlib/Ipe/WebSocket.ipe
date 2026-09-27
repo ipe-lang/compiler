@@ -14,6 +14,11 @@
 -- connections).  Build a `WsUrl` via `WebSocket.url` — a plain
 -- `String` or an `http://` URL is a type error.
 --
+-- Dial rule: a URL with `\` anywhere, or `@` in its path or fragment, is
+-- refused (its credentials could run into the host) — write `@` as `%40`.
+-- An `@` in the query is allowed, but an error for that URL then withholds
+-- the host.
+--
 -- Lifecycle:
 --
 --  1. `Cmd.perform (WebSocket.connect wsUrl) Connected` — kick

@@ -23,6 +23,7 @@
 
 use ipe_diagnostics::Span;
 use ipe_intern::{Interner, Symbol};
+use ipe_parse::{is_ident_continue, is_ident_start, is_keyword};
 
 use crate::ast::Module;
 use crate::ref_index::ReferenceIndex;
@@ -75,23 +76,8 @@ pub enum RenameError {
 
 // ── Identifier validation ─────────────────────────────────────────────────────
 //
-// Mirrors the lexer predicates (`src/compiler/parse/src/lexer.rs`
-// `is_ident_start` / `is_ident_continue`) and the keyword list used in
-// `src/lsp/features/src/rename.rs`.  If the lexer rules change, update all
-// three in lockstep.
-
-const fn ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-const fn ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-const KEYWORDS: &[&str] = &[
-    "module", "import", "exposing", "as", "type", "case", "of", "let", "in", "if", "then", "else",
-    "do",
-];
+// Charset and keyword checks delegate to the lexer (`ipe_parse`), the single
+// source of truth for what spells one identifier token.
 
 /// Whether a renamed symbol is a type/constructor (uppercase) or a value
 /// (lowercase / `_`).
@@ -118,21 +104,21 @@ fn validate_new_name(raw: &str, class: SymbolClass) -> Result<(), RenameError> {
         new_name: raw.to_owned(),
         reason: "empty identifier".to_owned(),
     })?;
-    if !ident_start(first) {
+    if !is_ident_start(first) {
         return Err(RenameError::InvalidIdentifier {
             new_name: raw.to_owned(),
             reason: format!("first character {first:?} is not a letter or underscore"),
         });
     }
     for c in chars {
-        if !ident_continue(c) {
+        if !is_ident_continue(c) {
             return Err(RenameError::InvalidIdentifier {
                 new_name: raw.to_owned(),
                 reason: format!("character {c:?} is not alphanumeric or underscore"),
             });
         }
     }
-    if KEYWORDS.contains(&raw) {
+    if is_keyword(raw) {
         return Err(RenameError::InvalidIdentifier {
             new_name: raw.to_owned(),
             reason: format!("{raw:?} is a reserved keyword"),
@@ -364,7 +350,7 @@ mod tests {
     use crate::ast::{Def, Expr, Expr_, Module};
     use crate::ref_index::ReferenceIndex;
 
-    use super::{RenameError, rename};
+    use super::{RenameError, SymbolClass, rename, validate_new_name};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -591,6 +577,32 @@ mod tests {
                 matches!(err, Err(RenameError::InvalidIdentifier { .. })),
                 "expected InvalidIdentifier for {bad:?}, got {err:?}"
             );
+        }
+    }
+
+    /// Every lexer keyword and every non-ASCII name is refused, for both
+    /// case classes — the charset and keyword table are the lexer's own.
+    #[test]
+    fn refuses_every_keyword_and_non_ascii() {
+        for class in [SymbolClass::Value, SymbolClass::Type] {
+            for kw in ipe_parse::KEYWORDS {
+                assert!(
+                    matches!(
+                        validate_new_name(kw, class),
+                        Err(RenameError::InvalidIdentifier { .. })
+                    ),
+                    "keyword {kw:?} accepted as a {class:?} name"
+                );
+            }
+            for bad in ["caf\u{e9}", "\u{c9}t\u{e9}", "x\u{0301}", "\u{ff58}"] {
+                assert!(
+                    matches!(
+                        validate_new_name(bad, class),
+                        Err(RenameError::InvalidIdentifier { .. })
+                    ),
+                    "non-ASCII {bad:?} accepted as a {class:?} name"
+                );
+            }
         }
     }
 

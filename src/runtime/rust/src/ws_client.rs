@@ -140,37 +140,158 @@ fn deregister(id: i64) {
 #[cfg(not(target_arch = "wasm32"))]
 static WS_CLIENT_NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Redact any `user:pass@` userinfo from a URL before it is echoed in an error
-/// message. WebSocket URLs legitimately carry credentials (`ws://user:pass@host`),
-/// and connect-error strings flow to `Ipe.Log` / structured logs, so the raw URL
-/// would leak the secret (PRINCIPLES #1: no secret leakage into errors/logs).
-/// Parse-and-rebuild via the `url` crate when possible; fall back to a manual
-/// `scheme://...@` strip so a URL the parser rejects (the bad-url error path)
-/// still never echoes credentials. Total — no unwrap/index/panic.
+/// Why a WebSocket dial or read failed, as a fixed class.
+///
+/// Built from the transport's error without keeping its text: a TLS or URL
+/// error can quote the server name or the whole URL, token included.
 #[cfg(not(target_arch = "wasm32"))]
-fn redact_ws_url(url: &str) -> String {
-    if let Ok(mut u) = ::url::Url::parse(url) {
-        if !u.username().is_empty() || u.password().is_some() {
-            // set_username/set_password return Err only for cannot-be-a-base URLs,
-            // which can't reach here (they have no userinfo); ignore either way.
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsFailure {
+    /// The TCP dial of the vetted address failed.
+    Dial(std::io::ErrorKind),
+    /// The connection was closed.
+    Closed,
+    /// An I/O error of the given class.
+    Io(std::io::ErrorKind),
+    /// TLS setup or verification failed.
+    Tls,
+    /// A message or frame exceeded the size limit.
+    Capacity,
+    /// The peer broke the WebSocket protocol.
+    Protocol,
+    /// The outbound buffer was full.
+    WriteBufferFull,
+    /// A text frame was not UTF-8.
+    Utf8,
+    /// The peer's traffic matched a known attack pattern.
+    AttackAttempt,
+    /// The URL cannot be dialled.
+    Url,
+    /// The server answered the handshake with a non-upgrade HTTP status.
+    HttpStatus(u16),
+    /// The handshake's HTTP was malformed.
+    HttpFormat,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WsFailure {
+    /// The class of `error`.
+    fn of(error: &tokio_tungstenite::tungstenite::Error) -> Self {
+        use tokio_tungstenite::tungstenite::Error;
+        match error {
+            Error::ConnectionClosed | Error::AlreadyClosed => Self::Closed,
+            Error::Io(io) => Self::Io(io.kind()),
+            Error::Tls(_) => Self::Tls,
+            Error::Capacity(_) => Self::Capacity,
+            Error::Protocol(_) => Self::Protocol,
+            Error::WriteBufferFull(_) => Self::WriteBufferFull,
+            Error::Utf8 => Self::Utf8,
+            Error::AttackAttempt => Self::AttackAttempt,
+            Error::Url(_) => Self::Url,
+            Error::Http(response) => Self::HttpStatus(response.status().as_u16()),
+            Error::HttpFormat(_) => Self::HttpFormat,
         }
-        return u.to_string();
     }
-    // Unparseable URL: strip a leading `scheme://userinfo@` manually. Only the
-    // authority's userinfo (before the first '/', '?' or '#') is considered, so a
-    // later `@` in a path/query is preserved.
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            let (authority, tail) = rest.split_at(authority_end);
-            match authority.rsplit_once('@') {
-                Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
-                None => url.to_string(),
-            }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Display for WsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dial(kind) => write!(f, "dial of the vetted address failed: {kind}"),
+            Self::Closed => f.write_str("connection closed"),
+            Self::Io(kind) => write!(f, "I/O error: {kind}"),
+            Self::Tls => f.write_str("TLS error"),
+            Self::Capacity => f.write_str("message or frame exceeds the size limit"),
+            Self::Protocol => f.write_str("WebSocket protocol error"),
+            Self::WriteBufferFull => f.write_str("write buffer full"),
+            Self::Utf8 => f.write_str("text frame is not UTF-8"),
+            Self::AttackAttempt => f.write_str("attack attempt detected"),
+            Self::Url => f.write_str("the URL cannot be dialled"),
+            Self::HttpStatus(status) => write!(f, "server answered HTTP {status}"),
+            Self::HttpFormat => f.write_str("malformed HTTP handshake"),
         }
-        None => url.to_string(),
+    }
+}
+
+/// Why `WebSocket.connect` failed, as the Ipê program sees it.
+///
+/// Holds no foreign text and no dialled address: the URL only as
+/// [`DisplayableUrl`](super::ssrf::DisplayableUrl) shows it, a header only by
+/// its position, and a transport failure only as its [`WsFailure`] class.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WsConnectError {
+    /// The SSRF gate refused the URL.
+    Refused(super::ssrf::UrlRefusal),
+    /// The URL is not a WebSocket handshake target.
+    BadUrl(super::ssrf::DisplayableUrl),
+    /// A caller-supplied header name does not parse.
+    InvalidHeaderName {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// The header's 1-based position in the caller's list.
+        position: usize,
+    },
+    /// A caller-supplied header value does not parse.
+    InvalidHeaderValue {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// The header's 1-based position in the caller's list.
+        position: usize,
+    },
+    /// A `wss://` URL under deny-private, whose pinned dial carries no TLS.
+    TlsUnderPin(super::ssrf::DisplayableUrl),
+    /// The dial or handshake failed.
+    Failed {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// What failed.
+        failure: WsFailure,
+    },
+    /// The handshake did not finish before the deadline.
+    TimedOut {
+        /// The URL as it may be shown.
+        url: super::ssrf::DisplayableUrl,
+        /// The deadline, in milliseconds.
+        after_ms: u64,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Display for WsConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(f, "ws: {refusal}"),
+            Self::BadUrl(url) => write!(f, "WebSocket.connect {url}: bad url"),
+            Self::InvalidHeaderName { url, position } => write!(
+                f,
+                "WebSocket.connect {url}: header {position} has an invalid name"
+            ),
+            Self::InvalidHeaderValue { url, position } => write!(
+                f,
+                "WebSocket.connect {url}: header {position} has an invalid value"
+            ),
+            Self::TlsUnderPin(url) => write!(
+                f,
+                "WebSocket.connect {url}: wss:// with IPE_HTTP_DENY_PRIVATE is unsupported \
+                 (SSRF-pinned dial bypasses TLS; disable IPE_HTTP_DENY_PRIVATE or use ws:// \
+                 for this endpoint)"
+            ),
+            Self::Failed { url, failure } => write!(f, "WebSocket.connect {url}: {failure}"),
+            Self::TimedOut { url, after_ms } => write!(
+                f,
+                "WebSocket.connect {url}: handshake timed out after {after_ms}ms"
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WsConnectError {
+    /// This failure as the task's error.
+    fn into_task<E: From<String>>(self) -> IpeResult<E, i64> {
+        IpeResult::Err(self.to_string().into())
     }
 }
 
@@ -183,55 +304,40 @@ async fn do_connect<E: From<String> + Send + 'static>(
 ) -> IpeResult<E, i64> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-    // Build the credential-stripped form ONCE; every error message below echoes
-    // this, never the raw `url`.
-    let safe_url = redact_ws_url(&url);
-    // SSRF guard: when IPE_HTTP_DENY_PRIVATE is set, reject a ws/wss URL whose host
-    // resolves to a private/loopback/link-local address BEFORE the handshake — the
-    // without this check the WebSocket surface would connect with no
-    // deny-private guard, letting an attacker-controlled URL reach internal
-    // services the Http client blocks.
-    if let Err(msg) = super::ssrf::ssrf_validate_url(&url) {
-        return IpeResult::Err(msg.into());
-    }
+    // Every error below shows this form of the URL, never the raw `url`.
+    let safe_url = super::ssrf::DisplayableUrl::of(&url);
+    // SSRF gate, before the handshake: under deny-private the host is resolved
+    // ONCE through the shared gate (bounded deadline, a host with any blocked
+    // answer refused whole) and the dial below is pinned to the vetted address,
+    // so tokio-tungstenite never re-resolves the name to a rebind target.
+    let dial = match super::ssrf::VettedDial::for_url(&url).await {
+        Ok(dial) => dial,
+        Err(refusal) => return WsConnectError::Refused(refusal).into_task(),
+    };
     // Build the handshake request so custom headers (e.g. Authorization) from
     // connectWith's cfg.headers are sent.
-    let mut req = match url.as_str().into_client_request() {
-        Ok(r) => r,
-        Err(e) => {
-            return IpeResult::Err(
-                format!("WebSocket.connect {}: bad url: {}", safe_url, e).into(),
-            );
-        }
+    let Ok(mut req) = url.as_str().into_client_request() else {
+        return WsConnectError::BadUrl(safe_url).into_task();
     };
     // Fail CLOSED on an unparseable caller-supplied header: a credential (e.g.
     // an Authorization bearer) that can't be attached must abort the connect,
-    // never connect unauthenticated. Echo only the header NAME (k) in the error
-    // — never the value (v), which may carry the secret.
-    for (k, v) in &headers {
-        let name = match k.parse::<HeaderName>() {
-            Ok(n) => n,
-            Err(_) => {
-                return IpeResult::Err(
-                    format!(
-                        "WebSocket.connect {}: invalid header name {:?}",
-                        safe_url, k
-                    )
-                    .into(),
-                );
+    // never connect unauthenticated. The header is named only by its position:
+    // its name and value may both carry the secret.
+    for (index, (k, v)) in headers.iter().enumerate() {
+        let position = index.saturating_add(1);
+        let Ok(name) = k.parse::<HeaderName>() else {
+            return WsConnectError::InvalidHeaderName {
+                url: safe_url,
+                position,
             }
+            .into_task();
         };
-        let val = match HeaderValue::from_str(v) {
-            Ok(val) => val,
-            Err(_) => {
-                return IpeResult::Err(
-                    format!(
-                        "WebSocket.connect {}: invalid value for header {:?}",
-                        safe_url, k
-                    )
-                    .into(),
-                );
+        let Ok(val) = HeaderValue::from_str(v) else {
+            return WsConnectError::InvalidHeaderValue {
+                url: safe_url,
+                position,
             }
+            .into_task();
         };
         req.headers_mut().insert(name, val);
     }
@@ -253,15 +359,6 @@ async fn do_connect<E: From<String> + Send + 'static>(
         max_frame_size: Some(max_msg),
         ..Default::default()
     };
-    // SSRF pin (R1): when IPE_HTTP_DENY_PRIVATE is on, resolve the host to a
-    // vetted non-private addr and dial THAT ourselves, so tokio-tungstenite can't
-    // re-resolve the name to a rebind target at connect time — closing the
-    // resolve->connect TOCTOU that the bare ssrf_validate_url check above leaves
-    // open (it validates a name that connect_async would resolve again).
-    let pinned = match super::ssrf::ssrf_pinned_ws_addr(&url) {
-        Ok(p) => p,
-        Err(msg) => return IpeResult::Err(msg.into()),
-    };
     type WsConnOut = Result<
         (
             tokio_tungstenite::WebSocketStream<
@@ -269,53 +366,47 @@ async fn do_connect<E: From<String> + Send + 'static>(
             >,
             tokio_tungstenite::tungstenite::handshake::client::Response,
         ),
-        tokio_tungstenite::tungstenite::Error,
+        WsFailure,
     >;
     let connect_fut: std::pin::Pin<Box<dyn std::future::Future<Output = WsConnOut> + Send>> =
-        match pinned {
-            Some(addr) => {
+        match dial {
+            super::ssrf::VettedDial::Pinned(addr) => {
                 // When SSRF-pinning is active (IPE_HTTP_DENY_PRIVATE), we dial
                 // the already-vetted IP directly via a raw TCP socket, bypassing
                 // the name-resolution step. A raw TCP socket carries no TLS
                 // context, so a `wss://` URL cannot be serviced here — TLS
                 // requires the full resolver path (`connect_async_with_config`,
-                // the `None` arm below). Refuse rather than dial plaintext to
-                // what the caller believes is a secure endpoint.
-                if url.starts_with("wss://") {
-                    return IpeResult::Err(
-                        format!(
-                            "WebSocket.connect {}: wss:// with IPE_HTTP_DENY_PRIVATE is \
-                         unsupported (SSRF-pinned dial bypasses TLS; disable \
-                         IPE_HTTP_DENY_PRIVATE or use ws:// for this endpoint)",
-                            safe_url
-                        )
-                        .into(),
-                    );
+                // the `Unrestricted` arm below). Refuse rather than dial plaintext
+                // to what the caller believes is a secure endpoint. The scheme is
+                // read from the parse the gate vetted, never from the raw text,
+                // which may differ in case or leading whitespace.
+                if !::url::Url::parse(&url).is_ok_and(|parsed| parsed.scheme() == "ws") {
+                    return WsConnectError::TlsUnderPin(safe_url).into_task();
                 }
                 // Dial INSIDE the future so the single handshake timeout below
                 // also bounds the pinned TCP connect — otherwise an unreachable
                 // / silently-stalling pinned addr would hang here, outside the
-                // timeout guard, leaking the task + FD.
+                // timeout guard, leaking the task + FD. The failure keeps only
+                // its class: the address may re-encode an IP-literal host the
+                // displayable URL withholds.
                 Box::pin(async move {
-                    let tcp = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
-                        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
-                            e.kind(),
-                            format!("pinned dial {} failed: {}", addr, e),
-                        ))
-                    })?;
+                    let tcp = tokio::net::TcpStream::connect(addr.socket_addr())
+                        .await
+                        .map_err(|e| WsFailure::Dial(e.kind()))?;
                     tokio_tungstenite::client_async_with_config(
                         req,
                         tokio_tungstenite::MaybeTlsStream::Plain(tcp),
                         Some(ws_config),
                     )
                     .await
+                    .map_err(|e| WsFailure::of(&e))
                 })
             }
-            None => Box::pin(tokio_tungstenite::connect_async_with_config(
-                req,
-                Some(ws_config),
-                false,
-            )),
+            super::ssrf::VettedDial::Unrestricted => Box::pin(async move {
+                tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
+                    .await
+                    .map_err(|e| WsFailure::of(&e))
+            }),
         };
     // Floor the handshake timeout: a non-positive cfg.timeout must NOT disable it
     // (an unreachable / silently-stalling host would otherwise hang connect_async
@@ -328,17 +419,19 @@ async fn do_connect<E: From<String> + Send + 'static>(
     let (stream, _resp) =
         match tokio::time::timeout(std::time::Duration::from_millis(to_ms), connect_fut).await {
             Ok(Ok(ok)) => ok,
-            Ok(Err(e)) => {
-                return IpeResult::Err(format!("WebSocket.connect {}: {}", safe_url, e).into());
+            Ok(Err(failure)) => {
+                return WsConnectError::Failed {
+                    url: safe_url,
+                    failure,
+                }
+                .into_task();
             }
             Err(_) => {
-                return IpeResult::Err(
-                    format!(
-                        "WebSocket.connect {}: handshake timed out after {}ms",
-                        safe_url, to_ms
-                    )
-                    .into(),
-                );
+                return WsConnectError::TimedOut {
+                    url: safe_url,
+                    after_ms: to_ms,
+                }
+                .into_task();
             }
         };
     let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -421,7 +514,8 @@ async fn do_connect<E: From<String> + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    let _ = frames.send(WsEvent::Error(format!("ws read error: {}", e)));
+                    let failure = WsFailure::of(&e);
+                    let _ = frames.send(WsEvent::Error(format!("ws read error: {failure}")));
                     break;
                 }
                 _ => {} // Ping/Pong handled by tungstenite
@@ -753,6 +847,112 @@ where
 mod tests {
     use super::*;
 
+    /// Every connect failure shows the URL only as scheme, host, and port,
+    /// withholds a host read from ambiguous userinfo, and never shows the
+    /// address an IP-literal host re-encodes to.
+    #[test]
+    fn connect_errors_never_show_credentials_or_the_dialled_address() {
+        let secrets = [
+            "1234567890",
+            "73.150.2.210",
+            "pw",
+            "x.example",
+            "t0k3n",
+            "s3ss10n",
+            "Bearer",
+        ];
+        for raw in [
+            "ws://1234567890?pw@x.example/",
+            "ws://1234567890/pw@x.example/",
+            "ws://1234567890\\pw@x.example/",
+            "ws://host.example/ws/s3ss10n?access_token=t0k3n",
+        ] {
+            let url = || super::super::ssrf::DisplayableUrl::of(raw);
+            for error in [
+                WsConnectError::BadUrl(url()),
+                WsConnectError::InvalidHeaderName {
+                    url: url(),
+                    position: 1,
+                },
+                WsConnectError::InvalidHeaderValue {
+                    url: url(),
+                    position: 2,
+                },
+                WsConnectError::TlsUnderPin(url()),
+                WsConnectError::Failed {
+                    url: url(),
+                    failure: WsFailure::Dial(std::io::ErrorKind::ConnectionRefused),
+                },
+                WsConnectError::Failed {
+                    url: url(),
+                    failure: WsFailure::Tls,
+                },
+                WsConnectError::TimedOut {
+                    url: url(),
+                    after_ms: 30_000,
+                },
+            ] {
+                for shown in [error.to_string(), format!("{error:?}")] {
+                    for secret in secrets {
+                        assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A dial URL whose credential may run into its host or path is refused
+    /// by the gate before any dial, under every policy.
+    #[tokio::test]
+    async fn connect_refuses_misplaced_userinfo_without_echoing_it() {
+        use super::super::ssrf::{DialPolicy, UrlRefusal, test_resolvers::NoDns, vet_url_with};
+        for raw in [
+            "ws://1234567890\\pw@x.example/",
+            "ws://10.0.0.1\\s3cr3t@x.example/",
+        ] {
+            for policy in [DialPolicy::DenyPrivate, DialPolicy::AllowAll] {
+                let refused =
+                    vet_url_with(policy, &NoDns, raw, std::time::Duration::from_secs(5)).await;
+                assert_eq!(refused, Err(UrlRefusal::MisplacedUserinfo), "{raw:?}");
+                if let Err(refusal) = refused {
+                    let shown = WsConnectError::Refused(refusal).to_string();
+                    for secret in [
+                        "1234567890",
+                        "73.150.2.210",
+                        "10.0.0.1",
+                        "s3cr3t",
+                        "x.example",
+                    ] {
+                        assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A transport failure keeps only its class, never the error's text.
+    #[test]
+    fn transport_failures_keep_only_their_class() {
+        use tokio_tungstenite::tungstenite::error::UrlError;
+        let unable = tokio_tungstenite::tungstenite::Error::Url(UrlError::UnableToConnect(
+            "wss://admin:s3cr3t@x.example/?token=t0k3n".to_owned(),
+        ));
+        assert_eq!(WsFailure::of(&unable), WsFailure::Url);
+        let shown = WsFailure::of(&unable).to_string();
+        for secret in ["admin", "s3cr3t", "x.example", "t0k3n"] {
+            assert!(!shown.contains(secret), "{secret:?} leaked into {shown}");
+        }
+        let io = tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "pinned dial 73.150.2.210:80 failed",
+        ));
+        assert_eq!(
+            WsFailure::of(&io),
+            WsFailure::Io(std::io::ErrorKind::ConnectionRefused)
+        );
+        assert!(!WsFailure::of(&io).to_string().contains("73.150.2.210"));
+    }
+
     #[test]
     fn close_code_mapping() {
         assert_eq!(ws_close_code(1000), WsCloseCode::Normal);
@@ -760,26 +960,6 @@ mod tests {
         assert_eq!(ws_close_code(1003), WsCloseCode::UnsupportedData);
         assert_eq!(ws_close_code(1011), WsCloseCode::InternalError);
         assert_eq!(ws_close_code(4000), WsCloseCode::Custom(4000));
-    }
-
-    #[test]
-    fn redact_ws_url_strips_userinfo() {
-        // Credentials must never survive into an error/log string.
-        let r = redact_ws_url("ws://user:s3cret@example.com:9000/feed?token=abc");
-        assert!(!r.contains("s3cret"), "password leaked: {r}");
-        assert!(!r.contains("user:"), "username leaked: {r}");
-        assert!(r.contains("example.com"));
-        // Username-only (no password) is also stripped.
-        let r2 = redact_ws_url("wss://admin@host/x");
-        assert!(!r2.contains("admin@"), "username leaked: {r2}");
-        // No userinfo → unchanged host/path.
-        let r3 = redact_ws_url("ws://example.com/feed");
-        assert!(r3.contains("example.com") && !r3.contains('@'));
-        // Unparseable URL still strips a leading scheme://userinfo@ and keeps a
-        // later '@' in the path intact.
-        let r4 = redact_ws_url("ws://bob:pw@@@host/a@b");
-        assert!(!r4.contains("bob:pw"), "creds leaked from bad url: {r4}");
-        assert!(r4.contains("a@b"), "path '@' wrongly stripped: {r4}");
     }
 }
 
@@ -844,8 +1024,15 @@ mod wasm_client {
     }
 
     fn open_socket<E: From<String> + 'static>(url: &str) -> Result<i64, E> {
-        let ws = web_sys::WebSocket::new(url)
-            .map_err(|e| E::from(format!("WebSocket.connect {url}: {e:?}")))?;
+        // Neither the URL nor the browser's exception is echoed: the URL can
+        // carry credentials and the exception text quotes it verbatim.
+        let ws = web_sys::WebSocket::new(url).map_err(|_| {
+            E::from(
+                "WebSocket.connect: the browser refused the URL (malformed, or a scheme or \
+                 port it blocks)"
+                    .to_owned(),
+            )
+        })?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
         let id = next_id();
         SOCKETS.with(|s| s.borrow_mut().insert(id, ws));
@@ -893,7 +1080,9 @@ mod wasm_client {
             if ws.ready_state() != web_sys::WebSocket::OPEN {
                 return Err(E::from(format!("{op_name}: socket {id} is not open")));
             }
-            f(ws).map_err(|e| E::from(format!("{op_name}: {e:?}")))
+            // The browser's exception text is not echoed: it may quote the
+            // socket's URL, which can carry credentials.
+            f(ws).map_err(|_| E::from(format!("{op_name}: the browser refused the operation")))
         })
     }
 

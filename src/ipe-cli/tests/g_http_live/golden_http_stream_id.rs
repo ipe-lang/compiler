@@ -64,7 +64,7 @@ fn http_stream_open_full_emit_succeeds() {
         .join("golden")
         .join("http_stream_id")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i148_http_stream_id_full_emit");
+    let out = crate::support::scratch_root().join("ipec_i148_http_stream_id_full_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

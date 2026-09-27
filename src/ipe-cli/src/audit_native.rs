@@ -964,7 +964,7 @@ fn native_tier2_on_platform(audit: &NativeAudit) -> Result<Tier2Outcome, CliErro
     // the single declared axis under test. The `exercised` field below is unused
     // on this path (it drives only the wrapper-probe-only shape's full run).
     let mut ro_binds = default_ro_binds();
-    ro_binds.extend(toolchain_ro_binds());
+    ro_binds.extend(toolchain_ro_binds()?);
     // The jailed `cargo build` reads the emitted app crate (which carries the
     // probe bin) and every crate its manifest pins by absolute path (the runtime
     // and each bound Rust dependency). Re-expose them read-only so the build can
@@ -1472,6 +1472,11 @@ pub const fn default_ro_binds() -> Vec<PathBuf> {
 /// These are ADDED to [`default_ro_binds`] on the real-build path only; the
 /// wrapper-probe-only control fixture needs no toolchain, so its bind set is
 /// unchanged.
+///
+/// # Errors
+/// [`CliError::EnvDirNotAbsolute`] when `CARGO_HOME` or `RUSTUP_HOME` is set
+/// but relative — binding the home default instead would expose a toolchain the
+/// host `cargo` never uses.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1480,21 +1485,15 @@ pub const fn default_ro_binds() -> Vec<PathBuf> {
     target_os = "macos",
     target_os = "freebsd"
 ))]
-#[must_use]
-pub fn toolchain_ro_binds() -> Vec<PathBuf> {
-    let home_dir = |var: &str, fallback: &str| -> Option<PathBuf> {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback)))
-    };
-    [
-        home_dir("CARGO_HOME", ".cargo"),
-        home_dir("RUSTUP_HOME", ".rustup"),
+pub fn toolchain_ro_binds() -> Result<Vec<PathBuf>, CliError> {
+    Ok([
+        crate::env_dir::tool_home("CARGO_HOME", ".cargo")?,
+        crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?,
     ]
     .into_iter()
     .flatten()
     .filter(|p| p.exists())
-    .collect()
+    .collect())
 }
 
 /// Windows: the jail reads no read-only tool binds, so the toolchain bind set is
@@ -1503,10 +1502,13 @@ pub fn toolchain_ro_binds() -> Vec<PathBuf> {
 /// A real Windows `cargo build` reaches its toolchain through the ACL-granted
 /// scratch and the jail's scrubbed `PATH` (see [`default_ro_binds`]), not host
 /// path binds.
+///
+/// # Errors
+/// Never; the signature matches the fallible POSIX resolution.
 #[cfg(target_os = "windows")]
-#[must_use]
-pub const fn toolchain_ro_binds() -> Vec<PathBuf> {
-    Vec::new()
+#[allow(clippy::unnecessary_wraps)] // shares the fallible POSIX signature
+pub const fn toolchain_ro_binds() -> Result<Vec<PathBuf>, CliError> {
+    Ok(Vec::new())
 }
 
 /// The read-only binds the emitted app crate (carrying the probe bin) and every
@@ -1649,23 +1651,19 @@ fn manifest_path_dependencies(manifest: &str) -> Vec<PathBuf> {
     target_os = "macos",
     target_os = "freebsd"
 ))]
-fn cargo_home_env() -> Vec<(String, std::ffi::OsString)> {
-    let home = |var: &str, fallback: &str| -> Option<std::ffi::OsString> {
-        std::env::var_os(var)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback).into()))
-            .filter(|p| Path::new(p).exists())
-    };
+fn cargo_home_env() -> Result<Vec<(String, std::ffi::OsString)>, CliError> {
+    let existing = |dir: Option<PathBuf>| dir.filter(|p| p.exists()).map(PathBuf::into_os_string);
     let mut out: Vec<(String, std::ffi::OsString)> = Vec::new();
-    if let Some(v) = home("CARGO_HOME", ".cargo") {
+    if let Some(v) = existing(crate::env_dir::tool_home("CARGO_HOME", ".cargo")?) {
         out.push(("CARGO_HOME".to_owned(), v));
     }
-    if let Some(v) = home("RUSTUP_HOME", ".rustup") {
+    if let Some(v) = existing(crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?) {
         out.push(("RUSTUP_HOME".to_owned(), v));
     }
-    if let Some(h) = std::env::var_os("HOME").filter(|p| Path::new(p).exists()) {
+    if let Some(h) = existing(crate::env_dir::home()) {
         out.push(("HOME".to_owned(), h));
     }
-    out
+    Ok(out)
 }
 
 /// The absolute path to `cargo`, resolved from `PATH` (the in-jail PATH is a
@@ -1812,7 +1810,16 @@ impl ProbeRunner for JailProbeRunner<'_> {
         let escape = self.working_tree.join("tier2-escape-probe");
         // Build the platform-native wrapper payload (POSIX `/bin/sh` vs Windows
         // `powershell.exe -File`), both enforcing the child-of-wrapper rule.
-        let payload = self.probe_payload(axis_sel.as_os_str(), &escape);
+        // A toolchain home that cannot be resolved faithfully fails the run
+        // closed rather than building against a toolchain the host never uses.
+        let payload = match self.probe_payload(axis_sel.as_os_str(), &escape) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return JailOutcome::BuildFailed {
+                    reason: err.to_string(),
+                };
+            }
+        };
         ipe_sandbox::build_jail::build_in_jail(
             self.tools,
             profile,
@@ -1843,7 +1850,11 @@ impl ProbeRunner for JailProbeRunner<'_> {
 impl JailProbeRunner<'_> {
     /// The POSIX payload: `env PROBE_MODE=tier2 TIER2_AXIS=… SCRATCH_DIR=…
     /// ESCAPE_PATH=… [toolchain homes] /bin/sh <wrapper.sh> <untrusted tail>`.
-    fn probe_payload(&self, axis_sel: &std::ffi::OsStr, escape: &Path) -> ProbePayload {
+    fn probe_payload(
+        &self,
+        axis_sel: &std::ffi::OsStr,
+        escape: &Path,
+    ) -> Result<ProbePayload, CliError> {
         // The fixed, trusted, exit-transparent launcher: `env NAME=VALUE … /bin/sh`
         // runs the wrapper under a scrubbed environment (per-run config travels
         // through the payload, never the process-global environment). It
@@ -1862,7 +1873,7 @@ impl JailProbeRunner<'_> {
         // are bound read-only, so the untrusted build can read the toolchain but
         // cannot write it. On the wrapper-probe-only shape they are absent.
         if self.exercise.is_real_build() {
-            for (name, value) in cargo_home_env() {
+            for (name, value) in cargo_home_env()? {
                 invocation_prefix.push(assignment(&name, value.as_os_str()));
             }
         }
@@ -1870,7 +1881,11 @@ impl JailProbeRunner<'_> {
         // The wrapper script owns the exit contract; the untrusted build is a
         // strictly subordinate tail it runs as its child (ProbePayload enforces
         // the ordering). The untrusted build can never own the exit.
-        ProbePayload::wrapper_owned(&invocation_prefix, &self.wrapper, self.exercise.tail())
+        Ok(ProbePayload::wrapper_owned(
+            &invocation_prefix,
+            &self.wrapper,
+            self.exercise.tail(),
+        ))
     }
 }
 
@@ -1895,7 +1910,12 @@ impl JailProbeRunner<'_> {
     /// / `PATH` / `TMP` / `TEMP`, and a real Windows Tier-2 build would allowlist
     /// the toolchain homes through the declared `env` axis. The wrapper-probe-only
     /// and offline-probe shapes the CI E2E exercises need none.
-    fn probe_payload(&self, axis_sel: &std::ffi::OsStr, escape: &Path) -> ProbePayload {
+    #[allow(clippy::unnecessary_wraps)] // shares the fallible POSIX signature
+    fn probe_payload(
+        &self,
+        axis_sel: &std::ffi::OsStr,
+        escape: &Path,
+    ) -> Result<ProbePayload, CliError> {
         let invocation_prefix = vec![
             self.tools.bwrap.clone().into_os_string(),
             OsString::from("-NoProfile"),
@@ -1916,12 +1936,12 @@ impl JailProbeRunner<'_> {
             escape.as_os_str().to_owned(),
             OsString::from("--"),
         ];
-        ProbePayload::wrapper_owned_with_flags(
+        Ok(ProbePayload::wrapper_owned_with_flags(
             &invocation_prefix,
             &self.wrapper,
             &wrapper_flags,
             self.exercise.tail(),
-        )
+        ))
     }
 }
 

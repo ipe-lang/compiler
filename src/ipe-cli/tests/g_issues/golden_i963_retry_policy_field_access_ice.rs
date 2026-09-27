@@ -53,7 +53,7 @@ fn built(root: &Path, out: &Path) -> Option<Result<(), CliError>> {
 fn retry_policy_nearmiss_still_rejects() {
     let root = repo_root();
     let entry = fixture_named(&root, "retry_policy_shape_nearmiss");
-    let out = std::env::temp_dir().join("ipec_i963_nearmiss_guard");
+    let out = crate::support::scratch_root().join("ipec_i963_nearmiss_guard");
     let _ = std::fs::remove_dir_all(&out);
     let Ok(runtime) = ipe::resolve_runtime() else {
         return;
@@ -76,7 +76,7 @@ fn retry_policy_nearmiss_still_rejects() {
 #[test]
 fn retry_policy_field_access_ice_emits() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_i963_emit");
+    let out = crate::support::scratch_root().join("ipec_i963_emit");
     let Some(result) = built(&root, &out) else {
         return;
     };
@@ -94,7 +94,7 @@ fn retry_policy_field_access_ice_emits() {
 #[test]
 fn retry_policy_field_access_ice_builds_and_runs() {
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_i963_e2e");
+    let out = crate::support::scratch_root().join("ipec_i963_e2e");
     let Some(result) = built(&root, &out) else {
         return;
     };

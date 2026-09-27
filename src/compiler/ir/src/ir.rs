@@ -2617,6 +2617,30 @@ pub fn carrier_is_clone(ty: &IrType) -> bool {
     }
 }
 
+/// Does `ty` embed a `Task` / `Cmd` / `Sub` effect carrier anywhere?
+///
+/// Every effect carrier renders to a runtime value with no `Clone` impl, so a
+/// value of such a type is move-only: the lowerer's non-`Clone` reuse gate and
+/// the emitter's field-read move share this one predicate. The walk follows the
+/// structural carriers (`Maybe`, `List`, `Set`, `Result`, `Dict`, tuple, record,
+/// enum type arguments, `Ui`, `WebRoute`).
+#[must_use]
+pub fn ir_type_has_effect_carrier(ty: &IrType) -> bool {
+    match ty {
+        IrType::Task(_) | IrType::Cmd(_) | IrType::Sub(_) => true,
+        IrType::Maybe(e) | IrType::List(e) | IrType::Set(e) => ir_type_has_effect_carrier(e),
+        IrType::Result(a, b) | IrType::Dict(a, b) => {
+            ir_type_has_effect_carrier(a) || ir_type_has_effect_carrier(b)
+        }
+        IrType::Tuple(es) => es.iter().any(ir_type_has_effect_carrier),
+        IrType::Record(fields) => fields.values().any(ir_type_has_effect_carrier),
+        IrType::Enum { args, .. } => args.iter().any(ir_type_has_effect_carrier),
+        IrType::Ui { msg, .. } => ir_type_has_effect_carrier(msg),
+        IrType::WebRoute(page) => ir_type_has_effect_carrier(page),
+        _ => false,
+    }
+}
+
 /// Is a BINDING of this type eligible for the `Arc<dyn Fn>` carrier promotion
 /// ([`Expr::SharedLambda`]) when it is captured at closure depth ≥ 1 or reused
 /// as a function value?
@@ -3032,6 +3056,74 @@ impl Callee {
     #[must_use]
     pub const fn evaluates_args_reversed(&self) -> bool {
         matches!(self, Self::Kernel(k) if k.swaps_first_two())
+    }
+
+    /// Whether the emitter renders every argument of a call to this callee in
+    /// place, in the order [`Self::args_in_eval_order`] yields.
+    ///
+    /// A user function's arguments are rendered left to right; an
+    /// argument-reversed kernel renders through the generic call tail, which
+    /// reverses them. Any other kernel or FFI emitter may reorder, hoist, or
+    /// defer an argument, so its order is unknown to an analysis.
+    #[must_use]
+    pub const fn has_known_eval_order(&self) -> bool {
+        matches!(self, Self::Func(_)) || self.evaluates_args_reversed()
+    }
+
+    /// A call's arguments in the order the emitted Rust evaluates them.
+    ///
+    /// The single ordering every evaluation-order analysis walks, so the
+    /// argument reversal is decided once ([`Self::evaluates_args_reversed`]).
+    #[must_use]
+    pub fn args_in_eval_order<'a>(&self, args: &'a [Expr]) -> EvalOrder<'a> {
+        EvalOrder {
+            args: args.iter(),
+            reversed: self.evaluates_args_reversed(),
+        }
+    }
+
+    /// Map `f` over owned call arguments in evaluation order, keeping IR order.
+    ///
+    /// The owned counterpart of [`Self::args_in_eval_order`] for a rewrite
+    /// whose state threads through the arguments in the order they run.
+    #[must_use]
+    pub fn map_args_in_eval_order(
+        &self,
+        mut args: Vec<Expr>,
+        f: impl FnMut(Expr) -> Expr,
+    ) -> Vec<Expr> {
+        let reversed = self.evaluates_args_reversed();
+        if reversed {
+            args.reverse();
+        }
+        let mut mapped: Vec<Expr> = args.into_iter().map(f).collect();
+        if reversed {
+            mapped.reverse();
+        }
+        mapped
+    }
+}
+
+/// A call's arguments in emitted evaluation order ([`Callee::args_in_eval_order`]).
+#[derive(Debug, Clone)]
+pub struct EvalOrder<'a> {
+    args: std::slice::Iter<'a, Expr>,
+    reversed: bool,
+}
+
+impl<'a> Iterator for EvalOrder<'a> {
+    type Item = &'a Expr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reversed {
+            self.args.next_back()
+        } else {
+            self.args.next()
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.args.size_hint()
     }
 }
 

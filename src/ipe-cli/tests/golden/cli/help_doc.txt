@@ -1,12 +1,13 @@
 exit: 0
 ---
 
+  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
   Look up documentation, generate API docs (docs.json + Markdown + HTML), query the stdlib, list modules, preview, or check coverage.
 
   ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 
   Arguments:
-    Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), language construct (case), or CLI command (version). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
+    Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), or CLI command (version); a key that names nothing lists the closest matches of every kind. `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
 
   Options:
     [--out <dir>]                            write the documentation to <dir> (default: doc/); generate only
@@ -14,4 +15,3 @@ exit: 0
     [--port <n>]                             pin the serve port (default: an auto-selected free one); serve only
     [--plain]                                bare output, one entry per line; list and <module> only
     [--json]                                 machine-readable JSON output; list and <module> only
-

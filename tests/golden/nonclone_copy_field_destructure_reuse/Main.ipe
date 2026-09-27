@@ -1,0 +1,30 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A record whose `action` field carries a Task (non-Clone), so the record is
+-- non-Clone and IPE-L0135 refuses a second consume of it.
+-- `{ count } = m` binds only the `Copy` field `count` (the `action` field is a
+-- wildcard): the emitted `let Model { count, action: _ } = m;` copies `count`
+-- and moves nothing, so the later by-value `total m` is the sole consume of
+-- `m` and must be accepted and build.
+--
+-- Expected output: "22"
+
+type alias Model =
+    { count : Int
+    , action : Task ()
+    }
+
+
+total : Model -> Int
+total model =
+    model.count * 10
+
+
+main =
+    let
+        m = { count = 2, action = Io.println "unused" }
+        { count } = m
+    in
+    Io.println (String.fromInt (count + total m))

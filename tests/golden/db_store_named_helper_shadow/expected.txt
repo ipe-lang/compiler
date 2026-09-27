@@ -1,0 +1,4 @@
+store-helper:ok
+store-cond:ok
+user-fn:7
+user-ctor:ok

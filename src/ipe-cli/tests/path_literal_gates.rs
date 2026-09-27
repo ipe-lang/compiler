@@ -36,7 +36,7 @@ fn e2e_enabled() -> bool {
 /// output. Fails the test on any build or runtime error.
 fn compile_build_run(name: &str) -> support::RunOutcome {
     let entry = golden_entry(name);
-    let out = std::env::temp_dir().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

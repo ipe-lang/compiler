@@ -1,21 +1,43 @@
-//! Token-level scanner for Rust abrupt-failure constructs.
+//! Syntax-tree scanner for Rust abrupt-failure constructs.
 //!
-//! It lexes with `proc-macro2` rather than matching text, so a construct named
-//! inside a string literal or a comment is invisible (a string is one opaque
-//! `Literal` token; comments are dropped), and a construct split across lines
-//! (`panic!\n(…)`, `obj.\nunwrap()`) is still found. That is what makes the
-//! scan free of false positives and — the property that matters for an
-//! attestation — free of false negatives.
+//! It parses with `syn`, so a construct named inside a string literal or a
+//! comment is invisible and a construct split across lines (`panic!\n(…)`,
+//! `obj.\nunwrap()`) is still found. Test-only exemption is decided per syntax
+//! node: a `#[cfg(test)]` or `#[test]` exempts exactly the item, arm, field,
+//! statement, or expression it decorates and never reaches a sibling, so a
+//! `,` or `;` can never carry the exemption past its node. Macro bodies have no
+//! syntax tree; their tokens are scanned flat, where a test-only attribute
+//! exempts only a whole item it parses as.
 //!
-//! Scope: it finds every *authored, token-detectable* abrupt-failure construct.
+//! Scope: it finds every *authored, syntax-detectable* abrupt-failure construct.
 //! Indexing (`a[i]`) and arithmetic overflow are deliberately out of scope —
-//! they are not distinct tokens and are covered by clippy (`indexing_slicing`,
-//! `arithmetic_side_effects`). Standard-library precondition panics
-//! (`split_at`, `borrow_mut`, …) are not authored tokens and cannot be found
-//! this way; they are the documented "no *authored* panic" boundary.
+//! they are not distinct constructs and are covered by clippy
+//! (`indexing_slicing`, `arithmetic_side_effects`). Standard-library
+//! precondition panics (`split_at`, `borrow_mut`, …) are not authored
+//! constructs and cannot be found this way; they are the documented "no
+//! *authored* panic" boundary.
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
-use std::str::FromStr;
+use proc_macro2::{Delimiter, Ident, TokenStream, TokenTree};
+use syn::ext::IdentExt;
+use syn::visit::{self, Visit};
+use syn::{
+    Arm, Attribute, Expr, ExprLit, ExprMethodCall, ExprPath, Field, FieldValue, ForeignItem,
+    ImplItem, Item, ItemMod, ItemUse, Lit, LitStr, Local, Macro, MacroDelimiter, Meta, MetaList,
+    Pat, Path, StmtMacro, TraitItem, Type, TypeParamBound, UseTree, Variant, Visibility,
+};
+
+mod includes;
+mod manifest;
+mod test_path;
+
+pub use includes::{
+    IncludeForm, IncludeTarget, IncludedSource, PathRefusal, TestPathInclude, judge_literal,
+};
+pub use manifest::{ManifestError, ManifestTargets, parse_manifest};
+pub use test_path::{
+    TestPathError, UngatedBy, check_manifest, check_test_path, is_template_path, is_test_path,
+    is_verified_test_path,
+};
 
 /// Panic-invoking macros (each may be invoked with `()`, `[]`, or `{}`).
 const MACROS: &[&str] = &[
@@ -68,23 +90,769 @@ pub struct Hit {
     pub tok: String,
 }
 
-/// Scan Rust source, returning every production-region abrupt-failure hit that
-/// is not sanctioned by an [`AUDIT_MARKER`] comment, or an error string if the
-/// input does not lex as Rust tokens.
+/// Attribute naming a module's source file.
+const PATH_ATTR: &str = "path";
+
+/// Attribute applying other attributes under a `cfg` predicate.
+const CFG_ATTR: &str = "cfg_attr";
+
+/// Macro compiling another file's tokens in place.
+const INCLUDE_MACRO: &str = "include";
+
+/// Directory name of test code a production module must never declare.
+const TESTS_MODULE: &str = "tests";
+
+/// Scan Rust source, returning every unsanctioned production-region hit.
 ///
-/// Test-only item bodies are skipped: this scanner attests the *production*
-/// surface. An item is test-only when carried by `#[test]` or a `#[cfg(…)]`
-/// whose predicate is guaranteed active only under the `test` cfg (see
-/// [`attr_gates_test_only`]). (A `--tests` mode with the inverted rule — allow
-/// the assert family, forbid the rest — is a separate entry point.)
+/// Test-only nodes are skipped: this scanner attests the *production* surface.
+/// A node is test-only when a `#[cfg(…)]` whose predicate is guaranteed active
+/// only under the `test` cfg decorates it, or when `#[test]` decorates a
+/// function.
+///
+/// # Errors
+///
+/// The parse error's text when `src` does not parse as a Rust file.
 pub fn scan_str(src: &str) -> Result<Vec<Hit>, String> {
-    let ts = TokenStream::from_str(src).map_err(|e| e.to_string())?;
-    let mut hits = Vec::new();
-    scan_stream(ts, &mut hits);
+    scan_source(src)
+        .map(|scan| scan.hits)
+        .map_err(|e| e.to_string())
+}
+
+/// Everything a production scan of one source file finds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Scan {
+    /// Unsanctioned abrupt-failure constructs, in line order.
+    pub hits: Vec<Hit>,
+    /// Production sources refused because they cannot be audited.
+    pub test_path_includes: Vec<TestPathInclude>,
+    /// Legal production sources the caller must resolve and scan in turn.
+    pub included_sources: Vec<IncludedSource>,
+}
+
+/// Scan Rust source for hits, refused sources, and legal sources in one parse.
+///
+/// Hits follow [`scan_str`]. A production `#[path = "…"]`, `include!("…")`, or
+/// `mod tests;` is either refused ([`TestPathInclude`]) or handed back as an
+/// [`IncludedSource`]; see [`judge_literal`].
+///
+/// # Errors
+///
+/// [`syn::Error`] when `src` does not parse as a Rust file.
+pub fn scan_source(src: &str) -> Result<Scan, syn::Error> {
+    syn::parse_file(src).map(|file| scan_file(&file, src))
+}
+
+/// Scan an already-parsed file; `src` is its text, read for audit markers.
+pub(crate) fn scan_file(file: &syn::File, src: &str) -> Scan {
+    if attrs_test_only(&file.attrs, false) {
+        return Scan::default();
+    }
+    let mut scanner = Scanner::default();
+    scanner.visit_file(file);
     let lines: Vec<&str> = src.lines().collect();
+    let mut hits = scanner.hits;
     hits.retain(|h| !is_sanctioned(&lines, h.line));
     hits.sort_by_key(|h| h.line);
-    Ok(hits)
+    Scan {
+        hits,
+        test_path_includes: scanner.test_path_includes,
+        included_sources: scanner.included_sources,
+    }
+}
+
+/// Whether `attrs` make their node test-only.
+///
+/// `is_fn` admits a bare `#[test]`, which gates only a function.
+pub(crate) fn attrs_test_only(attrs: &[Attribute], is_fn: bool) -> bool {
+    attrs.iter().any(|attr| {
+        meta_is_test_cfg(&attr.meta)
+            || (is_fn && matches!(&attr.meta, Meta::Path(path) if path.is_ident("test")))
+    })
+}
+
+/// Whether `meta` is `cfg(P)` with a test-only predicate `P`.
+pub(crate) fn meta_is_test_cfg(meta: &Meta) -> bool {
+    matches!(
+        meta,
+        Meta::List(list)
+            if list.path.is_ident("cfg")
+                && matches!(list.delimiter, MacroDelimiter::Paren(_))
+                && cfg_pred_is_test_only(&list.tokens)
+    )
+}
+
+/// 1-based line an identifier starts on.
+fn line_of(ident: &Ident) -> usize {
+    ident.span().start().line
+}
+
+/// 1-based line a path's last segment starts on.
+fn path_line(path: &Path) -> usize {
+    path.segments.last().map_or(0, |seg| line_of(&seg.ident))
+}
+
+/// Whether `tok` is the punctuation character `ch`.
+fn is_punct(tok: &TokenTree, ch: char) -> bool {
+    matches!(tok, TokenTree::Punct(p) if p.as_char() == ch)
+}
+
+/// Whether `tok` begins a call: an argument list or a `::` turbofish.
+fn opens_call(tok: Option<&TokenTree>) -> bool {
+    match tok {
+        Some(TokenTree::Group(g)) => g.delimiter() == Delimiter::Parenthesis,
+        Some(tok) => is_punct(tok, ':'),
+        None => false,
+    }
+}
+
+/// An identifier's name without a raw `r#` prefix.
+fn name_of(ident: &Ident) -> String {
+    ident.unraw().to_string()
+}
+
+/// A path's segments joined by `::`.
+fn path_text(path: &Path) -> String {
+    path.segments
+        .iter()
+        .map(|seg| name_of(&seg.ident))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// A short description of a non-literal attribute value.
+fn describe(expr: &Expr) -> String {
+    match expr {
+        Expr::Path(p) => path_text(&p.path),
+        Expr::Macro(m) => format!("{}!(…)", path_text(&m.mac.path)),
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(s), ..
+        }) => s.token().to_string(),
+        Expr::Lit(_) => "a non-string literal".to_owned(),
+        _ => "a non-literal expression".to_owned(),
+    }
+}
+
+/// The outer attributes of an expression node.
+fn expr_attrs(expr: &Expr) -> &[Attribute] {
+    match expr {
+        Expr::Array(e) => &e.attrs,
+        Expr::Assign(e) => &e.attrs,
+        Expr::Async(e) => &e.attrs,
+        Expr::Await(e) => &e.attrs,
+        Expr::Binary(e) => &e.attrs,
+        Expr::Block(e) => &e.attrs,
+        Expr::Break(e) => &e.attrs,
+        Expr::Call(e) => &e.attrs,
+        Expr::Cast(e) => &e.attrs,
+        Expr::Closure(e) => &e.attrs,
+        Expr::Const(e) => &e.attrs,
+        Expr::Continue(e) => &e.attrs,
+        Expr::Field(e) => &e.attrs,
+        Expr::ForLoop(e) => &e.attrs,
+        Expr::Group(e) => &e.attrs,
+        Expr::If(e) => &e.attrs,
+        Expr::Index(e) => &e.attrs,
+        Expr::Infer(e) => &e.attrs,
+        Expr::Let(e) => &e.attrs,
+        Expr::Lit(e) => &e.attrs,
+        Expr::Loop(e) => &e.attrs,
+        Expr::Macro(e) => &e.attrs,
+        Expr::Match(e) => &e.attrs,
+        Expr::MethodCall(e) => &e.attrs,
+        Expr::Paren(e) => &e.attrs,
+        Expr::Path(e) => &e.attrs,
+        Expr::Range(e) => &e.attrs,
+        Expr::RawAddr(e) => &e.attrs,
+        Expr::Reference(e) => &e.attrs,
+        Expr::Repeat(e) => &e.attrs,
+        Expr::Return(e) => &e.attrs,
+        Expr::Struct(e) => &e.attrs,
+        Expr::Try(e) => &e.attrs,
+        Expr::TryBlock(e) => &e.attrs,
+        Expr::Tuple(e) => &e.attrs,
+        Expr::Unary(e) => &e.attrs,
+        Expr::Unsafe(e) => &e.attrs,
+        Expr::While(e) => &e.attrs,
+        Expr::Yield(e) => &e.attrs,
+        _ => &[],
+    }
+}
+
+/// Whether an item is test-only.
+pub(crate) fn item_test_only(item: &Item) -> bool {
+    let (attrs, is_fn): (&[Attribute], bool) = match item {
+        Item::Const(i) => (&i.attrs, false),
+        Item::Enum(i) => (&i.attrs, false),
+        Item::ExternCrate(i) => (&i.attrs, false),
+        Item::Fn(i) => (&i.attrs, true),
+        Item::ForeignMod(i) => (&i.attrs, false),
+        Item::Impl(i) => (&i.attrs, false),
+        Item::Macro(i) => (&i.attrs, false),
+        Item::Mod(i) => (&i.attrs, false),
+        Item::Static(i) => (&i.attrs, false),
+        Item::Struct(i) => (&i.attrs, false),
+        Item::Trait(i) => (&i.attrs, false),
+        Item::TraitAlias(i) => (&i.attrs, false),
+        Item::Type(i) => (&i.attrs, false),
+        Item::Union(i) => (&i.attrs, false),
+        Item::Use(i) => (&i.attrs, false),
+        _ => (&[], false),
+    };
+    attrs_test_only(attrs, is_fn)
+}
+
+/// Whether an impl item is test-only.
+fn impl_item_test_only(item: &ImplItem) -> bool {
+    match item {
+        ImplItem::Const(i) => attrs_test_only(&i.attrs, false),
+        ImplItem::Fn(i) => attrs_test_only(&i.attrs, true),
+        ImplItem::Type(i) => attrs_test_only(&i.attrs, false),
+        ImplItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        _ => false,
+    }
+}
+
+/// Whether a trait item is test-only.
+fn trait_item_test_only(item: &TraitItem) -> bool {
+    match item {
+        TraitItem::Const(i) => attrs_test_only(&i.attrs, false),
+        TraitItem::Fn(i) => attrs_test_only(&i.attrs, true),
+        TraitItem::Type(i) => attrs_test_only(&i.attrs, false),
+        TraitItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        _ => false,
+    }
+}
+
+/// Whether a foreign item is test-only.
+fn foreign_item_test_only(item: &ForeignItem) -> bool {
+    match item {
+        ForeignItem::Fn(i) => attrs_test_only(&i.attrs, false),
+        ForeignItem::Static(i) => attrs_test_only(&i.attrs, false),
+        ForeignItem::Type(i) => attrs_test_only(&i.attrs, false),
+        ForeignItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        _ => false,
+    }
+}
+
+/// End index of the whole item a flat test-only attribute gates, if any.
+///
+/// `toks[start..]` follows the attribute. The item runs to the first top-level
+/// `;` or brace group and must parse as one item; a `cfg` gates any item, a
+/// bare `test` only a function. Anything else is not exempted.
+fn gated_item_end(meta: &Meta, toks: &[TokenTree], start: usize) -> Option<usize> {
+    let cfg = meta_is_test_cfg(meta);
+    let bare_test = matches!(meta, Meta::Path(path) if path.is_ident("test"));
+    if !(cfg || bare_test) {
+        return None;
+    }
+    let rest = toks.get(start..)?;
+    let last = rest.iter().position(|tok| {
+        is_punct(tok, ';')
+            || matches!(tok, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)
+    })?;
+    let item: TokenStream = rest.get(..=last)?.iter().cloned().collect();
+    let item = syn::parse2::<Item>(item).ok()?;
+    (cfg || matches!(item, Item::Fn(_))).then_some(start.saturating_add(last).saturating_add(1))
+}
+
+/// Visitor state for one file.
+#[derive(Default)]
+struct Scanner {
+    hits: Vec<Hit>,
+    test_path_includes: Vec<TestPathInclude>,
+    included_sources: Vec<IncludedSource>,
+    /// Names of the inline modules enclosing the current node, outermost first.
+    inline_mods: Vec<String>,
+    /// Whether the attributes being visited decorate an inline module.
+    relocating_inline_mod: bool,
+}
+
+impl Scanner {
+    fn hit(&mut self, line: usize, tok: String) {
+        self.hits.push(Hit { line, tok });
+    }
+
+    fn refuse(&mut self, line: usize, form: IncludeForm, target: IncludeTarget) {
+        self.test_path_includes
+            .push(TestPathInclude { line, form, target });
+    }
+
+    /// Judge a string-literal source and record it as legal or refused.
+    fn source(&mut self, form: IncludeForm, lit: &LitStr) {
+        let line = lit.span().start().line;
+        if !lit.suffix().is_empty() {
+            self.refuse(line, form, IncludeTarget::Opaque(lit.token().to_string()));
+            return;
+        }
+        let literal = lit.value();
+        if form == IncludeForm::PathAttr && self.relocating_inline_mod {
+            self.refuse(
+                line,
+                form,
+                IncludeTarget::Refused {
+                    path: literal,
+                    reason: PathRefusal::InlineModule,
+                },
+            );
+            return;
+        }
+        match judge_literal(&literal) {
+            Ok(()) => self.included_sources.push(IncludedSource {
+                line,
+                form,
+                literal,
+                inline_mods: self.inline_mods.clone(),
+            }),
+            Err(target) => self.refuse(line, form, target),
+        }
+    }
+
+    /// Visit a meta parsed locally rather than borrowed from the file's tree.
+    fn visit_owned_meta(&mut self, meta: &Meta) {
+        Visit::visit_meta(self, meta);
+    }
+
+    /// Visit the attributes a `cfg_attr` applies unless its predicate is test-only.
+    fn cfg_attr(&mut self, list: &MetaList) {
+        let mut operands = split_top_level_commas(&list.tokens).into_iter();
+        let Some(pred) = operands.next() else {
+            return;
+        };
+        if cfg_pred_is_test_only(&pred) {
+            return;
+        }
+        for operand in operands {
+            if operand.is_empty() {
+                continue;
+            }
+            match syn::parse2::<Meta>(operand.clone()) {
+                Ok(meta) => self.visit_owned_meta(&meta),
+                Err(_) => self.refuse(
+                    path_line(&list.path),
+                    IncludeForm::PathAttr,
+                    IncludeTarget::Opaque(operand.to_string()),
+                ),
+            }
+        }
+    }
+
+    /// Judge the arguments of an `include!` invocation.
+    fn include_args(&mut self, line: usize, args: &TokenStream) {
+        match syn::parse2::<LitStr>(args.clone()) {
+            Ok(lit) => self.source(IncludeForm::IncludeMacro, &lit),
+            Err(_) => self.refuse(
+                line,
+                IncludeForm::IncludeMacro,
+                IncludeTarget::Opaque(args.to_string()),
+            ),
+        }
+    }
+
+    /// Refuse a renamed or re-exported `include` macro.
+    fn aliased(&mut self, line: usize) {
+        self.refuse(
+            line,
+            IncludeForm::IncludeMacro,
+            IncludeTarget::Aliased(INCLUDE_MACRO.to_owned()),
+        );
+    }
+
+    /// Record banned names a `use` tree imports under another name or path.
+    fn use_tree(&mut self, tree: &UseTree, parent: Option<&Ident>, exported: bool) {
+        let under_process = parent.is_some_and(|p| name_of(p) == "process");
+        match tree {
+            UseTree::Path(p) => self.use_tree(&p.tree, Some(&p.ident), exported),
+            UseTree::Name(n) => {
+                let name = name_of(&n.ident);
+                let line = line_of(&n.ident);
+                if under_process && PROCESS_FNS.contains(&name.as_str()) {
+                    self.hit(line, format!("process::{name}"));
+                }
+                if exported && name == INCLUDE_MACRO {
+                    self.aliased(line);
+                }
+            }
+            UseTree::Rename(r) => {
+                let name = name_of(&r.ident);
+                let line = line_of(&r.ident);
+                if under_process && PROCESS_FNS.contains(&name.as_str()) {
+                    self.hit(line, format!("process::{name}"));
+                }
+                let banned = [MACROS, METHODS, FNS]
+                    .iter()
+                    .any(|names| names.contains(&name.as_str()));
+                if banned {
+                    self.hit(line, format!("{name} as {}", name_of(&r.rename)));
+                }
+                if name == INCLUDE_MACRO {
+                    self.aliased(line);
+                }
+            }
+            UseTree::Glob(g) => {
+                if under_process {
+                    let line = g.star_token.spans.first().map_or(0, |s| s.start().line);
+                    self.hit(line, "process::*".to_owned());
+                }
+            }
+            UseTree::Group(g) => {
+                for item in &g.items {
+                    self.use_tree(item, parent, exported);
+                }
+            }
+        }
+    }
+
+    /// Scan tokens that have no syntax tree, such as a macro body.
+    fn flat_scan(&mut self, ts: &TokenStream) {
+        let toks: Vec<TokenTree> = ts.clone().into_iter().collect();
+        let mut i = 0_usize;
+        while let Some(tok) = toks.get(i) {
+            let next = i.saturating_add(1);
+            i = match tok {
+                TokenTree::Punct(p) if p.as_char() == '#' => {
+                    let inner = toks.get(next).is_some_and(|t| is_punct(t, '!'));
+                    let at = if inner { next.saturating_add(1) } else { next };
+                    match toks.get(at) {
+                        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket => {
+                            let after = at.saturating_add(1);
+                            self.flat_attr(&g.stream(), inner, &toks, after)
+                                .unwrap_or(after)
+                        }
+                        _ => next,
+                    }
+                }
+                TokenTree::Punct(p) if p.as_char() == '.' => {
+                    if let Some(TokenTree::Ident(m)) = toks.get(next) {
+                        let name = name_of(m);
+                        if METHODS.contains(&name.as_str())
+                            && opens_call(toks.get(next.saturating_add(1)))
+                        {
+                            self.hit(line_of(m), format!(".{name}()"));
+                        }
+                    }
+                    next
+                }
+                TokenTree::Punct(p) if p.as_char() == ':' => {
+                    let colon = toks.get(next).is_some_and(|t| is_punct(t, ':'));
+                    if let (true, Some(TokenTree::Ident(m))) =
+                        (colon, toks.get(next.saturating_add(1)))
+                    {
+                        let name = name_of(m);
+                        if METHODS.contains(&name.as_str())
+                            && opens_call(toks.get(next.saturating_add(2)))
+                        {
+                            self.hit(line_of(m), format!("::{name}()"));
+                        }
+                    }
+                    next
+                }
+                TokenTree::Punct(_) | TokenTree::Literal(_) => next,
+                TokenTree::Ident(id) => {
+                    self.flat_ident(id, &toks, next);
+                    next
+                }
+                TokenTree::Group(g) => {
+                    self.flat_scan(&g.stream());
+                    next
+                }
+            };
+        }
+    }
+
+    /// Handle a flat `#[…]` or `#![…]` body; returns the index to resume at
+    /// when the attribute gates a whole test-only item.
+    fn flat_attr(
+        &mut self,
+        body: &TokenStream,
+        inner: bool,
+        toks: &[TokenTree],
+        next: usize,
+    ) -> Option<usize> {
+        if let Ok(meta) = syn::parse2::<Meta>(body.clone()) {
+            if !inner {
+                if let Some(end) = gated_item_end(&meta, toks, next) {
+                    return Some(end);
+                }
+            }
+            self.visit_owned_meta(&meta);
+            return None;
+        }
+        match body.clone().into_iter().next() {
+            Some(TokenTree::Ident(id)) if id == PATH_ATTR || id == CFG_ATTR => {
+                self.refuse(
+                    line_of(&id),
+                    IncludeForm::PathAttr,
+                    IncludeTarget::Opaque(body.to_string()),
+                );
+            }
+            _ => self.flat_scan(body),
+        }
+        None
+    }
+
+    /// Check one flat identifier against the banned and source-naming forms.
+    fn flat_ident(&mut self, id: &Ident, toks: &[TokenTree], next: usize) {
+        let name = name_of(id);
+        let line = line_of(id);
+        let after = toks.get(next);
+        let second = toks.get(next.saturating_add(1));
+        let bang = after.is_some_and(|t| is_punct(t, '!'));
+        if bang && MACROS.contains(&name.as_str()) {
+            self.hit(line, format!("{name}!"));
+        } else if name == INCLUDE_MACRO {
+            if bang {
+                match second {
+                    Some(TokenTree::Group(g)) => self.include_args(line, &g.stream()),
+                    _ => self.refuse(
+                        line,
+                        IncludeForm::IncludeMacro,
+                        IncludeTarget::Opaque(INCLUDE_MACRO.to_owned()),
+                    ),
+                }
+            } else if matches!(after, Some(TokenTree::Ident(a)) if a == "as") {
+                self.aliased(line);
+            }
+        } else if FNS.contains(&name.as_str())
+            && matches!(after, Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+        {
+            self.hit(line, format!("{name}()"));
+        } else if name == "process"
+            && after.is_some_and(|t| is_punct(t, ':'))
+            && second.is_some_and(|t| is_punct(t, ':'))
+        {
+            if let Some(TokenTree::Ident(f)) = toks.get(next.saturating_add(2)) {
+                let fname = name_of(f);
+                if PROCESS_FNS.contains(&fname.as_str()) {
+                    self.hit(line_of(f), format!("process::{fname}"));
+                }
+            }
+        } else if name == "mod" {
+            if let (Some(TokenTree::Ident(m)), Some(semi)) = (after, second) {
+                let module = name_of(m);
+                if is_punct(semi, ';') && module.eq_ignore_ascii_case(TESTS_MODULE) {
+                    self.refuse(
+                        line_of(m),
+                        IncludeForm::ModDecl,
+                        IncludeTarget::TestPath(module),
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Scanner {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if item_test_only(item) {
+            return;
+        }
+        match item {
+            Item::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if impl_item_test_only(item) {
+            return;
+        }
+        match item {
+            ImplItem::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_impl_item(self, item),
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        if trait_item_test_only(item) {
+            return;
+        }
+        match item {
+            TraitItem::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_trait_item(self, item),
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
+        if foreign_item_test_only(item) {
+            return;
+        }
+        match item {
+            ForeignItem::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_foreign_item(self, item),
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if attrs_test_only(expr_attrs(expr), false) {
+            return;
+        }
+        match expr {
+            Expr::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_expr(self, expr),
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast Pat) {
+        match pat {
+            Pat::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_pat(self, pat),
+        }
+    }
+
+    fn visit_type(&mut self, ty: &'ast Type) {
+        match ty {
+            Type::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_type(self, ty),
+        }
+    }
+
+    fn visit_type_param_bound(&mut self, bound: &'ast TypeParamBound) {
+        match bound {
+            TypeParamBound::Verbatim(ts) => self.flat_scan(ts),
+            _ => visit::visit_type_param_bound(self, bound),
+        }
+    }
+
+    fn visit_arm(&mut self, arm: &'ast Arm) {
+        if !attrs_test_only(&arm.attrs, false) {
+            visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast FieldValue) {
+        if !attrs_test_only(&field.attrs, false) {
+            visit::visit_field_value(self, field);
+        }
+    }
+
+    fn visit_field(&mut self, field: &'ast Field) {
+        if !attrs_test_only(&field.attrs, false) {
+            visit::visit_field(self, field);
+        }
+    }
+
+    fn visit_variant(&mut self, variant: &'ast Variant) {
+        if !attrs_test_only(&variant.attrs, false) {
+            visit::visit_variant(self, variant);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        if !attrs_test_only(&local.attrs, false) {
+            visit::visit_local(self, local);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, stmt: &'ast StmtMacro) {
+        if !attrs_test_only(&stmt.attrs, false) {
+            visit::visit_stmt_macro(self, stmt);
+        }
+    }
+
+    fn visit_item_mod(&mut self, module: &'ast ItemMod) {
+        let relocating =
+            std::mem::replace(&mut self.relocating_inline_mod, module.content.is_some());
+        for attr in &module.attrs {
+            self.visit_attribute(attr);
+        }
+        self.relocating_inline_mod = relocating;
+        let name = name_of(&module.ident);
+        match &module.content {
+            None => {
+                if name.eq_ignore_ascii_case(TESTS_MODULE) {
+                    self.refuse(
+                        line_of(&module.ident),
+                        IncludeForm::ModDecl,
+                        IncludeTarget::TestPath(name),
+                    );
+                }
+            }
+            Some((_, items)) => {
+                self.inline_mods.push(name);
+                for item in items {
+                    self.visit_item(item);
+                }
+                self.inline_mods.pop();
+            }
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if let Some(seg) = mac.path.segments.last() {
+            let name = name_of(&seg.ident);
+            let line = line_of(&seg.ident);
+            if MACROS.contains(&name.as_str()) {
+                self.hit(line, format!("{name}!"));
+            } else if name == INCLUDE_MACRO {
+                self.include_args(line, &mac.tokens);
+            }
+        }
+        visit::visit_macro(self, mac);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        let name = name_of(&call.method);
+        if METHODS.contains(&name.as_str()) {
+            self.hit(line_of(&call.method), format!(".{name}()"));
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
+        if let Some(seg) = expr.path.segments.last() {
+            let name = name_of(&seg.ident);
+            let qualified = expr.qself.is_some() || expr.path.segments.len() >= 2;
+            if qualified && METHODS.contains(&name.as_str()) {
+                self.hit(line_of(&seg.ident), format!("::{name}()"));
+            } else if FNS.contains(&name.as_str()) {
+                self.hit(line_of(&seg.ident), format!("{name}()"));
+            }
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
+    fn visit_path(&mut self, path: &'ast Path) {
+        let names: Vec<(String, usize)> = path
+            .segments
+            .iter()
+            .map(|seg| (name_of(&seg.ident), line_of(&seg.ident)))
+            .collect();
+        for pair in names.windows(2) {
+            if let [(module, _), (func, line)] = pair {
+                if module == "process" && PROCESS_FNS.contains(&func.as_str()) {
+                    self.hit(*line, format!("process::{func}"));
+                }
+            }
+        }
+        visit::visit_path(self, path);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        let exported = !matches!(item.vis, Visibility::Inherited);
+        self.use_tree(&item.tree, None, exported);
+        visit::visit_item_use(self, item);
+    }
+
+    fn visit_meta(&mut self, meta: &'ast Meta) {
+        match meta {
+            Meta::NameValue(nv) if nv.path.is_ident(PATH_ATTR) => match &nv.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(lit), ..
+                }) => self.source(IncludeForm::PathAttr, lit),
+                other => self.refuse(
+                    path_line(&nv.path),
+                    IncludeForm::PathAttr,
+                    IncludeTarget::Opaque(describe(other)),
+                ),
+            },
+            Meta::List(list) if list.path.is_ident(CFG_ATTR) => self.cfg_attr(list),
+            _ => visit::visit_meta(self, meta),
+        }
+    }
+
+    fn visit_token_stream(&mut self, tokens: &'ast TokenStream) {
+        self.flat_scan(tokens);
+    }
 }
 
 /// True when the [`AUDIT_MARKER`] annotates the construct on the 1-based `line`.
@@ -180,35 +948,6 @@ fn is_annotation_line(text: &str) -> bool {
     t.starts_with("//") || t.starts_with("#[")
 }
 
-/// True when an attribute's bracket body (the tokens inside `#[ … ]`) gates its
-/// item to test-only compilation, so the item body is test code the production
-/// scan must not recurse into. Two cases are honoured:
-///
-/// * `#[test]` — the body is exactly the `test` identifier.
-/// * `#[cfg(P)]` where the predicate `P` *implies* `test` — the item is present
-///   only when the `test` cfg is active. To keep this a sound production gate,
-///   only predicates that are *guaranteed* test-only qualify: a bare `test`, or
-///   an `all(…)` (possibly nested) with `test` as a direct positive conjunct
-///   (`cfg(all(test, unix))`, `cfg(all(test, feature = "x"))`, …). `any(…)`,
-///   `not(…)`, and `test` appearing only inside a string literal or as a
-///   substring of another identifier are deliberately *not* treated as
-///   test-only — those items can compile in a production configuration, so
-///   skipping them would let a production panic hide behind a fake cfg.
-fn attr_gates_test_only(inner: &TokenStream) -> bool {
-    let toks: Vec<TokenTree> = inner.clone().into_iter().collect();
-    // Bare `#[test]`.
-    if let [TokenTree::Ident(id)] = toks.as_slice() {
-        return id == "test";
-    }
-    // `#[cfg( … )]`: recurse into the predicate.
-    if let [TokenTree::Ident(id), TokenTree::Group(g)] = toks.as_slice() {
-        if id == "cfg" && g.delimiter() == Delimiter::Parenthesis {
-            return cfg_pred_is_test_only(&g.stream());
-        }
-    }
-    false
-}
-
 /// True when a `cfg` predicate is guaranteed active only under the `test` cfg.
 ///
 /// Structural, not string-based: it inspects the predicate's own tokens so
@@ -219,7 +958,7 @@ fn attr_gates_test_only(inner: &TokenStream) -> bool {
 /// qualify, as does a nested `all(all(test), …)`). `any( … )` and `not( … )`
 /// never qualify: `any(test, X)` also compiles when `X` holds without `test`,
 /// and `not(test)` is production-only.
-fn cfg_pred_is_test_only(pred: &TokenStream) -> bool {
+pub(crate) fn cfg_pred_is_test_only(pred: &TokenStream) -> bool {
     let toks: Vec<TokenTree> = pred.clone().into_iter().collect();
     // Bare `test`.
     if let [TokenTree::Ident(id)] = toks.as_slice() {
@@ -240,7 +979,7 @@ fn cfg_pred_is_test_only(pred: &TokenStream) -> bool {
 /// Split a `cfg` operand list on top-level commas, returning each operand as its
 /// own token stream. Commas nested inside a delimiter group (an inner
 /// `all(a, b)`, `any(…)`, or a `feature = "…"` value) are not split points.
-fn split_top_level_commas(ts: &TokenStream) -> Vec<TokenStream> {
+pub(crate) fn split_top_level_commas(ts: &TokenStream) -> Vec<TokenStream> {
     let mut operands = Vec::new();
     let mut current: Vec<TokenTree> = Vec::new();
     for tt in ts.clone() {
@@ -255,139 +994,6 @@ fn split_top_level_commas(ts: &TokenStream) -> Vec<TokenStream> {
         operands.push(current.into_iter().collect());
     }
     operands
-}
-
-fn scan_stream(ts: TokenStream, hits: &mut Vec<Hit>) {
-    let toks: Vec<TokenTree> = ts.into_iter().collect();
-    // When we pass a test-only attribute (`#[test]` or a `#[cfg(…)]` implying
-    // `test`), the brace body of the item it decorates is test code and is not
-    // recursed into. The flag is armed by the attribute and disarmed by the
-    // item's brace body — or by a top-level `;` that ends a *braceless* item
-    // (`#[cfg(test)] const N: u32 = 1;`, `#[cfg(test)] use x;`) before any
-    // brace, so the flag can never swallow the body of a following *sibling*
-    // production item.
-    let mut skip_next_brace = false;
-
-    for i in 0..toks.len() {
-        match &toks[i] {
-            // Attribute: `#` then a `[ … ]` group that gates its item to
-            // test-only compilation (`#[test]` or a `#[cfg(…)]` implying `test`).
-            TokenTree::Punct(p) if p.as_char() == '#' => {
-                if let Some(TokenTree::Group(g)) = toks.get(i + 1) {
-                    if g.delimiter() == Delimiter::Bracket && attr_gates_test_only(&g.stream()) {
-                        skip_next_brace = true;
-                    }
-                }
-            }
-
-            // A top-level `;` ends a braceless item: disarm so the skip flag
-            // never reaches a later sibling's brace body.
-            TokenTree::Punct(p) if p.as_char() == ';' => {
-                skip_next_brace = false;
-            }
-
-            // Macro invocation: Ident(name) immediately followed by `!`.
-            TokenTree::Ident(id) if MACROS.contains(&id.to_string().as_str()) => {
-                if let Some(TokenTree::Punct(bang)) = toks.get(i + 1) {
-                    if bang.as_char() == '!' {
-                        hits.push(Hit {
-                            line: id.span().start().line,
-                            tok: format!("{id}!"),
-                        });
-                    }
-                }
-            }
-
-            // Free-function call: `panic_any(` / `unreachable_unchecked(`.
-            TokenTree::Ident(id) if FNS.contains(&id.to_string().as_str()) => {
-                if let Some(TokenTree::Group(g)) = toks.get(i + 1) {
-                    if g.delimiter() == Delimiter::Parenthesis {
-                        hits.push(Hit {
-                            line: id.span().start().line,
-                            tok: id.to_string(),
-                        });
-                    }
-                }
-            }
-
-            // Path call: `process :: (abort|exit) (`.
-            TokenTree::Ident(id) if id == "process" => {
-                if let (
-                    Some(TokenTree::Punct(c1)),
-                    Some(TokenTree::Punct(c2)),
-                    Some(TokenTree::Ident(f)),
-                ) = (toks.get(i + 1), toks.get(i + 2), toks.get(i + 3))
-                {
-                    let fname = f.to_string();
-                    if c1.as_char() == ':'
-                        && c2.as_char() == ':'
-                        && PROCESS_FNS.contains(&fname.as_str())
-                    {
-                        hits.push(Hit {
-                            line: f.span().start().line,
-                            tok: format!("process::{fname}"),
-                        });
-                    }
-                }
-            }
-
-            // Method call/turbofish: `. ident ( … )` or `. ident :: < … >`.
-            TokenTree::Punct(dot) if dot.as_char() == '.' => {
-                if let Some(TokenTree::Ident(id)) = toks.get(i + 1) {
-                    if METHODS.contains(&id.to_string().as_str()) {
-                        let is_call = match toks.get(i + 2) {
-                            Some(TokenTree::Group(g)) => g.delimiter() == Delimiter::Parenthesis,
-                            Some(TokenTree::Punct(p)) => p.as_char() == ':',
-                            _ => false,
-                        };
-                        if is_call {
-                            hits.push(Hit {
-                                line: id.span().start().line,
-                                tok: format!(".{id}()"),
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Fully-qualified / UFCS call: `… :: <method> ( … )` — the same
-            // panicking method reached through a type path (`Result::unwrap(x)`,
-            // `Option::expect(o, m)`, `std::result::Result::unwrap(x)`) rather
-            // than receiver syntax. Keyed on the trailing `:: <method> (` so any
-            // path depth is covered; the two-colon shape distinguishes it from a
-            // method call (no leading `::`) and never double-counts `x.unwrap()`.
-            TokenTree::Punct(c1) if c1.as_char() == ':' => {
-                if let (Some(TokenTree::Punct(c2)), Some(TokenTree::Ident(id))) =
-                    (toks.get(i + 1), toks.get(i + 2))
-                {
-                    if c2.as_char() == ':' && METHODS.contains(&id.to_string().as_str()) {
-                        let is_call = match toks.get(i + 3) {
-                            Some(TokenTree::Group(g)) => g.delimiter() == Delimiter::Parenthesis,
-                            Some(TokenTree::Punct(p)) => p.as_char() == ':',
-                            _ => false,
-                        };
-                        if is_call {
-                            hits.push(Hit {
-                                line: id.span().start().line,
-                                tok: format!("::{id}()"),
-                            });
-                        }
-                    }
-                }
-            }
-
-            _ => {}
-        }
-
-        // Recurse into groups, skipping a test item body.
-        if let TokenTree::Group(g) = &toks[i] {
-            if skip_next_brace && g.delimiter() == Delimiter::Brace {
-                skip_next_brace = false;
-            } else {
-                scan_stream(g.stream(), hits);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -553,5 +1159,89 @@ fn f() {
                 .map(|h| (h.line, h.tok.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Lines of every hit in `src`, or an empty list when `src` does not parse.
+    fn hit_lines(src: &str) -> Vec<usize> {
+        scan_str(src)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.line)
+            .collect()
+    }
+
+    /// A test-only attribute exempts only its own node: a sibling separated by
+    /// `,` or `;` is still production code.
+    #[test]
+    fn test_cfg_never_leaks_past_its_node() {
+        let cases: [(&str, usize); 5] = [
+            (
+                "fn f(o: Option<u8>) -> u8 {\n    match 1 {\n        #[cfg(test)]\n        0 => 0,\n        _ => o.unwrap(),\n    }\n}\n",
+                5,
+            ),
+            (
+                "fn f(o: Option<u8>) -> S {\n    S {\n        #[cfg(test)]\n        a: 0,\n        b: o.unwrap(),\n    }\n}\n",
+                5,
+            ),
+            (
+                "fn f(o: Option<u8>) -> [u8; 2] {\n    [\n        #[cfg(test)]\n        0,\n        o.unwrap(),\n    ]\n}\n",
+                5,
+            ),
+            (
+                "fn f(o: Option<u8>) {\n    #[cfg(test)]\n    let a = 0;\n    let b = o.unwrap();\n}\n",
+                4,
+            ),
+            (
+                "fn f(o: Option<u8>) {\n    #[cfg(test)]\n    g();\n    o.unwrap();\n}\n",
+                4,
+            ),
+        ];
+        for (src, line) in cases {
+            assert_eq!(hit_lines(src), vec![line], "leak in:\n{src}");
+        }
+    }
+
+    /// A test-only attribute exempts the whole node it decorates.
+    #[test]
+    fn test_cfg_exempts_its_own_node() {
+        let cases = [
+            "fn f(o: Option<u8>) -> u8 {\n    match 1 {\n        #[cfg(test)]\n        0 => o.unwrap(),\n        _ => 0,\n    }\n}\n",
+            "fn f(o: Option<u8>) -> S {\n    S {\n        #[cfg(test)]\n        a: o.unwrap(),\n    }\n}\n",
+            "fn f(o: Option<u8>) {\n    #[cfg(test)]\n    let a = o.unwrap();\n}\n",
+            "#![cfg(test)]\nfn f(o: Option<u8>) {\n    o.unwrap();\n}\n",
+            "impl S {\n    #[test]\n    fn t() {\n        panic!();\n    }\n}\n",
+        ];
+        for src in cases {
+            assert!(scan_str(src).is_ok(), "must parse:\n{src}");
+            assert_eq!(hit_lines(src), Vec::<usize>::new(), "not exempt:\n{src}");
+        }
+    }
+
+    /// Macro bodies are scanned flat; a test-only attribute there exempts only
+    /// a whole item.
+    #[test]
+    fn macro_bodies_are_scanned_flat() {
+        let leak = "macro_rules! m {\n    () => {\n        #[cfg(test)] 0, o.unwrap()\n    };\n}\n";
+        assert_eq!(hit_lines(leak), vec![3]);
+        let item = "macro_rules! m {\n    () => {\n        #[cfg(test)]\n        fn t() { o.unwrap(); }\n    };\n}\n";
+        assert_eq!(hit_lines(item), Vec::<usize>::new());
+    }
+
+    /// A banned function imported under another name is a hit at the import.
+    #[test]
+    fn renamed_banned_names_are_hits() {
+        for src in [
+            "use std::process::exit as leave;\n",
+            "use std::process::*;\n",
+            "use std::panic::panic_any as boom;\n",
+        ] {
+            assert_eq!(hit_lines(src), vec![1], "missed:\n{src}");
+        }
+    }
+
+    /// Source that does not parse is an error, never an empty clean scan.
+    #[test]
+    fn unparseable_source_is_an_error() {
+        assert!(scan_str("fn f( {").is_err());
     }
 }

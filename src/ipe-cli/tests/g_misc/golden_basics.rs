@@ -77,7 +77,7 @@ fn end_to_end_builds_and_prints_one() {
     // Build OUTSIDE the workspace tree: an emitted project under the workspace's
     // own target/ dir is (correctly) rejected by cargo as a non-member package,
     // and the golden Cargo.toml carries no detaching `[workspace]` stanza.
-    let out = std::env::temp_dir().join("ipec_m0_e2e");
+    let out = crate::support::scratch_root().join("ipec_m0_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

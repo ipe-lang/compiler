@@ -33,7 +33,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Emit `ipe_source` for shape `name` and `cargo build` the emitted crate.
 /// Returns `Ok(())` iff `ipe` exits 0 AND the emitted crate builds — THE SEAL.
 fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
-    let src_dir = std::env::temp_dir().join(format!("seal_modset_{name}_ipe"));
+    let src_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_ipe"));
     let _ = std::fs::remove_dir_all(&src_dir);
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| -> BoxError { format!("{name}: cannot create src dir: {e}").into() })?;
@@ -42,7 +43,8 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
     std::fs::write(&entry, ipe_source)
         .map_err(|e| -> BoxError { format!("{name}: cannot write Main.ipe: {e}").into() })?;
 
-    let out_dir = std::env::temp_dir().join(format!("seal_modset_{name}_emitted"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime()
@@ -68,7 +70,8 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
 /// items, causing E0425/E0412 at `cargo build` despite `ipe` exit 0 — a SEAL
 /// breach that the default dep-model tests cannot catch.
 fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError> {
-    let src_dir = std::env::temp_dir().join(format!("seal_modset_{name}_ipe"));
+    let src_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_ipe"));
     let _ = std::fs::remove_dir_all(&src_dir);
     std::fs::create_dir_all(&src_dir)
         .map_err(|e| -> BoxError { format!("{name}: cannot create src dir: {e}").into() })?;
@@ -77,7 +80,8 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
     std::fs::write(&entry, ipe_source)
         .map_err(|e| -> BoxError { format!("{name}: cannot write Main.ipe: {e}").into() })?;
 
-    let out_dir = std::env::temp_dir().join(format!("seal_modset_{name}_emitted"));
+    let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = ipe::resolve_runtime()
@@ -227,7 +231,7 @@ const AUTHED_ROUTE: &str = include_str!(concat!(
 ///
 /// Under the vendored emit model the emitted `ipe_runtime/mod.rs` is a trimmed
 /// subset of the full runtime `mod.rs`. The runtime `db.rs` calls
-/// `crate::ssrf::VettedDial::for_host` in its `build_pool` function
+/// `crate::ssrf::VettedDial` in `VettedPool::connect`
 /// unconditionally (production code, not test-only), and `external_conn.rs` calls
 /// `crate::dsn::{Dsn, DsnDriver}` and `crate::ssrf::VettedDial`. Without `ssrf`,
 /// `dsn`, and `external_conn` appended to the vendored `mod.rs` whenever `uses_db`
@@ -354,7 +358,7 @@ fn authed_route_vendored_builds() {
 
 /// Under the vendored emit model an authed-route + Db-store program
 /// (`Server.getAuthed` + `Store.allAs`) must cargo-build. The runtime `db.rs`
-/// calls `crate::ssrf::VettedDial::for_host` in `build_pool` (production, not
+/// calls `crate::ssrf::VettedDial` in `VettedPool::connect` (production, not
 /// test-only); `external_conn.rs` calls `crate::dsn::{Dsn, DsnDriver}` and
 /// `crate::ssrf::VettedDial`. Without `ssrf`, `dsn`, and `external_conn`
 /// appended to the vendored `mod.rs` under `uses_db`, the emitted crate fails

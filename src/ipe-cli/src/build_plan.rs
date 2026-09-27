@@ -14,6 +14,8 @@ use std::fmt;
 
 use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
 
+use crate::text;
+
 /// The user's allocator choice before AUTO resolution — a closed enum.
 ///
 /// [`Self::parse`] rejects anything outside it (including `jemalloc` /
@@ -24,8 +26,10 @@ pub enum AllocatorChoice {
     /// Resolve by target: musl-static → dlmalloc.
     #[default]
     Auto,
-    /// The target libc's malloc. On musl this is the 0.14× throughput cliff
-    /// and requires the explicit acknowledgment key.
+    /// The target libc's malloc — honoured as asked.
+    ///
+    /// On musl it is several times slower on allocation-heavy work than the dlmalloc default, which
+    /// the `--allocator` help states; choosing it is the acknowledgment.
     System,
     /// Pure-Rust dlmalloc (the static default).
     Dlmalloc,
@@ -66,9 +70,6 @@ pub struct StaticRequestLayer {
     pub target: Option<String>,
     /// `--allocator` / `IPE_ALLOC` / `[rust] allocator`.
     pub allocator: Option<AllocatorChoice>,
-    /// `--allow-slow-allocator` / `[rust] allowSlowAllocator` — the second
-    /// key of the two-key musl-malloc-cliff acknowledgment.
-    pub allow_slow_allocator: Option<bool>,
     /// `--cfree` / `IPE_CFREE` / `[rust] cFree` — request a build that links
     /// no C. Resolved into [`CProfile::CFree`], where no C-requiring allocator
     /// can be paired with it.
@@ -83,7 +84,6 @@ impl StaticRequestLayer {
             static_build: self.static_build.or(weaker.static_build),
             target: self.target.or(weaker.target),
             allocator: self.allocator.or(weaker.allocator),
-            allow_slow_allocator: self.allow_slow_allocator.or(weaker.allow_slow_allocator),
             c_free: self.c_free.or(weaker.c_free),
         }
     }
@@ -112,7 +112,6 @@ pub fn env_layer() -> Result<StaticRequestLayer, Refusal> {
         static_build,
         target,
         allocator,
-        allow_slow_allocator: None,
         c_free,
     })
 }
@@ -146,9 +145,6 @@ pub enum Refusal {
     /// A non-default allocator was requested for a dynamic build — dynamic
     /// allocator selection is not a wired path.
     AllocatorRequiresStatic { got: AllocatorChoice },
-    /// `system` malloc on a musl target without the acknowledgment key: the
-    /// 0.14× cliff must be constructible only on purpose, by two keys.
-    MuslMallocCliff,
     /// talc as a hosted `#[global_allocator]` needs an unsafe static arena
     /// with a hard heap cap — deferred until an arena design passes the
     /// no-unsafe gate (design amendment A1).
@@ -178,71 +174,34 @@ pub enum Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownAllocator { got } => write!(
-                f,
-                "unknown allocator {got:?} — expected one of: auto, system, dlmalloc, talc, mimalloc"
+        let message = match self {
+            Self::UnknownAllocator { got } => text::unknown_allocator(&format_args!("{got:?}")),
+            Self::UnknownStaticTarget { got } => text::unknown_static_target(
+                &format_args!("{got:?}"),
+                &StaticTriple::SUPPORTED.join(", "),
             ),
-            Self::UnknownStaticTarget { got } => write!(
-                f,
-                "{got:?} is not a supported static target — supported: {}",
-                StaticTriple::SUPPORTED.join(", ")
-            ),
-            Self::TargetRequiresStatic { got } => write!(
-                f,
-                "--target {got} requires --static (cross-compiling a dynamic build is not supported)"
-            ),
-            Self::AllocatorRequiresStatic { got } => write!(
-                f,
-                "--allocator {got:?} requires --static (allocator selection applies to static builds)"
-            ),
-            Self::MuslMallocCliff => write!(
-                f,
-                "refusing system malloc on a musl-static target: musl's malloc is ~7x slower on \
-                 allocation-heavy workloads. Pass --allow-slow-allocator (or set \
-                 `Package.allowSlowAllocator True` in package.ipe) to accept, or drop \
-                 --allocator system to get the dlmalloc default"
-            ),
-            Self::TalcRequiresArenaDesign => write!(
-                f,
-                "the talc allocator is not wired yet: a hosted talc #[global_allocator] needs a \
-                 static arena design that has not landed. Use the dlmalloc default instead"
-            ),
-            Self::WebviewStatic => write!(
-                f,
-                "an Ipe.WebView app cannot be built --static: it links the system webview \
-                 (WebKit/WebView2), which has no static form"
-            ),
-            Self::TargetNotInstalled { triple } => write!(
-                f,
-                "the target {triple} is not installed — run: rustup target add {triple}"
-            ),
-            Self::MuslCCompilerMissing { triple } => write!(
-                f,
-                "no musl-capable C compiler found for {triple} (the emitted project's zstd/ring \
-                 dependencies compile C). Install one (Debian/Ubuntu: apt install musl-tools) or \
-                 set CC_{}",
-                triple.replace('-', "_")
-            ),
-            Self::AllocatorRequiresC { got } => write!(
-                f,
-                "--allocator {got:?} cannot combine with --cfree: {} links C. Drop --cfree, or \
-                 use the pure-Rust dlmalloc default",
-                match got {
-                    AllocatorChoice::Mimalloc => "mimalloc vendors and",
-                    _ => "the target libc's malloc",
-                }
-            ),
-            Self::CfreeNotYetWired => write!(
-                f,
-                "--cfree is not wired yet: the pure-Rust dependency swaps that make the default \
-                 emitted graph link no C (flate2/zstd codecs, a ring-free rustls provider) have \
-                 not landed, so the build would still pull C. Drop --cfree"
-            ),
-            Self::InvalidBool { source, got } => {
-                write!(f, "{source}: expected true/false/1/0, got {got:?}")
+            Self::TargetRequiresStatic { got } => text::target_requires_static(got),
+            Self::AllocatorRequiresStatic { got } => {
+                text::allocator_requires_static(&format_args!("{got:?}"))
             }
-        }
+            Self::TalcRequiresArenaDesign => text::talc_requires_arena_design().to_owned(),
+            Self::WebviewStatic => text::webview_static().to_owned(),
+            Self::TargetNotInstalled { triple } => text::target_not_installed(triple),
+            Self::MuslCCompilerMissing { triple } => {
+                text::musl_c_compiler_missing(triple, &triple.replace('-', "_"))
+            }
+            Self::AllocatorRequiresC {
+                got: got @ AllocatorChoice::Mimalloc,
+            } => text::mimalloc_requires_c(&format_args!("{got:?}")),
+            Self::AllocatorRequiresC { got } => {
+                text::libc_allocator_requires_c(&format_args!("{got:?}"))
+            }
+            Self::CfreeNotYetWired => text::cfree_not_yet_wired().to_owned(),
+            Self::InvalidBool { source, got } => {
+                text::invalid_bool(source, &format_args!("{got:?}"))
+            }
+        };
+        f.write_str(&message)
     }
 }
 
@@ -307,13 +266,8 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
         // clears the musl-malloc cliff.
         AllocatorChoice::Auto | AllocatorChoice::Dlmalloc => StaticAllocator::Dlmalloc,
         AllocatorChoice::Mimalloc => StaticAllocator::Mimalloc,
-        AllocatorChoice::System => {
-            if merged.allow_slow_allocator.unwrap_or(false) {
-                StaticAllocator::System
-            } else {
-                return Err(Refusal::MuslMallocCliff);
-            }
-        }
+        // An explicit `system` is the user's deliberate choice: honoured.
+        AllocatorChoice::System => StaticAllocator::System,
         AllocatorChoice::Talc => return Err(Refusal::TalcRequiresArenaDesign),
     };
 
@@ -425,13 +379,11 @@ mod tests {
         static_build: Option<bool>,
         target: Option<&str>,
         allocator: Option<AllocatorChoice>,
-        ack: Option<bool>,
     ) -> StaticRequestLayer {
         StaticRequestLayer {
             static_build,
             target: target.map(str::to_owned),
             allocator,
-            allow_slow_allocator: ack,
             c_free: None,
         }
     }
@@ -464,7 +416,7 @@ mod tests {
 
     #[test]
     fn auto_static_picks_musl_dlmalloc() {
-        let plan = resolve(&layer(Some(true), None, None, None));
+        let plan = resolve(&layer(Some(true), None, None));
         assert_eq!(
             plan,
             Ok(Some(with_libc(
@@ -476,35 +428,18 @@ mod tests {
 
     #[test]
     fn explicit_musl_target_accepted_unknown_target_refused() {
-        assert!(
-            resolve(&layer(
-                Some(true),
-                Some("x86_64-unknown-linux-musl"),
-                None,
-                None
-            ))
-            .is_ok()
-        );
-        assert!(
-            resolve(&layer(
-                Some(true),
-                Some("aarch64-unknown-linux-musl"),
-                None,
-                None
-            ))
-            .is_ok()
-        );
+        assert!(resolve(&layer(Some(true), Some("x86_64-unknown-linux-musl"), None)).is_ok());
+        assert!(resolve(&layer(Some(true), Some("aarch64-unknown-linux-musl"), None)).is_ok());
         assert!(matches!(
             resolve(&layer(
                 Some(true),
                 Some("riscv64gc-unknown-linux-musl"),
-                None,
                 None
             )),
             Err(Refusal::UnknownStaticTarget { .. })
         ));
         assert!(matches!(
-            resolve(&layer(Some(true), Some("x86_64-apple-darwin"), None, None)),
+            resolve(&layer(Some(true), Some("x86_64-apple-darwin"), None)),
             Err(Refusal::UnknownStaticTarget { .. })
         ));
     }
@@ -512,7 +447,7 @@ mod tests {
     #[test]
     fn target_without_static_is_refused() {
         assert!(matches!(
-            resolve(&layer(None, Some("x86_64-unknown-linux-musl"), None, None)),
+            resolve(&layer(None, Some("x86_64-unknown-linux-musl"), None)),
             Err(Refusal::TargetRequiresStatic { .. })
         ));
     }
@@ -520,34 +455,20 @@ mod tests {
     #[test]
     fn nondefault_allocator_without_static_is_refused() {
         assert!(matches!(
-            resolve(&layer(None, None, Some(AllocatorChoice::Mimalloc), None)),
+            resolve(&layer(None, None, Some(AllocatorChoice::Mimalloc))),
             Err(Refusal::AllocatorRequiresStatic { .. })
         ));
         // auto/system are the dynamic identity — no refusal.
         assert_eq!(
-            resolve(&layer(None, None, Some(AllocatorChoice::System), None)),
+            resolve(&layer(None, None, Some(AllocatorChoice::System))),
             Ok(None)
         );
     }
 
     #[test]
-    fn system_on_musl_needs_the_two_key_acknowledgment() {
+    fn an_explicit_system_allocator_on_musl_is_honoured() {
         assert_eq!(
-            resolve(&layer(
-                Some(true),
-                None,
-                Some(AllocatorChoice::System),
-                None
-            )),
-            Err(Refusal::MuslMallocCliff)
-        );
-        assert_eq!(
-            resolve(&layer(
-                Some(true),
-                None,
-                Some(AllocatorChoice::System),
-                Some(true)
-            )),
+            resolve(&layer(Some(true), None, Some(AllocatorChoice::System))),
             Ok(Some(with_libc(
                 StaticTriple::X8664LinuxMusl,
                 StaticAllocator::System
@@ -558,7 +479,7 @@ mod tests {
     #[test]
     fn talc_is_refused_until_the_arena_design_lands() {
         assert_eq!(
-            resolve(&layer(Some(true), None, Some(AllocatorChoice::Talc), None)),
+            resolve(&layer(Some(true), None, Some(AllocatorChoice::Talc))),
             Err(Refusal::TalcRequiresArenaDesign)
         );
     }
@@ -566,12 +487,7 @@ mod tests {
     #[test]
     fn mimalloc_optin_resolves() {
         assert_eq!(
-            resolve(&layer(
-                Some(true),
-                None,
-                Some(AllocatorChoice::Mimalloc),
-                None
-            )),
+            resolve(&layer(Some(true), None, Some(AllocatorChoice::Mimalloc))),
             Ok(Some(with_libc(
                 StaticTriple::X8664LinuxMusl,
                 StaticAllocator::Mimalloc
@@ -610,22 +526,16 @@ mod tests {
 
     #[test]
     fn precedence_cli_beats_env_beats_toml() {
-        let cli = layer(None, None, Some(AllocatorChoice::Mimalloc), None);
-        let env = layer(Some(true), None, Some(AllocatorChoice::System), None);
-        let toml = layer(
-            Some(false),
-            None,
-            Some(AllocatorChoice::Dlmalloc),
-            Some(true),
-        );
+        let cli = layer(None, None, Some(AllocatorChoice::Mimalloc));
+        let env = layer(Some(true), None, Some(AllocatorChoice::System));
+        let toml = layer(Some(false), None, Some(AllocatorChoice::Dlmalloc));
         let merged = cli.or(env).or(toml);
         assert_eq!(
             merged,
             layer(
                 Some(true), // env (CLI unset)
                 None,
-                Some(AllocatorChoice::Mimalloc), // CLI
-                Some(true),                      // toml (others unset)
+                Some(AllocatorChoice::Mimalloc)
             )
         );
     }

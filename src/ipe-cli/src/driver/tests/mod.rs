@@ -124,7 +124,7 @@ fn io_other_kind_stays_readable_without_errno() {
 #[test]
 fn unknown_command_screen_is_fully_guttered() {
     let err = CliError::UnknownCommand {
-        attempted: "frobnicate".to_owned(),
+        attempted: style::TerminalSafe::sanitize("frobnicate"),
     };
     let rendered = err.to_string();
     // The advice line and the help header both carry the shared gutter — no
@@ -216,12 +216,13 @@ fn emitted_build_failure_reports_missing_feature() {
     let err = CliError::EmittedBuildFailed {
         what: "the emitted program",
         code: 101,
-        stderr: "package `ipe-app` depends on `ipe-runtime-rust` with feature `regex` \
-             but `ipe-runtime-rust` does not have that feature."
-            .to_owned(),
+        stderr: style::TerminalSafe::sanitize(
+            "package `ipe-app` depends on `ipe-runtime-rust` with feature `regex` \
+             but `ipe-runtime-rust` does not have that feature.",
+        ),
         runtime: Some(RuntimeContext {
-            root: PathBuf::from("/tmp/rt"),
-            version: "0.1.34".to_owned(),
+            root: style::TerminalSafe::sanitize("/tmp/rt"),
+            version: style::TerminalSafe::sanitize("0.1.34"),
         }),
     };
     let rendered = err.to_string();
@@ -245,7 +246,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
     let err = CliError::EmittedBuildFailed {
         what: "the emitted program",
         code: 101,
-        stderr: "error[E0425]: cannot find value `x` in this scope".to_owned(),
+        stderr: style::TerminalSafe::sanitize("error[E0425]: cannot find value `x` in this scope"),
         runtime: None,
     };
     let rendered = err.to_string();
@@ -349,7 +350,7 @@ fn explain_unknown_code_display_is_deterministic() {
 
 #[test]
 fn explain_output_ends_with_trailing_newline() {
-    // `ipe explain <CODE>` does `print!("{page}")`, so the page itself must
+    // `ipe explain <CODE>` writes the page as is, so the page itself must
     // end with a newline to avoid a missing newline at the shell prompt.
     let page = explain_lookup("IPE-T0001").expect("known code must resolve");
     assert!(
@@ -1263,6 +1264,7 @@ fn find_single_cache_entry(cache_root: &Path) -> Option<PathBuf> {
 /// the SAME cache dir; if the driver reads and trusts the cache, the
 /// second build's `Cargo.toml` carries the sentinel verbatim. If it
 /// silently recompiled instead, the sentinel is gone.
+#[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     const SENTINEL: &str = "# CACHE-HIT-SENTINEL\n";
@@ -1273,6 +1275,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
 
     let tmp = std::env::temp_dir().join(format!("ipe-cache-e2e-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
+    let cache_site = crate::cache::CacheSite::Explicit(cache_dir.clone());
     let out_a = tmp.join("out-a");
     let out_b = tmp.join("out-b");
     let _ = fs::remove_dir_all(&tmp);
@@ -1286,10 +1289,10 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
             "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
         ),
     );
-    let discovered = vec![project::DiscoveredModule {
-        path: PathBuf::from("<cache-e2e>/Main.ipe"),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<cache-e2e>/Main.ipe"),
+        entry_path.clone(),
+    )];
 
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
@@ -1299,7 +1302,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
         &runtime,
         Path::new("<cache-e2e>"),
         ipe_backend_rust::DbDriver::Sqlite,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1333,7 +1336,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
         &runtime,
         Path::new("<cache-e2e>"),
         ipe_backend_rust::DbDriver::Sqlite,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1362,6 +1365,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
 /// default `<out>/.ipe-cache/<salt>` layout — succeeds and leaves the dir
 /// ipe-owned: the cache is stored only after the emit has claimed the dir,
 /// never creating it unmarked first. A rebuild into the same dir then hits.
+#[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
     let Ok(runtime) = resolve_runtime() else {
@@ -1372,6 +1376,10 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
     let _ = fs::remove_dir_all(&tmp);
     let out = tmp.join("out");
     let cache_dir = out.join(".ipe-cache").join("salt");
+    let cache_site = crate::cache::CacheSite::InOutput {
+        out_dir: out.clone(),
+        salt: "salt".to_owned(),
+    };
 
     let entry_path = vec!["Main".to_owned()];
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
@@ -1382,10 +1390,10 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
             "module Main exposing (main)\n\nimport Ipe.Io as Io\n\nmain : Task Error ()\nmain =\n    Io.println \"hi\"\n".to_owned(),
         ),
     );
-    let discovered = vec![project::DiscoveredModule {
-        path: PathBuf::from("<cache-in-out>/Main.ipe"),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<cache-in-out>/Main.ipe"),
+        entry_path.clone(),
+    )];
 
     let build = || {
         compile_modules_observed(
@@ -1396,7 +1404,7 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
             &runtime,
             Path::new("<cache-in-out>"),
             ipe_backend_rust::DbDriver::Sqlite,
-            Some(&cache_dir),
+            Some(&cache_site),
             BuildOptions::default(),
         )
     };
@@ -1424,6 +1432,113 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
     assert_eq!(warm_outcome, CacheOutcome::Hit);
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+/// Which level of a marked `out/` carries the planted cache link.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum PlantedCacheLink {
+    /// `out/.ipe-cache` itself.
+    CacheDir,
+    /// `out/.ipe-cache/<salt>`.
+    Salt,
+}
+
+/// Build twice into a marked `out/` whose cache path crosses a planted link.
+///
+/// Both builds succeed uncached: the cache is advisory, so skipping it is the
+/// fail-closed outcome that still ships the Rust built from the sources, while
+/// refusing the build would add nothing (no entry is read or written through the
+/// link either way). The link target stays empty.
+#[cfg(unix)]
+fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
+    // A refusal test that skips proves nothing, so a missing runtime fails it.
+    let runtime = resolve_runtime();
+    assert!(runtime.is_ok(), "runtime must resolve: {runtime:?}");
+    let Ok(runtime) = runtime else { return };
+
+    let tmp = std::env::temp_dir().join(format!("ipe-cache-link-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let out = tmp.join("out");
+    let elsewhere = tmp.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("create the link target");
+    crate::output_dir::OwnedDir::claim(&out).expect("mark out/ as ipe's");
+    let cache = out.join(crate::cache::CACHE_DIR_NAME);
+    match planted {
+        PlantedCacheLink::CacheDir => {
+            std::os::unix::fs::symlink(&elsewhere, &cache).expect("plant .ipe-cache link");
+        }
+        PlantedCacheLink::Salt => {
+            fs::create_dir_all(&cache).expect("mkdir .ipe-cache");
+            std::os::unix::fs::symlink(&elsewhere, cache.join("salt")).expect("plant salt link");
+        }
+    }
+    let cache_site = crate::cache::CacheSite::InOutput {
+        out_dir: out.clone(),
+        salt: "salt".to_owned(),
+    };
+
+    let entry_path = vec!["Main".to_owned()];
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    sources.insert(
+        entry_path.clone(),
+        (
+            PathBuf::from("<cache-link>/Main.ipe"),
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\nmain : Task Error ()\nmain =\n    Io.println \"hi\"\n".to_owned(),
+        ),
+    );
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<cache-link>/Main.ipe"),
+        entry_path.clone(),
+    )];
+    let build = || {
+        compile_modules_observed(
+            sources.clone(),
+            discovered.clone(),
+            &entry_path,
+            &out,
+            &runtime,
+            Path::new("<cache-link>"),
+            ipe_backend_rust::DbDriver::Sqlite,
+            Some(&cache_site),
+            BuildOptions::default(),
+        )
+    };
+
+    for round in ["cold", "rebuild"] {
+        let (result, outcome) = build();
+        assert!(
+            result.is_ok(),
+            "the {round} build proceeds without the cache: {result:?}"
+        );
+        assert_eq!(
+            outcome,
+            CacheOutcome::Miss,
+            "the {round} build never uses a cache behind the link"
+        );
+        assert!(
+            fs::read_dir(&elsewhere).is_ok_and(|mut entries| entries.next().is_none()),
+            "the {round} build wrote nothing through the planted link"
+        );
+    }
+    assert!(
+        out.join("Cargo.toml").is_file(),
+        "the product is still emitted"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn build_never_writes_through_a_planted_ipe_cache_link() {
+    build_through_planted_cache_link("dir", PlantedCacheLink::CacheDir);
+}
+
+#[cfg(unix)]
+#[test]
+fn build_never_writes_through_a_planted_salt_link() {
+    build_through_planted_cache_link("salt", PlantedCacheLink::Salt);
 }
 
 /// Walk `cache_root/<epoch>/*.ir.json` and return the single
@@ -1461,6 +1576,7 @@ fn find_single_ir_cache_entry(cache_root: &Path) -> Option<PathBuf> {
 /// at all, so the SAME lowered `Program` is still exactly reusable. This
 /// is the concrete case the IR tier exists to cover that the
 /// `EmittedProject` tier structurally cannot.
+#[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let Ok(runtime) = resolve_runtime() else {
@@ -1468,6 +1584,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     };
     let tmp = std::env::temp_dir().join(format!("ipec-ir-cache-driver-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
+    let cache_site = crate::cache::CacheSite::Explicit(cache_dir.clone());
     let out_a = tmp.join("out-a");
     let out_b = tmp.join("out-b");
     let _ = fs::remove_dir_all(&tmp);
@@ -1481,10 +1598,10 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
             "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
         ),
     );
-    let discovered = vec![project::DiscoveredModule {
-        path: PathBuf::from("<p>/Main.ipe"),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<p>/Main.ipe"),
+        entry_path.clone(),
+    )];
 
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
@@ -1494,7 +1611,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
         &runtime,
         Path::new("<p>"),
         ipe_backend_rust::DbDriver::Sqlite,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1523,7 +1640,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
         &runtime,
         Path::new("<p>"),
         ipe_backend_rust::DbDriver::Postgres,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1551,6 +1668,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
 /// the SENTINEL VALUE reaches the materialised `main.rs` — proof the
 /// driver actually reads, relocates, and RE-EMITS the on-disk IR entry
 /// rather than silently recompiling or ignoring the tamper.
+#[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let Ok(runtime) = resolve_runtime() else {
@@ -1558,6 +1676,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     };
     let tmp = std::env::temp_dir().join(format!("ipec-ir-cache-tamper-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
+    let cache_site = crate::cache::CacheSite::Explicit(cache_dir.clone());
     let out_a = tmp.join("out-a");
     let out_b = tmp.join("out-b");
     let _ = fs::remove_dir_all(&tmp);
@@ -1571,10 +1690,10 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
             "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
         ),
     );
-    let discovered = vec![project::DiscoveredModule {
-        path: PathBuf::from("<p>/Main.ipe"),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<p>/Main.ipe"),
+        entry_path.clone(),
+    )];
 
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
@@ -1584,7 +1703,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
         &runtime,
         Path::new("<p>"),
         ipe_backend_rust::DbDriver::Sqlite,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1619,7 +1738,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
         &runtime,
         Path::new("<p>"),
         ipe_backend_rust::DbDriver::Postgres,
-        Some(&cache_dir),
+        Some(&cache_site),
         BuildOptions::default(),
     );
     assert!(
@@ -1661,10 +1780,10 @@ fn cache_dir_none_disables_caching_entirely() {
             "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
         ),
     );
-    let discovered = vec![project::DiscoveredModule {
-        path: PathBuf::from("<cache-e2e>/Main.ipe"),
-        module_path: entry_path.clone(),
-    }];
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<cache-e2e>/Main.ipe"),
+        entry_path.clone(),
+    )];
 
     let (result, outcome) = compile_modules_observed(
         sources,
@@ -2112,18 +2231,22 @@ fn parse_audit_entry_args_rejects_unknown_flag() {
     );
 }
 
-/// `parse_audit_entry_args` — `--index` without a value yields `Usage`.
+/// `parse_audit_entry_args` — a value-taking flag without its value yields the
+/// catalog's `flag-needs-value` refusal, the one shape every such flag shares.
 #[test]
-fn parse_audit_entry_args_rejects_index_without_value() {
-    let args: Vec<String> = ["packages/foo.toml", "--index"]
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    let err = parse_audit_entry_args(&args).unwrap_err();
-    assert!(
-        matches!(err, CliError::Usage(_)),
-        "--index without value must be a Usage error: {err:?}"
-    );
+fn parse_audit_entry_args_rejects_a_flag_without_its_value() {
+    for flag in ["--index", "--attested-actor"] {
+        let args: Vec<String> = ["packages/foo.toml", flag]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let err = parse_audit_entry_args(&args).unwrap_err();
+        let expected = crate::text::flag_needs_value(&"package audit-entry", &flag);
+        assert!(
+            matches!(&err, CliError::UsageOwned(message) if *message == expected),
+            "{flag} without value must be the flag-needs-value refusal: {err:?}"
+        );
+    }
 }
 
 /// `parse_audit_entry_args` — two positionals yields `Usage`.

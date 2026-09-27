@@ -95,7 +95,7 @@ fn nonclone_handle_reused_fails_closed_before_cargo() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_nonclone_handle_reuse");
+    let tmp = crate::support::scratch_root().join("ipec_ffi_nonclone_handle_reuse");
     // `w` is bound once, then read by TWO `slot_count` calls that both discard
     // the threaded-back receiver and re-use the ORIGINAL `w` — a non-linear use
     // of a non-`Clone` foreign handle. `slot_count` now binds as
@@ -161,7 +161,7 @@ fn nonclone_handle_threaded_linearly_builds() {
         return; // runtime unavailable in this environment — skip silently
     };
 
-    let tmp = std::env::temp_dir().join("ipec_ffi_nonclone_handle_thread");
+    let tmp = crate::support::scratch_root().join("ipec_ffi_nonclone_handle_thread");
     // Each read consumes the world and hands the RETURNED handle to the next —
     // one linear chain, so the non-`Clone` handle never needs a clone.
     let wrote = write_project(

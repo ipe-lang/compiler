@@ -87,7 +87,7 @@ fn c01_enum_capture_fix1() {
         .join("golden")
         .join("enum_capture")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i130_enum_capture_e2e");
+    let out = crate::support::scratch_root().join("ipec_i130_enum_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -134,7 +134,7 @@ fn c02_record_capture_fix1() {
         .join("golden")
         .join("record_capture")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i130_record_capture_e2e");
+    let out = crate::support::scratch_root().join("ipec_i130_record_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -182,7 +182,7 @@ fn c13_complex_arg_hoist_t4() {
         .join("golden")
         .join("complex_arg_hoist")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i130_complex_arg_hoist_e2e");
+    let out = crate::support::scratch_root().join("ipec_i130_complex_arg_hoist_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

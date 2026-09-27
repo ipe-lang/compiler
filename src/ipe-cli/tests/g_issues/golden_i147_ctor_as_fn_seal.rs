@@ -94,7 +94,7 @@ fn a1_ctor_map_bare() {
         .join("golden")
         .join("ctor_map_bare")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i147_ctor_map_bare_e2e");
+    let out = crate::support::scratch_root().join("ipec_i147_ctor_map_bare_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -141,7 +141,7 @@ fn a2_ctor_partial_multiarg_with_clone() {
         .join("golden")
         .join("ctor_partial")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i147_ctor_partial_e2e");
+    let out = crate::support::scratch_root().join("ipec_i147_ctor_partial_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -188,7 +188,7 @@ fn a3_ctor_stored_in_record_field() {
         .join("golden")
         .join("ctor_field")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i147_ctor_field_e2e");
+    let out = crate::support::scratch_root().join("ipec_i147_ctor_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

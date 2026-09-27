@@ -61,7 +61,7 @@ fn end_to_end_prints_just_nothing_nothing() {
     }
 
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_money_parse_currency_maybe_e2e");
+    let out = crate::support::scratch_root().join("ipec_money_parse_currency_maybe_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

@@ -73,7 +73,7 @@ fn f1_firstclass_curried_and_shadow() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("firstclass_curried");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_firstclass_curried_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_firstclass_curried_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -133,7 +133,7 @@ fn f2_firstclass_arity0() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("firstclass_arity0");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_firstclass_arity0_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_firstclass_arity0_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -174,7 +174,7 @@ fn f3_partial_noncopy() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("partial_noncopy");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_partial_noncopy_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_partial_noncopy_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -225,7 +225,7 @@ fn f4_lambda_capture_noncopy_and_f11_shadow() {
         .join("golden")
         .join("lambda_capture_noncopy");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_lambda_capture_noncopy_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_lambda_capture_noncopy_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -269,7 +269,7 @@ fn f5_capture_fn_called_control() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("capture_fn_called");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_capture_fn_called_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_capture_fn_called_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -358,7 +358,7 @@ fn f7_succeed_curried() {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("succeed_curried");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_succeed_curried_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_succeed_curried_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -403,7 +403,7 @@ fn f8_curried_three_arrows() {
         .join("golden")
         .join("curried_three_arrows");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_curried_three_arrows_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_curried_three_arrows_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -452,7 +452,7 @@ fn f9_decoder_thunk_capture() {
         .join("golden")
         .join("decoder_thunk_capture");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_decoder_thunk_capture_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_decoder_thunk_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();
@@ -499,7 +499,7 @@ fn f10_generic_curried_capture_builds_and_runs() {
         .join("golden")
         .join("generic_curried")
         .join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_generic_curried_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_generic_curried_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {
@@ -549,7 +549,7 @@ fn f11_pipeline_custom_curried() {
         .join("golden")
         .join("pipeline_custom_curried");
     let entry = dir.join("Main.ipe");
-    let out = std::env::temp_dir().join("ipec_i121_pipeline_custom_curried_e2e");
+    let out = crate::support::scratch_root().join("ipec_i121_pipeline_custom_curried_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = ipe::resolve_runtime();

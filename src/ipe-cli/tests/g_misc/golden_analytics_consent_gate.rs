@@ -71,7 +71,7 @@ fn analytics_consent_gate_end_to_end() {
     }
 
     let root = repo_root();
-    let out = std::env::temp_dir().join("ipec_analytics_consent_gate_e2e");
+    let out = crate::support::scratch_root().join("ipec_analytics_consent_gate_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let Ok(runtime) = ipe::resolve_runtime() else {

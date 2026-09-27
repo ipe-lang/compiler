@@ -151,7 +151,7 @@ fn changed_model_fixture(marker: &str) -> String {
 const E2E_KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
-    let base = std::env::temp_dir().join(format!(
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "watch_bg_{tag}_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()

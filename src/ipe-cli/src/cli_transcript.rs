@@ -149,8 +149,8 @@ pub fn volatile_path_prefixes(repo_root: &Path) -> Vec<String> {
     }
     prefixes.push(repo_root.to_string_lossy().into_owned());
     prefixes.push(std::env::temp_dir().to_string_lossy().into_owned());
-    if let Some(home) = std::env::var_os("HOME") {
-        prefixes.push(PathBuf::from(home).to_string_lossy().into_owned());
+    if let Some(home) = crate::env_dir::home() {
+        prefixes.push(home.to_string_lossy().into_owned());
     }
     prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
     prefixes
