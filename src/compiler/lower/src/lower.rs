@@ -3714,245 +3714,12 @@ fn body_materializes_generic_decoder(tv: Symbol, expr: &Expr) -> bool {
     }
 }
 
-/// Does any emitted `move` closure in `expr` CAPTURE the value binder `binder`
-/// from an enclosing scope?
-///
-/// Every first-class closure this backend emits is a `Box<dyn Fn(..) -> .. +
-/// Send + Sync + 'static>` (`render_type`'s `IrType::Fun` arm), so every value
-/// it move-captures must itself be `Send + Sync + 'static`. When the captured
-/// value's type is a bare `Generic(tv)`, the tvar therefore needs `Sync` — else
-/// the closure→trait-object cast is E0277 (`tv cannot be shared between threads`),
-/// an `ipe`-accept-then-`cargo`-fail SEAL break. This is the general form of the
-/// narrow decoder-factory `Sync` obligations (`succeed`/`optional`), which are
-/// the same requirement at specific kernel-capture positions.
-///
-/// The walk descends with shadow discipline: a `Lambda`/`SharedLambda` that
-/// re-binds `binder` in its own params, or a `Let`/`Destructure`/`Match`-arm that
-/// shadows it, hides the outer binder inside that scope. A closure captures
-/// `binder` iff [`lambda_body_refs_sym`] finds it live in the closure body.
-fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
-    match expr {
-        Expr::Lambda { params, body, .. } | Expr::SharedLambda { params, body, .. } => {
-            if params.iter().any(|(s, _)| *s == binder) {
-                return false;
-            }
-            lambda_body_refs_sym(binder, body) || binder_captured_in_move_closure(binder, body)
-        }
-        Expr::Let { name, value, body } => {
-            binder_captured_in_move_closure(binder, value)
-                || (*name != binder && binder_captured_in_move_closure(binder, body))
-        }
-        Expr::Destructure {
-            binder: pat,
-            value,
-            body,
-        } => {
-            binder_captured_in_move_closure(binder, value)
-                || (!pat_binds_symbol(pat, binder) && binder_captured_in_move_closure(binder, body))
-        }
-        Expr::Match(m) => {
-            binder_captured_in_move_closure(binder, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    !pat_binds_symbol(&arm.pat, binder)
-                        && binder_captured_in_move_closure(binder, &arm.body)
-                })
-        }
-        Expr::If { cond, then_, else_ } => {
-            binder_captured_in_move_closure(binder, cond)
-                || binder_captured_in_move_closure(binder, then_)
-                || binder_captured_in_move_closure(binder, else_)
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            binder_captured_in_move_closure(binder, lhs)
-                || binder_captured_in_move_closure(binder, rhs)
-        }
-        Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => args
-            .iter()
-            .any(|a| binder_captured_in_move_closure(binder, a)),
-        Expr::Apply { func, args } => {
-            binder_captured_in_move_closure(binder, func)
-                || args
-                    .iter()
-                    .any(|a| binder_captured_in_move_closure(binder, a))
-        }
-        Expr::Tuple(items) | Expr::List { items, .. } => items
-            .iter()
-            .any(|e| binder_captured_in_move_closure(binder, e)),
-        Expr::Cons { head, tail } => {
-            binder_captured_in_move_closure(binder, head)
-                || binder_captured_in_move_closure(binder, tail)
-        }
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            binder_captured_in_move_closure(binder, list)
-        }
-        Expr::Record { fields, .. } | Expr::Update { fields, .. } => fields
-            .iter()
-            .any(|(_, e)| binder_captured_in_move_closure(binder, e)),
-        Expr::TaskSeq { effect, rest } => {
-            binder_captured_in_move_closure(binder, effect)
-                || binder_captured_in_move_closure(binder, rest)
-        }
-        Expr::TailLoop { params, body } => {
-            !params.iter().any(|(s, _)| *s == binder)
-                && binder_captured_in_move_closure(binder, body)
-        }
-        Expr::Access { record, .. } => binder_captured_in_move_closure(binder, record),
-        // A top-level function reference carries no captured environment.
-        Expr::FuncValue { .. }
-        | Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::PathLit(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit
-        | Expr::Var(_)
-        | Expr::CloneVar(_) => false,
-    }
-}
-
-/// Does a closure body `expr` move-capture a free value whose TYPE reaches a
-/// bare `tv` — i.e. a capture that, coerced into the closure's `+ Sync`
-/// trait-object carrier, forces `tv: Sync` on the enclosing generic?
-///
-/// `locally_bound` holds the symbols already bound WITHIN the closure (its
-/// params plus every inner binder), so a `Var`/`CloneVar` outside that set is a
-/// genuine capture from the enclosing scope. Two capture positions carry `tv`
-/// bare:
-///
-/// * A field read `record.field` whose `field_ty` [`ir_type_generic_reaches_bare`]
-///   the tvar — the captured record's `tv` rides in a TRANSPARENT field, read
-///   out into a bare-`tv` value inside the closure. This is TYPE-PROVEN: the
-///   field type itself carries `tv` bare, so it counts under either regime.
-/// * A free var used **as a bare value** — cons head, tuple/list element, call
-///   or constructor argument, `Task.map` continuation payload. A bare `Var`
-///   node carries no type, so this position is only trustworthy when the
-///   closure's own SIGNATURE reaches `tv` bare (the `decodeRows`
-///   `\more -> value :: more` case, where `value : tv` is consed and the
-///   signature `List tv -> List tv` reaches bare). `typed_capture_only` gates
-///   it: when the signature only MENTIONS `tv` under an opaque carrier, an
-///   untyped bare capture proves nothing (`class`'s captured `String`) and is
-///   NOT counted.
-///
-/// A free var used SOLELY as the base of an [`Expr::Access`] into an OPAQUE
-/// field (`field_ty` a `Fun`/`Decoder`/…, which `reaches_bare` stops at) is NOT
-/// a bare-`tv` capture: the captured record carries `tv` only behind an already
-/// `Send + Sync` carrier (a `Codec`'s `enc : a -> JsonVal`, a `DecBox`'s
-/// `dec : Decoder a`), read out as a whole thread-shareable value, so it obliges
-/// no `Sync`. Excluding that position is what keeps the `eta_0`-eta-lambda and
-/// record-wrapped-carrier classes (`codec_generic_combinator`,
-/// `decoder_record_capture`) unbounded and reusable.
-fn closure_captures_bare_generic(
-    tv: Symbol,
-    locally_bound: &BTreeSet<Symbol>,
-    typed_capture_only: bool,
-    expr: &Expr,
-) -> bool {
-    let recur = |bound: &BTreeSet<Symbol>, e: &Expr| {
-        closure_captures_bare_generic(tv, bound, typed_capture_only, e)
-    };
-    match expr {
-        // A bare free var IS a bare-value capture — but ONLY trustworthy when the
-        // closure signature reaches `tv` bare (a `Var` node carries no type).
-        // Under `typed_capture_only` an untyped bare capture proves nothing.
-        Expr::Var(s) | Expr::CloneVar(s) => !typed_capture_only && !locally_bound.contains(s),
-        // A field read: the projected value carries `tv` bare only when the
-        // field's own type reaches it. This is TYPE-PROVEN, so it counts under
-        // either regime. If it does, this Access is a bare-`tv` capture regardless
-        // of the record base's shape; if it does not, the record base is used
-        // solely under an opaque carrier here, so descend into the record ONLY to
-        // catch a bare capture nested deeper (a computed record expression),
-        // never counting the base var itself.
-        Expr::Access {
-            record, field_ty, ..
-        } => {
-            if ir_type_generic_reaches_bare(field_ty, tv) {
-                return true;
-            }
-            match record.as_ref() {
-                Expr::Var(_) | Expr::CloneVar(_) => false,
-                other => recur(locally_bound, other),
-            }
-        }
-        Expr::Lambda { params, body, .. } | Expr::SharedLambda { params, body, .. } => {
-            let mut inner = locally_bound.clone();
-            inner.extend(params.iter().map(|(s, _)| *s));
-            recur(&inner, body)
-        }
-        Expr::Let { name, value, body } => {
-            recur(locally_bound, value) || {
-                let mut inner = locally_bound.clone();
-                inner.insert(*name);
-                recur(&inner, body)
-            }
-        }
-        Expr::Destructure {
-            binder,
-            value,
-            body,
-        } => {
-            recur(locally_bound, value) || {
-                let mut inner = locally_bound.clone();
-                collect_ir_pat_syms(binder, &mut inner);
-                recur(&inner, body)
-            }
-        }
-        Expr::Match(m) => {
-            recur(locally_bound, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    let mut inner = locally_bound.clone();
-                    collect_ir_pat_syms(&arm.pat, &mut inner);
-                    arm.guard.as_ref().is_some_and(|g| recur(&inner, g)) || recur(&inner, &arm.body)
-                })
-        }
-        Expr::TailLoop { params, body } => {
-            let mut inner = locally_bound.clone();
-            inner.extend(params.iter().map(|(s, _)| *s));
-            recur(&inner, body)
-        }
-        Expr::If { cond, then_, else_ } => {
-            recur(locally_bound, cond) || recur(locally_bound, then_) || recur(locally_bound, else_)
-        }
-        Expr::BinOp { lhs, rhs, .. } => recur(locally_bound, lhs) || recur(locally_bound, rhs),
-        Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
-            args.iter().any(|a| recur(locally_bound, a))
-        }
-        Expr::Apply { func, args } => {
-            recur(locally_bound, func) || args.iter().any(|a| recur(locally_bound, a))
-        }
-        Expr::Tuple(items) | Expr::List { items, .. } => {
-            items.iter().any(|e| recur(locally_bound, e))
-        }
-        Expr::Cons { head, tail } => recur(locally_bound, head) || recur(locally_bound, tail),
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            recur(locally_bound, list)
-        }
-        Expr::Record { fields, .. } | Expr::Update { fields, .. } => {
-            fields.iter().any(|(_, e)| recur(locally_bound, e))
-        }
-        Expr::TaskSeq { effect, rest } => {
-            recur(locally_bound, effect) || recur(locally_bound, rest)
-        }
-        Expr::FuncValue { .. }
-        | Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::PathLit(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit => false,
-    }
-}
-
 /// Collect all variable-binding symbols from an IR [`Pat`] into `out`.
 ///
 /// Only [`Pat::Var`] and [`Pat::Alias`] introduce new bindings; structural
 /// patterns ([`Pat::Ctor`], [`Pat::Tuple`], [`Pat::Record`]) recurse into their
-/// sub-patterns. Used by [`closure_captures_bare_generic`] to track which
-/// symbols a match-arm pattern binds, so the arm body's references to those
-/// symbols are not counted as free captures.
+/// sub-patterns. Used by the capture walk ([`collect_ir_free_vars`]) so a
+/// pattern-bound symbol's reads are not counted as free captures.
 fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
     match pat {
         Pat::Var(s) => {
@@ -3989,131 +3756,337 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
     }
 }
 
-/// Does `expr` contain an emitted move-closure ([`Expr::Lambda`] or
-/// [`Expr::SharedLambda`], both rendered `Box`/`Arc<dyn Fn(..) -> .. + Send +
-/// Sync + 'static>`) that move-captures a free value whose TYPE reaches a bare
-/// `tv` ([`closure_captures_bare_generic`])?
+/// Type variables a binder's type reaches, keyed by binder.
+type CaptureReach = BTreeMap<Symbol, BTreeSet<Symbol>>;
+
+/// Scope entries a binder shadowed, with the reach each held before it.
+type ShadowedReach = Vec<(Symbol, Option<BTreeSet<Symbol>>)>;
+
+/// Auto-trait obligations a body's closure captures place on its generics.
 ///
-/// A closure that captures such a value coerces it into the `+ Sync`
-/// trait-object carrier, forcing `tv: Sync` on the enclosing generic function.
-/// Without the bound the emitted Rust is `ipe`-accepted then `cargo`-fails
-/// E0277 (`tv cannot be shared between threads`) — a SEAL violation.
+/// `sync` holds every generic reached by a value an emitted `Fn` closure
+/// captures: every [`Expr::Lambda`] / [`Expr::SharedLambda`] renders as a
+/// `Box`/`Arc<dyn Fn(..) -> .. + Send + Sync + 'static>`, so each move-captured
+/// value must be `Send + Sync + 'static`. `send` holds every generic reached by
+/// a value an [`Expr::TaskSeq`] continuation captures: that continuation is an
+/// `impl FnOnce + Send + 'static`, so its captures must be `Send + 'static`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CaptureObligations {
+    sync: BTreeSet<Symbol>,
+    send: BTreeSet<Symbol>,
+}
+
+/// Derive the auto-trait obligations every closure in `body` places on the def's generics.
 ///
-/// This is the GENERAL capture-site obligation for in-BODY binders: the value a
-/// closure captures is frequently NOT one of the enclosing function's `params`
-/// but a match-arm / destructure / `let` local (`Ipe.Db.Store.decodeRows`
-/// cons-prepends the `Ok value ->` arm local `value : a` inside a continuation
-/// lambda). Those locals are invisible to the `params`-keyed capture check, but
-/// the capture walk sees them regardless of the closure's return form — a direct
-/// cons, a `List.append` call, a tuple cons head (`(first, 0) :: more`), a
-/// `Maybe` wrap, a record build.
+/// The obligation is read off the closure's capture set, never off the shape of
+/// its signature or of the expression the capture sits in: every generic a
+/// captured binder's type reaches ([`ir_type_generic_reaches_bare`] — bare, or
+/// under any value container, tuple, record, or named ADT argument) is obliged.
+/// A capture's type comes from the innermost typed binder in scope (a def or
+/// closure parameter, a `TailLoop` variable, a `let` alias of either) unioned
+/// with `local_reach` (the solved use-site types of the def's source locals).
 ///
-/// The bound is tight because [`closure_captures_bare_generic`] counts only a
-/// capture that carries `tv` BARE: a free var used as a bare value, or a field
-/// read whose `field_ty` reaches bare `tv`. A record captured only for a read
-/// into an OPAQUE `Send + Sync` field (a `Codec`'s `enc`, a `DecBox`'s `dec`)
-/// carries `tv` behind an already-shareable carrier and obliges no `Sync`, so
-/// the `eta_0`-eta-lambda and record-wrapped-carrier classes stay unbounded. A
-/// structurally recursive walk descends into every sub-expression, so a
-/// qualifying closure nested inside a match arm, `let` chain, or another closure
-/// is also detected.
-fn body_move_closure_captures_generic(tv: Symbol, expr: &Expr) -> bool {
-    match expr {
-        Expr::Lambda { params, ret, body } | Expr::SharedLambda { params, ret, body } => {
-            // A closure can oblige `tv: Sync` only when its body move-captures a
-            // value that genuinely carries `tv` BARE into the emitted
-            // `Box`/`Arc<dyn Fn + Send + Sync + 'static>`. Two signature regimes
-            // gate WHICH captures count, because a captured value proves it carries
-            // `tv` in exactly one of two ways:
-            //
-            //   * The signature REACHES `tv` bare (a param/return `List tv`, `tv`,
-            //     `(tv, _)`, …). Here the closure exposes `tv` bare in its own type,
-            //     so a bare free-var capture is a plausible `tv`-carrier: the
-            //     `\more -> value :: more` continuation of `decodeRows` captures the
-            //     `Ok value ->` arm local `value : tv` and conses it. The bare-var
-            //     capture arm is enabled (`typed_capture_only = false`).
-            //   * The signature only MENTIONS `tv` under an opaque `Send + Sync`
-            //     carrier (`ret : Task Error (List tv)` in `\rows -> decodeRows
-            //     r.codec rows`). A bare capture here proves nothing — the closure's
-            //     own values may all be already-shareable (`String`, a boxed `Fn`) —
-            //     so ONLY a capture whose TYPE is known to reach `tv` bare counts: a
-            //     field read `r.codec` whose `field_ty : Codec tv` reaches bare
-            //     (`typed_capture_only = true`). This is what keeps `class =
-            //     attribute "class"` — `\eta -> html_named_attr_ cap eta :
-            //     String -> Attribute tv`, capturing only the `String` `cap` while
-            //     `tv` rides solely in the opaque `Attribute`/`Ui` return — from
-            //     spuriously obliging `tv: Sync`.
-            //
-            // The mention test scopes the obligation to the RIGHT tvar: a
-            // continuation whose signature never names `T2` cannot oblige `T2`.
-            let is_tv = |t: &IrType| matches!(t, IrType::Generic(g) if *g == tv);
-            let signature_reaches_tv = params
-                .iter()
-                .any(|(_, t)| ir_type_generic_reaches_bare(t, tv))
-                || ir_type_generic_reaches_bare(ret, tv);
-            let signature_mentions_tv = params.iter().any(|(_, t)| ir_type_mentions(t, &is_tv))
-                || ir_type_mentions(ret, &is_tv);
-            if signature_reaches_tv || signature_mentions_tv {
-                let closure_bound: BTreeSet<Symbol> = params.iter().map(|(s, _)| *s).collect();
-                let typed_capture_only = !signature_reaches_tv;
-                if closure_captures_bare_generic(tv, &closure_bound, typed_capture_only, body) {
-                    return true;
+/// Fail-closed: a captured symbol whose type neither source knows obliges every
+/// generic in `poly`. Over-bounding stays buildable: every emitted concrete type
+/// is `Send + Sync + 'static`, and a generic caller receives the bound through
+/// call-site propagation.
+fn closure_capture_obligations(
+    body: &Expr,
+    params: &[(Symbol, IrType)],
+    poly: &BTreeSet<Symbol>,
+    local_reach: &CaptureReach,
+) -> CaptureObligations {
+    let mut out = CaptureObligations::default();
+    if poly.is_empty() {
+        return out;
+    }
+    let walk = CaptureWalk { poly, local_reach };
+    let mut scope: CaptureReach = params
+        .iter()
+        .map(|(sym, ty)| (*sym, walk.reach_of(ty)))
+        .collect();
+    walk.expr(body, &mut scope, &mut out);
+    out
+}
+
+/// The fixed context of one [`closure_capture_obligations`] walk.
+struct CaptureWalk<'a> {
+    poly: &'a BTreeSet<Symbol>,
+    local_reach: &'a CaptureReach,
+}
+
+impl CaptureWalk<'_> {
+    /// The generics of the def that `ty` reaches.
+    fn reach_of(&self, ty: &IrType) -> BTreeSet<Symbol> {
+        self.poly
+            .iter()
+            .copied()
+            .filter(|tv| ir_type_generic_reaches_bare(ty, *tv))
+            .collect()
+    }
+
+    /// The generics a captured `sym` reaches; every generic when its type is unknown.
+    fn captured_reach(&self, sym: Symbol, scope: &CaptureReach) -> BTreeSet<Symbol> {
+        let scoped = scope.get(&sym);
+        let local = self.local_reach.get(&sym);
+        if scoped.is_none() && local.is_none() {
+            return self.poly.clone();
+        }
+        scoped.into_iter().chain(local).flatten().copied().collect()
+    }
+
+    /// The reach a `let` binding inherits from its value, when the value's type is known.
+    fn let_value_reach(&self, value: &Expr, scope: &CaptureReach) -> Option<BTreeSet<Symbol>> {
+        match value {
+            Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::FuncValue { .. } => {
+                Some(BTreeSet::new())
+            }
+            Expr::Var(s) | Expr::CloneVar(s) => Some(self.captured_reach(*s, scope)),
+            _ => None,
+        }
+    }
+
+    /// Oblige every generic reached by a value `closure` captures from `scope`.
+    fn note_captures(&self, closure: &Expr, scope: &CaptureReach, obliged: &mut BTreeSet<Symbol>) {
+        let mut free = BTreeSet::new();
+        collect_ir_free_vars(closure, &mut free);
+        for sym in free {
+            obliged.extend(self.captured_reach(sym, scope));
+        }
+    }
+
+    /// Walk `body` with the typed binders `binders` in scope, then restore `scope`.
+    fn under_typed(
+        &self,
+        binders: &[(Symbol, IrType)],
+        body: &Expr,
+        scope: &mut CaptureReach,
+        out: &mut CaptureObligations,
+    ) {
+        let saved: ShadowedReach = binders
+            .iter()
+            .map(|(sym, ty)| (*sym, scope.insert(*sym, self.reach_of(ty))))
+            .collect();
+        self.expr(body, scope, out);
+        restore_capture_scope(scope, saved);
+    }
+
+    /// Walk `body` with the untyped pattern binders of `pat` in scope, then restore `scope`.
+    fn under_pattern(
+        &self,
+        pat: &Pat,
+        bodies: &[&Expr],
+        scope: &mut CaptureReach,
+        out: &mut CaptureObligations,
+    ) {
+        let mut bound = BTreeSet::new();
+        collect_ir_pat_syms(pat, &mut bound);
+        let saved: ShadowedReach = bound
+            .into_iter()
+            .map(|sym| (sym, scope.remove(&sym)))
+            .collect();
+        for body in bodies {
+            self.expr(body, scope, out);
+        }
+        restore_capture_scope(scope, saved);
+    }
+
+    fn expr(&self, e: &Expr, scope: &mut CaptureReach, out: &mut CaptureObligations) {
+        match e {
+            Expr::Lambda { params, body, .. } | Expr::SharedLambda { params, body, .. } => {
+                self.note_captures(e, scope, &mut out.sync);
+                self.under_typed(params, body, scope, out);
+            }
+            Expr::TailLoop { params, body } => self.under_typed(params, body, scope, out),
+            Expr::TaskSeq { effect, rest } => {
+                self.expr(effect, scope, out);
+                self.note_captures(rest, scope, &mut out.send);
+                self.expr(rest, scope, out);
+            }
+            Expr::Let { name, value, body } => {
+                self.expr(value, scope, out);
+                let reach = self.let_value_reach(value, scope);
+                let saved = scope.remove(name);
+                if let Some(reach) = reach {
+                    scope.insert(*name, reach);
+                }
+                self.expr(body, scope, out);
+                restore_capture_scope(scope, vec![(*name, saved)]);
+            }
+            Expr::Destructure {
+                binder,
+                value,
+                body,
+            } => {
+                self.expr(value, scope, out);
+                self.under_pattern(binder, &[body.as_ref()], scope, out);
+            }
+            Expr::Match(m) => {
+                self.expr(m.scrutinee(), scope, out);
+                for arm in m.arms() {
+                    let bodies: Vec<&Expr> = arm.guard.iter().chain([&arm.body]).collect();
+                    self.under_pattern(&arm.pat, &bodies, scope, out);
                 }
             }
-            // Recurse regardless: a nested closure inside this body may qualify
-            // even when this one does not.
-            body_move_closure_captures_generic(tv, body)
+            Expr::If { cond, then_, else_ } => {
+                for child in [cond, then_, else_] {
+                    self.expr(child, scope, out);
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. }
+            | Expr::Cons {
+                head: lhs,
+                tail: rhs,
+            } => {
+                self.expr(lhs, scope, out);
+                self.expr(rhs, scope, out);
+            }
+            Expr::Call { args, .. }
+            | Expr::Ctor { args, .. }
+            | Expr::TailRecur { args }
+            | Expr::Tuple(args)
+            | Expr::List { items: args, .. } => {
+                for a in args {
+                    self.expr(a, scope, out);
+                }
+            }
+            Expr::Apply { func, args } => {
+                self.expr(func, scope, out);
+                for a in args {
+                    self.expr(a, scope, out);
+                }
+            }
+            Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
+                self.expr(list, scope, out);
+            }
+            Expr::Access { record, .. } => self.expr(record, scope, out),
+            Expr::Record { fields, .. } => {
+                for (_, f) in fields {
+                    self.expr(f, scope, out);
+                }
+            }
+            Expr::Update { record, fields } => {
+                self.expr(record, scope, out);
+                for (_, f) in fields {
+                    self.expr(f, scope, out);
+                }
+            }
+            Expr::FuncValue { .. }
+            | Expr::Int(_)
+            | Expr::Bool(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::PathLit(_)
+            | Expr::CustomElementRef { .. }
+            | Expr::Char(_)
+            | Expr::Unit
+            | Expr::Var(_)
+            | Expr::CloneVar(_) => {}
         }
-        Expr::TailLoop { body, .. } => body_move_closure_captures_generic(tv, body),
-        Expr::Let { value, body, .. } | Expr::Destructure { value, body, .. } => {
-            body_move_closure_captures_generic(tv, value)
-                || body_move_closure_captures_generic(tv, body)
+    }
+}
+
+/// Put back the scope entries a binder shadowed, innermost binder last-in first-out.
+fn restore_capture_scope(scope: &mut CaptureReach, saved: ShadowedReach) {
+    for (sym, old) in saved.into_iter().rev() {
+        scope.remove(&sym);
+        if let Some(reach) = old {
+            scope.insert(sym, reach);
         }
-        Expr::If { cond, then_, else_ } => {
-            body_move_closure_captures_generic(tv, cond)
-                || body_move_closure_captures_generic(tv, then_)
-                || body_move_closure_captures_generic(tv, else_)
+    }
+}
+
+/// Collect the symbols `expr` reads free of its own binders into `out`.
+///
+/// A closure node's free symbols are exactly the values it move-captures.
+fn collect_ir_free_vars(expr: &Expr, out: &mut BTreeSet<Symbol>) {
+    let under = |bound: &BTreeSet<Symbol>, bodies: &[&Expr], acc: &mut BTreeSet<Symbol>| {
+        let mut inner = BTreeSet::new();
+        for body in bodies {
+            collect_ir_free_vars(body, &mut inner);
+        }
+        acc.extend(inner.difference(bound).copied());
+    };
+    match expr {
+        Expr::Var(s) | Expr::CloneVar(s) => {
+            out.insert(*s);
+        }
+        Expr::Lambda { params, body, .. }
+        | Expr::SharedLambda { params, body, .. }
+        | Expr::TailLoop { params, body } => {
+            let bound: BTreeSet<Symbol> = params.iter().map(|(s, _)| *s).collect();
+            under(&bound, &[body.as_ref()], out);
+        }
+        Expr::Let { name, value, body } => {
+            collect_ir_free_vars(value, out);
+            under(&BTreeSet::from([*name]), &[body.as_ref()], out);
+        }
+        Expr::Destructure {
+            binder,
+            value,
+            body,
+        } => {
+            collect_ir_free_vars(value, out);
+            let mut bound = BTreeSet::new();
+            collect_ir_pat_syms(binder, &mut bound);
+            under(&bound, &[body.as_ref()], out);
         }
         Expr::Match(m) => {
-            body_move_closure_captures_generic(tv, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    arm.guard
-                        .as_ref()
-                        .is_some_and(|g| body_move_closure_captures_generic(tv, g))
-                        || body_move_closure_captures_generic(tv, &arm.body)
-                })
+            collect_ir_free_vars(m.scrutinee(), out);
+            for arm in m.arms() {
+                let mut bound = BTreeSet::new();
+                collect_ir_pat_syms(&arm.pat, &mut bound);
+                let bodies: Vec<&Expr> = arm.guard.iter().chain([&arm.body]).collect();
+                under(&bound, &bodies, out);
+            }
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            body_move_closure_captures_generic(tv, lhs)
-                || body_move_closure_captures_generic(tv, rhs)
+        Expr::If { cond, then_, else_ } => {
+            for child in [cond, then_, else_] {
+                collect_ir_free_vars(child, out);
+            }
         }
-        Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => args
-            .iter()
-            .any(|a| body_move_closure_captures_generic(tv, a)),
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::Cons {
+            head: lhs,
+            tail: rhs,
+        }
+        | Expr::TaskSeq {
+            effect: lhs,
+            rest: rhs,
+        } => {
+            collect_ir_free_vars(lhs, out);
+            collect_ir_free_vars(rhs, out);
+        }
+        Expr::Call { args, .. }
+        | Expr::Ctor { args, .. }
+        | Expr::TailRecur { args }
+        | Expr::Tuple(args)
+        | Expr::List { items: args, .. } => {
+            for a in args {
+                collect_ir_free_vars(a, out);
+            }
+        }
         Expr::Apply { func, args } => {
-            body_move_closure_captures_generic(tv, func)
-                || args
-                    .iter()
-                    .any(|a| body_move_closure_captures_generic(tv, a))
-        }
-        Expr::Tuple(items) | Expr::List { items, .. } => items
-            .iter()
-            .any(|e| body_move_closure_captures_generic(tv, e)),
-        Expr::Cons { head, tail } => {
-            body_move_closure_captures_generic(tv, head)
-                || body_move_closure_captures_generic(tv, tail)
+            collect_ir_free_vars(func, out);
+            for a in args {
+                collect_ir_free_vars(a, out);
+            }
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            body_move_closure_captures_generic(tv, list)
+            collect_ir_free_vars(list, out);
         }
-        Expr::Record { fields, .. } | Expr::Update { fields, .. } => fields
-            .iter()
-            .any(|(_, e)| body_move_closure_captures_generic(tv, e)),
-        Expr::TaskSeq { effect, rest } => {
-            body_move_closure_captures_generic(tv, effect)
-                || body_move_closure_captures_generic(tv, rest)
+        Expr::Access { record, .. } => collect_ir_free_vars(record, out),
+        Expr::Record { fields, .. } => {
+            for (_, f) in fields {
+                collect_ir_free_vars(f, out);
+            }
         }
-        Expr::Access { record, .. } => body_move_closure_captures_generic(tv, record),
+        Expr::Update { record, fields } => {
+            collect_ir_free_vars(record, out);
+            for (_, f) in fields {
+                collect_ir_free_vars(f, out);
+            }
+        }
         Expr::FuncValue { .. }
         | Expr::Int(_)
         | Expr::Bool(_)
@@ -4122,9 +4095,7 @@ fn body_move_closure_captures_generic(tv: Symbol, expr: &Expr) -> bool {
         | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
-        | Expr::Unit
-        | Expr::Var(_)
-        | Expr::CloneVar(_) => false,
+        | Expr::Unit => {}
     }
 }
 
@@ -4290,27 +4261,6 @@ fn apply_kernel_type_param_bounds(
         if fires_on(&sync_capture_matcher) {
             *bounds = bounds.with_sync();
         }
-        // `Sync` — GENERAL capture obligation: the tvar's VALUE binder is
-        // move-captured into an emitted closure (a user `filter`/`map` predicate,
-        // a builder's composing lambda, …). Every emitted closure is a
-        // `Box<dyn Fn(..) -> .. + Send + Sync + 'static>`, so a captured value
-        // whose type REACHES the tvar bare (a bare `Generic(tv)`, or a `tv`
-        // element inside a captured transparent composite — `Vec<(tv, String)>`
-        // for an `enum`'s pairs, `Vec<Variant<tv>>` for a `taggedUnion`'s
-        // variants) obliges `tv: Send + Sync + 'static`, or the
-        // closure→trait-object cast is E0277. [`ir_type_generic_reaches_bare`]
-        // stops at opaque `Send + Sync` carriers (`Decoder`/`Task`/…), so a tvar
-        // that rides ONLY under such a carrier (a `decode_list` run-through
-        // element) is NOT reached and gains no spurious `Sync`. Fires on the
-        // exact captured binder, so a tvar only read at the top level (never
-        // crossing a closure boundary) stays unbounded and reusable. This
-        // generalizes the decoder-factory `succeed`/`optional` matchers above to
-        // any closure capture of a value structurally carrying the tvar.
-        if params.iter().any(|(binder, ty)| {
-            ir_type_generic_reaches_bare(ty, *tv) && binder_captured_in_move_closure(*binder, body)
-        }) {
-            *bounds = bounds.with_sync();
-        }
         // `Sync` — a bare tvar VALUE pulled OUT of a captured transparent
         // composite (not itself a param) and moved into a `decode_succeed`
         // factory. An `enum`'s decode helper destructures the constructor `c`
@@ -4332,33 +4282,14 @@ fn apply_kernel_type_param_bounds(
         if sig_reaches_bare && body_succeeds_on_bare_var(body) {
             *bounds = bounds.with_sync();
         }
-        // `Sync` — GENERAL in-body-capture obligation: an emitted move-closure
-        // (`Lambda` or `SharedLambda`, both `Box`/`Arc<dyn Fn(..) + Send + Sync
-        // + 'static>`) whose OWN signature [`ir_type_generic_reaches_bare`] the
-        // tvar AND whose body move-captures a free variable. The captured value
-        // is often an in-body binder — a match-arm / destructure / `let` local
-        // (`Ipe.Db.Store.decodeRows` cons-prepends the `Ok value ->` arm local
-        // `value : a` inside a continuation lambda) — invisible to the
-        // `params`-keyed capture check above, but the closure's own type
-        // annotation still exposes the bare `tv`, so keying on the CLOSURE
-        // signature fires regardless of the closure's return shape (a direct
-        // cons, a `List.append` call, a `(first, 0) :: more` tuple head, a
-        // `Maybe` wrap, a record build). [`ir_type_generic_reaches_bare`] stops
-        // at opaque `Send + Sync` carriers, so an eta-lambda over a `tv`-taking
-        // param, a `Decoder tv` forwarder, or a record-wrapped generic does NOT
-        // reach bare and gains no spurious `Sync`.
-        if body_move_closure_captures_generic(*tv, body) {
-            *bounds = bounds.with_sync();
-        }
     }
 }
 
 /// Collect every direct user-function call in `expr` as `(callee, args)`.
 ///
-/// A structural walk over the body, mirroring [`body_move_closure_captures_generic`]'s
-/// coverage of every `Expr` arm. Kernel and FFI callees are skipped — their Rust
-/// bounds are already handled by [`apply_kernel_type_param_bounds`] and the FFI
-/// shim signatures; only a `Callee::Func` can carry a caller-propagable
+/// A structural walk over the body covering every `Expr` arm. Kernel and FFI
+/// callees are skipped — their Rust bounds are already handled by
+/// [`apply_kernel_type_param_bounds`] and the FFI shim signatures; only a `Callee::Func` can carry a caller-propagable
 /// [`BoundSet`] on its own generic parameters.
 fn collect_user_calls<'e>(expr: &'e Expr, out: &mut Vec<(FuncId, &'e [Expr])>) {
     match expr {
@@ -9973,6 +9904,13 @@ pub struct Lowerer<'a> {
     /// Recorded at every reference, folded into the def's generic bounds when it
     /// is finalized. Cleared per def.
     recorded_bounds: std::cell::RefCell<BTreeMap<Symbol, BoundSet>>,
+    /// The generics each source local of the current def reaches through its solved type.
+    ///
+    /// Recorded at every local read ([`Self::note_local_reach`]) and consumed
+    /// by [`closure_capture_obligations`], which reads a captured local's type
+    /// from here when no typed binder in the lowered body records it. Cleared
+    /// per def.
+    local_capture_reach: std::cell::RefCell<CaptureReach>,
     /// The current def's user-function references, each with the solved type
     /// it instantiates the callee at. Recorded at every reference by
     /// [`Self::note_callee_instance`], drained per def into the cross-call
@@ -11693,6 +11631,7 @@ impl<'a> Lowerer<'a> {
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
             recorded_bounds: std::cell::RefCell::new(BTreeMap::new()),
+            local_capture_reach: std::cell::RefCell::new(BTreeMap::new()),
             callee_instances: std::cell::RefCell::new(Vec::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
@@ -15336,6 +15275,7 @@ impl<'a> Lowerer<'a> {
         // must not leak its signals into the next def.
         self.deferred_fun_captures.borrow_mut().clear();
         self.recorded_bounds.borrow_mut().clear();
+        self.local_capture_reach.borrow_mut().clear();
         self.callee_instances.borrow_mut().clear();
         // Eta names are scope-local to one function: reset the monotonic cursor so
         // each def draws `eta_0, eta_1, …` afresh. Within the def the cursor only
@@ -15365,12 +15305,14 @@ impl<'a> Lowerer<'a> {
 
     /// Fold every body-derived bound obligation into a definition's generics.
     ///
-    /// Two independent sources oblige a generic: a kernel the body applies to a
-    /// parameter binder of that generic ([`apply_kernel_type_param_bounds`]:
+    /// Three independent sources oblige a generic: a kernel the body applies to
+    /// a parameter binder of that generic ([`apply_kernel_type_param_bounds`]:
     /// `IpeRow` for wildcard `any` only, `IpeStringify`, `Send + 'static`,
-    /// `Sync`), and a reference whose solved instantiation reaches the generic
+    /// `Sync`); a reference whose solved instantiation reaches the generic
     /// through a sync capture or a `Cmd` / `Sub` / `Decoder` carrier
-    /// ([`Self::apply_recorded_bounds`], recorded while the body lowered).
+    /// ([`Self::apply_recorded_bounds`], recorded while the body lowered); and a
+    /// value an emitted closure captures whose type reaches the generic
+    /// ([`closure_capture_obligations`]).
     fn finalize_type_params(
         &self,
         type_params: &mut [(Symbol, BoundSet)],
@@ -15381,6 +15323,17 @@ impl<'a> Lowerer<'a> {
     ) {
         apply_kernel_type_param_bounds(type_params, wildcard_any_syms, params, ret, body);
         self.apply_recorded_bounds(type_params);
+        let poly: BTreeSet<Symbol> = type_params.iter().map(|(tv, _)| *tv).collect();
+        let local_reach = self.local_capture_reach.take();
+        let captures = closure_capture_obligations(body, params, &poly, &local_reach);
+        for (tv, bounds) in type_params.iter_mut() {
+            if captures.sync.contains(tv) {
+                *bounds = bounds.with_sync();
+            }
+            if captures.send.contains(tv) {
+                *bounds = bounds.with_send();
+            }
+        }
     }
 
     /// Lower one definition's signature and body, before its bounds are folded in.
@@ -17871,6 +17824,7 @@ impl<'a> Lowerer<'a> {
         // T3: Capture-clone rewrite — classify free locals captured
         // by this closure and replace CloneOk reads with `.clone()`, emitting
         // IPE-L0125 for NonClone captures outside callee position.
+        self.note_closure_capture_reach(&all_param_pats, cur_body);
         body = self.rewrite_lambda_captures(&all_param_pats, cur_body, span, body)?;
         // Fold each destructuring param's `Destructure` around the body,
         // OUTERMOST-first (reverse of source order) so the first parameter's
@@ -19751,7 +19705,10 @@ impl<'a> Lowerer<'a> {
             }),
             canon::Expr_::Char(c) => Ok(Expr::Char(c.clone())),
             canon::Expr_::Unit => Ok(Expr::Unit),
-            canon::Expr_::VarLocal(s) => Ok(Expr::Var(*s)),
+            canon::Expr_::VarLocal(s) => {
+                self.note_local_reach(*s, e.span);
+                Ok(Expr::Var(*s))
+            }
             // A foreign wrapper call from an FFI interface module's forwarder
             // body. Always saturated by construction — the driver-generated
             // forwarder applies exactly its own parameters — so this lowers to
@@ -25591,6 +25548,63 @@ impl<'a> Lowerer<'a> {
         for tv in obliged {
             let slot = recorded.entry(tv).or_insert(BoundSet::UNBOUNDED);
             *slot = slot.with_send();
+        }
+    }
+
+    /// Record the generics a read of the source local `sym` at `span` reaches.
+    ///
+    /// The read's solved type is lowered in the def's generics and every generic
+    /// it reaches ([`ir_type_generic_reaches_bare`]) is unioned into the local's
+    /// entry. Fail-closed: a missing region type records every generic of the
+    /// def; a type that does not lower records every generic it mentions.
+    fn note_local_reach(&self, sym: Symbol, span: Span) {
+        let poly: BTreeSet<Symbol> = self.current_poly_tvars.borrow().values().copied().collect();
+        if poly.is_empty() {
+            return;
+        }
+        let reached: BTreeSet<Symbol> = self.region_ty(span).map_or_else(
+            || poly.clone(),
+            |solved| {
+                self.ir_type_from_ty(solved, span).map_or_else(
+                    |_| {
+                        poly.iter()
+                            .copied()
+                            .filter(|tv| self.ty_mentions_poly_tvar(solved, *tv))
+                            .collect()
+                    },
+                    |ir| {
+                        poly.iter()
+                            .copied()
+                            .filter(|tv| ir_type_generic_reaches_bare(&ir, *tv))
+                            .collect()
+                    },
+                )
+            },
+        );
+        self.local_capture_reach
+            .borrow_mut()
+            .entry(sym)
+            .or_default()
+            .extend(reached);
+    }
+
+    /// Record the reach of every local a closure's canonical body reads free of its parameters.
+    ///
+    /// Covers the reads the lowerer consumes without routing them through
+    /// [`Self::lower_expr`] (a record-update base), so every source capture of
+    /// the closure has a recorded type.
+    fn note_closure_capture_reach(&self, param_pats: &[&canon::Pattern], canon_body: &canon::Expr) {
+        if self.current_poly_tvars.borrow().is_empty() {
+            return;
+        }
+        let mut bound = BTreeSet::new();
+        for &p in param_pats {
+            canon_collect_pat_binds(p, &mut bound);
+        }
+        let mut free: BTreeMap<Symbol, Span> = BTreeMap::new();
+        canon_collect_free_locals(&mut free, &bound, canon_body);
+        for (sym, span) in free {
+            self.note_local_reach(sym, span);
         }
     }
 
@@ -32698,5 +32712,206 @@ mod tests {
             super::instance_tvars(&[], &IrType::Int, msg, &instance(vec![], vec![]), &caller)
                 .is_empty()
         );
+    }
+
+    /// Symbols shared by the closure-capture obligation tests.
+    struct CaptureSyms {
+        a: ipe_intern::Symbol,
+        b: ipe_intern::Symbol,
+        x: ipe_intern::Symbol,
+        n: ipe_intern::Symbol,
+        ys: ipe_intern::Symbol,
+        field: ipe_intern::Symbol,
+    }
+
+    fn capture_syms() -> CaptureSyms {
+        let mut interner = Interner::new();
+        let mut intern = |s: &str| interner.intern(s).unwrap();
+        CaptureSyms {
+            a: intern("a"),
+            b: intern("b"),
+            x: intern("x"),
+            n: intern("n"),
+            ys: intern("ys"),
+            field: intern("field"),
+        }
+    }
+
+    /// A `\n -> (n, <captured>)` closure with an `Int` parameter.
+    fn closure_capturing(n: ipe_intern::Symbol, captured: ipe_ir::Expr) -> ipe_ir::Expr {
+        use ipe_ir::{Expr, IrType};
+        Expr::Lambda {
+            params: vec![(n, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(Expr::Tuple(vec![Expr::Var(n), captured])),
+        }
+    }
+
+    #[test]
+    fn capture_of_bare_generic_param_obliges_sync() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        let body = closure_capturing(s.n, Expr::Var(s.x));
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::Generic(s.a))],
+            &BTreeSet::from([s.a, s.b]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl.sync, BTreeSet::from([s.a]));
+        assert!(obl.send.is_empty());
+    }
+
+    #[test]
+    fn capture_of_in_body_local_composite_obliges_sync() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        // `let ys = <untyped value> in \n -> (n, ys)`: the local's type is known
+        // only from its recorded use-site reach.
+        let body = Expr::Let {
+            name: s.ys,
+            value: Box::new(Expr::List {
+                elem: IrType::Generic(s.a),
+                items: vec![],
+            }),
+            body: Box::new(closure_capturing(s.n, Expr::Var(s.ys))),
+        };
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::List(Box::new(IrType::Generic(s.a))))],
+            &BTreeSet::from([s.a, s.b]),
+            &BTreeMap::from([(s.ys, BTreeSet::from([s.a]))]),
+        );
+        assert_eq!(obl.sync, BTreeSet::from([s.a]));
+        assert!(obl.send.is_empty());
+    }
+
+    #[test]
+    fn capture_of_nested_composite_obliges_sync() {
+        use ipe_ir::{Expr, IrType, ModPath};
+        let s = capture_syms();
+        let nested = IrType::Maybe(Box::new(IrType::Tuple(vec![
+            IrType::Record(BTreeMap::from([(
+                s.field,
+                IrType::Enum {
+                    home: ModPath(vec![]),
+                    name: s.field,
+                    args: vec![IrType::List(Box::new(IrType::Generic(s.b)))],
+                },
+            )])),
+            IrType::Int,
+        ])));
+        let body = closure_capturing(s.n, Expr::Var(s.x));
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, nested)],
+            &BTreeSet::from([s.a, s.b]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl.sync, BTreeSet::from([s.b]));
+    }
+
+    #[test]
+    fn closure_signature_mentioning_generic_without_capturing_it_obliges_nothing() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        // `\n -> (n, x)` with `n : a` and a captured `x : Int`.
+        let body = Expr::Lambda {
+            params: vec![(s.n, IrType::Generic(s.a))],
+            ret: IrType::Tuple(vec![IrType::Generic(s.a), IrType::Int]),
+            body: Box::new(Expr::Tuple(vec![Expr::Var(s.n), Expr::Var(s.x)])),
+        };
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::Int)],
+            &BTreeSet::from([s.a]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl, super::CaptureObligations::default());
+    }
+
+    #[test]
+    fn closure_without_captures_obliges_nothing() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        let body = closure_capturing(s.n, Expr::Int(1));
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::Generic(s.a))],
+            &BTreeSet::from([s.a]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl, super::CaptureObligations::default());
+    }
+
+    #[test]
+    fn capture_of_function_value_obliges_nothing() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        let fun = IrType::Fun(vec![IrType::Generic(s.a)], Box::new(IrType::Int));
+        let body = closure_capturing(s.n, Expr::Var(s.x));
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, fun)],
+            &BTreeSet::from([s.a]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl, super::CaptureObligations::default());
+    }
+
+    #[test]
+    fn capture_of_untyped_symbol_obliges_every_generic() {
+        use ipe_ir::Expr;
+        let s = capture_syms();
+        let body = closure_capturing(s.n, Expr::Var(s.ys));
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[],
+            &BTreeSet::from([s.a, s.b]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl.sync, BTreeSet::from([s.a, s.b]));
+    }
+
+    #[test]
+    fn task_continuation_capture_obliges_send_only() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        let body = Expr::TaskSeq {
+            effect: Box::new(Expr::Unit),
+            rest: Box::new(Expr::Tuple(vec![Expr::Var(s.x)])),
+        };
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::Generic(s.a))],
+            &BTreeSet::from([s.a]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl.send, BTreeSet::from([s.a]));
+        assert!(obl.sync.is_empty());
+    }
+
+    #[test]
+    fn let_bound_closure_shadowing_generic_param_obliges_nothing() {
+        use ipe_ir::{Expr, IrType};
+        let s = capture_syms();
+        // `let x = \n -> n in \n -> (n, x)`: the captured `x` is the inner
+        // closure, not the generic parameter it shadows.
+        let body = Expr::Let {
+            name: s.x,
+            value: Box::new(Expr::Lambda {
+                params: vec![(s.n, IrType::Int)],
+                ret: IrType::Int,
+                body: Box::new(Expr::Var(s.n)),
+            }),
+            body: Box::new(closure_capturing(s.n, Expr::Var(s.x))),
+        };
+        let obl = super::closure_capture_obligations(
+            &body,
+            &[(s.x, IrType::Generic(s.a))],
+            &BTreeSet::from([s.a]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(obl, super::CaptureObligations::default());
     }
 }

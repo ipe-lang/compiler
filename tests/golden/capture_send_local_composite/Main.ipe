@@ -1,0 +1,41 @@
+module Main exposing (main)
+
+-- SEAL repro: a closure captures an in-body local composite over `a` while its
+-- own signature never mentions `a`. `ys : List a` is built in the body, and the
+-- `\n -> ...` closure passed to `List.map` has type `Int -> Int`, yet it moves
+-- `ys` into a `Send + Sync` boxed closure, so `lens`'s generic must carry
+-- `T1: Send + Sync`. The obligation follows the closure's capture set, not the
+-- shape of its signature or of the enclosing parameters.
+--
+-- Output: the mapped list for an `Int` and a `String` instantiation.
+
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+lens : List a -> List Int -> List Int
+lens xs ns =
+    let
+        ys =
+            List.append xs xs
+    in
+    List.map (\n -> n + List.length ys) ns
+
+
+render : List Int -> String
+render ns =
+    String.join "," (List.map String.fromInt ns)
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ render (lens [ 1, 2 ] [ 10, 20 ])
+            , render (lens [ "a", "b", "c" ] [ 0, 1 ])
+            ]
+        )

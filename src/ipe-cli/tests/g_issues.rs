@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "g_issues/golden_capture_send_local_composite.rs"]
+mod golden_capture_send_local_composite;
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
 mod golden_generic_carrier_send_seal;
 #[path = "g_issues/golden_generic_msg_forward_sync_seal.rs"]

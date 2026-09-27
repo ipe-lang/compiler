@@ -6,15 +6,11 @@
 //! is accepted by ipe (exit 0) but fails `cargo build` with E0277 — a SEAL
 //! violation affecting every `Store.all` / `Store.findWhere` call site.
 //!
-//! Root cause: the bound-propagation pass in the lowerer walked only
-//! function-level *params* for the capture-of-generic-by-closure check; it
-//! did not see the `Ok value ->` match-arm local whose type is `Generic(a)`
-//! — that local is captured by the `\more -> value :: more` lambda passed to
-//! `Task.map`.  The fix keys the `Sync` obligation on the CLOSURE's own
-//! signature: `body_move_closure_captures_generic` fires on any
-//! `Lambda`/`SharedLambda` whose param/return type `reaches_bare` the tvar AND
-//! that move-captures a free value carrying the tvar bare (a bare-value
-//! capture, or a read of a transparent field whose type reaches the tvar).
+//! The captured value is the `Ok value ->` match-arm local whose type is
+//! `Generic(a)`, captured by the `\more -> value :: more` lambda passed to
+//! `Task.map`. The lowerer derives the `Sync` obligation from every closure's
+//! capture set (`closure_capture_obligations`): each generic a captured
+//! binder's type reaches — a parameter or an in-body local alike — is bound.
 //!
 //! The load-bearing proof is the SEAL check: under `IPE_E2E=1` the emitted
 //! crate must `cargo build` (no database connection required — the fixture
