@@ -233,7 +233,12 @@ uuid = { version = "1", features = ["v4", "v7", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
 # Browser sink (`wasm` module, feature `wasm-client`). Pinned exact
 # wasm-bindgen: the emitted-project glue is produced by the wasm-bindgen CLI,
-# which requires a byte-matching crate version.
+# which requires a byte-matching crate version. THIS is the canonical
+# wasm-bindgen version spelling — the emitted-project manifest templates and
+# the CLI's install-instructions message each repeat it (a `Cargo.toml`
+# dependency table can't `include!`/import a version from elsewhere), and
+# `ipe_backend_rust::project`'s `wasm_bindgen_version_matches_the_runtime_pin`
+# test fails the build the instant one of those copies drifts from this line.
 wasm-bindgen = { version = "=0.2.126", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }

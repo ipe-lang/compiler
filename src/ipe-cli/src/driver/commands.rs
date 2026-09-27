@@ -2009,6 +2009,11 @@ pub fn format_artifact_size(bytes: u64) -> String {
 }
 
 /// The `wasm-bindgen-cli` version that matches the runtime's pinned `wasm-bindgen` crate.
+///
+/// `src/runtime/rust/Cargo.toml`'s `wasm-bindgen` dependency line is the
+/// canonical spelling of this version; `ipe_backend_rust::project`'s
+/// `wasm_bindgen_version_matches_the_runtime_pin` test fails the build the
+/// instant this constant drifts from it.
 const WASM_BINDGEN_VERSION: &str = "0.2.126";
 
 /// Run the three post-emit bundle steps for `--target wasm`:

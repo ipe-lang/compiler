@@ -170,6 +170,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 subtle = "2"
 zeroize = "1"
+# Pinned exact to match `src/runtime/rust/Cargo.toml`'s own `wasm-bindgen` pin
+# (the canonical spelling — see the `wasm_bindgen_version_matches_the_runtime_pin`
+# test below, which fails the build the instant this drifts from it).
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -5700,6 +5703,58 @@ mod tests {
     fn tokio_line(manifest: &str) -> Option<&str> {
         let prefix = format!("{} = {{", crate_specs::TOKIO.name);
         manifest.lines().find(|l| l.starts_with(&prefix))
+    }
+
+    /// The quoted value immediately after the first occurrence of `anchor` in
+    /// `haystack`.
+    ///
+    /// Strips a leading `=` pin marker so an exact-pinned `"=X.Y.Z"` and a bare
+    /// `"X.Y.Z"` compare equal. `None` when `anchor` never opens a quoted value.
+    fn pinned_dependency_version<'a>(haystack: &'a str, anchor: &str) -> Option<&'a str> {
+        let (_, after_anchor) = haystack.split_once(anchor)?;
+        let (version, _) = after_anchor.split_once('"')?;
+        Some(version.trim_start_matches('='))
+    }
+
+    /// SSOT guard: the `wasm-bindgen` version is hand-spelled in four places.
+    ///
+    /// None of them can `include!`/import a Cargo dependency version from
+    /// another — two are real `Cargo.toml` dependency tables Cargo itself
+    /// parses at a different time than this compiler builds, and the CLI's
+    /// copy is a string literal in a separate crate's binary.
+    /// `src/runtime/rust/Cargo.toml` is the canonical spelling (the one pin
+    /// Cargo enforces for the runtime crate itself); this test fails the
+    /// instant any of the other three drifts from it.
+    #[test]
+    fn wasm_bindgen_version_matches_the_runtime_pin() {
+        const RUNTIME_CARGO_TOML: &str = include_str!("../../../../../src/runtime/rust/Cargo.toml");
+        const CLI_COMMANDS_RS: &str = include_str!("../../../../ipe-cli/src/driver/commands.rs");
+
+        let runtime_pin =
+            pinned_dependency_version(RUNTIME_CARGO_TOML, "wasm-bindgen = { version = \"")
+                .expect("src/runtime/rust/Cargo.toml must pin an exact wasm-bindgen version");
+        let dep_template_pin = pinned_dependency_version(CARGO_WASM_DEP_TOML, "wasm-bindgen = \"")
+            .expect("templates/Cargo.wasm-dep.toml must pin an exact wasm-bindgen version");
+        let monolithic_pin = pinned_dependency_version(WASM_CARGO_TOML, "wasm-bindgen = \"")
+            .expect("project.rs's WASM_CARGO_TOML must pin an exact wasm-bindgen version");
+        let cli_pin = pinned_dependency_version(CLI_COMMANDS_RS, "WASM_BINDGEN_VERSION: &str = \"")
+            .expect("ipe-cli must declare a WASM_BINDGEN_VERSION constant");
+
+        assert_eq!(
+            dep_template_pin, runtime_pin,
+            "templates/Cargo.wasm-dep.toml's wasm-bindgen pin has drifted from \
+             src/runtime/rust/Cargo.toml's"
+        );
+        assert_eq!(
+            monolithic_pin, runtime_pin,
+            "project.rs's WASM_CARGO_TOML wasm-bindgen pin has drifted from \
+             src/runtime/rust/Cargo.toml's"
+        );
+        assert_eq!(
+            cli_pin, runtime_pin,
+            "ipe-cli's WASM_BINDGEN_VERSION has drifted from \
+             src/runtime/rust/Cargo.toml's wasm-bindgen pin"
+        );
     }
 
     /// `ssrf_cargo_toml` adds tokio `"net"` to a line lacking it (the db-only
