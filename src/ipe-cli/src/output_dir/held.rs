@@ -414,22 +414,41 @@ impl HeldDir {
     /// [`CliError::Io`] on a filesystem failure.
     pub fn remove_proven(&self, name: &OsStr, child: Self) -> Result<(), CliError> {
         child.remove_contents(0)?;
+        let path = self.release_proven(name, child)?;
+        self.dir.rmdir(name).map_err(|e| io_err(&path, e))
+    }
+
+    /// Release the held `child` after re-proving that `name` still names it,
+    /// returning the entry's path.
+    ///
+    /// A held directory cannot be removed on every platform, so a removal
+    /// releases the handle first and proves identity immediately before.
+    ///
+    /// # Errors
+    /// [`OutputRefusal::Replaced`] when `name` no longer names `child`;
+    /// [`CliError::Io`] on a filesystem failure.
+    fn release_proven(&self, name: &OsStr, child: Self) -> Result<PathBuf, CliError> {
         let path = self.path.join(name);
         let still = self.child(name)?;
         let same = still.map_or(Ok(false), |now| Ok::<_, CliError>(now.id()? == child.id()?))?;
         drop(child);
         if same {
-            self.dir.rmdir(name).map_err(|e| io_err(&path, e))
+            Ok(path)
         } else {
             Err(OutputRefusal::Replaced(path).into())
         }
     }
 
-    /// Remove the subdirectory `name` when it is empty; `false` when it is not.
+    /// Remove the subdirectory `name`, held as `child`, when it is empty;
+    /// `false` when it is not.
+    ///
+    /// `child` is released before the removal (see [`Self::release_proven`]).
     ///
     /// # Errors
+    /// [`OutputRefusal::Replaced`] when `name` no longer names `child`;
     /// [`CliError::Io`] on a failure other than a non-empty directory.
-    pub fn remove_empty_dir(&self, name: &OsStr) -> Result<bool, CliError> {
+    pub fn remove_empty_dir(&self, name: &OsStr, child: Self) -> Result<bool, CliError> {
+        let path = self.release_proven(name, child)?;
         match self.dir.rmdir(name) {
             Ok(()) => Ok(true),
             Err(e)
@@ -440,7 +459,7 @@ impl HeldDir {
             {
                 Ok(false)
             }
-            Err(e) => Err(io_err(&self.path.join(name), e)),
+            Err(e) => Err(io_err(&path, e)),
         }
     }
 

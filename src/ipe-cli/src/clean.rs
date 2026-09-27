@@ -202,7 +202,7 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
                     EntryKind::Absent | EntryKind::Other => {}
                 }
             }
-            if root_dir.remove_empty_dir(os_name)? {
+            if root_dir.remove_empty_dir(os_name, dir)? {
                 return Ok(vec![format!("{name}/")]);
             }
             Ok(removed)
