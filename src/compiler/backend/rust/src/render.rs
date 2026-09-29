@@ -500,9 +500,11 @@ fn receiver_shape(
     }
 }
 
-/// Whether `inner` renders with a leading `(` at `start_col` — a self-parenthesizing
-/// block / paren-expr whose enclosing redundant paren pair `rustfmt` elides. Probed
-/// by rendering `inner` flat and inspecting its first character.
+/// Whether `inner` renders as ONE parenthesized group at `start_col` — a
+/// self-parenthesizing block / paren-expr whose enclosing redundant paren pair
+/// `rustfmt` elides. Probed by rendering `inner` flat: a leading `(` alone is not
+/// enough, since `(r).f` also starts with `(` yet dropping its wrapping pair turns
+/// the field-call callee `((r).f)(x)` into the method call `(r).f(x)`.
 fn inner_renders_parenthesized(
     inner: &Doc,
     cfg: RenderConfig,
@@ -518,7 +520,120 @@ fn inner_renders_parenthesized(
         true,
         &mut scratch,
     );
-    scratch.starts_with('(')
+    is_single_paren_group(&scratch)
+}
+
+/// Whether `src` is exactly one balanced `( … )` group: it opens with `(` and the
+/// paren that closes that first `(` is its last character. Parens inside string,
+/// raw-string, and char literals are skipped; a `'` that opens no char literal is a
+/// lifetime or label and is passed over.
+fn is_single_paren_group(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i.saturating_add(1) == bytes.len();
+                }
+            }
+            b'"' => i = skip_string(bytes, i),
+            b'r' if starts_raw_string(bytes, i) => i = skip_raw_string(bytes, i),
+            b'\'' => i = skip_char_literal(bytes, i),
+            _ => {}
+        }
+        i = i.saturating_add(1);
+    }
+    false
+}
+
+/// Whether the `r` at `at` opens a raw string (`r"` or `r#…"`) rather than ending
+/// or starting an identifier: the byte before it is no identifier character.
+fn starts_raw_string(bytes: &[u8], at: usize) -> bool {
+    let prev_is_ident = at
+        .checked_sub(1)
+        .and_then(|p| bytes.get(p))
+        .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_');
+    !prev_is_ident && matches!(bytes.get(at.saturating_add(1)), Some(b'"' | b'#'))
+}
+
+/// Index of the `"` closing the string literal whose opening `"` is at `open`
+/// (the last index when unterminated).
+fn skip_string(bytes: &[u8], open: usize) -> usize {
+    let mut i = open.saturating_add(1);
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\\' => i = i.saturating_add(2),
+            b'"' => return i,
+            _ => i = i.saturating_add(1),
+        }
+    }
+    bytes.len().saturating_sub(1)
+}
+
+/// Index of the last character of the raw string `r#…"…"#…` whose `r` is at
+/// `start`, or `start` itself when no `"` follows the `#` run.
+fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
+    let mut i = start.saturating_add(1);
+    let mut hashes = 0usize;
+    while bytes.get(i) == Some(&b'#') {
+        hashes = hashes.saturating_add(1);
+        i = i.saturating_add(1);
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return start;
+    }
+    i = i.saturating_add(1);
+    while let Some(&b) = bytes.get(i) {
+        if b == b'"' {
+            let after = i.saturating_add(1);
+            let closing = bytes.get(after..after.saturating_add(hashes));
+            if closing.is_some_and(|c| c.iter().all(|&h| h == b'#')) {
+                return i.saturating_add(hashes);
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    bytes.len().saturating_sub(1)
+}
+
+/// Index of the `'` closing the char literal opened at `open`, or `open` itself
+/// when the `'` begins a lifetime or label instead (`'a`, `'outer:`).
+fn skip_char_literal(bytes: &[u8], open: usize) -> usize {
+    let first = open.saturating_add(1);
+    if bytes.get(first) == Some(&b'\\') {
+        let mut i = first.saturating_add(2);
+        while let Some(&b) = bytes.get(i) {
+            if b == b'\'' {
+                return i;
+            }
+            i = i.saturating_add(1);
+        }
+        return bytes.len().saturating_sub(1);
+    }
+    let close = first.saturating_add(utf8_width(bytes.get(first).copied()));
+    if close > first && bytes.get(close) == Some(&b'\'') {
+        close
+    } else {
+        open
+    }
+}
+
+/// UTF-8 byte width of the codepoint whose lead byte is `lead`; `0` for none.
+fn utf8_width(lead: Option<u8>) -> usize {
+    match lead {
+        None => 0,
+        Some(b) if b < 0x80 => 1,
+        Some(b) if b >= 0xF0 => 4,
+        Some(b) if b >= 0xE0 => 3,
+        Some(_) => 2,
+    }
 }
 
 /// Render a [`Doc::TypeBound`] `Ptr<Head + T1 + …>` with `rustfmt`'s angle-bracket
@@ -3223,5 +3338,43 @@ mod p0_tests {
         // closing `)` (no break), so the method-on-its-own-line layout is invisible
         // to the leaf sequence.
         assert!(doc.normalized_leaves().ends_with(").clone()"));
+    }
+
+    /// Only a render that is ONE balanced paren group makes the wrapping pair
+    /// redundant: a field access on a parenthesized receiver keeps its parens, so a
+    /// field-call callee stays `((r).f)(x)`, never the method call `(r).f(x)`.
+    #[test]
+    fn single_paren_group_admits_only_one_whole_group() {
+        for whole in [
+            "(x)",
+            "({ a })",
+            "((a)(b))",
+            "(\")\")",
+            "(')')",
+            "(r#\")\"#)",
+            "('a: loop {})",
+        ] {
+            assert!(is_single_paren_group(whole), "{whole} is one group");
+        }
+        for split in [
+            "(r).f",
+            "(a)(b)",
+            "x",
+            "",
+            "(",
+            "(a",
+            "(\")\"",
+            "(a).0",
+            "(f)(\"(\")",
+        ] {
+            assert!(!is_single_paren_group(split), "{split} is not one group");
+        }
+    }
+
+    #[test]
+    fn field_callee_on_parenthesized_receiver_keeps_its_parens() {
+        let callee = Doc::concat(vec![Doc::text("(r)"), Doc::text(".f")]);
+        let doc = Doc::concat(vec![Doc::elidable_paren(callee), Doc::text("(x)")]);
+        assert_eq!(render(&doc, RenderConfig::default()), "((r).f)(x)");
     }
 }
