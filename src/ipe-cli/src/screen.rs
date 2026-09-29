@@ -470,7 +470,7 @@ mod tests {
             s.render(Header::Shown),
             format!(
                 "\n  Ipê language - v{version} - {}\n\n  hello\n  world\n",
-                style::REPO_URL
+                style::repo_url()
             )
         );
         assert_eq!(s.render(Header::Omitted), "\n  hello\n  world\n");
@@ -539,7 +539,7 @@ mod tests {
             s.render_chatter(Header::Shown),
             format!(
                 "\n  Ipê language - v{version} - {}\n\n  • building Main.ipe\n",
-                style::REPO_URL
+                style::repo_url()
             )
         );
     }

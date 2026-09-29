@@ -33,6 +33,7 @@ pub const GITHUB_REPO_SLUG: &str = "ipe-lang/compiler";
 /// Single source of truth: every humble / ICE message and every `IPE-I*` /
 /// `IPE-L*` explain page footer calls this one function, derived from
 /// [`GITHUB_REPO_SLUG`].
+#[must_use]
 pub fn issue_tracker_url() -> String {
     format!("https://github.com/{GITHUB_REPO_SLUG}/issues")
 }
