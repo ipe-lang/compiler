@@ -50,10 +50,13 @@ Acyclic chain of crates; most changes touch one stage.
 
 ## Fast gate (a PR must pass — minutes)
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --workspace -- -D warnings
-cargo nextest run -p ipe                 # + `-p <crate>` per crate you changed
+tools/scripts/gate quick      # fmt, clippy on changed crates, static guards, doc drift
+tools/scripts/gate affected   # + tests over changed crates and their reverse deps
+tools/scripts/gate full       # the local CI mirror (`IPE_E2E=1` included)
 ```
+- The commands are the `local:` blocks of `.github/ci/check-manifest.yml`, each
+  verified against the CI step it mirrors; `--plan` prints them without running.
+- Opt-in pre-push hook: `tools/scripts/install-pre-push-hook.sh` (runs `gate quick`).
 - `--profile ci` for slow emit tests (default 120s false-times-out; ci gives 600s).
 - `IPE_E2E=1` makes emit tests build+run the emitted project — THE SEAL:
   `ipe`-accepts ⇒ `cargo`-builds.

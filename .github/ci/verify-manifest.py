@@ -1306,6 +1306,12 @@ def main() -> int:
                 "(orphaned required context — wire it or set disposition:delete)"
             )
 
+    # ---- 8. local gate: every `gate` declares one typed `local:` disposition,
+    # and each local command mirrors its producer job's CI step ----
+    import local_gate  # noqa: PLC0415  # sibling module; sys.path holds this dir
+
+    local_gate.check_local_dispositions(entries, errors)
+
     # ---- 4. required-set reconciliation ----
     # gate-external contexts are required by the ruleset even though no CI
     # workflow produces them; include them alongside plain gate entries.

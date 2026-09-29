@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 
 use ipe::project;
 
+#[macro_use]
+mod parity_shards;
+
 type UserSources = BTreeMap<Vec<String>, String>;
 type PreparedSources = BTreeMap<Vec<String>, (PathBuf, String)>;
 
@@ -159,9 +162,9 @@ fn golden_fixture_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Drive one quarter of the golden fixture population (split for nextest
-/// parallelism; the union of the four shards is the full set).
-fn parity_shard(shard: usize) {
+/// Drive one shard of the golden fixture population; the union of all shards
+/// is the full set.
+fn parity_shard(shard: usize, count: usize) {
     let dirs = golden_fixture_dirs();
     assert!(
         dirs.len() >= 100,
@@ -171,7 +174,7 @@ fn parity_shard(shard: usize) {
     let mut covered = 0usize;
     let mut shard_engaged = 0usize;
     for (i, dir) in dirs.iter().enumerate() {
-        if i % 4 != shard {
+        if !parity_shards::owns(i, shard, count) {
             continue;
         }
         let Some(state0) = fixture_user_sources(dir) else {
@@ -196,25 +199,12 @@ fn parity_shard(shard: usize) {
     );
 }
 
-#[test]
-fn scoped_parity_golden_fixtures_shard0() {
-    parity_shard(0);
-}
-
-#[test]
-fn scoped_parity_golden_fixtures_shard1() {
-    parity_shard(1);
-}
-
-#[test]
-fn scoped_parity_golden_fixtures_shard2() {
-    parity_shard(2);
-}
-
-#[test]
-fn scoped_parity_golden_fixtures_shard3() {
-    parity_shard(3);
-}
+parity_shards!(parity_shard;
+    scoped_parity_golden_fixtures_shard0 = 0,
+    scoped_parity_golden_fixtures_shard1 = 1,
+    scoped_parity_golden_fixtures_shard2 = 2,
+    scoped_parity_golden_fixtures_shard3 = 3,
+);
 
 // ---------------------------------------------------------------------------
 // Adversarial multi-module edit sequence — the same edit classes the

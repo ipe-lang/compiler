@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 
 use ipe::project;
 
+#[macro_use]
+mod parity_shards;
+
 type UserSources = BTreeMap<Vec<String>, String>;
 type PreparedSources = BTreeMap<Vec<String>, (PathBuf, String)>;
 
@@ -312,14 +315,9 @@ fn probe_fixture(label: &str, state0: &UserSources) {
     );
 }
 
-/// The golden fixture population is split into this many shards so each shard's
-/// clean+incremental probe stays well under the per-test timeout; the union of
-/// all shards is the full set.
-const PARITY_SHARD_COUNT: usize = 8;
-
-/// Drive one shard of the golden fixture population (split for nextest
-/// parallelism; the union of all shards is the full set).
-fn probe_shard(shard: usize) {
+/// Drive one shard of the golden fixture population; the union of all shards
+/// is the full set.
+fn probe_shard(shard: usize, count: usize) {
     let dirs = golden_fixture_dirs();
     assert!(
         dirs.len() >= 100,
@@ -328,7 +326,7 @@ fn probe_shard(shard: usize) {
     );
     let mut covered = 0usize;
     for (i, dir) in dirs.iter().enumerate() {
-        if i % PARITY_SHARD_COUNT != shard {
+        if !parity_shards::owns(i, shard, count) {
             continue;
         }
         let Some(state0) = fixture_user_sources(dir) else {
@@ -341,47 +339,105 @@ fn probe_shard(shard: usize) {
         probe_fixture(&label, &state0);
         covered += 1;
     }
-    assert!(covered > 0, "shard {shard} covered zero fixtures");
+    assert!(
+        covered > 0,
+        "shard {shard} of {count} covered zero fixtures"
+    );
 }
 
+// Each shard holds about a dozen fixtures, so no single test is a long pole
+// and nextest bin-packs the population across every core.
+parity_shards!(probe_shard;
+    parity_probe_golden_fixtures_shard00 = 0,
+    parity_probe_golden_fixtures_shard01 = 1,
+    parity_probe_golden_fixtures_shard02 = 2,
+    parity_probe_golden_fixtures_shard03 = 3,
+    parity_probe_golden_fixtures_shard04 = 4,
+    parity_probe_golden_fixtures_shard05 = 5,
+    parity_probe_golden_fixtures_shard06 = 6,
+    parity_probe_golden_fixtures_shard07 = 7,
+    parity_probe_golden_fixtures_shard08 = 8,
+    parity_probe_golden_fixtures_shard09 = 9,
+    parity_probe_golden_fixtures_shard10 = 10,
+    parity_probe_golden_fixtures_shard11 = 11,
+    parity_probe_golden_fixtures_shard12 = 12,
+    parity_probe_golden_fixtures_shard13 = 13,
+    parity_probe_golden_fixtures_shard14 = 14,
+    parity_probe_golden_fixtures_shard15 = 15,
+    parity_probe_golden_fixtures_shard16 = 16,
+    parity_probe_golden_fixtures_shard17 = 17,
+    parity_probe_golden_fixtures_shard18 = 18,
+    parity_probe_golden_fixtures_shard19 = 19,
+    parity_probe_golden_fixtures_shard20 = 20,
+    parity_probe_golden_fixtures_shard21 = 21,
+    parity_probe_golden_fixtures_shard22 = 22,
+    parity_probe_golden_fixtures_shard23 = 23,
+    parity_probe_golden_fixtures_shard24 = 24,
+    parity_probe_golden_fixtures_shard25 = 25,
+    parity_probe_golden_fixtures_shard26 = 26,
+    parity_probe_golden_fixtures_shard27 = 27,
+    parity_probe_golden_fixtures_shard28 = 28,
+    parity_probe_golden_fixtures_shard29 = 29,
+    parity_probe_golden_fixtures_shard30 = 30,
+    parity_probe_golden_fixtures_shard31 = 31,
+    parity_probe_golden_fixtures_shard32 = 32,
+    parity_probe_golden_fixtures_shard33 = 33,
+    parity_probe_golden_fixtures_shard34 = 34,
+    parity_probe_golden_fixtures_shard35 = 35,
+    parity_probe_golden_fixtures_shard36 = 36,
+    parity_probe_golden_fixtures_shard37 = 37,
+    parity_probe_golden_fixtures_shard38 = 38,
+    parity_probe_golden_fixtures_shard39 = 39,
+    parity_probe_golden_fixtures_shard40 = 40,
+    parity_probe_golden_fixtures_shard41 = 41,
+    parity_probe_golden_fixtures_shard42 = 42,
+    parity_probe_golden_fixtures_shard43 = 43,
+    parity_probe_golden_fixtures_shard44 = 44,
+    parity_probe_golden_fixtures_shard45 = 45,
+    parity_probe_golden_fixtures_shard46 = 46,
+    parity_probe_golden_fixtures_shard47 = 47,
+    parity_probe_golden_fixtures_shard48 = 48,
+    parity_probe_golden_fixtures_shard49 = 49,
+    parity_probe_golden_fixtures_shard50 = 50,
+    parity_probe_golden_fixtures_shard51 = 51,
+    parity_probe_golden_fixtures_shard52 = 52,
+    parity_probe_golden_fixtures_shard53 = 53,
+    parity_probe_golden_fixtures_shard54 = 54,
+    parity_probe_golden_fixtures_shard55 = 55,
+    parity_probe_golden_fixtures_shard56 = 56,
+    parity_probe_golden_fixtures_shard57 = 57,
+    parity_probe_golden_fixtures_shard58 = 58,
+    parity_probe_golden_fixtures_shard59 = 59,
+    parity_probe_golden_fixtures_shard60 = 60,
+    parity_probe_golden_fixtures_shard61 = 61,
+    parity_probe_golden_fixtures_shard62 = 62,
+    parity_probe_golden_fixtures_shard63 = 63,
+);
+
+/// The shard index list is the shard count: a gap, a duplicate, or an
+/// out-of-order index is refused.
 #[test]
-fn parity_probe_golden_fixtures_shard0() {
-    probe_shard(0);
+fn parity_shard_indices_refuse_gaps_duplicates_and_disorder() {
+    assert!(parity_shards::dense(&[0, 1, 2]));
+    assert!(!parity_shards::dense(&[0, 2]));
+    assert!(!parity_shards::dense(&[0, 0, 1]));
+    assert!(!parity_shards::dense(&[1, 0]));
+    assert!(!parity_shards::dense(&[1]));
+    assert!(parity_shards::dense(PARITY_SHARDS));
 }
 
+/// Every fixture position belongs to exactly one shard, and a zero shard count
+/// owns nothing.
 #[test]
-fn parity_probe_golden_fixtures_shard1() {
-    probe_shard(1);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard2() {
-    probe_shard(2);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard3() {
-    probe_shard(3);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard4() {
-    probe_shard(4);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard5() {
-    probe_shard(5);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard6() {
-    probe_shard(6);
-}
-
-#[test]
-fn parity_probe_golden_fixtures_shard7() {
-    probe_shard(7);
+fn parity_shards_partition_every_fixture_exactly_once() {
+    let count = PARITY_SHARDS.len();
+    for position in 0..1000 {
+        let owners = (0..count)
+            .filter(|&shard| parity_shards::owns(position, shard, count))
+            .count();
+        assert_eq!(owners, 1, "fixture {position} owned by {owners} shards");
+    }
+    assert!(!parity_shards::owns(0, 0, 0));
 }
 
 // ---------------------------------------------------------------------------

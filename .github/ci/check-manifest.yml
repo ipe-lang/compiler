@@ -24,6 +24,22 @@
 # `owner` is required for every `informational` entry (who watches its surface).
 # `guards` records the Security / Soundness / SEAL invariant a check protects;
 # an entry that `guards` such an invariant may not be `informational`.
+#
+# `local` (required on every `gate`) is how `tools/scripts/gate` reproduces the
+# check before a push. Exactly one of:
+#   tier + run    Run these commands at `quick` (per push), `affected` (tests
+#                 over changed crates + reverse deps) or `full` (the CI mirror).
+#                 A command is a string or {cmd, env, cwd, differs}. Each must
+#                 match a command the producer job runs, token for token, with
+#                 the same env and working directory; `differs: <reason>`
+#                 waives only the token match. Placeholders: {packages} (changed
+#                 crates; `--workspace` in CI), {lib_packages} (the same, library
+#                 crates only), {repo_root}, {target_dir}.
+#   covered-by    Another gate context whose local run exercises this one.
+#   ci-only       Not reproducible locally: platform | privileged | classifier |
+#                 inline-script.
+# `.github/ci/local_gate.py` parses and verifies these; the verifier refuses a
+# gate without one and a local command that drifts from CI.
 
 version: 1
 
@@ -32,87 +48,209 @@ checks:
   - context: fmt
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo fmt --all -- --check
   - context: clippy
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo clippy --all-targets {packages} -- -D warnings
   - context: runtime-feature-combos
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features db --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features db,web --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --features debugger,tui --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --features debugger,web --all-targets -- -D warnings
     guards: >-
       Every runtime feature combination the emitter can select builds clean
       under clippy (SEAL); path-gated, so a skip on a non-emit PR passes.
   - context: windows-check
     disposition: gate
     producer: ci.yml
+    local:
+      ci-only: platform
     guards: >-
       The Windows output-directory code compiles, so its held-handle,
       reparse-point-refusing file operations ship rather than rot unbuilt.
   - context: quick-check
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo check --workspace
   - context: test
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cmd: cargo nextest run {packages} --profile ci --no-tests=warn
+          differs: CI runs the same suite from one archive split over shards; locally it runs over the selected crates directly
+        - cargo test --doc {lib_packages}
     aggregates: [test-prep, test-run]
   - context: artifact-guard
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - .github/ci/artifact-guard.sh
   - context: manifest-lock-consistency
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - .github/ci/manifest-lock-consistency.sh
     guards: >-
       Cargo.lock pins the first-party crates to the version Cargo.toml declares,
       so a release can never ship a lock that fails `cargo build --locked`.
   - context: diagnostic-tone
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - bash tools/scripts/tests/test-require-tool.sh
+        - bash tools/scripts/lint-diagnostic-tone.sh
   - context: "explain-page example gate (ADR 0059)"
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cargo build --release -p ipe
+        - cmd: bash tools/scripts/check-explain-examples.sh
+          env:
+            IPE_BIN: "{target_dir}/release/ipe"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
   - context: "doc-string example gate"
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cargo build --release -p ipe
+        - cmd: bash tools/scripts/check-doc-examples.sh
+          env:
+            IPE_BIN: "{target_dir}/release/ipe"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
   - context: "first-party check floor (ipe type-check only)"
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cargo build --release -p ipe
+        - cmd: bash tools/scripts/first-party-check-floor.sh
+          env:
+            IPE_BIN: "{target_dir}/release/ipe"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
   - context: "first-party shapes (build gate)"
     disposition: gate
     producer: ci.yml
+    local:
+      ci-only: inline-script
   - context: wasm-floor
     disposition: gate
     producer: ci.yml
+    local:
+      tier: full
+      run:
+        - cargo build -p ipe-runtime-rust --target wasm32-unknown-unknown
+        - cargo build -p ipe-runtime-rust --target wasm32-unknown-unknown --features json
+        - cargo build -p ipe-runtime-rust --target wasm32-unknown-unknown --no-default-features --features wasm-client,debugger
+        - cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features
+        - cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category
   - context: seal-smoke
     disposition: gate
     producer: ci.yml
+    local:
+      ci-only: inline-script
     guards: SEAL
   - context: stdlib-docs-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p ipe_docs --bin gen-stdlib-docs -- --repo-root {repo_root}
+        - git diff --exit-code docs/reference/stdlib.md docs/reference/stdlib/
   - context: env-docs-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p ipe_docs --bin gen-env-docs -- --repo-root {repo_root}
+        - git diff --exit-code docs/reference/env.md
   - context: capabilities-docs-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p ipe_docs --bin gen-capabilities-docs -- --repo-root {repo_root}
+        - git diff --exit-code docs/reference/capabilities.md
   - context: cli-docs-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p ipe --bin gen-cli-docs -- --repo-root {repo_root}
+        - git diff --exit-code docs/reference/cli.md
   - context: requirements-docs-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p ipe_docs --bin gen-requirements-docs -- --repo-root {repo_root}
+        - git diff --exit-code docs/reference/requirements.md
   - context: cli-transcripts-drift
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - cargo run -p regen-cli-transcripts -- --repo-root {repo_root}
+        - git diff --exit-code src/ipe-cli/tests/golden/cli/
   - context: markdown-parity
     disposition: gate
     producer: ci.yml
+    local:
+      tier: quick
+      run:
+        - tools/scripts/regen-markdown-parity.sh
+        - git diff --exit-code src/ipe-docs/src/markdown/parity/snapshot.txt
   - context: runtime-full-features
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cargo nextest run -p ipe-runtime-rust --features full --profile ci
     guards: SEAL
   - context: registry-admission
     disposition: gate
     producer: ci.yml
+    local:
+      tier: affected
+      run:
+        - cmd: cargo nextest run -p ipe --test registry_admission --profile ci
+          env:
+            IPE_E2E: "1"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
 
   # ── Cancel-on-cheap-red watcher — informational (never a merge gate) ──────
   # Normally SKIPPED (its `needs:` all succeed and `failure()` is false), so it
@@ -134,26 +272,44 @@ checks:
   - context: panic-scan
     disposition: gate
     producer: panic-scan.yml
+    local:
+      tier: quick
+      run:
+        - cargo test --manifest-path tools/panic-scan/Cargo.toml
+        - cmd: cargo run --release --manifest-path tools/panic-scan/Cargo.toml -- --walk src
+          differs: CI builds the scanner then runs it from its in-tree target dir; cargo run resolves the local target dir
     guards: Soundness
   - context: cargo-deny
     disposition: gate
     producer: security.yml
+    local:
+      tier: affected
+      run:
+        - cargo deny check advisories bans licenses sources
     guards: Security
   - context: playground-jail
     disposition: gate
     producer: playground.yml
+    local:
+      ci-only: privileged
     guards: Security
   - context: "linux-x64 (seccomp socket-deny + bubblewrap)"
     disposition: gate
     producer: admission-sandbox.yml
+    local:
+      ci-only: privileged
     guards: Security
   - context: "linux-arm64 (seccomp socket-deny + bubblewrap)"
     disposition: gate
     producer: admission-sandbox.yml
+    local:
+      ci-only: platform
     guards: Security
   - context: "macos-arm64 (sandbox-exec / Seatbelt)"
     disposition: gate
     producer: admission-sandbox.yml
+    local:
+      ci-only: platform
     guards: Security
 
   # ── Editor tooling (per-change gate) ──────────────────────────────────────
@@ -164,9 +320,21 @@ checks:
   - context: grammar
     disposition: gate
     producer: tree-sitter-ipe.yml
+    local:
+      tier: full
+      run:
+        - cmd: tree-sitter generate
+          cwd: editors/tree-sitter-ipe
+        - cmd: tree-sitter test
+          cwd: editors/tree-sitter-ipe
+        - bash editors/tree-sitter-ipe/scripts/parity-check.sh
   - context: editors-configure
     disposition: gate
     producer: ci.yml
+    local:
+      tier: full
+      run:
+        - bash editors/tests/configure-test.sh
     guards: >-
       Every editors/*/configure.sh path, plus the one Zed's "install dev
       extension" actually runs and nothing else validated: compiling
@@ -177,11 +345,21 @@ checks:
   - context: e2e-all
     disposition: gate
     producer: ci.yml
+    local:
+      tier: full
+      run:
+        - cmd: cargo nextest run --workspace --profile ci --no-fail-fast
+          env:
+            IPE_E2E: "1"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+          differs: CI runs the same suite from one archive split into heavy and light partitions
     guards: SEAL
     aggregates: [e2e]
   - context: seal-slice
     disposition: gate
     producer: ci.yml
+    local:
+      covered-by: e2e-all
     guards: SEAL
     aggregates: [seal-slice-shard]
 
@@ -315,16 +493,22 @@ checks:
   - context: changes
     disposition: gate
     producer: ci.yml
+    local:
+      ci-only: classifier
     guards: >-
       Security — fail-closed path classification: a failed classifier cannot
       skip every ci.yml tier into a passing required set.
   - context: admission-changes
     disposition: gate
     producer: admission-sandbox.yml
+    local:
+      ci-only: classifier
     guards: >-
       Security — fail-closed path classification for the admission jail proofs.
   - context: playground-changes
     disposition: gate
     producer: playground.yml
+    local:
+      ci-only: classifier
     guards: >-
       Security — fail-closed path classification for playground-jail.

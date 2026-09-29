@@ -138,9 +138,9 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 filter = 'binary(stdlib_coverage_dynamic)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
-# The parity probes compile every golden fixture twice (clean + incremental),
-# per shard — a shard legitimately approaches the default 600s ceiling under CI
-# load, so give the parity binaries a wider terminate window.
+# The parity probes compile every golden fixture of their shard twice (clean +
+# incremental); under CI load a shard can outrun the default ceiling, so give
+# the parity binaries a wider terminate window.
 [[profile.ci.overrides]]
 filter = 'binary(clean_vs_incremental_parity) | binary(per_module_typecheck_parity)'
 slow-timeout = { period = "60s", terminate-after = 20 }

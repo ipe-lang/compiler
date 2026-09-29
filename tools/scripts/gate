@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Run the local CI gate for one tier, as declared in `check-manifest.yml`.
+
+Usage:
+  tools/scripts/gate {quick|affected|full} [--base REF] [--plan] [--keep-going]
+
+The commands are exactly the manifest's `local:` dispositions (see
+`.github/ci/local_gate.py`); nothing is listed here. The manifest is verified
+first, and a manifest whose `local:` blocks drift from CI refuses to run.
+
+  quick     fmt, clippy on the changed crates, workspace check, static guards,
+            panic-scan and every generated-doc drift check.
+  affected  quick and tests, both over the changed crates and their reverse
+            dependencies, plus the example / admission / advisory gates.
+  full      the CI mirror: every locally reproducible gate over the whole
+            workspace, `IPE_E2E=1` included.
+
+Changed files are those differing from the merge-base with `--base`
+(default `origin/main`), plus untracked files. A changed file outside every
+workspace crate selects the whole workspace. CI stays authoritative: this is
+the same check list run earlier, not a replacement.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO_ROOT, ".github", "ci"))
+import local_gate  # noqa: E402  # the manifest's typed `local:` SSOT
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="gate", description=__doc__.splitlines()[0])
+    ap.add_argument("tier", choices=sorted(local_gate.TIER_NAMES))
+    ap.add_argument("--base", default="origin/main", help="ref whose merge-base defines the changed files")
+    ap.add_argument("--plan", action="store_true", help="print the commands without running them")
+    ap.add_argument("--keep-going", action="store_true", help="run every command even after a failure")
+    args = ap.parse_args()
+    tier = local_gate.TIER_NAMES[args.tier]
+
+    entries = local_gate.load_manifest_entries()
+    errors: list[str] = []
+    parsed = local_gate.check_local_dispositions(entries, errors)
+    if errors:
+        print("gate: check-manifest.yml `local:` blocks are invalid; refusing to run:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 2
+
+    try:
+        ws = local_gate.Workspace.from_metadata(local_gate.cargo_metadata(REPO_ROOT))
+        changed = local_gate.changed_files(REPO_ROOT, args.base)
+    except (subprocess.CalledProcessError, OSError) as e:
+        detail = e.stderr.strip() if isinstance(e, subprocess.CalledProcessError) and e.stderr else str(e)
+        print(f"gate: cannot resolve the workspace or the changed files: {detail}", file=sys.stderr)
+        return 2
+
+    steps = local_gate.plan(tier, entries, parsed, changed, ws)
+    sel = local_gate.select_packages(tier, changed, ws)
+    scope = "workspace" if sel.packages is None else (", ".join(sorted(sel.packages)) or "no crate changed")
+    print(f"gate {args.tier}: {len(changed)} changed file(s) vs {args.base}; crates: {scope}")
+    if args.plan:
+        for s in steps:
+            env = " ".join(f"{k}={shlex.quote(v)}" for k, v in s.env)
+            cwd = os.path.relpath(s.cwd, REPO_ROOT)
+            prefix = f"(cd {cwd} && " if cwd != "." else ""
+            print(f"  [{s.context}] {prefix}{env + ' ' if env else ''}{shlex.join(s.argv)}{')' if prefix else ''}")
+        return 0
+
+    failed: list[str] = []
+    for s in steps:
+        print(f"\n==> [{s.context}] {shlex.join(s.argv)}", flush=True)
+        start = time.monotonic()
+        try:
+            code = subprocess.run(list(s.argv), cwd=s.cwd, env={**os.environ, **dict(s.env)}).returncode
+        except FileNotFoundError:
+            print(f"gate: `{s.argv[0]}` is not installed; this gate cannot pass without it", file=sys.stderr)
+            code = 127
+        print(f"<== [{s.context}] exit {code} in {time.monotonic() - start:.0f}s", flush=True)
+        if code != 0:
+            failed.append(f"[{s.context}] {shlex.join(s.argv)} (exit {code})")
+            if not args.keep_going:
+                break
+    if failed:
+        print(f"\ngate {args.tier}: FAILED", file=sys.stderr)
+        for f in failed:
+            print(f"  - {f}", file=sys.stderr)
+        return 1
+    print(f"\ngate {args.tier}: OK ({len(steps)} command(s))")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

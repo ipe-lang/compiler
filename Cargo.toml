@@ -89,6 +89,13 @@ multiple_crate_versions = "allow"
 # interactive debugging of the library crates.
 [profile.test]
 debug = 0
+# The test suites are compile-bound pipelines run hundreds of times, so light
+# optimisation cuts their run time far more than it adds to build time. The
+# runtime checks the soundness gate relies on stay on explicitly: an optimised
+# test build still aborts on integer overflow and still runs `debug_assert!`.
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
 
 [profile.dev]
 debug = 1

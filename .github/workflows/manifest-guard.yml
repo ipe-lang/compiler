@@ -46,6 +46,9 @@ jobs:
       - name: Prove the strict-YAML loader refusals (unit tests)
         run: python3 .github/ci/test_strict_yaml.py -v
 
+      - name: Prove the local-gate refusals (unit tests)
+        run: python3 .github/ci/test_local_gate.py -v
+
       - name: The derived required-set is in sync with the manifest
         run: |
           python3 - <<'PY'
