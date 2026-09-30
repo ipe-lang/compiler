@@ -929,8 +929,11 @@ jobs:
   # single stable context (mirrors `e2e-all`) that branch protection could require
   # once these are proven green — deliberately NOT added to the required ruleset
   # yet. Path-scoping keeps it off a prose-only PR; always runs on push/nightly.
+  # No expression in `name:`: this job can be skipped before its matrix
+  # expands, and GitHub then shows the name's raw text (check 20). GitHub
+  # appends each leg's shard, so the legs still read "asan (1)" .. "asan (6)".
   asan:
-    name: asan (${{ matrix.shard }}/6)
+    name: asan
     runs-on: ubuntu-latest
     needs: [changes, quick-check]
     if: (needs.changes.outputs.sanitize != 'false' || (github.event_name != 'pull_request' && github.event_name != 'merge_group')) && needs.changes.outputs.release_only != 'true'

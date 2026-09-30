@@ -49,6 +49,7 @@ check_fast_gate_first = verify_manifest.check_fast_gate_first
 check_pull_request_target = verify_manifest.check_pull_request_target
 check_trust_roots = verify_manifest.check_trust_roots
 check_push_concurrency = verify_manifest.check_push_concurrency
+check_job_names_render = verify_manifest.check_job_names_render
 check_one_lock_per_graph = verify_manifest.check_one_lock_per_graph
 check_one_ipe_build = verify_manifest.check_one_ipe_build
 check_scoped_package_coverage = verify_manifest.check_scoped_package_coverage
@@ -4180,6 +4181,49 @@ jobs:
     steps:
       - run: 'true'
 """
+
+
+class TestJobNamesRender(unittest.TestCase):
+    """Check 20: a job skipped before matrix expansion never shows a raw name."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, job: str) -> list[str]:
+        _write(
+            os.path.join(self.root, "workflows", "w.yml"),
+            "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: 'true'\n"
+            "  j:\n" + job + "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 2]\n"
+            "    steps:\n      - run: 'true'\n",
+        )
+        errors: list[str] = []
+        check_job_names_render(errors, root=self.root)
+        return errors
+
+    def test_templated_name_without_skip_passes(self) -> None:
+        self.assertEqual(self.errors("    name: j (${{ matrix.shard }})\n"), [])
+
+    def test_plain_name_with_if_and_needs_passes(self) -> None:
+        self.assertEqual(self.errors("    name: j\n    needs: [a]\n    if: always()\n"), [])
+
+    def test_templated_name_with_if_refused(self) -> None:
+        errors = self.errors("    name: j (${{ matrix.shard }})\n    if: github.event_name == 'push'\n")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("`if:`", errors[0])
+
+    def test_templated_name_with_needs_refused(self) -> None:
+        errors = self.errors("    name: j (${{ matrix.shard }})\n    needs: [a]\n")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("`needs:`", errors[0])
+
+    def test_live_workflows_pass(self) -> None:
+        errors: list[str] = []
+        check_job_names_render(errors)
+        self.assertEqual(errors, [])
 
 
 class TestPushConcurrency(unittest.TestCase):

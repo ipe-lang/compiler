@@ -267,6 +267,11 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       their own, each with its reason; an exempt member's literal edition
       must equal the workspace edition and it must carry its own `[lints]`
       table, and an entry that is no member or inherits anyway is refused.
+  20. Job names render when skipped: a job whose `name:` holds a `${{ }}`
+      expression has no job-level `if:` and no `needs:`.  A job skipped by
+      either is skipped before its matrix and expressions are evaluated,
+      and GitHub then shows the raw `${{ matrix.KEY }}` text as the check
+      name.  Without an expression GitHub appends the matrix values itself.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -1737,6 +1742,34 @@ def _push_group(text: str, ctx: dict[str, str]) -> str:
         at = end
     out.append(text[at:])
     return "".join(out)
+
+
+def check_job_names_render(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 20 (see the module docstring). Unparseable workflows are refused
+    by check 6."""
+    for path in sorted(p for pattern in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(root, "workflows", pattern))):
+        fname = os.path.basename(path)
+        try:
+            with open(path) as f:
+                doc = strict_yaml.safe_load(f)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for job_id, job in (doc.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            name = job.get("name")
+            if not isinstance(name, str) or "${{" not in name:
+                continue
+            skippers = [key for key in ("if", "needs") if key in job]
+            if skippers:
+                errors.append(
+                    f"{fname}: job {job_id!r} is named {name!r} but has "
+                    f"{' and '.join(f'`{k}:`' for k in skippers)}, so a skip before its matrix expands "
+                    "shows that raw text as the check name; drop the expression and let GitHub "
+                    "append the matrix values"
+                )
 
 
 def check_push_concurrency(errors: list[str], root: str = REPO_ROOT) -> None:
@@ -4591,6 +4624,9 @@ def main() -> int:
 
     # ---- 19. Every workspace member inherits the workspace edition and lints ----
     check_workspace_inheritance(errors)
+
+    # ---- 20. a skipped job's check name never shows a raw expression ----
+    check_job_names_render(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
