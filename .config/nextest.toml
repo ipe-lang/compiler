@@ -95,7 +95,7 @@ wasm-external-cargo = { max-threads = 1 }
 # 900s stays under the harness's 1800s absolute backstop and the 30-min shard job
 # cap, so the layering is: idle watchdog (fast hang guard) < this net < backstop.
 [[profile.ci.overrides]]
-filter = 'binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance) | binary(watch_bluegreen) | binary(server_e2e) | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)'
+filter = 'binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance) | binary(watch_bluegreen) | binary(watch_cancellation) | binary(server_e2e) | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)'
 test-group = 'heavy-server-e2e'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
@@ -157,7 +157,7 @@ filter = 'test(hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wa
 test-group = 'wasm-external-cargo'
 
 [[profile.default.overrides]]
-filter = 'binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance) | binary(watch_bluegreen) | binary(server_e2e) | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)'
+filter = 'binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance) | binary(watch_bluegreen) | binary(watch_cancellation) | binary(server_e2e) | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)'
 test-group = 'heavy-server-e2e'
 
 [[profile.default.overrides]]

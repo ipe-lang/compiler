@@ -1034,7 +1034,7 @@ jobs:
 
   # E2E builds+runs the emitted Rust per golden (THE SEAL — the soundness floor:
   # every `ipe`-exit-0 golden's emitted Cargo project must `cargo build` + run).
-  # Sharded across 8 runners via nextest partitioning. Each golden self-anchors
+  # Sharded across 14 runners by the `e2e_shard.py` plan. Each golden self-anchors
   # its behaviour against a captured `expected.txt` (the Ipê-native regression
   # anchor). The cached expected_go.txt / oracle.meta Go oracle is retired.
   #
@@ -1126,13 +1126,13 @@ jobs:
           IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
           # This shard's entry of the `changes` job's `e2e_plan`, whose SSOT is
           # `.github/ci/e2e_shard.py`: shards 1-5 spread the heavy cold-build
-          # goldens, shards 6-14 the heavy-free complement, all from the
+          # goldens, shards 6-14 the heavy-free complement, each class split
+          # into name-length buckets balanced by measured time, all from the
           # prebuilt archive (no recompile). `seal-slice` proves the plan
           # partitions the archive's test set exactly, and manifest-guard
           # (`e2e_shard.py --lint`) pins this matrix and this wiring.
           SHARD_FILTER: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].filter }}
-          SHARD_PARTITION: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].partition }}
-        run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --profile ci --no-fail-fast --test-threads=2 --no-tests=fail -E "$SHARD_FILTER" --partition "$SHARD_PARTITION"
+        run: cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --profile ci --no-fail-fast --test-threads=2 --no-tests=fail -E "$SHARD_FILTER"
 
   # Stable aggregation gate for the sharded SEAL. The `e2e` matrix expands to one
   # shard-named job per partition, so no single shard name is a durable

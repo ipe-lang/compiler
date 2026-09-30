@@ -4,8 +4,8 @@
 `seal-slice` runs this with $E2E_PLAN, the `changes` job's `e2e_plan` output:
 the same plan every `e2e` shard read its selection from. It lists the archive
 in full and once per plan entry, and exits 0 only when every archived test is
-selected by exactly one shard and no shard selects a test outside the archive,
-so "the e2e shards run every archived test" is checked on every run, never
+selected by exactly one shard, every shard selects a test, and no shard
+selects a test outside the archive, so "the e2e shards run every archived test" is checked on every run, never
 assumed. The plan's shape and its tie to the `e2e` matrix are pinned by
 `.github/ci/e2e_shard.py --lint`.
 
@@ -31,8 +31,8 @@ class CoverError(Exception):
     """A plan or listing that proves nothing."""
 
 
-def parse_plan(text: str) -> dict[int, tuple[str, str]]:
-    """Parse `{"1": {"filter", "partition"}, ..., "N": ...}` into shard -> (filter, partition)."""
+def parse_plan(text: str) -> dict[int, str]:
+    """Parse `{"1": {"filter"}, ..., "N": ...}` into shard -> filter."""
     if len(text) > MAX_PLAN_CHARS:
         raise CoverError(f"E2E_PLAN exceeds {MAX_PLAN_CHARS} characters")
     try:
@@ -46,14 +46,14 @@ def parse_plan(text: str) -> dict[int, tuple[str, str]]:
     expected = [str(k) for k in range(1, len(doc) + 1)]
     if sorted(doc, key=lambda k: (len(k), k)) != expected:
         raise CoverError(f"E2E_PLAN keys are {sorted(doc)!r}, expected \"1\"..\"{len(doc)}\"")
-    plan: dict[int, tuple[str, str]] = {}
+    plan: dict[int, str] = {}
     for key, entry in doc.items():
-        if not isinstance(entry, dict) or set(entry) != {"filter", "partition"}:
-            raise CoverError(f"E2E_PLAN shard {key} must be exactly {{filter, partition}}")
-        filt, part = entry["filter"], entry["partition"]
-        if not isinstance(filt, str) or not filt.strip() or not isinstance(part, str) or not part.strip():
+        if not isinstance(entry, dict) or set(entry) != {"filter"}:
+            raise CoverError(f"E2E_PLAN shard {key} must be exactly {{filter}}")
+        filt = entry["filter"]
+        if not isinstance(filt, str) or not filt.strip():
             raise CoverError(f"E2E_PLAN shard {key} has an empty or non-string selection")
-        plan[int(key)] = (filt, part)
+        plan[int(key)] = filt
     return plan
 
 
@@ -93,6 +93,8 @@ def partition_errors(full: list[str], shards: dict[int, list[str]], count: int) 
         errors.append("the archive listing repeats a test id")
     owners: Counter[str] = Counter()
     for shard in sorted(shards):
+        if not shards[shard]:
+            errors.append(f"shard {shard} selects no test")
         for test in shards[shard]:
             owners[test] += 1
             if test not in full_set:
@@ -118,7 +120,7 @@ def cover(plan_text: str) -> int:
     """Fail unless the plan's selections partition the archive's test set exactly."""
     plan = parse_plan(plan_text)
     full = _list([])
-    shards = {k: _list(["-E", filt, "--partition", part]) for k, (filt, part) in plan.items()}
+    shards = {k: _list(["-E", filt]) for k, filt in plan.items()}
     errors = partition_errors(full, shards, len(plan))
     for err in errors:
         print(f"e2e shard cover: {err}", file=sys.stderr)
