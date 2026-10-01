@@ -8,6 +8,7 @@ use super::{
     resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
     runtime_dep_from_env, single_file_cargo_name_from_env,
 };
+use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
 use crate::{
@@ -3407,7 +3408,8 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 /// Returns [`CliError::Pipeline`] when the compiler rejects the program, or
 /// [`CliError::Io`] when the entry file cannot be read.
 pub fn emit_ir_text(entry: &Path) -> Result<String, CliError> {
-    emit_ir_text_for_target(&AnalysisTarget::LooseFile(entry.to_path_buf()))
+    let file = ResolvedPath::of(entry).map_err(|e| io_err(entry, e))?;
+    emit_ir_text_for_target(&AnalysisTarget::LooseFile(file))
 }
 
 // ===========================================================================
@@ -3996,7 +3998,7 @@ fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliErro
 pub fn typecheck_target(target: &AnalysisTarget) -> Result<(), CliError> {
     match target {
         AnalysisTarget::Project(entry) => typecheck_entry_via_graph(entry),
-        AnalysisTarget::LooseFile(file) => typecheck_entry_via_graph(file),
+        AnalysisTarget::LooseFile(file) => typecheck_entry_via_graph(file.as_path()),
         AnalysisTarget::SourceFile { file, src_root } => {
             typecheck_manifest_file_via_graph(src_root.as_path(), file.as_path())
         }
@@ -4020,7 +4022,10 @@ pub fn source_graph_for_target(
 ) -> Result<(SourceGraph, PathBuf), CliError> {
     match target {
         AnalysisTarget::Project(entry) => Ok((build_source_graph(entry)?, entry.clone())),
-        AnalysisTarget::LooseFile(file) => Ok((build_source_graph(file)?, file.clone())),
+        AnalysisTarget::LooseFile(file) => Ok((
+            build_source_graph(file.as_path())?,
+            file.as_path().to_path_buf(),
+        )),
         AnalysisTarget::SourceFile { file, src_root } => Ok((
             build_source_graph_for_manifest_file(src_root.as_path(), file.as_path())?,
             file.as_path().to_path_buf(),

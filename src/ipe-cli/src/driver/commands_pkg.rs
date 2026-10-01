@@ -1111,8 +1111,9 @@ const TESTS_DIR_NAME: &str = "tests";
 pub enum AnalysisTarget {
     /// A directory (or omitted) argument: the project's own entry file.
     Project(PathBuf),
-    /// A file no manifest roots, under the spelling the caller gave.
-    LooseFile(PathBuf),
+    /// A file no manifest roots, canonicalised like every other file
+    /// variant so each diagnostic names it the same way.
+    LooseFile(ResolvedPath),
     /// A file under a governing manifest's `src/` root.
     SourceFile {
         /// The named file.
@@ -1150,7 +1151,7 @@ pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> 
     }
     let file = ResolvedPath::of(path).map_err(|e| io_err(path, e))?;
     let Some(manifest_path) = discover_manifest(file.as_path())? else {
-        return Ok(AnalysisTarget::LooseFile(path.to_path_buf()));
+        return Ok(AnalysisTarget::LooseFile(file));
     };
     let parsed = project::parse_manifest(&manifest_path)?;
     let project_root = ResolvedPath::of(&parsed.root).map_err(|e| io_err(&parsed.root, e))?;
@@ -1172,7 +1173,7 @@ pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> 
     if file.is_strictly_under(&src_root) {
         return Ok(AnalysisTarget::SourceFile { file, src_root });
     }
-    Ok(AnalysisTarget::LooseFile(path.to_path_buf()))
+    Ok(AnalysisTarget::LooseFile(file))
 }
 
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same

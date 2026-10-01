@@ -2780,10 +2780,11 @@ fn resolve_analysis_target_of_an_in_project_file_outside_src_and_tests_is_loose(
     let script = scripts.join("Y.ipe");
     fs::write(&script, "module Y exposing (y)\ny = 1\n").expect("scripts/Y.ipe");
 
+    let canonical = fs::canonicalize(&script).expect("canonicalise the argument");
     let target = resolve_analysis_target(&script);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if *p == script),
+        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
         "a governed file outside src/ and tests/ must stay loose: {target:?}"
     );
 }
@@ -2802,10 +2803,11 @@ fn resolve_analysis_target_refuses_a_src_symlink_to_elsewhere_in_the_project() {
     std::os::unix::fs::symlink(&scripts, &link).expect("symlink src/link");
     let arg = link.join("Y.ipe");
 
+    let canonical = fs::canonicalize(&arg).expect("canonicalise the argument");
     let target = resolve_analysis_target(&arg);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if *p == arg),
+        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
         "a src/ symlink leaving src/ for elsewhere in the project must not be a \
          SourceFile: {target:?}"
     );
@@ -2824,10 +2826,11 @@ fn resolve_analysis_target_drops_a_tests_root_that_is_the_project_root() {
     std::os::unix::fs::symlink(".", &tests_link).expect("symlink tests -> .");
     let arg = tests_link.join("X.ipe");
 
+    let canonical = fs::canonicalize(&arg).expect("canonicalise the argument");
     let target = resolve_analysis_target(&arg);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if *p == arg),
+        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
         "a tests root equal to the project root must be dropped, so the file \
          is not a TestFile: {target:?}"
     );
