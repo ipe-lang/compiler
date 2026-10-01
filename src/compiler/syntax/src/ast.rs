@@ -303,17 +303,6 @@ pub enum Expr_ {
     /// (`\n`, `\\`) for an escaped one — matching the reference compiler's
     /// `Src.Chr String` representation so the value round-trips to the backend.
     Char(String),
-    /// A `path "…"` compile-time-validated path literal. The carried [`String`]
-    /// is the RAW source string (before clean/validation); the canonicaliser
-    /// seals it under every separator regime and, on success, stores each
-    /// regime's sealed form in the canon AST's own
-    /// [`ipe_canon::ast::Expr_::PathLit`] node. A failure is a compile error
-    /// ([`ipe_diagnostics::ParseError::InvalidPathLiteral`], IPE-P0063).
-    ///
-    /// `path` is a contextual keyword: `path "src/Main.ipe"` is a `PathLit` only
-    /// when `path` is immediately followed by a string literal; in all other
-    /// positions `path` continues to be a valid lowercase identifier.
-    PathLit(String),
     /// The unit value `()` — the sole inhabitant of the unit type. Built by the
     /// parser from empty parentheses. Mirrors the reference compiler's `Src.Unit`.
     Unit,

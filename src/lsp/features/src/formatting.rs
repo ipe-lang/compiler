@@ -635,15 +635,6 @@ fn push_expr(
             // the exact escaped spelling; re-escape as a fallback.
             push_span_or(out, expr.span, original, || escaped_string_literal(s));
         }
-        ipe_syntax::Expr_::PathLit(_) => {
-            // A `path "…"` literal — reproduce the whole construct verbatim from
-            // its span so the quoted path keeps its exact escaped spelling.
-            let lo = expr.span.lo as usize;
-            let hi = expr.span.hi as usize;
-            if let Some(slice) = original.get(lo..hi) {
-                out.push_str(slice);
-            }
-        }
         ipe_syntax::Expr_::MultilineStr { raw: s, .. } => {
             // Reproduce the whole `"""…"""` literal from its span so escapes and
             // interior quotes survive; fall back to the stored raw body.

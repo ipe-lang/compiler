@@ -2,12 +2,10 @@
 //!
 //! Every `Path` holds text produced by ONE constructor, `path_core::seal`,
 //! under the host separator regime. The builders that reach it are
-//! [`path_from_string`] (Ipê text), `from_os` (OS-produced text, refused
-//! when not valid UTF-8 — never rewritten lossily), and [`path_literal_host`]
-//! (a compiler-emitted `path "…"` literal, whose host form the compiler already
-//! sealed per regime). The seal normalises the path lexically and REJECTS the
-//! byte-level primitives that make a raw `String` path a traversal / injection
-//! surface:
+//! [`path_from_string`] (Ipê text) and `from_os` (OS-produced text, refused
+//! when not valid UTF-8 — never rewritten lossily). The seal normalises the
+//! path lexically and REJECTS the byte-level primitives that make a raw
+//! `String` path a traversal / injection surface:
 //!
 //! * a NUL byte (`\0`) — a C-string terminator that truncates the path at the
 //!   syscall boundary, so `"safe.txt\0../../etc/passwd"` reaches the kernel as
@@ -70,7 +68,7 @@
 
 use super::{IpeError, IpeResult, IpeTask, ok_res};
 // The lexical seal lives once in the sibling `path_core` module (shared with
-// the compiler's `path "…"` gate, which `include!`s the SAME `path_core.rs` file
+// the compiler's literal-path gate, which `include!`s the SAME `path_core.rs` file
 // via the `ipe_path_core` crate); this module drives it with the HOST regime so
 // the runtime seal stays target-specific. A sibling module (not an extern
 // crate) so it resolves both in the workspace AND when the runtime is vendored
@@ -85,8 +83,7 @@ use std::path::PathBuf;
 /// `Ipe.Path`'s opaque, sealed newtype.
 ///
 /// The wrapped `String` is always the output of `path_core::seal` under the
-/// host regime: [`path_from_string`], `from_os` and the compiler-sealed
-/// [`path_literal_host`] are the only builders.
+/// host regime: [`path_from_string`] and `from_os` are the only builders.
 ///
 /// `Clone` is derived (a `Path` may be stored and passed to more than one
 /// kernel). `Debug` / `PartialEq` / `Eq` are derived and safe: a `Path` is not
@@ -344,24 +341,6 @@ impl ChildRefusal {
 #[must_use]
 pub fn path_to_string(p: Path) -> String {
     p.0
-}
-
-/// Select the host form of a compiler-sealed `path "…"` literal.
-///
-/// Only the compiler's code generator calls this, and only with the two forms
-/// of one `PathLitText`, which `path_core::seal` produced for each regime at
-/// compile time; the runtime picks the host one without re-cleaning. Never
-/// exposed to Ipê source.
-#[must_use]
-#[doc(hidden)]
-pub fn path_literal_host(unix: &'static str, windows: &'static str) -> Path {
-    Path(
-        match HOST {
-            Regime::Unix => unix,
-            Regime::Windows => windows,
-        }
-        .to_owned(),
-    )
 }
 
 /// Borrow the cleaned path string. For the `Ipe.File` kernel boundary, which
@@ -857,6 +836,7 @@ pub fn path_absolute<E: Send + From<IpeError> + 'static>(p: Path) -> IpeTask<E, 
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::super::{IpeErrorKind, ipe_error_kind};
     use super::*;
@@ -1161,7 +1141,7 @@ mod tests {
         assert!(!win_seal_accepts("safe.txt\0..\\..\\Windows"));
     }
 
-    // ── SSOT: a `path "…"` literal carries exactly each regime's runtime seal ──
+    // ── SSOT: a sealed literal carries exactly each regime's runtime seal ──
     //    `PathLitText::seal` (the compile-time gate) is built from the same
     //    `seal` the runtime's `path_from_string` applies, once per regime, so an
     //    accepted literal's form for a regime IS that regime's runtime seal, and

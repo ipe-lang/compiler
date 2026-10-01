@@ -96,7 +96,6 @@ fn sym_referenced_directly(sym: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -149,7 +148,6 @@ pub(super) fn force_shared_capture_clones(sym: Symbol, expr: Expr) -> Expr {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

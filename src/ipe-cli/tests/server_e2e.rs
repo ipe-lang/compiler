@@ -111,8 +111,7 @@ fn compile_and_build_as(
         .join(format!("server_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let options = ipe::BuildOptions {
         intent,
@@ -541,7 +540,7 @@ fn http_post(
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn server_get_root() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -571,7 +570,7 @@ fn server_get_root() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn server_get_param() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -603,7 +602,7 @@ fn server_get_param() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn post_body_echo() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -635,7 +634,7 @@ fn post_body_echo() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn request_introspection() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -675,7 +674,7 @@ fn request_introspection() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn server_and_db_compose() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -701,7 +700,7 @@ fn server_and_db_compose() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_forged_post_without_token_rejected() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_forged_post_without_token_rejected";
@@ -736,7 +735,7 @@ fn csrf_forged_post_without_token_rejected() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_post_with_cookie_but_mismatched_header_rejected() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_post_with_cookie_but_mismatched_header_rejected";
@@ -805,7 +804,7 @@ fn csrf_post_with_cookie_but_mismatched_header_rejected() -> Result<(), BoxError
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_legit_post_with_matching_token_allowed() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_legit_post_with_matching_token_allowed";
@@ -874,7 +873,7 @@ fn csrf_legit_post_with_matching_token_allowed() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_cookie_secure_behind_trusted_tls_proxy() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_cookie_secure_behind_trusted_tls_proxy";
@@ -920,7 +919,7 @@ fn csrf_cookie_secure_behind_trusted_tls_proxy() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_cookie_not_secure_when_request_not_tls_detected() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_cookie_not_secure_when_request_not_tls_detected";
@@ -977,7 +976,7 @@ fn csrf_cookie_not_secure_when_request_not_tls_detected() -> Result<(), BoxError
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn csrf_cookie_secure_when_env_production_regardless_of_tls_signal() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "csrf_cookie_secure_when_env_production_regardless_of_tls_signal";
@@ -1094,7 +1093,7 @@ main =
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn server_mounts_web_app_and_api_on_one_port() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "server_mounts_web_app_and_api_on_one_port";
@@ -1205,7 +1204,7 @@ main =
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn server_honours_ipe_server_port_over_a_hardcoded_literal() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "server_honours_ipe_server_port_over_a_hardcoded_literal";

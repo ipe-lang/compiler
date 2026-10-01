@@ -29,10 +29,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_aud04_emit_expr_ir_capture
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -50,9 +50,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -66,7 +64,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
 /// stdout (covering the wrong-output witnesses, which compile fine but print a
 /// corrupted string when the textual rewrite corrupts a shared word).
 fn assert_e2e_output(fixture: &str, expect_contains: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -78,9 +76,7 @@ fn assert_e2e_output(fixture: &str, expect_contains: &str) {
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),

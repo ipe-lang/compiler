@@ -572,6 +572,33 @@ pub(crate) enum UrlUnproven {
     Invalid,
 }
 
+/// The query of a database connection URL, read exactly as its driver reads it.
+///
+/// The one sanctioned reader of a URL query outside the strict core. sqlx parses
+/// a connection URL with the same `url::Url` and reads its parameters (`host`,
+/// `hostaddr`, `port`, `sslmode`) through `Url::query_pairs`, a lenient decoder.
+/// The SSRF gate and the DSN checks must see exactly the host, port and TLS mode
+/// the driver will dial, so they read the query through that same decoder: a
+/// stricter reader here would vet a different host than the one dialled. The
+/// URL is author configuration, never a request from the network.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) struct DriverParityQuery<'u>(&'u Url);
+
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+impl<'u> DriverParityQuery<'u> {
+    /// The query of `url`: only a database URL whose userinfo the ambiguity
+    /// check cleared is read this way.
+    pub(crate) const fn of(url: &'u UnambiguousUrl) -> Self {
+        Self(url.url())
+    }
+
+    /// The query's key/value pairs, decoded as the driver decodes them.
+    #[allow(clippy::disallowed_methods)] // driver parity: sqlx reads this query through `Url::query_pairs`
+    pub(crate) fn pairs(&self) -> url::form_urlencoded::Parse<'u> {
+        self.0.query_pairs()
+    }
+}
+
 /// A URL whose user name and password cannot run past its authority.
 ///
 /// Built only after [`userinfo_is_ambiguous`] clears the parse it holds, so
@@ -632,8 +659,8 @@ impl UnambiguousUrl {
     /// The value of a `host` or `hostaddr` query parameter of this URL equal to
     /// `value`.
     pub(crate) fn query_host(&self, value: &str) -> Option<ConfiguredHost> {
-        self.parsed
-            .query_pairs()
+        DriverParityQuery::of(self)
+            .pairs()
             .find(|(key, named)| matches!(&**key, "host" | "hostaddr") && named == value)
             .map(|(_, named)| ConfiguredHost(named.into_owned()))
     }

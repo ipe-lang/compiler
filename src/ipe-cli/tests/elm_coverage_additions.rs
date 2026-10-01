@@ -13,17 +13,17 @@
 //! Under `IPE_E2E=1` the emitted Cargo project builds and RUNS to a
 //! deterministic line, proving the seed-reproducible contract end-to-end.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for elm-coverage tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -79,7 +79,7 @@ fn project_builds_and_emits_all_three_surfaces() {
 /// seed-fixed, so this pins the reproducibility contract.
 #[test]
 fn e2e_runs_and_prints_deterministic_line() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("elm_coverage_additions_e2e");

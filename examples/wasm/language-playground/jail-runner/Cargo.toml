@@ -21,6 +21,8 @@ ipe_sandbox = { path = "../../../../src/compiler/sandbox" }
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../../../tools/test-temp" }
+# Existence-proven test-artifact resolvers.
+e2e-support = { path = "../../../../tools/e2e-support" }
 tempfile = "3"
 ipe_sandbox = { path = "../../../../src/compiler/sandbox" }
 

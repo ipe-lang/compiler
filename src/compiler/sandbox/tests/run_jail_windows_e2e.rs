@@ -37,13 +37,6 @@ use ipe_sandbox::run_jail::{
     FilesystemScope, RunResourceLimits, SandboxProfile, run_windows_jailed_for_test,
 };
 
-/// Skip unless `IPE_E2E=1`. Absent, these tests do nothing (the CI job asserts
-/// the primitives separately as a hard, refuse-to-certify failure), never a
-/// silent green claim.
-fn e2e_enabled() -> bool {
-    ipe_env::var_os("IPE_E2E").is_some_and(|v| v == "1")
-}
-
 /// A per-test scratch under the process temp dir (NTFS on the hosted image, so
 /// the container-SID ACL is meaningful).
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -143,7 +136,7 @@ fn fs_granted() -> SandboxProfile {
 
 #[test]
 fn a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir("sub");
@@ -181,7 +174,7 @@ const ENV_CHILD_MARKER: &str = "IPE_WINDOWS_E2E_ENV_CHILD";
 
 #[test]
 fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // The launcher scrubs the environment: only the allowlist re-enters. The
@@ -203,35 +196,35 @@ fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_c
             rerun.is_ok(),
             "the env-seeded re-exec did not pass: {rerun:?}"
         );
-        return;
-    }
-    let scratch = scratch_dir("env");
-    // Print 1 iff the var is present, else 0.
-    let probe = |name: &str| {
-        format!(
-            "if ($env:{name}) {{ Write-Output 'PRESENT' }} else {{ Write-Output 'ABSENT' }}; exit 0"
-        )
-    };
-    // Under control (unscrubbed, inherited), the secret is present.
-    let _ = run_control(&probe("IPE_SECRET_E2E"));
+    } else {
+        let scratch = scratch_dir("env");
+        // Print 1 iff the var is present, else 0.
+        let probe = |name: &str| {
+            format!(
+                "if ($env:{name}) {{ Write-Output 'PRESENT' }} else {{ Write-Output 'ABSENT' }}; exit 0"
+            )
+        };
+        // Under control (unscrubbed, inherited), the secret is present.
+        let _ = run_control(&probe("IPE_SECRET_E2E"));
 
-    // Under the jail with an allowlist that does NOT include the secret, the
-    // secret must be absent from the child. We capture the child's stdout by
-    // running through cmd and asserting on the exit code the probe encodes.
-    let coded = |name: &str| format!("if ($env:{name}) {{ exit 42 }} else {{ exit 0 }}");
-    // Allowlist only IPE_ALLOWED_E2E: the secret is scrubbed (exit 0 = absent),
-    // and the allowlisted var survives (exit 42 = present).
-    let profile = env_granted(&["IPE_ALLOWED_E2E"]);
-    let secret_absent = run_jailed(&profile, &scratch, &coded("IPE_SECRET_E2E"));
-    let allowed_present = run_jailed(&profile, &scratch, &coded("IPE_ALLOWED_E2E"));
-    let _ = std::fs::remove_dir_all(&scratch);
-    assert_eq!(
-        secret_absent,
-        Some(0),
-        "a non-allowlisted var must be scrubbed from the jailed child"
-    );
-    if let Some(a) = allowed_present {
-        assert_eq!(a, 42, "an allowlisted var must survive the scrub");
+        // Under the jail with an allowlist that does NOT include the secret, the
+        // secret must be absent from the child. We capture the child's stdout by
+        // running through cmd and asserting on the exit code the probe encodes.
+        let coded = |name: &str| format!("if ($env:{name}) {{ exit 42 }} else {{ exit 0 }}");
+        // Allowlist only IPE_ALLOWED_E2E: the secret is scrubbed (exit 0 = absent),
+        // and the allowlisted var survives (exit 42 = present).
+        let profile = env_granted(&["IPE_ALLOWED_E2E"]);
+        let secret_absent = run_jailed(&profile, &scratch, &coded("IPE_SECRET_E2E"));
+        let allowed_present = run_jailed(&profile, &scratch, &coded("IPE_ALLOWED_E2E"));
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert_eq!(
+            secret_absent,
+            Some(0),
+            "a non-allowlisted var must be scrubbed from the jailed child"
+        );
+        if let Some(a) = allowed_present {
+            assert_eq!(a, 42, "an allowlisted var must survive the scrub");
+        }
     }
 }
 
@@ -239,7 +232,7 @@ fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_c
 
 #[test]
 fn an_out_of_scratch_write_is_denied_under_the_appcontainer_but_succeeds_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir("fs");
@@ -271,7 +264,7 @@ fn an_out_of_scratch_write_is_denied_under_the_appcontainer_but_succeeds_under_c
 
 #[test]
 fn a_write_into_the_granted_working_tree_succeeds_no_false_deny() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir("fs-grant");
@@ -296,7 +289,7 @@ fn a_write_into_the_granted_working_tree_succeeds_no_false_deny() {
 
 #[test]
 fn an_outbound_connect_is_denied_under_a_network_withholding_appcontainer() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir("net");

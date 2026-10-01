@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -48,7 +48,7 @@ fn run_with(exe: &str, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<
 
 #[test]
 fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -61,9 +61,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
     let out = crate::support::scratch_root().join("ipec_session_replay_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let options = ipe::BuildOptions {
         debugger: true,
@@ -89,7 +87,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
         "{}",
         exe.as_ref().err().map_or("", String::as_str)
     );
-    let Ok(exe) = exe else { return };
+    let exe = exe.expect("`exe` must succeed");
 
     let logs =
         crate::support::scratch_root().join(format!("ipe_session_replay_{}", std::process::id()));
@@ -118,7 +116,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
         "a replay must exit 0: {first:?}"
     );
     assert_eq!(first, second, "replaying twice must be byte-identical");
-    let Some((_, stdout)) = first else { return };
+    let (_, stdout) = first.expect("`first` must be present");
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 5, "start + 3 steps + final: {stdout:?}");
     assert!(

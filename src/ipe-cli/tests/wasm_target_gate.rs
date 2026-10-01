@@ -50,7 +50,7 @@ fn wasm_options() -> BuildOptions {
 
 #[allow(clippy::expect_used)] // test helper: an unresolvable runtime IS the failure
 fn build_wasm(entry: &Path, out: &Path) -> Result<(), CliError> {
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_with_options(entry, out, &runtime, wasm_options())
 }
 
@@ -361,7 +361,7 @@ fn process_run_still_builds_natively() {
          \x20   Process.run \"ls\" []\n",
     );
     let out = dir.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
         .expect("native build of Process.run must stay green");
 }
@@ -415,7 +415,7 @@ fn transitive_server_import_fails_naming_the_exact_chain() {
          \x20   Io.println label\n",
     );
     let out = dir.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let err = ipe::build_loose_file_with_options(&entry, &out, &runtime, wasm_options())
         .expect_err("View -> Data's File.readFile must be denied transitively");
     let CliError::Pipeline { diag, .. } = err else {
@@ -452,7 +452,7 @@ fn transitive_server_import_fails_naming_the_exact_chain() {
 #[test]
 #[allow(clippy::expect_used)] // test setup: a failed emit/cargo-spawn IS the failure
 fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Skip cleanly when the wasm target is not installed (cargo check would
@@ -464,14 +464,11 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
     if !target_installed {
         return;
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Emit the REAL wasm-hydration example (single source of truth) with the
     // hydrate mode its `package.ipe` declares.
-    let entry =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/wasm/hydration/src/Main.ipe");
+    let entry = e2e_support::manifest_dir!().join("../../examples/wasm/hydration/src/Main.ipe");
     let out = scratch_isolated("wasm_hydrate_seal").join("out");
     let options = BuildOptions {
         target: ipe_ir::Target::WasmClient,
@@ -539,7 +536,7 @@ fn server_only_kernel_still_builds_natively() {
          \x20       Err e -> Task.fail e\n",
     );
     let out = dir.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
         .expect("native build of the same program must stay green");
 }

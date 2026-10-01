@@ -37,6 +37,7 @@ mod naming;
 mod preamble;
 mod project;
 mod render;
+mod route_grammar;
 mod runtime_features;
 mod rust_file;
 pub mod static_build;

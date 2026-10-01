@@ -35,6 +35,7 @@ impl TuiKey {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // terminal input reaches Ipê as `String` text
 fn lossy(buf: &[u8]) -> String {
     String::from_utf8_lossy(buf).into_owned()
 }

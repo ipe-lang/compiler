@@ -39,16 +39,6 @@ use std::process::Command;
 use ipe_sandbox::build_jail::{macos_scrubbed_env, sbpl_from_profile};
 use ipe_sandbox::run_jail::SandboxProfile;
 
-/// Skip unless `IPE_E2E=1` and `sandbox-exec` is present. An absent primitive on
-/// a macOS runner is a skip here (the CI job asserts its presence separately as a
-/// hard, refuse-to-certify failure), never a silent green.
-fn e2e_enabled() -> bool {
-    if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
-        return false;
-    }
-    which_sandbox_exec().is_some()
-}
-
 fn which_sandbox_exec() -> Option<std::path::PathBuf> {
     let path = ipe_env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -137,7 +127,7 @@ fn env_granted(names: &[&str]) -> SandboxProfile {
 
 #[test]
 fn undeclared_network_is_denied_under_the_run_jail_but_succeeds_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -167,7 +157,7 @@ fn undeclared_network_is_denied_under_the_run_jail_but_succeeds_under_control() 
 
 #[test]
 fn declared_network_reaches_the_network_under_the_run_jail() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -187,7 +177,7 @@ fn declared_network_reaches_the_network_under_the_run_jail() {
 
 #[test]
 fn an_out_of_scratch_write_is_denied_under_the_run_jail_but_succeeds_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -216,7 +206,7 @@ fn an_out_of_scratch_write_is_denied_under_the_run_jail_but_succeeds_under_contr
 
 #[test]
 fn an_in_scratch_write_succeeds_under_the_run_jail() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -241,7 +231,7 @@ const SPAWN_CHILD: &str = "exec_target=$(command -v true); \"$exec_target\"";
 
 #[test]
 fn undeclared_subprocess_spawn_is_denied_under_the_run_jail_but_succeeds_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -266,7 +256,7 @@ fn undeclared_subprocess_spawn_is_denied_under_the_run_jail_but_succeeds_under_c
 
 #[test]
 fn declared_subprocess_spawn_succeeds_under_the_run_jail() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -293,7 +283,7 @@ const SECRET_PRESENT: &str = "test -n \"${IPE_E2E_SECRET-}\"";
 
 #[test]
 fn a_non_allowlisted_env_var_is_absent_under_the_run_jail_but_present_under_control() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();
@@ -328,7 +318,7 @@ fn a_non_allowlisted_env_var_is_absent_under_the_run_jail_but_present_under_cont
 
 #[test]
 fn an_allowlisted_env_var_is_present_under_the_run_jail() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let scratch = scratch_dir();

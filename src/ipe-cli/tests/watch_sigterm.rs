@@ -106,8 +106,7 @@ fn warm_server_fixture_deps() -> Result<(), BoxError> {
     std::fs::write(&entry, server_fixture("warm"))
         .map_err(|e| -> BoxError { format!("warm: write Main.ipe: {e}").into() })?;
 
-    let runtime_dir = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("warm: runtime must resolve: {e}").into() })?;
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     ipe::build(&entry, &out_dir, &runtime_dir)
         .map_err(|e| -> BoxError { format!("warm: ipe build failed: {e}").into() })?;
@@ -250,8 +249,7 @@ fn spawn_ipe_watch(
     port: u16,
     capture_stderr: bool,
 ) -> Result<std::process::Child, BoxError> {
-    let runtime_dir = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("runtime dir must resolve: {e}").into() })?;
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let mut cmd = std::process::Command::new(support::ipe_bin());
     cmd.arg("watch")
         .arg(entry)
@@ -347,7 +345,7 @@ fn wait_for_exit(
 #[test]
 fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() -> Result<(), BoxError>
 {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -421,10 +419,7 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
     // so no cargo build ever starts — the loop just stays alive.
     std::fs::write(ipe_dir.join("Main.ipe"), RED_BUILD_SOURCE)
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        eprintln!("skipping (embedded runtime not resolvable)");
-        return Ok(());
-    };
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let opts = ipe::watch::WatchOptions::new(ipe_dir.join("Main.ipe"), out_dir, runtime_dir);
     let (join, handle) = ipe::watch::spawn(opts);
 
@@ -491,7 +486,7 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
 #[test]
 fn double_sigterm_after_forwarder_consumed_is_silently_absorbed_use_sigkill() -> Result<(), BoxError>
 {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }

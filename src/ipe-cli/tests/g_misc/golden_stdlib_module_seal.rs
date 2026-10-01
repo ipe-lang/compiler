@@ -25,11 +25,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A runtime `false` the optimiser cannot fold.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 fn write_project(dir: &Path, main: &str) -> bool {
     let src = dir.join("src");
     let _ = fs::remove_dir_all(dir);
@@ -39,14 +34,11 @@ fn write_project(dir: &Path, main: &str) -> bool {
     fs::write(src.join("Main.ipe"), main).is_ok()
 }
 
-fn e2e_enabled() -> bool {
-    ipe_env::var("IPE_E2E").is_ok()
-}
-
 /// Compile `main` (a full `Main.ipe` program) through the ipe frontend into an
 /// emitted Rust project rooted at a per-`slug` temp dir. Asserts ipe exit 0 —
 /// a resolution/seal regression fails loudly. Returns the emitted-project dir.
-fn compile_module_probe(slug: &str, main: &str) -> Option<PathBuf> {
+#[allow(clippy::panic)] // a refused well-formed program is the test failure
+fn compile_module_probe(slug: &str, main: &str) -> PathBuf {
     // Unique dir PER CALL AND PER PROCESS: the `_resolves_and_emits` and
     // `_builds_and_runs` tests for one module share a slug and run concurrently under
     // nextest, so a shared temp dir races (write vs remove_dir_all) and flakily fails
@@ -56,9 +48,7 @@ fn compile_module_probe(slug: &str, main: &str) -> Option<PathBuf> {
     // Declared at scope top (before any statement) to satisfy
     // clippy::items_after_statements.
     static PROBE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None; // runtime unavailable in this environment — caller skips
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let uid = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let tmp = crate::support::scratch_root().join(format!("ipec_stdlib_seal_{slug}_{pid}_{uid}"));
@@ -79,24 +69,18 @@ fn compile_module_probe(slug: &str, main: &str) -> Option<PathBuf> {
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     if let Err(e) = built {
-        assert!(
-            false_marker(),
-            "module `{slug}` must resolve + emit through ipec (exit 0), got: {e:?}"
-        );
-        return None;
+        panic!("module `{slug}` must resolve + emit through ipec (exit 0), got: {e:?}");
     }
-    Some(out)
+    out
 }
 
 /// Full end-to-end seal for one module: ipe emits, then the emitted crate
 /// `cargo build`s + runs, and stdout matches `expected`.
 fn seal_module(slug: &str, main: &str, expected: &str) {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(dir) = compile_module_probe(slug, main) else {
-        return;
-    };
+    let dir = compile_module_probe(slug, main);
     let out = crate::support::build_and_run_emitted(slug, &dir);
     assert_eq!(
         out.exit_code,
@@ -518,11 +502,10 @@ fn pubsub_typed_shared_topic_resolves_and_emits() {
 /// Positive with E2E build: compiles and links.
 #[test]
 fn pubsub_typed_shared_topic_builds() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let _ = compile_module_probe("pubsub_typed_shared_e2e", PUBSUB_TYPED_SHARED_TOPIC)
-        .expect("typed shared Topic Int must compile end-to-end");
+    let _ = compile_module_probe("pubsub_typed_shared_e2e", PUBSUB_TYPED_SHARED_TOPIC);
 }
 
 // Negative: one shared `t : Topic Int` used to `publish` an `Int` and to
@@ -554,9 +537,7 @@ const PUBSUB_TOPIC_MISMATCH: &str = "module Main exposing (main)\n\
 #[test]
 fn pubsub_topic_type_mismatch_is_rejected() {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let uid = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Fold the PID in so two parallel test binaries never collide on the shared
     // temp_dir (the per-process counter alone restarts at 0 in each binary).
@@ -717,12 +698,10 @@ fn markdown_parser_resolves_and_emits() {
 
 #[test]
 fn markdown_builds_and_runs() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(dir) = compile_module_probe("markdown_e2e", MARKDOWN_MAIN) else {
-        return;
-    };
+    let dir = compile_module_probe("markdown_e2e", MARKDOWN_MAIN);
     let out = crate::support::build_and_run_emitted("markdown", &dir);
     assert_eq!(
         out.exit_code,
@@ -759,12 +738,10 @@ fn markdown_builds_and_runs() {
 
 #[test]
 fn markdown_parser_builds_and_runs() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(dir) = compile_module_probe("markdown_parser_e2e", MARKDOWN_PARSER_MAIN) else {
-        return;
-    };
+    let dir = compile_module_probe("markdown_parser_e2e", MARKDOWN_PARSER_MAIN);
     let out = crate::support::build_and_run_emitted("markdown_parser", &dir);
     assert_eq!(
         out.exit_code,
@@ -824,12 +801,10 @@ fn markdown_features_resolves_and_emits() {
 
 #[test]
 fn markdown_features_builds_and_runs() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(dir) = compile_module_probe("markdown_features_e2e", MARKDOWN_FEATURES_MAIN) else {
-        return;
-    };
+    let dir = compile_module_probe("markdown_features_e2e", MARKDOWN_FEATURES_MAIN);
     let out = crate::support::build_and_run_emitted("markdown_features", &dir);
     assert_eq!(
         out.exit_code,

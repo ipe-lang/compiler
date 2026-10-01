@@ -12,17 +12,17 @@
 //!     import, proving a colour value is one type everywhere, UI or not, and
 //!     that a bound a11y/parse kernel emits code that cargo-builds and runs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for color-e2e tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -61,7 +61,7 @@ fn color_project_builds_with_no_ui_import() {
 /// whole seam from `Ipe.Color` source to a running binary.
 #[test]
 fn color_e2e_runs_and_prints_hex_and_css() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("color_e2e_run");

@@ -85,7 +85,6 @@ fn walk_expr(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => {}
     }
 }
@@ -193,7 +192,6 @@ fn collect_used(expr: &Expr, used: &mut HashSet<Symbol>) {
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => {}
     }
 }

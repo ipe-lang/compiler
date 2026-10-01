@@ -184,6 +184,7 @@ fn guard_formula(cell: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // the writer is fed only `String` fields, so its bytes are UTF-8
 fn encode_delim(doc: &CsvDoc, delim: u8) -> String {
     // flexible(true): a parsed-then-encoded doc may carry ragged rows (row width ≠
     // header width) since the reader is flexible. Without this the writer errors on

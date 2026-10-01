@@ -1257,7 +1257,6 @@ impl Printer<'_> {
             Expr_::Int(n) => n.to_string(),
             Expr_::Float(f) => format_float(*f),
             Expr_::Str(s) => format!("\"{}\"", escape_str(s)),
-            Expr_::PathLit(s) => format!("path \"{}\"", escape_str(s)),
             Expr_::MultilineStr { raw, .. } => format!("\"\"\"{raw}\"\"\""),
             Expr_::Char(c) => format!("'{c}'"),
             Expr_::Unit => "()".to_owned(),

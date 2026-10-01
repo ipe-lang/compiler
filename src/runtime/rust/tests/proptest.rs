@@ -1,4 +1,5 @@
 //! Property-based tests for the Ipê Rust runtime.
+#![cfg(not(target_arch = "wasm32"))]
 
 use ipe_runtime_rust::*;
 use proptest::prelude::*;

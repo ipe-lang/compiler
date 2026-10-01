@@ -174,15 +174,11 @@ fn start_watch(
     out_dir: &Path,
     port: u16,
     bluegreen: bool,
-) -> Result<
-    (
-        std::thread::JoinHandle<Result<(), ipe::CliError>>,
-        WatchHandle,
-    ),
-    BoxError,
-> {
-    let runtime_dir = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("runtime dir must resolve: {e}").into() })?;
+) -> (
+    std::thread::JoinHandle<Result<(), ipe::CliError>>,
+    WatchHandle,
+) {
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let mut opts = WatchOptions::new(entry.to_path_buf(), out_dir.to_path_buf(), runtime_dir);
     opts.port = port;
     opts.bluegreen = bluegreen;
@@ -194,7 +190,7 @@ fn start_watch(
         quiescence: Duration::from_millis(120),
         hard_cap: Duration::from_millis(600),
     };
-    Ok(ipe::watch::spawn(opts))
+    ipe::watch::spawn(opts)
 }
 
 /// One `GET / HTTP/1.1` on an ALREADY-OPEN keep-alive socket, returning the
@@ -450,7 +446,7 @@ fn measure_rebuild_tail(
 fn run_measurement(bluegreen: bool, port: u16, tag: &str) -> Result<(), BoxError> {
     let (ipe_dir, out_dir) = fresh_dirs(tag)?;
     write_main(&ipe_dir, &web_fixture("M-0"))?;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, bluegreen)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, bluegreen);
     assert!(
         wait_for_marker(port, "M-0", Duration::from_mins(5)),
         "cold build must serve M-0"
@@ -496,7 +492,7 @@ fn run_measurement(bluegreen: bool, port: u16, tag: &str) -> Result<(), BoxError
 #[test]
 #[ignore = "measurement harness (prints a table); run explicitly with --ignored --nocapture"]
 fn measure_direct_path_tail() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -506,7 +502,7 @@ fn measure_direct_path_tail() -> Result<(), BoxError> {
 #[test]
 #[ignore = "measurement harness (prints a table); run explicitly with --ignored --nocapture"]
 fn measure_bluegreen_path_tail() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -517,7 +513,7 @@ fn measure_bluegreen_path_tail() -> Result<(), BoxError> {
 /// browser's connection, and the same socket afterwards serves the NEW binary.
 #[test]
 fn bluegreen_rebuild_keeps_the_client_connection_alive() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -525,7 +521,7 @@ fn bluegreen_rebuild_keeps_the_client_connection_alive() -> Result<(), BoxError>
     write_main(&ipe_dir, &web_fixture("MARKER-V1"))?;
 
     let port = 19191;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
 
     assert!(
         wait_for_marker(port, "MARKER-V1", Duration::from_mins(5)),
@@ -610,7 +606,7 @@ fn wait_for_count_at_least(port: u16, cookie: &str, min: i64, timeout: Duration)
 /// breaking new-session init.
 #[test]
 fn bluegreen_rebuild_preserves_the_model_across_the_swap() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -618,7 +614,7 @@ fn bluegreen_rebuild_preserves_the_model_across_the_swap() -> Result<(), BoxErro
     write_main(&ipe_dir, &ticker_fixture("HANDOFF-V1"))?;
 
     let port = 19193;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
     assert!(
         wait_for_marker(port, "HANDOFF-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -687,7 +683,7 @@ fn bluegreen_rebuild_preserves_the_model_across_the_swap() -> Result<(), BoxErro
 /// `init` (`score=0`), with the server healthy throughout.
 #[test]
 fn bluegreen_rebuild_resets_cleanly_on_model_type_change() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -695,7 +691,7 @@ fn bluegreen_rebuild_resets_cleanly_on_model_type_change() -> Result<(), BoxErro
     write_main(&ipe_dir, &ticker_fixture("RESET-V1"))?;
 
     let port = 19194;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
     assert!(
         wait_for_marker(port, "RESET-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -794,7 +790,7 @@ fn additive_ticker_fixture(marker: &str) -> String {
 /// value, without losing either old state or the new field's default.
 #[test]
 fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -802,7 +798,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
     write_main(&ipe_dir, &ticker_fixture("ADDITIVE-V1"))?;
 
     let port = 19195;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true);
     assert!(
         wait_for_marker(port, "ADDITIVE-V1", Duration::from_mins(5)),
         "cold build must serve v1 through the blue-green proxy"
@@ -855,7 +851,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
 /// direct path drops connections on restart by design).
 #[test]
 fn flag_off_direct_path_still_swaps_the_binary() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
@@ -863,7 +859,7 @@ fn flag_off_direct_path_still_swaps_the_binary() -> Result<(), BoxError> {
     write_main(&ipe_dir, &web_fixture("OFF-V1"))?;
 
     let port = 19192;
-    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false)?;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false);
 
     assert!(
         wait_for_marker(port, "OFF-V1", Duration::from_mins(5)),

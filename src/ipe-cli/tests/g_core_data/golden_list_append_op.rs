@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -32,18 +32,10 @@ fn compile_golden(name: &str) -> PathBuf {
     let entry = golden_dir(&root, name).join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else {
-        return out;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
-}
-
-fn e2e_enabled() -> bool {
-    ipe_env::var("IPE_E2E").is_ok()
 }
 
 /// (a/b/c) `++` on `List Int`, `List (Int, Bool)`, and `String` all compile
@@ -51,7 +43,7 @@ fn e2e_enabled() -> bool {
 /// source file / one binary to keep the E2E overhead minimal.
 #[test]
 fn list_append_op_runs_with_parity() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let dir = compile_golden("m_list_append_op");
@@ -78,11 +70,7 @@ fn append_on_int_is_rejected_at_typecheck() {
     let entry = golden_dir(&root, "m_neg_append_on_int").join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m_neg_append_on_int_e2e");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve");
-    let Ok(runtime) = runtime else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),

@@ -20,12 +20,12 @@
 //! directly reproduces the fuzzer failure at the ipe level. The run check is
 //! `IPE_E2E`-gated (builds + runs the emitted binary).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -44,7 +44,7 @@ fn interp_int_literal_compiles() {
     let entry = golden_entry("m_interp_int_literal");
     let out = crate::support::scratch_root().join("ipec_m_interp_int_literal");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -56,13 +56,13 @@ fn interp_int_literal_compiles() {
 /// The emitted binary prints the interpolated literals (`54`, `51`).
 #[test]
 fn interp_int_literal_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let entry = golden_entry("m_interp_int_literal");
     let out = crate::support::scratch_root().join("ipec_m_interp_int_literal_e2e");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build(&entry, &out, &runtime).expect("build must succeed");
     let outcome = support::build_and_run_emitted("m_interp_int_literal", &out);
     assert_eq!(outcome.exit_code, Some(0), "clean exit expected");

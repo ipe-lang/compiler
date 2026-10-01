@@ -582,7 +582,6 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -1200,7 +1199,6 @@ fn escapes(body: &Expr, row_syms: &BTreeSet<Symbol>, tail_sym: Option<Symbol>) -
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -1509,7 +1507,6 @@ fn canon_collect_free_locals(
         | canon::Expr_::Int(_)
         | canon::Expr_::Float(_)
         | canon::Expr_::Str(_)
-        | canon::Expr_::PathLit(_)
         | canon::Expr_::CustomElementCtor(_)
         | canon::Expr_::Char(_)
         | canon::Expr_::Unit => {}
@@ -1639,7 +1636,6 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -1789,7 +1785,6 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -1954,7 +1949,6 @@ fn flows_into_sync_kernel_call(sym: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -2035,7 +2029,6 @@ fn branch_value_leaf_reads_sym(name: Symbol, branch: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -2239,7 +2232,6 @@ fn unify_group_value_leaves(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -2293,7 +2285,6 @@ fn promote_unification_sibling_lambdas(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -2593,7 +2584,6 @@ fn find_first_varlocal_span(sym: Symbol, body: &canon::Expr) -> Option<Span> {
         | canon::Expr_::Int(_)
         | canon::Expr_::Float(_)
         | canon::Expr_::Str(_)
-        | canon::Expr_::PathLit(_)
         | canon::Expr_::CustomElementCtor(_)
         | canon::Expr_::Char(_)
         | canon::Expr_::Unit => None,
@@ -2762,7 +2752,6 @@ fn count_var_uses(sym: Symbol, expr: &Expr) -> usize {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -2941,7 +2930,6 @@ fn body_calls_kernel_on_param(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3036,7 +3024,6 @@ fn body_reads_field_of_param(param: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3202,7 +3189,6 @@ fn collect_row_update_fields(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3685,7 +3671,6 @@ fn body_succeeds_on_bare_var(expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3769,7 +3754,6 @@ fn body_boxes_generic_callback(tv: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3870,7 +3854,6 @@ fn body_materializes_generic_decoder(tv: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -3968,7 +3951,6 @@ fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -4104,7 +4086,6 @@ fn closure_captures_bare_generic(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit => false,
@@ -4284,7 +4265,6 @@ fn body_move_closure_captures_generic(tv: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -4623,7 +4603,6 @@ fn collect_user_calls<'e>(expr: &'e Expr, out: &mut Vec<(FuncId, &'e [Expr])>) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit => {}
@@ -4710,7 +4689,6 @@ fn arg_forwarded_binders(arg: &Expr, out: &mut Vec<Symbol>) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit => {}
@@ -4906,7 +4884,6 @@ fn collect_local_derived_tvars(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit => {}
@@ -5550,7 +5527,6 @@ fn collect_let_site_types(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit => {}
@@ -5734,7 +5710,6 @@ fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -5929,7 +5904,6 @@ fn fn_value_move_walk(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -6304,7 +6278,6 @@ fn count_value_consumes(sym: Symbol, copy_fields: &BTreeSet<Symbol>, expr: &Expr
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -6674,7 +6647,6 @@ fn nonclone_move_walk(sym: Symbol, expr: &Expr, state: &mut NonCloneMoveState<'_
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -6792,7 +6764,6 @@ fn sym_is_bare_update_base(sym: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -6934,7 +6905,6 @@ fn count_var_uses_update_aware(sym: Symbol, expr: &Expr) -> usize {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -7199,7 +7169,6 @@ fn collect_mentioned_syms(expr: &Expr, out: &mut BTreeSet<Symbol>) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -7356,7 +7325,6 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -7577,7 +7545,6 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -8002,7 +7969,6 @@ fn count_self_calls(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -8536,7 +8502,6 @@ fn collect_func_edges(expr: &Expr, out: &mut BTreeSet<FuncId>) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -8611,7 +8576,6 @@ fn body_uses_http_with_timeout(expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -8978,7 +8942,6 @@ fn collect_child_ir_type_refs(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -9076,7 +9039,6 @@ fn expr_uses_debug_pattern(e: &canon::Expr) -> bool {
         canon::Expr_::Int(_)
         | canon::Expr_::Float(_)
         | canon::Expr_::Str(_)
-        | canon::Expr_::PathLit(_)
         | canon::Expr_::CustomElementCtor(_)
         | canon::Expr_::Char(_)
         | canon::Expr_::Unit
@@ -9228,7 +9190,6 @@ fn scan_kernel_usage(expr: &Expr, usage: &mut KernelUsage) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -9314,7 +9275,6 @@ fn expr_constructs_sqlvalue(expr: &Expr, enums: &[Symbol]) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -10049,7 +10009,6 @@ fn rewrite_var_free_occurrences(
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -11119,7 +11078,6 @@ pub fn max_live_eta_params(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11197,7 +11155,6 @@ pub fn count_destructure_param_sites(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11307,7 +11264,6 @@ pub fn count_projection_decode_sites(m: &canon::Module, interner: &Interner) -> 
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11471,7 +11427,6 @@ pub fn count_destructure_thunk_sites(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11559,7 +11514,6 @@ pub fn count_nested_cons_payload_sites(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11649,7 +11603,6 @@ pub fn count_nested_strlit_payload_sites(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -11741,7 +11694,6 @@ pub fn count_tuple_elem_rebind_sites(m: &canon::Module) -> usize {
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => 0,
@@ -12080,7 +12032,6 @@ fn count_body_pool_sites(e: &canon::Expr, ctor_charge: usize, interner: &Interne
         | canon::Expr_::Int(_)
         | canon::Expr_::Float(_)
         | canon::Expr_::Str(_)
-        | canon::Expr_::PathLit(_)
         | canon::Expr_::CustomElementCtor(_)
         | canon::Expr_::Char(_)
         | canon::Expr_::Unit => {}
@@ -12236,7 +12187,6 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
             | canon::Expr_::Int(_)
             | canon::Expr_::Float(_)
             | canon::Expr_::Str(_)
-            | canon::Expr_::PathLit(_)
             | canon::Expr_::CustomElementCtor(_)
             | canon::Expr_::Char(_)
             | canon::Expr_::Unit => {}
@@ -20910,9 +20860,6 @@ impl<'a> Lowerer<'a> {
             }
             canon::Expr_::Float(f) => Ok(Expr::Float(*f)),
             canon::Expr_::Str(s) => Ok(Expr::Str(s.clone())),
-            // A compile-time-sealed `path "…"` literal: the sealed forms carry
-            // straight through; lower directly to PathLit.
-            canon::Expr_::PathLit(lit) => Ok(Expr::PathLit(lit.clone())),
             // The reserved `CustomElement.fromFile "<js-path>"` constructor. The carried
             // path is the CLEANED, in-project, traversal-free relative path the
             // canon seal already proved (and the build-stage containment gate
@@ -25049,7 +24996,7 @@ impl<'a> Lowerer<'a> {
                 // ── Http arity-1 ────────────────────────────────────────
                 // `HttpGet` : String -> Task Error HttpResponse
                 // `HttpRequest` : HttpRequest -> Task Error HttpResponse
-                // `HttpParseQuery` : String -> Dict String String (pure)
+                // `HttpParseQuery` : String -> Result Error (Dict String String) (pure, parse boundary)
                 // `HttpDefaultRequest` : Url -> Result Error HttpRequest (pure builder, scheme-narrowed)
                 // `HttpDefaultRequestFromString` : String -> Result Error HttpRequest (pure, marked parse boundary)
                 // `HttpMethodFromString` : String -> Maybe HttpMethod (pure, parse boundary)
@@ -26900,7 +26847,6 @@ impl<'a> Lowerer<'a> {
                 | canon::Expr_::Int(_)
                 | canon::Expr_::Float(_)
                 | canon::Expr_::Str(_)
-                | canon::Expr_::PathLit(_)
                 | canon::Expr_::CustomElementCtor(_)
                 | canon::Expr_::Char(_)
                 | canon::Expr_::Unit => {}

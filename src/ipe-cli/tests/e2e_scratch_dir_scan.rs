@@ -32,7 +32,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn no_fixed_temp_dir_in_e2e_tests() {
-    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let tests_dir = e2e_support::manifest_dir!().join("tests");
     let mut files = Vec::new();
     collect_rs_files(&tests_dir, &mut files);
 

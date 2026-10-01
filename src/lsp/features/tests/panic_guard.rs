@@ -144,11 +144,9 @@ fn prepare_rename_returns_none_on_cyclic_graph() {
 #[allow(clippy::expect_used)]
 fn no_raw_canonicalize_on_interactive_path() -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
-    use std::path::Path;
 
     // Locate the features/src directory relative to CARGO_MANIFEST_DIR.
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let src_dir = Path::new(manifest).join("src");
+    let src_dir = e2e_support::manifest_dir!().join("src");
     assert!(
         src_dir.exists(),
         "features src dir not found at {src_dir:?}"

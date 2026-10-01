@@ -604,14 +604,15 @@ fn viewport() -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::truncate;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn truncate_short_string_unchanged() {
         let s = "hello".to_owned();
         assert_eq!(truncate(s.clone(), 10), s);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn truncate_long_string_appends_ellipsis() {
         let s = "abcdefghij".to_owned(); // 10 chars
         let t = truncate(s, 5);
@@ -619,7 +620,7 @@ mod tests {
         assert!(t.starts_with("abcde"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn truncate_exact_boundary_unchanged() {
         let s = "hello".to_owned();
         assert_eq!(truncate(s, 5), "hello");

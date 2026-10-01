@@ -284,7 +284,6 @@ fn visit_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => {}
     }
 }

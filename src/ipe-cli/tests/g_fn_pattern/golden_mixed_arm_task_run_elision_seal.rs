@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -28,16 +28,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
         .join("Main.ipe")
 }
 
-/// Build the fixture and return the emitted `src/main.rs` text. `None` when
-/// the runtime resolver is unavailable in this environment (mirrors the
-/// resolve-skip convention every other golden test in this suite uses) or
-/// when the build itself fails (the caller's `assert!` reports the diag).
+/// Build the fixture and return the emitted `src/main.rs` text. `None` when the
+/// build fails (the caller's `assert!` reports the diag).
 fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<String>) {
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return (Ok(()), None);
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, out, &runtime);
     let main_rs = if built.is_ok() {
         std::fs::read_to_string(out.join("src").join("main.rs")).ok()
@@ -60,9 +56,7 @@ fn mixed_arm_entry_point_wraps_to_ipetask() {
         built.is_ok(),
         "mixed_arm_task_run_elision: must be accepted, got: {built:?}"
     );
-    let Some(main_rs) = main_rs else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let main_rs = main_rs.expect("an accepted build yields the emitted source");
 
     assert!(
         main_rs.contains("fn ipe_main() -> IpeTask<"),
@@ -100,9 +94,7 @@ fn mixed_arm_entry_point_wraps_via_task_from_result() {
         built.is_ok(),
         "mixed_arm_task_run_elision: must be accepted, got: {built:?}"
     );
-    let Some(main_rs) = main_rs else {
-        return;
-    };
+    let main_rs = main_rs.expect("an accepted build yields the emitted source");
 
     assert!(
         main_rs.contains("task_from_result({"),
@@ -120,9 +112,7 @@ fn mixed_arm_entry_point_wraps_via_task_from_result() {
 fn mixed_arm_task_run_elision_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_mixed_arm_task_run_elision_e2e");
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = fixture_entry(&root);
     let _ = std::fs::remove_dir_all(&out);
     let built = ipe::build(&entry, &out, &runtime);
@@ -131,19 +121,18 @@ fn mixed_arm_task_run_elision_builds_and_runs() {
         "mixed_arm_task_run_elision: must be accepted, got: {built:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("mixed_arm_task_run_elision", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "mixed_arm_task_run_elision: emitted crate must build and exit 0; stdout:\n{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stdout.trim().is_empty(),
+            "the effect-free Result body must produce no output; got: {:?}",
+            outcome.stdout
+        );
     }
-    let outcome = crate::support::build_and_run_emitted("mixed_arm_task_run_elision", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "mixed_arm_task_run_elision: emitted crate must build and exit 0; stdout:\n{}",
-        outcome.stdout
-    );
-    assert!(
-        outcome.stdout.trim().is_empty(),
-        "the effect-free Result body must produce no output; got: {:?}",
-        outcome.stdout
-    );
 }

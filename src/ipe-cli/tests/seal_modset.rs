@@ -47,8 +47,7 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
         .join(format!("seal_modset_{name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe accept — a codegen bug or a rejection surfaces here.
     ipe::build(&entry, &out_dir, &runtime)
@@ -84,8 +83,7 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
         .join(format!("seal_modset_{name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Force the vendored emit model so `#[cfg(feature = "...")]` coverage in
     // the vendored runtime source is verified — the dep-model never exercises it.
@@ -99,15 +97,6 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
     e2e_support::build_rust_binary(name, &out_dir)
         .map(|_| ())
         .map_err(|e| -> BoxError { e.into() })
-}
-
-/// True unless `IPE_E2E` is set — the per-shape `cargo build`s are expensive.
-fn skip() -> bool {
-    if ipe_env::var("IPE_E2E").is_err() {
-        eprintln!("seal_modset: set IPE_E2E=1 to run (each shape does a cargo build)");
-        return true;
-    }
-    false
 }
 
 // ── Program shapes ──────────────────────────────────────────────────────────
@@ -278,7 +267,7 @@ const AUTHED_PRINCIPAL_CLAIMS: &str = include_str!(concat!(
 
 #[test]
 fn bare_shape_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("bare", BARE).expect("bare shape must emit and cargo-build");
@@ -291,7 +280,7 @@ fn bare_shape_builds() {
 /// epilogue switch causes a `cargo build` failure here despite `ipe` exiting 0.
 #[test]
 fn cli_app_lines_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("cli_app_lines", CLI_APP_LINES).expect(
@@ -302,7 +291,7 @@ fn cli_app_lines_builds() {
 
 #[test]
 fn cmd_publish_no_live_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("cmd_publish", CMD_PUBLISH)
@@ -311,7 +300,7 @@ fn cmd_publish_no_live_builds() {
 
 #[test]
 fn sub_subscribe_topic_no_live_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("sub_subscribe", SUB_SUBSCRIBE)
@@ -320,7 +309,7 @@ fn sub_subscribe_topic_no_live_builds() {
 
 #[test]
 fn live_render_static_cli_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("live_render_static", LIVE_RENDER_STATIC)
@@ -329,7 +318,7 @@ fn live_render_static_cli_builds() {
 
 #[test]
 fn http_stream_chunks_no_open_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("http_stream_chunks", HTTP_STREAM_CHUNKS)
@@ -347,7 +336,7 @@ fn http_stream_chunks_no_open_builds() {
 /// the vendored emit path, which CI previously never ran.
 #[test]
 fn authed_route_vendored_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build_vendored("authed_route_vendored", AUTHED_ROUTE).expect(
@@ -365,7 +354,7 @@ fn authed_route_vendored_builds() {
 /// E0425/E0433 — ipe exit 0, cargo fails: the db-surface SEAL breach.
 #[test]
 fn authed_store_query_vendored_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build_vendored("authed_store_query_vendored", AUTHED_STORE_QUERY).expect(
@@ -382,7 +371,7 @@ fn authed_store_query_vendored_builds() {
 /// `ipe` exit 0 (the SEAL breach class for the principal-read surface).
 #[test]
 fn authed_principal_claims_vendored_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build_vendored("authed_principal_claims_vendored", AUTHED_PRINCIPAL_CLAIMS).expect(
@@ -413,7 +402,7 @@ const JWT_SIGN: &str = "module Main exposing (main)\n\
 /// despite `ipe` exit 0.
 #[test]
 fn jwt_sign_dep_model_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("jwt_sign_dep_model", JWT_SIGN).expect(
@@ -430,7 +419,7 @@ fn jwt_sign_dep_model_builds() {
 /// `jwt_cargo_toml` handles) and that the dep is in scope for `auth.rs`.
 #[test]
 fn jwt_sign_vendored_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build_vendored("jwt_sign_vendored", JWT_SIGN).expect(
@@ -449,7 +438,7 @@ fn jwt_sign_vendored_builds() {
 /// class this test gates.
 #[test]
 fn revoke_session_arity3_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build("revoke_session_arity3", REVOKE_SESSION_ARITY3).expect(
@@ -498,7 +487,7 @@ const TUI_APP: &str = "module Main exposing (main)\n\
 /// is the authoritative gate for that SEAL class on the Tui shape.
 #[test]
 fn tui_app_vendored_builds() {
-    if skip() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     emit_and_build_vendored("tui_app_vendored", TUI_APP).expect(
@@ -517,7 +506,7 @@ fn tui_app_vendored_builds() {
 /// contracted positions makes a tree move fail HERE, loudly and precisely.
 #[test]
 fn runtime_tree_resolves() {
-    let runtime = ipe::resolve_runtime().expect("runtime tree must resolve from the workspace");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let module_root = Path::new(&runtime);
     assert!(
         module_root.is_dir(),

@@ -331,12 +331,10 @@ fn a_resolvable_define_type_chain_all_survives() {
 /// build and round-trip.
 #[test]
 fn opaque_field_and_payload_build_and_run() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(cargo) = ipe_env::var("CARGO") else {
-        return; // no cargo on PATH in this environment — skip like the goldens
-    };
+    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
 
     // The full emitted `_bindings.rs`: the three definitions + their ctors,
     // wrapped as the backend's `pub mod <slug>` region.

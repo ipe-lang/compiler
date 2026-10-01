@@ -232,8 +232,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn fan_out_to_two_subscribers() {
         let got_a: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let got_b: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -250,13 +251,13 @@ mod tests {
         assert_eq!(*got_b.borrow(), vec!["hi".to_owned()]);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn zero_subscribers_returns_zero() {
         let broker = broker::<i64>();
         assert_eq!(broker.publish("empty-topic-xyz", 7, "", false), 0);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn skip_origin_suppresses_only_owning_instance() {
         let got_a: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let got_b: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -272,7 +273,7 @@ mod tests {
         assert_eq!(*got_b.borrow(), vec!["m".to_owned()]);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn unsubscribe_stops_delivery() {
         let got: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let g = Rc::clone(&got);
@@ -285,7 +286,7 @@ mod tests {
         assert!(got.borrow().is_empty());
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn per_type_isolation_same_topic_string() {
         let got_s: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let gs = Rc::clone(&got_s);

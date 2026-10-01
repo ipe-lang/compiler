@@ -459,12 +459,10 @@ fn build_and_assert(
     slot: &str,
     expected: &str,
 ) -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let emitted = RustBackend::new(interner).emit(prog)?;
 

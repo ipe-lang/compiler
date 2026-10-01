@@ -82,7 +82,8 @@ fn webview_program(interner: &mut Interner) -> Program {
 /// dependency-model emit gets a real resolvable `path`.
 #[allow(clippy::expect_used)]
 fn runtime_crate_root() -> PathBuf {
-    let mut here: Option<&Path> = Some(Path::new(env!("CARGO_MANIFEST_DIR")));
+    let manifest = e2e_support::manifest_dir!();
+    let mut here: Option<&Path> = Some(&manifest);
     let found = std::iter::from_fn(|| {
         let dir = here?;
         here = dir.parent();

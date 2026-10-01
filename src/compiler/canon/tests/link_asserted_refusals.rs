@@ -93,21 +93,20 @@ fn link_rejects_duplicate_def_identity_reports_both_spans() {
         ),
         "expected a DuplicateValue diagnostic, got {result:?}"
     );
-    let Err(Diagnostic::Name {
+    if let Err(Diagnostic::Name {
         span,
         msg: NameError::DuplicateValue { first, .. },
     }) = result
-    else {
-        return;
-    };
-    assert_eq!(
-        span, second_span,
-        "diagnostic span must point at the rejected (second) declaration"
-    );
-    assert_eq!(
-        first, first_span,
-        "`first` must point at the original declaration's real source span, not Span::DUMMY"
-    );
+    {
+        assert_eq!(
+            span, second_span,
+            "diagnostic span must point at the rejected (second) declaration"
+        );
+        assert_eq!(
+            first, first_span,
+            "`first` must point at the original declaration's real source span, not Span::DUMMY"
+        );
+    }
 }
 
 /// The same class-closing property for types: a cross-module duplicate union
@@ -155,21 +154,20 @@ fn link_rejects_duplicate_type_identity_reports_both_spans() {
         ),
         "expected a DuplicateType diagnostic, got {result:?}"
     );
-    let Err(Diagnostic::Name {
+    if let Err(Diagnostic::Name {
         span,
         msg: NameError::DuplicateType { first, .. },
     }) = result
-    else {
-        return;
-    };
-    assert_eq!(
-        span, second_span,
-        "diagnostic span must point at the rejected (second) declaration"
-    );
-    assert_eq!(
-        first, first_span,
-        "`first` must point at the original declaration's real source span, not Span::DUMMY"
-    );
+    {
+        assert_eq!(
+            span, second_span,
+            "diagnostic span must point at the rejected (second) declaration"
+        );
+        assert_eq!(
+            first, first_span,
+            "`first` must point at the original declaration's real source span, not Span::DUMMY"
+        );
+    }
 }
 
 /// Two distinct homes sharing a short name are NOT a duplicate — they mangle to

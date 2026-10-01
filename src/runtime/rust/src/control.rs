@@ -301,6 +301,7 @@ pub mod transport {
     }
 
     #[cfg(test)]
+    #[cfg(not(target_arch = "wasm32"))]
     mod transport_tests {
         use super::*;
 
@@ -629,6 +630,7 @@ pub mod server {
     }
 
     #[cfg(test)]
+    #[cfg(not(target_arch = "wasm32"))]
     mod tests {
         use super::super::{AppearancePatch, decode_frame};
         use super::*;
@@ -833,6 +835,7 @@ pub mod server {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

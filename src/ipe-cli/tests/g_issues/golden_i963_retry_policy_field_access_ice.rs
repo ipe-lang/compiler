@@ -41,10 +41,10 @@ fn fixture_named(root: &Path, name: &str) -> PathBuf {
         .join("Main.ipe")
 }
 
-fn built(root: &Path, out: &Path) -> Option<Result<(), CliError>> {
+fn built(root: &Path, out: &Path) -> Result<(), CliError> {
     let _ = std::fs::remove_dir_all(out);
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&fixture(root), out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&fixture(root), out, &runtime)
 }
 
 /// The fix must not regress: a user record with a lone `shouldRetry` field is
@@ -55,9 +55,7 @@ fn retry_policy_nearmiss_still_rejects() {
     let entry = fixture_named(&root, "retry_policy_shape_nearmiss");
     let out = crate::support::scratch_root().join("ipec_i963_nearmiss_guard");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -77,9 +75,7 @@ fn retry_policy_nearmiss_still_rejects() {
 fn retry_policy_field_access_ice_emits() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_i963_emit");
-    let Some(result) = built(&root, &out) else {
-        return;
-    };
+    let result = built(&root, &out);
     assert!(
         result.is_ok(),
         "RetryPolicy field access and predicate-lambda retryOn must compile \
@@ -95,29 +91,25 @@ fn retry_policy_field_access_ice_emits() {
 fn retry_policy_field_access_ice_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_i963_e2e");
-    let Some(result) = built(&root, &out) else {
-        return;
-    };
+    let result = built(&root, &out);
     assert!(
         result.is_ok(),
         "RetryPolicy field access fixture must be accepted; got: {result:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("retry_policy_field_access_ice", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "emitted crate must build and run successfully; stdout:\n{}",
+            outcome.stdout
+        );
+        // The fixture prints "withRetryOn ok" then "ok" (two successful Task chains).
+        let stdout = outcome.stdout.trim();
+        assert!(
+            stdout.contains("ok"),
+            "emitted program must print 'ok' from the retryWith chain"
+        );
     }
-
-    let outcome = crate::support::build_and_run_emitted("retry_policy_field_access_ice", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "emitted crate must build and run successfully; stdout:\n{}",
-        outcome.stdout
-    );
-    // The fixture prints "withRetryOn ok" then "ok" (two successful Task chains).
-    let stdout = outcome.stdout.trim();
-    assert!(
-        stdout.contains("ok"),
-        "emitted program must print 'ok' from the retryWith chain"
-    );
 }

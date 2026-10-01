@@ -21,10 +21,10 @@
 //! cargo test -p ipe --test golden_cross_module_type_res
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -42,10 +42,7 @@ fn assert_ipec_exit0(label: &str, entry_rel: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{label}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {label}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     // Multi-module examples require sibling-discovery so imports like
     // `import State exposing (..)` resolve to adjacent `.ipe` files.
     let result = ipe::build_loose_file(&entry, &out, &runtime);

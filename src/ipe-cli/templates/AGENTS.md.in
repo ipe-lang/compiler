@@ -395,7 +395,7 @@ app code.
 | `Time` | `Ipe.Time` | now, sleep (`Ipe.Duration`), every (`Ipe.Duration`), unixMillis, format/formatISO8601/formatRFC3339/formatHTTP, addMillis, diffMillis, timeString |
 | `Ipe.Time` | `Ipe.Time` | IANA zones, addMonths/Years (month-end CLAMPED), dayOfWeek (ISO Mon=1..Sun=7), weekOfYear (ISO 8601), startOfDay/Week/Month/Year, diffDays/Hours/Minutes/Seconds; `*Utc` infallible companions (`dayOfWeekUtc`/`startOfDayUtc`/`yearUtc`/etc — `Int -> Int`, plug "UTC" at call site). |
 | `Random` | `Ipe.Random` | int, float, range, choice, shuffle, weighted (entropy-backed); seed, seededInt, seededFloat, seededChoice (deterministic) |
-| `Http` | `Ipe.Http` | get, post, request (custom method/headers/body/timeout via `HttpRequest`), defaultRequest/withMethod/withHeader/withTimeout/withBody builders, parseQuery; typed `HttpResponse = { status : Int, body : String, headers : Dict String String }` |
+| `Http` | `Ipe.Http` | get, post, request (custom method/headers/body/timeout via `HttpRequest`), defaultRequest/withMethod/withHeader/withTimeout/withBody builders, parseQuery (`String -> Result Error (Dict String String)`, strict); typed `HttpResponse = { status : Int, body : String, headers : Dict String String }` |
 | `File` | `Ipe.File` | readFile, readFileLimit (`Ipe.ByteSize` ceiling), readFileBytes, writeFile, append, exists, remove, delete, mkdirAll, readDir, isDir, walk, walkMatching, tempFile, tempDir, copy, rename |
 | `Io` | `Ipe.Io` | readLine, writeStdout, writeStderr, println, eprintln (println/eprintln write a line + trailing newline to stdout/stderr) |
 | `System` | `Ipe.System` | args, getArg, getenv, getenvOr (bare), getenvInt, getenvBool, setenv, unsetenv, cwd, loadEnv, exit |
@@ -463,8 +463,8 @@ update", use `Cmd.publish` instead.
 | Field | Type | Source |
 |---|---|---|
 | `req.path` | `String` | URL path |
-| `req.query` | `String` | raw `?...` (parse via `Ipe.Http.parseQuery` if needed) |
-| `req.params` | `Dict String String` | matched-route `:name` segments |
+| `req.query` | `String` | raw `?...` (parse via `Ipe.Http.parseQuery` if needed; a malformed query is an `Err`) |
+| `req.params` | `Dict String String` | matched-route `:name` segments (`name` = `[A-Za-z_][A-Za-z0-9_]*`, unique per route) |
 | `req.method` | `String` | request method |
 | `req.headers` | `Dict String String` | request headers, canonical case |
 | `req.cookies` | `Dict String String` | parsed cookies |
@@ -546,6 +546,9 @@ nodes regardless of position.
 declaration order, captures `:param` segments, constructs Page w/ captured
 values (always `String`). Declaration order matters — literals before
 patterns (`/apps/new` before `/apps/:slug`, or "new" matches as slug).
+A `:name` is `[A-Za-z_][A-Za-z0-9_]*` and unique within its pattern; a
+literal segment's `%` starts a two-hex-digit UTF-8 escape (`%25` = `%`). A
+literal pattern breaking either rule is refused at compile time (IPE-L0156).
 
 ```elm
 type Page
@@ -735,6 +738,9 @@ Routes: `get/post/put/delete/any` | groups w/ prefix | cookies (HttpOnly,
 Secure, SameSite) | extractors: `param`, `queryParam`, `header`,
 `getCookie` | responses: `text`, `json`, `html`, `withStatus`, `redirect`
 | middleware: `Handler -> Handler`.
+Path params `:name` / catch-all `*name`: `name` = `[A-Za-z_][A-Za-z0-9_]*`,
+unique per path; a literal path breaking this is refused at compile time
+(IPE-L0156).
 
 **Handler annotation.** Named handlers ascribe at head position w/
 `Handler` alias:

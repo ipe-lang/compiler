@@ -75,7 +75,7 @@ fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestR
 /// the emitted test binary, needing `cargo` and the runtime.
 #[test]
 fn a_project_with_passing_tests_exits_zero_with_a_summary() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the passing-test E2E");
         return Ok(());
     }
@@ -106,7 +106,7 @@ fn a_project_with_passing_tests_exits_zero_with_a_summary() -> TestResult {
 /// `IPE_E2E=1` — it builds and runs the emitted test binary.
 #[test]
 fn a_project_with_a_failing_test_names_it_and_exits_non_zero() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the failing-test E2E");
         return Ok(());
     }
@@ -232,7 +232,7 @@ fn a_catch_all_in_the_test_entry_is_refused_at_its_own_arm() -> TestResult {
 /// — it builds and runs the emitted test binary.
 #[test]
 fn a_test_entry_importing_the_database_stdlib_passes() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the database-stdlib test E2E");
         return Ok(());
     }

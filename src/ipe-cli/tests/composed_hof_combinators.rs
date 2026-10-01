@@ -11,17 +11,17 @@
 //! application of a function-returning lambda lost its trailing argument). This
 //! test proves the whole surface now emits AND runs to a deterministic line.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for composed-hof tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -64,7 +64,7 @@ fn composed_combinators_lower() {
 /// pair or fail to run at all.
 #[test]
 fn composed_combinators_run_deterministically() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composed_hof_combinators_e2e");

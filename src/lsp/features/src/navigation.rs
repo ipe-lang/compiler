@@ -159,7 +159,6 @@ fn walk_for_ref_at(
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Char(_)
         | Expr_::Unit => {}
@@ -321,7 +320,6 @@ fn walk_for_refs(
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Char(_)
         | Expr_::Unit => {}
@@ -492,7 +490,6 @@ fn walk_for_span_at(
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Char(_)
         | Expr_::Unit => {}

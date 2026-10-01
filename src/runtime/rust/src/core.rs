@@ -981,7 +981,8 @@ pub fn record_stack_floor(stack_size: usize) {
 
 /// Read this thread's recorded stack floor, if any. Test-only accessor for the
 /// floor-recording regressions; production code never needs to read it directly.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn stack_floor_for_test() -> Option<usize> {
     STACK_FLOOR.with(std::cell::Cell::get)
 }
@@ -989,6 +990,7 @@ pub(crate) fn stack_floor_for_test() -> Option<usize> {
 /// Read this thread's current guarded recursion depth. Test-only accessor for
 /// the RAII-balance regressions.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn recursion_depth_for_test() -> usize {
     RECURSION_DEPTH.with(std::cell::Cell::get)
 }
@@ -1301,6 +1303,7 @@ pub fn eprint_task_error(msg: &str) {
 // when the `serde` feature is on. `cargo test --features serde` (or `json`) runs
 // them; a `--no-default-features` test build has no serde impls to exercise.
 #[cfg(all(test, feature = "serde"))]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -1698,6 +1701,7 @@ mod tests {
 // thread-local depth counter and stack floor start clean and never race another
 // test on the process's threads.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod recursion_guard_tests {
     use super::*;
 
@@ -1904,6 +1908,7 @@ mod recursion_guard_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod eprint_tests {
     use super::*;
 

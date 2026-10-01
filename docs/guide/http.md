@@ -60,10 +60,16 @@ describe raw =
 ```
 
 Inbound verbs pass through the single parse boundary, and `Http.parseQuery`
-decodes a query string into a `Dict`, percent-decoding each key and value:
+decodes a query string into a `Dict`, percent-decoding each key and value. A
+malformed escape or invalid UTF-8 anywhere refuses the whole query as an `Err`:
 
 ```ipe
-Http.parseQuery "?q=red%20shoes&page=2"
+case Http.parseQuery "?q=red%20shoes&page=2" of
+    Ok params ->
+        Maybe.withDefault "?" (Dict.get "q" params)
+
+    Err _ ->
+        "(refused)"
 ```
 
 Running it (`ipe run`) shows the two http(s) targets assembled into `POST`

@@ -33,10 +33,10 @@
 //! IPE_E2E=1 cargo test golden_m7_stdui_layoutwith
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -50,17 +50,7 @@ fn build_run_layoutwith() -> (PathBuf, crate::support::RunOutcome) {
     let out = crate::support::scratch_root().join("ipec_m7_stdui_layoutwith_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else {
-        return (
-            dir,
-            crate::support::RunOutcome {
-                stdout: String::new(),
-                exit_code: None,
-            },
-        );
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -77,7 +67,7 @@ fn build_run_layoutwith() -> (PathBuf, crate::support::RunOutcome) {
 /// Divergence golden — the expected value is ipe's own correct output.
 #[test]
 fn layoutwith_inline_cfg_applies_wrapper_and_root_attrs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 

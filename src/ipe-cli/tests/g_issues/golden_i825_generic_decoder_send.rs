@@ -43,9 +43,7 @@ fn generic_decoder_send_emits_byte_identical() {
     let out = crate::support::scratch_root().join("ipec_i825_generic_decoder_send_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -71,23 +69,20 @@ fn generic_decoder_send_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_i825_generic_decoder_send_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
-    let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "emitted crate must build and exit 0 — a generic `Decoder a` combinator \
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "emitted crate must build and exit 0 — a generic `Decoder a` combinator \
          must not be `ipe`-accept-then-`cargo`-fail; stdout:\n{}",
-        outcome.stdout
-    );
-    let dir = root.join("tests").join("golden").join(GOLDEN);
-    crate::support::assert_go_parity(GOLDEN, &dir, &outcome.stdout);
+            outcome.stdout
+        );
+        let dir = root.join("tests").join("golden").join(GOLDEN);
+        crate::support::assert_go_parity(GOLDEN, &dir, &outcome.stdout);
+    }
 }

@@ -91,7 +91,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -109,17 +109,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else {
-        return (
-            dir,
-            crate::support::RunOutcome {
-                stdout: String::new(),
-                exit_code: None,
-            },
-        );
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
@@ -130,7 +120,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
 /// Compile/build/run the golden and assert its stdout matches the cached oracle.
 /// Gated on `IPE_E2E=1`.
 fn assert_runs_and_matches_oracle(name: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let (dir, outcome) = build_run(name);
@@ -506,7 +496,7 @@ fn dsn_parse() {
     assert_runs_and_matches_oracle("dsn_parse");
     // Belt-and-suspenders Secret non-leak proof: the password sentinel must be
     // absent from the emitted program's stdout even on the happy path.
-    if ipe_env::var("IPE_E2E").is_ok() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let (_dir, outcome) = build_run("dsn_parse");
         assert!(
             !outcome.stdout.contains("hunter2SENTINEL"),
@@ -545,9 +535,7 @@ fn db_sql_decimal_accepts_decimal() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_accepts");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -569,9 +557,7 @@ fn db_sql_decimal_rejects_raw_string() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_rejects");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let err = ipe::build(&entry, &out, &runtime)
         .map_err(|e| e.to_string())
@@ -609,9 +595,7 @@ fn db_poly_params_compiles() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_poly_params");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Core assertion: `ipe::build` succeeds — no IPE-T0001 for any param-list shape.
     let built = ipe::build(&entry, &out, &runtime);

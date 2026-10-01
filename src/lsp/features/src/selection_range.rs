@@ -178,7 +178,6 @@ fn collect_expr_spans(expr: &ipe_syntax::Expr, byte: u32, out: &mut Vec<Span>) {
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => {}
     }
 }

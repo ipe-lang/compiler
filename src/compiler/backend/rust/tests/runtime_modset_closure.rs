@@ -37,35 +37,12 @@
 //! sweep is retained as a backstop.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::RustBackend;
 use ipe_intern::Interner;
 use ipe_ir::{ModPath, Module, Program, Target};
-
-/// Locate the runtime source tree (`src/runtime/rust/src`) — the vendored
-/// module files whose `use crate::` closure this test checks.
-fn resolve_runtime() -> Option<PathBuf> {
-    if let Ok(dir) = ipe_env::var("IPE_RUNTIME_DIR") {
-        let p = PathBuf::from(dir);
-        // Accept only if the dir contains actual runtime source files, not a
-        // parent directory whose only child is a `src/` subdirectory.
-        if p.is_dir() && p.join("log.rs").is_file() {
-            return Some(p);
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    let mut here: Option<&Path> = Some(cwd.as_path());
-    while let Some(dir) = here {
-        let candidate = dir.join("src").join("runtime").join("rust").join("src");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        here = dir.parent();
-    }
-    None
-}
 
 /// A `Module` with every module-set-relevant `uses_*` flag independently
 /// settable, all else empty. The record fold is index-driven: bit `i` of `mask`
@@ -647,8 +624,7 @@ fn assert_mask_closed(
 /// The base case of the composition argument (module docs).
 #[test]
 fn each_flag_declares_a_closed_modset() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -697,8 +673,7 @@ fn declared_modset_is_monotone() {
 /// a needed module.
 #[test]
 fn composed_full_modset_is_closed() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let all: u32 = (1u32 << FLAG_COUNT) - 1;
@@ -727,8 +702,7 @@ fn composed_full_modset_is_closed() {
 /// constant cost as `FLAG_COUNT` grows.
 #[test]
 fn sampled_full_masks_are_closed() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     let all: u32 = (1u32 << FLAG_COUNT) - 1;
@@ -806,8 +780,7 @@ fn emitted_mod_rs_declares_no_module_twice() {
 /// automatically.
 #[test]
 fn base_modules_do_not_reach_gated_modules() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
 
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
@@ -1059,8 +1032,7 @@ fn parse_inline_modules(mod_rs: &str) -> HashMap<String, Vec<String>> {
 /// only the explicitly-listed child files are scanned, not the whole directory.
 #[test]
 fn wasm_vendored_modset_is_closed() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
 
@@ -1283,8 +1255,7 @@ mod tests {
 /// name and not just by the structural test's catch-all message.
 #[test]
 fn scanner_detects_log_rs_dep_on_app_config() {
-    let runtime_root =
-        resolve_runtime().expect("runtime source tree (src/runtime/rust/src) must resolve");
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
     // `log.rs` uses `crate::app_config::resolve_log_level_override()` and
     // `crate::system::read_env_var()` unconditionally — both are inline paths,
     // not `use` statements. The reworked scanner must catch them.

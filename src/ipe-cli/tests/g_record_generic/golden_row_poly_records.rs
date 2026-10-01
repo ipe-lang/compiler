@@ -41,10 +41,10 @@
 //! `cargo`, so no gate needed) — they are the pinned-records ADR tripwires and
 //! must keep rejecting.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -75,10 +75,7 @@ fn subset_access_ipec_accepts_and_resolves_superset_struct() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_subset_access_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_subset_access: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -109,7 +106,7 @@ fn subset_access_ipec_accepts_and_resolves_superset_struct() {
 /// `Ada`"), hand-verified against `the prior compiler`.
 #[test]
 fn subset_access_cargo_builds_and_prints_ada() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -117,9 +114,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
     let out = crate::support::scratch_root().join("ipec_row_poly_subset_access_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -158,10 +153,7 @@ fn subset_pattern_ipec_accepts_and_completes_superset_pattern() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_subset_pattern_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_subset_pattern: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -193,7 +185,7 @@ fn subset_pattern_ipec_accepts_and_completes_superset_pattern() {
 /// (`Iri: Ada, Bo`).
 #[test]
 fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -201,9 +193,7 @@ fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
     let out = crate::support::scratch_root().join("ipec_row_poly_subset_pattern_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -242,13 +232,10 @@ fn closed_superset_is_ipe_t0001() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_T0001),
@@ -291,13 +278,10 @@ fn two_different_supersets_is_ipe_t0001() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_T0001),
@@ -331,10 +315,7 @@ fn row_var_annotation_lowers_to_witness_generic() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -383,10 +364,7 @@ fn accessor_ipec_accepts_and_resolves_concrete_getter() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_accessor_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_accessor: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -416,7 +394,7 @@ fn accessor_ipec_accepts_and_resolves_concrete_getter() {
 /// `IPE_E2E=1`.
 #[test]
 fn accessor_cargo_builds_and_prints_names() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -424,9 +402,7 @@ fn accessor_cargo_builds_and_prints_names() {
     let out = crate::support::scratch_root().join("ipec_row_poly_accessor_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -467,10 +443,7 @@ fn row_poly_greet_lowers_and_monomorphises_two_shapes() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_greet_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_greet: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -513,7 +486,7 @@ fn row_poly_greet_lowers_and_monomorphises_two_shapes() {
 /// sites.
 #[test]
 fn row_poly_greet_cargo_builds_and_prints_both() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -521,9 +494,7 @@ fn row_poly_greet_cargo_builds_and_prints_both() {
     let out = crate::support::scratch_root().join("ipec_row_poly_greet_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -558,10 +529,7 @@ fn row_poly_task_seq_row_read_routes_effect_through_getter() {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_task_seq_row_read_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_task_seq_row_read: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -608,7 +576,7 @@ fn row_poly_task_seq_row_read_routes_effect_through_getter() {
 /// `IPE_E2E=1`.
 #[test]
 fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -616,9 +584,7 @@ fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_row_poly_task_seq_row_read_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -659,16 +625,13 @@ fn let_rebind_of_row_is_ipe_l0131() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (row value escapes)"
     );
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_L0131),
@@ -692,16 +655,13 @@ fn subset_pattern_param_of_row_is_ipe_l0131() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (subset pattern over a row)"
     );
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_L0131),
@@ -727,13 +687,10 @@ fn non_first_arg_row_is_ipe_l0131_not_ice() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_L0131),
@@ -759,16 +716,13 @@ fn captured_clone_field_read_is_ipe_l0131() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let res = ipe::build(&entry, &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (captured row field read escapes)"
     );
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_L0131),
@@ -796,7 +750,7 @@ fn captured_clone_field_read_is_ipe_l0131() {
 /// companion to the annotated `greet` slice. Gated on `IPE_E2E=1`.
 #[test]
 fn accessor_two_shapes_cargo_builds_and_prints_both() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -804,9 +758,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
     let out = crate::support::scratch_root().join("ipec_row_poly_accessor_two_shapes_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -845,10 +797,7 @@ fn row_poly_multi_lowers_with_one_witness_bound_per_field() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_poly_multi_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP row_poly_multi: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -892,7 +841,7 @@ fn row_poly_multi_lowers_with_one_witness_bound_per_field() {
 /// labels, each field read off a different concrete shape. Gated on `IPE_E2E=1`.
 #[test]
 fn row_poly_multi_cargo_builds_and_prints_both() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -900,9 +849,7 @@ fn row_poly_multi_cargo_builds_and_prints_both() {
     let out = crate::support::scratch_root().join("ipec_row_poly_multi_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -942,10 +889,7 @@ fn row_poly_passthrough_lowers_to_r1_to_r1() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -971,7 +915,7 @@ fn row_poly_passthrough_lowers_to_r1_to_r1() {
 /// field of the record passed through `touch`. Gated on `IPE_E2E=1`.
 #[test]
 fn row_poly_passthrough_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -980,9 +924,7 @@ fn row_poly_passthrough_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -1021,10 +963,7 @@ fn row_poly_update_lowers_to_setter_witness() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -1064,7 +1003,7 @@ fn row_poly_update_lowers_to_setter_witness() {
 /// bumped `n` for both shapes. Gated on `IPE_E2E=1`.
 #[test]
 fn row_poly_update_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -1073,9 +1012,7 @@ fn row_poly_update_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -1117,10 +1054,7 @@ fn row_poly_map_update_funcvalue_lowers_and_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {name}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -1134,7 +1068,7 @@ fn row_poly_map_update_funcvalue_lowers_and_builds() {
 /// bumped `n` concatenated with the `label`. Gated on `IPE_E2E=1`.
 #[test]
 fn row_poly_map_update_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -1143,9 +1077,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),

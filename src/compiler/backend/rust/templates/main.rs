@@ -275,7 +275,7 @@ pub fn crypto_random_token(n: i64) -> IpeTask<String> {
     ipe_runtime::crypto_core::crypto_random_token(n)
 }
 // ── Http kernels ───────────────────────────────────────────────────────────
-pub fn http_parse_query(raw: String) -> HashMap<String, String> {
+pub fn http_parse_query(raw: String) -> IpeResult<IpeError, HashMap<String, String>> {
     ipe_runtime::http_client::http_parse_query(raw)
 }
 

@@ -277,7 +277,7 @@ mod real_jail {
     /// actually be established here (a clean-exit canary settles it once) —
     /// mirroring the sandbox crate's gate. Never a false pass.
     fn e2e_tools() -> Option<RunJailTools> {
-        if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
             return None;
         }
         let tools = probe_tools()?;
@@ -815,11 +815,8 @@ mod real_jail {
     /// its app crate under `base/out`, and repoint the bound-crate pin at the
     /// local fixture crate so an offline probe build resolves it. Returns the
     /// package root and the emitted crate dir.
-    fn emit_real_native_package(
-        base: &std::path::Path,
-        net_reach: bool,
-    ) -> Option<(PathBuf, PathBuf)> {
-        let runtime = ipe::resolve_runtime().ok()?;
+    fn emit_real_native_package(base: &std::path::Path, net_reach: bool) -> (PathBuf, PathBuf) {
+        let runtime = e2e_support::require_runtime().into_path_buf();
         let pkg = base.join("pkg");
         std::fs::create_dir_all(pkg.join("src")).expect("pkg src");
         // The FFI cache (not the manifest) supplies the native `csum` surface;
@@ -867,7 +864,7 @@ mod real_jail {
             &format!("csum = {{ path = {:?} }}", csum.display().to_string()),
         );
         std::fs::write(&manifest_path, patched).expect("patched manifest");
-        Some((pkg, out))
+        (pkg, out)
     }
 
     /// Build the Tier-2 probe crate `native_tier2` emitted into `out`, OUTSIDE the
@@ -914,10 +911,7 @@ mod real_jail {
             return;
         }
         let base = non_tmp_base("certify");
-        let Some((pkg, out)) = emit_real_native_package(&base, false) else {
-            eprintln!("audit_native e2e: skipping — runtime unavailable");
-            return;
-        };
+        let (pkg, out) = emit_real_native_package(&base, false);
 
         let declared: BTreeSet<Capability> = set(&[Capability::NativeFfi]);
         let _guard = JAIL_LOCK
@@ -982,10 +976,7 @@ mod real_jail {
             return;
         }
         let base = non_tmp_base("reject-undeclared");
-        let Some((pkg, out)) = emit_real_native_package(&base, true) else {
-            eprintln!("audit_native e2e: skipping — runtime unavailable");
-            return;
-        };
+        let (pkg, out) = emit_real_native_package(&base, true);
 
         // Declare only `native-ffi`: network is NOT in the consent surface, so the
         // declared-scoped jail withholds it.
@@ -1117,13 +1108,10 @@ mod real_jail {
     /// an un-granted native capability is a compile error naming the dep.
     #[test]
     fn build_refuses_an_ungranted_native_crossing_naming_the_dep() {
-        if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
             return;
         }
-        if ipe::resolve_runtime().is_err() {
-            eprintln!("audit_native e2e: skipping — runtime unavailable");
-            return;
-        }
+        let _runtime = e2e_support::require_runtime();
         let base = non_tmp_base("consent-refuse");
         // No `native-ffi` grant: the crossing is disclosed but ungranted.
         let pkg = write_native_crossing_package(&base, "");
@@ -1153,13 +1141,10 @@ mod real_jail {
     /// proves the gate admits a granted crossing rather than refusing everything.
     #[test]
     fn build_admits_a_granted_native_crossing_past_the_consent_gate() {
-        if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
             return;
         }
-        if ipe::resolve_runtime().is_err() {
-            eprintln!("audit_native e2e: skipping — runtime unavailable");
-            return;
-        }
+        let _runtime = e2e_support::require_runtime();
         let base = non_tmp_base("consent-admit");
         let pkg = write_native_crossing_package(&base, "NativeFfi");
         let out = base.join("out");

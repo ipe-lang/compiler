@@ -78,6 +78,7 @@ pub(crate) fn origin_host_mismatch(origin: &str, host: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::canonical_header;
     #[cfg(feature = "server")]

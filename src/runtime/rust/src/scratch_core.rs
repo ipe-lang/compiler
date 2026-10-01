@@ -344,7 +344,7 @@ impl TempRootRedactor {
 /// Tests that need the shared base itself (to plant a hostile entry, or to
 /// build a fixture next to a scratch entry) read it here, never through the
 /// standard library directly.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[must_use]
 #[allow(clippy::disallowed_methods)] // the sanctioned test reader of the temp root
 pub fn test_temp_root() -> PathBuf {
@@ -1583,7 +1583,7 @@ impl ScratchFile {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

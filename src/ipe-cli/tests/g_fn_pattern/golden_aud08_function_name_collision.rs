@@ -41,9 +41,7 @@ fn write_project(dir: &std::path::Path, files: &[(&str, &str)]) -> bool {
 
 #[test]
 fn distinct_functions_folding_to_the_same_rust_name_both_emit() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = crate::support::scratch_root().join("ipec_aud08_function_name_collision");
     let wrote = write_project(
@@ -98,9 +96,7 @@ fn distinct_functions_folding_to_the_same_rust_name_both_emit() {
 /// over-eager and reject legitimate distinct names.
 #[test]
 fn distinct_functions_with_distinct_rust_names_are_accepted() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = crate::support::scratch_root().join("ipec_aud08_function_name_collision_control");
     let wrote = write_project(

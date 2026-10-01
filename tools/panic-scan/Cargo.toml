@@ -13,7 +13,8 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [dev-dependencies]
-ipe_env = { path = "../../src/compiler/env" }
+# Existence-proven test-artifact resolvers.
+e2e-support = { path = "../e2e-support" }
 
 [lib]
 path = "src/lib.rs"

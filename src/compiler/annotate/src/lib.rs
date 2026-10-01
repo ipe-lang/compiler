@@ -63,7 +63,7 @@ pub enum TokenClass {
     Module,
     /// A binary operator (`+`, `|>`, `++`, `::`, `==`, …).
     Operator,
-    /// A string, character, or path literal.
+    /// A string or character literal.
     StringLit,
     /// An integer or float literal.
     Number,

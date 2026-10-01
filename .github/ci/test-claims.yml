@@ -1,0 +1,31 @@
+# Every non-host test cell of the workspace and the one CI job that runs it.
+#
+# A cell is (package, test target, platform). Host-platform cells are claimed by
+# the scoped nextest jobs (check 16); this table lists the wasm32 cells only.
+# `verify-manifest.py` (check 20) proves each owner job's cargo invocation
+# selects its cell, `src/runtime/rust/tests/wasm_cell_scan.rs` proves every
+# wasm32 test the tree declares is in a listed cell and counts `expect_tests`,
+# and `tools/scripts/wasm-test/wasm_test_count.py` proves the runner executed
+# exactly that many.
+#
+# Format (read by both a YAML loader and the Rust scanner's line parser):
+# one `- package:` line opens a cell, then one `key: value` line per field.
+cells:
+  - package: ipe-runtime-rust
+    target: lib
+    platform: wasm32-unknown-unknown
+    features: [wasm-client, debugger]
+    owner: wasm-floor
+    expect_tests: 10
+  - package: ipe-runtime-rust
+    target: {test: wasm_js_port_bridge}
+    platform: wasm32-unknown-unknown
+    features: [wasm-client]
+    owner: wasm-floor
+    expect_tests: 2
+  - package: ipe-runtime-rust
+    target: {test: wasm_websocket_bridge}
+    platform: wasm32-unknown-unknown
+    features: [wasm-client]
+    owner: browser-e2e
+    expect_tests: 1

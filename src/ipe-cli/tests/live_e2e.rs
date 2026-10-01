@@ -366,8 +366,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
         .join(format!("live_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
         .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
@@ -650,7 +649,7 @@ fn extract_hid_for_open_tag(html: &str, tag: &str) -> Option<String> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn live_get_root_contains_initial_count() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -696,7 +695,7 @@ fn live_get_root_contains_initial_count() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_counter_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -718,7 +717,7 @@ fn live_counter_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_html_helper_record_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -738,7 +737,7 @@ fn live_html_helper_record_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_lambda_subscriptions_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -778,7 +777,7 @@ fn live_lambda_subscriptions_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, HTTP, or assertion error.
 #[test]
 fn live_onclick_increments_counter() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -928,7 +927,7 @@ fn http_read_sse_until_patch(
 /// Propagates any pipeline, build, spawn, HTTP, or assertion error.
 #[test]
 fn live_sse_resync_body_carries_event_hids() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -982,7 +981,7 @@ fn live_sse_resync_body_carries_event_hids() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_routed_app_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1093,7 +1092,7 @@ main =
 
 #[test]
 fn live_pubsub_cmd_publish_and_sub_subscribe_topic_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1186,7 +1185,7 @@ main =
 
 #[test]
 fn live_pubsub_publish_polymorphic_record_payload_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1283,7 +1282,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_typed_record_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1317,7 +1316,7 @@ fn live_onsubmit_typed_record_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, HTTP, or assertion error.
 #[test]
 fn live_onsubmit_typed_record_dispatches_decoded_payload() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1491,7 +1490,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_bare_msg_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1528,7 +1527,7 @@ fn live_onsubmit_bare_msg_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, HTTP, or assertion error.
 #[test]
 fn live_onsubmit_bare_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1798,7 +1797,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_record_literal_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1817,7 +1816,7 @@ fn live_onsubmit_record_literal_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_tuple_literal_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1836,7 +1835,7 @@ fn live_onsubmit_tuple_literal_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_list_literal_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1952,7 +1951,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_var_bound_msg_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -1976,7 +1975,7 @@ fn live_onsubmit_var_bound_msg_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline, Cargo build, server-spawn, or HTTP error.
 #[test]
 fn live_onsubmit_var_bound_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2209,7 +2208,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_let_bound_handler_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2230,7 +2229,7 @@ fn live_onsubmit_let_bound_handler_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_onsubmit_let_alias_chain_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2343,7 +2342,7 @@ main =
 /// Propagates any pipeline, spawn, or HTTP failure as a test error.
 #[test]
 fn live_unrouted_get_does_not_wipe_form_handlers() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2471,7 +2470,7 @@ main =
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn live_generic_decoder_helper_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2543,8 +2542,7 @@ fn compile_and_build_geo_clipboard() -> Result<PathBuf, BoxError> {
         .join("live_e2e_geo_clipboard_emitted");
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("geo-clipboard: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_project_with_options(&manifest, &out_dir, &runtime, &dev_loop_options()).map_err(
         |e| -> BoxError { format!("geo-clipboard: ipe build_project failed: {e}").into() },
@@ -2574,7 +2572,7 @@ fn compile_and_build_geo_clipboard() -> Result<PathBuf, BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn geo_clipboard_browser_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2602,7 +2600,7 @@ fn geo_clipboard_browser_build_only() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, spawn, or HTTP error as a test error.
 #[test]
 fn geo_clipboard_browser_initial_page() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2690,8 +2688,7 @@ fn compile_and_build_gamepad_watch() -> Result<PathBuf, BoxError> {
         .join("live_e2e_gamepad_watch_emitted");
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("gamepad-watch: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_project_with_options(&manifest, &out_dir, &runtime, &dev_loop_options()).map_err(
         |e| -> BoxError { format!("gamepad-watch: ipe build_project failed: {e}").into() },
@@ -2720,7 +2717,7 @@ fn compile_and_build_gamepad_watch() -> Result<PathBuf, BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn gamepad_watch_browser_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2769,8 +2766,7 @@ fn compile_and_build_recorder_stream() -> Result<PathBuf, BoxError> {
         .join("live_e2e_recorder_stream_emitted");
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("recorder-stream: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_project_with_options(&manifest, &out_dir, &runtime, &dev_loop_options()).map_err(
         |e| -> BoxError { format!("recorder-stream: ipe build_project failed: {e}").into() },
@@ -2800,7 +2796,7 @@ fn compile_and_build_recorder_stream() -> Result<PathBuf, BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn recorder_stream_browser_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -2850,8 +2846,7 @@ fn compile_and_build_web_authn() -> Result<PathBuf, BoxError> {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("live_e2e_web_authn_emitted");
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("web-authn: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_project_with_options(&manifest, &out_dir, &runtime, &dev_loop_options())
         .map_err(|e| -> BoxError { format!("web-authn: ipe build_project failed: {e}").into() })?;
@@ -2880,7 +2875,7 @@ fn compile_and_build_web_authn() -> Result<PathBuf, BoxError> {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn web_authn_browser_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 

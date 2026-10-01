@@ -11,12 +11,12 @@
 //! &int_ty)`. If it returns false, emit `super_unsatisfied` (IPE-T0014)
 //! instead of the structural pin.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -36,9 +36,7 @@ fn out(name: &str) -> PathBuf {
 /// never accepted at exit 0 (a seal violation).
 #[test]
 fn append_and_number_on_same_var_is_ipe_t0014() {
-    let Ok(rt) = ipe::resolve_runtime() else {
-        return;
-    };
+    let rt = e2e_support::require_runtime().into_path_buf();
     let o = out("append_number");
     let _ = std::fs::remove_dir_all(&o);
     let built = ipe::build(&golden("append_number"), &o, &rt);
@@ -57,9 +55,7 @@ fn append_and_number_on_same_var_is_ipe_t0014() {
 /// compile — the fix must not over-tighten the defaulting rule.
 #[test]
 fn number_only_var_still_defaults_to_int() {
-    let Ok(rt) = ipe::resolve_runtime() else {
-        return;
-    };
+    let rt = e2e_support::require_runtime().into_path_buf();
     let o = out("number_only");
     let _ = std::fs::remove_dir_all(&o);
     let built = ipe::build(&golden("number_only"), &o, &rt);

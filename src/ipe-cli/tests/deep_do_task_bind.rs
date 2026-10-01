@@ -41,9 +41,7 @@ fn make_do_src(n: usize) -> String {
 fn deep_do_task_bind_emit_is_linear() {
     const N: usize = 20;
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let src = make_do_src(N);
 
@@ -97,40 +95,37 @@ fn deep_do_task_bind_emit_is_linear() {
 fn deep_do_task_bind_e2e_seal() {
     const N: usize = 20;
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let src = make_do_src(N);
+
+        let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind_e2e");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let src_dir = out_dir.join("src_input");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        let entry = src_dir.join("Main.ipe");
+        std::fs::write(&entry, &src).expect("write Main.ipe");
+
+        let emit_dir = out_dir.join("emit");
+        let built = ipe::build(&entry, &emit_dir, &runtime);
+        assert!(
+            built.is_ok(),
+            "ipe::build must succeed for a {N}-bind do-block: {:?}",
+            built.err()
+        );
+
+        // THE SEAL: emitted Rust must compile with cargo. Built through the shared
+        // e2e_support core — a unique package name gives this emitted crate its own
+        // fresh fingerprint (a broken emit still fails to build), while the heavy
+        // dependency tree is reused from the warm shared target instead of being
+        // cold-compiled and thrown away per run.
+        let built = e2e_support::build_rust_binary("deep_do_task_bind", &emit_dir);
+        assert!(
+            built.is_ok(),
+            "cargo build on emitted {N}-bind do-block must succeed: {}",
+            built.err().unwrap_or_default()
+        );
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
-    let src = make_do_src(N);
-
-    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("deep_do_task_bind_e2e");
-    let _ = std::fs::remove_dir_all(&out_dir);
-    let src_dir = out_dir.join("src_input");
-    std::fs::create_dir_all(&src_dir).expect("create src dir");
-    let entry = src_dir.join("Main.ipe");
-    std::fs::write(&entry, &src).expect("write Main.ipe");
-
-    let emit_dir = out_dir.join("emit");
-    let built = ipe::build(&entry, &emit_dir, &runtime);
-    assert!(
-        built.is_ok(),
-        "ipe::build must succeed for a {N}-bind do-block: {:?}",
-        built.err()
-    );
-
-    // THE SEAL: emitted Rust must compile with cargo. Built through the shared
-    // e2e_support core — a unique package name gives this emitted crate its own
-    // fresh fingerprint (a broken emit still fails to build), while the heavy
-    // dependency tree is reused from the warm shared target instead of being
-    // cold-compiled and thrown away per run.
-    let built = e2e_support::build_rust_binary("deep_do_task_bind", &emit_dir);
-    assert!(
-        built.is_ok(),
-        "cargo build on emitted {N}-bind do-block must succeed: {}",
-        built.err().unwrap_or_default()
-    );
-
-    let _ = std::fs::remove_dir_all(&out_dir);
 }

@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -65,7 +65,7 @@ fn emitted_program_source(out: &Path) -> String {
 /// `Color` in the same module still lowers to `UiPlain::Color`.
 #[test]
 fn user_color_via_hof_resolves_to_own_enum() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -75,9 +75,7 @@ fn user_color_via_hof_resolves_to_own_enum() {
     let out = crate::support::scratch_root().join("ipec_i101_user_color_hof_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe must succeed (it always did — the hole was cargo-side).
     let built = ipe::build(&entry, &out, &runtime);
@@ -134,7 +132,7 @@ fn user_color_via_hof_resolves_to_own_enum() {
 /// path) agrees with the annotated (canon) path — was IPE-I0001.
 #[test]
 fn user_color_in_record_field_agrees_across_paths() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -144,9 +142,7 @@ fn user_color_in_record_field_agrees_across_paths() {
     let out = crate::support::scratch_root().join("ipec_i101_user_color_record_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(

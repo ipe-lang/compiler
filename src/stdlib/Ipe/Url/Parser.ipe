@@ -334,10 +334,10 @@ emptyCaptures =
 -- ─── Path/query splitting (over the already-parsed Url) ─────────────
 -- | Split a raw path into non-empty, percent-decoded segments.  Leading /
 -- trailing slashes yield empty segments that carry no route information, so they
--- are dropped; each surviving segment is decoded through
--- `Ipe.Encoding.percentDecode` (a path is percent-encoded, not form-encoded, so a
--- `+` stays a literal `+`).  A malformed escape in any segment fails the
--- whole path (`Nothing`), never leaking the raw encoded form to a matcher.
+-- are dropped; each surviving segment is decoded through `Ipe.Encoding.percentDecode`
+-- (the path grammar: a `+` stays a literal `+`).  A malformed escape or invalid
+-- UTF-8 in any segment fails the whole path (`Nothing`), never leaking the raw
+-- encoded form to a matcher.
 preparePath : String -> Maybe (List String)
 preparePath path =
     Result.toMaybe

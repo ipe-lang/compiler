@@ -164,7 +164,6 @@ pub fn scan_free_target_into(
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -268,7 +267,6 @@ pub fn substitute_var(expr: Expr, target: Symbol, replacement: &Expr) -> Expr {
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

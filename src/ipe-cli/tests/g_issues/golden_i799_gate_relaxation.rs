@@ -42,9 +42,7 @@ fn assert_byte_identical(name: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -65,13 +63,11 @@ fn assert_builds_and_runs(name: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "{name} must be accepted, got: {built:?}");
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -93,9 +89,7 @@ fn assert_fail_closed(name: &str, expected: ipe_diagnostics::Code) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_gate"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),

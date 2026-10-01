@@ -131,8 +131,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
         .join(format!("tui_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build(&entry, &out_dir, &runtime)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
@@ -188,10 +187,7 @@ fn tui_onkey_record_typechecks() {
             .join(format!("tui_onkey_{label}_emitted"));
         let _ = std::fs::remove_dir_all(&out_dir);
 
-        let Ok(runtime) = ipe::resolve_runtime() else {
-            // Runtime unavailable — skip silently, matching the other goldens.
-            return String::new();
-        };
+        let runtime = e2e_support::require_runtime().into_path_buf();
 
         let built = ipe::build(&entry, &out_dir, &runtime);
         assert!(
@@ -224,9 +220,10 @@ fn tui_onkey_record_typechecks() {
 
     // ── Tui.tea subscribing with `Sub.onKey : (KeyEvent -> Msg) -> Sub Msg` ──
     let app_rs = compile_ok("terminal_app_screen", IPE_TUI_COUNTER);
-    if app_rs.is_empty() {
-        return; // runtime unavailable — structural assertions skipped
-    }
+    assert!(
+        !app_rs.is_empty(),
+        "the accepted terminal app must emit Rust"
+    );
 
     // The emitter must produce the bridging wrapper as ONE expression: the
     // `|kind: String, value: String|` closure whose body constructs
@@ -286,7 +283,7 @@ fn tui_onkey_record_typechecks() {
 /// Propagates any pipeline or Cargo build failure as a test error.
 #[test]
 fn tui_counter_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 

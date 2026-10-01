@@ -23,7 +23,6 @@ impl Builder<'_> {
             canon::Expr_::Int(_) => self.super_var(TyBounds::add(), span)?,
             canon::Expr_::Float(_) => self.float_var()?,
             canon::Expr_::Str(_) => self.string_var()?,
-            canon::Expr_::PathLit(_) => self.path_var()?,
             canon::Expr_::CustomElementCtor(_) => self.custom_element_var()?,
             canon::Expr_::Char(_) => self.char_var()?,
             canon::Expr_::Unit => self.structure(FlatType::Unit)?,

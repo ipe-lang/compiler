@@ -124,7 +124,6 @@ fn first_denied(e: &Expr, interner: &Interner, target: Target) -> Option<Diagnos
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Char(_)
         | Expr_::Unit => None,

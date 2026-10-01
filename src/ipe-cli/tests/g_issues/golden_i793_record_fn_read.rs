@@ -47,9 +47,7 @@ fn record_fn_read_emits_byte_identical() {
     let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -74,30 +72,27 @@ fn record_fn_read_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "fcf_record_fn_read must be accepted, got: {built:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
-    let outcome = crate::support::build_and_run_emitted("fcf_record_fn_read", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "emitted crate must build and exit 0 — a `SharedFun` record read into a \
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("fcf_record_fn_read", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "emitted crate must build and exit 0 — a `SharedFun` record read into a \
          higher-order parameter must not be `ipe`-accept-then-`cargo`-fail; \
          stdout:\n{}",
-        outcome.stdout
-    );
-    assert_eq!(
-        outcome.stdout.trim(),
-        "8",
-        "wrong runtime output — the demoted `runner.run` read computes `(7 + 1)`"
-    );
+            outcome.stdout
+        );
+        assert_eq!(
+            outcome.stdout.trim(),
+            "8",
+            "wrong runtime output — the demoted `runner.run` read computes `(7 + 1)`"
+        );
+    }
 }

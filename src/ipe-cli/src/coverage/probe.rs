@@ -18,6 +18,8 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use ipe_env::artifact::{ProvenBin, ResolveError, Source, resolve_bin_from};
+
 use crate::coverage::contract::StdlibSymbol;
 
 /// The browser web axis a symbol's module discloses, when it lives under a
@@ -349,12 +351,15 @@ const EMIT_PACKAGE_NAME: &str = "IPE_EMIT_PACKAGE_NAME";
 /// (where it already is `ipe`).
 ///
 /// # Errors
-/// The rendered failure when neither source yields a path.
-fn ipe_binary() -> Result<std::path::PathBuf, String> {
-    if let Some(p) = ipe_env::var_os("CARGO_BIN_EXE_ipe") {
-        return Ok(std::path::PathBuf::from(p));
-    }
-    std::env::current_exe().map_err(|e| format!("could not locate the ipe binary: {e}"))
+/// [`ResolveError`] when neither source names an existing regular file.
+fn ipe_binary() -> Result<ProvenBin, ResolveError> {
+    let runtime = ipe_env::var_os("CARGO_BIN_EXE_ipe")
+        .filter(|v| !v.is_empty())
+        .map(|p| (Source::NextestRuntime, std::path::PathBuf::from(p)));
+    let current = std::env::current_exe()
+        .ok()
+        .map(|p| (Source::CurrentExe, p));
+    resolve_bin_from("ipe", runtime.into_iter().chain(current))
 }
 
 /// The warm shared cargo target for the emitted probe build, or `None` to
@@ -428,11 +433,11 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         };
     }
     let ipe_bin = match ipe_binary() {
-        Ok(p) => p,
-        Err(message) => {
+        Ok(p) => p.into_path_buf(),
+        Err(e) => {
             return StageOutcome::Failed {
                 code: None,
-                message,
+                message: e.to_string(),
             };
         }
     };

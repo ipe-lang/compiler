@@ -23,7 +23,7 @@ use ipe::CliError;
 
 /// The `ipe-lang` workspace root (two levels up from this crate's manifest).
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -41,9 +41,7 @@ fn rejects_cleanly_or_builds_and_runs_never_silent_cargo_fail() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_value_return_reify_typevar_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
 
@@ -55,27 +53,26 @@ fn rejects_cleanly_or_builds_and_runs_never_silent_cargo_fail() {
             "a function value laundered into a record field through a returning \
              function's result must surface IPE-L0107, got: {diag:?}"
         );
-        return;
-    }
+    } else {
+        // The only other acceptable outcome is full acceptance — never another
+        // driver error, and never a silent accept that later cargo-fails.
+        assert!(
+            built.is_ok(),
+            "must reject cleanly (IPE-L0107) or accept fully — never another error: {:?}",
+            built.err()
+        );
 
-    // The only other acceptable outcome is full acceptance — never another
-    // driver error, and never a silent accept that later cargo-fails.
-    assert!(
-        built.is_ok(),
-        "must reject cleanly (IPE-L0107) or accept fully — never another error: {:?}",
-        built.err()
-    );
-
-    // With proper support the emitted crate MUST build and run with the
-    // semantically-correct output. Gated on IPE_E2E so default runs stay fast.
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+        // With proper support the emitted crate MUST build and run with the
+        // semantically-correct output. Gated on IPE_E2E so default runs stay fast.
+        if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+            let outcome =
+                crate::support::build_and_run_emitted("fn_value_return_reify_typevar", &out);
+            assert_eq!(
+                outcome.stdout.trim(),
+                "42",
+                "(pick True (\\n -> n + 1)).value is (\\n -> n + 1) and f 41 == 42"
+            );
+            assert_eq!(outcome.exit_code, Some(0), "exit 0");
+        }
     }
-    let outcome = crate::support::build_and_run_emitted("fn_value_return_reify_typevar", &out);
-    assert_eq!(
-        outcome.stdout.trim(),
-        "42",
-        "(pick True (\\n -> n + 1)).value is (\\n -> n + 1) and f 41 == 42"
-    );
-    assert_eq!(outcome.exit_code, Some(0), "exit 0");
 }

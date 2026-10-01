@@ -51,6 +51,7 @@ pub fn debug_todo<A>(location: String, note: String) -> A {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::debug_log_line;
 

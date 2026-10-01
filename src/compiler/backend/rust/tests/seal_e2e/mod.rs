@@ -14,34 +14,6 @@ use e2e_support::child_shared_target_from_env;
 use ipe_backend::EmittedProject;
 use ipe_diagnostics::{DResult, Diagnostic};
 
-/// Locate the Ipê runtime source tree (`src/runtime/rust/src`), checking
-/// `IPE_RUNTIME_DIR` first, then walking ancestor directories.
-///
-/// Returns `None` when the runtime cannot be found. Callers that require the
-/// runtime should skip gracefully on `None` rather than hard-erroring, so a
-/// bare dev environment without a runtime checkout does not break the test suite.
-#[allow(dead_code)]
-pub fn resolve_runtime() -> Option<PathBuf> {
-    if let Ok(dir) = ipe_env::var("IPE_RUNTIME_DIR") {
-        let p = PathBuf::from(dir);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    let mut here: Option<&Path> = Some(cwd.as_path());
-    while let Some(dir) = here {
-        // In-repo runtime (ipe-lang monorepo): the flat `src/` directory whose
-        // `.rs` files are vendored into each emitted crate's `src/ipe_runtime/`.
-        let candidate = dir.join("src").join("runtime").join("rust").join("src");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        here = dir.parent();
-    }
-    None
-}
-
 /// Recursively copy the runtime source tree `src` into `dst`.
 ///
 /// `src` is the flat `src/runtime/rust/src/` directory; `dst` is the emitted
@@ -66,9 +38,8 @@ pub fn copy_dir(src: &Path, dst: &Path) -> DResult<()> {
 /// beside it, run `cargo <subcmd>`, and return the process exit status.
 #[allow(dead_code)]
 ///
-/// Callers pass `"build"` or `"run"` as `subcmd`. The runtime must be available
-/// (i.e. `resolve_runtime()` returned `Some`) before calling this; the function
-/// errors rather than skipping — skip decisions belong to the test body.
+/// Callers pass `"build"` or `"run"` as `subcmd` and `runtime` from
+/// `e2e_support::require_runtime`.
 pub fn vendor_and_run(
     emitted: &EmittedProject,
     runtime: &Path,

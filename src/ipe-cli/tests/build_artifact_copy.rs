@@ -31,12 +31,8 @@ fn build_into_shared_target(
     src: &str,
     shared_target: &Path,
 ) -> Result<PathBuf, BoxError> {
-    let ipe_bin = env!("CARGO_BIN_EXE_ipe");
-    if !Path::new(ipe_bin).exists() {
-        return Err("ipe binary not built".into());
-    }
-    let runtime_dir = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("runtime dir must resolve: {e}").into() })?;
+    let ipe_bin = e2e_support::cargo_bin!("ipe");
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     let project = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_build_artifact_copy_{tag}"));
@@ -76,15 +72,8 @@ fn build_into_shared_target(
 /// produced in the shared target.
 #[test]
 fn build_copies_the_artifact_into_project_out_bin() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
-        return Ok(());
-    }
-    // The `env!`-baked binary path may not resolve when the test runs from a
-    // nextest archive shipped to another host (the CI e2e shards); skip then,
-    // matching the other `CARGO_BIN_EXE_ipe` build tests.
-    if !Path::new(env!("CARGO_BIN_EXE_ipe")).exists() {
-        eprintln!("skipping (ipe binary not present — nextest archive on another host)");
         return Ok(());
     }
     let shared = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -125,12 +114,8 @@ fn build_copies_the_artifact_into_project_out_bin() -> Result<(), BoxError> {
 /// (it was copied within A's build), never silently replaced by B's.
 #[test]
 fn a_second_same_named_project_does_not_clobber_the_first_out_bin() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
-        return Ok(());
-    }
-    if !Path::new(env!("CARGO_BIN_EXE_ipe")).exists() {
-        eprintln!("skipping (ipe binary not present — nextest archive on another host)");
         return Ok(());
     }
     let shared = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

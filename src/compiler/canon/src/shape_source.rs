@@ -318,7 +318,6 @@ fn expr_references_sink(
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => false,
         Expr_::Call(callee, args) => {
             expr_references_sink(callee, sink, module, interner)

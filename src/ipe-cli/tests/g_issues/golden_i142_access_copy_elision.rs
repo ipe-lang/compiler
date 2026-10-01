@@ -19,10 +19,10 @@
 //! * an E2E build+run proving correctness is unaffected
 //!   (`IPE_E2E=1 cargo test -p ipe --test golden_i142_access_copy_elision`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -37,11 +37,7 @@ fn emit_fixture(out_name: &str) -> String {
     let out = crate::support::scratch_root().join(out_name);
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else {
-        return String::new();
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -109,7 +105,7 @@ fn copy_field_reads_bare_heap_field_keeps_clone() {
 /// exact expected value.
 #[test]
 fn copy_field_no_clone_compiles_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 

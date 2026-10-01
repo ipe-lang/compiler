@@ -10,6 +10,18 @@ allow-expect-in-tests = true
 # and never answer a temp-root name. The OS temp root is resolved only by
 # `scratch_core`, behind its base checks; test code reads it through
 # `scratch_core::test_temp_root`.
+#
+# Every URL component is decoded by the one strict core,
+# `encoding::decode_component`; the lenient percent decoders are denied outright,
+# and lossy UTF-8 is allowed only per site, for bytes that are not a URL
+# component (a body, process output). The `url` crate's query readers and axum's
+# `Query`/`Form` extractors decode leniently too, so they are denied as well; the
+# one driver-parity reader, `ssrf::DriverParityQuery`, carries the sole per-site
+# allow. `serde_urlencoded`'s readers decode through the same lenient parser; the
+# one re-read of its own output, `dom::form::decode_form`, carries the per-site
+# allow. `percent-encoding`, `url`, `serde_urlencoded` and `axum` are optional
+# dependencies, so their entries tolerate a build without them (`allow-invalid`);
+# `src/clippy_paths_resolve.rs` names each one so a stale path breaks the build.
 disallowed-methods = [
     # The abrupt-failure constructs the root `clippy.toml` bans, mirrored here
     # because this crate reads its own config.
@@ -24,4 +36,18 @@ disallowed-methods = [
     { path = "std::env::vars", reason = "a whole-environment iterator bypasses the overlay and hands out the temp root; read named keys through `system::read_env_var`" },
     { path = "std::env::vars_os", reason = "a whole-environment iterator bypasses the overlay and hands out the temp root; read named keys through `system::read_env_var`" },
     { path = "std::env::temp_dir", reason = "a base other users can write; create temporary entries through `scratch_core` (tests: `scratch_core::test_temp_root`)" },
+    { path = "percent_encoding::percent_decode_str", reason = "lenient; decode a URL component through `encoding::decode_component`", allow-invalid = true },
+    { path = "percent_encoding::percent_decode", reason = "lenient; decode a URL component through `encoding::decode_component`", allow-invalid = true },
+    { path = "percent_encoding::PercentDecode::decode_utf8_lossy", reason = "lossy; decode a URL component through `encoding::decode_component`", allow-invalid = true },
+    { path = "std::string::String::from_utf8_lossy", reason = "lossy; a URL component goes through `encoding::decode_component`, other text needs a per-site allow with its reason" },
+    { path = "url::form_urlencoded::parse", reason = "lenient; decode a query through `encoding::decode_form_query`", allow-invalid = true },
+    { path = "serde_urlencoded::from_str", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
+    { path = "serde_urlencoded::from_bytes", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
+    { path = "serde_urlencoded::from_reader", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
+    { path = "url::Url::query_pairs", reason = "lenient; decode a query through `encoding::decode_form_query` (a driver-parity read goes through `ssrf::DriverParityQuery`)", allow-invalid = true },
+]
+
+disallowed-types = [
+    { path = "axum::extract::Query", reason = "lenient; read the request query through `server::strict_url_query`", allow-invalid = true },
+    { path = "axum::extract::Form", reason = "lenient; decode a form body through `encoding::decode_form_query`", allow-invalid = true },
 ]

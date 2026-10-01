@@ -391,7 +391,6 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -469,7 +468,6 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -601,7 +599,6 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -696,7 +693,6 @@ pub(super) fn collect_body_record_shapes(
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

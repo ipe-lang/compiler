@@ -158,10 +158,10 @@ fn capabilities_in_a_project_dir_resolves_the_entry() {
     // `capabilities` with NO positional and the project dir as the working
     // directory, exactly as the bug report did.
     let proj = support::manifest_dir().join("../../examples/shapes/non-tea/hello-world");
-    // Only run when the example exists (CI always has it; a sparse checkout may not).
-    if !proj.join("package.ipe").is_file() {
-        return;
-    }
+    assert!(
+        proj.join("package.ipe").is_file(),
+        "the hello-world example must exist"
+    );
     let r = match Command::new(support::ipe_bin())
         .arg("capabilities")
         .current_dir(&proj)
@@ -207,9 +207,10 @@ fn capabilities_in_a_project_dir_resolves_the_entry() {
 #[test]
 fn emit_ir_in_a_project_dir_resolves_the_entry() {
     let proj = support::manifest_dir().join("../../examples/shapes/non-tea/hello-world");
-    if !proj.join("package.ipe").is_file() {
-        return;
-    }
+    assert!(
+        proj.join("package.ipe").is_file(),
+        "the hello-world example must exist"
+    );
     let r = match Command::new(support::ipe_bin())
         .args(["build", "--emit-ir"])
         .current_dir(&proj)
@@ -539,10 +540,7 @@ fn check_success_output_is_guttered_and_framed() {
     // Use the examples tree as a known well-typed source so no fixture is needed.
     let entry =
         support::manifest_dir().join("../../examples/shapes/non-tea/hello-world/src/Main.ipe");
-    // Only run when the example exists (CI always has it; a sparse checkout may not).
-    if !entry.is_file() {
-        return;
-    }
+    assert!(entry.is_file(), "the hello-world example must exist");
     let r = run(&["type-check", &entry.to_string_lossy()]);
     assert!(
         r.ok,

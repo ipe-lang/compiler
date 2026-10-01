@@ -28,12 +28,12 @@
 //! cargo test -p ipe --test golden_i130_seal
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -51,9 +51,7 @@ fn assert_ipec_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently rather than fail
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -77,7 +75,7 @@ fn assert_ipec_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::
 /// Expected output: "green,green,green".
 #[test]
 fn c01_enum_capture_fix1() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -90,9 +88,7 @@ fn c01_enum_capture_fix1() {
     let out = crate::support::scratch_root().join("ipec_i130_enum_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -124,7 +120,7 @@ fn c01_enum_capture_fix1() {
 /// Expected output: "1,5 2,5 3,5".
 #[test]
 fn c02_record_capture_fix1() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -137,9 +133,7 @@ fn c02_record_capture_fix1() {
     let out = crate::support::scratch_root().join("ipec_i130_record_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -172,7 +166,7 @@ fn c02_record_capture_fix1() {
 /// Expected output: "hello! hello?".
 #[test]
 fn c13_complex_arg_hoist_t4() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -185,9 +179,7 @@ fn c13_complex_arg_hoist_t4() {
     let out = crate::support::scratch_root().join("ipec_i130_complex_arg_hoist_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -235,9 +227,7 @@ fn c14_nested_lambda_noncopy_promoted_accepts() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i130_nested_lambda_noncopy_accept");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -245,12 +235,11 @@ fn c14_nested_lambda_noncopy_promoted_accepts() {
         built.err()
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("nested_lambda_noncopy", &out);
+        assert_eq!(outcome.exit_code, Some(0), "exit 0");
+        assert_eq!(outcome.stdout.trim(), "6", "composed (*2) 3 = 6");
     }
-    let outcome = crate::support::build_and_run_emitted("nested_lambda_noncopy", &out);
-    assert_eq!(outcome.exit_code, Some(0), "exit 0");
-    assert_eq!(outcome.stdout.trim(), "6", "composed (*2) 3 = 6");
 }
 
 // ── c05 — StreamWriter capture-forward (clone_class opaque audit) ────────────
@@ -278,9 +267,7 @@ fn c05_streamwriter_capture_forward() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("streamwriter_capture");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently rather than fail
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -320,9 +307,7 @@ fn c06_stream_string_capture_seal() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stream_string_capture");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently rather than fail
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -330,15 +315,14 @@ fn c06_stream_string_capture_seal() {
         built.err()
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // Build-only: the fixture is a listening server, so it cannot run-to-exit.
+        // A successful cargo build is the seal (ipe-0 ⇒ cargo builds).
+        let built_bin = e2e_support::build_rust_binary("stream_string_capture", &out);
+        assert!(
+            built_bin.is_ok(),
+            "emitted crate must cargo-build (was 2x E0507 on the stream handler): {}",
+            built_bin.as_ref().err().map_or("", String::as_str)
+        );
     }
-    // Build-only: the fixture is a listening server, so it cannot run-to-exit.
-    // A successful cargo build is the seal (ipe-0 ⇒ cargo builds).
-    let built_bin = e2e_support::build_rust_binary("stream_string_capture", &out);
-    assert!(
-        built_bin.is_ok(),
-        "emitted crate must cargo-build (was 2x E0507 on the stream handler): {}",
-        built_bin.as_ref().err().map_or("", String::as_str)
-    );
 }

@@ -50,8 +50,7 @@ static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn fixture_path() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../src/compiler/sandbox`; the fixture lives at
     // the repo root under `tests/fixtures/admission/`.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../tests/fixtures/admission/untrusted-build.sh")
+    e2e_support::manifest_dir!().join("../../../tests/fixtures/admission/untrusted-build.sh")
 }
 
 /// Skip unless `IPE_E2E=1`, the jail tools are present, AND a jail can actually
@@ -59,7 +58,7 @@ fn fixture_path() -> PathBuf {
 /// alone is insufficient (a runner may have `bwrap` but deny the namespace
 /// setup), so a `/bin/true` canary under the isolated profile decides once.
 fn e2e_tools() -> Option<RunJailTools> {
-    if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return None;
     }
     let caps = ipe_sandbox::probe();

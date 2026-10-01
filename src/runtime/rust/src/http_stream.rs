@@ -189,6 +189,8 @@ where
         loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
+                    #[allow(clippy::disallowed_methods)]
+                    // a streamed chunk reaches Ipê as `String` text
                     let chunk = String::from_utf8_lossy(&bytes).into_owned();
                     match body(chunk).await {
                         IpeResult::Ok(()) => {}
@@ -292,6 +294,8 @@ where
                 loop {
                     match stream.next().await {
                         Some(Ok(bytes)) => {
+                            #[allow(clippy::disallowed_methods)]
+                            // a streamed chunk reaches Ipê as `String` text
                             let chunk = String::from_utf8_lossy(&bytes).into_owned();
                             emit(to_msg(ChunkEvent::Chunk(chunk)));
                         }

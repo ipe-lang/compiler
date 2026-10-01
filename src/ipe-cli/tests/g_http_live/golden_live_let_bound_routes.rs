@@ -24,14 +24,13 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
 /// Run the ipe pipeline on `tests/golden/live_let_bound_routes/Main.ipe`,
-/// emitting into `out`. Returns `None` when the embedded runtime is
-/// unavailable (skip).
-fn run_ipec(out: &Path) -> Option<Result<(), ipe::CliError>> {
+/// emitting into `out`.
+fn run_ipec(out: &Path) -> Result<(), ipe::CliError> {
     let root = repo_root();
     let entry = root
         .join("tests")
@@ -40,10 +39,8 @@ fn run_ipec(out: &Path) -> Option<Result<(), ipe::CliError>> {
         .join("Main.ipe");
     let _ = std::fs::remove_dir_all(out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// The emit dir shared by the compile-only assertions.
@@ -62,9 +59,7 @@ fn compile_out() -> PathBuf {
 /// `Web.route`, not at the list-collection level.
 #[test]
 fn live_let_bound_routes_compiles_no_ice() {
-    let Some(result) = run_ipec(&compile_out()) else {
-        return;
-    };
+    let result = run_ipec(&compile_out());
     assert!(
         result.is_ok(),
         "IPE-I0001 regression: let-bound routeTable must compile, got: {:?}",
@@ -86,9 +81,7 @@ fn live_let_bound_routes_compiles_no_ice() {
 #[test]
 fn live_let_bound_routes_renders_route_page() {
     let out = compile_out();
-    let Some(result) = run_ipec(&out) else {
-        return;
-    };
+    let result = run_ipec(&out);
     assert!(result.is_ok(), "must compile: {:?}", result.err());
     // A layout builder is compiled-source Ipê now, so the route table's home may
     // lower to `src/ipe_mods/*.rs` — scan the WHOLE emitted Ipê-side tree.
@@ -106,16 +99,14 @@ fn live_let_bound_routes_renders_route_page() {
 /// shared dependency target is reused, so the deps compile once, not per fixture.
 #[test]
 fn live_let_bound_routes_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Emit into a PRIVATE dir this test alone owns, so a compile-only sibling
     // re-emitting into `compile_out()` in parallel cannot delete rustc's
     // working directory mid-build.
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m7_live_let_bound_routes_e2e_emit");
-    let Some(result) = run_ipec(&out) else {
-        return;
-    };
+    let result = run_ipec(&out);
     assert!(result.is_ok(), "must compile: {:?}", result.err());
     let built = e2e_support::build_rust_binary("m7_let_bound_routes", &out);
     assert!(

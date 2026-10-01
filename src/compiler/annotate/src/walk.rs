@@ -228,7 +228,7 @@ fn canon_expr(out: &mut Vec<Raw>, expr: &ipe_canon::ast::Expr, interner: &Intern
         Expr_::Int(_) | Expr_::Float(_) => {
             Raw::push(out, expr.span, TokenClass::Number, None);
         }
-        Expr_::Str(_) | Expr_::Char(_) | Expr_::PathLit(_) | Expr_::CustomElementCtor(_) => {
+        Expr_::Str(_) | Expr_::Char(_) | Expr_::CustomElementCtor(_) => {
             Raw::push(out, expr.span, TokenClass::StringLit, None);
         }
         Expr_::Unit => {}
@@ -510,7 +510,6 @@ fn push_syn_expr(out: &mut Vec<Raw>, expr: &ipe_syntax::Expr, interner: &Interne
         }
         ipe_syntax::Expr_::Str(_)
         | ipe_syntax::Expr_::MultilineStr { .. }
-        | ipe_syntax::Expr_::PathLit(_)
         | ipe_syntax::Expr_::Char(_) => {
             Raw::push(out, expr.span, TokenClass::StringLit, None);
         }

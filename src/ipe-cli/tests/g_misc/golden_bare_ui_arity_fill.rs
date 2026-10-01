@@ -82,19 +82,17 @@ fn html_app_out_dir(tag: &str) -> PathBuf {
     crate::support::scratch_root().join(format!("bare_ui_{tag}_app_out"))
 }
 
-/// Compile a fixture into its own out dir; `None` (skip) when the runtime
-/// cannot be resolved.
-fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Option<Result<(), ipe::CliError>> {
+/// Compile a fixture into its own out dir.
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Result<(), ipe::CliError> {
     let ipe_dir = crate::support::scratch_root().join(format!("bare_ui_{tag}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).ok()?;
+    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
     let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, fixture).ok()?;
+    std::fs::write(&entry, fixture).expect("the fixture scratch dir must be writable");
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// Concatenate the emitted `.rs` files that carry GENERATED program code —
@@ -136,10 +134,10 @@ fn emitted_program_sources(out: &Path) -> String {
 /// caller passes a distinct `tag` so concurrent tests never share — and thus
 /// never race on — an emit/out dir; a shared dir lets one test's re-emit
 /// (which wipes and rewrites the dir) invalidate another's `--locked` lockfile
-/// mid-build. Returns the out dir, or `None` when the runtime cannot resolve.
-fn emit_and_assert_bare_html_view(tag: &str) -> Option<PathBuf> {
+/// mid-build. Returns the out dir.
+fn emit_and_assert_bare_html_view(tag: &str) -> PathBuf {
     let out = html_app_out_dir(tag);
-    let result = compile(BARE_HTML_VIEW_APP, tag, &out)?;
+    let result = compile(BARE_HTML_VIEW_APP, tag, &out);
     assert!(
         result.is_ok(),
         "a bare `view : Model -> Html` must arity-fill and be ipe-0, got: {:?}",
@@ -156,12 +154,12 @@ fn emit_and_assert_bare_html_view(tag: &str) -> Option<PathBuf> {
         "the pinned view must not emit `Html<()>` — that would mismatch the \
          app consumer's `Fn(Model) -> Html<Msg>` bound at cargo time",
     );
-    Some(out)
+    out
 }
 
 #[test]
 fn bare_html_view_emits_concrete_msg() {
-    emit_and_assert_bare_html_view("html_view_emit");
+    let _ = emit_and_assert_bare_html_view("html_view_emit");
 }
 
 /// Bare `Attribute` and `Element` annotations arity-fill their message
@@ -170,9 +168,7 @@ fn bare_html_view_emits_concrete_msg() {
 #[test]
 fn bare_attribute_and_element_arity_fill() {
     let out = crate::support::scratch_root().join("bare_ui_attr_out");
-    let Some(result) = compile(BARE_ATTRIBUTE_HELPER, "attr", &out) else {
-        return;
-    };
+    let result = compile(BARE_ATTRIBUTE_HELPER, "attr", &out);
     assert!(
         result.is_ok(),
         "bare `Attribute` / `Element` annotations must arity-fill and be ipe-0, \
@@ -187,12 +183,10 @@ fn bare_attribute_and_element_arity_fill() {
 /// arity-filled return.
 #[test]
 fn bare_html_view_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Some(out) = emit_and_assert_bare_html_view("html_view_build") else {
-        return;
-    };
+    let out = emit_and_assert_bare_html_view("html_view_build");
     let built = e2e_support::build_rust_binary("bare_html_view", &out);
     assert!(
         built.is_ok(),

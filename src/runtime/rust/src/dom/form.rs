@@ -6,30 +6,49 @@
 
 use crate::html::FormData;
 
-/// Decode browser form data into a typed Ipê record `T`.
+/// Why a browser `FormData` payload did not decode into the target record.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormDecodeError {
+    /// The name/value pairs could not be re-encoded as `x-www-form-urlencoded`.
+    Encode(serde_urlencoded::ser::Error),
+    /// The pairs do not fit the target record (a missing required field, an
+    /// unknown variant, a value the field's type does not parse).
+    Decode(serde_urlencoded::de::Error),
+}
+
+impl core::fmt::Display for FormDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(e) => write!(f, "form pairs could not be encoded: {e}"),
+            Self::Decode(e) => write!(f, "form does not fit the record: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FormDecodeError {}
+
+/// Decode a browser `FormData` payload into a typed Ipê record `T`.
 ///
 /// Form values are always strings; `T`'s fields are matched by name (Ipê record
 /// fields are camelCase, matching the HTML `name=` attributes the view emits).
-/// A missing required field makes serde return an error → the caller dispatches
-/// no Msg (the `OnForm` closure maps `Err` to `None`).
-///
-// Type-directed coercion via serde_urlencoded: a numeric/bool record field
-// decodes `"42"`/`"true"` (the deserializer parses by the TARGET type), while a
-// String field keeps the raw string. The old all-String serde_json path rejected
-// any non-String field. We re-encode the `{name: value}` map to an x-www-form-
-// urlencoded string (round-tripped through the same crate so values are escaped),
-// then deserialize into `T`. A missing required field → `Err` → no Msg dispatched
-// (the `OnForm` closure maps `Err` to `None`), unchanged.
-/// Decode a browser `FormData` payload into a typed value `T`.
+/// The pairs are re-encoded as `x-www-form-urlencoded` and deserialized by the
+/// target type, so a numeric or bool field parses `"42"`/`"true"` while a
+/// `String` field keeps the value verbatim.
 ///
 /// # Errors
 ///
-/// Returns an error string when the form data cannot be URL-encoded or when
-/// the encoded pairs cannot be deserialized into `T`.
-pub fn decode_form<T: serde::de::DeserializeOwned>(fd: FormData) -> Result<T, String> {
+/// [`FormDecodeError::Encode`] when the pairs cannot be encoded;
+/// [`FormDecodeError::Decode`] when they do not fit `T` (a missing required
+/// field makes the `OnForm` closure dispatch no Msg).
+pub fn decode_form<T: serde::de::DeserializeOwned>(fd: FormData) -> Result<T, FormDecodeError> {
     let pairs: Vec<(String, String)> = fd.into_iter().collect();
-    let encoded = serde_urlencoded::to_string(&pairs).map_err(|e| e.to_string())?;
-    serde_urlencoded::from_str::<T>(&encoded).map_err(|e| e.to_string())
+    let encoded = serde_urlencoded::to_string(&pairs).map_err(FormDecodeError::Encode)?;
+    // `encoded` is this function's own output: every escape is well-formed and
+    // the bytes are UTF-8, so the lenient reader reproduces `pairs` exactly and
+    // no URL component from the wire is decoded here.
+    #[allow(clippy::disallowed_methods)]
+    let decoded = serde_urlencoded::from_str::<T>(&encoded);
+    decoded.map_err(FormDecodeError::Decode)
 }
 
 /// `decode_form` + a warn on failure. The `OnForm` closure is synchronous and
@@ -54,6 +73,7 @@ pub fn decode_form_or_warn<T: serde::de::DeserializeOwned>(fd: FormData) -> Opti
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -159,7 +179,7 @@ mod tests {
         fd.insert("qty".to_string(), "42".to_string());
         fd.insert("express".to_string(), "true".to_string());
         fd.insert("price".to_string(), "9.99".to_string());
-        let r: Result<Order, String> = decode_form(fd);
+        let r: Result<Order, FormDecodeError> = decode_form(fd);
         assert_eq!(
             r,
             Ok(Order {
@@ -176,7 +196,7 @@ mod tests {
         let mut fd = FormData::new();
         fd.insert("email".to_string(), "a@b.c".to_string());
         fd.insert("password".to_string(), "pw".to_string());
-        let r: Result<Creds, String> = decode_form(fd);
+        let r: Result<Creds, FormDecodeError> = decode_form(fd);
         assert_eq!(
             r,
             Ok(Creds {
@@ -188,7 +208,7 @@ mod tests {
         // Missing `password` → "" (zero value via `#[serde(default)]`), Ok.
         let mut partial = FormData::new();
         partial.insert("email".to_string(), "a@b.c".to_string()); // missing password
-        let r2: Result<Creds, String> = decode_form(partial);
+        let r2: Result<Creds, FormDecodeError> = decode_form(partial);
         assert_eq!(
             r2,
             Ok(Creds {
@@ -275,7 +295,7 @@ mod tests {
         let mut fd = FormData::new();
         fd.insert("email".to_string(), "a@b.c".to_string());
         fd.insert("tier".to_string(), "Pro".to_string());
-        let r: Result<Subscription, String> = decode_form(fd);
+        let r: Result<Subscription, FormDecodeError> = decode_form(fd);
         assert_eq!(
             r,
             Ok(Subscription {
@@ -290,7 +310,7 @@ mod tests {
         // enum/Result-field form.
         let mut partial = FormData::new();
         partial.insert("email".to_string(), "a@b.c".to_string());
-        let r2: Result<Subscription, String> = decode_form(partial);
+        let r2: Result<Subscription, FormDecodeError> = decode_form(partial);
         assert!(r2.is_err());
     }
 

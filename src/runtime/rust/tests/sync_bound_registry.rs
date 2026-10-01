@@ -261,7 +261,7 @@ const fn registry_len(kernel: StdlibKernel) -> usize {
 
 #[test]
 fn every_sync_bounded_runtime_fn_is_owned_by_a_registry() {
-    let runtime_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let runtime_src = e2e_support::manifest_dir!().join("src");
     let mut scanned = BTreeMap::new();
     let patterns = Patterns::new().expect("the scan patterns compile");
     walk(&runtime_src, &patterns, &mut scanned);

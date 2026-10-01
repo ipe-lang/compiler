@@ -356,12 +356,7 @@ impl Uses {
                     self.opaque = true;
                 }
             }
-            Expr_::Int(_)
-            | Expr_::Float(_)
-            | Expr_::Str(_)
-            | Expr_::Char(_)
-            | Expr_::PathLit(_)
-            | Expr_::Unit => {}
+            Expr_::Int(_) | Expr_::Float(_) | Expr_::Str(_) | Expr_::Char(_) | Expr_::Unit => {}
         }
     }
 

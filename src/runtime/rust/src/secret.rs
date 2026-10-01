@@ -202,6 +202,7 @@ pub fn secret_redacted(s: Secret) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

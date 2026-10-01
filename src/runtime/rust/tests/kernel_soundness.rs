@@ -3,6 +3,7 @@
 //! out-of-domain math) — each asserts the kernel is TOTAL (defined result,
 //! never a Rust panic) plus the expected value, and the seeded-random kernels
 //! assert determinism (same seed ⇒ same output).
+#![cfg(not(target_arch = "wasm32"))]
 
 // The crate-root glob supplies the unqualified `IpeMaybe` / `IpeError` /
 // `with_default` names the `random`- and `decimal`-gated tests use; the other

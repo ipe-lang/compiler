@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -68,10 +68,7 @@ fn i193_ipec_accepts_asymmetric_arms() {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_asymmetric_arms_cloneok_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP asymmetric_arms_cloneok: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
@@ -125,10 +122,7 @@ fn i193_idempotent() {
     let _ = std::fs::remove_dir_all(&out1);
     let _ = std::fs::remove_dir_all(&out2);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP i193_idempotent: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let b1 = ipe::build_loose_file(&entry, &out1, &runtime);
     assert!(b1.is_ok(), "pass 1 must succeed: {:?}", b1.err());
@@ -149,7 +143,7 @@ fn i193_idempotent() {
 /// and prints the correct formatted strings.  Gated on `IPE_E2E=1`.
 #[test]
 fn i193_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -158,9 +152,7 @@ fn i193_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_i193_asymmetric_arms_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());

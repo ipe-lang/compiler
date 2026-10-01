@@ -53,7 +53,7 @@ fn assert_accepted_and_builds(fixture: &str) {
         built.err()
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Build-only: the fixture is a listening server, so it cannot run-to-exit.

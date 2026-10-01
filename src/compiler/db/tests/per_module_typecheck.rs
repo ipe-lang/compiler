@@ -127,6 +127,7 @@ const ENTRY_WITH_TWO_DEPS: &str = "module Entry exposing (e)\n\n\
 /// interfaces all the way down, including the module's own), and its result
 /// is byte-identical to the normalized whole-program projection.
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn scoped_solve_engages_and_matches_projection() {
     let (db, _log) = logged_db();
     let a = file(&db, &["A"], DEP_A);
@@ -135,12 +136,8 @@ fn scoped_solve_engages_and_matches_projection() {
 
     for module in [a, b] {
         let scoped = ipe_db::infer_module_scoped(&db, root, module);
-        assert!(
-            matches!(scoped, ScopedModuleTypes::PerModule { .. }),
-            "closed modular program must take the scoped path"
-        );
         let ScopedModuleTypes::PerModule { types, .. } = scoped else {
-            return;
+            panic!("closed modular program must take the scoped path");
         };
         assert_eq!(
             Some(&**types),

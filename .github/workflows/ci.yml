@@ -554,6 +554,32 @@ jobs:
       # instead of shipping an ipe-accept-then-cargo-fail.
       - if: needs.changes.outputs.release_only != 'true'
         run: cargo build -p ipe-runtime-rust --target wasm32-wasip1 --no-default-features --features time,log,json,uuid,random,decimal,regex,crypto-core,secret,char-category
+      # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
+      # (a runner of another version refuses the test binary).
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        if: needs.changes.outputs.release_only != 'true'
+        with:
+          tool: wasm-bindgen@0.2.126
+      # Each cell of .github/ci/test-claims.yml this job owns runs here, piped
+      # into its count proof: the step is red unless the runner reports
+      # exactly the cell's `expect_tests` passing tests (verify-manifest check
+      # 20 proves each count equals its cell's).
+      - name: Self-test the count proof
+        if: needs.changes.outputs.release_only != 'true'
+        run: python3 tools/scripts/wasm-test/test_wasm_test_count.py
+      - name: Run the wasm32 lib tests (node)
+        if: needs.changes.outputs.release_only != 'true'
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client,debugger --lib | python3 tools/scripts/wasm-test/wasm_test_count.py 10
+      - name: Run the JS-port bridge tests (headless Chrome)
+        if: needs.changes.outputs.release_only != 'true'
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          CHROMEDRIVER: chromedriver
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 2
 
   # Every editors/*/configure.sh happy path, plus the one step none of them
   # proved before: Zed's "install dev extension" compiles editors/zed-ipe as a
@@ -1830,6 +1856,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: wasm32-unknown-unknown
       - uses: ./.github/actions/mold
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -1943,6 +1971,47 @@ jobs:
       - name: Kill server
         if: always()
         run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" 2>/dev/null || true
+      # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
+      # (a runner of another version refuses the test binary).
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
+      - name: Self-test the echo server and the count proof
+        run: |
+          set -euo pipefail
+          python3 tools/scripts/wasm-test/test_ws_echo_server.py
+          python3 tools/scripts/wasm-test/test_wasm_test_count.py
+      - name: Spawn WebSocket echo server
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/tools/scripts/wasm-test/ws_echo_server.py" &
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_WS_ECHO_PID "$!"
+          ready=""
+          for i in $(seq 1 40); do
+            if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:8033/ws"; then
+              echo "echo server ready (attempt $i)"; ready=1; break
+            fi
+            sleep 0.5
+          done
+          # Fail closed: a dead echo server would fail the bridge test for the
+          # wrong reason.
+          if [ -z "$ready" ]; then
+            echo "WebSocket echo server never became ready on port 8033" >&2
+            exit 1
+          fi
+      # The WebSocket bridge cell of .github/ci/test-claims.yml, counted
+      # (verify-manifest check 20). mold links host binaries only, so the
+      # wasm32 build clears the job's RUSTFLAGS.
+      - name: Run the WebSocket bridge test (headless Chrome)
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          CHROMEDRIVER: chromedriver
+        run: cargo test -p ipe-runtime-rust --target wasm32-unknown-unknown --features wasm-client --test wasm_websocket_bridge | python3 tools/scripts/wasm-test/wasm_test_count.py 1
+      - name: Kill echo server
+        if: always()
+        run: kill "$CI_JOB_WS_ECHO_PID" 2>/dev/null || true
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

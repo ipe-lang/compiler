@@ -369,12 +369,6 @@ module.exports = grammar({
         $.parenthesized_expr,
       ),
 
-    // `path "…"` is a contextual compile-time-validated literal in the compiler
-    // (parser.rs ~1531): `path` is a keyword ONLY when a string literal follows
-    // it, and an ordinary lowercase identifier everywhere else. For highlighting
-    // it parses as an ordinary application of the `path` reference to the string
-    // (the `@keyword.import` capture on `path`-before-string lives in the query,
-    // not the grammar), which keeps `path` usable as a plain variable name.
     value_qualified: ($) => $.qualified_lower, // Qualifier.name (dotted, ends lower)
     value_reference: ($) => $.lower_identifier,
     constructor_reference: ($) => $.upper_identifier,

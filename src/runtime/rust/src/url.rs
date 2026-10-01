@@ -407,6 +407,7 @@ pub fn url_relative_to_string(r: UrlRelative) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -606,6 +607,8 @@ mod tests {
         );
         // The encoded value round-trips back to the original via a re-parse — the
         // proof that encoding is lossless, not lossy sanitisation.
+        #[allow(clippy::disallowed_methods)]
+        // test oracle: the serializer's own inverse; `url` builds without the strict core's `encoding` feature
         let round: std::collections::HashMap<String, String> =
             form_urlencoded::parse(q.as_bytes()).into_owned().collect();
         assert_eq!(round.get("q").map(String::as_str), Some("a&b=c d#e"));

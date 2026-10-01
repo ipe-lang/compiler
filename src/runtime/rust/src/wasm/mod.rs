@@ -529,7 +529,11 @@ where
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
     FSetPage: Fn(Page, Model) -> (Model, IpeCmd<Msg>) + 'static,
 {
-    use crate::web::route::{enter, matches_any};
+    use crate::web::route::{DecodedPath, enter, matches_any, refuse_route_table};
+
+    // A malformed literal in the route table fails the mount loudly, with the
+    // same refusal the server's `web_app_routed` starts with.
+    refuse_route_table(&routes)?;
 
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or("document has no <body>")?;
@@ -539,11 +543,17 @@ where
 
     // Seed the model from `init`, then enter the current URL so the `page`
     // field reflects the browser's address bar before the first render. This
-    // mirrors the server's miss: `init`'s Cmd, then the entry Cmd.
+    // mirrors the server's miss: `init`'s Cmd, then the entry Cmd. A malformed
+    // address-bar path names no route: it enters `not_found`.
     let (init_model, init_cmd) = init(req);
-    let entered = enter(&routes, &not_found, &initial_path, init_model, &set_page);
-    let model = entered.model;
-    let cmd0 = IpeCmd::Batch(vec![init_cmd, entered.cmd]);
+    let (model, entry_cmd) = match DecodedPath::parse(&initial_path) {
+        Ok(path) => {
+            let entered = enter(&routes, &not_found, &path, init_model, &set_page);
+            (entered.model, entered.cmd)
+        }
+        Err(_) => set_page(not_found.clone(), init_model),
+    };
+    let cmd0 = IpeCmd::Batch(vec![init_cmd, entry_cmd]);
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
@@ -554,7 +564,7 @@ where
     // Shared router closure: enters a URL path → new model + entry Cmd, or
     // `None` when the path does not match any declared route.
     //
-    // The `matches_any` guard before `match_routes` is the browser-client
+    // The `matches_any` guard before `enter` is the browser-client
     // analogue of the server's routed-app noise-path guard: a popstate to an
     // unrouted path (e.g.
     // `/favicon.ico`) must not re-route the model to `not_found` and rebuild
@@ -567,8 +577,10 @@ where
         let routes = Rc::clone(&routes_rc);
         let not_found = Rc::clone(&not_found_rc);
         let set_page = Rc::clone(&set_page_rc);
-        Box::new(move |path: &str, m: Model| {
-            matches_any(&routes, path).then(|| enter(&routes, &not_found, path, m, &*set_page))
+        Box::new(move |raw: &str, m: Model| {
+            // Parsed once; a malformed path is refused like an unrouted one.
+            let path = DecodedPath::parse(raw).ok()?;
+            matches_any(&routes, &path).then(|| enter(&routes, &not_found, &path, m, &*set_page))
         })
     };
 

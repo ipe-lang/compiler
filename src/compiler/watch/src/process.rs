@@ -30,7 +30,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 /// An artifact that has, at some point, passed its readiness probe.
@@ -221,10 +221,10 @@ impl SupervisorState {
     }
 
     /// Advance the state machine on a GREEN build. `candidate_path` is the
-    /// freshly built artifact; `spawn` constructs the `Command` to launch
-    /// WHATEVER path it is given (the caller owns env/args, e.g. the port
-    /// and `IPE_WEB_STORE` injection); `readiness` and `timeouts` govern
-    /// the readiness gate.
+    /// freshly built artifact; `spawn` launches WHATEVER path it is given
+    /// and returns the spawned `Child` (the caller owns env/args/stdin, e.g.
+    /// the port and `IPE_WEB_STORE` injection, and how the child is forked);
+    /// `readiness` and `timeouts` govern the readiness gate.
     ///
     /// `spawn` takes the path as a PARAMETER (rather than the caller
     /// capturing one fixed path in the closure) because the SAME
@@ -244,7 +244,7 @@ impl SupervisorState {
     pub fn apply_green(
         &mut self,
         candidate_path: &Path,
-        spawn: impl Fn(&Path) -> Command,
+        spawn: impl Fn(&Path) -> std::io::Result<Child>,
         readiness: ReadinessCheck,
         timeouts: RestartTimeouts,
     ) -> RestartOutcome {
@@ -274,7 +274,7 @@ impl SupervisorState {
         }
 
         // Spawn the candidate and await readiness.
-        match spawn_and_await_ready(spawn(candidate_path), readiness, timeouts) {
+        match await_ready(spawn(candidate_path), readiness, timeouts) {
             Ok(child) => {
                 *self = Self::Running {
                     child,
@@ -322,7 +322,7 @@ impl SupervisorState {
         };
 
         let last_good_path = last_good.artifact_path.clone();
-        match spawn_and_await_ready(spawn(&last_good_path), readiness, timeouts) {
+        match await_ready(spawn(&last_good_path), readiness, timeouts) {
             Ok(child) => {
                 *self = Self::Running {
                     child,
@@ -358,8 +358,8 @@ impl SupervisorState {
     /// binaries cannot coexist; here they bind DIFFERENT internal ports and
     /// overlap on purpose).
     ///
-    /// `spawn` builds the launch `Command` for a given `(path, internal_port)`
-    /// — the caller owns the env (it injects `IPE_WEB_PORT=internal_port`, the
+    /// `spawn` launches the child for a given `(path, internal_port)` and
+    /// returns it — the caller owns the env (it injects `IPE_WEB_PORT=internal_port`, the
     /// session-store path, …). `cut_over` is invoked with the ready internal
     /// port EXACTLY ONCE, between "new binary ready" and "old binary drained".
     ///
@@ -375,7 +375,7 @@ impl SupervisorState {
         &mut self,
         candidate_path: &Path,
         internal_port: u16,
-        spawn: impl Fn(&Path, u16) -> Command,
+        spawn: impl Fn(&Path, u16) -> std::io::Result<Child>,
         readiness: ReadinessCheck,
         timeouts: RestartTimeouts,
         cut_over: impl FnOnce(u16),
@@ -402,7 +402,7 @@ impl SupervisorState {
 
         // Spawn the NEW binary on its own internal port and await readiness —
         // WITHOUT stopping the old one first (they hold different ports).
-        match spawn_and_await_ready(spawn(candidate_path, internal_port), readiness, timeouts) {
+        match await_ready(spawn(candidate_path, internal_port), readiness, timeouts) {
             Ok(new_child) => {
                 // The new binary is ready. Flip the proxy's upstream to it —
                 // this is the zero-drop cutover: the user-facing port has been
@@ -471,8 +471,8 @@ impl SupervisorState {
 /// SAFETY / design note: this uses the SAFE, portable [`Child::kill`]
 /// (SIGKILL) as the escalation path. A true graceful SIGTERM needs a raw
 /// `kill(2)` call; the runtime isolates the whole workspace's raw-signal
-/// `unsafe` in one place (`system::harden_child_parent_death`, the sanctioned
-/// `PR_SET_PDEATHSIG` site — see `PRINCIPLES.md`) — this module deliberately
+/// `unsafe` in one place (the sanctioned `PR_SET_PDEATHSIG` site behind
+/// `system::spawn_hardened` — see `PRINCIPLES.md`) — this module deliberately
 /// does NOT duplicate that unsafe surface. Consequence: the "graceful" step here is a bounded WAIT
 /// (letting a process that is already shutting down on its own drain)
 /// rather than an ACTIVE SIGTERM; [`Child::kill`] (SIGKILL, always
@@ -500,29 +500,22 @@ fn stop_gracefully(child: &mut Child, grace: Duration) {
     let _ = child.wait();
 }
 
-/// Spawn `cmd` and poll `readiness` until it passes or its budget elapses.
+/// Poll `readiness` on a freshly spawned child until it passes or its budget elapses.
+///
 /// Returns the live `Child` on success. On failure, the child (if it was
 /// spawned at all) is killed before returning — callers never have to
 /// remember to clean up a half-ready process.
 ///
-/// Takes `cmd` BY VALUE (not `&Command`): `std::process::Command` has no
-/// `Clone` impl and no public accessor for its configured argv/envs, so the
-/// only sound way to spawn a fully-configured command (port env vars,
-/// `IPE_WEB_STORE`, …) without silently dropping that configuration is to
-/// consume the one, already-built `Command` the caller hands in. Every call
-/// site therefore builds a FRESH `Command` per spawn attempt (`apply_green`
-/// calls the caller's `spawn` factory for the candidate, and
-/// [`respawn_command`] for the last-good fallback) rather than trying to
-/// reuse one across attempts.
-fn spawn_and_await_ready(
-    mut cmd: Command,
+/// Takes the spawn RESULT rather than a `Command`: how the child is forked
+/// (the parent-death floor, stdin, env) is the caller's factory's concern, and
+/// every call site invokes that factory FRESH per spawn attempt (the candidate
+/// and the last-good fallback alike) rather than reusing one child source.
+fn await_ready(
+    spawned: std::io::Result<Child>,
     readiness: ReadinessCheck,
     timeouts: RestartTimeouts,
 ) -> Result<Child, String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+    let mut child = spawned.map_err(|e| format!("spawn failed: {e}"))?;
 
     // `AliveImmediate` (test-only): confirm the process is alive with a
     // tight `try_wait` loop, then declare it ready.  Tests that use this
@@ -602,7 +595,7 @@ const fn is_alive_based_readiness(readiness: &ReadinessCheck) -> bool {
 /// One readiness probe attempt (non-blocking beyond a short per-attempt
 /// socket timeout) — `true` means ready. `AliveGrace` always reports "not
 /// yet" here; its success path is the deadline branch in
-/// [`spawn_and_await_ready`] (surviving to the end of the grace window IS
+/// [`await_ready`] (surviving to the end of the grace window IS
 /// the readiness signal for a program with no network surface to ask).
 fn probe_once(readiness: &ReadinessCheck) -> bool {
     match *readiness {
@@ -656,6 +649,21 @@ fn http_get_ok(port: u16, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+
+    /// A plain `/bin/sleep 5` child with stdin closed.
+    ///
+    /// The supervisor's factory contract is "spawn a child"; the parent-death
+    /// floor is the runtime's concern and is pinned there, so a plain spawn is
+    /// the correct test double here.
+    #[cfg(unix)]
+    fn sleep_5() -> std::io::Result<Child> {
+        Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .spawn()
+    }
 
     #[test]
     fn last_good_hash_is_deterministic() {
@@ -696,11 +704,7 @@ mod tests {
         let mut state = SupervisorState::fresh();
         let outcome = state.apply_green(
             Path::new("/bin/sleep"),
-            |_path| {
-                let mut c = Command::new("/bin/sleep");
-                c.arg("5");
-                c
-            },
+            |_path| sleep_5(),
             ReadinessCheck::AliveImmediate,
             quick_timeouts(),
         );
@@ -713,11 +717,7 @@ mod tests {
     #[test]
     fn apply_green_reports_unchanged_binary_for_a_byte_identical_candidate() {
         let mut state = SupervisorState::fresh();
-        let spawn = |_path: &Path| {
-            let mut c = Command::new("/bin/sleep");
-            c.arg("5");
-            c
-        };
+        let spawn = |_path: &Path| sleep_5();
         let first = state.apply_green(
             Path::new("/bin/sleep"),
             spawn,
@@ -755,7 +755,7 @@ mod tests {
         // The bad-candidate command deliberately points to a nonexistent
         // binary so that `spawn()` itself fails (an I/O error, not a
         // process-exit race).  A spawn failure is caught inside
-        // `spawn_and_await_ready` before any process is created, making
+        // `await_ready` before any process is created, making
         // the readiness failure 100% deterministic regardless of OS load
         // or scheduler timing.  The last-good respawn uses `/bin/sleep 5`,
         // which stays alive and passes `AliveImmediate`'s spin-poll.
@@ -764,14 +764,12 @@ mod tests {
             let good_path = good_path.clone();
             move |path: &Path| {
                 if path == good_path {
-                    let mut c = Command::new("/bin/sleep");
-                    c.arg("5");
-                    c
+                    sleep_5()
                 } else {
                     // Nonexistent binary → `spawn()` returns Err immediately,
                     // no process is ever created, readiness fails without any
                     // timing dependency.
-                    Command::new("/nonexistent/__ipe_watch_test_bad_candidate__")
+                    Command::new("/nonexistent/__ipe_watch_test_bad_candidate__").spawn()
                 }
             }
         };
@@ -794,7 +792,7 @@ mod tests {
         // file so it is not judged byte-identical) that the spawn closure
         // routes to a nonexistent binary.  The spawn fails immediately
         // (before any process is created), which is the same `Err` path
-        // inside `spawn_and_await_ready` as a process-exit readiness
+        // inside `await_ready` as a process-exit readiness
         // failure — fully deterministic, no OS timing involved.  The state
         // machine then respawns the last-good artifact (`/bin/sleep 5`)
         // which stays alive and passes readiness.
@@ -839,11 +837,7 @@ mod tests {
         let cut_to = Arc::new(AtomicU16::new(0));
         let cut_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let spawn = |_path: &Path, _port: u16| {
-            let mut c = Command::new("/bin/sleep");
-            c.arg("5");
-            c
-        };
+        let spawn = |_path: &Path, _port: u16| sleep_5();
 
         let internal = 41999;
         let cut_to_cb = Arc::clone(&cut_to);
@@ -888,11 +882,7 @@ mod tests {
         let cut_calls = Arc::new(AtomicUsize::new(0));
 
         // First, establish a running old binary via the same blue-green path.
-        let spawn_good = |_path: &Path, _port: u16| {
-            let mut c = Command::new("/bin/sleep");
-            c.arg("5");
-            c
-        };
+        let spawn_good = |_path: &Path, _port: u16| sleep_5();
         let cc = Arc::clone(&cut_calls);
         let first = state.apply_green_behind_proxy(
             &good_path,
@@ -920,7 +910,7 @@ mod tests {
         let bad = dir.join("bad");
         std::fs::write(&bad, b"distinct-bytes").unwrap();
         let spawn_bad =
-            |_path: &Path, _port: u16| Command::new("/nonexistent/__ipe_watch_bg_bad__");
+            |_path: &Path, _port: u16| Command::new("/nonexistent/__ipe_watch_bg_bad__").spawn();
         let cc2 = Arc::clone(&cut_calls);
         let outcome = state.apply_green_behind_proxy(
             &bad,
@@ -969,11 +959,7 @@ mod tests {
         let cut_calls = Arc::new(AtomicUsize::new(0));
 
         // Establish a running old binary (alive-immediate, cuts over once).
-        let spawn_good = |_path: &Path, _port: u16| {
-            let mut c = Command::new("/bin/sleep");
-            c.arg("5");
-            c
-        };
+        let spawn_good = |_path: &Path, _port: u16| sleep_5();
         let cc = Arc::clone(&cut_calls);
         let first = state.apply_green_behind_proxy(
             &good_path,
@@ -1007,11 +993,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let candidate = dir.join("alive-but-silent");
         std::fs::write(&candidate, b"tcp-readiness-distinct-bytes").unwrap();
-        let spawn_silent = |_path: &Path, _port: u16| {
-            let mut c = Command::new("/bin/sleep");
-            c.arg("5");
-            c
-        };
+        let spawn_silent = |_path: &Path, _port: u16| sleep_5();
         let cc2 = Arc::clone(&cut_calls);
         let outcome = state.apply_green_behind_proxy(
             &candidate,

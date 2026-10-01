@@ -55,9 +55,7 @@ fn store_ident_parity_resolves_and_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("store_ident_parity_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
@@ -72,7 +70,7 @@ fn store_ident_parity_resolves_and_builds() {
 /// pinned verdicts. Gated on `IPE_E2E=1` so the default gate stays fast.
 #[test]
 fn store_ident_parity_end_to_end() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -80,9 +78,7 @@ fn store_ident_parity_end_to_end() {
     let out = crate::support::scratch_root().join("ipec_store_ident_parity_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(

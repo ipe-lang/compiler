@@ -1,4 +1,4 @@
-//! The compiler's entry onto the `path "…"` literal gate (IPE-P0063).
+//! Compile-time validation for a literal path in source (IPE-P0063).
 //!
 //! The algorithm is NOT defined here — it lives once in the dependency-free
 //! `ipe_path_core` crate, which the runtime `Path.fromString` seal
@@ -9,8 +9,7 @@
 //! [`PathLitText::seal`] is the all-targets compile-time gate: the compiler does
 //! not know the final target OS, so it seals a literal under EVERY separator
 //! regime and refuses it when any regime refuses. An accepted literal carries
-//! each regime's sealed form; the emitted program selects the host one, so the
-//! text a literal yields on a target IS that target's runtime seal.
+//! each regime's sealed form.
 
 pub use ipe_path_core::{LiteralRefusal, PathLitText, Regime, SealRefusal, seal};
 

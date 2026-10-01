@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -51,10 +51,7 @@ fn i195_ipec_accepts_and_renders_send_only_fnonce_payload() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i195_json_decode_pipeline_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP json_decode_pipeline: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
@@ -104,7 +101,7 @@ fn i195_ipec_accepts_and_renders_send_only_fnonce_payload() {
 /// the original SEAL violation (ipe-0, cargo-fail).
 #[test]
 fn i195_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -113,9 +110,7 @@ fn i195_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_i195_json_decode_pipeline_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(

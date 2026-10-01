@@ -283,7 +283,6 @@ fn expr_children(expr: &Located<Expr_>) -> Vec<&Located<Expr_>> {
         | Expr_::Float(_)
         | Expr_::Str(_)
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Unit => Vec::new(),
     }

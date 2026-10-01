@@ -72,6 +72,7 @@ pub fn trace_attr<E: Send + 'static>(key: String, value: String) -> IpeTask<E, (
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

@@ -8,7 +8,7 @@
 //! never a self-report.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::fmt::{self, format_source};
 
@@ -309,7 +309,7 @@ fn init_template_is_a_near_fixed_point() {
 /// live, current content rather than a copy baked in at compile time.
 #[test]
 fn code_review_db_bare_run_formats() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = e2e_support::manifest_dir!()
         .join("..")
         .join("..")
         .join("tools")
@@ -317,9 +317,7 @@ fn code_review_db_bare_run_formats() {
         .join("src")
         .join("Lib")
         .join("Db.ipe");
-    let read = fs::read_to_string(&path);
-    assert!(read.is_ok(), "reading fixture {}: {read:?}", path.display());
-    let Ok(src) = read else { return };
+    let src = fs::read_to_string(&path).expect("reading the code-review Db.ipe fixture");
     let out = format_source(&src);
     assert!(
         out.is_ok(),

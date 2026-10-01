@@ -57,7 +57,7 @@ static JAIL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// the tests could not pass no matter how correct the jail is, so they must skip.
 /// The [`jail_can_establish`] canary settles this once.
 fn e2e_tools() -> Option<RunJailTools> {
-    if ipe_env::var_os("IPE_E2E").is_none_or(|v| v != "1") {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return None;
     }
     let caps = ipe_sandbox::probe();

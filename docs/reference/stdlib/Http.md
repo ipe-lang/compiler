@@ -46,9 +46,10 @@ for reading, but the AUTHORITATIVE scheme-narrowing implementation is the
 runtime `narrow_http_scheme` the kernels call — the two cannot diverge
 because the kernel path, not these bodies, is what lowers.
 
-`parseQuery` is pure: trims a leading `?`, splits on `&`/`=`,
-percent-decodes, first-key-wins, returns a `Dict String String` (no
-duplicate keys — the invariant is proven by the HashMap return type).
+`parseQuery` is pure: trims a leading `?`, splits on `&`/`=`, decodes each
+key and value under the form grammar (`+` is a space), first-key-wins, and
+returns a `Dict String String`. A malformed escape, invalid UTF-8, or too
+many pairs refuses the whole query with an `Err`.
 
 Builders (`defaultRequest` / `with*`) are pure Ipe. `withHeader`
 cons-prepends `(k, v)` onto `req.headers`, so the most-recently-added
@@ -134,8 +135,15 @@ runtime converts `HttpMethod` to the reqwest `Method` internally.
 ## `parseQuery`
 
 ```ipe
-parseQuery : String -> Dict String String
+parseQuery : String -> Result Error (Dict String String)
 ```
+
+Decode a form-encoded query string into its key/value pairs.
+
+A leading `?` is dropped and a repeated key keeps its first value. Returns
+`Err` when any key or value holds a malformed percent-escape or decodes to
+invalid UTF-8, or when the query carries too many pairs — there is no
+partial result.
 
 ## `post`
 

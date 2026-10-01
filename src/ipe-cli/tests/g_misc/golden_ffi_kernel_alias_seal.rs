@@ -36,7 +36,7 @@ fn write_project(dir: &std::path::Path, main: &str) -> bool {
 /// Build the user project and assert `ipe` rejects it with the origin-gate
 /// diagnostic `NameError::KernelAliasInUserSource` (IPE-N0042).
 fn assert_rejected_as_user_kernel_alias(sub_dir: &str, out_dir: &str, main: &str) {
-    let runtime = crate::support::expect_runtime(sub_dir, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = crate::support::scratch_root().join(sub_dir);
     assert!(

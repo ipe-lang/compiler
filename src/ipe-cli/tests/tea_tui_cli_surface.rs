@@ -40,7 +40,7 @@ fn compile_files(
         .join(format!("tea_surface_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build_loose_file(&entry, &out_dir, &runtime))
 }
 
@@ -455,7 +455,7 @@ fn point_free_tui_on_key_emits_the_bridge() -> Result<(), BoxError> {
         .collect::<Vec<_>>()
         .join(" ");
     if emitted.is_empty() {
-        return Ok(()); // runtime unavailable — structural assertion skipped
+        return Err("point_free_on_key: the accepted build emitted no Rust".into());
     }
     if !emitted.contains("tui_sub_on_key(") || !emitted.contains("|kind: String, value: String|") {
         return Err(
@@ -555,7 +555,7 @@ fn assert_builds_files(test_name: &str, files: &[(&str, &str)]) -> Result<(), Bo
     if let Err(e) = compile_files(test_name, files)? {
         return Err(format!("{test_name}: expected ipe success, got {e:?}").into());
     }
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

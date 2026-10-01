@@ -22,10 +22,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_i149_noncl_var_hof
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -41,9 +41,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -62,39 +60,35 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
 fn a1_noncl_var_task_and_then_compiles() {
     assert_ipec_ok("noncl_var_hof", "i149_noncl_var_hof_emit");
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let root = repo_root();
+        let entry = root
+            .join("tests")
+            .join("golden")
+            .join("noncl_var_hof")
+            .join("Main.ipe");
+        let out = crate::support::scratch_root().join("ipec_i149_noncl_var_hof_e2e");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let runtime = e2e_support::require_runtime().into_path_buf();
+
+        let built = ipe::build(&entry, &out, &runtime);
+        assert!(
+            built.is_ok(),
+            "ipe build must succeed for noncl_var_hof: {:?}",
+            built.err()
+        );
+
+        let outcome = crate::support::build_and_run_emitted("noncl_var_hof", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "A1: must exit 0 (was IPE-L0126 before #149)"
+        );
+        assert!(
+            outcome.stdout.contains("hello!"),
+            "A1: NonClone Var forwarded to Task.andThen must produce 'hello!'; got:\n{}",
+            outcome.stdout
+        );
     }
-
-    let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("noncl_var_hof")
-        .join("Main.ipe");
-    let out = crate::support::scratch_root().join("ipec_i149_noncl_var_hof_e2e");
-    let _ = std::fs::remove_dir_all(&out);
-
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
-
-    let built = ipe::build(&entry, &out, &runtime);
-    assert!(
-        built.is_ok(),
-        "ipe build must succeed for noncl_var_hof: {:?}",
-        built.err()
-    );
-
-    let outcome = crate::support::build_and_run_emitted("noncl_var_hof", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "A1: must exit 0 (was IPE-L0126 before #149)"
-    );
-    assert!(
-        outcome.stdout.contains("hello!"),
-        "A1: NonClone Var forwarded to Task.andThen must produce 'hello!'; got:\n{}",
-        outcome.stdout
-    );
 }

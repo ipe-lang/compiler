@@ -27,33 +27,25 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
         .join("Main.ipe")
 }
 
-/// Build `golden` and return the diagnostic code it was rejected with, or `None`
-/// if it built or failed without a pipeline diagnostic.
-fn rejection_code(golden: &str) -> Option<ipe_diagnostics::Code> {
-    let root = repo_root();
-    let entry = fixture_entry(&root, golden);
-    let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
-    let _ = std::fs::remove_dir_all(&out);
-
-    let runtime = ipe::resolve_runtime().ok()?;
-    match ipe::build(&entry, &out, &runtime) {
-        Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
-        _ => None,
-    }
+/// Build `golden` and return the diagnostic code it was rejected with.
+fn rejection_code(golden: &str) -> ipe_diagnostics::Code {
+    rejection_diagnostic(golden).code()
 }
 
-/// Build `golden` and return the full [`Diagnostic`] it was rejected with, or
-/// `None` if it built or failed without a pipeline diagnostic.
-fn rejection_diagnostic(golden: &str) -> Option<Box<Diagnostic>> {
+/// Build `golden` and return the pipeline [`Diagnostic`] it was rejected with.
+///
+/// A build that succeeds, or fails without a pipeline diagnostic, fails the
+/// test: the refusal is the property under proof.
+fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let root = repo_root();
     let entry = fixture_entry(&root, golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime().ok()?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
-        Err(CliError::Pipeline { diag, .. }) => Some(diag),
-        _ => None,
+        Err(CliError::Pipeline { diag, .. }) => *diag,
+        other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
     }
 }
 
@@ -62,9 +54,7 @@ fn rejection_diagnostic(golden: &str) -> Option<Box<Diagnostic>> {
 /// single-reference refusal).
 #[test]
 fn single_column_computed_projection_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_reject_single_computed") else {
-        return; // resolver unavailable — skip
-    };
+    let code = rejection_code("db_store_projection_reject_single_computed");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0149,
@@ -76,9 +66,7 @@ fn single_column_computed_projection_is_rejected() {
 /// rejected with IPE-L0149.
 #[test]
 fn multicol_computed_element_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_reject_computed") else {
-        return;
-    };
+    let code = rejection_code("db_store_projection_reject_computed");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0149,
@@ -90,9 +78,7 @@ fn multicol_computed_element_is_rejected() {
 /// reference is rejected with IPE-L0149.
 #[test]
 fn multicol_literal_element_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_reject_literal") else {
-        return;
-    };
+    let code = rejection_code("db_store_projection_reject_literal");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0149,
@@ -104,9 +90,7 @@ fn multicol_literal_element_is_rejected() {
 /// IPE-L0149 — a multi-column projection is a flat tuple of references.
 #[test]
 fn multicol_nested_tuple_element_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_reject_nested_tuple") else {
-        return;
-    };
+    let code = rejection_code("db_store_projection_reject_nested_tuple");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0149,
@@ -121,9 +105,7 @@ fn multicol_nested_tuple_element_is_rejected() {
 /// unrelated failure and leave the refusal unproven.
 #[test]
 fn upper_on_non_string_column_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_upper_non_string_rejected") else {
-        return; // resolver unavailable — skip
-    };
+    let code = rejection_code("db_store_projection_upper_non_string_rejected");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_T0001,
@@ -138,9 +120,7 @@ fn upper_on_non_string_column_is_rejected() {
 /// the numeric obligation is enforced rather than an unrelated failure.
 #[test]
 fn arith_on_non_numeric_column_is_rejected() {
-    let Some(code) = rejection_code("db_store_projection_arith_non_numeric_rejected") else {
-        return; // resolver unavailable — skip
-    };
+    let code = rejection_code("db_store_projection_arith_non_numeric_rejected");
     assert_eq!(
         code,
         ipe_diagnostics::IPE_T0001,
@@ -156,9 +136,7 @@ fn arith_on_non_numeric_column_is_rejected() {
 /// that covers computed column expressions.
 #[test]
 fn literal_unsupported_type_is_rejected_with_type_name() {
-    let Some(diag) = rejection_diagnostic("db_store_projection_literal_type_unsupported") else {
-        return; // resolver unavailable — skip
-    };
+    let diag = rejection_diagnostic("db_store_projection_literal_type_unsupported");
     assert_eq!(
         diag.code(),
         ipe_diagnostics::IPE_L0149,
@@ -167,7 +145,7 @@ fn literal_unsupported_type_is_rejected_with_type_name() {
     let Diagnostic::Lower {
         msg: LowerError::StoreSelectProjectionInvalid(defect),
         ..
-    } = *diag
+    } = diag
     else {
         panic!(
             "expected StoreSelectProjectionInvalid, got a different diagnostic variant: {diag:?}"

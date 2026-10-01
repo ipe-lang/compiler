@@ -31,9 +31,8 @@ const fn false_marker() -> bool {
 }
 
 /// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path, or `None` (reported as a failure) when the
-/// scratch setup fails.
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
+/// `name`, returning the entry path; a failed scratch setup fails the test.
+fn write_single(name: &str, source: &str) -> PathBuf {
     let dir = crate::support::scratch_root()
         .join("ipec_enum_fn_payload_reuse")
         .join(name);
@@ -45,7 +44,7 @@ fn write_single(name: &str, source: &str) -> Option<PathBuf> {
         written.is_ok(),
         "{name}: must write the fixture source to a scratch dir: {written:?}"
     );
-    written.ok().map(|()| entry)
+    entry
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -62,14 +61,7 @@ fn out_dir(name: &str) -> PathBuf {
 fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
     // A refusal test proves nothing if it skips silently: a missing runtime
     // would let the fail-closed assertion pass without driving the pipeline.
-    let runtime = ipe::resolve_runtime();
-    assert!(
-        runtime.is_ok(),
-        "{name}: runtime must resolve to prove the fail-closed refusal: {runtime:?}"
-    );
-    let Ok(runtime) = runtime else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
     match ipe::build_loose_file(entry, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
@@ -89,35 +81,23 @@ fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
     }
 }
 
-/// Build `entry`; `None` when the runtime is unavailable or `ipe` refused it.
-///
-/// Both `None` cases are reported as test failures, so a caller that returns
-/// on `None` never passes without driving the pipeline.
+/// Build `entry` and return its output dir; an `ipe` refusal fails the test.
 #[track_caller]
-fn accepted_out(name: &str, entry: &Path) -> Option<PathBuf> {
-    let runtime = ipe::resolve_runtime();
-    assert!(
-        runtime.is_ok(),
-        "{name}: runtime must resolve to prove the program is accepted: {runtime:?}"
-    );
-    let runtime = runtime.ok()?;
+fn accepted_out(name: &str, entry: &Path) -> PathBuf {
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    match ipe::build_loose_file(entry, &out, &runtime) {
-        Ok(()) => Some(out),
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: ipe REJECTED a well-formed program — a false rejection: {err}"
-            );
-            None
-        }
-    }
+    let built = ipe::build_loose_file(entry, &out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{name}: ipe REJECTED a well-formed program — a false rejection: {built:?}"
+    );
+    out
 }
 
 /// Under `IPE_E2E`, `cargo build` + run the crate in `out` and check its stdout.
 #[track_caller]
 fn assert_runs(name: &str, out: &Path, expected_stdout: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return; // emit-only fast pass
     }
     let outcome = crate::support::build_and_run_emitted(name, out);
@@ -265,56 +245,38 @@ main =
 #[test]
 fn boxed_fn_payload_enum_reuse_fails_closed() {
     let name = "boxed_fn_payload_enum_reuse";
-    let Some(entry) = write_single(name, BOXED_FN_PAYLOAD_ENUM_REUSE) else {
-        return;
-    };
+    let entry = write_single(name, BOXED_FN_PAYLOAD_ENUM_REUSE);
     assert_rejected(name, &entry, ipe_diagnostics::IPE_L0127);
 }
 
 #[test]
 fn boxed_fn_payload_enum_linear_builds() {
     let name = "boxed_fn_payload_enum_linear";
-    let Some(entry) = write_single(name, BOXED_FN_PAYLOAD_ENUM_LINEAR) else {
-        return;
-    };
-    let Some(out) = accepted_out(name, &entry) else {
-        return;
-    };
+    let entry = write_single(name, BOXED_FN_PAYLOAD_ENUM_LINEAR);
+    let out = accepted_out(name, &entry);
     assert_runs(name, &out, "42");
 }
 
 #[test]
 fn shared_fn_payload_enum_reuse_builds() {
     let name = "shared_fn_payload_enum_reuse";
-    let Some(entry) = write_single(name, SHARED_FN_PAYLOAD_ENUM_REUSE) else {
-        return;
-    };
-    let Some(out) = accepted_out(name, &entry) else {
-        return;
-    };
+    let entry = write_single(name, SHARED_FN_PAYLOAD_ENUM_REUSE);
+    let out = accepted_out(name, &entry);
     assert_runs(name, &out, "30");
 }
 
 #[test]
 fn enum_recursive_through_a_task_builds() {
     let name = "enum_recursive_through_a_task";
-    let Some(entry) = write_single(name, ENUM_RECURSIVE_THROUGH_A_TASK) else {
-        return;
-    };
-    let Some(out) = accepted_out(name, &entry) else {
-        return;
-    };
+    let entry = write_single(name, ENUM_RECURSIVE_THROUGH_A_TASK);
+    let out = accepted_out(name, &entry);
     assert_runs(name, &out, "7");
 }
 
 #[test]
 fn enums_mutually_recursive_through_tasks_build() {
     let name = "enums_mutually_recursive_through_tasks";
-    let Some(entry) = write_single(name, ENUMS_MUTUALLY_RECURSIVE_THROUGH_TASKS) else {
-        return;
-    };
-    let Some(out) = accepted_out(name, &entry) else {
-        return;
-    };
+    let entry = write_single(name, ENUMS_MUTUALLY_RECURSIVE_THROUGH_TASKS);
+    let out = accepted_out(name, &entry);
     assert_runs(name, &out, "3");
 }

@@ -224,7 +224,7 @@ pub mod trace;
 pub use file::*;
 
 // The lexical path-validation algorithm — the SINGLE source of truth shared
-// with the compiler's `path "…"` gate (the `ipe_path_core` crate `include!`s
+// with the compiler's literal-path gate (the `ipe_path_core` crate `include!`s
 // this exact file). A sibling module (not an extern crate) so it also resolves
 // when the runtime is vendored as `mod ipe_runtime` into an emitted app. No
 // glob re-export: `path` reaches it via `super::path_core::…`.
@@ -813,6 +813,7 @@ const _WASI_TIME_FLOOR_SEAL: () = {
 };
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod control_surface_absence {
     // The dev-loop control channel — the `control` module and its loopback
     // `server` accept-loop — is present ONLY under a dev-loop surface (`web`,
@@ -845,3 +846,8 @@ mod control_surface_absence {
         }
     }
 }
+
+// Names every path the runtime `clippy.toml` denies, so a stale path breaks the
+// test build instead of silently disabling its lint.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod clippy_paths_resolve;

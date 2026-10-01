@@ -46,9 +46,7 @@ fn emits_byte_identical_main_rs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_alias_move_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
@@ -73,9 +71,7 @@ fn no_by_value_alias_uses_at_subpattern() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_alias_move_seal_shapes");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
     let src = std::fs::read_to_string(out.join("src").join("main.rs")).expect("main.rs");
@@ -110,7 +106,7 @@ fn no_by_value_alias_uses_at_subpattern() {
 /// owned and live.
 #[test]
 fn end_to_end_builds_and_prints_the_concatenation() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -118,9 +114,7 @@ fn end_to_end_builds_and_prints_the_concatenation() {
     let out = crate::support::scratch_root().join("ipec_l0105_alias_move_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 

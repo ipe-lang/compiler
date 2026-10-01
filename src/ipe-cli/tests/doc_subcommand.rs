@@ -757,7 +757,7 @@ fn extract_backtick_example(text: &str) -> io::Result<String> {
 /// against each other, so they cannot silently drift apart.
 #[test]
 fn help_doc_examples_all_resolve() -> io::Result<()> {
-    let help_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("help/doc.md");
+    let help_path = e2e_support::manifest_dir!().join("help/doc.md");
     let help = fs::read_to_string(&help_path)?;
 
     let examples = [

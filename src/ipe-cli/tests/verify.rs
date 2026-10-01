@@ -113,7 +113,7 @@ fn unknown_flag_is_misuse_and_shows_help() {
 /// Ipê runtime — kept out of the default fast, offline test run.
 #[test]
 fn clean_project_passes_every_stage() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the building verify E2E");
         return Ok(());
     }
@@ -146,7 +146,7 @@ fn clean_project_passes_every_stage() -> TestResult {
 /// Gated on `IPE_E2E=1` — the test stage invokes `cargo` and needs the runtime.
 #[test]
 fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the test-stage E2E");
         return Ok(());
     }
@@ -180,7 +180,7 @@ fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
 /// Gated on `IPE_E2E=1` — the test stage invokes `cargo` and needs the runtime.
 #[test]
 fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the cross-directory test-stage E2E");
         return Ok(());
     }
@@ -231,7 +231,7 @@ fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
 /// Gated on `IPE_E2E=1` — the test stage invokes `cargo` and needs the runtime.
 #[test]
 fn project_with_failing_tests_fails_the_test_stage() -> TestResult {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping: set IPE_E2E=1 to run the test-stage E2E");
         return Ok(());
     }

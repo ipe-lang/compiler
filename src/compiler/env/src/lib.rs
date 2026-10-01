@@ -16,6 +16,8 @@
 //! whole-environment iterator: an iteration would hand a refused value out
 //! under its own name.
 
+pub mod artifact;
+
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};
 

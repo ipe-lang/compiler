@@ -33,9 +33,9 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, LetDefect, LowerError, NameError, ParseError, SandboxError, SealRejection,
-    SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
-    TypeDeclDefect, TypeError, WildcardDependence,
+    Hint, IfDefect, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect, SandboxError,
+    SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
+    TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
 };
 use crate::span::Span;
 
@@ -701,6 +701,9 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::RouteParamCountMismatch { .. } => {
             "This route's `:param` segments don't line up with its page constructor.".to_string()
+        }
+        LowerError::RoutePatternMalformed { call, .. } => {
+            format!("The path you gave `{call}` isn't a valid route.")
         }
         LowerError::RouteBuilderUnsupportedShape => {
             "I can't read this route's page builder — it isn't in a shape I can compile."
@@ -1858,6 +1861,7 @@ fn lower_label(msg: &LowerError) -> String {
             "pattern `{pattern}` has {param_count} `:param` segment(s) but the page \
              constructor takes {ctor_payload_count} payload field(s)"
         ),
+        LowerError::RoutePatternMalformed { defect, .. } => route_pattern_label(defect),
         LowerError::RouteBuilderUnsupportedShape => {
             "this page builder shape is not supported — inline a constructor or lambda \
              at the `Web.route` call site"
@@ -2011,6 +2015,30 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
 
 /// The detailed caret label for a [`LowerError::StoreEqAccessorInvalid`],
 /// factored out of [`lower_label`] so that dispatcher stays under the line cap.
+fn route_pattern_label(defect: &RoutePatternDefect) -> String {
+    match defect {
+        RoutePatternDefect::ParamEmpty => {
+            "a `:` or `*` segment has no parameter name after it".to_string()
+        }
+        RoutePatternDefect::ParamNotIdentifier { name, at } => format!(
+            "parameter name `{name}` is not an identifier (byte {at} is not a letter, \
+             digit, or `_`)"
+        ),
+        RoutePatternDefect::ParamDuplicate { name } => {
+            format!("parameter name `{name}` appears more than once in this path")
+        }
+        RoutePatternDefect::MalformedEscape { segment, at } => format!(
+            "segment `{segment}` has a `%` at byte {at} that is not followed by two hex digits"
+        ),
+        RoutePatternDefect::InvalidUtf8 { segment, at } => {
+            format!("segment `{segment}` percent-decodes to invalid UTF-8 starting at byte {at}")
+        }
+        RoutePatternDefect::TooLong { cap } => {
+            format!("this path is longer than the {cap}-byte route ceiling")
+        }
+    }
+}
+
 fn store_eq_accessor_label(defect: &StoreEqAccessorDefect) -> String {
     match defect {
         StoreEqAccessorDefect::NotAnAccessor => {
@@ -3371,7 +3399,7 @@ mod tests {
         }
     }
 
-    /// A `path "…"` literal containing a NUL byte renders its specific detail message.
+    /// A path literal containing a NUL byte renders its specific detail message.
     ///
     /// Uses `plain_message` (which includes the label from `parse_label`) because
     /// `render` with a `Span::DUMMY` suppresses the snippet+label band.
@@ -3394,7 +3422,7 @@ mod tests {
         );
     }
 
-    /// A `path "…"` literal with a traversal renders its specific detail message.
+    /// A path literal with a traversal renders its specific detail message.
     #[test]
     fn path_rejection_traversal_renders_traversal_message() {
         let diag = Diagnostic::Parse {

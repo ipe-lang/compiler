@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 /// The `crates/ipe/tests` directory holding every `golden_*.rs`.
 fn tests_dir() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let joined = e2e_support::manifest_dir!().join("tests");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -53,7 +53,7 @@ fn tests_dir() -> PathBuf {
 /// this crate's manifest). Every golden test resolves its fixtures under here
 /// via `root.join("tests").join("golden").join(<name>)`.
 fn golden_fixtures_dir() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let joined = e2e_support::manifest_dir!()
         .join("..")
         .join("..")
         .join("tests")

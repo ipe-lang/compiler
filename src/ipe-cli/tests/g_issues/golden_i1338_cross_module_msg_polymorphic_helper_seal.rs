@@ -50,9 +50,7 @@ fn i1338_cross_module_msg_polymorphic_helper_emits() {
         .join("ipec_i1338_cross_module_msg_polymorphic_helper_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable -- skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -86,9 +84,7 @@ fn i1338_cross_module_msg_polymorphic_helper_seal_builds() {
         .join("ipec_i1338_cross_module_msg_polymorphic_helper_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 

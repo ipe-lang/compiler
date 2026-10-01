@@ -21,8 +21,16 @@ into the `Selection` cargo builds: named packages, the package a member
 directory defaults to, the whole root workspace (a bare invocation at the
 virtual root, or `--workspace`), or bins picked by `--bin`.
 
-Callers: `verify-manifest` check 15 (only one job builds `ipe`) and check 16
-(a path-scoped job's scope covers what it compiles).
+A compiling invocation also carries its `--target` triple, its feature set
+(`-F`/`--features`, comma- or space-separated, repeats unioned; an empty list
+is refused), `--all-features`, `--no-default-features`, and its
+`TargetSelection`: `DefaultTargets` when no target-kind option is given, else
+`ExplicitTargets` naming the lib, the `--test` names, and whether every test
+target (`--tests`, `--all-targets`) or any other kind is picked.
+
+Callers: `verify-manifest` check 15 (only one job builds `ipe`), check 16
+(a path-scoped job's scope covers what it compiles) and check 20 (every
+non-host test cell is run by the job that claims it).
 """
 
 from __future__ import annotations
@@ -110,6 +118,41 @@ _SUBCOMMANDS: dict[str, tuple[frozenset[str], frozenset[str], str | None]] = {
 
 
 @dataclass(frozen=True)
+class DefaultTargets:
+    """No target-kind option: cargo picks its default targets (for `test`,
+    the lib, every test target, bins and examples)."""
+
+    def selects(self, target: str) -> bool:
+        """Whether `target` (`lib`, or `test:<name>`) is among these."""
+        return target == "lib" or (target.startswith("test:") and len(target) > len("test:"))
+
+
+@dataclass(frozen=True)
+class ExplicitTargets:
+    """The target kinds named on the command line."""
+
+    lib: bool = False
+    tests: frozenset[str] = frozenset()
+    all_tests: bool = False
+    other: bool = False
+
+    def selects(self, target: str) -> bool:
+        """Whether `target` (`lib`, or `test:<name>`) is among these."""
+        if target == "lib":
+            return self.lib
+        name = target.removeprefix("test:")
+        return name != target and (self.all_tests or name in self.tests)
+
+
+TargetSelection = DefaultTargets | ExplicitTargets
+
+# Target-kind options: each flips `ExplicitTargets` on.
+_KIND_FLAGS = frozenset({"--lib", "--tests", "--all-targets", "--bins", "--examples", "--benches", "--doc"})
+_KIND_VALUED = frozenset({"--test", "--bin", "--example", "--bench"})
+_FEATURE_SPLIT = re.compile(r"[,\s]+")
+
+
+@dataclass(frozen=True)
 class CargoInvocation:
     """One `cargo` command. `subcommand` is its canonical name (`""` for a
     bare `cargo --version`); the selection fields are empty unless it is
@@ -125,6 +168,13 @@ class CargoInvocation:
     manifest_path: str | None = None
     install_crates: tuple[str, ...] = ()
     install_path: str | None = None
+    target: str | None = None
+    features: frozenset[str] = frozenset()
+    all_features: bool = False
+    no_default_features: bool = False
+    selection: TargetSelection = DefaultTargets()
+    filtered: bool = False
+    no_run: bool = False
 
 
 def _option(word: str, valued: frozenset[str], flags: frozenset[str]) -> tuple[str, str | None, bool] | None:
@@ -187,8 +237,11 @@ def parse(words: Sequence[str]) -> CargoInvocation | str:
     bins: list[str] = []
     crates: list[str] = []
     workspace = False
-    manifest = install_path = None
-    filtered = False
+    manifest = install_path = target = None
+    filtered = all_features = no_default_features = no_run = explicit = False
+    features: set[str] = set()
+    lib = all_tests = other = False
+    tests: set[str] = set()
     while i < n:
         w = words[i]
         if w == "--":
@@ -224,8 +277,43 @@ def parse(words: Sequence[str]) -> CargoInvocation | str:
             manifest = value
         elif name == "--path":
             install_path = value
+        elif name == "--target":
+            if not value:
+                return f"`{command}`: --target lacks its value"
+            if target is not None and target != value:
+                return f"`{command}`: more than one --target, which this check does not read"
+            target = value
+        elif name in ("-F", "--features"):
+            named = {f for f in _FEATURE_SPLIT.split(value or "") if f}
+            if not named:
+                return f"`{command}`: {name} names no feature"
+            features |= named
+        elif name == "--all-features":
+            all_features = True
+        elif name == "--no-default-features":
+            no_default_features = True
+        elif name == "--no-run":
+            no_run = True
+        if name in _KIND_FLAGS or name in _KIND_VALUED:
+            explicit = True
+            if name == "--lib":
+                lib = True
+            elif name == "--test":
+                if not value:
+                    return f"`{command}`: --test lacks its value"
+                tests.add(value)
+            elif name == "--tests":
+                all_tests = True
+            elif name == "--all-targets":
+                lib = all_tests = other = True
+            else:
+                other = True
+    selection: TargetSelection = (
+        ExplicitTargets(lib, frozenset(tests), all_tests, other) if explicit else DefaultTargets()
+    )
     return CargoInvocation(
-        command, toolchain, directory, sub, tuple(packages), workspace, tuple(bins), manifest, tuple(crates), install_path
+        command, toolchain, directory, sub, tuple(packages), workspace, tuple(bins), manifest, tuple(crates),
+        install_path, target, frozenset(features), all_features, no_default_features, selection, filtered, no_run,
     )
 
 

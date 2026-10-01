@@ -36,7 +36,7 @@ fn def_projects_the_authoritative_methods() {
 
 /// The vendored runtime source root, relative to this crate's manifest.
 fn runtime_src_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/rust/src")
+    e2e_support::manifest_dir!().join("../../runtime/rust/src")
 }
 
 /// The set of source files that make up a conditionally-vendored

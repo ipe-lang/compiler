@@ -21,10 +21,10 @@
 //! constructor would still type-check but print `2,1`. Running the emitted
 //! binary is therefore the only sound check of field-order correctness.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -32,7 +32,7 @@ const EXPECTED_STDOUT: &str = "7/hi\n1,2\n4\n99n\n60\nok\n";
 
 #[test]
 fn record_ctor_end_to_end_field_order() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -44,9 +44,7 @@ fn record_ctor_end_to_end_field_order() {
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -75,15 +73,13 @@ fn record_ctor_and_literal_share_one_struct() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_twin_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let emitted = std::fs::read_to_string(out.join("src").join("main.rs"));
     assert!(emitted.is_ok(), "emitted main.rs must read");
-    let Ok(src) = emitted else { return };
+    let src = emitted.expect("`emitted` must succeed");
 
     // The `{ x, y }` shape resolves to `RecXY` (camel-cased field set). It must
     // be declared exactly once — the constructor reuses the literal's struct.
@@ -132,9 +128,7 @@ fn seal_fn_field_alias_emits_no_struct() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_fn_field_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — a function-embedding alias that is merely NAMED
     // (declared, never constructed) is a valid program.
     let built = ipe::build(&entry, &out, &runtime);
@@ -146,7 +140,7 @@ fn seal_fn_field_alias_emits_no_struct() {
 
     let emitted = std::fs::read_to_string(out.join("src").join("main.rs"));
     assert!(emitted.is_ok(), "emitted main.rs must read");
-    let Ok(src) = emitted else { return };
+    let src = emitted.expect("`emitted` must succeed");
     // No constructor was synthesised, so the field-set struct (`RecChecks`) and
     // the `main_Handlers` ctor function must be ABSENT — their presence would
     // mean a `Box<dyn Fn>`-field struct was emitted (the seal hole).
@@ -166,7 +160,7 @@ fn seal_fn_field_alias_emits_no_struct() {
 /// cargo-success is the seal violation.
 #[test]
 fn seal_fn_field_alias_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -178,9 +172,7 @@ fn seal_fn_field_alias_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_fn_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "ipe build failed: {:?}", built.err());
 
@@ -212,9 +204,7 @@ fn seal_opaque_field_alias_emits_no_struct() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_opaque_field_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — an opaque-wrapper-field alias that is merely NAMED
     // (declared, never constructed) is a valid program.
     let built = ipe::build(&entry, &out, &runtime);
@@ -226,7 +216,7 @@ fn seal_opaque_field_alias_emits_no_struct() {
 
     let emitted = std::fs::read_to_string(out.join("src").join("main.rs"));
     assert!(emitted.is_ok(), "emitted main.rs must read");
-    let Ok(src) = emitted else { return };
+    let src = emitted.expect("`emitted` must succeed");
     // No constructor was synthesised, so the field-set struct (`RecDec`) and the
     // `main_D` ctor function must be ABSENT — their presence would mean a
     // `#[derive(…)]` struct over the non-derivable `Decoder` was emitted (the
@@ -247,7 +237,7 @@ fn seal_opaque_field_alias_emits_no_struct() {
 /// without a matching cargo-success (E0277/E0369/E0599 over `Decoder`).
 #[test]
 fn seal_opaque_field_alias_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -259,9 +249,7 @@ fn seal_opaque_field_alias_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_opaque_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "ipe build failed: {:?}", built.err());
 
@@ -290,9 +278,7 @@ fn seal_opaque_field_used_as_ctor_fails_closed() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m82_record_ctor_opaque_ctor_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -308,7 +294,7 @@ fn seal_opaque_field_used_as_ctor_fails_closed() {
 
 #[test]
 fn record_ctor_cross_module_end_to_end() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -320,9 +306,7 @@ fn record_ctor_cross_module_end_to_end() {
     let out = crate::support::scratch_root().join("ipec_m82_record_ctor_xmod_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_project(&manifest, &out, &runtime);
     assert!(
         built.is_ok(),

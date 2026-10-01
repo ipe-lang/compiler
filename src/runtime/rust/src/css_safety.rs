@@ -948,6 +948,7 @@ pub(crate) fn neutralise_script_close(body: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

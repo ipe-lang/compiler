@@ -203,8 +203,7 @@ fn compile_and_build_with_files(
         .join(format!("webview_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, webview_host_options())
         .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
@@ -237,7 +236,7 @@ fn is_missing_linux_webview_system_libs(err: &str) -> bool {
 ///   `webview` module line.
 #[test]
 fn webview_counter_build_only() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -267,7 +266,7 @@ fn webview_counter_build_only() -> Result<(), BoxError> {
 /// a served `Web` build; a clean `cargo build` is the proof.
 #[test]
 fn webview_ui_widget_seal_builds() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -302,7 +301,7 @@ fn webview_ui_widget_seal_builds() -> Result<(), BoxError> {
 /// skipped and why.
 #[test]
 fn webview_counter_tier_b() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 

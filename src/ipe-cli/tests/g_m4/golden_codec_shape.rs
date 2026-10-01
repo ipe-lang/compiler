@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -34,7 +34,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project, run
 /// it, and assert its stdout matches the cached oracle. Gated on `IPE_E2E=1`.
 fn assert_runs_and_matches_oracle(name: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -44,9 +44,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
@@ -64,9 +62,7 @@ fn codec_shape_accepts_and_emits() {
     let out = crate::support::scratch_root().join("ipec_codec_shape_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip, matches the sibling goldens
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -95,9 +91,7 @@ fn codec_timestamp_role_rejects_raw_int() {
     let out = crate::support::scratch_root().join("ipec_codec_timestamp_role_reject_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip, matches the sibling goldens
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),

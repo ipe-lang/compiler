@@ -1233,6 +1233,7 @@ pub fn color_simulate(deficiency: Deficiency, c: Color) -> Color {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

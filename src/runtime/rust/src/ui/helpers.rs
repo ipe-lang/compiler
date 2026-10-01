@@ -1591,6 +1591,7 @@ pub fn ui_breakpoint_<M: Clone>(
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod script_node_tests {
     use super::html_script_node_;
     use crate::css_safety::neutralise_script_close;
@@ -1639,6 +1640,7 @@ mod script_node_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod link_tests {
     use super::ui_link_;
     use super::{Attribute, Element};

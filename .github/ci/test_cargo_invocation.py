@@ -65,11 +65,54 @@ class TestParse(unittest.TestCase):
             ("cargo build --frob", "option '--frob'"),
             ("cargo build -p", "lacks its value"),
             ("cargo build stray", "operand 'stray'"),
+            ("cargo test --frob --lib", "option '--frob'"),
+            ("cargo test --target", "lacks its value"),
+            ("cargo test --target=", "--target lacks its value"),
+            ("cargo test --target a --target b", "more than one --target"),
+            ("cargo test --features=", "names no feature"),
+            ("cargo test -F ,", "names no feature"),
+            ("cargo test --test=", "--test lacks its value"),
+            ("cargo nextest run --frob", "option '--frob'"),
         ):
             with self.subTest(line=line):
                 got = _parse(line)
                 self.assertIsInstance(got, str)
                 self.assertIn(needle, got)  # type: ignore[arg-type]
+
+
+class TestTargetsAndFeatures(unittest.TestCase):
+    def test_target_features_and_flags(self) -> None:
+        inv = _parse("cargo test -p a --target wasm32-unknown-unknown -F x,y --features=z -Fw --no-default-features --lib")
+        assert isinstance(inv, cargo_invocation.CargoInvocation), inv
+        self.assertEqual(inv.target, "wasm32-unknown-unknown")
+        self.assertEqual(inv.features, frozenset({"x", "y", "z", "w"}))
+        self.assertTrue(inv.no_default_features)
+        self.assertFalse(inv.all_features)
+        inv = _parse("cargo test --all-features --no-run filt")
+        assert isinstance(inv, cargo_invocation.CargoInvocation), inv
+        self.assertEqual((inv.all_features, inv.no_run, inv.filtered, inv.target), (True, True, True, None))
+
+    def test_selection(self) -> None:
+        for line, lib, named, other in (
+            ("cargo test", True, True, True),
+            ("cargo test --lib", True, False, False),
+            ("cargo test --test n", False, True, False),
+            ("cargo test --test m", False, False, False),
+            ("cargo test --tests", False, True, False),
+            ("cargo test --all-targets", True, True, True),
+            ("cargo test --bins", False, False, True),
+            ("cargo test --lib --test=n", True, True, False),
+        ):
+            with self.subTest(line=line):
+                inv = _parse(line)
+                assert isinstance(inv, cargo_invocation.CargoInvocation), inv
+                sel = inv.selection
+                self.assertEqual((sel.selects("lib"), sel.selects("test:n")), (lib, named))
+                self.assertFalse(sel.selects("n"))
+                if isinstance(sel, cargo_invocation.ExplicitTargets):
+                    self.assertEqual(sel.other, other)
+                else:
+                    self.assertTrue(other)
 
 
 class TestResolve(unittest.TestCase):

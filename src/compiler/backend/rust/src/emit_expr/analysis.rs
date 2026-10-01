@@ -147,7 +147,6 @@ pub fn fn_binder_used_as_value(sym: Symbol, body: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -213,7 +212,6 @@ pub fn expr_refs_symbol(sym: Symbol, expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

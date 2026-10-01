@@ -160,7 +160,6 @@ fn collect_expr(map: &mut BTreeMap<SymbolKey, Vec<Reference>>, expr: &Expr, cont
         | Expr_::Float(_)
         | Expr_::Str(_)
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Unit => {}
 

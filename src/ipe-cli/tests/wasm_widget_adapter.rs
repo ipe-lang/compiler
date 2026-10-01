@@ -85,7 +85,7 @@ fn emit_wasm(test_name: &str) -> Result<std::path::PathBuf, BoxError> {
         .join(format!("wasm_widget_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let mut opts = BuildOptions::from_env();
     opts.target = ipe_ir::Target::WasmClient;
     ipe::build_with_options(&entry, &out_dir, &runtime, opts)

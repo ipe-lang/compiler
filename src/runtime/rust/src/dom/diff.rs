@@ -293,6 +293,7 @@ fn render_children<M>(parent_tag: &str, kids: &[Html<M>]) -> String {
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
     use crate::{Event, assign_ipe_ids};

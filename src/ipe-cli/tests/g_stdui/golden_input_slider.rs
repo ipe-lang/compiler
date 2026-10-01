@@ -12,10 +12,10 @@
 //! diagnostic, no panic.  It does NOT run cargo or the emitted binary (no
 //! `IPE_E2E` required).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -32,9 +32,7 @@ fn input_slider_typechecks_and_lowers() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i148_input_slider_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let result = ipe::build(&entry, &out, &runtime);
     assert!(
         result.is_ok(),

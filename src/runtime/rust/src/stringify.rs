@@ -363,6 +363,7 @@ impl IpeStringify for serde_json::Value {
 // no separate `Stringify` impl is needed.
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

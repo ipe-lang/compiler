@@ -173,12 +173,10 @@ fn a_marked_borrowed_return_method_over_drops() {
 /// hand-written trait impl.
 #[test]
 fn the_marker_surfaces_the_type_and_the_emitted_crate_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(cargo) = ipe_env::var("CARGO") else {
-        return; // no cargo on PATH in this environment — skip like the goldens
-    };
+    let cargo = ipe_env::var("CARGO").expect("cargo sets CARGO for every test it runs");
 
     // The built inspector binary sits beside the test deps under the target dir;
     // `env!` gives the ffi crate dir, from which the workspace target is
@@ -305,7 +303,7 @@ fn inspect_marked_wrapper(
 ) -> Option<PkgInfo> {
     // The `ipe_bindgen` marker crate lives beside the ffi crate in the
     // workspace; the wrapper depends on it by an absolute `path`.
-    let define_crate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let define_crate = e2e_support::manifest_dir!()
         .join("../../ffi-bindgen-macro")
         .canonicalize()
         .expect("ipe_bindgen crate resolves");

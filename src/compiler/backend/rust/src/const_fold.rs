@@ -222,7 +222,6 @@ fn fold_expr(expr: Expr, funcs: &BTreeMap<FuncId, &Func>, interner: &Interner) -
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -493,7 +492,6 @@ fn body_has_tail_construct(expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -571,7 +569,6 @@ fn substitute(expr: Expr, subst: &BTreeMap<Symbol, Expr>) -> Expr {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

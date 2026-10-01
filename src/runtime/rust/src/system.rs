@@ -539,6 +539,325 @@ fn apply_env_overlay(builder: &mut std::process::Command) {
     }
 }
 
+/// Why a hardened spawn was refused.
+///
+/// Every variant is a refusal: a hardened spawn never degrades to an unhardened
+/// one. The variants split on whether a child can exist. `Spawn` and
+/// `SpawnPanicked` from `spawn_hardened_tokio` may follow the fork: tokio drops
+/// a child it forked but failed to register without killing it, and that child
+/// runs until this process exits, when the parent-death floor SIGTERMs it
+/// (Linux only; elsewhere nothing bounds it by this process). Every other
+/// variant, and every variant from `spawn_hardened`, leaves no child running.
+#[derive(Debug)]
+pub enum SpawnRefusal {
+    /// The process-lifetime spawner thread could not be started.
+    SpawnerUnavailable(std::io::ErrorKind),
+    /// The spawner thread is gone: its job queue or the reply was disconnected.
+    SpawnerGone,
+    /// The spawner neither accepted nor answered the request within the ceiling.
+    ///
+    /// A child the spawner hands back for the abandoned request afterwards is
+    /// killed; one tokio forks and then fails to register is the `Spawn` case,
+    /// which no requester sees.
+    ReplyTimedOut,
+    /// The runtime refused the child listener claimed before the fork.
+    ///
+    /// Nothing was forked.
+    #[cfg(all(feature = "web", unix))]
+    ProbeRefused(std::io::Error),
+    /// Claiming the child listener before the fork panicked.
+    ///
+    /// Nothing was forked. Tokio panics here when the runtime was built without
+    /// `enable_io`. Reachable only where panics unwind: under `panic = "abort"`
+    /// (every emitted release build) the panic aborts the process instead.
+    #[cfg(all(feature = "web", unix))]
+    ProbePanicked,
+    /// The spawn panicked on the spawner thread, which caught it and lives on.
+    ///
+    /// From `spawn_hardened_tokio` the panic may follow the fork (tokio panics
+    /// registering a child with a runtime missing a driver), leaving a child
+    /// that only the parent-death floor bounds. Reachable only where panics
+    /// unwind: under `panic = "abort"` (every emitted release build) the panic
+    /// aborts the process, and the floor SIGTERMs any forked child.
+    SpawnPanicked,
+    /// `spawn_hardened_tokio` was called outside a tokio runtime.
+    #[cfg(all(feature = "web", not(target_arch = "wasm32")))]
+    NoRuntime,
+    /// The spawn failed.
+    ///
+    /// From `spawn_hardened` nothing is left running: std reaps a child whose
+    /// `exec` failed. From `spawn_hardened_tokio` the error may follow the
+    /// fork, when tokio fails to register the forked child (a driver shutting
+    /// down, a stdio or pidfd registration refused) and drops it unkilled; that
+    /// child is bounded only by the parent-death floor.
+    Spawn(std::io::Error),
+}
+
+impl std::fmt::Display for SpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpawnerUnavailable(kind) => {
+                write!(f, "the process spawner thread could not start ({kind})")
+            }
+            Self::SpawnerGone => f.write_str("the process spawner thread is gone"),
+            Self::ReplyTimedOut => f.write_str("the process spawner did not answer in time"),
+            #[cfg(all(feature = "web", unix))]
+            Self::ProbeRefused(e) => write!(
+                f,
+                "the tokio runtime refused a child listener; nothing was spawned ({})",
+                e.kind()
+            ),
+            #[cfg(all(feature = "web", unix))]
+            Self::ProbePanicked => f.write_str(
+                "the tokio runtime has no IO or signal driver for a child; nothing was spawned",
+            ),
+            Self::SpawnPanicked => f.write_str("the spawn panicked on the process spawner thread"),
+            #[cfg(all(feature = "web", not(target_arch = "wasm32")))]
+            Self::NoRuntime => f.write_str("no tokio runtime is active on the spawning thread"),
+            Self::Spawn(e) => write!(f, "spawn failed ({})", e.kind()),
+        }
+    }
+}
+
+impl std::error::Error for SpawnRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(e) => Some(e),
+            #[cfg(all(feature = "web", unix))]
+            Self::ProbeRefused(e) => Some(e),
+            #[cfg(all(feature = "web", unix))]
+            Self::ProbePanicked => None,
+            #[cfg(all(feature = "web", not(target_arch = "wasm32")))]
+            Self::NoRuntime => None,
+            Self::SpawnerUnavailable(_)
+            | Self::SpawnerGone
+            | Self::ReplyTimedOut
+            | Self::SpawnPanicked => None,
+        }
+    }
+}
+
+impl From<SpawnRefusal> for std::io::Error {
+    fn from(refusal: SpawnRefusal) -> Self {
+        match refusal {
+            SpawnRefusal::Spawn(e) => e,
+            #[cfg(all(feature = "web", unix))]
+            refused @ (SpawnRefusal::ProbeRefused(_) | SpawnRefusal::ProbePanicked) => {
+                Self::other(refused)
+            }
+            #[cfg(all(feature = "web", not(target_arch = "wasm32")))]
+            refused @ SpawnRefusal::NoRuntime => Self::other(refused),
+            refused @ (SpawnRefusal::SpawnerUnavailable(_)
+            | SpawnRefusal::SpawnerGone
+            | SpawnRefusal::ReplyTimedOut
+            | SpawnRefusal::SpawnPanicked) => Self::other(refused),
+        }
+    }
+}
+
+/// Longest a hardened spawn waits for the spawner to accept and answer it.
+const SPAWN_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Most spawn requests queued on the spawner at once; a full queue is retried
+/// until `SPAWN_REPLY_CEILING`, never grown.
+const SPAWN_QUEUE_BOUND: usize = 16;
+
+/// Pause between attempts to enqueue on a full spawner queue.
+const SPAWN_QUEUE_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// One spawn request, run on the spawner thread.
+type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The spawner's job queue, or why its thread could not start.
+type SpawnerSlot = Result<std::sync::mpsc::SyncSender<SpawnJob>, std::io::ErrorKind>;
+
+/// The process-lifetime spawner thread's job queue.
+///
+/// The sender lives in a `static`, so the queue never disconnects and the
+/// thread's `recv` loop never ends: the thread lives as long as the process.
+/// `PR_SET_PDEATHSIG` fires when the FORKING THREAD exits, so forking only here
+/// makes the signal mean "the process died", never "some worker thread was
+/// reaped".
+///
+/// Jobs run one at a time, so a spawn stuck in the kernel (an `exec` in
+/// uninterruptible sleep) delays every later request. The delay is bounded: a
+/// queued requester gives up at `SPAWN_REPLY_CEILING` with `ReplyTimedOut`, and
+/// the child forked for it afterwards is reclaimed, never handed out unhardened.
+fn spawner() -> Result<&'static std::sync::mpsc::SyncSender<SpawnJob>, SpawnRefusal> {
+    static SPAWNER: std::sync::OnceLock<SpawnerSlot> = std::sync::OnceLock::new();
+    SPAWNER
+        .get_or_init(|| {
+            let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(SPAWN_QUEUE_BOUND);
+            std::thread::Builder::new()
+                .name("ipe-spawner".to_owned())
+                .spawn(move || run_spawn_jobs(&queue))
+                .map(|_| jobs)
+                .map_err(|e| e.kind())
+        })
+        .as_ref()
+        .map_err(|kind| SpawnRefusal::SpawnerUnavailable(*kind))
+}
+
+/// Run every job `queue` yields, until it disconnects.
+///
+/// A panicking job is contained so the spawner outlives it. A job's spawn
+/// panic is answered inside the job as `SpawnPanicked`; this containment is
+/// the backstop for a panic anywhere else in a job.
+fn run_spawn_jobs(queue: &std::sync::mpsc::Receiver<SpawnJob>) {
+    while let Ok(job) = queue.recv() {
+        let _unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    }
+}
+
+/// Run `spawn` on the spawner behind `jobs` and hand its child back.
+///
+/// A child whose requester is no longer waiting is passed to `discard` on the
+/// spawner thread, so a child `spawn` hands back to an abandoned request never
+/// stays running. A panic out of `spawn` is caught on the spawner thread and
+/// answered as `SpawnPanicked`.
+fn request_spawn<T: Send + 'static>(
+    jobs: &std::sync::mpsc::SyncSender<SpawnJob>,
+    ceiling: std::time::Duration,
+    spawn: impl FnOnce() -> Result<T, SpawnRefusal> + Send + 'static,
+    discard: fn(T),
+) -> Result<T, SpawnRefusal> {
+    use std::sync::mpsc::{RecvTimeoutError, SendError, TrySendError};
+
+    let start = std::time::Instant::now();
+    // Capacity 0 makes the reply a rendezvous: a child is handed over only to a
+    // requester still inside `recv_timeout`. A buffered slot would accept a
+    // child sent just after the requester timed out, and dropping the receiver
+    // would then drop that child unkilled; with no slot the late `send` fails
+    // and `discard` reclaims the child on the spawner thread.
+    let (reply, answer) = std::sync::mpsc::sync_channel::<Result<T, SpawnRefusal>>(0);
+    let mut job: SpawnJob = Box::new(move || {
+        let spawned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(spawn)) {
+            Ok(spawned) => spawned,
+            Err(_payload) => Err(SpawnRefusal::SpawnPanicked),
+        };
+        if let Err(SendError(Ok(child))) = reply.send(spawned) {
+            discard(child);
+        }
+    });
+    loop {
+        match jobs.try_send(job) {
+            Ok(()) => break,
+            Err(TrySendError::Disconnected(_)) => return Err(SpawnRefusal::SpawnerGone),
+            Err(TrySendError::Full(back)) => {
+                if start.elapsed() >= ceiling {
+                    return Err(SpawnRefusal::ReplyTimedOut);
+                }
+                job = back;
+                std::thread::sleep(SPAWN_QUEUE_RETRY);
+            }
+        }
+    }
+    match answer.recv_timeout(ceiling.saturating_sub(start.elapsed())) {
+        Ok(spawned) => spawned,
+        Err(RecvTimeoutError::Timeout) => Err(SpawnRefusal::ReplyTimedOut),
+        Err(RecvTimeoutError::Disconnected) => Err(SpawnRefusal::SpawnerGone),
+    }
+}
+
+/// Spawn `cmd` with the parent-death floor, forked by the spawner thread.
+///
+/// On Linux the child is SIGTERMed when this process dies by ANY means, and
+/// never earlier: the forking thread is the process-lifetime spawner, not the
+/// caller's (possibly short-lived) thread.
+///
+/// # Thread attributes
+///
+/// The child inherits the per-thread kernel attributes of the spawner thread,
+/// not of the requesting thread: its seccomp filter, Landlock domain,
+/// `no_new_privs` bit, CPU affinity and namespaces. A restriction a caller
+/// applies only to its own thread does not reach the child.
+///
+/// # Errors
+///
+/// A `SpawnRefusal` when the spawner is unavailable, gone, or silent past
+/// `SPAWN_REPLY_CEILING`, or when the spawn itself fails. No refusal leaves a
+/// child running, and none ever falls back to an unhardened spawn.
+pub fn spawn_hardened(cmd: std::process::Command) -> Result<std::process::Child, SpawnRefusal> {
+    spawn_hardened_on(spawner()?, SPAWN_REPLY_CEILING, cmd)
+}
+
+/// `spawn_hardened` against an explicit spawner queue and reply ceiling.
+fn spawn_hardened_on(
+    jobs: &std::sync::mpsc::SyncSender<SpawnJob>,
+    ceiling: std::time::Duration,
+    mut cmd: std::process::Command,
+) -> Result<std::process::Child, SpawnRefusal> {
+    request_spawn(
+        jobs,
+        ceiling,
+        move || {
+            harden_child_parent_death(&mut cmd);
+            cmd.spawn().map_err(SpawnRefusal::Spawn)
+        },
+        |mut child: std::process::Child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        },
+    )
+}
+
+/// Spawn a tokio `cmd` with the parent-death floor, forked by the spawner thread.
+///
+/// The child is registered with the caller's tokio runtime (the spawner enters
+/// the caller's runtime handle to spawn it), so it is awaited like any tokio
+/// child, and the caller's `kill_on_drop` still applies. A child abandoned by
+/// a timed-out requester is killed; tokio's orphan queue reaps it when the
+/// runtime next handles `SIGCHLD`.
+///
+/// Registering a child needs the runtime's IO and signal drivers, and tokio
+/// panics when they are absent. On Unix the spawner claims a `SIGCHLD`
+/// listener before it forks, so a runtime built without `enable_io` is refused
+/// as `ProbePanicked`, and a refused listener as `ProbeRefused`, with no child
+/// forked.
+///
+/// # Errors
+///
+/// `SpawnRefusal::NoRuntime` when called outside a tokio runtime, the probe
+/// refusals above, otherwise the refusals of `spawn_hardened`. A `Spawn` or
+/// `SpawnPanicked` refusal here may follow the fork and leave a child that only
+/// the parent-death floor bounds (see [`SpawnRefusal`]). No refusal ever falls
+/// back to an unhardened spawn.
+#[cfg(all(feature = "web", not(target_arch = "wasm32")))]
+pub fn spawn_hardened_tokio(
+    mut cmd: tokio::process::Command,
+) -> Result<tokio::process::Child, SpawnRefusal> {
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| SpawnRefusal::NoRuntime)?;
+    request_spawn(
+        spawner()?,
+        SPAWN_REPLY_CEILING,
+        move || {
+            let _runtime = handle.enter();
+            #[cfg(unix)]
+            let _drivers = probe_child_listener()?;
+            harden_child_parent_death(cmd.as_std_mut());
+            cmd.spawn().map_err(SpawnRefusal::Spawn)
+        },
+        |mut child: tokio::process::Child| {
+            let _ = child.start_kill();
+        },
+    )
+}
+
+/// Claim a `SIGCHLD` listener on the entered runtime before any fork.
+///
+/// Tokio panics claiming it on a runtime without its IO or signal driver; the
+/// panic is caught here so it surfaces as `ProbePanicked`, distinct from a
+/// panic after the fork.
+#[cfg(all(feature = "web", unix))]
+fn probe_child_listener() -> Result<tokio::signal::unix::Signal, SpawnRefusal> {
+    use tokio::signal::unix::{SignalKind, signal};
+    match std::panic::catch_unwind(|| signal(SignalKind::child())) {
+        Ok(Ok(listener)) => Ok(listener),
+        Ok(Err(e)) => Err(SpawnRefusal::ProbeRefused(e)),
+        Err(_payload) => Err(SpawnRefusal::ProbePanicked),
+    }
+}
+
 /// Give a child the non-graceful death floor: if the parent process dies by ANY
 /// means (SIGKILL, OOM, panic-abort — the paths a signal handler or `Drop` can
 /// never run on) the kernel delivers SIGTERM to the child, so it can never
@@ -546,19 +865,18 @@ fn apply_env_overlay(builder: &mut std::process::Command) {
 /// non-Linux (where graceful shutdown / kill-tracking are the only floor).
 ///
 /// THE single sanctioned `PR_SET_PDEATHSIG` site in the whole workspace (see
-/// `PRINCIPLES.md` / `AGENTS.md`). Both callers route their child here:
-/// `ipe watch`'s `spawn_command` (a `std::process::Command`) and the runtime's
-/// `web::console_proxy::spawn_console` (a `tokio::process::Command`, via its
-/// `as_std_mut()` view — the `pre_exec` set here is honoured by tokio's spawn).
-/// Its `kill_on_drop` covers the graceful paths the std side handles via explicit
-/// `Child` tracking; this floor is the shared NON-graceful guarantee.
+/// `PRINCIPLES.md` / `AGENTS.md`). Private: it runs only inside a spawn job on
+/// the process-lifetime spawner thread (`spawn_hardened` /
+/// `spawn_hardened_tokio`), because the kernel fires the signal when the thread
+/// that FORKED the child exits, and only that thread lives as long as the
+/// process.
 ///
 /// A parent that dies after the fork but before the child armed the signal
 /// leaves the child already reparented, so the signal would never fire. The
 /// child therefore compares its parent pid, AFTER arming, with the launcher
 /// pid captured before the spawn, and refuses to exec (`ESRCH`) on a mismatch:
 /// no orphan survives the fork-to-`prctl` window.
-pub fn harden_child_parent_death(_builder: &mut std::process::Command) {
+fn harden_child_parent_death(_builder: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt as _;
@@ -699,6 +1017,7 @@ fn process_run_with_cap<E: Send + From<String> + 'static>(
         // panicked) doesn't need `cmd` — it's moved into the closure.
         match run_blocking(move || process_run_sync(&cmd, &args, cap)).await {
             Ok(out) => {
+                #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
                 let text = String::from_utf8_lossy(&out.combined).into_owned();
                 if out.success {
                     ok_res(text)
@@ -813,12 +1132,16 @@ fn process_run_with_sync(
     }
 
     let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
+    #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
     #[allow(non_snake_case)]
     Ok(ProcessRunOutput {
         exitCode: i64::from(status.code().unwrap_or(-1)),
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        stdout,
+        stderr,
     })
 }
 
@@ -1124,11 +1447,13 @@ fn process_run_in_pty_sync(cfg: ProcessRunInPtyCfg, cap: u64) -> Result<ProcessP
     }
 
     let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
+    #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
+    let output = String::from_utf8_lossy(&combined).into_owned();
 
     #[allow(non_snake_case)]
     Ok(ProcessPtyOutput {
         exitCode: i64::from(status.code().unwrap_or(-1)),
-        output: String::from_utf8_lossy(&combined).into_owned(),
+        output,
     })
 }
 
@@ -1354,6 +1679,7 @@ pub fn system_load_env<E: Send + 'static>(_: ()) -> IpeTask<E, ()> {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod temp_root_env_tests {
     use super::{locked_remove_var, locked_set_var, read_env_var};
     use std::env::VarError;
@@ -1399,6 +1725,7 @@ mod temp_root_env_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod exit_hook_tests {
     use super::{register_exit_hook, run_exit_hook};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1425,6 +1752,7 @@ mod exit_hook_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod gutter_line_tests {
     use super::gutter_line;
 
@@ -1460,6 +1788,7 @@ mod gutter_line_tests {
 /// regression (a new call site hand-rolling the tag) without reimplementing a
 /// Rust parser.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod runtime_log_emitter_tests {
     use std::path::{Path, PathBuf};
 
@@ -1549,6 +1878,7 @@ mod runtime_log_emitter_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod scrub_log_controls_tests {
     use super::{runtime_log_line, scrub_log_controls};
 
@@ -1635,19 +1965,213 @@ mod home_dir_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod parent_death_floor_tests {
-    use super::harden_child_parent_death;
+    use super::{SpawnJob, SpawnRefusal, run_spawn_jobs, spawn_hardened, spawn_hardened_on};
+    use std::time::Duration;
 
-    /// The floor installs a fork-time `pre_exec` (Linux `PR_SET_PDEATHSIG`); on
-    /// every OS a hardened child must still spawn and run normally — the prctl is
-    /// async-signal-safe and best-effort, so it can never break the spawn. Pins
-    /// that routing a `Command` through the floor keeps it launchable.
+    /// The floor installs a fork-time `pre_exec` (Linux `PR_SET_PDEATHSIG`); a
+    /// child spawned through the spawner must still spawn and run normally — the
+    /// prctl is async-signal-safe and best-effort, so it can never break the
+    /// spawn.
+    #[cfg(unix)]
     #[test]
     fn hardened_child_still_spawns_and_runs() {
-        let mut cmd = std::process::Command::new("/bin/true");
-        harden_child_parent_death(&mut cmd);
-        let status = cmd.status().expect("hardened child must spawn");
+        let mut child = spawn_hardened(std::process::Command::new("/bin/true"))
+            .expect("hardened child must spawn");
+        let status = child.wait().expect("reap hardened /bin/true");
         assert!(status.success(), "hardened /bin/true must exit 0");
+    }
+
+    /// A spawn the OS refuses surfaces as `SpawnRefusal::Spawn` carrying the OS
+    /// error, which converts back to that same `io::Error` kind.
+    #[test]
+    fn an_os_refused_spawn_is_a_spawn_refusal() {
+        let refused = spawn_hardened(std::process::Command::new("/nonexistent/ipe-spawn-probe"));
+        let kind = match &refused {
+            Err(SpawnRefusal::Spawn(e)) => Some(e.kind()),
+            _ => None,
+        };
+        assert_eq!(kind, Some(std::io::ErrorKind::NotFound), "{refused:?}");
+        let io = std::io::Error::from(SpawnRefusal::Spawn(std::io::ErrorKind::NotFound.into()));
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+        let gone = std::io::Error::from(SpawnRefusal::SpawnerGone);
+        assert_eq!(gone.kind(), std::io::ErrorKind::Other);
+    }
+
+    /// A spawner whose queue is gone refuses the request and forks nothing: no
+    /// unhardened fallback runs the command.
+    #[cfg(unix)]
+    #[test]
+    fn a_gone_spawner_refuses_and_never_spawns() {
+        let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
+        drop(queue);
+        let marker = crate::scratch_core::test_temp_root()
+            .join(format!("ipe-spawner-gone-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(": > \"$1\"").arg("sh").arg(&marker);
+        let refused = spawn_hardened_on(&jobs, Duration::from_secs(5), cmd);
+        assert!(
+            matches!(refused, Err(SpawnRefusal::SpawnerGone)),
+            "{refused:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused spawn must never run the command"
+        );
+    }
+
+    /// A request that finds the spawner queue still full at its ceiling is
+    /// refused and forks nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_queue_past_the_ceiling_refuses_and_never_spawns() {
+        let (jobs, _queue) = std::sync::mpsc::sync_channel::<SpawnJob>(0);
+        let marker = crate::scratch_core::test_temp_root()
+            .join(format!("ipe-spawner-full-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(": > \"$1\"").arg("sh").arg(&marker);
+        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd);
+        assert!(
+            matches!(refused, Err(SpawnRefusal::ReplyTimedOut)),
+            "{refused:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused spawn must never run the command"
+        );
+    }
+
+    /// Unwinds out of a spawn job, the way a panicking job would.
+    fn unwinding_job() {
+        std::panic::resume_unwind(Box::new(()));
+    }
+
+    /// A job that panics leaves the spawner running the jobs after it.
+    #[test]
+    fn a_panicking_job_does_not_stop_the_spawner() {
+        let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(2);
+        let (ran, seen) = std::sync::mpsc::channel::<()>();
+        jobs.send(Box::new(unwinding_job))
+            .expect("queue the unwinding job");
+        jobs.send(Box::new(move || {
+            let _ = ran.send(());
+        }))
+        .expect("queue the next job");
+        drop(jobs);
+        let runner = std::thread::spawn(move || run_spawn_jobs(&queue));
+        let next = seen.recv_timeout(Duration::from_secs(10));
+        runner.join().expect("the spawner loop must not unwind");
+        assert_eq!(next, Ok(()), "the job after an unwind must still run");
+    }
+
+    /// A spawn that panics on the spawner is refused as `SpawnPanicked`, never
+    /// relabelled `SpawnerGone`, and the spawner runs the next request.
+    #[test]
+    fn a_panicking_spawn_is_refused_as_spawn_panicked() {
+        use super::request_spawn;
+        let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
+        let runner = std::thread::spawn(move || run_spawn_jobs(&queue));
+        let refused = request_spawn(
+            &jobs,
+            Duration::from_secs(10),
+            || -> Result<(), SpawnRefusal> { std::panic::resume_unwind(Box::new(())) },
+            |(): ()| {},
+        );
+        let next = request_spawn(&jobs, Duration::from_secs(10), || Ok(()), |(): ()| {});
+        drop(jobs);
+        runner.join().expect("the spawner loop must not unwind");
+        assert!(
+            matches!(refused, Err(SpawnRefusal::SpawnPanicked)),
+            "{refused:?}"
+        );
+        assert!(next.is_ok(), "{next:?}");
+    }
+
+    /// A tokio runtime without its IO driver is refused before the fork.
+    ///
+    /// The refusal is `ProbePanicked`, which only the pre-fork probe yields
+    /// (without it tokio panics after the fork, as `SpawnPanicked`). The command
+    /// would hold a pipe's only other write end: the pipe reaches EOF with no
+    /// byte written, so no child ever ran, and it does so once the spawner has
+    /// dropped the command, with no timing race.
+    #[cfg(all(feature = "web", unix))]
+    #[test]
+    fn a_runtime_without_io_refuses_before_forking() {
+        use super::spawn_hardened_tokio;
+        use std::io::Read as _;
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("echo forked")
+            .stdout(writer)
+            .kill_on_drop(true);
+        let refused = rt.block_on(async { spawn_hardened_tokio(cmd) });
+        assert!(
+            matches!(refused, Err(SpawnRefusal::ProbePanicked)),
+            "{refused:?}"
+        );
+        let (drained, eof) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = drained.send(reader.read_to_end(&mut out).map(|_| out));
+        });
+        let written = eof.recv_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(&written, Ok(Ok(out)) if out.is_empty()),
+            "a refused spawn must never run the command: {written:?}"
+        );
+    }
+
+    /// A spawner that drops a request without answering it is reported gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_request_is_reported_gone() {
+        let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
+        let dropper = std::thread::spawn(move || drop(queue.recv()));
+        let refused = spawn_hardened_on(
+            &jobs,
+            Duration::from_secs(5),
+            std::process::Command::new("/bin/true"),
+        );
+        dropper.join().expect("dropper thread");
+        assert!(
+            matches!(refused, Err(SpawnRefusal::SpawnerGone)),
+            "{refused:?}"
+        );
+    }
+
+    /// A request abandoned past its ceiling is refused, and the child the
+    /// spawner forks for it afterwards is killed and reaped rather than left
+    /// running: the pipe the child holds reaches EOF long before the child's
+    /// own 30s sleep would end.
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_reply_kills_and_reaps_the_child() {
+        use std::io::Read as _;
+        let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("30").stdout(writer);
+        let refused = spawn_hardened_on(&jobs, Duration::ZERO, cmd);
+        assert!(
+            matches!(refused, Err(SpawnRefusal::ReplyTimedOut)),
+            "{refused:?}"
+        );
+        let job = queue.recv().expect("the abandoned request stays queued");
+        let started = std::time::Instant::now();
+        job();
+        let mut drained = Vec::new();
+        reader.read_to_end(&mut drained).expect("read to EOF");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the abandoned child must be killed, not left to run"
+        );
     }
 
     /// A child reparented before it armed the signal (its launcher died in the
@@ -1668,6 +2192,7 @@ mod parent_death_floor_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod env_overlay_tests {
     use super::*;
 
@@ -1755,6 +2280,7 @@ mod env_overlay_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod process_run_tests {
     use super::*;
 
@@ -1872,6 +2398,7 @@ mod process_run_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod process_run_with_tests {
     use super::*;
 
@@ -2147,6 +2674,7 @@ mod process_run_in_pty_tests {
 }
 
 #[cfg(all(test, feature = "tokio"))]
+#[cfg(not(target_arch = "wasm32"))]
 mod process_run_spawn_blocking_tests {
     use super::*;
     use std::sync::Arc;
@@ -2198,6 +2726,7 @@ mod process_run_spawn_blocking_tests {
 }
 
 #[cfg(all(test, feature = "tokio"))]
+#[cfg(not(target_arch = "wasm32"))]
 mod system_load_env_spawn_blocking_tests {
     use super::*;
     use std::sync::Arc;
@@ -2293,6 +2822,7 @@ mod system_load_env_spawn_blocking_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod argv_tests {
     use super::super::IpeErrorKind;
     use super::{IpeError, IpeMaybe, decode_arg_at, decode_args};

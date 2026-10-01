@@ -276,7 +276,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
 
 /// The golden entry, located relative to this crate's manifest.
 fn golden_entry() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    e2e_support::manifest_dir!()
         .join("..")
         .join("..")
         .join("tests")
@@ -304,7 +304,7 @@ fn all_taxonomy_codes_resolve_via_explain_lookup() {
 fn explain_resolves_a_known_code() {
     let page = explain_lookup("IPE-T0001");
     assert!(page.is_ok(), "known code must resolve: {:?}", page.err());
-    let Ok(page) = page else { return };
+    let page = page.expect("`page` must succeed");
     assert!(
         page.starts_with("# IPE-T0001:"),
         "page line 1 must name the code, got:\n{page}"
@@ -389,7 +389,7 @@ fn emit_ir_prints_a_tree_for_the_golden() {
         "emit-ir must succeed: {:?}",
         tree.as_ref().err()
     );
-    let Ok(tree) = tree else { return };
+    let tree = tree.expect("`tree` must succeed");
     assert!(
         tree.starts_with("program"),
         "tree roots at `program`:\n{tree}"
@@ -408,7 +408,7 @@ fn emit_ir_prints_a_tree_for_the_golden() {
 /// modules so the divergence cannot return.
 #[test]
 fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
-    let entry = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let entry = e2e_support::manifest_dir!()
         .join("..")
         .join("..")
         .join("tests")
@@ -421,7 +421,7 @@ fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
         "emit-ir must resolve `Ipe.Test` (no IPE-N0004): {:?}",
         tree.as_ref().err()
     );
-    let Ok(tree) = tree else { return };
+    let tree = tree.expect("`tree` must succeed");
     // The injected compiled-source module's OWN types + members are present
     // — proof the closure was injected, not merely that the diagnostic was
     // silenced.
@@ -453,7 +453,7 @@ fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
 /// (which calls `String.*` internally), making it the ideal witness.
 #[test]
 fn compiled_source_stdlib_own_imports_resolve_no_n0034() {
-    let entry = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let entry = e2e_support::manifest_dir!()
         .join("..")
         .join("..")
         .join("tests")
@@ -466,7 +466,7 @@ fn compiled_source_stdlib_own_imports_resolve_no_n0034() {
         "emit-ir must resolve `Ipe.Money` (no IPE-N0034 inside the embedded module): {:?}",
         tree.as_ref().err()
     );
-    let Ok(tree) = tree else { return };
+    let tree = tree.expect("`tree` must succeed");
     // The injected module's types must appear — proof the closure was injected,
     // not merely that the diagnostic was silenced at a shallower stage.
     assert!(
@@ -565,7 +565,7 @@ fn generic_record_program_builds_and_prints_forty_two() {
          unwrap r =\n    r.value\n\n\
          main = Io.println (String.fromInt (unwrap (wrap 42)))\n";
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -577,7 +577,7 @@ fn generic_record_program_builds_and_prints_forty_two() {
 
     let runtime = resolve_runtime();
     assert!(runtime.is_ok(), "runtime must resolve: {runtime:?}");
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let out = dir.join("out");
     let built = build(&entry, &out, &runtime);
@@ -985,11 +985,7 @@ Task.fail (Error.unexpected \"intentional\")
 ";
 
     let runtime = resolve_runtime();
-    if runtime.is_err() {
-        // Runtime not present in this environment — skip rather than fail.
-        return;
-    }
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let dir = ipe_test_temp::temp_root().join("ipec_panything_regression");
     let _ = fs::remove_dir_all(&dir);
@@ -1025,10 +1021,7 @@ Io.println \"hello from main task\"
 ";
 
     let runtime = resolve_runtime();
-    if runtime.is_err() {
-        return;
-    }
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let dir = ipe_test_temp::temp_root().join("ipec_taskrun_elision_regression");
     let _ = fs::remove_dir_all(&dir);
@@ -1141,13 +1134,14 @@ Web.tea
 /// under `src/ipe_mods/`, where the `view` body actually lands), or `None`
 /// when the runtime cannot be resolved (so the test is a no-op on a machine
 /// without an installed runtime crate).
-fn emit_web_app_source(hot_appearance: bool, tag: &str) -> Option<String> {
-    let runtime = resolve_runtime().ok()?;
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn emit_web_app_source(hot_appearance: bool, tag: &str) -> String {
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let dir = ipe_test_temp::temp_root().join(format!("ipec_hot_appearance_{tag}"));
     let _ = fs::remove_dir_all(&dir);
     let entry = dir.join("Main.ipe");
-    fs::create_dir_all(&dir).ok()?;
-    fs::write(&entry, WEB_APP_WITH_STYLE).ok()?;
+    fs::create_dir_all(&dir).expect("scratch setup must succeed");
+    fs::write(&entry, WEB_APP_WITH_STYLE).expect("scratch setup must succeed");
     let out = dir.join("out");
     let options = BuildOptions {
         hot_appearance,
@@ -1181,7 +1175,7 @@ fn emit_web_app_source(hot_appearance: bool, tag: &str) -> Option<String> {
         "emitted src/ must carry at least one .rs file ({tag})"
     );
     let _ = fs::remove_dir_all(&dir);
-    Some(sources)
+    sources
 }
 
 /// PROD-CLEAN: a build-mode emit (`hot_appearance = false`, what `ipe build`
@@ -1189,9 +1183,7 @@ fn emit_web_app_source(hot_appearance: bool, tag: &str) -> Option<String> {
 /// `LiteralTable` and no `/_ipe/hot-appearance` endpoint.
 #[test]
 fn build_mode_emit_carries_no_hot_swap_scaffolding() {
-    let Some(src) = emit_web_app_source(false, "build_clean") else {
-        return;
-    };
+    let src = emit_web_app_source(false, "build_clean");
     assert!(
         !src.contains("__ipe_lit"),
         "a build-mode emit must introduce no literal table, got:\n{src}"
@@ -1207,9 +1199,7 @@ fn build_mode_emit_carries_no_hot_swap_scaffolding() {
 /// hot-swapped without a rebuild.
 #[test]
 fn watch_mode_emit_hoists_literal_table() {
-    let Some(src) = emit_web_app_source(true, "watch_hoist") else {
-        return;
-    };
+    let src = emit_web_app_source(true, "watch_hoist");
     assert!(
         src.contains("__ipe_lit"),
         "a watch-mode emit must hoist style literals into a table, got:\n{src}"
@@ -1241,12 +1231,7 @@ fn find_manifest_returns_none_when_absent() {
 #[test]
 fn sibling_discovery_compiles_two_module_program() {
     let runtime = resolve_runtime();
-    if runtime.is_err() {
-        // Runtime not found in this environment (CI without IPE_RUNTIME_DIR) —
-        // skip rather than fail: the sweep catches this live.
-        return;
-    }
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let tmp = ipe_test_temp::temp_root().join("ipec_sibling_disc_test");
     let _ = fs::remove_dir_all(&tmp);
@@ -1284,7 +1269,7 @@ fn sibling_discovery_compiles_two_module_program() {
 #[test]
 fn test_stage_build_resolves_src_modules_from_tests_dir() {
     let runtime = resolve_runtime();
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let tmp = ipe_test_temp::temp_root().join("ipec_verify_test_stage_src_disc");
     let _ = fs::remove_dir_all(&tmp);
@@ -1416,12 +1401,12 @@ fn infer_error_in_dep_module_names_dep_file() {
 
     // Must fail — the program has a type error in Helper.
     assert!(
-        result.is_err(),
-        "#144 fixture must fail (type error in dep); got Ok unexpectedly"
+        matches!(result, Err(CliError::Pipeline { .. })),
+        "#144 fixture must fail with a pipeline diagnostic (type error in dep): {result:?}"
     );
     let Err(CliError::Pipeline { file, .. }) = result else {
         let _ = fs::remove_dir_all(&tmp);
-        return; // any other error kind is a separate concern
+        return;
     };
 
     // The file blamed must be Helper.ipe, not Main.ipe.
@@ -1521,8 +1506,8 @@ fn home_discriminant_cross_module_type_error_names_correct_file() {
 
     // Must fail — type error in Lib.
     assert!(
-        result.is_err(),
-        "home-discriminant fixture must fail (type error in Lib); got Ok unexpectedly"
+        matches!(result, Err(CliError::Pipeline { .. })),
+        "home-discriminant fixture must fail with a pipeline diagnostic (type error in Lib): {result:?}"
     );
     let Err(CliError::Pipeline { file, .. }) = result else {
         let _ = fs::remove_dir_all(&tmp);
@@ -1593,9 +1578,7 @@ fn find_single_cache_entry(cache_root: &Path) -> Option<PathBuf> {
 fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
     const SENTINEL: &str = "# CACHE-HIT-SENTINEL\n";
 
-    let Ok(runtime) = resolve_runtime() else {
-        return; // No in-repo runtime tree in this environment — see other tests' pattern.
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
 
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-e2e-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -1692,9 +1675,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
-    let Ok(runtime) = resolve_runtime() else {
-        return;
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
 
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-in-out-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
@@ -1775,11 +1756,12 @@ enum PlantedCacheLink {
 /// refusing the build would add nothing (no entry is read or written through the
 /// link either way). The link target stays empty.
 #[cfg(unix)]
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
 fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
     // A refusal test that skips proves nothing, so a missing runtime fails it.
     let runtime = resolve_runtime();
     assert!(runtime.is_ok(), "runtime must resolve: {runtime:?}");
-    let Ok(runtime) = runtime else { return };
+    let runtime = runtime.expect("`runtime` must succeed");
 
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipe-cache-link-{tag}-{}", std::process::id()));
@@ -1904,9 +1886,7 @@ fn find_single_ir_cache_entry(cache_root: &Path) -> Option<PathBuf> {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
-    let Ok(runtime) = resolve_runtime() else {
-        return;
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-driver-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -1997,9 +1977,7 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
-    let Ok(runtime) = resolve_runtime() else {
-        return;
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-tamper-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2115,9 +2093,7 @@ fn shipped_artifact_builds_are_release() {
 #[cfg(unix)] // a cache hit needs a file identity check
 #[test]
 fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
-    let Ok(runtime) = resolve_runtime() else {
-        return;
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp =
         ipe_test_temp::temp_root().join(format!("ipec-ir-cache-blame-{}", std::process::id()));
     let cache_dir = tmp.join("cache");
@@ -2200,9 +2176,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
 /// caching purposes and always runs the full pipeline.
 #[test]
 fn cache_dir_none_disables_caching_entirely() {
-    let Ok(runtime) = resolve_runtime() else {
-        return;
-    };
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp = ipe_test_temp::temp_root().join(format!("ipe-cache-disabled-{}", std::process::id()));
     let out_dir = tmp.join("out");
     let _ = fs::remove_dir_all(&tmp);
@@ -4119,7 +4093,7 @@ fn default_replay_prefers_the_typed_log_then_the_trace() {
     let out = dir.join("out");
     let output_result = resolve_output_root(Some(&out.to_string_lossy()), &entry, None);
     assert!(output_result.is_ok(), "out must resolve: {output_result:?}");
-    let Ok(output) = output_result else { return };
+    let output = output_result.expect("`output_result` must succeed");
     let replay = cli_args::SessionMode::Replay(None);
 
     let none = resolve_session_plan(&replay, &output);
@@ -4165,7 +4139,7 @@ fn shown_trace_strips_every_control_character() {
         shown.is_ok(),
         "a UTF-8 trace under the cap must show: {shown:?}"
     );
-    let Ok(out) = shown else { return };
+    let out = shown.expect("`shown` must succeed");
     assert!(
         !out.chars().any(|c| c.is_control() && c != '\n'),
         "the shown trace must carry no control character: {out:?}"
@@ -4608,11 +4582,11 @@ fn homed_warning_renders_against_its_home_module_file() {
         .unwrap_or_default();
     let warning = ipe_types::HomedWarning::new(redundant_red_branch_at(lo), &lib);
     assert!(warning.is_ok(), "a homed T0011 warning is accepted");
-    let Ok(warning) = warning else { return };
+    let warning = warning.expect("`warning` must succeed");
 
     let rendered = render_homed_warnings(&home_to_source, &entry, &[warning]);
     assert!(rendered.is_ok(), "a known home renders, got {rendered:?}");
-    let Ok(rendered) = rendered else { return };
+    let rendered = rendered.expect("`rendered` must succeed");
     assert_eq!(rendered.len(), 1, "one warning renders once");
     let text = rendered.concat();
     assert!(
@@ -4643,7 +4617,7 @@ fn homed_warning_with_unknown_home_is_refused() {
         &[ipe_intern::Symbol::from_raw(7)],
     );
     assert!(warning.is_ok(), "a homed T0011 warning is accepted");
-    let Ok(warning) = warning else { return };
+    let warning = warning.expect("`warning` must succeed");
 
     let rendered = render_homed_warnings(&home_to_source, &entry, &[warning]);
     assert!(

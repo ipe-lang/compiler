@@ -28,7 +28,7 @@ fn compile(test_name: &str, source: &str) -> Result<Result<(), ipe::CliError>, B
         .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build(&entry, &out_dir, &runtime))
 }
 
@@ -74,7 +74,7 @@ fn compile_with_widget_file(
         .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build(&entry, &out_dir, &runtime))
 }
 

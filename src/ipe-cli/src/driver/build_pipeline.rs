@@ -2649,47 +2649,23 @@ pub fn build_project_into(
 
 /// Locate the Ipê runtime module tree (`src/runtime/rust/src/`).
 ///
-/// Resolution order:
-/// 1. `$IPE_RUNTIME_DIR` — explicit override, allows pointing at any tree.
-/// 2. Upward walk from the current directory, checking in order:
-///    - `src/runtime/rust/src/ipe_runtime` (the in-repo copy — found immediately when
-///      running from anywhere inside the ipe-lang workspace)
-///    - `ipe/runtime-rust/src/ipe_runtime` (sibling ipe checkout — legacy)
-///    - `runtime-rust/src/ipe_runtime` (legacy sibling path)
+/// Delegates to [`ipe_env::artifact::resolve_runtime_src`], the one runtime
+/// module-tree resolver: `$IPE_RUNTIME_DIR` when set (authoritative — a value
+/// that is not a directory is refused, never walked past), else the upward walk
+/// from the current directory.
 ///
 /// # Errors
-/// Returns [`CliError::RuntimeNotFound`] when no candidate directory exists, or
-/// [`CliError::Io`] if the current directory cannot be read.
+/// Returns [`CliError::RuntimeNotFound`] when the override is not a directory or
+/// no walk candidate exists, or [`CliError::Io`] if the current directory cannot
+/// be read.
 pub fn resolve_runtime() -> Result<PathBuf, CliError> {
-    if let Ok(dir) = ipe_env::var("IPE_RUNTIME_DIR") {
-        let path = PathBuf::from(dir);
-        if path.is_dir() {
-            return Ok(path);
-        }
-    }
-
     let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
-    let mut here: Option<&Path> = Some(cwd.as_path());
-    while let Some(dir) = here {
-        for candidate in [
-            // In-repo runtime (ipe-lang monorepo): found when CWD is anywhere
-            // inside the workspace.
-            dir.join("src").join("runtime").join("rust").join("src"),
-            // Legacy: sibling `ipe` checkout.
-            dir.join("ipe")
-                .join("runtime-rust")
-                .join("src")
-                .join("ipe_runtime"),
-            // Legacy: sibling `runtime-rust` directory.
-            dir.join("runtime-rust").join("src").join("ipe_runtime"),
-        ] {
-            if candidate.is_dir() {
-                return Ok(candidate);
-            }
-        }
-        here = dir.parent();
-    }
-    Err(CliError::RuntimeNotFound)
+    ipe_env::artifact::resolve_runtime_src(
+        ipe_env::var_os(ipe_env::artifact::RUNTIME_DIR_VAR),
+        &cwd,
+    )
+    .map(ipe_env::artifact::ProvenRuntime::into_path_buf)
+    .map_err(|_| CliError::RuntimeNotFound)
 }
 
 /// Resolve the vendored runtime MODULE tree the emit copies into the project,

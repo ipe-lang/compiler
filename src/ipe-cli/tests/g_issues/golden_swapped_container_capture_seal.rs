@@ -87,16 +87,7 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
         return;
     };
     let out = out_dir(name);
-    let runtime = match ipe::resolve_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: the embedded runtime could not be resolved: {err:?}"
-            );
-            return;
-        }
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
@@ -116,7 +107,7 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
         }
     }
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return; // emit-only fast pass
     }
     let outcome = crate::support::build_and_run_emitted(name, &out);

@@ -2,7 +2,7 @@
 //! seal.
 //!
 //! Both the runtime `Path.fromString` seal (`ipe_runtime::path`) and the
-//! compiler's `path "…"` literal gate (`ipe_diagnostics::path_check`) validate
+//! compiler's literal-path gate (`ipe_diagnostics::path_check`) validate
 //! through the SAME `seal`, so the algorithm lives ONCE and both consumers use
 //! it. Neither keeps its own copy. The crate is dependency-free (std only) so
 //! the compiler can seal a literal without pulling in the runtime's heavy

@@ -1,27 +1,39 @@
 module Main exposing (main)
 
--- Http.parseQuery: first-key-wins, percent-decode, empty-value.
+-- Http.parseQuery: first-key-wins, form-decode, empty-value, strict refusal.
 -- Uses Dict.get on specific keys to avoid Dict.toList iteration-order
--- non-determinism between backends (Go/Rust hash maps differ in order).
+-- non-determinism between backends (hash maps differ in order).
 --
 -- Semantics:
 --   "a" → "1"          (first-key-wins: "a=1" before "a=ignored")
 --   "b" → "two words"  (percent-decode of "two%20words")
 --   "c" → ""           (bare key, empty value)
 --   "x" → absent       (key not present)
+--   "a=1&b=%zz"        → refused (a malformed escape refuses the whole query)
 import Ipe.Http as Http
 import Ipe.Dict as Dict
 import Ipe.Io as Io
 import Ipe.Maybe
+import Ipe.Result exposing (Result(..))
 import Ipe.String
 
 
+-- Render the four probed keys of a well-formed query, one per line.
+render : String -> String
+render raw =
+    case Http.parseQuery raw of
+
+        Ok parsed ->
+            String.join "\n"
+                [ Maybe.withDefault "MISSING" (Dict.get "a" parsed)
+                , Maybe.withDefault "MISSING" (Dict.get "b" parsed)
+                , Maybe.withDefault "MISSING" (Dict.get "c" parsed)
+                , Maybe.withDefault "absent" (Dict.get "x" parsed)
+                ]
+
+        Err _ ->
+            "refused"
+
+
 main =
-    let
-        parsed = Http.parseQuery "a=1&b=two%20words&a=ignored&c"
-        aVal = Maybe.withDefault "MISSING" (Dict.get "a" parsed)
-        bVal = Maybe.withDefault "MISSING" (Dict.get "b" parsed)
-        cVal = Maybe.withDefault "MISSING" (Dict.get "c" parsed)
-        xVal = Maybe.withDefault "absent" (Dict.get "x" parsed)
-    in
-    Io.println (String.join "\n" [ aVal, bVal, cVal, xVal ])
+    Io.println (String.join "\n" [ render "a=1&b=two%20words&a=ignored&c", render "a=1&b=%zz" ])

@@ -73,7 +73,7 @@ fn jail_or_skip(test: &str) -> Option<std::path::PathBuf> {
 /// Repo root: `examples/wasm/language-playground/jail-runner` →
 /// `language-playground` → `wasm` → `examples` → repo.
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    e2e_support::manifest_dir!()
         .ancestors()
         .nth(4)
         .expect("repo root")

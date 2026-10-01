@@ -65,7 +65,7 @@ fn rust_files(root: &Path) -> Vec<(String, PathBuf)> {
 
 #[test]
 fn no_source_file_prints_raw() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = e2e_support::manifest_dir!().join("src");
     let files = rust_files(&src);
     assert!(
         !files.is_empty(),

@@ -19,18 +19,18 @@ use crate::code::{
     IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132, IPE_L0134, IPE_L0135,
     IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144, IPE_L0145, IPE_L0146,
     IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152, IPE_L0153, IPE_L0154,
-    IPE_L0155, IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010,
-    IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024,
-    IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032,
-    IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041,
-    IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049,
-    IPE_N0050, IPE_N0051, IPE_N0052, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
-    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
-    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
-    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
-    IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011,
-    IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019,
-    IPE_T0020, IPE_T0021, Severity,
+    IPE_L0155, IPE_L0156, IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005,
+    IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023,
+    IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031,
+    IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040,
+    IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048,
+    IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010,
+    IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018,
+    IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060,
+    IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068,
+    IPE_P0069, IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
+    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
+    IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
 use crate::terminal::TerminalSafe;
@@ -398,7 +398,7 @@ pub enum ParseError {
     MalformedLet(LetDefect),
     /// An `if … then … else …` expression is malformed. [IPE-P0062]
     MalformedIf(IfDefect),
-    /// A `path "…"` literal whose string fails compile-time validation.
+    /// A `CustomElement.fromFile` path literal that fails compile-time validation.
     ///
     /// `refusal` names the separator regime whose seal refused the literal and
     /// why (a NUL byte, a Windows-disguised `..`, or a `..` escape). `literal`
@@ -1439,6 +1439,16 @@ pub enum LowerError {
         /// How many payload fields the page constructor declares.
         ctor_payload_count: usize,
     },
+    /// A literal `Web.route` pattern or `Server.*` route path breaks the route
+    /// grammar the runtime enforces at startup: a `:param` / `*param` name is
+    /// empty, not an identifier (`[A-Za-z_][A-Za-z0-9_]*`), or repeated, or a
+    /// literal segment is not strictly percent-decodable UTF-8. [IPE-L0156]
+    RoutePatternMalformed {
+        /// The dotted call that received the path (e.g. `Web.route`).
+        call: Box<str>,
+        /// Why the path was refused.
+        defect: RoutePatternDefect,
+    },
     /// A `Web.route` page builder is not a page constructor, inline lambda, or
     /// named function — the Rust backend cannot emit a type-directed params
     /// closure for a let-bound variable or computed expression. [IPE-L0123]
@@ -1611,6 +1621,46 @@ pub enum LowerError {
     UnsaturatedHandlerKernel {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
+    },
+}
+
+/// Why a literal route pattern or server route path was refused under
+/// [IPE-L0156]. Every text field is a bounded, escaped excerpt of the source
+/// literal, never the whole literal.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum RoutePatternDefect {
+    /// A `:` or `*` segment marker is followed by no name.
+    ParamEmpty,
+    /// A parameter name is not an identifier.
+    ParamNotIdentifier {
+        /// The offending parameter name.
+        name: Box<str>,
+        /// Byte offset of the first non-identifier byte within the name.
+        at: usize,
+    },
+    /// Two parameters in one path share a name.
+    ParamDuplicate {
+        /// The repeated parameter name.
+        name: Box<str>,
+    },
+    /// A literal segment has a `%` not followed by two hex digits.
+    MalformedEscape {
+        /// The offending literal segment.
+        segment: Box<str>,
+        /// Byte offset of the `%` within the segment.
+        at: usize,
+    },
+    /// A literal segment percent-decodes to bytes that are not UTF-8.
+    InvalidUtf8 {
+        /// The offending literal segment.
+        segment: Box<str>,
+        /// Byte offset within the segment where the invalid sequence starts.
+        at: usize,
+    },
+    /// The whole path exceeds the runtime's component length ceiling.
+    TooLong {
+        /// The ceiling in bytes.
+        cap: usize,
     },
 }
 
@@ -2303,6 +2353,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::BackendNestingTooDeep { .. } => IPE_L0200,
         LowerError::DecodeSucceedArityTooHigh { .. } => IPE_L0121,
         LowerError::RouteParamCountMismatch { .. } => IPE_L0122,
+        LowerError::RoutePatternMalformed { .. } => IPE_L0156,
         LowerError::RouteBuilderUnsupportedShape | LowerError::RouteParamUnsupportedType { .. } => {
             IPE_L0123
         }
@@ -2676,6 +2727,7 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             )
             .into_boxed_str(),
         )],
+        LowerError::RoutePatternMalformed { defect, .. } => route_pattern_malformed_help(defect),
         LowerError::RouteBuilderUnsupportedShape => vec![HelpLine::Note(
             "inline the constructor or lambda directly at the `Web.route` call site; \
              a let-bound variable or computed expression cannot be used as a page builder."
@@ -2835,6 +2887,38 @@ fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
 
 /// The help lines for [`LowerError::StoreEqAccessorInvalid`], factored out so
 /// [`lower_help`] stays a thin per-variant dispatcher.
+/// Help for [`LowerError::RoutePatternMalformed`]: the grammar rule the defect
+/// broke and the rewrite that satisfies it.
+fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
+    let note = match defect {
+        RoutePatternDefect::ParamEmpty => "every `:` or `*` segment needs a name after it — \
+             write `/posts/:id`, not `/posts/:`"
+            .to_string(),
+        RoutePatternDefect::ParamNotIdentifier { name, .. } => format!(
+            "a parameter name is a letter or `_` followed by letters, digits, or `_` — \
+             rename `{name}` (for example `post_id` instead of `post-id`)"
+        ),
+        RoutePatternDefect::ParamDuplicate { name } => format!(
+            "each parameter in one path has its own name — rename one of the `{name}` \
+             segments (for example `/:user_id/:post_id`)"
+        ),
+        RoutePatternDefect::MalformedEscape { .. } => {
+            "a `%` in a path must start an escape of two hex digits — write `%25` for a \
+             literal percent sign"
+                .to_string()
+        }
+        RoutePatternDefect::InvalidUtf8 { .. } => {
+            "percent escapes in a path must decode to valid UTF-8 — escape each byte of a \
+             real UTF-8 character, or write the character itself"
+                .to_string()
+        }
+        RoutePatternDefect::TooLong { cap } => {
+            format!("a route path is at most {cap} bytes — shorten it")
+        }
+    };
+    vec![HelpLine::Note(note.into_boxed_str())]
+}
+
 fn store_eq_accessor_invalid_help(defect: &StoreEqAccessorDefect) -> Vec<HelpLine> {
     let note: Box<str> = match defect {
         StoreEqAccessorDefect::NotAnAccessor => {

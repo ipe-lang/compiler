@@ -18,8 +18,9 @@
 //! ## Golden catalogue
 //!
 //! * `http_parse_query` — `Http.parseQuery "a=1&b=two%20words&a=ignored&c"`
-//!   first-key-wins, percent-decodes, empty-value for key-only, sorted via
-//!   `Dict.toList`. Output: three `key=value` lines.
+//!   first-key-wins, percent-decodes, empty-value for key-only, probed via
+//!   `Dict.get`; then `Http.parseQuery "a=1&b=%zz"` is refused whole as `Err`.
+//!   Output: four probed values, then `refused`.
 //!
 //! * `http_builders` — `defaultRequestFromString "http://example.com"` (the
 //!   marked parse-at-the-boundary helper) then, on the `Ok` branch,
@@ -43,7 +44,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -61,17 +62,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else {
-        return (
-            dir,
-            crate::support::RunOutcome {
-                stdout: String::new(),
-                exit_code: None,
-            },
-        );
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
@@ -82,7 +73,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
 /// Compile/build/run the golden and assert its stdout matches the cached
 /// oracle. Gated on `IPE_E2E=1`.
 fn assert_runs_and_matches_oracle(name: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let (dir, outcome) = build_run(name);
@@ -93,8 +84,9 @@ fn assert_runs_and_matches_oracle(name: &str) {
 // ── Http.parseQuery ───────────────────────────────────────────────────────────
 
 /// `Http.parseQuery "a=1&b=two%20words&a=ignored&c"` — first-key-wins,
-/// percent-decodes spaces, empty-value for bare key.  Output: 3 `key=value`
-/// lines (sorted by `Dict.toList`).  golden-verified oracle.
+/// percent-decodes spaces, empty-value for bare key; a malformed escape
+/// (`a=1&b=%zz`) is refused whole as `Err`.  Output: four probed values, then
+/// `refused`.
 #[test]
 fn http_parse_query() {
     assert_runs_and_matches_oracle("http_parse_query");
@@ -166,12 +158,7 @@ fn http_default_request_emits_without_signature_consumer() {
     let out = crate::support::scratch_root().join("ipec_m5b_http_default_request_no_sig_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        // Mirrors the byte goldens' resolve dependency — skip rather than
-        // false-fail when the runtime dir can't be resolved in this
-        // environment.
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(

@@ -654,8 +654,8 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
         ("Process", &["run", "runWith", "runInPty"]),
         // `Ipe.Http` — outbound HTTP client.
         // `get` / `post` / `request` are effect kernels (Task Error
-        // HttpResponse); `parseQuery` is a pure kernel (String -> Dict
-        // String String); the `with*` builders + `defaultRequest` are ALSO
+        // HttpResponse); `parseQuery` is a pure kernel (String -> Result
+        // Error (Dict String String)); the `with*` builders + `defaultRequest` are ALSO
         // pure kernels (HttpRequest record-update emission in the backend) —
         // cross-module pure-Ipê stdlib calls are not resolved by ipe, so the
         // builders cannot live as pure Ipê in Http.ipe. Every name below is

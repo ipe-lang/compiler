@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for this test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 #[allow(clippy::expect_used)]

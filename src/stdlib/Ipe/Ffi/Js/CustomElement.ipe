@@ -14,7 +14,7 @@
 --     to a SINGLE string literal naming the author's widget-hook JS file. The two
 --     type parameters are the seal (down-state / up-event); the JS source is a
 --     value argument, never a type parameter. The literal is cleaned and
---     traversal-checked at build time (the same `path "…"` seal), and its
+--     traversal-checked at build time (the shared `ipe_path_core` seal), and its
 --     existence inside the project root is verified at the build stage that owns
 --     the root. Any other position, a non-literal argument, a wrong argument
 --     count, a bare reference, or a missing / non-`CustomElement` annotation fails

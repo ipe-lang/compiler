@@ -21,10 +21,14 @@ around it (`(`, `$(`, a backtick), outermost first, each a number unique to
 its lexing, so a `cd` inside one is seen not to reach a command outside it.
 Unterminated quotes run to the end of the text — the lexer never raises, it
 only ever sees more text as one word.
+
+`literal_words` parses words into `LiteralWord`s: words the shell passes on
+exactly as written, so a check on their spelling is a check on the argv.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 
@@ -239,6 +243,32 @@ def _lex(
         i += 1
     end_command()
     return cmds
+
+
+# The characters of a `LiteralWord`. None of them starts an expansion (`$`, a
+# backtick), a glob (`*`, `?`, `[`), a brace or tilde expansion (`{`, `~`),
+# quoting (a quote, a backslash), a separator, a redirection or a comment.
+LITERAL_WORD_CHARS = "A-Za-z0-9_.,=/:+@-"
+_LITERAL_WORD = re.compile(f"[{LITERAL_WORD_CHARS}]+")
+
+
+@dataclass(frozen=True)
+class LiteralWord:
+    """A word bash passes to its command unchanged: one argument, spelled as
+    in the source, with no expansion, word splitting, glob or quote removal
+    between the source and the argv. Built only by `literal_words`."""
+
+    text: str
+
+
+def literal_words(words: list[str]) -> tuple[LiteralWord, ...] | str:
+    """`words` as `LiteralWord`s, else the first word that is none."""
+    out: list[LiteralWord] = []
+    for word in words:
+        if _LITERAL_WORD.fullmatch(word) is None:
+            return word
+        out.append(LiteralWord(word))
+    return tuple(out)
 
 
 def trim(text: str) -> str:

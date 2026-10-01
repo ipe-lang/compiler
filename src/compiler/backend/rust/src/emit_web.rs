@@ -28,6 +28,7 @@ use ipe_ir::{Callee, Expr, IrType, KernelFn};
 use crate::EmitCtx;
 use crate::emit_expr::emit_expr_at;
 use crate::emit_types::{GenericScope, render_type};
+use crate::route_grammar;
 
 /// Wrap an emitted `view : Model -> Element Msg` so its result type is the
 /// `Html` the runtime sink mounts: the emitted `Element`-returning view is
@@ -233,6 +234,12 @@ fn emit_web_route(
             detail: format!("Web.route requires 2 arguments, got {}", args.len()),
         });
     };
+    if let Expr::Str(pat_s) = pattern_e {
+        route_grammar::refuse_malformed(
+            "Web.route",
+            route_grammar::web_route_pattern(pat_s.as_str()),
+        )?;
+    }
     let pattern_s = emit_expr_at(ctx, pattern_e, indent, child, generics)?;
 
     let build_closure = if let Expr::Ctor {

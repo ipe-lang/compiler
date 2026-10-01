@@ -31,10 +31,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test g_tuple
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -53,9 +53,7 @@ fn refutable_var_scrutinee_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tuple_refutable_var_scrut_gate");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently rather than fail
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&fixture_entry(), &out, &runtime);
     assert!(
         built.is_ok(),
@@ -70,16 +68,14 @@ fn refutable_var_scrutinee_builds() {
 /// = 2 + 3 + 42 + 0 = 47.
 #[test]
 fn refutable_var_scrutinee_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
     let out = crate::support::scratch_root().join("ipec_tuple_refutable_var_scrut_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&fixture_entry(), &out, &runtime);
     assert!(

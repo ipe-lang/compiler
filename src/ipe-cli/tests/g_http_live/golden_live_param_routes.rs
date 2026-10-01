@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -45,33 +45,30 @@ fn solo_out() -> PathBuf {
 }
 
 /// Compile the on-disk solo golden (`tests/golden/live_param_routes`) into
-/// `out`. Returns `None` (skip) when the embedded runtime cannot be resolved.
-fn compile_solo_into(out: &Path) -> Option<Result<(), CliError>> {
+/// `out`. Returns
+fn compile_solo_into(out: &Path) -> Result<(), CliError> {
     let entry = repo_root()
         .join("tests")
         .join("golden")
         .join("live_param_routes")
         .join("Main.ipe");
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// Compile an inline source through the ipe pipeline (no cargo).
-fn compile_src(test_name: &str, source: &str) -> Option<Result<(), CliError>> {
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn compile_src(test_name: &str, source: &str) -> Result<(), CliError> {
     let ipe_dir = crate::support::scratch_root().join(format!("param_routes_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).ok()?;
+    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
     let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
+    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
     let out = crate::support::scratch_root().join(format!("param_routes_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, &out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, &out, &runtime)
 }
 
 /// MIXED: one nullary route + one `:param` route in the SAME routes list.
@@ -141,9 +138,7 @@ main =
 /// path). Compile-only — always runs.
 #[test]
 fn param_route_solo_compiles_and_emits_param_conversion() {
-    let Some(result) = compile_solo_into(&solo_out()) else {
-        return;
-    };
+    let result = compile_solo_into(&solo_out());
     assert!(
         result.is_ok(),
         "#108 hole 3: a `:param` route with a payload-ctor builder must be \
@@ -166,9 +161,7 @@ fn param_route_solo_compiles_and_emits_param_conversion() {
 /// MIXED nullary + param routes in one list → ipe-0.
 #[test]
 fn param_route_mixed_with_nullary_compiles() {
-    let Some(result) = compile_src("mixed", MIXED_NULLARY_AND_PARAM) else {
-        return;
-    };
+    let result = compile_src("mixed", MIXED_NULLARY_AND_PARAM);
     assert!(
         result.is_ok(),
         "#108 hole 3: nullary + `:param` routes must type-check into ONE \
@@ -180,9 +173,7 @@ fn param_route_mixed_with_nullary_compiles() {
 /// WRONG-ADT param ctor → IPE-T0001 (the witness still rejects).
 #[test]
 fn param_route_wrong_adt_ctor_is_ipe_t0001() {
-    let Some(result) = compile_src("wrong_adt", WRONG_ADT_PARAM_CTOR) else {
-        return;
-    };
+    let result = compile_src("wrong_adt", WRONG_ADT_PARAM_CTOR);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -248,16 +239,14 @@ fn http_get(port: u16, path: &str) -> std::io::Result<String> {
 /// captured `:param` delivered through `match_routes` into `UserPage`.
 #[test]
 fn param_route_solo_cargo_builds_and_delivers_param() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Emit into a PRIVATE dir this test alone owns, so the compile-only sibling
     // re-emitting into `solo_out()` in parallel cannot delete rustc's working
     // directory mid-build.
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m7_live_param_routes_e2e_emit");
-    let Some(result) = compile_solo_into(&out) else {
-        return;
-    };
+    let result = compile_solo_into(&out);
     assert!(
         result.is_ok(),
         "a `:param` route with a payload-ctor builder must be ipe-0, got: {:?}",

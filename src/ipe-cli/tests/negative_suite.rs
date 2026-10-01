@@ -32,18 +32,19 @@ const fn false_marker() -> bool {
 }
 
 /// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed
-/// by `name`, returning the entry path (or `None` if scratch setup fails — the
-/// caller must fail loudly, never skip). The scratch dir lives in the test
+/// by `name`, returning the entry path (a failed scratch setup fails the
+/// test). The scratch dir lives in the test
 /// crate's `CARGO_TARGET_TMPDIR`, never the repo tree.
-fn write_entry(name: &str, source: &str) -> Option<PathBuf> {
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn write_entry(name: &str, source: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite")
         .join(name);
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir).expect("scratch setup must succeed");
     let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
+    std::fs::write(&entry, source).expect("scratch setup must succeed");
+    entry
 }
 
 /// The outcome of running the pipeline over a fixture.
@@ -59,12 +60,12 @@ enum Outcome {
 }
 
 fn compile(name: &str, source: &str, target: Target) -> Outcome {
-    let entry = crate::support::expect_scratch_entry(name, write_entry(name, source));
+    let entry = write_entry(name, source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let options = BuildOptions {
         target,
         intent: ipe_backend_rust::BuildIntent::Development,
@@ -80,12 +81,12 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
 /// Like [`compile`] but with the production flag set — simulates `ipe release`
 /// so the `Debug.*` gate (IPE-L0140) fires without spawning a real release build.
 fn compile_production(name: &str, source: &str) -> Outcome {
-    let entry = crate::support::expect_scratch_entry(name, write_entry(name, source));
+    let entry = write_entry(name, source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-prod-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let options = BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Release,
         ..BuildOptions::default()
@@ -129,7 +130,7 @@ fn compile_project(name: &str, files: &[(&str, &str)]) -> Outcome {
         .join("negsuite-proj-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = src.join("Main.ipe");
     match ipe::build_loose_file(&entry, &out, &runtime) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
@@ -1016,7 +1017,7 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
         .join("negsuite-ce-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
@@ -1093,8 +1094,7 @@ fn custom_element_ctor_missing_file_rejected() {
 }
 
 /// (d) `customElement "../escape.js"` is rejected by the shared path seal — a `..`
-/// that climbs out of the project root is refused at build (IPE-P0063), the same
-/// code the `path "…"` literal uses.
+/// that climbs out of the project root is refused at build (IPE-P0063).
 #[test]
 fn custom_element_ctor_path_traversal_rejected() {
     let src = format!(
@@ -1104,6 +1104,52 @@ fn custom_element_ctor_path_traversal_rejected() {
          main = 1\n"
     );
     assert_rejected("custom_element_traversal", &src, "IPE-P0063");
+}
+
+/// A `CustomElement.fromFile` path carrying a NUL byte is refused at build
+/// (IPE-P0063) before it can reach a syscall.
+#[test]
+fn custom_element_ctor_nul_path_rejected() {
+    let src = format!(
+        "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+         editor : CustomElement Int String\n\
+         editor = CustomElement.fromFile \"js/a\\0b.js\"\n\
+         main = 1\n"
+    );
+    assert_rejected("custom_element_nul", &src, "IPE-P0063");
+}
+
+/// Refusal: a widget path the Unix seal accepts but the Windows seal refuses
+/// is still IPE-P0063 — the compiler does not know the build host's separator
+/// regime, so the literal must be safe under every regime.
+#[test]
+fn custom_element_ctor_windows_only_traversal_rejected() {
+    for (i, literal) in [
+        "..\\\\secret",
+        ".. .",
+        ".. \\\\x",
+        "C:..\\\\x",
+        "a\\\\..\\\\..\\\\b",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let src = format!(
+            "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
+             editor : CustomElement Int String\n\
+             editor = CustomElement.fromFile \"{literal}\"\n\
+             main = 1\n"
+        );
+        assert_rejected(&format!("custom_element_win_{i}"), &src, "IPE-P0063");
+    }
+}
+
+/// Refusal: `path "…"` is no literal form, so with no `path` in scope it is an
+/// unresolved name (IPE-N0001).
+#[test]
+fn path_before_a_string_with_no_path_binder_is_unresolved() {
+    let src = format!("{HEAD}main = path \"src/Main.ipe\"\n");
+    assert_rejected("path_is_an_ordinary_name", &src, "IPE-N0001");
 }
 
 /// (e) A well-formed `customElement "js/x.js"` with the file PRESENT type-checks
@@ -1174,7 +1220,7 @@ fn custom_element_in_unused_binding_compiles_no_model_gate() {
 
 /// (g) `customElement "/etc/passwd"` (an ABSOLUTE path) is rejected at CANON with
 /// IPE-N0044 — the widget path must be project-root-relative. An absolute literal
-/// would survive the shared `path "…"` seal (which legitimately accepts absolute
+/// would survive the shared `ipe_path_core` seal (which legitimately accepts absolute
 /// paths) yet, joined at the build gate, `Path::join` discards the project root
 /// and stats an arbitrary out-of-project file. This closes that escape at the name
 /// stage, before any filesystem access.
@@ -1281,7 +1327,7 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     crate::support::expect_scratch_step(name, std::fs::write(&entry, &src));
     let out = base.join("out");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let outcome = match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
@@ -3011,6 +3057,126 @@ main =
 }
 
 // ===========================================================================
+// Literal route paths follow the runtime's grammar — IPE-L0156. A `:name` is
+// `[A-Za-z_][A-Za-z0-9_]*` and unique per path; a `Web.route` literal segment
+// is strictly percent-decodable. A literal that breaks it is refused at ipe
+// time rather than at listener startup.
+// ===========================================================================
+
+/// A `Web.tea` app whose second route pattern is `pattern`, built by the
+/// one-field `PostPage` or the two-field `PairPage` constructor.
+fn web_route_fixture(pattern: &str, ctor: &str) -> String {
+    format!(
+        r#"module Main exposing (main)
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+type Page = HomePage | PostPage String | PairPage String String
+type Msg = Noop
+type alias Model = {{ count : Int }}
+init : WebReq -> ( Model, Cmd Msg )
+init _req = ( {{ count = 0 }}, Cmd.none )
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model = ( model, Cmd.none )
+view : Model -> Element Msg
+view _model = Ui.text "hi"
+subscriptions : Model -> Sub Msg
+subscriptions _model = Sub.none
+main =
+    Web.tea
+        {{ init = init, update = update, view = view
+        , subscriptions = subscriptions
+        , routes = [ Web.route "/" HomePage, Web.route "{pattern}" {ctor} ]
+        , notFound = HomePage
+        }}
+"#
+    )
+}
+
+/// A `Server.listen` program with one route built by `route`.
+fn server_route_fixture(route: &str) -> String {
+    format!(
+        r#"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+main =
+    Server.listen 8000
+        [ {route} (\_ -> Task.succeed (Server.text "hi")) ]
+"#
+    )
+}
+
+#[test]
+fn lower_web_route_param_not_identifier() {
+    let src = web_route_fixture("/posts/:post-id", "PostPage");
+    assert_rejected("lower_web_route_param_not_identifier", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_param_empty() {
+    let src = web_route_fixture("/posts/:", "PostPage");
+    assert_rejected("lower_web_route_param_empty", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_param_duplicate() {
+    let src = web_route_fixture("/users/:id/posts/:id", "PairPage");
+    assert_rejected("lower_web_route_param_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_web_route_malformed_escape() {
+    let src = web_route_fixture("/files/100%zz", "HomePage");
+    assert_rejected("lower_web_route_malformed_escape", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_param_not_identifier() {
+    let src = server_route_fixture(r#"Server.get "/:post-id""#);
+    assert_rejected("lower_server_route_param_not_identifier", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_param_duplicate() {
+    let src = server_route_fixture(r#"Server.get "/:id/:id""#);
+    assert_rejected("lower_server_route_param_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_param_empty() {
+    let src = server_route_fixture(r#"Server.post "/:""#);
+    assert_rejected("lower_server_route_param_empty", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_api_path_param_not_identifier() {
+    let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
+    assert_rejected(
+        "lower_server_api_path_param_not_identifier",
+        &src,
+        "IPE-L0156",
+    );
+}
+
+/// The contrapositive: well-formed literal paths still compile.
+#[test]
+fn well_formed_route_paths_compile() {
+    assert_compiles(
+        "web_route_well_formed",
+        &web_route_fixture("/users/:user_id/posts/:post_id", "PairPage"),
+    );
+    assert_compiles(
+        "server_route_well_formed",
+        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+    );
+    assert_compiles(
+        "server_api_well_formed",
+        &server_route_fixture(r#"Server.api "POST /v1/:id""#),
+    );
+}
+
+// ===========================================================================
 // App entries need a concrete Model / Msg — IPE-N0051. Every app entry's
 // runtime function bounds the cfg's model and message types with traits a
 // Rust generic does not carry, so an entry built inside a definition generic
@@ -3212,16 +3378,12 @@ main =
 #[test]
 fn row_generic_in_scope_web_embed_refused_undetermined() {
     let name = "row_generic_in_scope_web_embed";
-    let Some(entry) = write_entry(name, WEB_EMBED_ROW_IN_SCOPE) else {
-        return;
-    };
+    let entry = write_entry(name, WEB_EMBED_ROW_IN_SCOPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
@@ -3285,16 +3447,12 @@ main =
 #[test]
 fn unpinned_msg_web_embed_refused() {
     let name = "unpinned_msg_web_embed";
-    let Some(entry) = write_entry(name, WEB_EMBED_UNPINNED_MSG) else {
-        return;
-    };
+    let entry = write_entry(name, WEB_EMBED_UNPINNED_MSG);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
@@ -3560,17 +3718,14 @@ fn ffi_planted_bindings_file_is_ignored_on_load() {
         \"params\":[{\"name\":\"text\",\"type\":\"String\",\"ipeType\":\"String\",\"rustType\":\"&str\"}],\
         \"results\":[{\"name\":\"\",\"type\":\"Result Error Version\",\"rustType\":\"Result<Version, Error>\"}],\
         \"effect\":\"fallible\"}],\"errors\":[]}";
-    let Some(dir) = write_entry("ffi_planted_cache", "") else {
-        return;
-    };
+    let dir = write_entry("ffi_planted_cache", "");
     let root = dir
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or(dir);
     let cache = FfiCache::at_project_root(&root);
-    let Ok((_pkg, paths)) = ipe_ffi::driver::install_from_inspection(&cache, doc) else {
-        return;
-    };
+    let (_pkg, paths) = ipe_ffi::driver::install_from_inspection(&cache, doc)
+        .expect("a well-formed inspection document installs");
     // Plant an injected item into a reached wrapper region of _bindings.rs.
     if let Ok(text) = std::fs::read_to_string(&paths.bindings) {
         let planted = text.replace(

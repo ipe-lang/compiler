@@ -297,6 +297,46 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       their own, each with its reason; an exempt member's literal edition
       must equal the workspace edition and it must carry its own `[lints]`
       table, and an entry that is no member or inherits anyway is refused.
+  20. Every non-host test cell is run by the job that claims it: each cell of
+      `ci/test-claims.yml` (read by `claims_table.load_cells`) is claimed by
+      exactly one workflow step, in its `owner` job, read once into a
+      `ClaimRun`.  The step's whole `run:` is `cargo test … | python3
+      tools/scripts/wasm-test/wasm_test_count.py N`, with no workflow
+      expression, `N` the cell's `expect_tests`, every word a
+      `shell_lex.LiteralWord` (no parameter expansion, glob, brace or tilde
+      expansion, quote or backslash, so the argv is the words as written),
+      and a bare `cargo` (no env assignment, wrapper, path or `+toolchain`)
+      passing no `--`, `--config`, `-C`, `-Z` or `--manifest-path`.  The cargo side tests the
+      cell: the platform as `--target`, the package by one `-p` (no
+      `--workspace`), only `--lib` or only `--test <name>`, the cell's
+      features, no filter and no `--no-run`.  The step runs under `shell:
+      bash` (so `pipefail` holds), with no `continue-on-error` on it or its
+      job, no `working-directory` on it and no `defaults.run` one on its job
+      or workflow, no `container:` on its job (whose image env this check
+      cannot read), and no `if:` beyond the release-only guard.  Its
+      effective env (workflow, then job, then step `env:`, each a literal
+      mapping) sets the platform's runner key to the runner, and otherwise
+      only the `_CLAIM_ENV` keys at their admitted values — so no
+      `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, per-target rustflags,
+      `CARGO_HOME` or other key can add a `--cfg` that swaps a test at an
+      equal count.  The checkout's `.cargo/config.toml` holds only the
+      `_CLAIM_CONFIG_*` tables and keys, and every rustflags of its
+      `[build]` and of a `[target]` table applying to the platform passes
+      only cfg-neutral `-C` codegen options; a legacy `.cargo/config` is
+      refused.  The owner job installs the runner through
+      `taiki-e/install-action` at the `Cargo.lock` version before the claim
+      step; every `wasm-bindgen` tool pin in any workflow names that
+      version, and no step `cargo install`s the runner.  A count piped from
+      a command that tests no cell is refused.  The owner job's context is a
+      required `gate` or a `nightly-gate` of the manifest, produced by that
+      workflow.  Any other cargo test run on a wasm32 `--target` in any job
+      is refused as unclaimed.  LIMIT: a target set through
+      `CARGO_BUILD_TARGET` rather than `--target` is not seen as a run; a
+      cargo config above the checkout or under `$CARGO_HOME`, a `Cargo.toml`
+      `[profile]`/`[patch]`, and a config or env an earlier step or action
+      writes (`GITHUB_ENV`) are not read;
+      `src/runtime/rust/tests/wasm_cell_scan.rs` proves the tree declares no
+      test outside the claimed cells.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -336,6 +376,7 @@ import trust_roots  # noqa: E402  # the CODEOWNERS trust-root parser, shared wit
 import drift_assertion  # noqa: E402  # the one drift-assertion parser, shared with change_class
 import cargo_invocation  # noqa: E402  # the one cargo-invocation reader, checks 15 and 16
 import check_required_set  # noqa: E402  # owns the admin-read environment's name
+import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -2318,6 +2359,380 @@ def check_workspace_inheritance(errors: list[str], root: str = REPO_ROOT) -> Non
             )
     for m in sorted(set(WORKSPACE_INHERIT_EXEMPT) - seen):
         errors.append(f"check 19: WORKSPACE_INHERIT_EXEMPT names {m!r}, which is not a workspace member; drop it")
+
+
+TEST_CLAIMS = ("ci", "test-claims.yml")
+# The count harness runs after the build, so it lives outside the pre-tool
+# `.github/ci` tree (check 7); this check proves its wiring from that tree.
+WASM_COUNT_SCRIPT = "tools/scripts/wasm-test/wasm_test_count.py"
+# Per claimable platform: the runner env key, its value, and the tool (a
+# `Cargo.lock` package) whose install provides that runner.
+WASM_RUNNERS: dict[str, tuple[str, str, str]] = {
+    "wasm32-unknown-unknown": ("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER", "wasm-bindgen-test-runner", "wasm-bindgen"),
+}
+WASM_RUNNER_CRATES = frozenset({"wasm-bindgen-cli"})
+_TOOL_INSTALLER = "taiki-e/install-action@"
+# The one step `if:` a claim step may carry: the release-only trivial pass.
+_CLAIM_STEP_GUARDS = frozenset({"needs.changes.outputs.release_only != 'true'"})
+_TEST_RUNS = frozenset({"test", "nextest run", "bench"})
+# Options that change the manifest, directory, or config a claimed run reads.
+_CLAIM_REDIRECTING = frozenset({"--config", "-C", "-Z", "--manifest-path"})
+# The env a claim step may run under, beyond its platform's runner key: per
+# key, the values it may hold (`None`: any value). Every other key is refused,
+# since cargo, rustc, a build script or the runner could read it to change
+# which tests compile or run at an equal count.
+_CLAIM_ENV: dict[str, frozenset[str] | None] = {
+    "RUSTFLAGS": frozenset({""}),
+    "CHROMEDRIVER": frozenset({"chromedriver"}),
+    "CARGO_TERM_COLOR": frozenset({"always", "never", "auto"}),
+    "CARGO_INCREMENTAL": frozenset({"0", "1"}),
+    # Read by other steps of the job (the `ipe` CLI, the geo-clipboard and
+    # layout-fill servers); neither cargo nor rustc reads them, and no build
+    # script of the tree does (`test_inert_claim_env_unread_by_build_scripts`).
+    "IPE_RUNTIME_DIR": None,
+    "IPE_GEO_CLIPBOARD_PORT": None,
+    "IPE_LAYOUT_FILL_PORT": None,
+}
+# The `.cargo/config.toml` a claimed run reads: its admitted tables, the keys
+# of `[build]` and of a `[target]` table that applies to the claim platform,
+# and the `-C` codegen options its rustflags may pass.  None sets a `cfg`
+# (`opt-level` is out: rustc derives `debug_assertions` from it when cargo
+# passes no `-C debug-assertions`).
+_CLAIM_CONFIG_TABLES = frozenset({"build", "target", "term", "net", "http"})
+_CLAIM_CONFIG_BUILD = frozenset({"rustflags", "target", "target-dir", "jobs", "incremental"})
+_CLAIM_CONFIG_TARGET = frozenset({"rustflags"})
+_CLAIM_CODEGEN = frozenset({"debuginfo", "strip", "codegen-units"})
+_TOOL_SPLIT = re.compile(r"[,\s]+")
+
+
+def _lock_versions(repo: str, name: str) -> list[str] | str:
+    """Every `Cargo.lock` version of package `name`, or why the lock is unreadable."""
+    lock = _load_toml(os.path.join(repo, "Cargo.lock"))
+    if isinstance(lock, str):
+        return f"Cargo.lock {lock}"
+    pkgs = lock.get("package")
+    if not isinstance(pkgs, list):
+        return "Cargo.lock has no `[[package]]` list"
+    return sorted({p["version"] for p in pkgs if isinstance(p, dict) and p.get("name") == name and isinstance(p.get("version"), str)})
+
+
+def _claim_env(scopes: tuple[dict, ...]) -> dict[str, object] | str:
+    """The env a step runs under: the `env:` of each scope, later scopes
+    winning; why not, when an `env:` is no mapping."""
+    out: dict[str, object] = {}
+    for scope in scopes:
+        env = scope.get("env", {})
+        if not isinstance(env, dict):
+            return "an `env:` of its workflow, job or step is not a literal mapping"
+        out.update({str(k): v for k, v in env.items()})
+    return out
+
+
+def _codegen_only(flags: object) -> str | None:
+    """Why the rustflags `flags` (a string or a list of strings) could pass
+    more than the `_CLAIM_CODEGEN` options, else None."""
+    if isinstance(flags, str):
+        words = flags.split()
+    elif isinstance(flags, list) and all(isinstance(f, str) for f in flags):
+        words = [w for f in flags for w in f.split()]
+    else:
+        return "is not a string or a list of strings"
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in ("-C", "--codegen"):
+            option, i = (words[i + 1] if i + 1 < len(words) else ""), i + 2
+        elif word.startswith("--codegen="):
+            option, i = word.removeprefix("--codegen="), i + 1
+        elif word.startswith("-C"):
+            option, i = word.removeprefix("-C"), i + 1
+        else:
+            return f"passes {word!r}"
+        if option.split("=", 1)[0] not in _CLAIM_CODEGEN:
+            return f"passes `-C {option}`"
+    return None
+
+
+def _claim_config(repo: str, platform: str) -> str | None:
+    """Why the checkout's cargo config could change what a claimed run on
+    `platform` compiles, else None."""
+    cargo_dir = os.path.join(repo, ".cargo")
+    if os.path.lexists(os.path.join(cargo_dir, "config")):
+        return "`.cargo/config` is a cargo config this check does not read"
+    path = os.path.join(cargo_dir, "config.toml")
+    if not os.path.lexists(path):
+        return None
+    cfg = _load_toml(path)
+    if isinstance(cfg, str):
+        return f"`.cargo/config.toml` {cfg}"
+    extra = sorted(set(cfg) - _CLAIM_CONFIG_TABLES)
+    if extra:
+        return f"`.cargo/config.toml` sets {extra}, which this check does not read"
+    build, targets = cfg.get("build", {}), cfg.get("target", {})
+    if not isinstance(build, dict) or not isinstance(targets, dict):
+        return "`.cargo/config.toml` [build] or [target] is not a table"
+    tables: list[tuple[str, dict, frozenset[str]]] = [("[build]", build, _CLAIM_CONFIG_BUILD)]
+    for triple, table in targets.items():
+        if not isinstance(table, dict):
+            return f"`.cargo/config.toml` [target.{triple}] is not a table"
+        if triple == platform or triple.startswith("cfg("):
+            tables.append((f"[target.{triple}]", table, _CLAIM_CONFIG_TARGET))
+    for where, table, admitted in tables:
+        extra = sorted(set(table) - admitted)
+        if extra:
+            return f"`.cargo/config.toml` {where} sets {extra}, which this check does not read"
+        why = _codegen_only(table["rustflags"]) if "rustflags" in table else None
+        if why is not None:
+            return f"`.cargo/config.toml` {where} rustflags {why}, which could change the tests it compiles"
+    return None
+
+
+def _tool_pins(step: dict) -> list[str]:
+    """The `tool:` items of a `taiki-e/install-action` step, else none."""
+    uses = step.get("uses")
+    if not isinstance(uses, str) or not uses.startswith(_TOOL_INSTALLER):
+        return []
+    with_ = step.get("with")
+    tool = with_.get("tool") if isinstance(with_, dict) else None
+    return [t for t in _TOOL_SPLIT.split(tool) if t] if isinstance(tool, str) else []
+
+
+@dataclass(frozen=True)
+class ClaimRun:
+    """A claim step, read once: the cell its bare `cargo test` runs exactly,
+    under an env of only `_CLAIM_ENV` keys and the platform's runner, in the
+    checkout root, with a cargo config that cannot change what it compiles."""
+
+    cell: claims_table.Cell
+    runner_crate: str
+
+
+def _claimed_cell(
+    cmd: shell_lex.Command, run: str, by_key: dict[tuple[str, str, str], claims_table.Cell]
+) -> claims_table.Cell | str:
+    """The cell the pipeline ending in `cmd` runs exactly, else why none."""
+    if "${{" in run:
+        return "its `run:` holds a workflow expression"
+    src = cmd.pipe_source
+    if src is None:
+        return "its runner output is not piped into the count"
+    if shell_lex.trim(run) != f"{' '.join(src)} | {' '.join(cmd.words)}":
+        return "its `run:` is not exactly `cargo test … | python3 " + WASM_COUNT_SCRIPT + " N`"
+    words = shell_lex.literal_words(src + cmd.words)
+    if isinstance(words, str):
+        return (
+            f"its word {words!r} is not literal (only [{shell_lex.LITERAL_WORD_CHARS}]), "
+            "so the shell could expand it into arguments this check does not read"
+        )
+    if src[:1] != ["cargo"]:
+        return "its runner command is not a bare `cargo` (no env assignment, wrapper, or path)"
+    args = [w.text for w in words[1 : len(src)]]
+    if "--" in args:
+        return "it passes arguments after `--`, which this check does not read"
+    redirecting = next((w for w in args if cargo_invocation._option(w, _CLAIM_REDIRECTING, frozenset()) is not None), None)
+    if redirecting is not None:
+        return f"its {redirecting!r} changes what cargo reads, which this check does not follow"
+    inv = cargo_invocation.parse(args)
+    if isinstance(inv, str):
+        return f"its runner command is unreadable: {inv}"
+    if inv.toolchain is not None:
+        return f"it picks toolchain `+{inv.toolchain}`, whose cfgs and build scripts may differ from the pinned one"
+    if inv.subcommand not in _TEST_RUNS:
+        return f"`cargo {inv.subcommand}` runs no test"
+    if len(inv.packages) != 1 or inv.workspace:
+        return "it does not select exactly one package by `-p`"
+    sel = inv.selection
+    if sel == cargo_invocation.ExplicitTargets(lib=True):
+        target = "lib"
+    elif isinstance(sel, cargo_invocation.ExplicitTargets) and len(sel.tests) == 1 and sel == cargo_invocation.ExplicitTargets(tests=sel.tests):
+        target = "test:" + next(iter(sel.tests))
+    else:
+        return "it does not select exactly one target (`--lib` or one `--test`)"
+    if not inv.target:
+        return "it names no `--target`, so it tests the host"
+    key = (inv.packages[0], target, inv.target)
+    cell = by_key.get(key)
+    if cell is None:
+        return f"it tests {' '.join(key)}, which no cell of test-claims.yml lists"
+    missing = cell.features - inv.features
+    if missing and not inv.all_features:
+        return f"it lacks feature(s) {sorted(missing)} the cell is counted under"
+    if inv.filtered or inv.no_run:
+        return "it filters or skips the tests it counts"
+    if cmd.words[2:] != [str(cell.expect_tests)]:
+        return f"it counts {' '.join(cmd.words[2:])!r}, but the cell claims {cell.expect_tests}"
+    return cell
+
+
+def _claim_run(
+    cmd: shell_lex.Command,
+    run: str,
+    scopes: tuple[dict, dict, dict],
+    job_id: str,
+    repo: str,
+    by_key: dict[tuple[str, str, str], claims_table.Cell],
+) -> ClaimRun | str:
+    """The claim the step `scopes[2]` (of job `job_id`, workflow and job
+    `scopes[:2]`) makes with the pipeline ending in `cmd`, else the refusal."""
+    cell = _claimed_cell(cmd, run, by_key)
+    if isinstance(cell, str):
+        return f"pipes a test run into the count, but {cell}"
+    wf, job, st = scopes
+    claim = f"claims {' '.join(cell.key)}, but"
+    if cell.owner != job_id:
+        return f"{claim} the cell's owner is {cell.owner!r}, not this job"
+    if "container" in job:
+        return f"{claim} its job runs in a `container:`, whose image and `container.env` env this check does not read"
+    if st.get("shell") != "bash":
+        return f"{claim} it lacks `shell: bash`, so a failing runner would not fail the pipeline"
+    if st.get("continue-on-error", False) is not False or job.get("continue-on-error", False) is not False:
+        return f"{claim} a `continue-on-error` would let a red count pass"
+    if "working-directory" in st or _default_wd(job) is not None or _default_wd(wf) is not None:
+        return f"{claim} it sets a `working-directory`, so cargo reads another directory's config"
+    if "if" in st and st["if"] not in _CLAIM_STEP_GUARDS:
+        return f"{claim} its `if: {st['if']}` could skip the count"
+    runner = WASM_RUNNERS.get(cell.platform)
+    if runner is None:
+        return f"{claim} platform {cell.platform} has no runner this check proves"
+    env = _claim_env(scopes)
+    if isinstance(env, str):
+        return f"{claim} {env}"
+    if env.get(runner[0]) != runner[1]:
+        return f"{claim} {runner[0]} is not {runner[1]!r} for this step"
+    for key, value in sorted(env.items()):
+        if key == runner[0]:
+            continue
+        if key not in _CLAIM_ENV:
+            return f"{claim} its env sets {key}, which could change the tests cargo compiles or the runner runs"
+        admitted = _CLAIM_ENV[key]
+        if not isinstance(value, str) or (admitted is not None and value not in admitted):
+            return f"{claim} its env sets {key} to {value!r}, not one of {sorted(admitted or ())}"
+    why = _claim_config(repo, cell.platform)
+    if why is not None:
+        return f"{claim} {why}"
+    return ClaimRun(cell, runner[2])
+
+
+def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 20 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    cells = claims_table.load_cells(os.path.join(root, *TEST_CLAIMS))
+    if isinstance(cells, str):
+        errors.append(f"check 20: {cells}; refused")
+        return
+    by_key = {c.key: c for c in cells}
+    tool_versions: dict[str, str] = {}
+    for tool in sorted({t for _, _, t in WASM_RUNNERS.values()}):
+        got = _lock_versions(repo, tool)
+        if isinstance(got, str) or len(got) != 1:
+            errors.append(f"check 20: Cargo.lock must hold exactly one {tool} version, got {got!r}; refused")
+            return
+        tool_versions[tool] = got[0]
+    claims: dict[tuple[str, str, str], list[str]] = {c.key: [] for c in cells}
+    owner_jobs: dict[str, tuple[str, dict]] = {}
+    for wf in _load_workflows(root, errors):
+        for wj in wf.jobs:
+            job, loc_job = wj.raw, f"{wf.fname}: job {wj.job_id!r}"
+            steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+            claimed_lines: list[str] = []
+            pinned: set[str] = set()
+            for i, st in enumerate(steps):
+                if not isinstance(st, dict):
+                    continue
+                loc = f"{loc_job} step {i} ({st.get('name') or st.get('uses') or '<unnamed>'})"
+                for pin in _tool_pins(st):
+                    name = pin.split("@", 1)[0]
+                    if name in tool_versions:
+                        if pin != f"{name}@{tool_versions[name]}":
+                            errors.append(
+                                f"check 20: {loc} installs {pin!r}; the runner must be "
+                                f"{name}@{tool_versions[name]}, the Cargo.lock version; refused"
+                            )
+                        else:
+                            pinned.add(name)
+                run = st.get("run")
+                if not isinstance(run, str):
+                    continue
+                for text in _shell_texts(run):
+                    for cmd in shell_lex.split_commands(text):
+                        if not any(os.path.basename(w) == "wasm_test_count.py" for w in cmd.words):
+                            continue
+                        words = cmd.words
+                        if len(words) != 3 or words[:2] != ["python3", WASM_COUNT_SCRIPT]:
+                            errors.append(
+                                f"check 20: {loc} runs the count as {' '.join(words)!r}, not "
+                                f"`python3 {WASM_COUNT_SCRIPT} N`; refused"
+                            )
+                            continue
+                        claim = _claim_run(cmd, run, (wf.doc, job, st), wj.job_id, repo, by_key)
+                        if isinstance(claim, str):
+                            errors.append(f"check 20: {loc} {claim}; refused")
+                            continue
+                        key, crate = claim.cell.key, claim.runner_crate
+                        if crate not in pinned:
+                            errors.append(
+                                f"check 20: {loc} claims {' '.join(key)}, but no earlier step of the job "
+                                f"installs {crate}@{tool_versions.get(crate, '?')}; refused"
+                            )
+                            continue
+                        claimed_lines.append(" ".join(cmd.pipe_source or []))
+                        claims[key].append(loc)
+                        owner_jobs[wj.job_id] = (wf.fname, job)
+            for found in _job_cargo(job, repo, wf.doc):
+                inv = found.invocation
+                if isinstance(inv, str):
+                    if "wasm32" in found.line:
+                        errors.append(f"check 20: {loc_job} runs `{found.line}`, which this check cannot read: {inv}; refused")
+                    continue
+                if inv.subcommand == "install" and any(c.split("@", 1)[0] in WASM_RUNNER_CRATES for c in inv.install_crates):
+                    errors.append(
+                        f"check 20: {loc_job} runs `{found.line}`; install the runner through the pinned "
+                        f"{_TOOL_INSTALLER.rstrip('@')} step instead; refused"
+                    )
+                if inv.subcommand not in _TEST_RUNS or inv.no_run or not (inv.target or "").startswith("wasm32"):
+                    continue
+                if found.line in claimed_lines:
+                    claimed_lines.remove(found.line)
+                    continue
+                errors.append(
+                    f"check 20: {loc_job} runs `{found.line}` on a wasm32 target outside a claim step; "
+                    f"pipe it into {WASM_COUNT_SCRIPT} under a cell of test-claims.yml; refused"
+                )
+    for key, locs in claims.items():
+        if not locs:
+            errors.append(f"check 20: cell {' '.join(key)} is claimed by no step of its owner {by_key[key].owner!r}; refused")
+        elif len(locs) > 1:
+            errors.append(f"check 20: cell {' '.join(key)} is claimed by {len(locs)} steps ({'; '.join(locs)}); refused")
+    if not owner_jobs:
+        return
+    try:
+        with open(os.path.join(root, "ci", "check-manifest.yml")) as f:
+            manifest = strict_yaml.safe_load(f)
+        with open(os.path.join(root, "ci", "required-set.json")) as f:
+            required = {c for c, _ in check_required_set.parse_pairs(json.load(f), "ci/required-set.json")}
+    except (OSError, ValueError, yaml.YAMLError, check_required_set.Refused) as e:
+        errors.append(f"check 20: the manifest or required set is unreadable: {e}; refused")
+        return
+    entries = manifest.get("checks") if isinstance(manifest, dict) else None
+    entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+    for job_id, (fname, job) in sorted(owner_jobs.items()):
+        name = job.get("name", job_id)
+        if not isinstance(name, str) or "${{" in name:
+            errors.append(f"check 20: owner job {job_id!r} has no literal context name; refused")
+            continue
+        # An owner job reports either as its own context or through the one
+        # entry whose `aggregates:` names it (check 1), whose verdict it inherits.
+        entry = next((e for e in entries if e.get("context") == name), None) or next(
+            (e for e in entries if {name, job_id} & set(e.get("aggregates") or [])), None
+        )
+        disp = entry.get("disposition") if entry else None
+        if entry is None or entry.get("producer") != fname:
+            errors.append(f"check 20: owner job {job_id!r} ({name!r}) has no manifest entry produced by {fname}; refused")
+        elif not (disp == "gate" and entry.get("context") in required) and disp != "nightly-gate":
+            errors.append(
+                f"check 20: owner job {job_id!r} ({name!r}) is {disp!r}, not a required gate or a "
+                "nightly-gate, so its red count blocks nothing; refused"
+            )
 
 
 IPE_BUILD_PRODUCER = "build-tools"
@@ -4881,6 +5296,9 @@ def main() -> int:
 
     # ---- 19. Every workspace member inherits the workspace edition and lints ----
     check_workspace_inheritance(errors)
+
+    # ---- 20. Every non-host test cell is run by the job that claims it ----
+    check_test_claims(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

@@ -12,9 +12,9 @@ use ipe::style::{self, Palette};
 /// error — the empty string it returns then fails every `contains` check with a
 /// clear message, never a silent pass.
 fn install_script() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh");
-    let read = std::fs::read_to_string(path);
-    assert!(read.is_ok(), "could not read {path}: {read:?}");
+    let path = e2e_support::manifest_dir!().join("../../install.sh");
+    let read = std::fs::read_to_string(&path);
+    assert!(read.is_ok(), "could not read {}: {read:?}", path.display());
     read.unwrap_or_default()
 }
 
@@ -179,10 +179,11 @@ fn installer_banner_success_and_footer_use_the_two_space_gutter() {
 #[test]
 fn install_entrypoints_agree_on_the_root_installer() {
     // 1. The installer lives at the repository root (short, easy-to-locate path).
-    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh");
+    let script_path = e2e_support::manifest_dir!().join("../../install.sh");
     assert!(
-        std::path::Path::new(script_path).is_file(),
-        "install.sh must live at the repository root: {script_path}"
+        script_path.is_file(),
+        "install.sh must live at the repository root: {}",
+        script_path.display()
     );
 
     // 2. `ipe upgrade` curls exactly this URL — the real constant the command runs.
@@ -194,7 +195,7 @@ fn install_entrypoints_agree_on_the_root_installer() {
 
     // 3. The README `curl … | sh` one-liner must curl that same URL — one source
     //    of truth shared by the fresh-install and self-update paths.
-    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+    let readme = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../README.md"))
         .expect("README.md is readable");
     let curl_line = readme
         .lines()

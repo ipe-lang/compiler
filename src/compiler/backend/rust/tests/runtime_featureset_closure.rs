@@ -67,7 +67,7 @@
 mod seal_e2e;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::RustBackend;
@@ -107,33 +107,6 @@ fn sampled_masks(count: usize) -> Vec<u32> {
             u32::try_from(z % mask_space).unwrap_or(0)
         })
         .collect()
-}
-
-/// Locate the runtime crate root (`src/runtime/rust`) — the manifest whose
-/// `[features]` universe and the `src/mod.rs` whose cfg gates this test reads.
-fn resolve_runtime_crate() -> Option<PathBuf> {
-    if let Ok(dir) = ipe_env::var("IPE_RUNTIME_DIR") {
-        let p = PathBuf::from(dir);
-        // Accept either the crate root or the legacy `src/` tree (walk up one).
-        if p.join("Cargo.toml").is_file() {
-            return Some(p);
-        }
-        if let Some(parent) = p.parent()
-            && parent.join("Cargo.toml").is_file()
-        {
-            return Some(parent.to_owned());
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    let mut here: Option<&Path> = Some(cwd.as_path());
-    while let Some(dir) = here {
-        let candidate = dir.join("src").join("runtime").join("rust");
-        if candidate.join("Cargo.toml").is_file() {
-            return Some(candidate);
-        }
-        here = dir.parent();
-    }
-    None
 }
 
 /// Build a body-free `Module` with the mask's `uses_*` flags, mirroring the
@@ -548,8 +521,7 @@ struct SealFixtures {
 
 #[allow(clippy::expect_used)] // test scaffolding: the crate sources always parse
 fn load_fixtures() -> SealFixtures {
-    let crate_root =
-        resolve_runtime_crate().expect("runtime crate root (src/runtime/rust) must resolve");
+    let crate_root = e2e_support::require_runtime_crate();
     let cargo_toml =
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
     let table = parse_feature_table(&cargo_toml);
@@ -854,8 +826,7 @@ fn sampled_full_masks_are_closed() {
 /// unsatisfied gate as satisfied) trips here.
 #[test]
 fn prelude_reference_gap_fails_closed() {
-    let crate_root =
-        resolve_runtime_crate().expect("runtime crate root (src/runtime/rust) must resolve");
+    let crate_root = e2e_support::require_runtime_crate();
     let cargo_toml =
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
     let table = parse_feature_table(&cargo_toml);
@@ -918,8 +889,7 @@ fn prelude_reference_gap_fails_closed() {
 /// declared universe and includes the dependency-bearing surfaces.
 #[test]
 fn ssot_selects_a_meaningful_subset_of_the_universe() {
-    let crate_root =
-        resolve_runtime_crate().expect("runtime crate root (src/runtime/rust) must resolve");
+    let crate_root = e2e_support::require_runtime_crate();
     let cargo_toml =
         std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
     let table = parse_feature_table(&cargo_toml);
@@ -1116,12 +1086,10 @@ fn uses_email_selects_email_feature() {
 /// Gated on `IPE_E2E=1`; skipped in offline / unit-test-only runs.
 #[test]
 fn email_parse_address_only_cargo_builds() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let mut interner = Interner::new();
     let main_mod = interner.intern("Main")?;

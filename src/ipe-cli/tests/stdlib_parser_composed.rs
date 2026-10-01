@@ -12,17 +12,17 @@
 //! green build is itself the lowering proof and a green run proves the state
 //! threads correctly.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for the stdlib parser test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -56,7 +56,7 @@ fn stdlib_parser_composed_combinators_lower() {
 /// command or fail to run at all.
 #[test]
 fn stdlib_parser_composed_combinators_run() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stdlib_parser_composed_e2e");

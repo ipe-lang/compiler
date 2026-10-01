@@ -24,7 +24,6 @@
 //! the runtime library.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// Emit symbols never reached via the generic `callee_name()` path (a dedicated
 /// emit function intercepts the variant first), OR defined in the generated-code
@@ -136,7 +135,7 @@ fn walk(dir: &std::path::Path, fn_re: &regex::Regex, out: &mut HashSet<String>) 
 
 #[test]
 fn every_kernel_name_resolves_to_runtime_fn() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = e2e_support::manifest_dir!();
 
     // ── 1. Collect every kernel's emit symbol from the SSOT ──────────────────
     // `StdlibKernel::def().runtime_fn` is the single source the backend's
@@ -433,7 +432,7 @@ const NO_RUNTIME_FN_ARG_ORDER: [&str; 2] = ["task_retry_on", "task_with_retry_on
 fn declared_arg_order_matches_runtime_signature() {
     use ipe_kernels::StdlibKernel;
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = e2e_support::manifest_dir!();
     let mut sources = Vec::new();
     read_sources(&root.join("src"), &mut sources);
     let runtime_files = sources.len();

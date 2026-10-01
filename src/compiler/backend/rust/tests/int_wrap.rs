@@ -117,12 +117,10 @@ fn build_overflow_checked_and_assert(
     slot: &str,
     expected: &str,
 ) -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let emitted = RustBackend::new(interner).emit(prog)?;
 
@@ -302,7 +300,7 @@ fn negate_program(interner: &mut Interner, value: i64) -> DResult<Program> {
 /// `negate(i64::MIN)` must wrap to `i64::MIN` (no panic) under overflow-checks=on.
 #[test]
 fn end_to_end_negate_min_i64_wraps() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let mut interner = Interner::new();
@@ -433,7 +431,7 @@ fn generic_double_program(interner: &mut Interner, arg: i64) -> DResult<Program>
 /// proves the wrapping path is now in place.
 #[test]
 fn end_to_end_generic_add_wraps_at_max() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let mut interner = Interner::new();

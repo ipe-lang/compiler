@@ -663,7 +663,6 @@ fn write_expr_at(out: &mut String, expr: &Expr, interner: &Interner, level: usiz
         Expr::Bool(b) => line(out, level, &format!("Bool {b}")),
         Expr::Float(f) => line(out, level, &format!("Float {f}")),
         Expr::Str(s) => line(out, level, &format!("Str {s:?}")),
-        Expr::PathLit(lit) => line(out, level, &format!("PathLit {:?}", lit.raw())),
         Expr::CustomElementRef { tag, js_path } => {
             line(out, level, &format!("CustomElementRef {tag:?} {js_path:?}"));
         }

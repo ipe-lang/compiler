@@ -63,10 +63,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_class1_boundary_scheme_field_result
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -86,10 +86,7 @@ fn class1_field_result_ipec_accepts_and_emits_concrete_getter() {
         .join("class1_boundary_scheme_field_result_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP boundary_scheme_field_result: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
@@ -132,7 +129,7 @@ fn class1_field_result_ipec_accepts_and_emits_concrete_getter() {
 /// `ipe_types` unit test in the prior attempt passed despite the bug).
 #[test]
 fn class1_field_result_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -146,9 +143,7 @@ fn class1_field_result_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_class1_boundary_scheme_field_result_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(

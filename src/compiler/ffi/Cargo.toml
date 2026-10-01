@@ -39,6 +39,8 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 ipe-test-temp = { path = "../../../tools/test-temp" }
 ipe_env = { path = "../env" }
+# The e2e tier gate and existence-proven test-artifact resolvers.
+e2e-support = { path = "../../../tools/e2e-support" }
 
 [features]
 # The by-path, link-following catalog reader (`driver::load_catalog`) for

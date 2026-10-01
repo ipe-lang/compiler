@@ -144,8 +144,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
         .join(format!("widget_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
         .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
@@ -392,7 +391,7 @@ fn sri_of(bytes: &[u8]) -> String {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn ui_widget_serves_sri_glue_and_round_trips_up_event() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -698,7 +697,7 @@ fn emitted_source(out_dir: &std::path::Path) -> String {
 ///    `js_send`/`js_subscribe` this program lowers to.
 #[test]
 fn js_port_seal_legal_lowers_and_builds() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     // `compile_and_build` returns the built binary path; reaching it means both

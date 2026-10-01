@@ -23,7 +23,7 @@ const END: &str = "# <<< private-scratch helpers";
 
 /// The helper block of `install.sh`, markers included.
 fn helpers() -> io::Result<String> {
-    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))?;
+    let script = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../install.sh"))?;
     let block = script
         .find(BEGIN)
         .and_then(|start| {
@@ -187,7 +187,7 @@ fn tag_file_ok_refuses_a_planted_symlink_and_leaves_its_target() -> io::Result<(
 
 #[test]
 fn the_installer_routes_its_scratch_through_the_helpers() -> io::Result<()> {
-    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))?;
+    let script = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../install.sh"))?;
     for needle in [
         "tag_file_ok \"$TAG_FILE\"",
         "trusted_tmp_base \"${TMPDIR:-/tmp}\" >/dev/null || die \"$(tmp_base_refusal)\"",

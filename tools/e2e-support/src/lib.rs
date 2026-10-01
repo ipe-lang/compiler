@@ -11,6 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bin;
+
+pub use bin::{
+    ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,
+    require_runtime_crate,
+};
+
 use std::io::{BufRead, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};

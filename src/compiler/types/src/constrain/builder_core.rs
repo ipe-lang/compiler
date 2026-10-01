@@ -344,15 +344,6 @@ impl<'a> Builder<'a> {
         })
     }
 
-    pub fn path_var(&mut self) -> DResult<VarId> {
-        let name = self.builtins.path;
-        self.structure(FlatType::Con {
-            module: Vec::new(),
-            name,
-            args: Vec::new(),
-        })
-    }
-
     /// The type of a `customElement "<js-path>"` constructor node: `CustomElement
     /// down up` with two fresh flexible parameters. The annotation on the binding
     /// (a resolved `CustomElement down up`) unifies with these, pinning the seal

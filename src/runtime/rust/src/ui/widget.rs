@@ -150,6 +150,7 @@ pub fn ui_widget_<M, Down, Up, F>(ce: IpeCustomElement, _state: Down, _on_up: F)
 }
 
 #[cfg(all(test, feature = "json"))]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
     use crate::ui::element::{Attribute, Element};

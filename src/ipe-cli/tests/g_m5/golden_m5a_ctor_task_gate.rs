@@ -14,19 +14,18 @@
 //! the non-derivable enum gracefully, so the declaration builds cleanly rather
 //! than being rejected. This test pins that no new rejection was added.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
 /// Build the named golden fixture and return the pipeline diagnostic code, if the
-/// build failed with one (never a panic). A skip (returns `None` early via the
-/// runtime guard) occurs only when the runtime cannot be resolved.
-fn build_fixture(fixture: &str, out_suffix: &str) -> Option<Result<(), CliError>> {
+/// build failed with one (never a panic).
+fn build_fixture(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let root = repo_root();
     let entry = root
         .join("tests")
@@ -36,17 +35,15 @@ fn build_fixture(fixture: &str, out_suffix: &str) -> Option<Result<(), CliError>
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&entry, &out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, &out, &runtime)
 }
 
 /// E2: a mis-arity `Task` in a constructor payload is a clean IPE-T0016, not an
 /// ICE / `CompilerBug`.
 #[test]
 fn ctor_task_arity_three_is_ipe_t0016_not_ice() {
-    let Some(built) = build_fixture("gate_ctor_task_arity", "m5a_gate_ctor_task_arity_emit") else {
-        return; // runtime unresolvable in this environment — skip.
-    };
+    let built = build_fixture("gate_ctor_task_arity", "m5a_gate_ctor_task_arity_emit");
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -63,9 +60,7 @@ fn ctor_task_arity_three_is_ipe_t0016_not_ice() {
 /// spec's decision to NOT add a new rejection here (symmetric with Item B).
 #[test]
 fn ctor_task_well_formed_builds() {
-    let Some(built) = build_fixture("ctor_task_ok", "m5a_ctor_task_ok_emit") else {
-        return; // runtime unresolvable in this environment — skip.
-    };
+    let built = build_fixture("ctor_task_ok", "m5a_ctor_task_ok_emit");
     // Whatever else, it must NOT be a Task-arity rejection and must NOT be an
     // internal compiler bug. `build` may still surface a downstream cargo error
     // in a bare CI without a warm runtime, so assert on the specific fail-closed

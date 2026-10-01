@@ -11,8 +11,8 @@
 //! INBOUND direction, exercising the exact runtime fns the gate now allows.
 //!
 //! ```sh
-//! CHROMEDRIVER=chromedriver cargo test --target wasm32-unknown-unknown \
-//!     --features wasm-client --test wasm_js_port_bridge
+//! CHROMEDRIVER=chromedriver cargo test -p ipe-runtime-rust \
+//!     --target wasm32-unknown-unknown --features wasm-client --test wasm_js_port_bridge
 //! ```
 
 #![cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
@@ -29,12 +29,19 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-/// Drive an `IpeSub::Source` by hand (no TEA scheduler here — driving the Source
-/// directly is the narrowest proof of the exact runtime fn the gate now allows).
-fn drive_source<M: 'static>(sub: IpeSub<M>, emit: Rc<dyn Fn(M)>) -> Box<dyn FnOnce()> {
-    match sub {
-        IpeSub::Source(spawn) => spawn(emit),
-        _ => panic!("test bug: expected IpeSub::Source"),
+/// Teardown thunk a started `IpeSub::Source` hands back.
+type Teardown = Box<dyn FnOnce()>;
+
+/// Start an `IpeSub::Source` by hand, returning its teardown.
+///
+/// `None` when `sub` is any other variant; callers assert on it. No TEA
+/// scheduler runs here: driving the Source directly is the narrowest proof of
+/// the exact runtime fn under test.
+fn drive_source<M: 'static>(sub: IpeSub<M>, emit: Rc<dyn Fn(M)>) -> Option<Teardown> {
+    if let IpeSub::Source(spawn) = sub {
+        Some(spawn(emit))
+    } else {
+        None
     }
 }
 
@@ -50,6 +57,10 @@ fn inbound_decodes_clean_and_drops_malformed() {
     let got_w = Rc::clone(&got);
     let emit: Rc<dyn Fn(i64)> = Rc::new(move |m| got_w.borrow_mut().push(m));
     let teardown = drive_source(js_subscribe::<i64, i64, _>(int_decoder(), |a| a), emit);
+    assert!(teardown.is_some(), "js_subscribe must be an IpeSub::Source");
+    let Some(teardown) = teardown else {
+        return;
+    };
 
     // Clean integer frame → decoded and emitted.
     push_inbound("7");
@@ -81,31 +92,29 @@ fn outbound_encodes_and_delivers_to_page_handler() {
             seen_w.borrow_mut().push(s);
         }
     });
-    // `run_in_browser` guarantees a real `Window`; its absence would be a
-    // harness bug, so a match-panic (not `.expect()`, which the crate's
-    // `expect_used = "deny"` scope covers even in tests) states that plainly.
-    let window = match web_sys::window() {
-        Some(w) => w,
-        None => panic!("wasm-bindgen-test harness bug: no Window in a run_in_browser test"),
+    let window = web_sys::window();
+    assert!(window.is_some(), "run_in_browser must provide a Window");
+    let Some(window) = window else {
+        return;
     };
-    if js_sys::Reflect::set(
+    let installed = js_sys::Reflect::set(
         &window,
         &JsValue::from_str("ipeOnReceive"),
         handler.as_ref().unchecked_ref(),
-    )
-    .is_err()
-    {
-        panic!("test bug: could not install window.ipeOnReceive");
-    }
+    );
+    assert!(installed.is_ok(), "could not install window.ipeOnReceive");
     handler.forget();
 
-    match js_send::<i64, i64>(42) {
-        // In wasm the origin arg is unused (delivery is in-tab, not per-session).
-        IpeCmd::Publish(thunk) => {
-            let _ = thunk("");
-        }
-        _ => panic!("js_send must build a Publish cmd"),
-    }
+    let cmd = js_send::<i64, i64>(42);
+    assert!(
+        matches!(cmd, IpeCmd::Publish(_)),
+        "js_send must build a Publish cmd"
+    );
+    let IpeCmd::Publish(thunk) = cmd else {
+        return;
+    };
+    // In wasm the origin arg is unused (delivery is in-tab, not per-session).
+    let _ = thunk("");
 
     assert_eq!(
         seen.borrow().last().map(String::as_str),

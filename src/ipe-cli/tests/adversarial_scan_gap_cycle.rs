@@ -21,10 +21,7 @@ use std::fs;
 #[allow(clippy::panic)]
 #[test]
 fn scan_invisible_cycle_must_not_panic_the_driver() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_review_scan_gap_cycle");

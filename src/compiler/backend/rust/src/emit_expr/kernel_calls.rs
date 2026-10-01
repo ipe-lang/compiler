@@ -183,9 +183,9 @@ pub fn call_has_kernel_special_case(
 /// closure that converts `ipe_runtime::HttpResponse` into the synthesised
 /// Ipê record struct for `{body, headers, status}`.
 ///
-/// `HttpParseQuery` returns `HashMap<String,String>` which is exactly
-/// `Dict String String` — the standard `Expr::Call` emitter is correct
-/// and this function returns `None` for it.
+/// `HttpParseQuery` returns `IpeResult<IpeError, HashMap<String,String>>`,
+/// which is exactly `Result Error (Dict String String)` — the standard
+/// `Expr::Call` emitter is correct and this function returns `None` for it.
 ///
 /// The conversion is a PURE FIELD-FOR-FIELD MOVE — no validation, no
 /// second parse boundary. All guards (SSRF, body cap, timeout, error
@@ -2061,8 +2061,10 @@ pub fn emit_server_call(
             )))
         }
 
-        // All remaining server kernels use the standard N-arg call path — no
-        // special boxing or argument projection is needed.
+        // Route constructors whose first argument is the route path use the
+        // standard N-arg call path; a literal path is first held to the
+        // runtime's parameter-name grammar (IPE-L0156), so a table the
+        // listener would refuse at startup is refused here.
         KernelFn::ServerGet
         | KernelFn::ServerPost
         | KernelFn::ServerPut
@@ -2074,7 +2076,32 @@ pub fn emit_server_call(
         // via the standard 2-arg call path; the `WebApp` arg is the leaf value
         // built by `Web.embed` (a `WebApp(web_app(...))` handle).
         | KernelFn::ServerMountApp
-        | KernelFn::ServerListen
+        // Authed routes take a two-argument handler `Request -> Principal ->
+        // Task Error Response`; the shared N-arg call path emits it as a
+        // `Box<dyn Fn(ServerRequest, Principal) -> IpeTask<ServerResponse>>`,
+        // matching `server_*_authed`'s `F: Fn(ServerRequest, Principal)` bound.
+        | KernelFn::ServerGetAuthed
+        | KernelFn::ServerPostAuthed
+        | KernelFn::ServerPutAuthed
+        | KernelFn::ServerDeleteAuthed => {
+            if let Some(Expr::Str(lit)) = args.first() {
+                let d = k.decl();
+                let call = format!("{}.{}", d.qualifier, d.name);
+                let path = if matches!(k, KernelFn::ServerApi) {
+                    crate::route_grammar::server_api_path(lit.as_str())
+                } else {
+                    lit.as_str()
+                };
+                crate::route_grammar::refuse_malformed(
+                    &call,
+                    crate::route_grammar::server_route_path(path),
+                )?;
+            }
+            Ok(None)
+        }
+        // All remaining server kernels use the standard N-arg call path — no
+        // special boxing or argument projection is needed.
+        KernelFn::ServerListen
         | KernelFn::ServerText
         | KernelFn::ServerJson
         | KernelFn::ServerHtml
@@ -2114,15 +2141,7 @@ pub fn emit_server_call(
         | KernelFn::WsSendToClient
         | KernelFn::WsSendBinaryToClient
         | KernelFn::WsBroadcast
-        | KernelFn::WsCloseClient
-        // Authed routes take a two-argument handler `Request -> Principal ->
-        // Task Error Response`; the shared N-arg call path emits it as a
-        // `Box<dyn Fn(ServerRequest, Principal) -> IpeTask<ServerResponse>>`,
-        // matching `server_*_authed`'s `F: Fn(ServerRequest, Principal)` bound.
-        | KernelFn::ServerGetAuthed
-        | KernelFn::ServerPostAuthed
-        | KernelFn::ServerPutAuthed
-        | KernelFn::ServerDeleteAuthed => Ok(None),
+        | KernelFn::WsCloseClient => Ok(None),
         // Any is_server() variant not listed above is a gap — hard error so
         // the Rust compiler's exhaustiveness check catches it at compile time.
         _ => Err(Diagnostic::CompilerBug {

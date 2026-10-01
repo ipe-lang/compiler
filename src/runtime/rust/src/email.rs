@@ -289,7 +289,9 @@ async fn read_email_body_capped<E: From<String>>(
         }
         buf.extend_from_slice(&bytes);
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    #[allow(clippy::disallowed_methods)] // a provider response is display text, not a URL component
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok(text)
 }
 
 // ──────────────────── Resend ────────────────────

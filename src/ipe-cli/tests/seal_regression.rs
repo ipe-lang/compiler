@@ -63,7 +63,7 @@ fn out_dir(name: &str) -> PathBuf {
 fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
     let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
     let out = out_dir(name);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
@@ -83,7 +83,7 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
         }
     }
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return; // emit-only fast pass
     }
     match e2e_support::build_and_run_rust(name, &out) {
@@ -114,7 +114,7 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
 fn emit_main_rs(name: &str, source: &str) -> String {
     let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
     let out = out_dir(name);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "{name}: build failed: {built:?}");
     let text = std::fs::read_to_string(out.join("src").join("main.rs"));
@@ -144,7 +144,7 @@ fn assert_accepted_project(name: &str, files: &[(&str, &str)], expected_stdout: 
         crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
     }
     let out = out_dir(name);
-    let runtime = crate::support::expect_runtime(name, ipe::resolve_runtime());
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = src.join("Main.ipe");
     match ipe::build_loose_file(&entry, &out, &runtime) {
         Ok(()) => {}
@@ -165,7 +165,7 @@ fn assert_accepted_project(name: &str, files: &[(&str, &str)], expected_stdout: 
         }
     }
 
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     match e2e_support::build_and_run_rust(name, &out) {

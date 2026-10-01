@@ -66,12 +66,9 @@ fn run(args: &[&str]) -> Run {
 }
 
 /// A well-typed source file the self-contained success quadrants type-check /
-/// inspect. Falls back to `None` on a sparse checkout that lacks the examples
-/// tree, so the success assertions skip rather than fail spuriously.
-fn well_typed_entry() -> Option<PathBuf> {
-    let entry =
-        support::manifest_dir().join("../../examples/shapes/non-tea/hello-world/src/Main.ipe");
-    entry.is_file().then_some(entry)
+/// inspect.
+fn well_typed_entry() -> PathBuf {
+    support::manifest_dir().join("../../examples/shapes/non-tea/hello-world/src/Main.ipe")
 }
 
 /// A fixture whose inferred capability set is a known, non-empty pair, for the
@@ -119,7 +116,7 @@ const MACHINE_CONFORMANCE: &[MachineConformance] = &[
     MachineConformance {
         command: "type-check",
         success: MachineSuccess::Drive(|| {
-            well_typed_entry().map(|e| vec![e.to_string_lossy().into_owned()])
+            Some(vec![well_typed_entry().to_string_lossy().into_owned()])
         }),
     },
     MachineConformance {
@@ -500,9 +497,7 @@ fn machine_mode_operational_error_routes_through_the_error_envelope() {
 /// the human vocabulary from the style SSOT, never flush-left machine text.
 #[test]
 fn human_success_quadrant_is_framed_and_guttered() {
-    let Some(entry) = well_typed_entry() else {
-        return; // sparse checkout — the example tree is absent
-    };
+    let entry = well_typed_entry();
     let r = run(&["type-check", &entry.to_string_lossy()]);
     assert!(
         r.ok,

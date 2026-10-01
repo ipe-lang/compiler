@@ -103,13 +103,11 @@ fn run_no_arg_empty_dir_returns_usage_error() {
 /// Gated on `IPE_E2E=1` — requires a working cargo and `IPE_RUNTIME_DIR`.
 #[test]
 fn build_no_arg_in_project_dir_succeeds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return; // runtime not available in this environment
-    };
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     let dir = fresh_dir("build_project");
     let project = dir.join("counter");
@@ -149,13 +147,11 @@ fn build_no_arg_in_project_dir_succeeds() {
 /// Gated on `IPE_E2E=1`.
 #[test]
 fn build_flag_first_no_entry_resolves_default() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     let dir = fresh_dir("build_flagfirst");
     let project = dir.join("counter");

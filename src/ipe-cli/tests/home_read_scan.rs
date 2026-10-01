@@ -33,6 +33,12 @@ const ACCESSOR_FILES: &[&str] = &[
     "src/runtime/rust/src/system.rs",
 ];
 
+/// The runtime file that names every `clippy.toml`-banned path under an
+/// `#[expect]` to prove each ban fires. It names the `std` home reader as a
+/// value and never calls it, which `ban_proof_file_never_calls_the_home_reader`
+/// pins.
+const BAN_PROOF_FILE: &str = "src/runtime/rust/src/clippy_paths_resolve.rs";
+
 /// Workspace-relative files that hold the only raw environment reads outside
 /// the runtime crate, each under a per-site `clippy::disallowed_methods` allow.
 const ENV_ALLOW_FILES: &[&str] = &[
@@ -54,19 +60,32 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// sandbox home reader, the jail passthrough); the dev-only temp-root test
 /// reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
-/// the environment accessor's readers, and an integration test with no
-/// crate-private accessor.
+/// the environment accessor's readers, two integration tests with no
+/// crate-private accessor, the lenient-decoder ban proofs, and the audited
+/// lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/env/src/lib.rs", 3),
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
+    ("src/runtime/rust/src/clippy_paths_resolve.rs", 10),
     ("src/runtime/rust/src/core.rs", 1),
+    ("src/runtime/rust/src/csv.rs", 1),
+    ("src/runtime/rust/src/dom/form.rs", 1),
+    ("src/runtime/rust/src/email.rs", 1),
+    ("src/runtime/rust/src/http_client.rs", 2),
+    ("src/runtime/rust/src/http_stream.rs", 2),
     ("src/runtime/rust/src/scratch_core.rs", 2),
-    ("src/runtime/rust/src/system.rs", 5),
+    ("src/runtime/rust/src/server.rs", 2),
+    ("src/runtime/rust/src/ssrf.rs", 1),
+    ("src/runtime/rust/src/system.rs", 9),
     ("src/runtime/rust/src/terminal_access.rs", 1),
+    ("src/runtime/rust/src/tui/key.rs", 1),
+    ("src/runtime/rust/src/url.rs", 1),
+    ("src/runtime/rust/src/web/mod.rs", 1),
     ("src/runtime/rust/tests/debug_behavior.rs", 1),
+    ("src/runtime/rust/tests/parent_death_spawner.rs", 1),
 ];
 
 /// The sandbox crate's sources: the only callers of the crate-private raw
@@ -468,7 +487,7 @@ fn pinned_allows(rel: &str) -> usize {
 
 /// The workspace root.
 fn workspace() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    e2e_support::manifest_dir!().join("../..")
 }
 
 /// Every scanned file under `src/`, `tools/`, and `examples/` whose path
@@ -671,7 +690,7 @@ fn no_production_source_reads_the_home_directly() {
     );
     let offenders: Vec<_> = files
         .iter()
-        .filter(|(rel, _)| !ACCESSOR_FILES.contains(&rel.as_str()))
+        .filter(|(rel, _)| !ACCESSOR_FILES.contains(&rel.as_str()) && rel != BAN_PROOF_FILE)
         .map(|(rel, text)| (rel, raw_home_reads(text)))
         .filter(|(_, hits)| !hits.is_empty())
         .collect();
@@ -679,6 +698,30 @@ fn no_production_source_reads_the_home_directly() {
         offenders.is_empty(),
         "raw home reads found; use `ipe_sandbox::home::home_dir` (compiler) or \
          `system::home_dir` (runtime) instead: {offenders:?}"
+    );
+}
+
+#[test]
+fn ban_proof_file_never_calls_the_home_reader() {
+    let files = workspace_sources(false);
+    let (_, text) = files
+        .iter()
+        .find(|(rel, _)| rel == BAN_PROOF_FILE)
+        .expect("the ban-proof file moved; update `BAN_PROOF_FILE`");
+    let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    for read in STD_HOME_READS {
+        assert_eq!(
+            flat.matches(read).count(),
+            flat.matches(&format!("let_=::std::{read};")).count(),
+            "`{BAN_PROOF_FILE}` may only name `{read}` as a `let _ = ..;` value"
+        );
+    }
+    assert!(
+        literal_home_reads()
+            .iter()
+            .all(|read| !flat.contains(read.as_str()))
+            && home_crate_paths(text).is_empty(),
+        "`{BAN_PROOF_FILE}` reads the home beyond naming the `std` reader"
     );
 }
 
@@ -1790,7 +1833,7 @@ mod lexical {
 
     /// The workspace root.
     fn workspace() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        e2e_support::manifest_dir!().join("../..")
     }
 
     #[test]
@@ -1804,7 +1847,10 @@ mod lexical {
         );
 
         let mut offenders = Vec::new();
-        for (rel, text) in files {
+        for (rel, text) in files
+            .into_iter()
+            .filter(|(rel, _)| rel != super::BAN_PROOF_FILE)
+        {
             let hits = raw_home_reads(
                 &text,
                 &exempt_in(LITERAL_ALLOWED, &rel),

@@ -149,9 +149,7 @@ main =
 #[test]
 fn untyped_embed_row_model_refused_or_builds() {
     let name = "untyped_embed_row_model";
-    let Some((built, out)) = build_fixture(name, UNTYPED_EMBED_ROW_MODEL) else {
-        return;
-    };
+    let (built, out) = build_fixture(name, UNTYPED_EMBED_ROW_MODEL);
     match built {
         Ok(()) => crate::support::assert_seal_builds(name, &out),
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
@@ -172,9 +170,7 @@ fn untyped_embed_row_model_refused_or_builds() {
 #[test]
 fn untyped_embed_row_model_pinned_msg_builds() {
     let name = "untyped_embed_row_model_pinned_msg";
-    let Some((built, out)) = build_fixture(name, UNTYPED_EMBED_ROW_MODEL_PINNED_MSG) else {
-        return;
-    };
+    let (built, out) = build_fixture(name, UNTYPED_EMBED_ROW_MODEL_PINNED_MSG);
     match built {
         Ok(()) => crate::support::assert_seal_builds(name, &out),
         Err(err) => assert!(
@@ -184,26 +180,13 @@ fn untyped_embed_row_model_pinned_msg_builds() {
     }
 }
 
-/// Build `source` as `name`, returning the build result and its output dir
-/// (`None`, after a failed assertion, when scratch or runtime setup fails).
-fn build_fixture(name: &str, source: &str) -> Option<(Result<(), CliError>, PathBuf)> {
+/// Build `source` as `name`, returning the build result and its output dir.
+#[allow(clippy::panic)] // a refused well-formed program is the test failure
+fn build_fixture(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
     let Some(entry) = write_single(name, source) else {
-        assert!(
-            false_marker(),
-            "{name}: could not write the fixture into the scratch dir"
-        );
-        return None;
+        panic!("{name}: could not write the fixture into the scratch dir");
     };
     let out = out_dir(name);
-    let runtime = match ipe::resolve_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: the embedded runtime could not be resolved: {err:?}"
-            );
-            return None;
-        }
-    };
-    Some((ipe::build(&entry, &out, &runtime), out))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    (ipe::build(&entry, &out, &runtime), out)
 }

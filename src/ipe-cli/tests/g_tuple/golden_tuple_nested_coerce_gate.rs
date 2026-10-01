@@ -19,12 +19,12 @@
 //!   column). So a `PList` / `PCons` column at any depth stays an honest
 //!   ipe-fail, never an exit-0-then-cargo-fail.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -46,9 +46,7 @@ fn assert_l0115_gate(fixture: &str, out_suffix: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -70,9 +68,7 @@ fn nested_tuple_str_column_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tuple_nested_coerce_str_gate");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&fixture_entry("i_tuple_nested_coerce_str"), &out, &runtime);
     assert!(
         built.is_ok(),
@@ -86,15 +82,13 @@ fn nested_tuple_str_column_builds() {
 /// arm firing. `classify (("x", 5), A)` matches the first arm → prints `5`.
 #[test]
 fn nested_tuple_str_column_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = crate::support::scratch_root().join("ipec_tuple_nested_coerce_str_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&fixture_entry("i_tuple_nested_coerce_str"), &out, &runtime);
     assert!(
         built.is_ok(),

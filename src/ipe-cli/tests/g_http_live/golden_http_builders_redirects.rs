@@ -13,10 +13,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_m5b_http_builders_redirects
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -31,9 +31,7 @@ fn redirect_builders_compile_and_run() {
     let out = crate::support::scratch_root().join("ipec_m5b_http_builders_redirects_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve: {:?}", runtime.err());
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: the builders must resolve through the kernel path.
     let built = ipe::build(&entry, &out, &runtime);
@@ -66,24 +64,22 @@ fn redirect_builders_compile_and_run() {
          API-layer scheme narrowing).\n--- src/main.rs ---\n{emitted}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // cargo-0 + run-0 with the exact expected chain result.
+        let outcome = crate::support::build_and_run_emitted("http_builders_redirects", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "binary must exit 0; stdout:\n{}",
+            outcome.stdout
+        );
+        assert_eq!(
+            outcome.stdout.trim(),
+            // `withUrl` carries the typed `Url`'s canonical serialization; the two
+            // blocks exercise both `RedirectPolicy` variants (NoRedirects and
+            // FollowRedirects Int).
+            "http://example.org/\nnoredirect\nhttp://example.org/\nfollow 3",
+            "builder chain must override url and both redirect-policy variants"
+        );
     }
-
-    // cargo-0 + run-0 with the exact expected chain result.
-    let outcome = crate::support::build_and_run_emitted("http_builders_redirects", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "binary must exit 0; stdout:\n{}",
-        outcome.stdout
-    );
-    assert_eq!(
-        outcome.stdout.trim(),
-        // `withUrl` carries the typed `Url`'s canonical serialization; the two
-        // blocks exercise both `RedirectPolicy` variants (NoRedirects and
-        // FollowRedirects Int).
-        "http://example.org/\nnoredirect\nhttp://example.org/\nfollow 3",
-        "builder chain must override url and both redirect-policy variants"
-    );
 }

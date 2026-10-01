@@ -56,10 +56,10 @@
 //!
 //! The compile-time negatives run unconditionally (no build/run, so no gate).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -72,7 +72,7 @@ fn golden_dir(name: &str) -> PathBuf {
 // broken toolchain environment should fail loudly here, not silently skip.
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for golden_parser_gaps tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ fn runtime() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn assert_single_oracle(name: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let dir = golden_dir(name);
@@ -117,7 +117,7 @@ fn blockcomment_builds_and_matches_oracle() {
 
 #[test]
 fn qualtype_project_builds_and_prints_42() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let name = "mm_qualtype";
@@ -148,7 +148,7 @@ fn qualtype_project_builds_and_prints_42() {
 
 #[test]
 fn intdiv_by_zero_aborts_exit_101() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let name = "intdiv_divzero";
@@ -206,7 +206,7 @@ fn unterminated_blockcomment_is_ipe_p0017() {
 
     let res = ipe::build(&entry, &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_P0017),
@@ -223,7 +223,7 @@ fn unknown_module_in_annotation_is_ipe_n0004() {
 
     let res = ipe::build_project(&dir.join("package.ipe"), &out, &runtime());
     assert!(res.is_err(), "{name} must fail to compile");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     assert_eq!(
         diag_code(&err),
         Some(ipe_diagnostics::IPE_N0004),

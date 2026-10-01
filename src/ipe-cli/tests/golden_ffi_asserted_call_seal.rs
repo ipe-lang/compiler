@@ -23,11 +23,6 @@ use std::path::{Path, PathBuf};
 
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
-/// A runtime `false` the optimiser cannot fold — a deliberate failure marker.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 /// Seed the project's FFI cache with an inspection for a crate `tm` whose
 /// surface exercises both checker arms: `shift` is inspected with exact `i64`
 /// carriers (compile-time check passes), `clamped` is inspected with `u32`
@@ -138,9 +133,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// shim region with exact carriers, the panic boundary, and no coercion.
 #[test]
 fn asserted_call_emits_the_exact_carrier_shim() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_call");
     assert!(
@@ -153,11 +146,7 @@ fn asserted_call_emits_the_exact_carrier_shim() {
     let _ = fs::remove_dir_all(&out);
 
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(
-            false_marker(),
-            "asserted-call fixture must build, got: {err}"
-        );
-        return;
+        panic!("asserted-call fixture must build, got: {err}")
     }
 
     // The shim region: exact declared carriers, the panic boundary, no
@@ -207,9 +196,7 @@ fn asserted_call_emits_the_exact_carrier_shim() {
 /// preparation, naming the real Rust carrier — never silently clamped.
 #[test]
 fn a_clamp_requiring_assertion_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let main = "module Main exposing (main)\n\
             import Ipe.Io as Io\n\
         import Rust.Ffi\n\n\
@@ -240,9 +227,7 @@ fn a_clamp_requiring_assertion_is_refused() {
 /// teachable IPE-N0038 — never silently ignored, never a confusing miss.
 #[test]
 fn a_misplaced_asserted_call_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let main = "module Main exposing (main)\n\
             import Ipe.Io as Io\n\
         import Rust.Ffi\n\n\
@@ -352,12 +337,10 @@ fn analysis_entrypoints_accept_an_asserted_program() {
 /// crate — surfacing as a typed `Err`, proven by the printed branch.
 #[test]
 fn asserted_call_emitted_crate_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_call_e2e");
@@ -370,11 +353,7 @@ fn asserted_call_emitted_crate_builds_and_runs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_call_e2e_out");
     let _ = fs::remove_dir_all(&out);
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(
-            false_marker(),
-            "asserted-call fixture must build, got: {err}"
-        );
-        return;
+        panic!("asserted-call fixture must build, got: {err}")
     }
 
     // The real foreign crate: `hidden_double` and `boom` exist here but were
@@ -460,9 +439,7 @@ const CONST_MAIN_IPE: &str = "module Main exposing (main)\n\
 /// `IpeResult`, no `catch_unwind`.
 #[test]
 fn const_read_emits_a_bare_infallible_shim() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_read");
     assert!(
@@ -474,8 +451,7 @@ fn const_read_emits_a_bare_infallible_shim() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_out");
     let _ = fs::remove_dir_all(&out);
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(false_marker(), "const fixture must build, got: {err}");
-        return;
+        panic!("const fixture must build, got: {err}")
     }
 
     let ffi_rs = read_emitted(&out, "src/ffi.rs");
@@ -501,9 +477,7 @@ fn const_read_emits_a_bare_infallible_shim() {
 /// — a native constant is a single infallible value.
 #[test]
 fn a_result_typed_const_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_result_refused");
@@ -534,12 +508,10 @@ fn a_result_typed_const_is_refused() {
 /// REAL foreign crate exposing the constants and runs, reading both values.
 #[test]
 fn const_read_emitted_crate_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_read_e2e");
     assert!(
@@ -551,8 +523,7 @@ fn const_read_emitted_crate_builds_and_runs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_e2e_out");
     let _ = fs::remove_dir_all(&out);
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(false_marker(), "const fixture must build, got: {err}");
-        return;
+        panic!("const fixture must build, got: {err}")
     }
 
     let tm_dir = tmp.join("tm");

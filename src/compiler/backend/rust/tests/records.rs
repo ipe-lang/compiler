@@ -457,7 +457,7 @@ fn distinct_shapes_sharing_a_field_set_emit_two_structs() -> DResult<()> {
 /// disambiguated emit is sound Rust. Gated on `IPE_E2E=1` (offline by default).
 #[test]
 fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -543,9 +543,7 @@ fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
     );
     let emitted = RustBackend::new(&interner).emit(&prog)?;
 
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let status = seal_e2e::vendor_and_run(
         &emitted,
         &runtime,
@@ -565,12 +563,10 @@ fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
 /// `IPE_E2E=1` so the default `cargo test` stays fast and offline.
 #[test]
 fn end_to_end_builds_and_prints_five() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let mut interner = Interner::new();
     let prog = record_trio(&mut interner)?;

@@ -69,7 +69,6 @@ fn rewrite(expr: Expr, target: Symbol, eager: bool, payloads: &EnumPayloadTable)
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
@@ -321,7 +320,6 @@ pub fn seq_rewrite_clones_symbol(sym: Symbol, expr: &Expr, payloads: &EnumPayloa
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

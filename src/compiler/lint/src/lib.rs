@@ -495,7 +495,6 @@ fn collect_call_edits(
         | Expr_::Float(_)
         | Expr_::Str(_)
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::CustomElementCtor(_)
         | Expr_::Unit => {}
 

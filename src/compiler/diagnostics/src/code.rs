@@ -331,7 +331,7 @@ code! {
     IPE_P0061 = "IPE-P0061", "malformed let expression", "IPE-P0061";
     /// malformed if expression
     IPE_P0062 = "IPE-P0062", "malformed if expression", "IPE-P0062";
-    /// invalid path literal — a `path "…"` whose string fails compile-time validation
+    /// invalid path literal — a `CustomElement.fromFile` path that fails compile-time validation
     IPE_P0063 = "IPE-P0063", "invalid path literal", "IPE-P0063";
     /// a bare `_` as the whole `let` binding pattern binds nothing and is not allowed
     IPE_P0064 = "IPE-P0064", "bare `_` as a whole `let` binding pattern is not allowed", "IPE-P0064";
@@ -669,6 +669,10 @@ code! {
     /// Re-carrying the stored functions a mapper receives needs one fresh
     /// parameter per wrapper and adapter position, bounded per call site.
     IPE_L0155 = "IPE-L0155", "a collection mapper needs more adapter parameters than one call site allows", "IPE-L0155";
+    /// a literal route pattern or server route path is malformed.
+    ///
+    /// The runtime refuses the same literal at startup; `ipe` refuses it first.
+    IPE_L0156 = "IPE-L0156", "a literal route pattern or server route path is malformed", "IPE-L0156";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
 

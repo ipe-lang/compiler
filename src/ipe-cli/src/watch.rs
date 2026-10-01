@@ -2762,18 +2762,29 @@ fn post_hot_wiring(port: u16, token: &str, body: &str) -> std::io::Result<bool> 
     Ok(head.starts_with("HTTP/1.1 200"))
 }
 
-fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> Command {
+/// The dev child's launch `Command`: `exe_path` with `env` applied and stdin closed.
+fn child_command(exe_path: &Path, env: &[(String, String)]) -> Command {
     let mut cmd = Command::new(exe_path);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // Non-graceful death floor: the supervisor reaps this child on every GRACEFUL
-    // path (shutdown / SIGTERM-forwarder / Drop), but a SIGKILL/OOM/panic-abort of
-    // `ipe watch` would otherwise orphan it holding the dev port. On Linux the
-    // kernel then SIGTERMs it when we die by ANY means. (Runtime-crate SSOT — the
-    // sole sanctioned `PR_SET_PDEATHSIG`; the watch crates stay unsafe-free.)
-    ipe_runtime_rust::system::harden_child_parent_death(&mut cmd);
+    cmd.stdin(std::process::Stdio::null());
     cmd
+}
+
+/// Spawn the dev child through the runtime's parent-death floor.
+///
+/// The supervisor reaps this child on every GRACEFUL path (shutdown /
+/// SIGTERM-forwarder / Drop), but a SIGKILL/OOM/panic-abort of `ipe watch`
+/// would otherwise orphan it holding the dev port. `spawn_hardened` forks it
+/// from the runtime's process-lifetime spawner thread, so on Linux the kernel
+/// SIGTERMs it when `ipe watch` dies by ANY means, and never earlier (the
+/// signal is bound to the forking thread, which lives as long as the process).
+/// A refused hardened spawn surfaces as a spawn error; it never degrades to an
+/// unhardened spawn.
+fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<Child> {
+    ipe_runtime_rust::system::spawn_hardened(child_command(exe_path, env))
+        .map_err(std::io::Error::from)
 }
 
 /// Frame a compiler diagnostic for the watch stderr build-failed report: the
@@ -3331,7 +3342,7 @@ mod tests {
     use super::{
         AppearanceRoute, BuildAccel, Command, Duration, OrchestratorEvent, RESOLVE_RETRY_DELAY,
         RebuildTimings, ResolvedProject, ScopeSpec, WatchRole, appearance_route,
-        apply_build_accel_env, child_env, choose_build_accel, compile_failed_frame,
+        apply_build_accel_env, child_command, child_env, choose_build_accel, compile_failed_frame,
         dir_has_dep_rlib, emitted_binds_http, emitted_is_tui, emitted_is_web, env_flag_on,
         first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
         resolve_project_sources, schedule_resolve_retry, send_control_frame, spawn_command,
@@ -4021,27 +4032,36 @@ mod tests {
         assert!(frame.contains("bell"), "text after a control byte survives");
     }
 
-    /// `spawn_command` builds a launchable child `Command` with the requested env
-    /// applied, and routes it through the runtime's parent-death floor
-    /// (`harden_child_parent_death`) so a non-graceful `ipe watch` death cannot
-    /// orphan the child. The floor is a Linux `pre_exec` (a fork-time syscall not
-    /// observable from the parent `Command`), so this pins the observable
-    /// contract: the env is set and the command is the requested binary.
+    /// The dev child's `Command` carries the requested env into the running
+    /// child when launched through the runtime's hardened spawner: the child
+    /// (`/usr/bin/env`) prints its environment and it contains the port.
+    #[cfg(unix)]
     #[test]
-    fn spawn_command_sets_env_and_is_launchable() {
+    fn child_command_env_reaches_the_hardened_child() {
         let env = vec![("IPE_WEB_PORT".to_string(), "4321".to_string())];
-        let cmd = spawn_command(Path::new("/bin/true"), &env);
-        assert_eq!(cmd.get_program(), OsStr::new("/bin/true"));
-        let has_port = cmd
-            .get_envs()
-            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
-            .any(|pair| {
-                pair == (
-                    OsStr::new("IPE_WEB_PORT").to_owned(),
-                    OsStr::new("4321").to_owned(),
-                )
-            });
-        assert!(has_port, "child env must carry the requested port");
+        let mut cmd = child_command(Path::new("/usr/bin/env"), &env);
+        cmd.stdout(std::process::Stdio::piped());
+        let child = ipe_runtime_rust::system::spawn_hardened(cmd)
+            .map_err(std::io::Error::from)
+            .expect("hardened /usr/bin/env must spawn");
+        let out = child.wait_with_output().expect("reap /usr/bin/env");
+        assert!(out.status.success(), "/usr/bin/env must exit 0");
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            printed.lines().any(|l| l == "IPE_WEB_PORT=4321"),
+            "child env must carry the requested port: {printed}"
+        );
+    }
+
+    /// `spawn_command` launches the requested binary through the hardened
+    /// spawner and hands back a live, reapable `Child`.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_command_launches_through_the_hardened_spawner() {
+        let mut child =
+            spawn_command(Path::new("/bin/true"), &[]).expect("hardened /bin/true must spawn");
+        let status = child.wait().expect("reap /bin/true");
+        assert!(status.success(), "hardened /bin/true must exit 0");
     }
 
     /// The hot-control token is 256 bits of OS-CSPRNG output rendered as 64 hex

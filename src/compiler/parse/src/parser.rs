@@ -1537,20 +1537,6 @@ impl<'a> Parser<'a> {
             Tok::Char(c) => Ok(Located::new(span, Expr_::Char(c))),
             Tok::Minus => self.parse_negative_literal(span, threshold, depth),
             Tok::Ident(text) => {
-                // `path "…"` — a contextual path literal. `path` is only
-                // special when immediately followed (in the same layout block)
-                // by a string literal; everywhere else it is a plain identifier.
-                if text == "path"
-                    && self
-                        .peek()
-                        .is_some_and(|next| matches!(&next.kind, Tok::Str(_)))
-                {
-                    let str_tok = self.bump(Construct::Expression)?;
-                    if let Tok::Str(raw) = str_tok.kind {
-                        let merged = Self::span_merge(span, str_tok.span);
-                        return Ok(Located::new(merged, Expr_::PathLit(raw)));
-                    }
-                }
                 let expr = self.ident_expr(&text, span)?;
                 Ok(Located::new(span, expr))
             }

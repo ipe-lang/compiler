@@ -35,9 +35,7 @@ fn db_store_rename_column_emits() {
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -49,7 +47,7 @@ fn db_store_rename_column_emits() {
 /// checked-in `expected.txt` byte-for-byte.
 #[test]
 fn db_store_rename_column_runs_and_matches() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -59,9 +57,7 @@ fn db_store_rename_column_runs_and_matches() {
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(

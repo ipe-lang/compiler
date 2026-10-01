@@ -27,8 +27,9 @@
 //! parse boundary; connecting is a distinct, separately-reviewed act.
 
 use super::IpeResult;
+use crate::encoding::{UrlGrammar, decode_component};
 use crate::secret::{Secret, secret_from_string};
-use crate::ssrf::{ConfiguredHost, UnambiguousUrl};
+use crate::ssrf::{ConfiguredHost, DriverParityQuery, UnambiguousUrl};
 
 /// The closed set of drivers the runtime can describe. Exactly the two sqlx
 /// drivers the `db` feature links (`sqlite`, `postgres`); a driver the runtime
@@ -110,10 +111,7 @@ struct DsnPart(String);
 impl DsnPart {
     /// A part written percent-encoded in a URL, held decoded.
     fn of_encoded(encoded: &str) -> Option<Self> {
-        let decoded = percent_encoding::percent_decode_str(encoded)
-            .decode_utf8()
-            .ok()?;
-        Self::of_text(decoded.into_owned())
+        Self::of_text(decode_component(encoded, UrlGrammar::Path).ok()?)
     }
 
     /// A part given as its own literal text.
@@ -184,23 +182,29 @@ impl SqliteDb {
     /// The database named by the text of a SQLite DSN after its scheme.
     ///
     /// Read as a single scheme, one optional `//`, and the path up to the
-    /// first `?`, percent-decoded. The only query admitted is `mode=rwc`, the
-    /// mode the connection pins.
+    /// first `?`, percent-decoded under the path grammar. The only query
+    /// admitted is `mode=rwc`, the mode the connection pins; every query pair
+    /// is decoded under the form grammar, so a malformed escape is refused.
     fn of_dsn_rest(rest: &str) -> Result<Self, DsnReject> {
         let rest = rest.strip_prefix("//").unwrap_or(rest);
         let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-        let pinned_only = ::url::form_urlencoded::parse(query.as_bytes())
-            .all(|(key, value)| key == "mode" && value == "rwc");
+        let pinned_only = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .all(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                decode_component(key, UrlGrammar::Form).is_ok_and(|key| key == "mode")
+                    && decode_component(value, UrlGrammar::Form).is_ok_and(|value| value == "rwc")
+            });
         if !pinned_only {
             return Err(DsnReject::ConflictingParameter);
         }
         if path.len() > MAX_COMPONENT_LEN {
             return Err(DsnReject::InvalidComponent);
         }
-        percent_encoding::percent_decode_str(path)
-            .decode_utf8()
+        decode_component(path, UrlGrammar::Path)
             .ok()
-            .and_then(|name| Self::of_name(name.into_owned()))
+            .and_then(Self::of_name)
             .ok_or(DsnReject::InvalidComponent)
     }
 
@@ -356,13 +360,11 @@ const MAX_DSN_LEN: usize = 4096;
 /// embedded null, no leading/trailing/interior whitespace, and within the length
 /// bound — checked on the PERCENT-DECODED form, so a `%0a`/`%00` that decodes to a
 /// control byte is rejected too. Rejecting whitespace and control bytes closes the
-/// injection/smuggling vector before any component is trusted.
+/// injection/smuggling vector before any component is trusted. A malformed escape
+/// or decoded bytes that are not UTF-8 are rejected as well.
 fn component_ok(s: &str) -> bool {
-    // Validate the decoded bytes: a `%0a` in the raw form decodes to a newline, a
-    // control byte the raw scan would miss. Lossy UTF-8 is fine here — we only
-    // ever REJECT on a control/whitespace byte, never trust the decoded value.
     s.len() <= MAX_COMPONENT_LEN
-        && text_ok(&percent_encoding::percent_decode_str(s).decode_utf8_lossy())
+        && decode_component(s, UrlGrammar::Path).is_ok_and(|decoded| text_ok(&decoded))
 }
 
 /// True when `s`, taken literally, is non-empty, within the length bound, and
@@ -400,9 +402,9 @@ fn parse_sslmode(token: &str) -> Result<TlsMode, DsnReject> {
 /// duplicated `sslmode` with differing values, or any of the credential-smuggling
 /// shapes is a `ConflictingParameter` rejection: the password must arrive through
 /// the structured userinfo, never a re-parseable query segment.
-fn tls_from_query(url: &::url::Url) -> Result<TlsMode, DsnReject> {
+fn tls_from_query(url: &UnambiguousUrl) -> Result<TlsMode, DsnReject> {
     let mut chosen: Option<TlsMode> = None;
-    for (key, value) in url.query_pairs() {
+    for (key, value) in DriverParityQuery::of(url).pairs() {
         match key.as_ref() {
             "password" | "user" | "username" => {
                 // Credential smuggled into the query string — reject; credentials
@@ -462,19 +464,18 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
         return reject(DsnReject::UnknownDriver);
     };
 
-    let tls = match tls_from_query(&parsed) {
-        Ok(t) => t,
-        Err(r) => return reject(r),
-    };
-
     // Sqlite is a local file driver: the "host" is empty and the database is the
     // file path. Postgres is a network driver: a host is mandatory.
-    let (host, port, target) = match driver {
+    let (host, port, target, tls) = match driver {
         DsnDriver::Postgres => {
             // A credential holding an unencoded `/`, `?`, `#` or `\` ends the
             // authority early, so the parser would read part of it as the host.
             let Some(url) = UnambiguousUrl::of_parsed(&s, parsed.clone()) else {
                 return reject(DsnReject::AmbiguousUserinfo);
+            };
+            let tls = match tls_from_query(&url) {
+                Ok(t) => t,
+                Err(r) => return reject(r),
             };
             let Some(host) = DsnHost::of_url(&url) else {
                 return reject(DsnReject::MissingHost);
@@ -487,7 +488,7 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
             let Some(database) = DsnPart::of_encoded(parsed.path().trim_start_matches('/')) else {
                 return reject(DsnReject::InvalidComponent);
             };
-            (host, port, DsnTarget::Postgres(database))
+            (host, port, DsnTarget::Postgres(database), tls)
         }
         DsnDriver::Sqlite => {
             // A file-backed sqlite DSN has no network host, port, or
@@ -495,9 +496,11 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
             if !parsed.username().is_empty() || parsed.password().is_some() {
                 return reject(DsnReject::ConflictingParameter);
             }
+            // The query admits only `mode=rwc` (`SqliteDb::of_dsn_rest`), so
+            // no `sslmode` can be present and the posture is the secure default.
             let rest = s.split_once(':').map_or("", |(_, rest)| rest);
             match SqliteDb::of_dsn_rest(rest) {
-                Ok(db) => (DsnHost::none(), 0, DsnTarget::Sqlite(db)),
+                Ok(db) => (DsnHost::none(), 0, DsnTarget::Sqlite(db), TlsMode::Require),
                 Err(r) => return reject(r),
             }
         }
@@ -516,12 +519,10 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
     };
 
     // Held decoded, as the user name is, so the connection URL encodes it once.
-    let Ok(password) =
-        percent_encoding::percent_decode_str(parsed.password().unwrap_or("")).decode_utf8()
-    else {
+    let Ok(password) = decode_component(parsed.password().unwrap_or(""), UrlGrammar::Path) else {
         return reject(DsnReject::InvalidComponent);
     };
-    let password = secret_from_string(password.into_owned());
+    let password = secret_from_string(password);
     let credentials = match Credentials::of_parts(user, password) {
         Ok(credentials) => credentials,
         Err(r) => return reject(r),
@@ -1186,6 +1187,11 @@ mod tests {
             "postgres://u:p%ff@db.example/app",
             "postgres://db.example/a%ff",
             "postgres://u%0a@db.example/app",
+            "postgres://u%zz@db.example/app",
+            "postgres://u:p%zz@db.example/app",
+            "postgres://u:p%@db.example/app",
+            "postgres://db.example/a%zz",
+            "postgres://db.example/a%C0%AF",
         ] {
             assert!(
                 matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
@@ -1336,6 +1342,8 @@ mod tests {
             "sqlite://x.db?sslmode=require",
             "sqlite://u:p@x.db",
             "sqlite::memory:?cache=shared",
+            "sqlite:x.db?mode=%zz",
+            "sqlite:x.db?mode=rwc&%zz",
         ] {
             assert!(
                 matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("conflicting or misplaced parameter")),
@@ -1346,6 +1354,8 @@ mod tests {
             "sqlite:file:x.db",
             "sqlite:file%3Ax.db?mode=rwc",
             "sqlite:%ff",
+            "sqlite:a%zz.db",
+            "sqlite:a%.db",
         ] {
             assert!(
                 matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),

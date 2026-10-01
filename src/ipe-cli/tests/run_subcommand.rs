@@ -11,15 +11,6 @@ use std::path::PathBuf;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// `assert!(false_marker())` fails the test without tripping
-/// `clippy::assertions_on_constants`.
-// `const` is rejected on purpose: a const-known `false` would re-trip
-// `assertions_on_constants` at the call site, defeating the `black_box`.
-#[allow(clippy::missing_const_for_fn)]
-fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 // ---------------------------------------------------------------------------
 // CLI-parsing tests (unconditional — no network, no build)
 // ---------------------------------------------------------------------------
@@ -72,77 +63,69 @@ fn run_unknown_flag_returns_usage_error() {
 /// This test exercises the full `run_run` path from CLI dispatch through the
 /// Unix `exec` replacement.  It is skipped unless `IPE_E2E=1` is set.
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn run_subcommand_builds_and_executes_hello_program() {
     const SRC: &str =
         "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hello from run\"\n";
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // Resolve the runtime dir (skips the test when IPE_RUNTIME_DIR is unset
+        // and the walk-up also fails, which happens in CI without the repo tree).
+        let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    // Resolve the runtime dir (skips the test when IPE_RUNTIME_DIR is unset
-    // and the walk-up also fails, which happens in CI without the repo tree).
-    let runtime = ipe::resolve_runtime();
-    assert!(
-        runtime.is_ok(),
-        "runtime must resolve for E2E test: {runtime:?}"
-    );
-    let Ok(runtime_dir) = runtime else {
-        return;
-    };
+        // Write the source file into a temp directory.
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
+        let _ = fs::remove_dir_all(&dir);
+        let entry = dir.join("Main.ipe");
+        let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
+        assert!(created.is_ok(), "write source: {created:?}");
 
-    // Write the source file into a temp directory.
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
-    let _ = fs::remove_dir_all(&dir);
-    let entry = dir.join("Main.ipe");
-    let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
-    assert!(created.is_ok(), "write source: {created:?}");
+        // Use a dedicated out dir so CARGO_TARGET_DIR contention is isolated.
+        let out_dir = dir.join("out");
 
-    // Use a dedicated out dir so CARGO_TARGET_DIR contention is isolated.
-    let out_dir = dir.join("out");
+        // --- Step 1+2: compile + cargo build via run_cli ---
+        // We cannot call run_cli("run", …) directly here because on Unix it would
+        // exec (replace) this test process.  Instead, call the public `build`
+        // function + cargo build directly to verify SEAL, then run the binary as a
+        // child process to check stdout.  This exercises the same code paths as
+        // run_run without sacrificing the test runner.
+        let built = ipe::build(&entry, &out_dir, &runtime_dir);
+        assert!(built.is_ok(), "ipe build step must succeed: {built:?}");
 
-    // --- Step 1+2: compile + cargo build via run_cli ---
-    // We cannot call run_cli("run", …) directly here because on Unix it would
-    // exec (replace) this test process.  Instead, call the public `build`
-    // function + cargo build directly to verify SEAL, then run the binary as a
-    // child process to check stdout.  This exercises the same code paths as
-    // run_run without sacrificing the test runner.
-    let built = ipe::build(&entry, &out_dir, &runtime_dir);
-    assert!(built.is_ok(), "ipe build step must succeed: {built:?}");
+        // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
+        // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
+        // dir inside out_dir so a bare local run stays hermetic.
+        let target_dir = e2e_support::child_shared_target_from_env()
+            .map_or_else(|| out_dir.join("target"), PathBuf::from);
+        let cargo_status = std::process::Command::new("cargo")
+            .arg("build")
+            .current_dir(&out_dir)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .status();
+        assert!(
+            matches!(&cargo_status, Ok(s) if s.success()),
+            "cargo build on emitted project must succeed: {cargo_status:?}"
+        );
 
-    // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
-    // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
-    // dir inside out_dir so a bare local run stays hermetic.
-    let target_dir = e2e_support::child_shared_target_from_env()
-        .map_or_else(|| out_dir.join("target"), PathBuf::from);
-    let cargo_status = std::process::Command::new("cargo")
-        .arg("build")
-        .current_dir(&out_dir)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status();
-    assert!(
-        matches!(&cargo_status, Ok(s) if s.success()),
-        "cargo build on emitted project must succeed: {cargo_status:?}"
-    );
+        // --- Step 3: run the binary, capture stdout ---
+        let bin: PathBuf = target_dir.join("debug").join("ipe-app");
+        let run = std::process::Command::new(&bin).output();
+        let Ok(run) = run else {
+            panic!("failed to run emitted binary: {run:?}")
+        };
+        assert!(run.status.success(), "binary must exit 0");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "hello from run\n",
+            "ipec run e2e: stdout mismatch"
+        );
 
-    // --- Step 3: run the binary, capture stdout ---
-    let bin: PathBuf = target_dir.join("debug").join("ipe-app");
-    let run = std::process::Command::new(&bin).output();
-    let Ok(run) = run else {
-        assert!(false_marker(), "failed to run emitted binary: {run:?}");
-        return;
-    };
-    assert!(run.status.success(), "binary must exit 0");
-    assert_eq!(
-        String::from_utf8_lossy(&run.stdout),
-        "hello from run\n",
-        "ipec run e2e: stdout mismatch"
-    );
-
-    // Prune only an isolated per-test target; a shared warm target is owned by
-    // the harness and must not be removed here.
-    if e2e_support::child_shared_target_from_env().is_none() {
-        let _ = fs::remove_dir_all(&target_dir);
+        // Prune only an isolated per-test target; a shared warm target is owned by
+        // the harness and must not be removed here.
+        if e2e_support::child_shared_target_from_env().is_none() {
+            let _ = fs::remove_dir_all(&target_dir);
+        }
     }
 }
 
@@ -159,118 +142,115 @@ fn run_subcommand_builds_and_executes_hello_program() {
 fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"ok\"\n";
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+        // --- Case 1: single-file build (no manifest) → name must be "ipe-app" ---
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_bin_name_e2e");
+        let _ = fs::remove_dir_all(&dir);
+        let entry = dir.join("Main.ipe");
+        let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
+        assert!(created.is_ok(), "write source: {created:?}");
 
-    // --- Case 1: single-file build (no manifest) → name must be "ipe-app" ---
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_bin_name_e2e");
-    let _ = fs::remove_dir_all(&dir);
-    let entry = dir.join("Main.ipe");
-    let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
-    assert!(created.is_ok(), "write source: {created:?}");
+        let out_single = dir.join("out_single");
+        let built = ipe::build(&entry, &out_single, &runtime_dir);
+        assert!(built.is_ok(), "single-file build must succeed: {built:?}");
 
-    let out_single = dir.join("out_single");
-    let built = ipe::build(&entry, &out_single, &runtime_dir);
-    assert!(built.is_ok(), "single-file build must succeed: {built:?}");
+        let cargo_toml_text = fs::read_to_string(out_single.join("Cargo.toml"))
+            .expect("emitted Cargo.toml must exist");
+        assert!(
+            cargo_toml_text.contains("name = \"ipe-app\""),
+            "single-file build must emit name = \"ipe-app\", got:\n{cargo_toml_text}"
+        );
 
-    let cargo_toml_text =
-        fs::read_to_string(out_single.join("Cargo.toml")).expect("emitted Cargo.toml must exist");
-    assert!(
-        cargo_toml_text.contains("name = \"ipe-app\""),
-        "single-file build must emit name = \"ipe-app\", got:\n{cargo_toml_text}"
-    );
-
-    // --- Case 2: manifest build → name is the FRIENDLY slug + a path-derived
-    // crate-identity hash suffix. The manifest name "Crc32 Checksum" sanitizes to
-    // "crc32-checksum"; the emitted crate identity is "crc32-checksum_<hash>" so
-    // two same-named projects at different paths own separate shared-target slots.
-    // The `ipe run` binary lookup reads THIS emitted name (SSOT), so it locates
-    // the hashed binary cargo produces — never "ipe-app".
-    let pkg_dir = dir.join("pkg");
-    let src_dir = pkg_dir.join("src");
-    let _ = fs::create_dir_all(&src_dir);
-    fs::write(
+        // --- Case 2: manifest build → name is the FRIENDLY slug + a path-derived
+        // crate-identity hash suffix. The manifest name "Crc32 Checksum" sanitizes to
+        // "crc32-checksum"; the emitted crate identity is "crc32-checksum_<hash>" so
+        // two same-named projects at different paths own separate shared-target slots.
+        // The `ipe run` binary lookup reads THIS emitted name (SSOT), so it locates
+        // the hashed binary cargo produces — never "ipe-app".
+        let pkg_dir = dir.join("pkg");
+        let src_dir = pkg_dir.join("src");
+        let _ = fs::create_dir_all(&src_dir);
+        fs::write(
         pkg_dir.join("package.ipe"),
         "module Package exposing (package)\n\n\npackage =\n    { name = \"Crc32 Checksum\", version = \"0.1.0\" }\n",
     )
     .expect("write package.ipe");
-    fs::write(src_dir.join("Main.ipe"), SRC).expect("write Main.ipe");
+        fs::write(src_dir.join("Main.ipe"), SRC).expect("write Main.ipe");
 
-    let emitted_pkg_name = |out: &std::path::Path| -> String {
-        let text =
-            fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml must exist");
-        text.lines()
-            .find_map(|l| {
-                let t = l.trim();
-                t.strip_prefix("name")
-                    .and_then(|r| r.trim_start().strip_prefix('='))
-                    .map(|r| r.trim().trim_matches('"').to_owned())
-            })
-            .filter(|n| !n.is_empty())
-            .expect("emitted Cargo.toml must carry a [package] name")
-    };
+        let emitted_pkg_name = |out: &std::path::Path| -> String {
+            let text =
+                fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml must exist");
+            text.lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("name")
+                        .and_then(|r| r.trim_start().strip_prefix('='))
+                        .map(|r| r.trim().trim_matches('"').to_owned())
+                })
+                .filter(|n| !n.is_empty())
+                .expect("emitted Cargo.toml must carry a [package] name")
+        };
 
-    let out_pkg = dir.join("out_pkg");
-    let built = ipe::build_project(&pkg_dir.join("package.ipe"), &out_pkg, &runtime_dir);
-    assert!(built.is_ok(), "project build must succeed: {built:?}");
-    let name_pkg = emitted_pkg_name(&out_pkg);
+        let out_pkg = dir.join("out_pkg");
+        let built = ipe::build_project(&pkg_dir.join("package.ipe"), &out_pkg, &runtime_dir);
+        assert!(built.is_ok(), "project build must succeed: {built:?}");
+        let name_pkg = emitted_pkg_name(&out_pkg);
 
-    // Friendly base preserved as the prefix; the crate identity carries a hash
-    // suffix so the plain slug never has to fight for a shared-target slot.
-    assert!(
-        name_pkg.starts_with("crc32-checksum_"),
-        "project build must emit the friendly slug as the crate-identity prefix, got: {name_pkg}"
-    );
-    assert_ne!(
-        name_pkg, "crc32-checksum",
-        "the emitted crate identity must carry a path-derived suffix"
-    );
-    assert_ne!(
-        name_pkg, "ipe-app",
-        "a manifest build must NOT collapse to the single-file default"
-    );
+        // Friendly base preserved as the prefix; the crate identity carries a hash
+        // suffix so the plain slug never has to fight for a shared-target slot.
+        assert!(
+            name_pkg.starts_with("crc32-checksum_"),
+            "project build must emit the friendly slug as the crate-identity prefix, got: {name_pkg}"
+        );
+        assert_ne!(
+            name_pkg, "crc32-checksum",
+            "the emitted crate identity must carry a path-derived suffix"
+        );
+        assert_ne!(
+            name_pkg, "ipe-app",
+            "a manifest build must NOT collapse to the single-file default"
+        );
 
-    // Deterministic: re-emitting the SAME project (same canonical path) yields
-    // the SAME crate identity (PRINCIPLE 2 Correctness; reproducible goldens).
-    let out_pkg2 = dir.join("out_pkg2");
-    ipe::build_project(&pkg_dir.join("package.ipe"), &out_pkg2, &runtime_dir)
-        .expect("re-emit must succeed");
-    assert_eq!(
-        name_pkg,
-        emitted_pkg_name(&out_pkg2),
-        "the same project path must yield the same crate identity every build"
-    );
+        // Deterministic: re-emitting the SAME project (same canonical path) yields
+        // the SAME crate identity (PRINCIPLE 2 Correctness; reproducible goldens).
+        let out_pkg2 = dir.join("out_pkg2");
+        ipe::build_project(&pkg_dir.join("package.ipe"), &out_pkg2, &runtime_dir)
+            .expect("re-emit must succeed");
+        assert_eq!(
+            name_pkg,
+            emitted_pkg_name(&out_pkg2),
+            "the same project path must yield the same crate identity every build"
+        );
 
-    // Distinct: a project with the SAME friendly name at a DIFFERENT canonical
-    // path gets a DIFFERENT crate identity — the anti-thrash guarantee.
-    let pkg_dir_b = dir.join("pkg_b");
-    let src_dir_b = pkg_dir_b.join("src");
-    let _ = fs::create_dir_all(&src_dir_b);
-    fs::write(
+        // Distinct: a project with the SAME friendly name at a DIFFERENT canonical
+        // path gets a DIFFERENT crate identity — the anti-thrash guarantee.
+        let pkg_dir_b = dir.join("pkg_b");
+        let src_dir_b = pkg_dir_b.join("src");
+        let _ = fs::create_dir_all(&src_dir_b);
+        fs::write(
         pkg_dir_b.join("package.ipe"),
         "module Package exposing (package)\n\n\npackage =\n    { name = \"Crc32 Checksum\", version = \"0.1.0\" }\n",
     )
     .expect("write package.ipe (b)");
-    fs::write(src_dir_b.join("Main.ipe"), SRC).expect("write Main.ipe (b)");
-    let out_pkg_b = dir.join("out_pkg_b");
-    ipe::build_project(&pkg_dir_b.join("package.ipe"), &out_pkg_b, &runtime_dir)
-        .expect("second project build must succeed");
-    let name_pkg_b = emitted_pkg_name(&out_pkg_b);
-    assert!(
-        name_pkg_b.starts_with("crc32-checksum_"),
-        "second project keeps the same friendly base, got: {name_pkg_b}"
-    );
-    assert_ne!(
-        name_pkg, name_pkg_b,
-        "two same-named projects at different paths must own DISTINCT crate identities"
-    );
+        fs::write(src_dir_b.join("Main.ipe"), SRC).expect("write Main.ipe (b)");
+        let out_pkg_b = dir.join("out_pkg_b");
+        ipe::build_project(&pkg_dir_b.join("package.ipe"), &out_pkg_b, &runtime_dir)
+            .expect("second project build must succeed");
+        let name_pkg_b = emitted_pkg_name(&out_pkg_b);
+        assert!(
+            name_pkg_b.starts_with("crc32-checksum_"),
+            "second project keeps the same friendly base, got: {name_pkg_b}"
+        );
+        assert_ne!(
+            name_pkg, name_pkg_b,
+            "two same-named projects at different paths must own DISTINCT crate identities"
+        );
 
-    let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,14 +266,13 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
 /// replaces the child, not the test runner) and requires no cargo, so it runs
 /// unconditionally.
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn run_without_cargo_reports_the_missing_toolchain() {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 
     // A runtime dir is needed to reach the toolchain check (which fires after
     // emit). Skip when the repo tree is unavailable (CI without checkout).
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_no_cargo_e2e");
     let _ = fs::remove_dir_all(&dir);
@@ -302,15 +281,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     let created = fs::create_dir_all(&empty_home).and_then(|()| fs::write(&entry, SRC));
     assert!(created.is_ok(), "write source + empty home: {created:?}");
 
-    let ipe_bin = env!("CARGO_BIN_EXE_ipe");
-    // This path is baked at compile time; a nextest archive that ships the test
-    // to another host runs it where that path does not resolve. Skip there — the
-    // toolchain-resolution dispositions are covered by the unit tests in
-    // `toolchain.rs`; this end-to-end spawn only adds value where the binary is
-    // present.
-    if !std::path::Path::new(ipe_bin).exists() {
-        return;
-    }
+    let ipe_bin = e2e_support::cargo_bin!("ipe");
     // A minimal PATH with no cargo. `/nonexistent-ipe-cargo-probe` cannot hold
     // any executable, so cargo is unresolvable on the PATH.
     let cargoless_path = "/nonexistent-ipe-cargo-probe";
@@ -324,8 +295,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
         .env("NO_COLOR", "1")
         .output();
     let Ok(out) = out else {
-        assert!(false_marker(), "failed to spawn ipe: {out:?}");
-        return;
+        panic!("failed to spawn ipe: {out:?}")
     };
 
     assert!(

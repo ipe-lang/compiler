@@ -47,7 +47,7 @@ fn compile_with_files(
         .join(format!("ui_widget_gate_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime().map_err(|e| -> BoxError { format!("{e:?}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     Ok(ipe::build(&entry, &out_dir, &runtime))
 }
 

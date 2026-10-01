@@ -116,19 +116,17 @@ fn ok_out_dir() -> PathBuf {
     crate::support::scratch_root().join("i180_init_reads_req_path_out")
 }
 
-/// Compile a fixture into its own out dir; `None` (skip) when the runtime
-/// cannot be resolved.
-fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Option<Result<(), ipe::CliError>> {
+/// Compile a fixture into its own out dir.
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Result<(), ipe::CliError> {
     let ipe_dir = crate::support::scratch_root().join(format!("i180_{tag}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).ok()?;
+    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
     let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, fixture).ok()?;
+    std::fs::write(&entry, fixture).expect("the fixture scratch dir must be writable");
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// `init : WebReq -> …` reading `req.path` must be ipe-0 and emit
@@ -137,9 +135,7 @@ fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Option<Result<(), ipe::Cl
 #[test]
 fn live_init_reads_req_path_field() {
     let out = ok_out_dir();
-    let Some(result) = compile(LIVE_INIT_READS_REQ_PATH, "reads_req_path", &out) else {
-        return;
-    };
+    let result = compile(LIVE_INIT_READS_REQ_PATH, "reads_req_path", &out);
     assert!(
         result.is_ok(),
         "#180: `init : WebReq -> …` reading `req.path` must be ipe-0, got: {:?}",
@@ -163,9 +159,7 @@ fn live_init_reads_req_path_field() {
 #[test]
 fn live_init_unit_is_rejected() {
     let out = crate::support::scratch_root().join("i180_init_unit_out");
-    let Some(result) = compile(LIVE_INIT_UNIT_REJECTED, "init_unit", &out) else {
-        return;
-    };
+    let result = compile(LIVE_INIT_UNIT_REJECTED, "init_unit", &out);
     let err = result.expect_err(
         "#180: `init : {} -> …` on a Web.tea must be a compile error under the \
          prescriptive WebReq scheme",
@@ -183,9 +177,7 @@ fn live_init_unit_is_rejected() {
 #[test]
 fn live_init_poly_var_is_rejected() {
     let out = crate::support::scratch_root().join("i180_init_poly_out");
-    let Some(result) = compile(LIVE_INIT_POLY_REJECTED, "init_poly", &out) else {
-        return;
-    };
+    let result = compile(LIVE_INIT_POLY_REJECTED, "init_poly", &out);
     let err = result.expect_err(
         "#180: `init : a -> …` on a Web.tea must be a compile error (IPE-N0046) \
          under the prescriptive WebReq scheme",
@@ -206,13 +198,11 @@ fn live_init_poly_var_is_rejected() {
 /// working directory mid-build.
 #[test]
 fn live_init_reads_req_path_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = crate::support::scratch_root().join("i180_init_reads_req_path_e2e_out");
-    let Some(result) = compile(LIVE_INIT_READS_REQ_PATH, "reads_req_path_e2e", &out) else {
-        return;
-    };
+    let result = compile(LIVE_INIT_READS_REQ_PATH, "reads_req_path_e2e", &out);
     assert!(
         result.is_ok(),
         "`init : WebReq -> …` reading `req.path` must be ipe-0, got: {:?}",

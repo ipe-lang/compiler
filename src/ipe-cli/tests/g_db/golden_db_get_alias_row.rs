@@ -32,7 +32,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -56,10 +56,7 @@ fn assert_ipec_bounds_fn_not_struct(fixture: &str) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{fixture}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {fixture}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
@@ -95,7 +92,7 @@ fn assert_ipec_bounds_fn_not_struct(fixture: &str) {
 /// cargo-0 ∧ run-0 for the emitted project — the only check that would have
 /// caught the E0277 regression. Gated on `IPE_E2E=1`.
 fn assert_cargo_builds_and_runs(fixture: &str) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -104,10 +101,7 @@ fn assert_cargo_builds_and_runs(fixture: &str) {
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP {fixture}: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(

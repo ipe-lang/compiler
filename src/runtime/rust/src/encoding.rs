@@ -4,7 +4,7 @@
 use super::IpeResult;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 /// The set of bytes `urlEncode` percent-encodes, matching
 /// `url.QueryEscape` (`encodeQueryComponent`): every byte is escaped EXCEPT
@@ -29,88 +29,434 @@ const QUERY: &AsciiSet = &NON_ALPHANUMERIC
 // path and the JWT path (jwt.rs, which owns its own raw-byte base64/hex) are
 // unaffected.
 
-/// Decode one `application/x-www-form-urlencoded` field (key or value):
-/// `+` → space, `%XX` → byte.
+/// The RFC grammar a URL component is decoded under.
 ///
-/// # Contract: deliberately lenient
-///
-/// This decoder is **intentionally permissive** about malformed input:
-///
-/// - A `%` not followed by exactly two hex digits (stray `%`, truncated `%A`,
-///   non-hex `%ZZ`) is copied through as a literal `%` byte rather than
-///   producing an error.
-/// - Decoded bytes that are not valid UTF-8 are replaced with U+FFFD via
-///   [`String::from_utf8_lossy`] rather than returning an error.
-///
-/// # Why this differs from the `urlDecode` / `percentDecode` kernels
-///
-/// `url_decode` (`Encoding.urlDecode`, the strict form decode) and
-/// `percent_decode` (`Encoding.percentDecode`, the strict RFC 3986 decode,
-/// `+` literal — the one for path components) are **strict**: they reject
-/// malformed percent-escapes with `Err` at the boundary, as required for
-/// user-supplied strings that will be re-encoded, used as path components, or
-/// passed to security-sensitive sinks. That strictness is appropriate for
-/// *application* data whose well-formedness must be guaranteed before use.
-///
-/// HTTP servers and clients are conventionally permissive about query strings
-/// on *incoming requests*: real-world browsers and libraries emit malformed
-/// escapes, and a 400 on every such request is not the right tradeoff.
-/// Leniency here is correct — the decoded values feed **application logic
-/// only** (a `Dict String String` handed to the route handler, or the
-/// `Http.parseQuery` result in the client), never a security-sensitive
-/// re-encode, path join, SQL string, or outgoing header.
-///
-/// # Safety boundary (invariant that makes leniency safe)
-///
-/// This function is called **only** at the query-string splitting layer, where
-/// its output becomes a plain key/value dictionary for the application to
-/// inspect. It is NOT used anywhere a malformed escape could escape the value
-/// boundary: the decoded string never flows into a file path, a SQL query, an
-/// outgoing HTTP header, or any re-encoding path. Callers that need a strict
-/// contract must use `url_decode` or `percent_decode` instead.
-///
-/// Shared by `server::parse_query` (incoming request query strings) and
-/// `http_client::http_parse_query` (`Http.parseQuery`) so both stay consistent.
-//
-// NOT cfg-gated: generated projects compile the runtime WITHOUT cargo features
-// (their server.rs is always included), so a `#[cfg(feature=…)]` gate would drop
-// this from generated server builds and break them. In the standalone crate it
-// only looks dead under a feature subset, hence `allow(dead_code)`.
-#[allow(dead_code)]
-pub(crate) fn form_url_decode(s: &str) -> String {
-    // A percent-escape is "%XX": a '%' marker followed by two hex digits, e.g.
-    // "%20" → 0x20 (space). RFC 3986 §2.1.
-    const PCT: u8 = b'%';
-    const HEX: u32 = 16;
-    const HEX_DIGITS: usize = 2;
-    const ESCAPE_LEN: usize = 1 + HEX_DIGITS; // '%' + two hex digits
-
-    let s = s.replace('+', " ");
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == PCT {
-            // The two hex digits sit at [i+1, i+1+HEX_DIGITS). `str::get(range)`
-            // is total — None when out of bounds OR not on a char boundary (e.g.
-            // a stray '%' before a multi-byte char) — so we fall through and copy
-            // the literal '%' rather than panicking.
-            let hex = s.get(i + 1..i + 1 + HEX_DIGITS);
-            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, HEX).ok()) {
-                out.push(byte);
-                i += ESCAPE_LEN;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+/// The two grammars differ in exactly one byte: under `Form`
+/// (`application/x-www-form-urlencoded`, a query key or value) a `+` means a
+/// space; under `Path` (an RFC 3986 path segment) a `+` is a literal `+`. Both
+/// decode `%XX` to the byte `0xXX` and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlGrammar {
+    /// An RFC 3986 path segment: `+` is literal.
+    Path,
+    /// A form-encoded query key or value: `+` is a space.
+    Form,
 }
 
-/// Ipê `base64Encode : String -> String` — encodes the input's UTF-8 bytes
-/// )`). Non-ASCII
+/// A byte position inside the raw (still-encoded) component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteOffset(usize);
+
+impl ByteOffset {
+    /// The position as a plain byte index into the raw component.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// A component length in bytes, kept apart from positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentLen(usize);
+
+impl ComponentLen {
+    /// The length as a plain byte count.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// The largest raw component `decode_component` accepts.
 ///
+/// Equal to the server's default request-body ceiling, so a form field that
+/// fits in a body is never refused for length, while no input can make the
+/// decoder allocate without a bound.
+pub const MAX_URL_COMPONENT_LEN: ComponentLen = ComponentLen(32 * 1024 * 1024);
+
+/// Why a URL component was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeRefusal {
+    /// A `%` at this raw offset is not followed by two hex digits.
+    MalformedEscape { at: ByteOffset },
+    /// The decoded bytes stop being UTF-8 at the escape or byte at this raw offset.
+    InvalidUtf8 { at: ByteOffset },
+    /// The raw component is longer than `cap` bytes.
+    TooLong { cap: ComponentLen },
+}
+
+impl std::fmt::Display for DecodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedEscape { at } => write!(
+                f,
+                "malformed percent-escape at byte {} (a '%' must be followed by two hex digits)",
+                at.get()
+            ),
+            Self::InvalidUtf8 { at } => {
+                write!(
+                    f,
+                    "decoded bytes are not valid UTF-8 (at byte {})",
+                    at.get()
+                )
+            }
+            Self::TooLong { cap } => write!(f, "component longer than {} bytes", cap.get()),
+        }
+    }
+}
+
+/// Decode one URL component under `grammar`, refusing anything malformed.
+///
+/// This is the single percent-decoder of the runtime: every URL component (a
+/// path parameter, a query key or value, `Encoding.urlDecode`,
+/// `Encoding.percentDecode`, `Http.parseQuery`, a database DSN part) is decoded
+/// here. It is total and strict: a `%` not followed by two hex digits, decoded
+/// bytes that are not UTF-8 (overlong forms such as `%C0%AF` included), and a
+/// component longer than `MAX_URL_COMPONENT_LEN` are each a typed refusal,
+/// never a lossy or pass-through success.
+///
+/// # Errors
+///
+/// Returns the `DecodeRefusal` naming the first defect found.
+pub fn decode_component(raw: &str, grammar: UrlGrammar) -> Result<String, DecodeRefusal> {
+    decode_component_within(raw, grammar, MAX_URL_COMPONENT_LEN)
+}
+
+/// Split a URL path on its raw `/` separators, without decoding.
+///
+/// Surrounding `/` are trimmed first, so `/a/b/` and `/a/b` yield the same
+/// segments and `/` yields none. This is the one split rule for a URL path:
+/// [`decode_path_segments`] decodes each piece it yields, and a route pattern
+/// is split by it too, so a pattern and a request path always agree on where
+/// their segments lie.
+///
+/// # Errors
+///
+/// `DecodeRefusal::TooLong` for a path over `MAX_URL_COMPONENT_LEN` bytes.
+pub fn raw_path_segments(path: &str) -> Result<Vec<&str>, DecodeRefusal> {
+    if path.len() > MAX_URL_COMPONENT_LEN.get() {
+        return Err(DecodeRefusal::TooLong {
+            cap: MAX_URL_COMPONENT_LEN,
+        });
+    }
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(trimmed.split('/').collect())
+}
+
+/// Decode one raw path segment under the path grammar (`+` stays literal).
+///
+/// # Errors
+///
+/// The refusal of `decode_component` under [`UrlGrammar::Path`].
+pub fn decode_path_segment(raw: &str) -> Result<String, DecodeRefusal> {
+    decode_component(raw, UrlGrammar::Path)
+}
+
+/// Split a URL path on its raw `/` separators ([`raw_path_segments`]) and
+/// decode each segment under the path grammar ([`decode_path_segment`]).
+///
+/// Splitting precedes decoding, so an encoded `%2F` stays inside its segment.
+/// This is the one definition of a well-formed request path: the route matcher
+/// reads its segments from here and the request gate refuses exactly what this
+/// refuses.
+///
+/// # Errors
+///
+/// `DecodeRefusal::TooLong` for a path over `MAX_URL_COMPONENT_LEN` bytes, else
+/// the refusal of the first segment that does not decode.
+pub fn decode_path_segments(path: &str) -> Result<Vec<String>, DecodeRefusal> {
+    raw_path_segments(path)?
+        .into_iter()
+        .map(decode_path_segment)
+        .collect()
+}
+
+/// A request path split on its raw `/` separators, each segment decoded once
+/// under the RFC 3986 path grammar ([`decode_path_segments`]).
+///
+/// A request path is parsed into this once, at the request boundary; every
+/// route matcher, param resolver and base-path strip then reads the decoded
+/// segments and never re-parses the raw text. Splitting precedes decoding, so
+/// an encoded `%2F` stays inside its segment and never becomes a separator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedPath(Vec<String>);
+
+impl DecodedPath {
+    /// Split `path` and decode every segment.
+    ///
+    /// # Errors
+    ///
+    /// The `DecodeRefusal` of the first segment that is not a well-formed,
+    /// UTF-8 percent-encoding, or `TooLong` for an oversized path.
+    pub fn parse(path: &str) -> Result<Self, DecodeRefusal> {
+        decode_path_segments(path).map(Self)
+    }
+
+    /// The decoded segments, in path order.
+    #[must_use]
+    pub fn segments(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Is this the root path (`/`, no segments)?
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The path below `base`, when `base`'s segments are a whole-segment
+    /// prefix of this path's.
+    ///
+    /// The comparison is segment-wise on decoded segments, so a base `/app`
+    /// strips `/app/x` to `/x` and `/app` to `/`, but never touches `/apple`
+    /// (`None`): a base is a path prefix, not a string prefix.
+    #[must_use]
+    pub fn strip_base(&self, base: &Self) -> Option<Self> {
+        self.0
+            .strip_prefix(base.0.as_slice())
+            .map(|rest| Self(rest.to_vec()))
+    }
+}
+
+/// A route parameter name, proven to match `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// This is the one parameter-name grammar of every route syntax in the
+/// runtime: a `Web.route` pattern and an `Ipe.Server` path both admit their
+/// names through [`ParamNames::admit`], so no route table can hold an empty,
+/// non-identifier or repeated name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ParamName(String);
+
+impl ParamName {
+    /// Parse `raw` (the text after the `:` or `*` sigil) as a parameter name.
+    ///
+    /// # Errors
+    ///
+    /// `Empty` for an empty name, `NotIdentifier` at the first byte outside the
+    /// identifier grammar (a leading digit included).
+    pub fn parse(raw: &str) -> Result<Self, ParamNameRefusal> {
+        let bytes = raw.as_bytes();
+        let Some(&first) = bytes.first() else {
+            return Err(ParamNameRefusal::Empty);
+        };
+        let bad = if first.is_ascii_alphabetic() || first == b'_' {
+            bytes
+                .iter()
+                .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        } else {
+            Some(0)
+        };
+        bad.map_or_else(
+            || Ok(Self(raw.to_owned())),
+            |at| Err(ParamNameRefusal::NotIdentifier { at: ByteOffset(at) }),
+        )
+    }
+
+    /// The name as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ParamName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why a route parameter name was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamNameRefusal {
+    /// The sigil is not followed by a name.
+    Empty,
+    /// The byte at this offset of the name breaks `[A-Za-z_][A-Za-z0-9_]*`.
+    NotIdentifier { at: ByteOffset },
+    /// An earlier parameter of the same route already has this name.
+    Duplicate { name: ParamName },
+}
+
+impl std::fmt::Display for ParamNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a parameter has no name (write `:name`)"),
+            Self::NotIdentifier { at } => write!(
+                f,
+                "a parameter name breaks `[A-Za-z_][A-Za-z0-9_]*` at byte {} of the name",
+                at.get()
+            ),
+            Self::Duplicate { name } => write!(
+                f,
+                "parameter `{name}` appears twice (each parameter of a route needs its own name)"
+            ),
+        }
+    }
+}
+
+/// The parameter names one route has admitted so far.
+///
+/// A route parser admits each name through one `ParamNames`, which parses it
+/// ([`ParamName::parse`]) and refuses a repeat.
+#[derive(Debug, Default)]
+pub struct ParamNames(std::collections::HashSet<ParamName>);
+
+impl ParamNames {
+    /// Parse `raw` as a parameter name this route has not admitted yet.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of [`ParamName::parse`], or `Duplicate` for a repeat.
+    pub fn admit(&mut self, raw: &str) -> Result<ParamName, ParamNameRefusal> {
+        let name = ParamName::parse(raw)?;
+        if self.0.insert(name.clone()) {
+            Ok(name)
+        } else {
+            Err(ParamNameRefusal::Duplicate { name })
+        }
+    }
+}
+
+/// `decode_component` under an explicit length cap.
+fn decode_component_within(
+    raw: &str,
+    grammar: UrlGrammar,
+    cap: ComponentLen,
+) -> Result<String, DecodeRefusal> {
+    if raw.len() > cap.get() {
+        return Err(DecodeRefusal::TooLong { cap });
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'%' => {
+                let hi = bytes.get(i + 1).copied().and_then(hex_value);
+                let lo = bytes.get(i + 2).copied().and_then(hex_value);
+                let (Some(hi), Some(lo)) = (hi, lo) else {
+                    return Err(DecodeRefusal::MalformedEscape { at: ByteOffset(i) });
+                };
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'+' if grammar == UrlGrammar::Form => {
+                out.push(b' ');
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|e| DecodeRefusal::InvalidUtf8 {
+        at: raw_offset_of(bytes, e.utf8_error().valid_up_to()),
+    })
+}
+
+/// The value of one ASCII hex digit, or `None` for any other byte.
+const fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The raw offset that produced decoded byte number `decoded`.
+///
+/// Only called after a scan that accepted every escape, so each `%` starts a
+/// three-byte escape yielding one decoded byte and every other byte yields one.
+fn raw_offset_of(raw: &[u8], decoded: usize) -> ByteOffset {
+    let mut i = 0;
+    let mut produced = 0;
+    while let Some(&c) = raw.get(i) {
+        if produced == decoded {
+            break;
+        }
+        i += if c == b'%' { 3 } else { 1 };
+        produced += 1;
+    }
+    ByteOffset(i)
+}
+
+/// A number of query pairs, kept apart from lengths and positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairCount(usize);
+
+impl PairCount {
+    /// The count as a plain number.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// The most `key=value` pairs one query string may carry.
+///
+/// Bounds the map a single request or `Http.parseQuery` call can build.
+pub const MAX_QUERY_PAIRS: PairCount = PairCount(1024);
+
+/// Why a query string was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryRefusal {
+    /// A key or value is not a well-formed form component.
+    Component(DecodeRefusal),
+    /// The query carries more than `cap` pairs.
+    TooManyPairs { cap: PairCount },
+}
+
+impl std::fmt::Display for QueryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Component(refusal) => refusal.fmt(f),
+            Self::TooManyPairs { cap } => write!(f, "more than {} query pairs", cap.get()),
+        }
+    }
+}
+
+/// Decode a form-encoded query string (no leading `?`) into its pairs.
+///
+/// Pairs split on `&` (empty pairs skipped) and each on its first `=` (a bare
+/// key maps to `""`); every key and value is decoded by `decode_component`
+/// under the form grammar. A repeated key keeps its FIRST value. The whole
+/// query is refused when any component is malformed or it carries more than
+/// `MAX_QUERY_PAIRS` pairs — there is no partial, lenient result.
+///
+/// # Errors
+///
+/// Returns the `QueryRefusal` naming the first defect found.
+pub fn decode_form_query(
+    raw: &str,
+) -> Result<std::collections::HashMap<String, String>, QueryRefusal> {
+    decode_form_query_within(raw, MAX_QUERY_PAIRS)
+}
+
+/// `decode_form_query` under an explicit pair cap.
+fn decode_form_query_within(
+    raw: &str,
+    cap: PairCount,
+) -> Result<std::collections::HashMap<String, String>, QueryRefusal> {
+    let mut out = std::collections::HashMap::new();
+    let mut pairs = 0;
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        pairs += 1;
+        if pairs > cap.get() {
+            return Err(QueryRefusal::TooManyPairs { cap });
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let k = decode_component(k, UrlGrammar::Form).map_err(QueryRefusal::Component)?;
+        let v = decode_component(v, UrlGrammar::Form).map_err(QueryRefusal::Component)?;
+        out.entry(k).or_insert(v);
+    }
+    Ok(out)
+}
+
+/// Ipê `base64Encode : String -> String` — encodes the input's UTF-8 bytes.
 #[must_use]
 pub fn base64_encode(s: String) -> String {
     B64.encode(s.as_bytes())
@@ -146,70 +492,43 @@ pub fn url_encode(s: String) -> String {
         .replace("%20", "+")
 }
 
-/// True when every `%` in `s` is followed by exactly two hex digits — the only
-/// well-formed percent-escape shape (`%XX`, RFC 3986 §2.1). A stray `%`, a
-/// truncated `%A`, or a non-hex `%ZZ` is malformed. The `percent-encoding`
-/// decoder passes such input through as literal bytes and never errors, so
-/// `strict_percent_decode` scans FIRST and rejects malformed input at this
-/// untrusted boundary (fail-closed) rather than silently returning the raw text.
-fn is_well_formed_percent(s: &str) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == b'%' {
-            // Both trailing bytes must exist AND be ASCII hex digits.
-            match (b.get(i + 1), b.get(i + 2)) {
-                (Some(h1), Some(h2)) if h1.is_ascii_hexdigit() && h2.is_ascii_hexdigit() => {
-                    i += 3;
-                    continue;
-                }
-                _ => return false,
-            }
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Strict RFC 3986 §2.1 percent-decode of `s`, the one decoder both
-/// `urlDecode` and `percentDecode` share. `kernel` names the calling kernel in
-/// the error. Fails closed with `Err` on a malformed percent-escape (a `%` not
-/// followed by two hex digits) and on a decode that is not valid UTF-8.
-fn strict_percent_decode<E: From<String>>(s: &str, kernel: &str) -> IpeResult<E, String> {
-    if !is_well_formed_percent(s) {
-        return IpeResult::Err(
-            format!(
-                "{kernel}: malformed percent-escape (a '%' must be followed by two hex digits)"
-            )
-            .into(),
-        );
-    }
-    match percent_decode_str(s).decode_utf8() {
-        Ok(cow) => IpeResult::Ok(cow.into_owned()),
-        Err(e) => IpeResult::Err(format!("{kernel}: {e}").into()),
-    }
-}
-
-/// Ipê `urlDecode : String -> Result Error String` — the form decode
-/// (`application/x-www-form-urlencoded`, `QueryUnescape`), the inverse of
-/// `urlEncode`: `+` -> space, then strict percent-decode (so a literal `%2B`
-/// round-trips back to `+`).
+/// Ipê `urlDecode : String -> Result Error String` — `QueryUnescape`.
+///
+/// Decodes under the form grammar (`+` -> space, then `%XX`, so a literal
+/// `%2B` round-trips back to `+`) through `decode_component`, so it fails
+/// closed with `Err` on a malformed percent-escape, on decoded bytes that are
+/// not valid UTF-8, and on an over-cap component.
 #[must_use]
 pub fn url_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
-    strict_percent_decode(&s.replace('+', " "), "urlDecode")
+    decode_kernel("urlDecode", &s, UrlGrammar::Form)
 }
 
 /// Ipê `percentDecode : String -> Result Error String` — the RFC 3986 §2.1
 /// percent-decode for a URL path, a `file:`/`sqlite:` location, or any other
-/// non-form component: only `%XX` escapes decode, and a `+` stays a literal `+`.
+/// non-form component.
+///
+/// Decodes `%XX` under the path grammar (`+` stays a literal `+`) through
+/// `decode_component`, refusing exactly what `url_decode` refuses.
 #[must_use]
-pub fn percent_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
-    strict_percent_decode(&s, "percentDecode")
+pub fn path_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
+    decode_kernel("percentDecode", &s, UrlGrammar::Path)
 }
 
-/// Ipê `hexEncode : String -> String` — encodes the input's UTF-8 bytes
-/// )`). Non-ASCII
-/// than truncating codepoints > 255.
+/// Run `decode_component` for the kernel `name`, rendering a refusal as its error.
+fn decode_kernel<E: From<String>>(
+    name: &str,
+    s: &str,
+    grammar: UrlGrammar,
+) -> IpeResult<E, String> {
+    match decode_component(s, grammar) {
+        Ok(text) => IpeResult::Ok(text),
+        Err(refusal) => IpeResult::Err(format!("{name}: {refusal}").into()),
+    }
+}
+
+/// Ipê `hexEncode : String -> String` — encodes the input's UTF-8 bytes, so a
+/// non-ASCII character becomes the hex of its UTF-8 encoding rather than a
+/// codepoint truncated to one byte.
 #[must_use]
 pub fn encoding_hex_encode(s: String) -> String {
     hex::encode(s.as_bytes())
@@ -236,7 +555,8 @@ pub fn encoding_hex_decode<E: From<String>>(s: String) -> IpeResult<E, String> {
 
 // ── Concrete (non-generic) wrappers for generated Ipê code ─────────────
 //
-// The generic `base64_decode<E>`, `url_decode<E>`, `encoding_hex_decode<E>` above
+// The generic `base64_decode<E>`, `url_decode<E>`, `path_decode<E>`,
+// `encoding_hex_decode<E>` above
 // use a flexible `E: From<String>` bound so the error type can be inferred from
 // surrounding context. Generated Ipê code sets `IpeError = ipe_runtime::error::
 // IpeError`, but Rust's type inference cannot pin `E` when
@@ -257,10 +577,10 @@ pub fn ipe_url_decode(s: String) -> IpeResult<crate::error::IpeError, String> {
     url_decode(s)
 }
 
-/// Generated-code alias for `percent_decode` with `E = IpeError`.
+/// Generated-code alias for `path_decode` with `E = IpeError`.
 #[must_use]
 pub fn ipe_percent_decode(s: String) -> IpeResult<crate::error::IpeError, String> {
-    percent_decode(s)
+    path_decode(s)
 }
 
 /// Generated-code alias for `encoding_hex_decode` with `E = IpeError`.
@@ -279,6 +599,7 @@ pub fn ipe_encoding_hex_decode(s: String) -> IpeResult<crate::error::IpeError, S
 // `compression.rs`, `ws_client.rs`, `server.rs`, and `email.rs`.
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -375,10 +696,8 @@ mod tests {
     }
 
     // A malformed percent-escape (a `%` not followed by two hex digits) is
-    // turned away at the boundary — the documented fail-closed contract. The
-    // stray/truncated/non-hex cases are the ones the raw `percent-encoding`
-    // decoder passes through as literal bytes, so they must be caught by the
-    // pre-scan, not the decoder.
+    // turned away at the boundary — the documented fail-closed contract — by
+    // both kernels, whatever their `+` grammar.
     #[test]
     fn test_url_decode_malformed_escape() {
         for bad in ["a%ZZb", "100%done", "trailing%", "%A", "%G0", "%2"] {
@@ -387,7 +706,21 @@ mod tests {
                 matches!(got, IpeResult::Err(_)),
                 "malformed percent-escape {bad:?} must be rejected"
             );
+            let got: IpeResult<String, String> = path_decode(bad.to_string());
+            assert!(
+                matches!(got, IpeResult::Err(_)),
+                "malformed percent-escape {bad:?} must be rejected by percentDecode"
+            );
         }
+    }
+
+    // `percentDecode` keeps `+` literal; `urlDecode` reads it as a space.
+    #[test]
+    fn test_percent_decode_plus_is_literal() {
+        let path: IpeResult<String, String> = path_decode("a+b%20c".to_string());
+        assert!(matches!(path, IpeResult::Ok(ref s) if s == "a+b c"));
+        let form: IpeResult<String, String> = url_decode("a+b%20c".to_string());
+        assert!(matches!(form, IpeResult::Ok(ref s) if s == "a b c"));
     }
 
     // The non-UTF-8 decode path stays an `Err` (a well-formed `%C0` escape whose
@@ -419,13 +752,13 @@ mod tests {
     // space.
     #[test]
     fn test_percent_decode_keeps_plus() {
-        let plus: IpeResult<String, String> = percent_decode("a+b".to_string());
+        let plus: IpeResult<String, String> = path_decode("a+b".to_string());
         assert!(matches!(plus, IpeResult::Ok(ref s) if s == "a+b"));
-        let escaped_plus: IpeResult<String, String> = percent_decode("%2B".to_string());
+        let escaped_plus: IpeResult<String, String> = path_decode("%2B".to_string());
         assert!(matches!(escaped_plus, IpeResult::Ok(ref s) if s == "+"));
-        let space: IpeResult<String, String> = percent_decode("a%20b".to_string());
+        let space: IpeResult<String, String> = path_decode("a%20b".to_string());
         assert!(matches!(space, IpeResult::Ok(ref s) if s == "a b"));
-        let path: IpeResult<String, String> = percent_decode("/t/a+b.db".to_string());
+        let path: IpeResult<String, String> = path_decode("/t/a+b.db".to_string());
         assert!(matches!(path, IpeResult::Ok(ref s) if s == "/t/a+b.db"));
     }
 
@@ -443,7 +776,7 @@ mod tests {
             "%G0",
             "bad-utf8-%C0",
         ] {
-            let got: IpeResult<String, String> = percent_decode(bad.to_string());
+            let got: IpeResult<String, String> = path_decode(bad.to_string());
             assert!(
                 matches!(got, IpeResult::Err(ref e) if e.starts_with("percentDecode: ")),
                 "malformed input {bad:?} must be rejected by percentDecode"
@@ -467,25 +800,230 @@ mod tests {
         assert!(matches!(odd, IpeResult::Err(_)));
     }
 
-    // Pin the lenient contract of `form_url_decode`: malformed percent-escapes
-    // pass through as literal bytes (contrast: `url_decode` rejects them with
-    // `Err`). Stray `%`, truncated `%A`, non-hex `%ZZ` all survive unchanged.
-    // This test guards against a future "fix" that accidentally routes
-    // form_url_decode through the strict url_decode path and breaks query parsing.
+    // ── decode_component: the single strict core ──────────────────────────
+
+    fn refusal(raw: &str, grammar: UrlGrammar) -> Option<DecodeRefusal> {
+        decode_component(raw, grammar).err()
+    }
+
     #[test]
-    fn form_url_decode_lenient_contract() {
-        // Normal well-formed input still decodes correctly.
-        assert_eq!(form_url_decode("hello+world"), "hello world");
-        assert_eq!(form_url_decode("a%20b"), "a b");
-        assert_eq!(form_url_decode("foo%3Dbar"), "foo=bar");
+    fn decode_component_refuses_malformed_escape() {
+        for grammar in [UrlGrammar::Path, UrlGrammar::Form] {
+            assert_eq!(
+                refusal("a%zzb", grammar),
+                Some(DecodeRefusal::MalformedEscape { at: ByteOffset(1) })
+            );
+            assert_eq!(
+                refusal("trailing%", grammar),
+                Some(DecodeRefusal::MalformedEscape { at: ByteOffset(8) })
+            );
+            assert_eq!(
+                refusal("%A", grammar),
+                Some(DecodeRefusal::MalformedEscape { at: ByteOffset(0) })
+            );
+            assert_eq!(
+                refusal("ok%20and%ZZbad", grammar),
+                Some(DecodeRefusal::MalformedEscape { at: ByteOffset(8) })
+            );
+            // A `%` before a multi-byte char is malformed, not a boundary panic.
+            assert_eq!(
+                refusal("%é", grammar),
+                Some(DecodeRefusal::MalformedEscape { at: ByteOffset(0) })
+            );
+        }
+    }
 
-        // Malformed percent-escapes pass through as literal bytes — lenient.
-        assert_eq!(form_url_decode("100%done"), "100%done");
-        assert_eq!(form_url_decode("trailing%"), "trailing%");
-        assert_eq!(form_url_decode("%A"), "%A");
-        assert_eq!(form_url_decode("a%ZZb"), "a%ZZb");
+    #[test]
+    fn decode_component_refuses_invalid_utf8() {
+        for grammar in [UrlGrammar::Path, UrlGrammar::Form] {
+            // A truncated two-byte sequence.
+            assert_eq!(
+                refusal("%C3", grammar),
+                Some(DecodeRefusal::InvalidUtf8 { at: ByteOffset(0) })
+            );
+            // A lead byte followed by a non-continuation byte.
+            assert_eq!(
+                refusal("x%C3%28", grammar),
+                Some(DecodeRefusal::InvalidUtf8 { at: ByteOffset(1) })
+            );
+            // The overlong encoding of `/` — the classic path-traversal smuggle.
+            assert_eq!(
+                refusal("a%C0%AF", grammar),
+                Some(DecodeRefusal::InvalidUtf8 { at: ByteOffset(1) })
+            );
+        }
+    }
 
-        // Mixed: well-formed escapes decode; malformed ones pass through.
-        assert_eq!(form_url_decode("ok%20and%ZZbad"), "ok and%ZZbad");
+    #[test]
+    fn decode_component_plus_depends_on_grammar() {
+        assert_eq!(
+            decode_component("a+b", UrlGrammar::Path),
+            Ok("a+b".to_string())
+        );
+        assert_eq!(
+            decode_component("a+b", UrlGrammar::Form),
+            Ok("a b".to_string())
+        );
+        // `%2B` is a literal `+` under both grammars, so it round-trips.
+        for grammar in [UrlGrammar::Path, UrlGrammar::Form] {
+            assert_eq!(decode_component("a%2Bb", grammar), Ok("a+b".to_string()));
+            assert_eq!(
+                decode_component("caf%C3%A9", grammar),
+                Ok("café".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn decode_component_length_cap() {
+        let cap = ComponentLen(8);
+        assert_eq!(
+            decode_component_within("aaaaaaaa", UrlGrammar::Path, cap),
+            Ok("aaaaaaaa".to_string())
+        );
+        assert_eq!(
+            decode_component_within("aaaaaaaaa", UrlGrammar::Path, cap),
+            Err(DecodeRefusal::TooLong { cap })
+        );
+        // The shipped cap: one byte past it is refused before any decoding.
+        let past = "a".repeat(MAX_URL_COMPONENT_LEN.get() + 1);
+        assert_eq!(
+            refusal(&past, UrlGrammar::Form),
+            Some(DecodeRefusal::TooLong {
+                cap: MAX_URL_COMPONENT_LEN
+            })
+        );
+    }
+
+    // ── decode_form_query: the one query splitter ─────────────────────────
+
+    #[test]
+    fn decode_form_query_first_wins_and_bare_keys() {
+        let decoded = decode_form_query("a=1&b=two+words%21&a=ignored&flag&&c=x=y");
+        assert!(decoded.is_ok(), "a well-formed query must decode");
+        let Ok(q) = decoded else { return };
+        assert_eq!(q.get("a").map(String::as_str), Some("1"));
+        assert_eq!(q.get("b").map(String::as_str), Some("two words!"));
+        assert_eq!(q.get("flag").map(String::as_str), Some(""));
+        assert_eq!(q.get("c").map(String::as_str), Some("x=y"));
+        assert_eq!(q.len(), 4);
+        assert_eq!(decode_form_query(""), Ok(std::collections::HashMap::new()));
+    }
+
+    #[test]
+    fn decode_form_query_refuses_any_malformed_component() {
+        for bad in ["a=%zz", "%zz=1", "a=1&b=%C3", "a=1&a=%zz", "q=100%"] {
+            assert!(
+                matches!(decode_form_query(bad), Err(QueryRefusal::Component(_))),
+                "{bad:?} must be refused whole"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_form_query_pair_cap() {
+        let cap = PairCount(3);
+        assert!(decode_form_query_within("a=1&b=2&c=3", cap).is_ok());
+        // Empty pairs do not count toward the cap.
+        assert!(decode_form_query_within("a=1&&b=2&c=3&", cap).is_ok());
+        assert_eq!(
+            decode_form_query_within("a=1&b=2&c=3&d=4", cap),
+            Err(QueryRefusal::TooManyPairs { cap })
+        );
+        // The shipped cap: exactly at it decodes, one past it is refused.
+        let at: Vec<String> = (0..MAX_QUERY_PAIRS.get())
+            .map(|i| format!("k{i}=v"))
+            .collect();
+        assert!(decode_form_query(&at.join("&")).is_ok());
+        let past = format!("{}&extra=1", at.join("&"));
+        assert_eq!(
+            decode_form_query(&past),
+            Err(QueryRefusal::TooManyPairs {
+                cap: MAX_QUERY_PAIRS
+            })
+        );
+    }
+
+    #[test]
+    fn raw_path_segments_trims_and_splits_without_decoding() {
+        assert_eq!(raw_path_segments("/"), Ok(vec![]));
+        assert_eq!(raw_path_segments(""), Ok(vec![]));
+        assert_eq!(raw_path_segments("//"), Ok(vec![]));
+        assert_eq!(raw_path_segments("/a/b/"), Ok(vec!["a", "b"]));
+        assert_eq!(raw_path_segments("/a%2Fb"), Ok(vec!["a%2Fb"]));
+        let long = "a".repeat(MAX_URL_COMPONENT_LEN.get() + 1);
+        assert_eq!(
+            raw_path_segments(&long),
+            Err(DecodeRefusal::TooLong {
+                cap: MAX_URL_COMPONENT_LEN
+            })
+        );
+    }
+
+    #[test]
+    fn decoded_path_root_and_segments() {
+        let root = DecodedPath::parse("/").unwrap();
+        assert!(root.is_root());
+        assert!(root.segments().is_empty());
+        let p = DecodedPath::parse("/a%2Fb/c").unwrap();
+        assert!(!p.is_root());
+        assert_eq!(p.segments(), ["a/b".to_string(), "c".to_string()]);
+        assert!(DecodedPath::parse("/a/%zz").is_err());
+    }
+
+    /// A base is a whole-segment prefix: `/app` never strips `/apple`.
+    #[test]
+    fn strip_base_is_segment_bounded() {
+        let dp = |p: &str| DecodedPath::parse(p).unwrap();
+        let base = dp("/app");
+        assert_eq!(dp("/apple").strip_base(&base), None);
+        assert_eq!(dp("/apple/x").strip_base(&base), None);
+        assert_eq!(dp("/app/x").strip_base(&base), Some(dp("/x")));
+        let at_base = dp("/app").strip_base(&base);
+        assert_eq!(at_base, Some(dp("/")));
+        assert!(at_base.is_some_and(|p| p.is_root()));
+        assert_eq!(dp("/other/app").strip_base(&base), None);
+        // Segments compare decoded: `%61pp` is the segment `app`.
+        assert_eq!(dp("/%61pp/x").strip_base(&base), Some(dp("/x")));
+        // The root base strips nothing.
+        assert_eq!(dp("/app/x").strip_base(&dp("/")), Some(dp("/app/x")));
+    }
+
+    /// The one parameter-name grammar admits exactly `[A-Za-z_][A-Za-z0-9_]*`
+    /// and refuses a repeat within one route.
+    #[test]
+    fn param_name_grammar_and_uniqueness() {
+        for ok in ["a", "_", "_x", "A", "a_Z9", "snake_case_1"] {
+            assert!(
+                ParamName::parse(ok).is_ok_and(|n| n.as_str() == ok && n.to_string() == ok),
+                "{ok} must be admitted verbatim"
+            );
+        }
+        assert_eq!(ParamName::parse(""), Err(ParamNameRefusal::Empty));
+        for (bad, at) in [
+            ("1a", 0),
+            ("-", 0),
+            ("\u{e9}", 0),
+            ("a\u{e9}", 1),
+            ("a-b", 1),
+            ("a_Z9 ", 4),
+        ] {
+            assert_eq!(
+                ParamName::parse(bad),
+                Err(ParamNameRefusal::NotIdentifier { at: ByteOffset(at) }),
+                "{bad}"
+            );
+        }
+        let mut names = ParamNames::default();
+        assert!(names.admit("id").is_ok());
+        assert!(names.admit("Id").is_ok());
+        assert!(matches!(
+            names.admit("id"),
+            Err(ParamNameRefusal::Duplicate { name }) if name.as_str() == "id"
+        ));
+        assert!(matches!(
+            names.admit("9"),
+            Err(ParamNameRefusal::NotIdentifier { .. })
+        ));
     }
 }

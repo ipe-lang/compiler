@@ -237,7 +237,7 @@ mod tests {
 
     async fn body_string(r: axum::response::Response) -> String {
         let bytes = to_bytes(r.into_body(), 64 * 1024).await.unwrap_or_default();
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8(bytes.to_vec()).unwrap_or_default()
     }
 
     #[test]

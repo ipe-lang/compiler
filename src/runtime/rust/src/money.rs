@@ -394,6 +394,7 @@ fn _unused_ipemaybe<T>() -> IpeMaybe<T> {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
     use rust_decimal::Decimal as RD;

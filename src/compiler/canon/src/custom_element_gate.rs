@@ -116,7 +116,6 @@ fn walk(e: &Expr, out: &mut Vec<WidgetFile>) {
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
-        | Expr_::PathLit(_)
         | Expr_::Char(_)
         | Expr_::Unit => {}
     }

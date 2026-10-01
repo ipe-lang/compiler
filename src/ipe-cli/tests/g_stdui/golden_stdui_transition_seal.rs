@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for transition seal test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// A minimal Ipe.Ui program exercising BOTH transition entry points: the
@@ -124,7 +124,7 @@ fn transition_module_resolves_and_emits_kernel() {
 /// rendering the CSS `transition:` shorthand — the seal, end to end.
 #[test]
 fn transition_e2e_builds_and_renders_shorthand() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let (emit, res) = build_transition_project("e2e");

@@ -22,11 +22,6 @@ use std::path::{Path, PathBuf};
 
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
-/// A runtime `false` the optimiser cannot fold — a deliberate failure marker.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 /// Seed the project's FFI cache with an inspection document for a crate
 /// `demo` that DEFINES one all-identity-carrier struct (`Counter`) and one
 /// enum (`Message` — a unit and a payload variant): both must surface
@@ -125,9 +120,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// definitions typed at the defined Rust types.
 #[test]
 fn define_transparency_emits_the_conversion_seam() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_define_transparency");
@@ -141,11 +134,7 @@ fn define_transparency_emits_the_conversion_seam() {
     let _ = fs::remove_dir_all(&out);
 
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(
-            false_marker(),
-            "define-transparency fixture must build, got: {err}"
-        );
-        return;
+        panic!("define-transparency fixture must build, got: {err}")
     }
 
     // The forwarder module carries the app enum for the transparent union and
@@ -185,12 +174,10 @@ fn define_transparency_emits_the_conversion_seam() {
 /// constructed union value all round-trip.
 #[test]
 fn define_transparency_emitted_crate_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("ipec_ffi_define_transparency_e2e");
@@ -203,11 +190,7 @@ fn define_transparency_emitted_crate_builds_and_runs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_define_transparency_e2e_out");
     let _ = fs::remove_dir_all(&out);
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(
-            false_marker(),
-            "define-transparency fixture must build, got: {err}"
-        );
-        return;
+        panic!("define-transparency fixture must build, got: {err}")
     }
 
     // The manifest pins the bound crate (the define surface rides `ipe rust
@@ -289,9 +272,7 @@ fn write_mismatched_project(dir: &Path) -> bool {
 /// rustc backstop for any mismatch that slipped past.
 #[test]
 fn value_struct_marshal_refuses_a_mismatched_record_shape() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("ipec_ffi_value_struct_mismatch");

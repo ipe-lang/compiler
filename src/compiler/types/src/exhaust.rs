@@ -662,7 +662,6 @@ fn check_expr_ctx(e: &canon::Expr, ctx: &Ctx<'_>, warnings: &mut Vec<Diagnostic>
         canon::Expr_::Int(_)
         | canon::Expr_::Float(_)
         | canon::Expr_::Str(_)
-        | canon::Expr_::PathLit(_)
         | canon::Expr_::CustomElementCtor(_)
         | canon::Expr_::Char(_)
         | canon::Expr_::Unit

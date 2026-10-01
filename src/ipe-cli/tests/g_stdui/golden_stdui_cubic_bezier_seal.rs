@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for cubic-bezier seal test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// Standard curve (`x1 = 0.4, y1 = 0.0, x2 = 0.2, y2 = 1.0`) — values are
@@ -79,7 +79,7 @@ fn cubic_bezier_record_form_compiles() {
 /// `cubic-bezier(0.4, 0, 0.2, 1)` string.
 #[test]
 fn cubic_bezier_in_range_e2e() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let (emit, res) = build_project("in_range", MAIN_IN_RANGE);
@@ -102,7 +102,7 @@ fn cubic_bezier_in_range_e2e() {
 /// `y1 = -0.5` must survive unchanged (Y is unconstrained).
 #[test]
 fn cubic_bezier_clamp_x_e2e() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let (emit, res) = build_project("clamp_x", MAIN_CLAMP_X);

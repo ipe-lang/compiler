@@ -17,14 +17,14 @@
 //!   (`Model { page: __page, ..__model }`) is NOT emitted for this app — that
 //!   form is reserved for apps that omit `onNavigate`.
 //!
-//! Compile-only assertions always run, and an unresolvable embedded runtime
+//! Compile-only assertions always run, and an unresolvable runtime tree
 //! fails them. Under `IPE_E2E=1` the emitted project (whose `Navigate` arm
 //! returns a `Cmd.perform`) must cargo-build.
 
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -45,7 +45,7 @@ fn emit_golden(golden: &str, out: &Path) -> String {
         .join("Main.ipe");
     let _ = std::fs::remove_dir_all(out);
 
-    let runtime = ipe::resolve_runtime().expect("the embedded runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build(&entry, out, &runtime).expect("routed app must ipe-compile");
     // A layout builder is compiled-source Ipê, so a home may lower to
     // `src/ipe_mods/*.rs` — scan the WHOLE emitted Ipê-side tree.

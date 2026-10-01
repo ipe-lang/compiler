@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for animation const-fold test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// A `Ipe.Tea.Web` app whose view attaches an animation built from a fully

@@ -50,14 +50,6 @@ pub fn emit_expr_at(
         // `String`, never `&str`). The `{:?}` Debug form produces a valid Rust
         // string literal with deterministic escaping.
         Expr::Str(s) => Ok(format!("{s:?}.to_string()")),
-        // A compile-time-sealed `path "…"` literal. Both regimes' sealed forms
-        // are emitted; `path_literal_host` selects the one the running host's
-        // seal would produce, so no runtime re-seal is needed.
-        Expr::PathLit(lit) => Ok(format!(
-            "ipe_runtime::path::path_literal_host({:?}, {:?})",
-            lit.sealed(ipe_diagnostics::path_check::Regime::Unix),
-            lit.sealed(ipe_diagnostics::path_check::Regime::Windows)
-        )),
         // The reserved `CustomElement.fromFile` constructor value: a widget handle built
         // from its generated content-addressed tag. The tag was minted at
         // lowering from the sealed, in-project JS path (never raw user input);

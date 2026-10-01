@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -20,28 +20,23 @@ fn out_dir() -> PathBuf {
     crate::support::scratch_root().join("ipec_m6_middleware_csrf")
 }
 
-/// Compile the fixture into `out`; `None` (skip) when the runtime cannot be
-/// resolved.
-fn compile(out: &Path) -> Option<Result<(), ipe::CliError>> {
+/// Compile the fixture into `out`.
+fn compile(out: &Path) -> Result<(), ipe::CliError> {
     let entry = repo_root()
         .join("tests")
         .join("golden")
         .join("middleware_csrf")
         .join("Main.ipe");
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// A `Server.post` route wrapped in `Middleware.withCsrf` must be ipe-0 and
 /// emit `middleware_with_csrf(...)` wrapping the handler.
 #[test]
 fn middleware_with_csrf_emits_wrapped_handler() {
-    let Some(result) = compile(&out_dir()) else {
-        return;
-    };
+    let result = compile(&out_dir());
     assert!(
         result.is_ok(),
         "#63: Middleware.withCsrf-wrapped route must be ipe-0, got: {:?}",
@@ -60,16 +55,14 @@ fn middleware_with_csrf_emits_wrapped_handler() {
 /// `ServerResponse.cookies` field and the `middleware_with_csrf` kernel.
 #[test]
 fn middleware_with_csrf_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Emit into a PRIVATE dir this test alone owns, so the compile-only sibling
     // re-emitting into `out_dir()` in parallel cannot delete rustc's working
     // directory mid-build.
     let out = crate::support::scratch_root().join("ipec_m6_middleware_csrf_e2e");
-    let Some(result) = compile(&out) else {
-        return;
-    };
+    let result = compile(&out);
     assert!(
         result.is_ok(),
         "Middleware.withCsrf-wrapped route must be ipe-0, got: {:?}",

@@ -480,7 +480,11 @@ mod tests {
                 .await
                 .unwrap_or_default();
             if let Ok(mut g) = rec.lock() {
-                g.push((path, auth, String::from_utf8_lossy(&body).to_string()));
+                g.push((
+                    path,
+                    auth,
+                    String::from_utf8(body.to_vec()).expect("a UTF-8 body"),
+                ));
             }
             "OK"
         }

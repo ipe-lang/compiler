@@ -23,11 +23,6 @@ use std::path::{Path, PathBuf};
 
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
-/// A runtime `false` the optimiser cannot fold — a deliberate failure marker.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 /// Seed the project's FFI cache with an inspection for a crate `tm`: `shift` is
 /// inspected with exact `i64` carriers (the compile-time check passes) and
 /// `clamped` is inspected with `u32` carriers (the exact-carrier refusal).
@@ -134,9 +129,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// auto-injected by the resolver when `Ipe.Ffi.Rust` is in scope.
 #[test]
 fn rust_fn_resolves_without_import_rust_ffi() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Identical program to MAIN_IPE but with `import Rust.Ffi` removed.
     let main_no_ffi_import = "module Main exposing (main)\n\
@@ -175,11 +168,9 @@ fn rust_fn_resolves_without_import_rust_ffi() {
     let _ = fs::remove_dir_all(&out);
 
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(
-            false_marker(),
+        panic!(
             "Rust.fn must build with only `import Ipe.Ffi.Rust as Rust` (no `import Rust.Ffi`): {err}"
-        );
-        return;
+        )
     }
 
     let forwarders = read_emitted(&out, "src/ipe_mods/ipe_mod_rust_ffi.rs");
@@ -197,9 +188,7 @@ fn rust_fn_resolves_without_import_rust_ffi() {
 /// and no coercion. The two spellings share one forwarder by construction.
 #[test]
 fn rust_fn_emits_the_shared_exact_carrier_shim() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn");
     assert!(
@@ -212,8 +201,7 @@ fn rust_fn_emits_the_shared_exact_carrier_shim() {
     let _ = fs::remove_dir_all(&out);
 
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(false_marker(), "rust-fn fixture must build, got: {err}");
-        return;
+        panic!("rust-fn fixture must build, got: {err}")
     }
 
     let ffi_rs = read_emitted(&out, "src/ffi.rs");
@@ -259,9 +247,7 @@ fn rust_fn_emits_the_shared_exact_carrier_shim() {
 /// refused at build preparation, naming the real Rust carrier — never clamped.
 #[test]
 fn a_clamp_requiring_rust_fn_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let main = "module Main exposing (main)\n\
             import Ipe.Io as Io\n\
         import Ipe.Ffi.Rust as Rust\n\
@@ -293,9 +279,7 @@ fn a_clamp_requiring_rust_fn_is_refused() {
 /// refused with the teachable IPE-N0038 — never silently mis-parsed.
 #[test]
 fn a_malformed_rust_fn_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let main = "module Main exposing (main)\n\
             import Ipe.Io as Io\n\
         import Ipe.Ffi.Rust as Rust\n\
@@ -327,9 +311,7 @@ fn a_malformed_rust_fn_is_refused() {
 /// target is rejected, never blind-trusted into an emitted binding.
 #[test]
 fn a_rust_fn_on_an_uninstalled_crate_is_refused() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let main = "module Main exposing (main)\n\
             import Ipe.Io as Io\n\
         import Ipe.Ffi.Rust as Rust\n\
@@ -364,12 +346,10 @@ fn a_rust_fn_on_an_uninstalled_crate_is_refused() {
 /// spelling, since both compile to the same forwarder + shim.
 #[test]
 fn rust_fn_emitted_crate_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_rust_fn_e2e");
     assert!(
@@ -381,8 +361,7 @@ fn rust_fn_emitted_crate_builds_and_runs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_rust_fn_e2e_out");
     let _ = fs::remove_dir_all(&out);
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
-        assert!(false_marker(), "rust-fn fixture must build, got: {err}");
-        return;
+        panic!("rust-fn fixture must build, got: {err}")
     }
 
     let tm_dir = tmp.join("tm");

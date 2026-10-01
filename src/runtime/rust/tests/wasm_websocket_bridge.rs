@@ -6,14 +6,13 @@
 //! `chromedriver`) proof that the symbol it now has actually works, not
 //! just compiles.
 //!
-//! Needs a live counterparty: `examples/33-websocket-echo`'s native server
-//! running on `127.0.0.1:8033` (echoes every text frame prefixed
-//! `"echo: "`) — start it before running this file, e.g.:
+//! Needs a live counterparty: a native echo server on `127.0.0.1:8033`
+//! (path `/ws`) that echoes every text frame prefixed `"echo: "`. CI's
+//! `browser-e2e` job starts `tools/scripts/wasm-test/ws_echo_server.py` and runs:
 //!
 //! ```sh
-//! (cd examples/33-websocket-echo && ./out/app &)
-//! CHROMEDRIVER=chromedriver cargo test --target wasm32-unknown-unknown \
-//!     --features wasm-client --test wasm_websocket_bridge
+//! CHROMEDRIVER=chromedriver cargo test -p ipe-runtime-rust \
+//!     --target wasm32-unknown-unknown --features wasm-client --test wasm_websocket_bridge
 //! ```
 //!
 //! A real browser socket to a real server (not a mock) is the point: it
@@ -21,11 +20,12 @@
 //! wiring in `ws_client.rs`'s wasm32 arm actually round-trips a frame,
 //! which no native-target test can exercise.
 
-#![cfg(target_arch = "wasm32")]
+#![cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use ipe_runtime_rust::core::IpeResult;
 use ipe_runtime_rust::tea::IpeSub;
 use ipe_runtime_rust::ws_client::{web_socket_close, web_socket_connect, web_socket_send};
 use wasm_bindgen_test::*;
@@ -34,44 +34,50 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 const ECHO_URL: &str = "ws://127.0.0.1:8033/ws";
 
-/// Poll `IpeSub::Source`'s teardown-thunk shape by hand (no TEA scheduler in
-/// this test — driving the Source directly is the narrowest proof of the
-/// exact runtime fn the M1 gate now allows).
-fn drive_source<M: 'static>(sub: IpeSub<M>, emit: Rc<dyn Fn(M)>) -> Box<dyn FnOnce()> {
-    match sub {
-        IpeSub::Source(spawn) => spawn(emit),
-        _ => panic!("test bug: expected IpeSub::Source"),
+/// Teardown thunk a started `IpeSub::Source` hands back.
+type Teardown = Box<dyn FnOnce()>;
+
+/// Start an `IpeSub::Source` by hand, returning its teardown.
+///
+/// `None` when `sub` is any other variant; callers assert on it. No TEA
+/// scheduler runs here: driving the Source directly is the narrowest proof of
+/// the exact runtime fn under test.
+fn drive_source<M: 'static>(sub: IpeSub<M>, emit: Rc<dyn Fn(M)>) -> Option<Teardown> {
+    if let IpeSub::Source(spawn) = sub {
+        Some(spawn(emit))
+    } else {
+        None
     }
 }
 
-/// Busy-poll-with-yield until `pred` is true or `attempts` is exhausted —
+/// Busy-poll-with-yield until `pred` is true or `attempts` is exhausted.
+///
 /// `wasm_bindgen_test`'s async support has no timer primitive of its own, so
-/// this drives the microtask queue forward via `gloo_timers`-free
-/// `wasm_bindgen_futures::JsFuture` yields against a zero-length promise.
+/// this drives the event loop forward by awaiting a short `setTimeout`
+/// promise between polls.
 async fn wait_until(mut attempts: u32, mut pred: impl FnMut() -> bool) -> bool {
     while attempts > 0 {
         if pred() {
             return true;
         }
         yield_to_browser().await;
-        attempts -= 1;
+        attempts = attempts.saturating_sub(1);
     }
     pred()
 }
 
 async fn yield_to_browser() {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        // `wasm_bindgen_test_configure!(run_in_browser)` guarantees a real
-        // `Window` global for every test in this file — `None` here would be
-        // a harness bug, not a runtime condition this test recovers from, so
-        // a `match`-panic (not `.expect()`, which the crate's
-        // `clippy::expect_used = "deny"` scope covers even in tests) states
-        // that plainly.
-        match web_sys::window() {
-            Some(window) => {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 20);
-            }
-            None => panic!("wasm-bindgen-test harness bug: no Window in a run_in_browser test"),
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        // Without a `Window` (or a timer) the promise rejects at once, so the
+        // poll loop runs out of attempts and the caller's assertion fails
+        // instead of hanging.
+        let scheduled = web_sys::window().is_some_and(|window| {
+            window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 20)
+                .is_ok()
+        });
+        if !scheduled {
+            let _ = reject.call0(&wasm_bindgen::JsValue::NULL);
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -82,9 +88,14 @@ async fn onopen_onmessage_onclose_round_trip_against_a_live_server() {
     // Task-tier connect — the M4 substitute already tagged `WasmClient`
     // before this change; unaffected here except as the socket this test's
     // new Sub-tier coverage subscribes against.
-    let socket_id = web_socket_connect::<String>(ECHO_URL.to_owned())
-        .await
-        .expect_ok("WebSocket.connect against the live echo server must resolve");
+    let connected = web_socket_connect::<String>(ECHO_URL.to_owned()).await;
+    assert!(
+        matches!(connected, IpeResult::Ok(_)),
+        "WebSocket.connect against the live echo server must resolve: {connected:?}"
+    );
+    let IpeResult::Ok(socket_id) = connected else {
+        return;
+    };
 
     // ── onOpen: the one-shot Sub-tier receive kernel this commit adds ──────
     let opened = Rc::new(RefCell::new(false));
@@ -94,6 +105,10 @@ async fn onopen_onmessage_onclose_round_trip_against_a_live_server() {
         ipe_runtime_rust::ws_client::sub_subscribe_ws_open(socket_id, ()),
         open_emit,
     );
+    assert!(open_teardown.is_some(), "onOpen must be an IpeSub::Source");
+    let Some(open_teardown) = open_teardown else {
+        return;
+    };
     assert!(
         wait_until(100, || *opened.borrow()).await,
         "onOpen never fired against a live socket"
@@ -112,10 +127,20 @@ async fn onopen_onmessage_onclose_round_trip_against_a_live_server() {
         }),
         msg_emit,
     );
+    assert!(
+        message_teardown.is_some(),
+        "onMessage must be an IpeSub::Source"
+    );
+    let Some(message_teardown) = message_teardown else {
+        return;
+    };
 
-    web_socket_send::<String>(socket_id, "hello-from-wasm-bindgen-test".to_owned())
-        .await
-        .expect_ok("WebSocket.send on an open socket must resolve");
+    let sent =
+        web_socket_send::<String>(socket_id, "hello-from-wasm-bindgen-test".to_owned()).await;
+    assert!(
+        matches!(sent, IpeResult::Ok(_)),
+        "WebSocket.send on an open socket must resolve: {sent:?}"
+    );
 
     assert!(
         wait_until(100, || received
@@ -136,10 +161,19 @@ async fn onopen_onmessage_onclose_round_trip_against_a_live_server() {
         ipe_runtime_rust::ws_client::sub_subscribe_ws_close(socket_id, |code| code),
         close_emit,
     );
+    assert!(
+        close_teardown.is_some(),
+        "onClose must be an IpeSub::Source"
+    );
+    let Some(close_teardown) = close_teardown else {
+        return;
+    };
 
-    web_socket_close::<String>(socket_id)
-        .await
-        .expect_ok("WebSocket.close must resolve");
+    let closed_result = web_socket_close::<String>(socket_id).await;
+    assert!(
+        matches!(closed_result, IpeResult::Ok(_)),
+        "WebSocket.close must resolve: {closed_result:?}"
+    );
 
     assert!(
         wait_until(100, || *closed.borrow()).await,
@@ -149,23 +183,4 @@ async fn onopen_onmessage_onclose_round_trip_against_a_live_server() {
     open_teardown();
     message_teardown();
     close_teardown();
-}
-
-/// Local `Result`-unwrap helper: this crate's `IpeResult` has no
-/// `std::result`-shaped `.expect`, and pulling in `unwrap_used = "deny"`
-/// clippy scope means a raw `match` reads clearer at each call site than a
-/// borrowed trait impl for a two-call-site test helper.
-trait ExpectOk<T> {
-    fn expect_ok(self, msg: &str) -> T;
-}
-
-impl<E: std::fmt::Debug, T> ExpectOk<T> for ipe_runtime_rust::core::IpeResult<E, T> {
-    fn expect_ok(self, msg: &str) -> T {
-        match self {
-            ipe_runtime_rust::core::IpeResult::Ok(v) => v,
-            ipe_runtime_rust::core::IpeResult::Err(e) => {
-                panic!("{msg}: {e:?}");
-            }
-        }
-    }
 }

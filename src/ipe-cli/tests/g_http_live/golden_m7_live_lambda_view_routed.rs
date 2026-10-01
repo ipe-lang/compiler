@@ -59,21 +59,20 @@ fn out_dir() -> PathBuf {
     crate::support::scratch_root().join("m7_live_lambda_view_routed_out")
 }
 
-/// Compile the fixture into `out`; `None` (skip) when the runtime cannot be
-/// resolved. `tag` names a private source dir so parallel callers never share
+/// Compile the fixture into `out`. `tag` names a private source dir so parallel callers never share
 /// the `Main.ipe` staging path.
-fn compile(tag: &str, out: &Path) -> Option<Result<(), ipe::CliError>> {
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn compile(tag: &str, out: &Path) -> Result<(), ipe::CliError> {
     let ipe_dir =
         crate::support::scratch_root().join(format!("m7_live_lambda_view_routed_{tag}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).ok()?;
+    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
     let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, LIVE_LAMBDA_VIEW_ROUTED).ok()?;
+    std::fs::write(&entry, LIVE_LAMBDA_VIEW_ROUTED)
+        .expect("the fixture scratch dir must be writable");
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// The lambda-view routed app must be ipe-0 AND emit `web_app_routed` with
@@ -81,9 +80,7 @@ fn compile(tag: &str, out: &Path) -> Option<Result<(), ipe::CliError>> {
 /// `routes`/`notFound`.
 #[test]
 fn lambda_view_routed_app_emits_web_app_routed() {
-    let Some(result) = compile("main", &out_dir()) else {
-        return;
-    };
+    let result = compile("main", &out_dir());
     assert!(
         result.is_ok(),
         "#108 hole 2: lambda-view routed app must be ipe-0, got: {:?}",
@@ -107,16 +104,14 @@ fn lambda_view_routed_app_emits_web_app_routed() {
 /// core: unique package name → fresh app fingerprint, warm dep target reused).
 #[test]
 fn lambda_view_routed_app_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     // Emit into a PRIVATE dir this test alone owns, so the compile-only sibling
     // re-emitting into `out_dir()` in parallel cannot delete rustc's working
     // directory mid-build.
     let out = crate::support::scratch_root().join("m7_live_lambda_view_routed_e2e_out");
-    let Some(result) = compile("e2e", &out) else {
-        return;
-    };
+    let result = compile("e2e", &out);
     assert!(
         result.is_ok(),
         "lambda-view routed app must be ipe-0, got: {:?}",

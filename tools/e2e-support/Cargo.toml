@@ -15,6 +15,10 @@ ipe_env = { path = "../../src/compiler/env" }
 
 [dev-dependencies]
 ipe-test-temp = { path = "../test-temp" }
+# `skip_scan` reads every test target's syntax tree; span-locations gives real
+# 1-based line numbers outside a proc-macro context.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lints]
 workspace = true

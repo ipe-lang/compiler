@@ -318,26 +318,22 @@ main =
 "#;
 
 /// Compile an inline source through the full ipe pipeline (parse → … → emit).
-/// Returns `None` (skip) when the embedded runtime cannot be resolved.
-fn compile_src(test_name: &str, source: &str) -> Option<Result<(), CliError>> {
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn compile_src(test_name: &str, source: &str) -> Result<(), CliError> {
     let ipe_dir = crate::support::scratch_root().join(format!("t0020_web_view_{test_name}_ipe"));
     let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).ok()?;
+    std::fs::create_dir_all(&ipe_dir).expect("scratch setup must succeed");
     let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
+    std::fs::write(&entry, source).expect("scratch setup must succeed");
     let out = crate::support::scratch_root().join(format!("t0020_web_view_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return None;
-    };
-    Some(ipe::build(&entry, &out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, &out, &runtime)
 }
 
 #[test]
 fn any_view_returning_html_is_ipe_t0020() {
-    let Some(result) = compile_src("html", ANY_VIEW_RETURNS_HTML) else {
-        return;
-    };
+    let result = compile_src("html", ANY_VIEW_RETURNS_HTML);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -352,9 +348,7 @@ fn any_view_returning_html_is_ipe_t0020() {
 
 #[test]
 fn any_view_returning_element_compiles() {
-    let Some(result) = compile_src("element", ANY_VIEW_RETURNS_ELEMENT) else {
-        return;
-    };
+    let result = compile_src("element", ANY_VIEW_RETURNS_ELEMENT);
     assert!(
         result.is_ok(),
         "a `view : Model -> any` returning an Element must NOT be rejected, \
@@ -364,9 +358,7 @@ fn any_view_returning_element_compiles() {
 
 #[test]
 fn any_view_wrapping_with_ui_html_compiles() {
-    let Some(result) = compile_src("ui_html", ANY_VIEW_WRAPS_WITH_UI_HTML) else {
-        return;
-    };
+    let result = compile_src("ui_html", ANY_VIEW_WRAPS_WITH_UI_HTML);
     assert!(
         result.is_ok(),
         "a `view : Model -> any` wrapping raw Html with `Ui.html` must \
@@ -376,9 +368,7 @@ fn any_view_wrapping_with_ui_html_compiles() {
 
 #[test]
 fn element_view_is_positive_control() {
-    let Some(result) = compile_src("control", ELEMENT_VIEW_OK) else {
-        return;
-    };
+    let result = compile_src("control", ELEMENT_VIEW_OK);
     assert!(
         result.is_ok(),
         "the canonical `view : Model -> Element Msg` form must compile, \
@@ -388,9 +378,7 @@ fn element_view_is_positive_control() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_even_when_main_precedes_view() {
-    let Some(result) = compile_src("main_first", ANY_VIEW_HTML_MAIN_FIRST) else {
-        return;
-    };
+    let result = compile_src("main_first", ANY_VIEW_HTML_MAIN_FIRST);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -405,9 +393,7 @@ fn any_view_html_is_ipe_t0020_even_when_main_precedes_view() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_through_a_let_alias() {
-    let Some(result) = compile_src("let_alias", ANY_VIEW_HTML_LET_ALIAS) else {
-        return;
-    };
+    let result = compile_src("let_alias", ANY_VIEW_HTML_LET_ALIAS);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -422,9 +408,7 @@ fn any_view_html_is_ipe_t0020_through_a_let_alias() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_through_a_chained_alias() {
-    let Some(result) = compile_src("chained", ANY_VIEW_HTML_CHAINED_ALIAS) else {
-        return;
-    };
+    let result = compile_src("chained", ANY_VIEW_HTML_CHAINED_ALIAS);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -439,9 +423,7 @@ fn any_view_html_is_ipe_t0020_through_a_chained_alias() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_through_an_eta_lambda() {
-    let Some(result) = compile_src("eta", ANY_VIEW_HTML_ETA_LAMBDA) else {
-        return;
-    };
+    let result = compile_src("eta", ANY_VIEW_HTML_ETA_LAMBDA);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -456,9 +438,7 @@ fn any_view_html_is_ipe_t0020_through_an_eta_lambda() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_through_a_point_free_view() {
-    let Some(result) = compile_src("point_free", ANY_VIEW_HTML_POINT_FREE) else {
-        return;
-    };
+    let result = compile_src("point_free", ANY_VIEW_HTML_POINT_FREE);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -473,9 +453,7 @@ fn any_view_html_is_ipe_t0020_through_a_point_free_view() {
 
 #[test]
 fn any_view_html_is_ipe_t0020_through_a_point_free_alias() {
-    let Some(result) = compile_src("point_free_alias", ANY_VIEW_HTML_POINT_FREE_ALIAS) else {
-        return;
-    };
+    let result = compile_src("point_free_alias", ANY_VIEW_HTML_POINT_FREE_ALIAS);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -490,9 +468,7 @@ fn any_view_html_is_ipe_t0020_through_a_point_free_alias() {
 
 #[test]
 fn element_annotated_view_with_html_body_is_ipe_t0020() {
-    let Some(result) = compile_src("elem_html_body", ELEMENT_VIEW_HTML_BODY) else {
-        return;
-    };
+    let result = compile_src("elem_html_body", ELEMENT_VIEW_HTML_BODY);
     let got = match &result {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

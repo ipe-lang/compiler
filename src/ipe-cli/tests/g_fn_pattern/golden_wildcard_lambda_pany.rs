@@ -27,16 +27,16 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_l0102_wildcard_lambda_pany
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
 #[test]
 fn wildcard_lambda_pany_ipec_cargo_and_run_zero() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -49,9 +49,7 @@ fn wildcard_lambda_pany_ipec_cargo_and_run_zero() {
     let out = crate::support::scratch_root().join("ipec_l0102_wildcard_lambda_pany_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiler must succeed.  Without the wildcard mapping this fails
     // with IPE-L0102 ("unsupported feature: Polymorphism") on the `\_ ->`

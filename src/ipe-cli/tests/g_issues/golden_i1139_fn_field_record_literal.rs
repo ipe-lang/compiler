@@ -36,9 +36,7 @@ fn assert_rejects_l0107(dir: &str) {
     let entry = fixture(&root, dir);
     let out = crate::support::scratch_root().join(format!("ipec_{dir}"));
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),

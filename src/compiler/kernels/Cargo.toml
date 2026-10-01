@@ -28,6 +28,8 @@ strum = { version = "0.26", features = ["derive"] }
 # BELOW `ipe_kernels` in the DAG (they have no dependency on `ipe_kernels`),
 # so adding them here introduces no cycle.
 [dev-dependencies]
+# Existence-proven test-artifact resolvers.
+e2e-support = { path = "../../../tools/e2e-support" }
 ipe_intern = { path = "../intern" }
 ipe_parse = { path = "../parse" }
 ipe_syntax = { path = "../syntax" }

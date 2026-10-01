@@ -11,13 +11,6 @@
 use std::fs;
 use std::path::Path;
 
-/// `assert!(false_marker())` fails a test without tripping
-/// `clippy::assertions_on_constants`.
-#[allow(clippy::missing_const_for_fn)]
-fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 /// Write an executable fake `cargo` at `dir/cargo` that exits non-zero with
 /// the DNS/registry-error patterns cargo emits when offline or when the
 /// registry is unreachable.
@@ -46,17 +39,13 @@ fn write_offline_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 /// `cargo` and PATH scrubbing to guarantee the fake is the one resolved.
 #[cfg(unix)]
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    let ipe_bin = env!("CARGO_BIN_EXE_ipe");
-    if !Path::new(ipe_bin).exists() {
-        return;
-    }
+    let ipe_bin = e2e_support::cargo_bin!("ipe");
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("ipe_build_registry_unreachable_e2e");
@@ -78,8 +67,7 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
         .env("NO_COLOR", "1")
         .output();
     let Ok(out) = out else {
-        assert!(false_marker(), "failed to spawn ipe build: {out:?}");
-        return;
+        panic!("failed to spawn ipe build: {out:?}")
     };
 
     let stderr = String::from_utf8_lossy(&out.stderr);

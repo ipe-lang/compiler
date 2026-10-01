@@ -49,10 +49,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../../tools/test-temp" }
-
-# `rerun_this_test_exact`: the Windows e2e env test's re-exec must prove the
-# child ran its test, not merely exited 0.
-[target.'cfg(windows)'.dev-dependencies]
+# The e2e tier gate and existence-proven test-artifact resolvers.
 e2e-support = { path = "../../../tools/e2e-support" }
 
 [lints]

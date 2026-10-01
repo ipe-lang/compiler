@@ -253,7 +253,7 @@ fn location_and_caret(report: &str) -> Option<(String, String)> {
 /// any runtime is read, so a resolvable runtime is only needed to get `build`
 /// as far as the compiler.
 fn build_stderr(entry: &Path) -> Option<String> {
-    let runtime = ipe::resolve_runtime().ok()?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let out = Command::new(support::ipe_bin())
         .args(["build", &entry.to_string_lossy()])
         .arg("--out")
@@ -365,12 +365,7 @@ fn closed_union_catch_all_fails_check_nonzero() -> TestResult {
 /// error stops the pipeline before code generation, not merely at print time.
 #[test]
 fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        // No resolvable runtime in this environment; the compile-time error
-        // fires before any runtime is read, and the `check` test above already
-        // pins the non-zero exit. Skip the build-artifact assertion.
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let dir = crate::support::scratch_root().join(format!(
         "ipe_t0018_no_emit_{}_{}",
         std::process::id(),

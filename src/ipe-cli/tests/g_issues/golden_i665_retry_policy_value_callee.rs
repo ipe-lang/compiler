@@ -39,14 +39,12 @@ fn fixture_entry_named(root: &Path, name: &str) -> PathBuf {
         .join("Main.ipe")
 }
 
-/// Build the fixture; return whether the frontend accepted + emitted it. `None`
-/// when the runtime resolver is unavailable in this environment (mirrors the
-/// resolve-skip convention every other golden in this suite uses).
-fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
+/// Build the fixture; return whether the frontend accepted + emitted it.
+fn built(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// Emit assertion (default gate): the frontend must accept the piped
@@ -57,9 +55,7 @@ fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
 fn retry_policy_value_callee_emits() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_retry_policy_value_callee_emit");
-    let Some(built) = built(&root, &out) else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let built = built(&root, &out);
     assert!(
         built.is_ok(),
         "retry_policy_value_callee: piped `Task.retryOn` must be accepted + \
@@ -76,31 +72,28 @@ fn retry_policy_value_callee_emits() {
 fn retry_policy_value_callee_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_retry_policy_value_callee_e2e");
-    let Some(built) = built(&root, &out) else {
-        return;
-    };
+    let built = built(&root, &out);
     assert!(
         built.is_ok(),
         "retry_policy_value_callee: must be accepted, got: {built:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
-    let outcome = crate::support::build_and_run_emitted("retry_policy_value_callee", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "retry_policy_value_callee: emitted crate must build and exit 0 (the \
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("retry_policy_value_callee", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "retry_policy_value_callee: emitted crate must build and exit 0 (the \
          `RetryPolicy` `shouldRetry` fn field emits as an `Arc<dyn Fn>` on a \
          kernel-managed struct); stdout:\n{}",
-        outcome.stdout
-    );
-    assert_eq!(
-        outcome.stdout.trim(),
-        "x",
-        "wrong runtime output — the succeeding Task carries the value `x`"
-    );
+            outcome.stdout
+        );
+        assert_eq!(
+            outcome.stdout.trim(),
+            "x",
+            "wrong runtime output — the succeeding Task carries the value `x`"
+        );
+    }
 }
 
 /// SEAL negative: the `RetryPolicy` exemption must be scoped to the FULL closed
@@ -118,9 +111,7 @@ fn retry_policy_shape_nearmiss_rejects() {
     let entry = fixture_entry_named(&root, "retry_policy_shape_nearmiss");
     let out = crate::support::scratch_root().join("ipec_retry_policy_shape_nearmiss");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),

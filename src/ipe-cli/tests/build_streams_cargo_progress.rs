@@ -75,17 +75,10 @@ fn run_streams_the_emitted_cargo_progress() {
 fn assert_relays_cargo_progress(subcommand: &str) {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 
-    // The runtime dir must resolve for the emit to reach the cargo step. When the
-    // repo tree is unavailable (a nextest archive shipped to another host), skip
-    // — the streaming primitive is also unit-covered below.
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+    // The runtime dir must resolve for the emit to reach the cargo step.
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    let ipe_bin = env!("CARGO_BIN_EXE_ipe");
-    if !Path::new(ipe_bin).exists() {
-        return;
-    }
+    let ipe_bin = e2e_support::cargo_bin!("ipe");
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ipe_{subcommand}_stream_progress_e2e"));

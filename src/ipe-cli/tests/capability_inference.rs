@@ -287,7 +287,7 @@ fn a_broken_unimported_sibling_refuses_the_package_like_the_build() -> Result<()
         "expected the public entry point to agree, got: {public:?}"
     );
     // The build graph refuses the same package, blamed on the same file.
-    let runtime = ipe::resolve_runtime()?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build_project(&manifest, &dir.join("out"), &runtime);
     assert!(
         is_pipeline_error_in(&built, "Broken.ipe"),

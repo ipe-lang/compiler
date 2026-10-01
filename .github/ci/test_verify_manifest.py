@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Refusal proofs for `verify-manifest.py`'s step checks (checks 6 and 7),
 merge-queue safety check (check 8), release-only skip-as-pass check
-(check 9), fast-gate-first check (check 10), and one-lock-per-graph
-check (check 14).
+(check 9), fast-gate-first check (check 10), one-lock-per-graph check (check 14), and test-claims check
+(check 20).
 
 Check 7 covers content-pinned `uses:`/images, the hash-checked pip shape, and
 env-file writes only through `github-env.sh`; its cases sit in
@@ -55,6 +55,7 @@ check_scoped_package_coverage = verify_manifest.check_scoped_package_coverage
 check_drift_sees_untracked = verify_manifest.check_drift_sees_untracked
 check_dependabot_pr_budget = verify_manifest.check_dependabot_pr_budget
 check_workspace_inheritance = verify_manifest.check_workspace_inheritance
+check_test_claims = verify_manifest.check_test_claims
 
 with open(os.path.join(HERE, "github-env-allowlist.txt")) as _f:
     VALID_ENV_ALLOWLIST = _f.read()
@@ -1981,6 +1982,33 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
             if out == "2":
                 splits.add(ch)
         self.assertEqual(splits, set(verify_manifest.shell_lex.BLANKS))
+
+    def test_shell_lex_literal_words(self) -> None:
+        import shutil
+        import subprocess
+
+        lex = verify_manifest.shell_lex
+        word = "".join(chr(i) for i in range(0x20, 0x7F) if lex.literal_words([chr(i)]) == (lex.LiteralWord(chr(i)),))
+        self.assertEqual(lex.literal_words(["a", "--f=x,y"]), (lex.LiteralWord("a"), lex.LiteralWord("--f=x,y")))
+        for bad in ("$X", "${X}", "a*", "a?", "[a]", "{a,b}", "~", "~/x", "a\\b", "'a'", '"a"', "`x`", "a b", "a\tb", "a\nb", "a!", "", "é"):
+            with self.subTest(bad=bad):
+                self.assertEqual(lex.literal_words(["ok", bad]), bad)
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is not installed")
+        # Every literal character, alone and in one word, reaches the argv
+        # unchanged as one argument, even beside files a glob could match.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a", "b", "ab"):
+                open(os.path.join(tmp, name), "w").close()
+            for w in [*word, word, "a" + word]:
+                with self.subTest(word=w):
+                    out = subprocess.run(
+                        [bash, "--norc", "--noprofile", "-c", f"printf '%s\\0' {w}"],
+                        capture_output=True, cwd=tmp, check=False, env={"HOME": tmp},
+                    ).stdout
+                    self.assertEqual(out, w.encode() + b"\0")
+        self.assertEqual(set(word), set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.,=/:+@-"))
 
     # ---- a verdict-bearing step cannot be masked -------------------------
 
@@ -5565,6 +5593,324 @@ class TestWorkspaceInheritance(unittest.TestCase):
     def test_root_without_workspace_lints_refused(self) -> None:
         self.files["Cargo.toml"] = _WI_ROOT.replace('[workspace.lints.clippy]\nunwrap_used = "deny"\n', "")
         self.assertRefused("`[workspace.lints]` table")
+
+
+_TC_CLAIMS = """\
+cells:
+  - package: p
+    target: lib
+    platform: wasm32-unknown-unknown
+    features: [a]
+    owner: wasm
+    expect_tests: 3
+"""
+_TC_LOCK = _lock(("p", None), ("wasm-bindgen", _REG)).replace(
+    'name = "wasm-bindgen"\nversion = "1.0.0"', 'name = "wasm-bindgen"\nversion = "0.2.126"'
+)
+_TC_MANIFEST = """\
+checks:
+  - context: wasm
+    disposition: gate
+    producer: ci.yml
+"""
+_TC_PIN = """\
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
+"""
+_TC_RUN = (
+    "cargo test -p p --target wasm32-unknown-unknown --features a --lib"
+    " | python3 tools/scripts/wasm-test/wasm_test_count.py 3"
+)
+_TC_CLAIM = """\
+      - name: Count
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: %s
+"""
+
+
+def _tc_ci(steps: str, *, job: str = "wasm", name: str = "wasm") -> str:
+    return f"name: ci\non: [push]\njobs:\n  {job}:\n    name: {name}\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+
+
+def _tc_env(claim: str, line: str) -> str:
+    return claim.replace("        env:\n", f"        env:\n          {line}\n")
+
+
+_TC_OK = _tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN)
+
+
+class TestTestClaims(unittest.TestCase):
+    """Check 20: every wasm32 test cell is run, and counted, by the job that claims it."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = self._tmp.name
+        self.root = os.path.join(self.repo, ".github")
+        self.files = {
+            "Cargo.lock": _TC_LOCK,
+            ".github/ci/test-claims.yml": _TC_CLAIMS,
+            ".github/ci/check-manifest.yml": _TC_MANIFEST,
+            ".github/ci/required-set.json": json.dumps([{"context": "wasm", "integration_id": 15368}]),
+        }
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, ci: str) -> list[str]:
+        for rel, text in self.files.items():
+            _write(os.path.join(self.repo, rel), text)
+        _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
+        errors: list[str] = []
+        check_test_claims(errors, root=self.root)
+        return errors
+
+    def assertRefused(self, ci: str, needle: str) -> None:
+        errors = self.errors(ci)
+        self.assertTrue(any(needle in e and e.startswith("check 20:") for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_valid_claim_passes(self) -> None:
+        self.assertEqual(self.errors(_TC_OK), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        check_test_claims(errors)
+        self.assertEqual(errors, [])
+
+    def test_all_features_satisfies_the_cell(self) -> None:
+        run = _TC_RUN.replace("--features a", "--all-features")
+        self.assertEqual(self.errors(_tc_ci(_TC_PIN + _TC_CLAIM % run)), [])
+
+    def test_guarded_claim_passes(self) -> None:
+        claim = (_TC_CLAIM % _TC_RUN).replace("        shell:", "        if: needs.changes.outputs.release_only != 'true'\n        shell:")
+        self.assertEqual(self.errors(_tc_ci(_TC_PIN + claim)), [])
+
+    def test_unclaimed_cell_refused(self) -> None:
+        self.assertRefused(_tc_ci(_TC_PIN + "      - run: echo\n"), "is claimed by no step of its owner")
+
+    def test_double_claim_refused(self) -> None:
+        self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN + _TC_CLAIM % _TC_RUN), "is claimed by 2 steps")
+
+    def test_claim_step_refusals(self) -> None:
+        claim = _TC_CLAIM % _TC_RUN
+        for name, steps, needle in (
+            ("not piped", _TC_PIN + _TC_CLAIM % "python3 tools/scripts/wasm-test/wasm_test_count.py 3", "not piped"),
+            ("or true", _TC_PIN + _TC_CLAIM % (_TC_RUN + " || true"), "is not exactly"),
+            ("second command", _TC_PIN + _TC_CLAIM % ("echo x; " + _TC_RUN), "is not exactly"),
+            ("not cargo", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "echo test"), "not a bare `cargo`"),
+            ("env assignment", _TC_PIN + _TC_CLAIM % ("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=x " + _TC_RUN), "not a bare `cargo`"),
+            ("env wrapper", _TC_PIN + _TC_CLAIM % ("env " + _TC_RUN), "not a bare `cargo`"),
+            ("cargo path", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "/usr/bin/cargo test"), "not a bare `cargo`"),
+            ("args after dashes", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib -- only_this"), "after `--`"),
+            ("bare dashes", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib --"), "after `--`"),
+            ("config", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "cargo --config x test"), "'--config' changes what cargo reads"),
+            ("config joined", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib --config=x"), "'--config=x' changes what cargo reads"),
+            ("directory", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "cargo -C sub test"), "'-C' changes what cargo reads"),
+            ("unstable flag", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "cargo -Zbuild-std test"), "'-Zbuild-std' changes what cargo reads"),
+            ("manifest path", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib --manifest-path x/Cargo.toml"), "'--manifest-path' changes what cargo reads"),
+            ("cargo build", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "cargo build"), "runs no test"),
+            ("host target", _TC_PIN + _TC_CLAIM % _TC_RUN.replace(" --target wasm32-unknown-unknown", ""), "names no `--target`"),
+            ("workspace", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("-p p", "-p p --workspace"), "exactly one package"),
+            ("missing feature", _TC_PIN + _TC_CLAIM % _TC_RUN.replace(" --features a", ""), "lacks feature(s) ['a']"),
+            ("all targets", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib --tests"), "select"),
+            ("filtered", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib only_this"), "filter"),
+            ("no run", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib --no-run"), "filters or skips"),
+            ("wrong count args", _TC_PIN + _TC_CLAIM % (_TC_RUN + " extra"), "not `python3"),
+            ("unknown test", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--test x"), "p test:x wasm32-unknown-unknown, which no cell"),
+            ("other package", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("-p p", "-p q"), "q lib wasm32-unknown-unknown, which no cell"),
+            ("other platform", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("wasm32-unknown-unknown", "wasm32-wasip1"), "p lib wasm32-wasip1, which no cell"),
+            ("two packages", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("-p p", "-p p -p q"), "exactly one package"),
+            ("short count", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("count.py 3", "count.py 2"), "counts '2', but the cell claims 3"),
+            ("long count", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("count.py 3", "count.py 30"), "counts '30', but the cell claims 3"),
+            ("padded count", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("count.py 3", "count.py 03"), "counts '03', but the cell claims 3"),
+            ("no count", _TC_PIN + _TC_CLAIM % _TC_RUN.replace(" 3", ""), "not `python3"),
+            ("relative script path", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("tools/", "./tools/"), "not `python3"),
+            ("other script path", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("tools/scripts/wasm-test/", ".github/ci/"), "not `python3"),
+            ("no shell bash", _TC_PIN + claim.replace("        shell: bash\n", ""), "lacks `shell: bash`"),
+            ("shell sh", _TC_PIN + claim.replace("shell: bash", "shell: sh"), "lacks `shell: bash`"),
+            ("continue on error", _TC_PIN + claim.replace("        shell:", "        continue-on-error: true\n        shell:"), "continue-on-error"),
+            ("working directory", _TC_PIN + claim.replace("        shell:", "        working-directory: x\n        shell:"), "working-directory"),
+            ("skippable if", _TC_PIN + claim.replace("        shell:", "        if: github.event_name == 'push'\n        shell:"), "could skip the count"),
+            ("expression in run", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a,${{env.B}}"), "workflow expression"),
+            ("parameter in option value", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a,$IPE_RUNTIME_DIR"), "word 'a,$IPE_RUNTIME_DIR' is not literal"),
+            ("braced parameter", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a,${IPE_RUNTIME_DIR}"), "word 'a,${IPE_RUNTIME_DIR}' is not literal"),
+            ("bare parameter word", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--lib", "--lib $X"), "word '$X' is not literal"),
+            ("glob star in features", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a*"), "word 'a*' is not literal"),
+            ("glob question in features", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a?"), "word 'a?' is not literal"),
+            ("glob bracket in features", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features [a]"), "word '[a]' is not literal"),
+            ("brace expansion", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features {a,b}"), "word '{a,b}' is not literal"),
+            ("tilde", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a --target-dir ~/t"), "word '~/t' is not literal"),
+            ("backslash", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features a\\\\b"), "is not exactly"),
+            ("literal backslash word", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features 'a\\b'"), "is not exactly"),
+            ("runner-spoofing env word", _TC_PIN + _tc_env(_TC_CLAIM % _TC_RUN.replace("--features a", "--features a $IPE_RUNTIME_DIR"), "IPE_RUNTIME_DIR: 'a --config=target.wasm32-unknown-unknown.runner=[\"sh\",\"-c\",\"echo test result: ok. 3 passed; 0 failed;\"]'"), "word '$IPE_RUNTIME_DIR' is not literal"),
+            ("parameter in count", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("count.py 3", "count.py $N"), "word '$N' is not literal"),
+            ("bad incremental", _TC_PIN + _tc_env(claim, 'CARGO_INCREMENTAL: "2"'), "sets CARGO_INCREMENTAL to '2'"),
+            ("bad term color", _TC_PIN + _tc_env(claim, "CARGO_TERM_COLOR: sometimes"), "sets CARGO_TERM_COLOR to 'sometimes'"),
+            ("missing runner env", _TC_PIN + claim.replace("wasm-bindgen-test-runner", "node"), "is not 'wasm-bindgen-test-runner'"),
+            ("no pin", claim, "no earlier step of the job installs wasm-bindgen@0.2.126"),
+            ("pin after", claim + _TC_PIN, "no earlier step of the job installs"),
+            ("toolchain", _TC_PIN + _TC_CLAIM % _TC_RUN.replace("cargo test", "cargo +nightly test"), "picks toolchain `+nightly`"),
+            ("step rustflags cfg", _TC_PIN + _tc_env(claim, 'RUSTFLAGS: "--cfg x"'), "sets RUSTFLAGS to '--cfg x'"),
+            ("encoded rustflags", _TC_PIN + _tc_env(claim, 'CARGO_ENCODED_RUSTFLAGS: "--cfg\\x1fx"'), "sets CARGO_ENCODED_RUSTFLAGS"),
+            ("target rustflags", _TC_PIN + _tc_env(claim, 'CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: "--cfg x"'), "sets CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS"),
+            ("cargo home", _TC_PIN + _tc_env(claim, "CARGO_HOME: /tmp/h"), "sets CARGO_HOME"),
+            ("unknown cargo key", _TC_PIN + _tc_env(claim, "CARGO_BUILD_TARGET: wasm32-wasip1"), "sets CARGO_BUILD_TARGET"),
+            ("rustc wrapper", _TC_PIN + _tc_env(claim, "RUSTC_WRAPPER: x"), "sets RUSTC_WRAPPER"),
+            ("chromedriver other", _TC_PIN + _tc_env(claim, "CHROMEDRIVER: /tmp/driver"), "sets CHROMEDRIVER to '/tmp/driver'"),
+            ("rustflags not string", _TC_PIN + _tc_env(claim, "RUSTFLAGS: 0"), "sets RUSTFLAGS to 0"),
+            ("env not a mapping", _TC_PIN + claim.replace("        env:\n          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner\n", "        env: ${{ fromJSON(vars.E) }}\n"), "is not a literal mapping"),
+        ):
+            with self.subTest(name):
+                self.assertRefused(_tc_ci(steps), needle)
+        job_env = _TC_OK.replace("    runs-on:", '    env:\n      RUSTFLAGS: "--cfg x"\n    runs-on:')
+        wf_env = _TC_OK.replace("on: [push]\n", 'on: [push]\nenv:\n  RUSTFLAGS: "--cfg x"\n')
+        for name, ci, needle in (
+            ("job rustflags cfg", job_env, "sets RUSTFLAGS to '--cfg x'"),
+            ("workflow rustflags cfg", wf_env, "sets RUSTFLAGS to '--cfg x'"),
+            ("job env not a mapping", _TC_OK.replace("    runs-on:", "    env: ${{ vars.E }}\n    runs-on:"), "is not a literal mapping"),
+            ("job container", _TC_OK.replace("    runs-on:", "    container: rust:1\n    runs-on:"), "runs in a `container:`"),
+            ("job container env", _TC_OK.replace("    runs-on:", "    container:\n      image: rust:1\n      env:\n        RUSTFLAGS: --cfg x\n    runs-on:"), "runs in a `container:`"),
+            ("job defaults working directory", _TC_OK.replace("    runs-on:", "    defaults:\n      run:\n        working-directory: x\n    runs-on:"), "working-directory"),
+            ("workflow defaults working directory", _TC_OK.replace("on: [push]\n", "on: [push]\ndefaults:\n  run:\n    working-directory: x\n"), "working-directory"),
+        ):
+            with self.subTest(name):
+                self.assertRefused(ci, needle)
+        for name, config, needle in (
+            ("config target cfg", '[target.wasm32-unknown-unknown]\nrustflags = ["--cfg", "x"]\n', "passes '--cfg'"),
+            ("config target cfg string", '[target.wasm32-unknown-unknown]\nrustflags = "-C debuginfo=0 --cfg x"\n', "passes '--cfg'"),
+            ("config build cfg", '[build]\nrustflags = ["--cfg=x"]\n', "[build] rustflags passes '--cfg=x'"),
+            ("config cfg table target feature", "[target.'cfg(target_arch = \"wasm32\")']\nrustflags = [\"-Ctarget-feature=+simd128\"]\n", "passes `-C target-feature=+simd128`"),
+            ("config codegen panic", '[target.wasm32-unknown-unknown]\nrustflags = ["--codegen", "panic=abort"]\n', "passes `-C panic=abort`"),
+            ("config trailing codegen", '[build]\nrustflags = ["-C"]\n', "passes `-C `"),
+            ("config rustflags not list", "[build]\nrustflags = 3\n", "is not a string or a list of strings"),
+            ("config opt level", '[build]\nrustflags = ["-C", "opt-level=1"]\n', "passes `-C opt-level=1`"),
+            ("config runner", '[target.wasm32-unknown-unknown]\nrunner = "x"\n', "sets ['runner']"),
+            ("config linker", '[target.wasm32-unknown-unknown]\nlinker = "x"\n', "sets ['linker']"),
+            ("config build rustc", '[build]\nrustc-wrapper = "x"\n', "[build] sets ['rustc-wrapper']"),
+            ("config patch table", '[patch.crates-io]\np = { path = "x" }\n', "sets ['patch']"),
+            ("config env table", '[env]\nX = "y"\n', "sets ['env']"),
+            ("config unreadable", "[build\n", "`.cargo/config.toml` is unreadable"),
+        ):
+            with self.subTest(name):
+                self.files[".cargo/config.toml"] = config
+                self.assertRefused(_TC_OK, needle)
+        del self.files[".cargo/config.toml"]
+        with self.subTest("legacy config"):
+            self.files[".cargo/config"] = "[build]\n"
+            self.assertRefused(_TC_OK, "`.cargo/config` is a cargo config this check does not read")
+
+    def test_claim_env_and_config_admitted(self) -> None:
+        claim = _TC_CLAIM % _TC_RUN
+        mold = _tc_ci(_TC_PIN + _tc_env(claim, 'RUSTFLAGS: ""')).replace("    runs-on:", "    env:\n      RUSTFLAGS: -C link-arg=-fuse-ld=mold\n    runs-on:")
+        wf_env = _TC_OK.replace("on: [push]\n", 'on: [push]\nenv:\n  CARGO_TERM_COLOR: always\n  CARGO_INCREMENTAL: "0"\n')
+        for name, ci in (
+            ("empty rustflags", _tc_ci(_TC_PIN + _tc_env(claim, 'RUSTFLAGS: ""'))),
+            ("job rustflags overridden by step", mold),
+            ("chromedriver", _tc_ci(_TC_PIN + _tc_env(claim, "CHROMEDRIVER: chromedriver"))),
+            ("inert key expression", _tc_ci(_TC_PIN + _tc_env(claim, "IPE_RUNTIME_DIR: ${{ github.workspace }}/x"))),
+            ("inert geo port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_GEO_CLIPBOARD_PORT: "0"'))),
+            ("inert layout port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_LAYOUT_FILL_PORT: "0"'))),
+            ("literal option values", _tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features=a,b:c/d+e@f.g-h_0"))),
+            ("workflow term env", wf_env),
+        ):
+            with self.subTest(name):
+                self.assertEqual(self.errors(ci), [])
+        for name, config in (
+            ("config debuginfo", '[target.wasm32-unknown-unknown]\nrustflags = ["-C", "debuginfo=0"]\n'),
+            ("config joined codegen", '[build]\nrustflags = "-Cstrip=symbols --codegen=codegen-units=1"\n'),
+            ("config other target cfg", '[target.wasm32-wasip1]\nrustflags = ["--cfg", "x"]\n'),
+        ):
+            with self.subTest(name):
+                self.files[".cargo/config.toml"] = config
+                self.assertEqual(self.errors(_TC_OK), [])
+
+    def test_inert_claim_env_unread_by_build_scripts(self) -> None:
+        inert = [k for k, v in verify_manifest._CLAIM_ENV.items() if v is None]
+        self.assertTrue(inert)
+        scripts = subprocess.run(
+            ["git", "ls-files", "-z", "--", "build.rs", "*/build.rs"],
+            cwd=os.path.dirname(verify_manifest.REPO_ROOT), capture_output=True, check=True,
+        ).stdout.decode().split("\0")
+        for rel in filter(None, scripts):
+            with open(os.path.join(os.path.dirname(verify_manifest.REPO_ROOT), rel), encoding="utf-8") as f:
+                text = f.read()
+            for key in inert:
+                with self.subTest(rel=rel, key=key):
+                    self.assertNotIn(key, text)
+
+    def test_job_level_continue_on_error_refused(self) -> None:
+        ci = _TC_OK.replace("    runs-on:", "    continue-on-error: true\n    runs-on:")
+        self.assertRefused(ci, "continue-on-error")
+
+    def test_wrong_owner_job_refused(self) -> None:
+        self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, job="other"), "the cell's owner is 'wasm'")
+
+    def test_pin_mismatch_refused(self) -> None:
+        self.assertRefused(_TC_OK.replace("wasm-bindgen@0.2.126", "wasm-bindgen@0.2.100"), "the Cargo.lock version")
+
+    def test_lock_without_one_runner_version_refused(self) -> None:
+        self.files["Cargo.lock"] = _lock(("p", None))
+        self.assertRefused(_TC_OK, "must hold exactly one wasm-bindgen version")
+
+    def test_cargo_install_runner_refused(self) -> None:
+        ci = _TC_OK + "      - run: cargo install wasm-bindgen-cli --version 0.2.126\n"
+        self.assertRefused(ci, "install the runner through the pinned")
+
+    def test_claimless_wasm_test_refused(self) -> None:
+        for line in (
+            "cargo test -p p --target wasm32-unknown-unknown --lib",
+            "cargo nextest run -p p --target wasm32-wasip1",
+            "cargo test --target=wasm32-unknown-unknown -p p --features a --lib",
+        ):
+            with self.subTest(line=line):
+                self.assertRefused(_TC_OK + f"      - run: {line}\n", "outside a claim step")
+
+    def test_wasm_build_and_no_run_allowed(self) -> None:
+        for line in (
+            "cargo build -p p --target wasm32-unknown-unknown",
+            "cargo test -p p --target wasm32-unknown-unknown --no-run",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.errors(_TC_OK + f"      - run: {line}\n"), [])
+
+    def test_unreadable_wasm_cargo_refused(self) -> None:
+        self.assertRefused(_TC_OK + "      - run: cargo test --target wasm32-unknown-unknown --bogus\n", "cannot read")
+
+    def test_owner_not_required_refused(self) -> None:
+        self.files[".github/ci/required-set.json"] = json.dumps([{"context": "other", "integration_id": 15368}])
+        self.assertRefused(_TC_OK, "blocks nothing")
+
+    def test_owner_advisory_refused(self) -> None:
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST.replace("gate", "advisory")
+        self.assertRefused(_TC_OK, "blocks nothing")
+
+    def test_owner_nightly_gate_passes(self) -> None:
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST.replace("gate", "nightly-gate")
+        self.files[".github/ci/required-set.json"] = json.dumps([{"context": "other", "integration_id": 15368}])
+        self.assertEqual(self.errors(_TC_OK), [])
+
+    def test_owner_without_manifest_entry_refused(self) -> None:
+        self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="renamed"), "has no manifest entry produced by ci.yml")
+
+    def test_owner_aggregated_by_required_gate_passes(self) -> None:
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.assertEqual(self.errors(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg")), [])
+
+    def test_owner_aggregated_by_unrequired_gate_refused(self) -> None:
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/required-set.json"] = json.dumps([{"context": "other", "integration_id": 15368}])
+        self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
+
+    def test_owner_aggregated_by_advisory_refused(self) -> None:
+        manifest = _TC_MANIFEST.replace("gate", "advisory") + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/check-manifest.yml"] = manifest
+        self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
+
+    def test_bad_claims_table_refused(self) -> None:
+        self.files[".github/ci/test-claims.yml"] = "cells: []\n"
+        self.assertRefused(_TC_OK, "non-empty `cells`")
 
 
 if __name__ == "__main__":

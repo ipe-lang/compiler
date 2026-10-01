@@ -190,6 +190,7 @@ fn module_interface_completeness() {
 /// Closed-enum resolution values: in-set imports resolve to the dep's
 /// `SourceFile`; kernel/missing imports are `Unresolved`.
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn resolve_imports_shape() {
     let (db, _log) = logged_db();
     let a = file(&db, &["A"], DEP_A);
@@ -202,8 +203,7 @@ fn resolve_imports_shape() {
 
     let resolutions = resolve_imports(&db, root, b);
     let Ok(resolutions) = resolutions else {
-        assert!(resolutions.is_ok(), "B must parse");
-        return;
+        panic!("B must parse");
     };
     let expected = vec![
         (vec!["A".to_owned()], ImportResolution::Resolved(a)),

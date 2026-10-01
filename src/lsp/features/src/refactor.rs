@@ -362,7 +362,6 @@ fn find_case_or_if(expr: &Expr, byte: u32) -> Option<&Expr> {
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => None,
     };
     if child.is_some() {

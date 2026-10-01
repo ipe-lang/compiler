@@ -2,6 +2,7 @@
 //! for `Dict.keys` / `values` / `toList` (the `_fieldIndex` emission contract),
 //! so these must return key-sorted output regardless of insertion order. Also
 //! asserts the absent-key / idempotent-remove behaviours that must NOT panic.
+#![cfg(not(target_arch = "wasm32"))]
 
 use ipe_runtime_rust::*;
 use proptest::prelude::*;

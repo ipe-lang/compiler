@@ -19,5 +19,9 @@ ipe_fmt = { path = "../../ipe-fmt" }
 lsp-types = "0.95"
 serde_json = "1"
 
+[dev-dependencies]
+# Existence-proven test-artifact resolvers.
+e2e-support = { path = "../../../tools/e2e-support" }
+
 [lints]
 workspace = true

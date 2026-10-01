@@ -8,27 +8,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The built scanner, archive-safe: nextest re-exports `CARGO_BIN_EXE_panic-scan`
-/// at runtime pointing at the extracted binary; fall back to the baked path for a
-/// plain (non-archive) run.
+/// The built scanner, proven to exist; fails the test otherwise.
 fn bin() -> Command {
-    Command::new(ipe_env::var_os("CARGO_BIN_EXE_panic-scan").map_or_else(
-        || PathBuf::from(env!("CARGO_BIN_EXE_panic-scan")),
-        PathBuf::from,
-    ))
+    Command::new(e2e_support::cargo_bin!("panic-scan"))
 }
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join(name)
+    e2e_support::manifest_dir!().join("fixtures").join(name)
 }
 
 /// Run the binary from the `fixtures` directory on the named fixture files.
 #[allow(clippy::expect_used)] // a test that cannot spawn the binary has nothing to assert
 fn scan_fixtures(args: &[&str]) -> std::process::Output {
     bin()
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
+        .current_dir(e2e_support::manifest_dir!().join("fixtures"))
         .args(args)
         .output()
         .expect("run panic-scan")

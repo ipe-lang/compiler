@@ -30,10 +30,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_i161_list_filter_partial_app
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -50,9 +50,7 @@ fn list_filter_partial_app_compiles() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i161_list_filter_partial_app_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -60,40 +58,36 @@ fn list_filter_partial_app_compiles() {
         built.err()
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // Re-emit into a stable temp dir for the cargo build/run leg (the
+        // CARGO_TARGET_TMPDIR copy above is fine for the compile-only check but
+        // `crate::support::build_and_run_emitted` wants a dedicated directory it can
+        // freely rewrite the manifest of).
+        let e2e_out = crate::support::scratch_root().join("ipec_i161_list_filter_partial_app_e2e");
+        let _ = std::fs::remove_dir_all(&e2e_out);
 
-    // Re-emit into a stable temp dir for the cargo build/run leg (the
-    // CARGO_TARGET_TMPDIR copy above is fine for the compile-only check but
-    // `crate::support::build_and_run_emitted` wants a dedicated directory it can
-    // freely rewrite the manifest of).
-    let e2e_out = crate::support::scratch_root().join("ipec_i161_list_filter_partial_app_e2e");
-    let _ = std::fs::remove_dir_all(&e2e_out);
+        let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+        let built = ipe::build(&entry, &e2e_out, &runtime);
+        assert!(
+            built.is_ok(),
+            "ipe build must succeed for list_filter_partial_app (E2E leg): {:?}",
+            built.err()
+        );
 
-    let built = ipe::build(&entry, &e2e_out, &runtime);
-    assert!(
-        built.is_ok(),
-        "ipe build must succeed for list_filter_partial_app (E2E leg): {:?}",
-        built.err()
-    );
-
-    let outcome = crate::support::build_and_run_emitted("list_filter_partial_app", &e2e_out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "#161: emitted crate must build with cargo and exit 0 (was E0277 \
+        let outcome = crate::support::build_and_run_emitted("list_filter_partial_app", &e2e_out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "#161: emitted crate must build with cargo and exit 0 (was E0277 \
          `Box<dyn Fn> is not Clone` before the fix)"
-    );
-    assert!(
-        outcome.stdout.contains("3TF"),
-        "#161: List.filter (isAbove 3) [1..6] must keep [4,5,6] (len 3), \
+        );
+        assert!(
+            outcome.stdout.contains("3TF"),
+            "#161: List.filter (isAbove 3) [1..6] must keep [4,5,6] (len 3), \
          List.any (isAbove 5) must be true, List.any (isAbove 10) must be \
          false — expected \"3TF\" in stdout; got:\n{}",
-        outcome.stdout
-    );
+            outcome.stdout
+        );
+    }
 }

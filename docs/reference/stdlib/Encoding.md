@@ -53,12 +53,11 @@ Form-decode a query-string key or value, the inverse of `urlEncode`.
 The decoding is `application/x-www-form-urlencoded`: a `+` becomes a space,
 then each `%XX` escape decodes.
 
-Use `percentDecode` for a URL path or a file location, where `+` is a
-literal `+`.
-
-Returns `Err` when the input contains a malformed percent-escape sequence
-(a `%` not followed by two hex digits) or when the decoded bytes are not
-valid UTF-8.
+Returns `Err` when the input contains a malformed
+percent-escape sequence (a `%` not followed by two hex digits), when the
+decoded bytes are not valid UTF-8, or when the input exceeds the URL
+component length cap. Use `percentDecode` for a URL path or a file location,
+where `+` is a literal `+`.
 
 ## `percentDecode`
 
@@ -71,9 +70,8 @@ Percent-decode a non-form URL component such as a path segment (RFC 3986).
 Each `%XX` escape decodes and a `+` stays a literal `+`, so it also fits a
 file location.
 
-Returns `Err` when the input contains a malformed percent-escape sequence
-(a `%` not followed by two hex digits) or when the decoded bytes are not
-valid UTF-8.
+Returns `Err` on the same malformed input as `urlDecode`: a bad
+percent-escape, decoded bytes that are not valid UTF-8, or an over-cap input.
 
 ## `hexEncode`
 

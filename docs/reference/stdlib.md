@@ -2127,7 +2127,7 @@ Ipe.Http — outbound HTTP client.
 | `get` | `get url` — outbound GET. Takes an already-sealed typed `Url` (parsed once |
 | `methodFromString` | `methodFromString s` — the single typed parse boundary for inbound method |
 | `methodToString` | `methodToString m` — the canonical uppercase string for `m` |
-| `parseQuery` | (no summary) |
+| `parseQuery` | Decode a form-encoded query string into its key/value pairs. |
 | `post` | `post url body` — outbound POST. Takes an already-sealed typed `Url` (see |
 | `request` | (no summary) |
 | `withBody` | (no summary) |

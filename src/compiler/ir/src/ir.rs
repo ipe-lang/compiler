@@ -2770,29 +2770,6 @@ pub const fn fun_value_arc_promotable(ty: &IrType) -> bool {
 /// check, and would make illegal IR representable.
 // `Eq` is not derived: [`Expr::Float`] carries an `f64`, which is only
 // `PartialEq` (IEEE-754). No consumer keys a map / set on an [`Expr`].
-/// Persist a sealed path literal as its raw text, re-sealing it on load.
-mod path_lit_serde {
-    use ipe_diagnostics::path_check::PathLitText;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    /// Write the literal's raw source text.
-    pub fn serialize<S: Serializer>(lit: &PathLitText, s: S) -> Result<S::Ok, S::Error> {
-        lit.raw().serialize(s)
-    }
-
-    /// Read raw text and re-seal it; text the seal refuses fails the load.
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathLitText, D::Error> {
-        let raw = String::deserialize(d)?;
-        PathLitText::seal(raw.as_str()).map_err(|refusal| {
-            serde::de::Error::custom(format!(
-                "path literal {raw:?} refused under the {} regime: {:?}",
-                refusal.regime.name(),
-                refusal.why
-            ))
-        })
-    }
-}
-
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     Int(i64),
@@ -2808,16 +2785,6 @@ pub enum Expr {
     /// A string literal — the carried [`String`] is the already-unescaped value.
     /// The backend renders it as an owned `String` (`"…".to_string()`).
     Str(String),
-    /// A `path "…"` compile-time-sealed path literal.
-    ///
-    /// The carried [`PathLitText`] holds each separator regime's sealed form;
-    /// the backend renders it as `ipe_runtime::path::path_literal_host(…)`,
-    /// which selects the host regime's form. It persists as its raw source text
-    /// and is re-sealed on load, so no unsealed literal is representable here
-    /// either.
-    ///
-    /// [`PathLitText`]: ipe_diagnostics::path_check::PathLitText
-    PathLit(#[serde(with = "path_lit_serde")] ipe_diagnostics::path_check::PathLitText),
     /// The reserved `CustomElement.fromFile "<js-path>"` constructor, lowered. `tag` is
     /// the generated content-addressed custom-element tag (`ipe-ce-<hex>`),
     /// derived at lowering from a hash of the cleaned JS path (which the canon

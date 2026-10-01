@@ -43,9 +43,7 @@ fn enum_payload_emits_arc_carrier_and_clone() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_enum_payload_dispatch_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -74,7 +72,7 @@ fn enum_payload_emits_arc_carrier_and_clone() {
 
 #[test]
 fn enum_payload_end_to_end_prints_two_hundred_seven() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -82,9 +80,7 @@ fn enum_payload_end_to_end_prints_two_hundred_seven() {
     let out = crate::support::scratch_root().join("ipec_fn_enum_payload_dispatch_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -96,18 +92,18 @@ fn enum_payload_end_to_end_prints_two_hundred_seven() {
     assert_eq!(outcome.exit_code, Some(0), "exit 0 (THE SEAL)");
 }
 
-/// Build a one-file program to a fresh temp dir. Returns `None` when the test
-/// environment cannot set up (runtime unavailable / filesystem error) so the
-/// caller skips rather than falsely fails; `Some` carries the driver result.
-fn build_source(name: &str, source: &str) -> Option<Result<(), CliError>> {
+/// Build a one-file program to a fresh temp dir. A failed scratch
+/// setup or an unresolvable runtime fails the test.
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn build_source(name: &str, source: &str) -> Result<(), CliError> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir).expect("scratch setup must succeed");
     let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
+    std::fs::write(&entry, source).expect("scratch setup must succeed");
     let out = dir.join("out");
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&entry, &out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, &out, &runtime)
 }
 
 #[test]
@@ -122,9 +118,7 @@ fn equality_on_a_fn_embedding_enum_is_rejected() {
                main =\n\
                \x20   let r = OnClick (\\n -> n + 1) in\n\
                \x20   Io.println (if same r r then \"y\" else \"n\")\n";
-    let Some(built) = build_source("fn_enum_eq_gate", src) else {
-        return;
-    };
+    let built = build_source("fn_enum_eq_gate", src);
     assert!(
         matches!(&built, Err(CliError::Pipeline { .. })),
         "== on a fn-embedding enum must fail closed, got: {built:?}"
@@ -142,9 +136,7 @@ fn a_fn_embedding_enum_dict_key_is_rejected() {
                main =\n\
                \x20   let d = Dict.singleton (OnClick (\\n -> n + 1)) 5 in\n\
                \x20   Io.println \"x\"\n";
-    let Some(built) = build_source("fn_enum_dict_key_gate", src) else {
-        return;
-    };
+    let built = build_source("fn_enum_dict_key_gate", src);
     assert!(
         matches!(&built, Err(CliError::Pipeline { .. })),
         "a fn-embedding enum Dict key must fail closed, got: {built:?}"

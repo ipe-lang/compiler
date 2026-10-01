@@ -35,9 +35,7 @@ fn nested_transitive_emits_byte_identical_main_rs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_record_nested_transitive_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -49,7 +47,7 @@ fn nested_transitive_emits_byte_identical_main_rs() {
 
 #[test]
 fn nested_transitive_end_to_end_prints_twenty_seven() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -57,9 +55,7 @@ fn nested_transitive_end_to_end_prints_twenty_seven() {
     let out = crate::support::scratch_root().join("ipec_fn_record_nested_transitive_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 

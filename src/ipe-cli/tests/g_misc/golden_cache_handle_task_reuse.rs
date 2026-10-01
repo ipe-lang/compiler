@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -29,14 +29,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
         .join("Main.ipe")
 }
 
-/// Build the fixture; return whether the frontend accepted + emitted it. `None`
-/// when the runtime resolver is unavailable in this environment (mirrors the
-/// resolve-skip convention every other golden in this suite uses).
-fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
+/// Build the fixture; return whether the frontend accepted + emitted it.
+fn built(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&entry, out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, out, &runtime)
 }
 
 /// Emit assertion (default gate): the frontend must accept the handle-reuse
@@ -45,9 +43,7 @@ fn built(root: &Path, out: &Path) -> Option<Result<(), ipe::CliError>> {
 fn cache_handle_task_reuse_emits() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_cache_handle_task_reuse_emit");
-    let Some(built) = built(&root, &out) else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let built = built(&root, &out);
     assert!(
         built.is_ok(),
         "cache_handle_task_reuse: must be accepted + emitted, got: {built:?}"
@@ -62,28 +58,25 @@ fn cache_handle_task_reuse_emits() {
 fn cache_handle_task_reuse_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_cache_handle_task_reuse_e2e");
-    let Some(built) = built(&root, &out) else {
-        return;
-    };
+    let built = built(&root, &out);
     assert!(
         built.is_ok(),
         "cache_handle_task_reuse: must be accepted, got: {built:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
-    let outcome = crate::support::build_and_run_emitted("cache_handle_task_reuse", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "cache_handle_task_reuse: emitted crate must build and exit 0 (the reused \
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("cache_handle_task_reuse", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "cache_handle_task_reuse: emitted crate must build and exit 0 (the reused \
          non-Copy `IpeCacheHandle` must be cloned at the effect use site); stdout:\n{}",
-        outcome.stdout
-    );
-    assert_eq!(
-        outcome.stdout.trim(),
-        "1",
-        "wrong runtime output — one `Cache.put` leaves `Cache.size` at 1"
-    );
+            outcome.stdout
+        );
+        assert_eq!(
+            outcome.stdout.trim(),
+            "1",
+            "wrong runtime output — one `Cache.put` leaves `Cache.size` at 1"
+        );
+    }
 }

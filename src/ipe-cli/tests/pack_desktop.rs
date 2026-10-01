@@ -175,7 +175,7 @@ fn claim_dist(dist: &std::path::Path, project: &std::path::Path) -> ipe::output_
 /// deliverable (the bundle around a binary) on this box.
 #[test]
 fn linux_bundle_is_materialised_end_to_end() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -187,7 +187,7 @@ fn linux_bundle_is_materialised_end_to_end() {
     std::fs::write(&entry, TRIVIAL_MAIN).expect("write Main.ipe");
 
     let out_dir = dir.join("out").join("rust");
-    let runtime = ipe::resolve_runtime().expect("runtime available");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build(&entry, &out_dir, &runtime).expect("ipe build of the program");
 
     let exe = PathBuf::from(

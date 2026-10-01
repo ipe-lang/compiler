@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -40,18 +40,10 @@ fn compile_golden(name: &str) -> PathBuf {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else {
-        return out;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
-}
-
-fn e2e_enabled() -> bool {
-    ipe_env::var("IPE_E2E").is_ok()
 }
 
 /// The `DoS` containment proof. An unbounded non-tail recursion on the normalized
@@ -61,7 +53,7 @@ fn e2e_enabled() -> bool {
 /// stack and SIGABRT here (`exit_code == None`, no classified line).
 #[test]
 fn recursion_limit_trip_survives_as_classified_exit_not_abort() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let dir = compile_golden("recursion_limit_trip");
@@ -105,7 +97,7 @@ fn recursion_limit_trip_survives_as_classified_exit_not_abort() {
 /// legitimate deep recursion.
 #[test]
 fn recursion_normal_depth_runs_clean_and_returns_value() {
-    if !e2e_enabled() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let dir = compile_golden("recursion_normal_depth");

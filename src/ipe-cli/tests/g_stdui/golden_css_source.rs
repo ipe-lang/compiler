@@ -10,15 +10,15 @@
 //!     rule byte-for-byte while NEUTRALISING all three injection vectors
 //!     (value breakout, `url(javascript:)`, selector breakout).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for css golden")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -76,7 +76,7 @@ fn css_source_builds_and_injects_leaf_kernels() {
 /// no `</style>`, `<script>`, `javascript:`, `expression(`, or `alert` survives.
 #[test]
 fn css_e2e_neutralises_injection() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_e2e");

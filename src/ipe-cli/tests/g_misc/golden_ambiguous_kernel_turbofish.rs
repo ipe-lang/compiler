@@ -22,10 +22,10 @@
 //! correct (every discarded/empty shape yields its expected value, not just that
 //! it compiles with a default type).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -46,7 +46,7 @@ fn ambiguous_kernel_turbofish_compiles() {
     let entry = golden_entry(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -61,13 +61,13 @@ fn ambiguous_kernel_turbofish_compiles() {
 /// (`List.length []`, `Dict.keys Dict.empty`, `Set.toList Set.empty`).
 #[test]
 fn ambiguous_kernel_turbofish_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let entry = golden_entry(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel_e2e");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build(&entry, &out, &runtime).expect("build must succeed");
     let outcome = crate::support::build_and_run_emitted("i181_ambiguous_kernel", &out);
     assert_eq!(

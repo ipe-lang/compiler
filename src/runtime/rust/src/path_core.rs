@@ -2,9 +2,9 @@
 //
 // Every `Path` value is text produced by `seal(text, regime)`: the runtime
 // `Path.fromString` seal (`crate::path`) calls it with the host regime, and the
-// compiler's `path "…"` literal gate (`ipe_diagnostics::path_check`) calls it
-// under BOTH regimes through `PathLitText::seal`, emitting both results so the
-// runtime selects the host one without re-cleaning. The module is
+// compiler's literal-path gate (`ipe_diagnostics::path_check`) calls it
+// under BOTH regimes through `PathLitText::seal`, refusing a literal either
+// regime refuses. The module is
 // dependency-free (std only): the runtime references it as a sibling module
 // (`crate::path_core::…`), and the standalone `ipe_path_core` crate `include!`s
 // this exact file so the compiler seals a literal without pulling in the
@@ -174,10 +174,10 @@ pub fn seal(text: &str, regime: Regime) -> Result<String, SealRefusal> {
     Ok(cleaned)
 }
 
-/// A `path "…"` literal sealed under every separator regime.
+/// A source path literal sealed under every separator regime.
 ///
 /// The compiler cannot know the final target, so a literal carries the sealed
-/// form for each regime and the runtime selects the host one. The fields are
+/// form for each regime. The fields are
 /// private and [`PathLitText::seal`] is the only builder, so both forms always
 /// come from the same raw text.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -678,6 +678,7 @@ pub fn clean_with(path: &str, regime: Regime) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

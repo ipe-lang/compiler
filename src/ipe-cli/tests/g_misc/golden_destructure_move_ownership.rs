@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -39,10 +39,7 @@ fn i224_destructure_ipec_accepts_and_clones_reused_component() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i224_destructure_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        eprintln!("SKIP destructure_move_ownership: runtime not available");
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
@@ -67,7 +64,7 @@ fn i224_destructure_ipec_accepts_and_clones_reused_component() {
 /// cargo-0 ∧ run-correct: gated on `IPE_E2E=1` — THE SEAL.
 #[test]
 fn i224_destructure_cargo_builds_and_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -76,9 +73,7 @@ fn i224_destructure_cargo_builds_and_runs() {
     let out = crate::support::scratch_root().join("ipec_i224_destructure_move_ownership_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());

@@ -28,10 +28,10 @@
 //! IPE_E2E=1 cargo nextest run -p ipe -E 'binary(g_stdui)' css_length_color_ssot
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -44,7 +44,7 @@ fn golden_dir() -> PathBuf {
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for css_length_color_ssot golden")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// Compile `tests/golden/css_length_color_ssot/Main.ipe` and assert the
@@ -76,7 +76,7 @@ fn css_length_color_ssot_emits_byte_identical() {
 /// end-to-end.
 #[test]
 fn css_length_color_ssot_e2e_output_matches_native_table() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 

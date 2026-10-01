@@ -16,13 +16,6 @@
 use std::fs;
 use std::path::Path;
 
-/// `assert!(false_marker())` fails a test without tripping
-/// `clippy::assertions_on_constants` (a plain `assert!(false)` would).
-#[allow(clippy::missing_const_for_fn)]
-fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 /// Write an executable fake `cargo` at `dir/cargo` that prints an `E0609`-shaped
 /// error to stderr and exits 1 for a `build` invocation, and prints a minimal
 /// valid `cargo metadata` JSON for a `metadata` invocation (so any metadata
@@ -47,21 +40,14 @@ fn write_failing_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 /// `cargo` and on `PATH` scrubbing to guarantee the fake is the one resolved.
 #[cfg(unix)]
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn build_propagates_a_failed_emitted_cargo_build() {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 
-    // The runtime dir must resolve for the emit to reach the cargo step. When
-    // the repo tree is unavailable (a nextest archive shipped to another host),
-    // skip — the propagation primitive is also unit-covered in `toolchain.rs`
-    // and `lib.rs`; this end-to-end spawn only adds value where the tree exists.
-    let Ok(runtime_dir) = ipe::resolve_runtime() else {
-        return;
-    };
+    // The runtime dir must resolve for the emit to reach the cargo step.
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    let ipe_bin = env!("CARGO_BIN_EXE_ipe");
-    if !Path::new(ipe_bin).exists() {
-        return;
-    }
+    let ipe_bin = e2e_support::cargo_bin!("ipe");
 
     let dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_build_cargo_fail_e2e");
@@ -86,8 +72,7 @@ fn build_propagates_a_failed_emitted_cargo_build() {
         .env("NO_COLOR", "1")
         .output();
     let Ok(out) = out else {
-        assert!(false_marker(), "failed to spawn ipe build: {out:?}");
-        return;
+        panic!("failed to spawn ipe build: {out:?}")
     };
 
     // The core assertion: a failed emitted-crate cargo build must NOT be a

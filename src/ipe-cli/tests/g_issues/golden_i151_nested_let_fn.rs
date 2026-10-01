@@ -37,10 +37,10 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_i151_nested_let_fn
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -60,9 +60,7 @@ fn c01_nested_let_fn_callee_green() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nested_let_fn_callee");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -70,21 +68,20 @@ fn c01_nested_let_fn_callee_green() {
         built.err()
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let outcome = crate::support::build_and_run_emitted("nested_let_fn_callee", &out);
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "must exit 0; got:\n{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stdout.contains("11, 12, 13"),
+            "applyInner 10 over [1,2,3] must print '11, 12, 13'; got:\n{}",
+            outcome.stdout
+        );
     }
-    let outcome = crate::support::build_and_run_emitted("nested_let_fn_callee", &out);
-    assert_eq!(
-        outcome.exit_code,
-        Some(0),
-        "must exit 0; got:\n{}",
-        outcome.stdout
-    );
-    assert!(
-        outcome.stdout.contains("11, 12, 13"),
-        "applyInner 10 over [1,2,3] must print '11, 12, 13'; got:\n{}",
-        outcome.stdout
-    );
 }
 
 // ── c02 — let-fn forwarded to Task.onError inside a polymorphic function ─────
@@ -117,9 +114,7 @@ fn c02_poly_fn_on_error_green() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("poly_task_on_error");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),

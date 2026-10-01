@@ -24,7 +24,7 @@ use ipe::project::{IpeDep, RustDep};
 /// Path to the `sp2_manifest` fixture project, which has index/git/path/native
 /// deps in one manifest and no `ipe.lock`.
 fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sp2_manifest")
+    e2e_support::manifest_dir!().join("tests/fixtures/sp2_manifest")
 }
 
 // ── surface enumeration ───────────────────────────────────────────────────────

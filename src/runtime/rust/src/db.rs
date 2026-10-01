@@ -1393,7 +1393,7 @@ fn read_dial_targets(url: &UnambiguousUrl) -> Result<Vec<DialTarget>, DbConnectE
         let socket = host.as_str().starts_with("%2F") || host.as_str().starts_with("%2f");
         push_host((!socket).then_some(host))?;
     }
-    for (key, value) in parsed.query_pairs() {
+    for (key, value) in crate::ssrf::DriverParityQuery::of(url).pairs() {
         match &*key {
             "host" | "hostaddr" => {
                 let host = if value.starts_with('/') {

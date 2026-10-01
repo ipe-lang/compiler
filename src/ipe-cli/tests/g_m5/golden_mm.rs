@@ -21,10 +21,10 @@
 //! The golden `main.rs` files are the checked-in output of `ipe` against each
 //! fixture.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -38,7 +38,7 @@ fn golden_dir(name: &str) -> PathBuf {
 // broken environment, and `expect` is the idiomatic way to express that.
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for golden_mm tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +115,7 @@ fn mm_qualtype_local_shadow_compiles() {
 // Negative helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
 fn expect_error_code(fixture_name: &str, expected: ipe_diagnostics::Code) {
     let fixture = golden_dir(fixture_name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
@@ -125,7 +126,7 @@ fn expect_error_code(fixture_name: &str, expected: ipe_diagnostics::Code) {
         res.is_err(),
         "fixture `{fixture_name}` must fail but succeeded"
     );
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     // Extract the Code from a Pipeline error; other variants have no code.
     let code = match &err {
         ipe::CliError::Pipeline { diag, .. } => Some(diag.code()),

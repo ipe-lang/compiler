@@ -1077,7 +1077,7 @@ impl Transfer {
     /// Run `command` under this transfer's budget and deadline.
     fn run(
         &self,
-        command: &mut Command,
+        command: Command,
         stdin: Option<Zeroizing<Vec<u8>>>,
         watch: Option<&Path>,
         mode: Mode,
@@ -1113,7 +1113,7 @@ enum Mode {
 /// The deadline is `started + limits.wall`. Stdout is held to its ceiling;
 /// stderr is truncated at [`CHILD_STDERR_MAX_BYTES`].
 fn run_core(
-    command: &mut Command,
+    mut command: Command,
     stdin: Option<Zeroizing<Vec<u8>>>,
     watch: Option<&Path>,
     limits: &Limits,
@@ -1198,12 +1198,12 @@ struct Running {
 }
 
 impl Running {
-    /// Spawn `command` in `mode`, bound to the CLI's lifetime where the platform allows.
-    fn spawn(command: &mut Command, mode: Mode) -> std::io::Result<Self> {
-        ipe_runtime_rust::system::harden_child_parent_death(command);
+    /// Spawn `command` in `mode` through the runtime's hardened spawner, bound
+    /// to the CLI's lifetime where the platform allows.
+    fn spawn(command: Command, mode: Mode) -> std::io::Result<Self> {
         let (child, group) = match mode {
             Mode::Detached => group::spawn_detached(command)?,
-            Mode::Attached => (command.spawn()?, None),
+            Mode::Attached => (ipe_runtime_rust::system::spawn_hardened(command)?, None),
         };
         Ok(Self {
             child,
@@ -1304,12 +1304,12 @@ mod group {
     /// # Errors
     /// The relay could not be installed, a relayed signal ended every transfer
     /// ([`std::io::ErrorKind::Interrupted`]), or the spawn failed.
-    pub fn spawn_detached(command: &mut Command) -> std::io::Result<(Child, Option<Pid>)> {
+    pub fn spawn_detached(mut command: Command) -> std::io::Result<(Child, Option<Pid>)> {
         super::relay::ensure()?;
         command.process_group(0);
         let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         registry.admit()?;
-        let child = command.spawn()?;
+        let child = ipe_runtime_rust::system::spawn_hardened(command)?;
         let pid = Pid::from_child(&child);
         registry.live.push(pid);
         drop(registry);
@@ -1398,8 +1398,8 @@ mod group {
     pub enum GroupId {}
 
     /// Spawn `command` as a plain child.
-    pub fn spawn_detached(command: &mut Command) -> std::io::Result<(Child, Option<GroupId>)> {
-        command.spawn().map(|child| (child, None))
+    pub fn spawn_detached(command: Command) -> std::io::Result<(Child, Option<GroupId>)> {
+        Ok((ipe_runtime_rust::system::spawn_hardened(command)?, None))
     }
 
     /// Unreachable: no `GroupId` exists.
@@ -1643,7 +1643,7 @@ mod relay {
             wall: PS_WALL,
         };
         let captured = super::run_core(
-            &mut command,
+            command,
             None,
             None,
             &limits,
@@ -1885,7 +1885,7 @@ mod relay {
             let mut sleeper = std::process::Command::new("sleep");
             sleeper.arg("30");
             let (mut child, id) =
-                super::super::group::spawn_detached(&mut sleeper).expect("spawn sleep");
+                super::super::group::spawn_detached(sleeper).expect("spawn sleep");
             let id = id.expect("a detached group");
             signal_hook::low_level::raise(SIGHUP).expect("raise the hangup");
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1905,8 +1905,7 @@ mod relay {
         fn hangup_child_default() {
             let mut sleeper = std::process::Command::new("sleep");
             sleeper.arg("30");
-            let (mut child, _) =
-                super::super::group::spawn_detached(&mut sleeper).expect("spawn sleep");
+            let (mut child, _) = super::super::group::spawn_detached(sleeper).expect("spawn sleep");
             writeln!(std::io::stdout(), "{ARMED}").expect("report the marker to the parent");
             signal_hook::low_level::raise(SIGHUP).expect("raise the hangup");
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -2148,28 +2147,28 @@ impl Git {
     /// # Errors
     /// See [`RunError`].
     pub fn run_detached(
-        mut self,
+        self,
         watch: Option<&Path>,
         transfer: &Transfer,
     ) -> Result<Captured, RunError> {
-        transfer.run(&mut self.command, None, watch, Mode::Detached)
+        transfer.run(self.command, None, watch, Mode::Detached)
     }
 
     /// Run in the CLI's process group under `transfer`, keeping the terminal for a signing prompt.
     ///
     /// # Errors
     /// See [`RunError`].
-    pub fn run_attached(mut self, transfer: &Transfer) -> Result<Captured, RunError> {
-        transfer.run(&mut self.command, None, None, Mode::Attached)
+    pub fn run_attached(self, transfer: &Transfer) -> Result<Captured, RunError> {
+        transfer.run(self.command, None, None, Mode::Attached)
     }
 
     /// Run a local query, held to a query's output and time ceilings.
     ///
     /// # Errors
     /// See [`RunError`]; a crossed ceiling is a [`LocalRefusal`] naming `source`.
-    pub fn query(mut self, source: LocalSource) -> Result<Captured, RunError<LocalRefusal>> {
+    pub fn query(self, source: LocalSource) -> Result<Captured, RunError<LocalRefusal>> {
         run_core(
-            &mut self.command,
+            self.command,
             None,
             None,
             &QUERY_LIMITS,
@@ -2244,13 +2243,13 @@ impl Curl {
     /// # Errors
     /// See [`RunError`].
     pub fn run(
-        mut self,
+        self,
         stdin: Option<&[u8]>,
         watch: Option<&Path>,
         transfer: &Transfer,
     ) -> Result<Captured, RunError> {
         let stdin = stdin.map(|bytes| Zeroizing::new(bytes.to_vec()));
-        transfer.run(&mut self.command, stdin, watch, Mode::Detached)
+        transfer.run(self.command, stdin, watch, Mode::Detached)
     }
 
     /// The arguments given so far.
@@ -2411,7 +2410,7 @@ mod tests {
 
     /// Run `command` detached under `budget`, its clock starting now.
     fn run(
-        command: &mut Command,
+        command: Command,
         stdin: Option<&[u8]>,
         watch: Option<&std::path::Path>,
         budget: &Budget,
@@ -2749,7 +2748,7 @@ mod tests {
         let out = dir.path().join("out");
         let mut command = sh("head -c 16 /dev/zero > \"$0\"");
         command.arg(&out);
-        let run = run(&mut command, None, Some(&out), &budget(16, 1));
+        let run = run(command, None, Some(&out), &budget(16, 1));
         assert!(matches!(run, Ok(ref captured) if captured.status.success()));
     }
 
@@ -2760,7 +2759,7 @@ mod tests {
         let out = dir.path().join("out");
         let mut command = sh("head -c 17 /dev/zero > \"$0\"");
         command.arg(&out);
-        let run = run(&mut command, None, Some(&out), &budget(16, 1));
+        let run = run(command, None, Some(&out), &budget(16, 1));
         assert!(matches!(
             run,
             Err(RunError::Exceeded(IngestLimit::Bytes(16)))
@@ -2775,7 +2774,7 @@ mod tests {
         let mut command = sh("cat /dev/zero > \"$0\"");
         command.arg(&out);
         let cap = 1024 * 1024;
-        let run = run(&mut command, None, Some(&out), &budget(cap, 1));
+        let run = run(command, None, Some(&out), &budget(cap, 1));
         assert!(matches!(
             run,
             Err(RunError::Exceeded(IngestLimit::Bytes(c))) if c == cap
@@ -2795,8 +2794,8 @@ mod tests {
     #[test]
     fn a_child_staging_exactly_the_entry_cap_is_accepted() {
         let dir = scratch();
-        let mut command = touch_files(dir.path(), 4);
-        let run = run(&mut command, None, Some(dir.path()), &budget(0, 4));
+        let command = touch_files(dir.path(), 4);
+        let run = run(command, None, Some(dir.path()), &budget(0, 4));
         assert!(matches!(run, Ok(ref captured) if captured.status.success()));
     }
 
@@ -2804,8 +2803,8 @@ mod tests {
     #[test]
     fn a_child_staging_one_entry_past_the_cap_is_refused() {
         let dir = scratch();
-        let mut command = touch_files(dir.path(), 5);
-        let run = run(&mut command, None, Some(dir.path()), &budget(0, 4));
+        let command = touch_files(dir.path(), 5);
+        let run = run(command, None, Some(dir.path()), &budget(0, 4));
         assert!(matches!(
             run,
             Err(RunError::Exceeded(IngestLimit::Entries(4)))
@@ -2819,7 +2818,7 @@ mod tests {
         let dir = scratch();
         let transfer = Transfer::begin(budget(0, 4));
         let run = transfer.run(
-            &mut touch_files(dir.path(), 4),
+            touch_files(dir.path(), 4),
             None,
             Some(dir.path()),
             Mode::Detached,
@@ -2835,7 +2834,7 @@ mod tests {
         let dir = scratch();
         let transfer = Transfer::begin(budget(0, 4));
         let run = transfer.run(
-            &mut touch_files(dir.path(), 5),
+            touch_files(dir.path(), 5),
             None,
             Some(dir.path()),
             Mode::Detached,
@@ -2862,7 +2861,7 @@ mod tests {
         let mut command = sh("(cat /dev/zero > \"$0\") & wait");
         command.arg(&out);
         let cap = 1024 * 1024;
-        let run = run(&mut command, None, Some(&out), &budget(cap, 1));
+        let run = run(command, None, Some(&out), &budget(cap, 1));
         assert!(matches!(
             run,
             Err(RunError::Exceeded(IngestLimit::Bytes(c))) if c == cap
@@ -2879,7 +2878,7 @@ mod tests {
     #[test]
     fn a_finished_childs_lingering_grandchild_is_killed() {
         let started = Instant::now();
-        let run = run(&mut sh("sleep 30 & exit 0"), None, None, &budget(0, 0));
+        let run = run(sh("sleep 30 & exit 0"), None, None, &budget(0, 0));
         assert!(matches!(run, Ok(ref captured) if captured.status.success()));
         assert!(started.elapsed() < Duration::from_secs(4));
     }
@@ -2889,7 +2888,7 @@ mod tests {
     #[test]
     fn a_pipe_held_past_the_grace_is_a_drain_timeout() {
         let run = run_core(
-            &mut sh("sleep 8 & exit 0"),
+            sh("sleep 8 & exit 0"),
             None,
             None,
             &budget(0, 0).limits(),
@@ -2910,7 +2909,7 @@ mod tests {
         limits.wall = Duration::from_secs(2);
         let started = Instant::now();
         let first = run_core(
-            &mut sh("sleep 1.2"),
+            sh("sleep 1.2"),
             None,
             None,
             &limits,
@@ -2919,7 +2918,7 @@ mod tests {
         );
         assert!(matches!(first, Ok(ref captured) if captured.status.success()));
         let second = run_core(
-            &mut sh("sleep 1.2"),
+            sh("sleep 1.2"),
             None,
             None,
             &limits,
@@ -2938,7 +2937,7 @@ mod tests {
         let mut limits = budget(0, 0).limits();
         limits.wall = Duration::ZERO;
         let run = run_core(
-            &mut Command::new("ipe-no-such-program"),
+            Command::new("ipe-no-such-program"),
             None,
             None,
             &limits,
@@ -2951,9 +2950,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stdout_of_exactly_the_cap_is_kept_and_one_past_is_refused() {
-        let at_cap = run(&mut sh("head -c 16 /dev/zero"), None, None, &budget(0, 0));
+        let at_cap = run(sh("head -c 16 /dev/zero"), None, None, &budget(0, 0));
         assert!(matches!(at_cap, Ok(ref captured) if captured.stdout.len() == 16));
-        let past = run(&mut sh("head -c 17 /dev/zero"), None, None, &budget(0, 0));
+        let past = run(sh("head -c 17 /dev/zero"), None, None, &budget(0, 0));
         assert!(matches!(
             past,
             Err(RunError::Exceeded(IngestLimit::Bytes(CAP)))
@@ -2964,14 +2963,14 @@ mod tests {
     #[test]
     fn a_child_past_its_wall_time_is_killed() {
         let quick = budget(0, 0).with_wall(Duration::from_millis(200));
-        let run = run(&mut sh("sleep 30"), None, None, &quick);
+        let run = run(sh("sleep 30"), None, None, &quick);
         assert!(matches!(run, Err(RunError::Exceeded(IngestLimit::Time(_)))));
     }
 
     #[cfg(unix)]
     #[test]
     fn stdin_reaches_the_child() {
-        let run = run(&mut sh("cat"), Some(b"ping"), None, &GITHUB_API);
+        let run = run(sh("cat"), Some(b"ping"), None, &GITHUB_API);
         assert!(matches!(run, Ok(ref captured) if captured.stdout == b"ping"));
     }
 
@@ -2981,7 +2980,7 @@ mod tests {
     fn stdin_larger_than_a_pipe_buffer_does_not_deadlock() {
         let input = vec![b'x'; 1024 * 1024];
         let wide = budget(0, 0).with_stdout(bytes(2 * 1024 * 1024));
-        let run = run(&mut sh("cat"), Some(&input), None, &wide);
+        let run = run(sh("cat"), Some(&input), None, &wide);
         assert!(matches!(run, Ok(ref captured) if captured.stdout.len() == input.len()));
     }
 

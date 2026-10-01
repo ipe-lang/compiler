@@ -125,6 +125,7 @@ fn dev_overlay() -> &'static Mutex<DevOverlay> {
 #[must_use]
 pub fn dev_overlay_active() -> bool {
     #[cfg(test)]
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(forced) = test_override::get() {
         return forced;
     }
@@ -142,6 +143,7 @@ pub fn dev_overlay_active() -> bool {
 /// first call. Never compiled into a non-test build, so it cannot affect the
 /// production gate.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod test_override {
     use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -169,6 +171,7 @@ mod test_override {
 /// Force [`dev_overlay_active`] for a test, or `None` to fall back to the env
 /// gate. Test-support only.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn set_dev_overlay_active_for_test(active: Option<bool>) {
     test_override::set(active);
 }
@@ -178,6 +181,7 @@ pub(crate) fn set_dev_overlay_active_for_test(active: Option<bool>) {
 /// must hold, so no two such tests — in this module or elsewhere in the web
 /// crate — interleave their global-state mutations.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn overlay_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GUARD.lock().unwrap_or_else(|e| e.into_inner())
@@ -208,12 +212,14 @@ fn dev_overlay_patch_for(defaults: &[String]) -> Option<Vec<(usize, String)>> {
 /// Clear all registered dev patches. Test-support for asserting the flag-off /
 /// inert path without cross-test overlay leakage.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn clear_dev_overlay_for_test() {
     let mut map = dev_overlay().lock().unwrap_or_else(|e| e.into_inner());
     map.clear();
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::LiteralTable;
 

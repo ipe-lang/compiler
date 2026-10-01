@@ -568,7 +568,10 @@ async fn read_body_capped<E: From<String> + Send + 'static>(
         }
         buf.extend_from_slice(&bytes);
     }
-    IpeResult::Ok(String::from_utf8_lossy(&buf).into_owned())
+    #[allow(clippy::disallowed_methods)]
+    // a response body reaches Ipê as `String` text, not a URL component
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    IpeResult::Ok(text)
 }
 
 /// Http.get : Url -> Task Error HttpResponse
@@ -621,25 +624,25 @@ pub fn http_request<E: From<String> + Send + 'static>(
     Box::pin(do_request(req))
 }
 
-/// `Http.parseQuery : String -> Dict String String` (pure; first value wins).
+/// `Http.parseQuery : String -> Result Error (Dict String String)` (pure).
 ///
-/// Decodes each key and value with `form_url_decode` — lenient by design
-/// (malformed `%`-escapes pass through as literal bytes; invalid UTF-8 →
-/// U+FFFD). Result is a plain app-logic Dict; it does not flow into any
-/// path, SQL, header, or re-encode sink. See `encoding::form_url_decode` doc
-/// for the full contract and the safety boundary that makes leniency safe.
-pub fn http_parse_query(raw: String) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for pair in raw.trim_start_matches('?').split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let mut it = pair.splitn(2, '=');
-        let k = form_url_decode(it.next().unwrap_or(""));
-        let v = form_url_decode(it.next().unwrap_or(""));
-        out.entry(k).or_insert(v); // repeated keys keep the first value
+/// A leading `?` is dropped, then the query is decoded by the same
+/// `encoding::decode_form_query` the server uses for request queries: form
+/// grammar, first value wins, at most `encoding::MAX_QUERY_PAIRS` pairs. Any
+/// malformed component refuses the whole query with an `InvalidInput` error
+/// that names the defect's position, never the query text.
+///
+/// # Errors
+///
+/// Returns `Err` when a key or value is not a well-formed form component or
+/// the query carries too many pairs.
+pub fn http_parse_query(raw: String) -> IpeResult<crate::error::IpeError, HashMap<String, String>> {
+    match crate::encoding::decode_form_query(raw.trim_start_matches('?')) {
+        Ok(pairs) => IpeResult::Ok(pairs),
+        Err(refusal) => IpeResult::Err(crate::error::IpeError::invalid_input(format!(
+            "parseQuery: {refusal}"
+        ))),
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +856,10 @@ async fn read_wasm_body_capped(resp: &web_sys::Response, cap: usize) -> Result<S
             break;
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    #[allow(clippy::disallowed_methods)]
+    // a response body reaches Ipê as `String` text, not a URL component
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok(text)
 }
 
 /// Http.get : Url -> Task Error HttpResponse (browser substitute)
@@ -892,6 +898,7 @@ pub fn http_request<E: From<String> + 'static>(req: HttpRequest) -> IpeTask<E, H
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
@@ -924,14 +931,56 @@ mod tests {
 
     #[test]
     fn parse_query_decode_and_first_wins() {
-        let q = http_parse_query("a=1&b=two%20words&a=ignored&c".to_string());
+        let parsed = http_parse_query("a=1&b=two%20words+more&a=ignored&c".to_string());
+        assert!(
+            matches!(parsed, IpeResult::Ok(_)),
+            "a well-formed query parses"
+        );
+        let IpeResult::Ok(q) = parsed else { return };
         assert_eq!(q.get("a").map(String::as_str), Some("1")); // first value wins
-        assert_eq!(q.get("b").map(String::as_str), Some("two words"));
+        assert_eq!(q.get("b").map(String::as_str), Some("two words more"));
         assert_eq!(q.get("c").map(String::as_str), Some(""));
         // Leading '?' tolerated; empty pairs skipped.
-        let q2 = http_parse_query("?x=9&".to_string());
+        let parsed = http_parse_query("?x=9&".to_string());
+        assert!(
+            matches!(parsed, IpeResult::Ok(_)),
+            "a leading `?` is dropped"
+        );
+        let IpeResult::Ok(q2) = parsed else { return };
         assert_eq!(q2.get("x").map(String::as_str), Some("9"));
         assert_eq!(q2.len(), 1);
+    }
+
+    #[test]
+    fn parse_query_refuses_malformed_queries_whole() {
+        // Prove the refusals: a bad escape, invalid UTF-8 in a key or value, or
+        // too many pairs refuses the whole query as `InvalidInput`, and the
+        // message never echoes the query text.
+        let mut past_cap: Vec<String> = (0..crate::encoding::MAX_QUERY_PAIRS.get())
+            .map(|i| format!("k{i}=v"))
+            .collect();
+        past_cap.push("secret=hunter2".to_string());
+        for raw in [
+            "a=1&b=%zz".to_string(),
+            "?a=100%".to_string(),
+            "%C3=1".to_string(),
+            "a=%C0%AF".to_string(),
+            past_cap.join("&"),
+        ] {
+            let parsed = http_parse_query(raw.clone());
+            assert!(
+                matches!(parsed, IpeResult::Err(_)),
+                "{raw:?} must be refused"
+            );
+            let IpeResult::Err(crate::error::IpeError::Error(kind, info)) = parsed else {
+                return;
+            };
+            assert_eq!(kind, crate::error::IpeErrorKind::InvalidInput, "{raw:?}");
+            assert!(
+                !info.message.contains("hunter2") && !info.message.contains("zz"),
+                "{raw:?}"
+            );
+        }
     }
     // SSRF guard unit tests moved to `ssrf.rs` alongside the validators.
 

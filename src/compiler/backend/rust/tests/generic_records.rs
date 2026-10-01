@@ -408,12 +408,10 @@ fn monomorphic_record_stays_byte_identical() -> DResult<()> {
 /// `cargo build`, run, and assert the program prints `42` — the expected value/// backend produces. Gated on `IPE_E2E=1` so the default `cargo test` stays fast.
 #[test]
 fn end_to_end_builds_and_prints_forty_two() -> DResult<()> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
-    let Some(runtime) = seal_e2e::resolve_runtime() else {
-        return Ok(());
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let mut interner = Interner::new();
     let prog = wrap_unwrap_program(&mut interner)?;

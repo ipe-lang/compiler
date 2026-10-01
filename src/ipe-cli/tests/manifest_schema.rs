@@ -3,14 +3,14 @@
 //! `ProjectManifest`, exercised through the public `parse_manifest` API.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::project::{IpeDep, parse_manifest};
 use ipe_ir::Capability;
 
 /// The bundled multi-section manifest fixture.
 fn fixture_manifest() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sp2_manifest/package.ipe")
+    e2e_support::manifest_dir!().join("tests/fixtures/sp2_manifest/package.ipe")
 }
 
 #[test]

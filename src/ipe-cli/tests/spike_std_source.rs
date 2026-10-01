@@ -6,17 +6,17 @@
 //!   * a hostile user file named `Ipe.Palette` stays IPE-N0025-rejected;
 //!   * (`IPE_E2E`) the emitted Cargo project builds and runs to `#000 42`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod support;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for spike tests")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -110,7 +110,7 @@ fn hostile_std_squat_is_ipe_n0025() {
     let out = root.join("out");
     let res = ipe::build_project(&root.join("package.ipe"), &out, &runtime());
     assert!(res.is_err(), "hostile Ipe.Palette squat must be rejected");
-    let Err(err) = res else { return };
+    let err = res.expect_err("`res` must be rejected");
     let code = match &err {
         ipe::CliError::Pipeline { diag, .. } => Some(diag.code()),
         _ => None,
@@ -127,7 +127,7 @@ fn hostile_std_squat_is_ipe_n0025() {
 /// from Std-source to a running binary, matching the reference value.
 #[test]
 fn spike_e2e_runs_and_prints_hex() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spike_std_source_e2e");

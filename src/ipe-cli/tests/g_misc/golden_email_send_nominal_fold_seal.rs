@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -57,16 +57,12 @@ fn concat_emitted_rs(dir: &Path, out: &mut String) {
     }
 }
 
-/// Build the fixture and return the concatenated emitted APP Rust source. `None`
-/// when the runtime resolver is unavailable in this environment (mirrors the
-/// resolve-skip convention every other golden test in this suite uses) or when
-/// the build itself fails (the caller's `assert!` reports the diag).
+/// Build the fixture and return the concatenated emitted APP Rust source.
+/// `None` when the build fails (the caller's `assert!` reports the diag).
 fn built_app_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<String>) {
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return (Ok(()), None);
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, out, &runtime);
     let emitted = if built.is_ok() {
         // Scan the emitted APP modules only (`src/ipe_mods/` + `src/main.rs`),
@@ -97,9 +93,7 @@ fn email_literals_emit_runtime_structs_and_provider_variant() {
         built.is_ok(),
         "email_send_nominal_fold_seal: must be accepted (ipe-0), got: {built:?}"
     );
-    let Some(app_rs) = app_rs else {
-        return; // resolver unavailable — skip, matches the other goldens
-    };
+    let app_rs = app_rs.expect("an accepted build yields the emitted source");
 
     assert!(
         app_rs.contains("EmailMessage {"),
@@ -132,9 +126,7 @@ fn email_literals_emit_runtime_structs_and_provider_variant() {
 fn email_send_nominal_fold_seal_builds() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_email_send_nominal_fold_seal_e2e");
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = fixture_entry(&root);
     let _ = std::fs::remove_dir_all(&out);
     let built = ipe::build(&entry, &out, &runtime);
@@ -143,18 +135,17 @@ fn email_send_nominal_fold_seal_builds() {
         "email_send_nominal_fold_seal: must be accepted (ipe-0), got: {built:?}"
     );
 
-    if ipe_env::var("IPE_E2E").is_err() {
-        return;
-    }
-    // The `email.send` kernel is network-effectful (no deterministic stdout
-    // without a live provider), so the SEAL proof is the cargo BUILD, not a run:
-    // ipe-0 ⇒ the emitted crate compiles.
-    let outcome = crate::support::build_emitted("email_send_nominal_fold_seal", &out);
-    assert!(
-        outcome.is_ok(),
-        "email_send_nominal_fold_seal: emitted crate must `cargo build` exit 0 \
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // The `email.send` kernel is network-effectful (no deterministic stdout
+        // without a live provider), so the SEAL proof is the cargo BUILD, not a run:
+        // ipe-0 ⇒ the emitted crate compiles.
+        let outcome = crate::support::build_emitted("email_send_nominal_fold_seal", &out);
+        assert!(
+            outcome.is_ok(),
+            "email_send_nominal_fold_seal: emitted crate must `cargo build` exit 0 \
          (pre-fix: IPE-N0028 fail-closed; the fold + kernel + `lettre` dep must \
          seal it): {}",
-        outcome.err().unwrap_or_default()
-    );
+            outcome.err().unwrap_or_default()
+        );
+    }
 }

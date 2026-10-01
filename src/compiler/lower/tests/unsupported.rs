@@ -79,12 +79,13 @@ fn run_with_regions(
 
 /// Assert the lowering failed with exactly the expected unsupported feature,
 /// code, and primary span — and that it is a `Lower`, never a `CompilerBug`.
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
 fn assert_unsupported(res: DResult<ipe_ir::Program>, feature: Feature, code: Code, span: Span) {
     assert!(
         res.is_err(),
         "expected an unsupported-feature diagnostic for {feature:?}, got a successful lowering"
     );
-    let Err(d) = res else { return };
+    let d = res.expect_err("`res` must be rejected");
     assert_eq!(d.code(), code, "code mismatch ({feature:?}): {d:?}");
     assert_eq!(d.primary_span(), span, "span mismatch ({feature:?}): {d:?}");
     assert_ne!(
@@ -382,7 +383,7 @@ fn return_only_wildcard_any_is_rejected() -> DResult<()> {
         res.is_err(),
         "return-only `List any` must be rejected, got a successful lowering: {res:?}"
     );
-    let Err(d) = res else { return Ok(()) };
+    let d = res.expect_err("`res` must be rejected");
     assert!(
         matches!(
             d,
@@ -1728,6 +1729,7 @@ fn ctor_then_variable_catch_all_lowers_to_flat_match() -> DResult<()> {
 }
 
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn partial_application_eta_expands_to_a_closure() -> DResult<()> {
     // `add` declares two parameters; `add 2` passes one. Partial application now
     // eta-expands into a boxed closure `\eta_0 -> add(2, eta_0)` — a first-class
@@ -1804,21 +1806,15 @@ fn partial_application_eta_expands_to_a_closure() -> DResult<()> {
 
     let caller_fn = func_named(&res, &i, "caller");
     let Some(caller_fn) = caller_fn else {
-        assert!(false_marker(), "caller must lower");
-        return Ok(());
+        panic!("caller must lower")
     };
     // The body is the eta-lambda `\eta_0: Int -> add(2, eta_0)` : Int -> Int.
     let Expr::Lambda { params, ret, body } = &caller_fn.body else {
-        assert!(
-            false_marker(),
-            "partial lowers to a Lambda, got {:?}",
-            caller_fn.body
-        );
-        return Ok(());
+        panic!("partial lowers to a Lambda, got {:?}", caller_fn.body)
     };
     assert_eq!(params.len(), 1, "one missing parameter");
     let Some((eta_sym, eta_ty)) = params.first() else {
-        return Ok(());
+        panic!("one missing parameter");
     };
     assert_eq!(*eta_ty, IrType::Int, "missing param keeps its solved type");
     assert_eq!(
@@ -1829,8 +1825,7 @@ fn partial_application_eta_expands_to_a_closure() -> DResult<()> {
     assert_eq!(*ret, IrType::Int, "residual return type");
     // body: add(2, eta_0) — a saturated direct Call to add (FuncId 0).
     let Expr::Call { callee, args, .. } = body.as_ref() else {
-        assert!(false_marker(), "eta body is a saturated Call, got {body:?}");
-        return Ok(());
+        panic!("eta body is a saturated Call, got {body:?}")
     };
     assert_eq!(*callee, Callee::Func(FuncId::from_raw(0)));
     assert_eq!(args.len(), 2, "supplied arg + synthesised param");
@@ -1843,6 +1838,7 @@ fn partial_application_eta_expands_to_a_closure() -> DResult<()> {
 }
 
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn over_application_saturates_via_apply() -> DResult<()> {
     // `f` declares one parameter; `f 1 2` passes two — over-application across
     // the arity boundary. The first arg saturates the direct `Call(f, [1])`
@@ -1891,24 +1887,17 @@ fn over_application_saturates_via_apply() -> DResult<()> {
     assert!(res.is_ok(), "over-application must lower, got {res:?}");
 
     let Some(caller_fn) = func_named(&res, &i, "caller") else {
-        assert!(false_marker(), "caller must lower");
-        return Ok(());
+        panic!("caller must lower")
     };
     // body: (f(1))(2) — Apply over a saturated direct Call.
     let Expr::Apply { func, args } = &caller_fn.body else {
-        assert!(
-            false_marker(),
-            "over lowers to an Apply, got {:?}",
-            caller_fn.body
-        );
-        return Ok(());
+        panic!("over lowers to an Apply, got {:?}", caller_fn.body)
     };
     let Expr::Call {
         callee, args: head, ..
     } = func.as_ref()
     else {
-        assert!(false_marker(), "Apply func is a direct Call, got {func:?}");
-        return Ok(());
+        panic!("Apply func is a direct Call, got {func:?}")
     };
     assert_eq!(*callee, Callee::Func(FuncId::from_raw(0)));
     assert_eq!(head.len(), 1, "first arity args saturate the Call");
@@ -1922,6 +1911,7 @@ fn over_application_saturates_via_apply() -> DResult<()> {
 }
 
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn nested_lambda_body_flattens_into_one_closure() -> DResult<()> {
     // `f a = \b -> \c -> 0` declared `Int -> Int -> Int -> Int`. The body is a
     // curried lambda chain; the lowerer must flatten it into ONE
@@ -2001,8 +1991,7 @@ fn nested_lambda_body_flattens_into_one_closure() -> DResult<()> {
     assert!(res.is_ok(), "nested-lambda binding must lower, got {res:?}");
 
     let Some(f_fn) = func_named(&res, &i, "f") else {
-        assert!(false_marker(), "f must lower");
-        return Ok(());
+        panic!("f must lower")
     };
     // f keeps its one declared parameter; its return type is the FLATTENED
     // two-argument closure, never a curried one.
@@ -2015,12 +2004,10 @@ fn nested_lambda_body_flattens_into_one_closure() -> DResult<()> {
     // The body is ONE Lambda taking BOTH `b` and `c`, returning Int — the nested
     // chain collapsed into a single multi-parameter closure.
     let Expr::Lambda { params, ret, body } = &f_fn.body else {
-        assert!(
-            false_marker(),
+        panic!(
             "body lowers to a single flattened Lambda, got {:?}",
             f_fn.body
-        );
-        return Ok(());
+        )
     };
     assert_eq!(params.len(), 2, "both `b` and `c` in one closure");
     let names: Vec<Option<&str>> = params.iter().map(|(s, _)| i.resolve(*s)).collect();
@@ -2042,6 +2029,7 @@ fn nested_lambda_body_flattens_into_one_closure() -> DResult<()> {
 }
 
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn partial_application_of_a_first_class_value_eta_expands() -> DResult<()> {
     // Partial application of a first-class *value* (here a lambda) — `(\b -> \c
     // -> 0) 2` passes one argument to a two-arity closure. The named-callee path
@@ -2109,31 +2097,21 @@ fn partial_application_of_a_first_class_value_eta_expands() -> DResult<()> {
     );
     let caller_fn = func_named(&res, &i, "caller");
     let Some(caller_fn) = caller_fn else {
-        assert!(false_marker(), "caller must lower");
-        return Ok(());
+        panic!("caller must lower")
     };
     // The body is the residual eta-lambda `\eta_0: Int -> (value)(2, eta_0)`.
     let Expr::Lambda { params, ret, body } = &caller_fn.body else {
-        assert!(
-            false_marker(),
-            "value partial lowers to a Lambda, got {:?}",
-            caller_fn.body
-        );
-        return Ok(());
+        panic!("value partial lowers to a Lambda, got {:?}", caller_fn.body)
     };
     assert_eq!(params.len(), 1, "one missing parameter");
     let Some((_, eta_ty)) = params.first() else {
-        return Ok(());
+        panic!("one missing parameter");
     };
     assert_eq!(*eta_ty, IrType::Int, "missing param keeps its solved type");
     assert_eq!(*ret, IrType::Int, "residual return type");
     // body: Apply { func: <value>, args: [2, eta_0] } — every arg at once.
     let Expr::Apply { args, .. } = body.as_ref() else {
-        assert!(
-            false_marker(),
-            "eta body is an Apply of the value, got {body:?}"
-        );
-        return Ok(());
+        panic!("eta body is an Apply of the value, got {body:?}")
     };
     assert_eq!(args.len(), 2, "supplied arg + synthesised residual param");
     assert!(
@@ -2149,6 +2127,7 @@ fn partial_application_of_a_first_class_value_eta_expands() -> DResult<()> {
 // saturation, and asserts the full residual eta-lambda shape. Naturally long;
 // matches the ipe_backend_rust fixture-test convention.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn over_application_with_partial_surplus_eta_expands() -> DResult<()> {
     // `f` declares ONE parameter but a four-arrow type `Int -> Int -> Int -> Int
     // -> Int`, so `f 1` returns a flattened THREE-argument closure. `f 1 2`
@@ -2244,17 +2223,11 @@ fn over_application_with_partial_surplus_eta_expands() -> DResult<()> {
         "under-saturating over-application must eta-expand, got {res:?}"
     );
     let Some(caller_fn) = func_named(&res, &i, "caller") else {
-        assert!(false_marker(), "caller must lower");
-        return Ok(());
+        panic!("caller must lower")
     };
     // Residual eta-lambda `\eta_0 \eta_1 -> (Call(f, [1]))(2, eta_0, eta_1)`.
     let Expr::Lambda { params, body, .. } = &caller_fn.body else {
-        assert!(
-            false_marker(),
-            "over-partial lowers to a Lambda, got {:?}",
-            caller_fn.body
-        );
-        return Ok(());
+        panic!("over-partial lowers to a Lambda, got {:?}", caller_fn.body)
     };
     assert_eq!(
         params.len(),
@@ -2262,8 +2235,7 @@ fn over_application_with_partial_surplus_eta_expands() -> DResult<()> {
         "two still-missing params (3 returned − 1 surplus)"
     );
     let Expr::Apply { func, args } = body.as_ref() else {
-        assert!(false_marker(), "eta body is an Apply, got {body:?}");
-        return Ok(());
+        panic!("eta body is an Apply, got {body:?}")
     };
     assert!(
         matches!(func.as_ref(), Expr::Call { .. }),
@@ -2452,10 +2424,4 @@ fn list_map2_two_argument_callback_passes_backstop() -> DResult<()> {
         "a full-arity `map2` callback must not trip IPE-L0154: {res:?}"
     );
     Ok(())
-}
-
-/// A runtime `false` the optimiser cannot fold, so `assert!(false_marker())`
-/// fails the test without tripping `clippy::assertions_on_constants`.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
 }

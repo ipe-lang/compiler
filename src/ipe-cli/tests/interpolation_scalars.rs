@@ -34,11 +34,7 @@ fn build_source(name: &str, src: &str) -> Result<(), Option<ipe_diagnostics::Cod
         std::fs::write(&entry, src).is_ok(),
         "{name}: fixture must be writable"
     );
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "{name}: the in-repo runtime must resolve");
-    let Ok(runtime) = runtime else {
-        return Err(None);
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
         Ok(()) => Ok(()),
         Err(ipe::CliError::Pipeline { diag, .. }) => Err(Some(diag.code())),

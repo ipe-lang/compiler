@@ -128,7 +128,6 @@ pub fn collect_free_vars(expr: &Expr, out: &mut BTreeSet<Symbol>) {
         | Expr::Bool(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::PathLit(_)
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit

@@ -51,9 +51,7 @@ fn generic_succeed_capture_sync_bounds_emitted() {
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -77,7 +75,7 @@ fn generic_succeed_capture_sync_bounds_emitted() {
 /// THE SEAL: under `IPE_E2E=1` the emitted crate must build and print every decoded value.
 #[test]
 fn generic_succeed_tail_sync_seal_runs() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -87,9 +85,7 @@ fn generic_succeed_tail_sync_seal_runs() {
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),

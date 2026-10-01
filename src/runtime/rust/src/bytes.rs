@@ -142,6 +142,7 @@ pub fn bytes_slice(start: i64, end: i64, b: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

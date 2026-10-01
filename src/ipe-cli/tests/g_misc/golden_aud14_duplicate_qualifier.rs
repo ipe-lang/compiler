@@ -12,13 +12,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// A runtime `false` the optimiser cannot fold, so `assert!(false_marker())`
-/// reads as a deliberate unconditional failure, not a suspicious constant
-/// condition — mirrors `crates/ipe/src/lib.rs`'s own test helper.
-const fn false_marker() -> bool {
-    std::hint::black_box(false)
-}
-
 fn write_project(dir: &std::path::Path, files: &[(&str, &str)]) -> bool {
     let src = dir.join("src");
     let _ = fs::remove_dir_all(dir);
@@ -35,10 +28,9 @@ fn write_project(dir: &std::path::Path, files: &[(&str, &str)]) -> bool {
 /// to whichever import is LAST in source order (`B`'s), with no diagnostic — a
 /// well-typed program producing a wrong-module resolution.
 #[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
 fn distinct_modules_sharing_an_explicit_alias_is_rejected() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable in this environment — skip silently
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = crate::support::scratch_root().join("ipec_aud14_duplicate_qualifier");
     let wrote = write_project(
@@ -64,27 +56,20 @@ import Ipe.Io
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     let Err(err) = built else {
-        assert!(
-            false_marker(),
+        panic!(
             "expected DuplicateQualifier rejection for two modules sharing alias `Utils`, \
              but ipe build SUCCEEDED — the last import silently won"
-        );
-        return;
+        )
     };
     let ipe::CliError::Pipeline { diag, .. } = &err else {
-        assert!(false_marker(), "expected a Pipeline diagnostic, got: {err}");
-        return;
+        panic!("expected a Pipeline diagnostic, got: {err}")
     };
     let ipe_diagnostics::Diagnostic::Name {
         msg: ipe_diagnostics::NameError::DuplicateQualifier { qualifier, .. },
         ..
     } = &**diag
     else {
-        assert!(
-            false_marker(),
-            "expected NameError::DuplicateQualifier, got: {err}"
-        );
-        return;
+        panic!("expected NameError::DuplicateQualifier, got: {err}")
     };
     assert_eq!(&**qualifier, "Utils");
 }
@@ -94,9 +79,7 @@ import Ipe.Io
 /// check only rejects a clash between two DIFFERENT dep modules.
 #[test]
 fn same_module_reimported_under_same_alias_is_accepted() {
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let tmp = crate::support::scratch_root().join("ipec_aud14_duplicate_qualifier_diamond");
     let wrote = write_project(

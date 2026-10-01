@@ -277,6 +277,7 @@ pub fn inspect_model<Model: crate::stringify::IpeStringify>(model: &Model) -> St
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

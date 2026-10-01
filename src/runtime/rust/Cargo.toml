@@ -14,7 +14,7 @@ path = "src/mod.rs"
 # scan) lives in this crate's OWN `src/path_core.rs` sibling module, NOT an
 # extern crate — so it vendors automatically with `mod ipe_runtime` into every
 # emitted app (an extern crate would not survive that source-copy). The
-# compiler's `path "…"` gate shares the SAME file via the `ipe_path_core` crate,
+# compiler's literal-path gate shares the SAME file via the `ipe_path_core` crate,
 # which `include!`s `src/path_core.rs`, so the runtime seal and the compile-time
 # gate cannot drift.
 # `preserve_order`: `Json.Encode.object` takes an ordered `List (String, Value)`
@@ -445,8 +445,9 @@ tui = ["unicode-width", "crossterm", "tokio", "random"]
 # THIS feature (not `web`), so the core compiles wherever any of the three is
 # selected. `serde_json` backs the webview IPC parse + the floor wire; `json`
 # pulls `serde` (the `Patch`/`FormData` derives); `serde_urlencoded` is the typed
-# form-record decode (`dom/form.rs`).
-web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded"]
+# form-record decode (`dom/form.rs`); `encoding` is the strict percent-decoder
+# the route matcher decodes each path segment with (`web/route.rs`).
+web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded", "encoding"]
 # Real native-window Webview backend (opt-in; needs the system webview dev libs).
 # NOT in `full` — default/CI builds compile the cross-platform stub instead.
 # Pulls ONLY the server-free `web-core` render core (the `Html` renderer +
@@ -622,6 +623,8 @@ wasm-client = [
 ]
 
 [dev-dependencies]
+# Existence-proven test-artifact resolvers.
+e2e-support = { path = "../../../tools/e2e-support" }
 regex = "1"
 serde_json = "1"
 sha2 = "0.10"

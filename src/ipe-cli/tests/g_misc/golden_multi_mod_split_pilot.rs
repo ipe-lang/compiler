@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// The `ipe-lang` workspace root (two levels up from this crate's manifest).
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -35,7 +35,7 @@ fn fixture_dir() -> PathBuf {
 // fail loudly on a broken environment (mirrors `golden_mm.rs`'s own helper).
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for the pilot golden test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// Byte-diff every checked-in `ipe_mods/<name>.rs` golden against its
@@ -148,7 +148,7 @@ fn emits_split_spine_and_per_module_files() {
 /// `Lib.seedAndCount` are counted and printed as `seeded:2`.
 #[test]
 fn end_to_end_builds_and_prints_seeded_count() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 

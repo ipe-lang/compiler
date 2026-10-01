@@ -7,12 +7,12 @@
 //! floor). This locks the property that removing the IPE-L0116 gate did NOT
 //! remove the exhaustiveness guarantee: the Maranget check is the gate.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -29,9 +29,7 @@ fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code)
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),

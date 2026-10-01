@@ -29,36 +29,24 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// This crate's manifest directory, resolved so it stays correct when a test
-/// binary runs from a `nextest archive` on a different machine than the one that
-/// compiled it.
+/// This crate's manifest directory, proven to exist; fails the test otherwise.
 ///
-/// `env!("CARGO_MANIFEST_DIR")` bakes the BUILD machine's absolute path at
-/// compile time; under `cargo nextest run --archive-file … --workspace-remap .`
-/// the run happens on a separate runner where that baked path does not exist.
-/// Nextest re-exports `CARGO_MANIFEST_DIR` in the runtime environment, re-rooted
-/// to the remapped checkout, so read it at runtime and fall back to the baked
-/// value for a plain (non-archive) `cargo test`/`nextest` run, which sets no such
-/// runtime variable.
+/// Archive-safe: the run-time `CARGO_MANIFEST_DIR` (re-rooted by
+/// `nextest --workspace-remap`) wins over the compile-time path.
 #[must_use]
-#[allow(dead_code)] // adopted file-by-file as tests migrate to the shared helper
+#[allow(dead_code)] // shared across test binaries; not every one calls it
 pub fn manifest_dir() -> PathBuf {
-    ipe_env::var_os("CARGO_MANIFEST_DIR")
-        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+    e2e_support::manifest_dir!()
 }
 
-/// Absolute path to the built `ipe` binary, archive-safe for the same reason as
-/// [`manifest_dir`].
+/// The built `ipe` binary, proven to be a regular file; fails the test otherwise.
 ///
-/// `env!("CARGO_BIN_EXE_ipe")` points at the build machine's `target/`, which a
-/// separate `nextest archive` runner does not have. Nextest re-exports
-/// `CARGO_BIN_EXE_ipe` at runtime pointing at the extracted binary; read that,
-/// falling back to the baked path for a plain (non-archive) run.
+/// Archive-safe: the run-time `CARGO_BIN_EXE_ipe` (re-exported by nextest)
+/// wins over the compile-time path.
 #[must_use]
-#[allow(dead_code)] // adopted file-by-file as tests migrate to the shared helper
+#[allow(dead_code)] // shared across test binaries; not every one calls it
 pub fn ipe_bin() -> PathBuf {
-    ipe_env::var_os("CARGO_BIN_EXE_ipe")
-        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ipe")), PathBuf::from)
+    e2e_support::cargo_bin!("ipe").into_path_buf()
 }
 
 /// Per-binary scratch root for e2e output, isolated per `CARGO_TARGET_DIR` pool
@@ -89,24 +77,6 @@ pub fn expect_scratch_entry(test_name: &str, entry: Option<PathBuf>) -> PathBuf 
          fail loudly, never skip silently"
     );
     entry.unwrap_or_default()
-}
-
-/// Unwrap a refusal/acceptance test's runtime resolution, failing the test
-/// loudly when it is `Err` instead of letting the caller skip silently.
-///
-/// See [`expect_scratch_entry`] for why a silent skip here is unacceptable; the
-/// placeholder `PathBuf` returned after the assertion is unreachable.
-#[must_use]
-#[allow(dead_code)] // adopted file-by-file as refusal/acceptance tests migrate
-#[track_caller]
-pub fn expect_runtime(test_name: &str, runtime: Result<PathBuf, ipe::CliError>) -> PathBuf {
-    assert!(
-        runtime.is_ok(),
-        "{test_name}: runtime resolution failed — a refusal/acceptance test must \
-         fail loudly, never skip silently: {:?}",
-        runtime.as_ref().err()
-    );
-    runtime.unwrap_or_default()
 }
 
 /// Assert a refusal/acceptance test's scratch-dir setup step (a directory
@@ -509,7 +479,7 @@ pub fn build_emitted(golden_name: &str, emitted_dir: &Path) -> Result<(), String
 #[track_caller]
 #[allow(dead_code)] // not every test binary exercises this helper
 pub fn assert_seal_builds(seal_name: &str, emitted_dir: &Path) {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return; // fast default gate: emit-only pass
     }
     let outcome = build_emitted(seal_name, emitted_dir);
@@ -763,6 +733,7 @@ pub fn build_and_run_emitted_capturing_stderr(
 /// always a hard failure — never a skip — so a golden without a captured
 /// expected output cannot pass silently.
 #[allow(dead_code)] // exercised by goldens with a captured expected output
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
 pub fn assert_self_regression(golden_name: &str, golden_dir: &Path, ipe_stdout: &str) {
     // Bless mode: overwrite `expected.txt` with the compiler's actual stdout
     // instead of asserting. The counterpart to `IPE_BLESS` in the byte-diff
@@ -785,7 +756,7 @@ pub fn assert_self_regression(golden_name: &str, golden_dir: &Path, ipe_stdout: 
         "{golden_name}: {}",
         expected.as_ref().err().map_or("", String::as_str)
     );
-    let Ok(expected) = expected else { return };
+    let expected = expected.expect("`expected` must succeed");
     assert_eq!(
         ipe_stdout, expected,
         "{golden_name}: stdout does not match expected.txt"

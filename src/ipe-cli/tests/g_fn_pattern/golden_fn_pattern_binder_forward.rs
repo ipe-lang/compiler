@@ -40,9 +40,7 @@ fn pattern_binder_forward_emits_byte_identical_main_rs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_pattern_binder_forward_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -54,7 +52,7 @@ fn pattern_binder_forward_emits_byte_identical_main_rs() {
 
 #[test]
 fn pattern_binder_forward_end_to_end_prints_nine() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let root = repo_root();
@@ -62,9 +60,7 @@ fn pattern_binder_forward_end_to_end_prints_nine() {
     let out = crate::support::scratch_root().join("ipec_fn_pattern_binder_forward_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
@@ -76,18 +72,17 @@ fn pattern_binder_forward_end_to_end_prints_nine() {
     assert_eq!(outcome.exit_code, Some(0), "exit 0 (THE SEAL)");
 }
 
-/// Build a one-file program to a fresh temp dir. Returns `None` when the test
-/// environment cannot set up (runtime unavailable / filesystem error) so the
-/// caller skips rather than falsely fails; `Some` carries the driver result.
-fn build_source(name: &str, source: &str) -> Option<Result<(), CliError>> {
+/// Build a one-file program to a fresh temp dir and return the driver result.
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn build_source(name: &str, source: &str) -> Result<(), CliError> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir).expect("the fixture scratch dir must be writable");
     let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
+    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
     let out = dir.join("out");
-    let runtime = ipe::resolve_runtime().ok()?;
-    Some(ipe::build(&entry, &out, &runtime))
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&entry, &out, &runtime)
 }
 
 #[test]
@@ -108,9 +103,7 @@ fn decoder_pattern_capture_forward_is_admitted() {
                \x20           List.map (\\_ -> d) [1, 2]\n\
                main =\n\
                \x20   Io.println \"x\"\n";
-    let Some(built) = build_source("fn_pattern_binder_decoder_forward", src) else {
-        return;
-    };
+    let built = build_source("fn_pattern_binder_decoder_forward", src);
     assert!(
         built.is_ok(),
         "a `Decoder`-valued pattern binder forwarded through a closure is now \
@@ -135,9 +128,7 @@ fn non_clone_pattern_capture_forward_stays_fail_closed() {
                \x20           List.map (\\_ -> t) [1, 2]\n\
                main =\n\
                \x20   Io.println \"x\"\n";
-    let Some(built) = build_source("fn_pattern_binder_noncl_forward_gate", src) else {
-        return;
-    };
+    let built = build_source("fn_pattern_binder_noncl_forward_gate", src);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

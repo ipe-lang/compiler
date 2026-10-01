@@ -109,7 +109,6 @@ fn walk(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>, in_binop_operand: bool) 
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => {}
     }
 }
@@ -255,7 +254,6 @@ impl SubjectKind {
             | Expr_::Str(_)
             | Expr_::MultilineStr { .. }
             | Expr_::Char(_)
-            | Expr_::PathLit(_)
             | Expr_::Unit
             | Expr_::Call(..)
             | Expr_::Tuple(_)

@@ -65,6 +65,7 @@ pub fn char_is_alpha_num(c: char) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

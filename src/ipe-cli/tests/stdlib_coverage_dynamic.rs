@@ -18,11 +18,6 @@ use ipe::coverage::contract::{AspectCheck, Cell, StdlibSymbol, Surface};
 use ipe::coverage::matrix::run;
 use ipe::coverage::surface::StdlibSurface;
 
-/// Whether the heavy end-to-end path is enabled.
-fn e2e_enabled() -> bool {
-    ipe_env::var("IPE_E2E").is_ok()
-}
-
 /// The bounded worker count for the parallel build+run sweep.
 ///
 /// Each probe shells out to `ipe run`, which cargo-builds the emitted crate; the
@@ -125,27 +120,25 @@ fn dotted(sym: &StdlibSymbol) -> String {
 #[test]
 fn composes_column_passes_over_every_higher_order_symbol() {
     use std::fmt::Write as _;
-    if !e2e_enabled() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let holes = holes_of(Box::new(
+            ipe::coverage::columns_runtime::ComposesColumn::new(),
+        ));
 
-    let holes = holes_of(Box::new(
-        ipe::coverage::columns_runtime::ComposesColumn::new(),
-    ));
-
-    let mut unexpected = String::new();
-    for (symbol, message) in holes {
-        if !allowlisted("composes", &symbol) {
-            let _ = writeln!(unexpected, "  HOLE [composes] {symbol}: {message}");
+        let mut unexpected = String::new();
+        for (symbol, message) in holes {
+            if !allowlisted("composes", &symbol) {
+                let _ = writeln!(unexpected, "  HOLE [composes] {symbol}: {message}");
+            }
         }
-    }
 
-    assert!(
-        unexpected.is_empty(),
-        "every higher-order stdlib symbol must lower under nesting (a composed \
+        assert!(
+            unexpected.is_empty(),
+            "every higher-order stdlib symbol must lower under nesting (a composed \
          combinator that type-checks but does not lower is a real lowering gap):\n\
          {unexpected}",
-    );
+        );
+    }
 }
 
 // ── lowers ────────────────────────────────────────────────────────────────────
@@ -153,23 +146,21 @@ fn composes_column_passes_over_every_higher_order_symbol() {
 #[test]
 fn lowers_column_passes_over_the_surface() {
     use std::fmt::Write as _;
-    if !e2e_enabled() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let holes = holes_of(Box::new(ipe::coverage::columns_runtime::LowersColumn::new()));
 
-    let holes = holes_of(Box::new(ipe::coverage::columns_runtime::LowersColumn::new()));
-
-    let mut unexpected = String::new();
-    for (symbol, message) in holes {
-        if !allowlisted("lowers", &symbol) {
-            let _ = writeln!(unexpected, "  HOLE [lowers] {symbol}: {message}");
+        let mut unexpected = String::new();
+        for (symbol, message) in holes {
+            if !allowlisted("lowers", &symbol) {
+                let _ = writeln!(unexpected, "  HOLE [lowers] {symbol}: {message}");
+            }
         }
-    }
 
-    assert!(
-        unexpected.is_empty(),
-        "every stdlib symbol whose point-free probe type-checks must lower:\n{unexpected}",
-    );
+        assert!(
+            unexpected.is_empty(),
+            "every stdlib symbol whose point-free probe type-checks must lower:\n{unexpected}",
+        );
+    }
 }
 
 // ── runtime-fn-exists + wasm (registry reads; cheap even under E2E) ────────────
@@ -177,29 +168,27 @@ fn lowers_column_passes_over_the_surface() {
 #[test]
 fn runtime_fn_and_wasm_columns_report_no_holes() {
     use std::fmt::Write as _;
-    if !e2e_enabled() {
-        return;
-    }
-
-    let mut unexpected = String::new();
-    for column in [
-        Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
-            as Box<dyn AspectCheck<StdlibSymbol>>,
-        Box::new(ipe::coverage::columns_runtime::WasmColumn),
-    ] {
-        let aspect = column.name();
-        for (symbol, message) in holes_of(column) {
-            if !allowlisted(aspect, &symbol) {
-                let _ = writeln!(unexpected, "  HOLE [{aspect}] {symbol}: {message}");
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let mut unexpected = String::new();
+        for column in [
+            Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
+                as Box<dyn AspectCheck<StdlibSymbol>>,
+            Box::new(ipe::coverage::columns_runtime::WasmColumn),
+        ] {
+            let aspect = column.name();
+            for (symbol, message) in holes_of(column) {
+                if !allowlisted(aspect, &symbol) {
+                    let _ = writeln!(unexpected, "  HOLE [{aspect}] {symbol}: {message}");
+                }
             }
         }
-    }
 
-    assert!(
-        unexpected.is_empty(),
-        "the runtime-fn-exists and wasm columns report holes (both emit advisories, \
+        assert!(
+            unexpected.is_empty(),
+            "the runtime-fn-exists and wasm columns report holes (both emit advisories, \
          not holes, by design — a hole here is a contract break):\n{unexpected}",
-    );
+        );
+    }
 }
 
 // ── build+run: heavy (a full cargo build per symbol) ──────────────────────────
@@ -218,26 +207,24 @@ fn runtime_fn_and_wasm_columns_report_no_holes() {
 #[test]
 fn build_run_column_over_a_representative_slice() {
     use std::fmt::Write as _;
-    if !e2e_enabled() {
-        return;
-    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let symbols: Vec<StdlibSymbol> = StdlibSurface
+            .all()
+            .into_iter()
+            .filter(|s| s.is_higher_order)
+            .collect();
 
-    let symbols: Vec<StdlibSymbol> = StdlibSurface
-        .all()
-        .into_iter()
-        .filter(|s| s.is_higher_order)
-        .collect();
+        let mut unexpected = String::new();
+        for (path, message) in build_run_holes(&symbols) {
+            let _ = writeln!(unexpected, "  HOLE [build+run] {path}: {message}");
+        }
 
-    let mut unexpected = String::new();
-    for (path, message) in build_run_holes(&symbols) {
-        let _ = writeln!(unexpected, "  HOLE [build+run] {path}: {message}");
-    }
-
-    assert!(
-        unexpected.is_empty(),
-        "every higher-order symbol's minimal program must emit, build, and run \
+        assert!(
+            unexpected.is_empty(),
+            "every higher-order symbol's minimal program must emit, build, and run \
          (or be a justified NotApplicable):\n{unexpected}",
-    );
+        );
+    }
 }
 
 // ── the whole dynamic set, for a single-command CI sweep ──────────────────────
@@ -269,45 +256,43 @@ fn build_run_column_over_a_representative_slice() {
 #[test]
 fn dynamic_columns_pass_over_the_whole_surface() {
     use std::fmt::Write as _;
-    if !e2e_enabled() {
-        return;
-    }
-
-    // The cheap registry columns over the WHOLE surface (no build, no lowering).
-    let report = run(
-        &StdlibSurface,
-        &[
-            Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
-                as Box<dyn AspectCheck<StdlibSymbol>>,
-            Box::new(ipe::coverage::columns_runtime::WasmColumn),
-        ],
-    );
-    let mut unexpected = String::new();
-    for h in &report.holes {
-        if !allowlisted(h.aspect, &h.symbol) {
-            let _ = writeln!(
-                unexpected,
-                "  HOLE [{}] {}: {}",
-                h.aspect, h.symbol, h.message
-            );
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        // The cheap registry columns over the WHOLE surface (no build, no lowering).
+        let report = run(
+            &StdlibSurface,
+            &[
+                Box::new(ipe::coverage::columns_runtime::RuntimeFnExistsColumn::new())
+                    as Box<dyn AspectCheck<StdlibSymbol>>,
+                Box::new(ipe::coverage::columns_runtime::WasmColumn),
+            ],
+        );
+        let mut unexpected = String::new();
+        for h in &report.holes {
+            if !allowlisted(h.aspect, &h.symbol) {
+                let _ = writeln!(
+                    unexpected,
+                    "  HOLE [{}] {}: {}",
+                    h.aspect, h.symbol, h.message
+                );
+            }
         }
-    }
 
-    // The build+run slice (the higher-order combinators), fanned across the pool.
-    // A browser web axis or an unaddressable point-free reference is a justified
-    // NotApplicable, not a dropped symbol.
-    let ho_symbols: Vec<StdlibSymbol> = StdlibSurface
-        .all()
-        .into_iter()
-        .filter(|s| s.is_higher_order)
-        .collect();
-    for (path, message) in build_run_holes(&ho_symbols) {
-        let _ = writeln!(unexpected, "  HOLE [build+run] {path}: {message}");
-    }
+        // The build+run slice (the higher-order combinators), fanned across the pool.
+        // A browser web axis or an unaddressable point-free reference is a justified
+        // NotApplicable, not a dropped symbol.
+        let ho_symbols: Vec<StdlibSymbol> = StdlibSurface
+            .all()
+            .into_iter()
+            .filter(|s| s.is_higher_order)
+            .collect();
+        for (path, message) in build_run_holes(&ho_symbols) {
+            let _ = writeln!(unexpected, "  HOLE [build+run] {path}: {message}");
+        }
 
-    assert!(
-        unexpected.is_empty(),
-        "the dynamic coverage sweep must pass (the per-symbol lowering tiers run in \
+        assert!(
+            unexpected.is_empty(),
+            "the dynamic coverage sweep must pass (the per-symbol lowering tiers run in \
          their own named tests; see this test's doc):\n{unexpected}",
-    );
+        );
+    }
 }

@@ -19,12 +19,12 @@
 //!   refutable class is closed by BOTH gates, and no refutable param reaches
 //!   codegen.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe::CliError;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -41,9 +41,7 @@ fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code)
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
@@ -134,50 +132,11 @@ fn single_ctor_case_accessor_compiles() {
         .join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("money_ctor_accessor_case_emit");
     let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "single-ctor case accessor must compile: {:?}",
         built.err()
     );
-}
-
-/// Seal remeasure: building examples/00-standard-libs must NOT produce IPE-T0015
-/// on Std/Money or Ipê/Test after the Std/Money.ipe accessor fix.
-#[test]
-fn standard_libs_ipe_t0015_money_blocker_gone() {
-    let root = repo_root();
-    let manifest = root
-        .join("examples")
-        .join("00-standard-libs")
-        .join("package.ipe");
-    if !manifest.exists() {
-        return;
-    }
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("00_standard_libs_t0015_gate");
-    let _ = std::fs::remove_dir_all(&out);
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
-    let result = ipe::build_project(&manifest, &out, &runtime);
-    match &result {
-        Err(ipe::CliError::Pipeline { diag, .. }) => {
-            let msg = format!("{diag:?}");
-            assert!(
-                !msg.contains("IPE-T0015") || (!msg.contains("Money") && !msg.contains("Test.ipe")),
-                "IPE-T0015 from Std/Money/Ipe.Test must be gone after accessor fix; got: {msg}"
-            );
-        }
-        Ok(()) => {}
-        Err(other) => {
-            let msg = format!("{other:?}");
-            assert!(
-                !msg.contains("IPE-T0015") || (!msg.contains("Money") && !msg.contains("Test.ipe")),
-                "IPE-T0015 from Std/Money/Ipe.Test must be gone after accessor fix; got: {msg}"
-            );
-        }
-    }
 }

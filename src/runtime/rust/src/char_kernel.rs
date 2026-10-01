@@ -55,6 +55,7 @@ pub fn char_from_code(n: i64) -> char {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

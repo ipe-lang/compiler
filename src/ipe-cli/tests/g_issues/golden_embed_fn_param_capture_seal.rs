@@ -184,15 +184,6 @@ fn build_fixture(name: &str, source: &str) -> Option<(Result<(), CliError>, Path
     }
     let out = root.join(format!("{name}-out"));
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = match ipe::resolve_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: the embedded runtime could not be resolved: {err:?}"
-            );
-            return None;
-        }
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     Some((ipe::build(&entry, &out, &runtime), out))
 }

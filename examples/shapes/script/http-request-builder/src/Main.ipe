@@ -21,7 +21,8 @@ import Ipe.Io as Io
 --     silent default.
 --   • `Http.parseQuery` decodes a query string into a `Dict`, percent-decoding
 --     each key and value and keeping the first of any duplicate key — the result
---     is a typed map, not a re-splittable string.
+--     is a typed map, not a re-splittable string. A malformed escape refuses the
+--     whole query as an `Err`, never a half-decoded map.
 
 
 -- Build a request from a raw string target. `defaultRequestFromString` is the
@@ -58,6 +59,19 @@ targets =
     ]
 
 
+-- Read one query parameter. The query is decoded once, strictly: a malformed
+-- query is reported as refused rather than guessed at.
+queryParam : String -> String -> String
+queryParam key raw =
+    case Http.parseQuery raw of
+
+        Ok params ->
+            Maybe.withDefault "?" (Dict.get key params)
+
+        Err _ ->
+            "(refused)"
+
+
 -- Parse an inbound verb string at the single typed boundary.
 methodLabel : String -> String
 methodLabel raw =
@@ -77,11 +91,7 @@ main =
             |> printAll
         Io.println ("method parse: " ++ methodLabel "get")
         Io.println ("method parse: " ++ methodLabel "TRACE")
-        Io.println
-            ("query q = "
-                ++ Maybe.withDefault "?"
-                    (Dict.get "q" (Http.parseQuery "?q=red%20shoes&page=2"))
-            )
+        Io.println ("query q = " ++ queryParam "q" "?q=red%20shoes&page=2")
 
 
 printAll : List (Task Error ()) -> Task Error ()

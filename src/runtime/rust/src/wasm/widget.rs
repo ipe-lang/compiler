@@ -149,8 +149,9 @@ pub fn sync_widget_properties<M>(document: &web_sys::Document, tree: &crate::htm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn widget_tag_detection_is_prefix_exact() {
         assert!(is_widget_tag("ipe-ce-cafef00d"));
         assert!(is_widget_tag("ipe-ce-0011223344556677"));
@@ -161,7 +162,7 @@ mod tests {
         assert!(!is_widget_tag("ipe-cell"));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn up_event_name_is_the_shared_custom_event_constant() {
         assert_eq!(up_event_name(), "ipe-widget-up");
         assert_eq!(up_event_name(), WIDGET_UP_CUSTOM_EVENT);

@@ -143,7 +143,11 @@ fn console_command(
 /// No-orphan defence in depth: `kill_on_drop` + `shutdown_console` (signal
 /// handler) cover the graceful paths, and on Linux `PR_SET_PDEATHSIG` makes the
 /// kernel SIGTERM the child if the parent dies by ANY means — including SIGKILL
-/// / OOM / a crash the signal handler can't catch.
+/// / OOM / a crash the signal handler can't catch. A refused hardened spawn
+/// falls back to the in-process console, never to an unhardened child. A
+/// refusal tokio raises after the fork (`SpawnRefusal::Spawn` /
+/// `SpawnPanicked`) can leave that child running unproxied on `child_port`
+/// until this process exits, when the parent-death floor SIGTERMs it.
 pub(crate) fn spawn_console(
     child_port: u16,
     store: &str,
@@ -160,13 +164,12 @@ pub(crate) fn spawn_console(
     let mut cmd = console_command(&bin, child_port, store, child_collects, &token);
     // Parent-death signal: if the parent dies for ANY reason (SIGKILL, OOM,
     // panic-abort) the kernel SIGTERMs this child, so it can never outlive the
-    // parent as an orphan. Routed through the SINGLE sanctioned `PR_SET_PDEATHSIG`
-    // site (`system::harden_child_parent_death`) via tokio's std view — the
-    // `pre_exec` set there is honoured by tokio's spawn. `kill_on_drop` in
-    // `console_command` remains the graceful-path floor tokio adds on top.
-    // No-op on non-Linux.
-    crate::system::harden_child_parent_death(cmd.as_std_mut());
-    match cmd.spawn() {
+    // parent as an orphan. `spawn_hardened_tokio` forks it from the runtime's
+    // process-lifetime spawner thread (the signal is bound to the forking
+    // thread), registered with this caller's tokio runtime. `kill_on_drop` in
+    // `console_command` remains the graceful-path floor tokio adds on top, for
+    // a registered child only. No-op on non-Linux.
+    match crate::system::spawn_hardened_tokio(cmd) {
         Ok(child) => {
             if let Ok(mut g) = CHILD.lock() {
                 *g = Some(child);
@@ -210,8 +213,8 @@ pub fn shutdown_console() {
 // exits 0. A previous `install_shutdown_hook` here installed a SECOND tokio
 // signal handler that `std::process::exit(130)`'d; two handlers raced and the
 // 130 exit defeated the exit-0-on-clean-shutdown contract. It was removed. The
-// `PR_SET_PDEATHSIG` (Linux) + `kill_on_drop` set in `spawn_console` remain the
-// defense-in-depth floor for NON-graceful parent death (SIGKILL / OOM / crash).
+// `PR_SET_PDEATHSIG` (Linux, via `system::spawn_hardened_tokio`) + `kill_on_drop`
+// set in `spawn_console` remain the defense-in-depth floor for NON-graceful parent death (SIGKILL / OOM / crash).
 
 // ─── Reverse proxy ──────────────────────────────────────────────────────────
 
@@ -686,7 +689,7 @@ mod tests {
                 "{method} {}{} {}",
                 uri.path(),
                 uri.query().map(|q| format!("?{q}")).unwrap_or_default(),
-                String::from_utf8_lossy(&body)
+                String::from_utf8(body.to_vec()).expect("a UTF-8 request body")
             )
         }
 
@@ -714,7 +717,7 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .expect("read resp body");
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8(bytes.to_vec()).expect("a UTF-8 response body");
         // Prefix stripped → child sees /_ipe/event; method, query, body preserved.
         assert_eq!(text, "POST /_ipe/event?x=1 hi", "got: {text}");
     }
@@ -822,6 +825,6 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .expect("read resp body");
-        assert_eq!(String::from_utf8_lossy(&bytes), "/");
+        assert_eq!(bytes.as_ref(), b"/".as_slice());
     }
 }

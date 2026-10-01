@@ -1163,7 +1163,7 @@ fn alias_gate_probes_a_module_without_the_kernel_import() {
         bytes.is_some(),
         "`Ipe.Bytes` must be a compiled-source module"
     );
-    let Some(bytes) = bytes else { return };
+    let bytes = bytes.expect("`bytes` must be present");
     assert!(
         !bytes.source.contains("import Ipe.Ffi.Kernel"),
         "the refusal needs a module that does not import `Ipe.Ffi.Kernel`"
@@ -1181,7 +1181,7 @@ fn alias_gate_probes_a_module_without_the_kernel_import() {
         aliases.as_ref().is_ok_and(|a| a.contains("length")),
         "canon must record `Ipe.Bytes.length` as a kernel alias: {aliases:?}"
     );
-    let Ok(aliases) = aliases else { return };
+    let aliases = aliases.expect("`aliases` must succeed");
     let members = alias_members(
         "Ipe.Bytes",
         &drifted,
@@ -1194,7 +1194,7 @@ fn alias_gate_probes_a_module_without_the_kernel_import() {
         "`Ipe.Bytes.length` must be selected for probing: {:?}",
         members.as_ref().err()
     );
-    let Ok(mut m) = members else { return };
+    let mut m = members.expect("`members` must succeed");
     m.replacement = Some(drifted);
     let drifts = module_drifts(&m);
     assert!(
@@ -1225,43 +1225,40 @@ fn alias_gate_refuses_an_unrecorded_kernel_shaped_binding() {
 
 /// The shipped `Ipe.Ffi.Js.CustomElement` probe module with `node`'s
 /// annotation replaced by `annotation`, plus that member.
-fn custom_element_node(annotation: &str) -> Option<(ProbeModule, AliasMember)> {
+#[allow(clippy::panic)] // a missing shipped module or member is the test failure
+fn custom_element_node(annotation: &str) -> (ProbeModule, AliasMember) {
     let dotted = "Ipe.Ffi.Js.CustomElement";
-    let module = ipe_stdlib::COMPILED_STD_MODULES
+    let Some(module) = ipe_stdlib::COMPILED_STD_MODULES
         .iter()
-        .find(|m| m.dotted == dotted);
-    assert!(
-        module.is_some(),
-        "`{dotted}` must be a compiled-source module"
-    );
-    let module = module?;
-    let aliases = canon_kernel_aliases(dotted, None);
-    assert!(
-        aliases.as_ref().is_ok_and(|a| a.contains("node")),
-        "canon must record `{dotted}.node` as a kernel alias: {aliases:?}"
-    );
-    let m = alias_members(
+        .find(|m| m.dotted == dotted)
+    else {
+        panic!("`{dotted}` must be a compiled-source module");
+    };
+    let aliases = match canon_kernel_aliases(dotted, None) {
+        Ok(a) if a.contains("node") => a,
+        other => panic!("canon must record `{dotted}.node` as a kernel alias: {other:?}"),
+    };
+    let m = match alias_members(
         dotted,
         module.source,
-        &AliasScope::CanonKernelAliases(aliases.ok()?),
-    );
-    assert!(
-        m.is_ok(),
-        "`{dotted}` members must select: {:?}",
-        m.as_ref().err()
-    );
-    let m = m.ok()?;
-    let name = m
+        &AliasScope::CanonKernelAliases(aliases),
+    ) {
+        Ok(m) => m,
+        Err(e) => panic!("`{dotted}` members must select: {e:?}"),
+    };
+    let Some(name) = m
         .members
         .iter()
         .find(|x| x.name == "node")
-        .map(|x| x.name.clone());
-    assert!(name.is_some(), "`{dotted}.node` must be selected");
+        .map(|x| x.name.clone())
+    else {
+        panic!("`{dotted}.node` must be selected");
+    };
     let member = AliasMember {
-        name: name?,
+        name,
         annotation: annotation.to_owned(),
     };
-    Some((m, member))
+    (m, member)
 }
 
 const NODE_ANNOTATION: &str = "CustomElement down up -> down -> (up -> msg) -> Element msg";
@@ -1270,14 +1267,12 @@ const NODE_ANNOTATION: &str = "CustomElement down up -> down -> (up -> msg) -> E
 /// checks.
 #[test]
 fn unprobeable_gate_accepts_the_shipped_entry() {
-    let Some((m, member)) = custom_element_node(NODE_ANNOTATION) else {
-        return;
-    };
+    let (m, member) = custom_element_node(NODE_ANNOTATION);
     let entry = UNPROBEABLE
         .iter()
         .find(|u| u.path == "Ipe.Ffi.Js.CustomElement.node");
     assert!(entry.is_some(), "`CustomElement.node` must be listed");
-    let Some(entry) = entry else { return };
+    let entry = entry.expect("`entry` must be present");
     let checked = check_unprobeable(&m, &member, entry);
     assert!(checked.is_ok(), "the shipped entry must pass: {checked:?}");
 }
@@ -1286,9 +1281,7 @@ fn unprobeable_gate_accepts_the_shipped_entry() {
 /// gives fails the gate.
 #[test]
 fn unprobeable_gate_refuses_a_wrong_code() {
-    let Some((m, member)) = custom_element_node(NODE_ANNOTATION) else {
-        return;
-    };
+    let (m, member) = custom_element_node(NODE_ANNOTATION);
     let entry = Unprobeable {
         path: "Ipe.Ffi.Js.CustomElement.node",
         code: "IPE-T0001",
@@ -1335,9 +1328,7 @@ fn unprobeable_gate_refuses_a_stale_entry() {
 /// Refusal: a seal variable absent from the annotation fails the gate.
 #[test]
 fn unprobeable_gate_refuses_an_unused_seal() {
-    let Some((m, member)) = custom_element_node(NODE_ANNOTATION) else {
-        return;
-    };
+    let (m, member) = custom_element_node(NODE_ANNOTATION);
     let entry = Unprobeable {
         path: "Ipe.Ffi.Js.CustomElement.node",
         code: "IPE-N0039",
@@ -1357,9 +1348,7 @@ fn unprobeable_gate_refuses_an_unused_seal() {
 #[test]
 fn unprobeable_gate_refuses_a_sealed_drift() {
     let drifted = "CustomElement down up -> up -> (up -> msg) -> Element msg";
-    let Some((m, member)) = custom_element_node(drifted) else {
-        return;
-    };
+    let (m, member) = custom_element_node(drifted);
     let entry = Unprobeable {
         path: "Ipe.Ffi.Js.CustomElement.node",
         code: "IPE-N0039",
@@ -1381,7 +1370,7 @@ fn seal_comparison_is_bijective() {
     let mut interner = Interner::new();
     let seal = interner.intern("IpeProbeSeal0");
     assert!(seal.is_ok(), "interning a seal name must succeed");
-    let Ok(seal) = seal else { return };
+    let seal = seal.expect("`seal` must succeed");
     let seal_ty = Ty::Con {
         module: Vec::new(),
         name: seal,
@@ -1417,7 +1406,7 @@ fn file_read_file_limit_takes_a_byte_size_ceiling() {
         "import Ipe.ByteSize as ByteSize exposing (ByteSize)\n",
         "import Ipe.File as File\n",
         "import Ipe.Io as Io\n",
-        "import Ipe.Path exposing (Path)\n",
+        "import Ipe.Path as Path exposing (Path)\n",
         "import Ipe.Task as Task\n\n",
         "sourceCeiling : ByteSize\n",
         "sourceCeiling =\n",
@@ -1427,7 +1416,10 @@ fn file_read_file_limit_takes_a_byte_size_ceiling() {
         "    File.readFileLimit path sourceCeiling\n\n",
         "main : Task Error ()\n",
         "main =\n",
-        "    readCapped (path \"/tmp/ipe-probe\") |> Task.andThen Io.println\n",
+        "    Path.fromString \"/tmp/ipe-probe\"\n",
+        "        |> Task.fromResult\n",
+        "        |> Task.andThen readCapped\n",
+        "        |> Task.andThen Io.println\n",
     );
     let outcome = compile_main(main);
     assert!(
@@ -1444,15 +1436,48 @@ fn file_read_file_limit_rejects_a_bare_int_ceiling() {
         "module Main exposing (main)\n",
         "import Ipe.File as File\n",
         "import Ipe.Io as Io\n",
+        "import Ipe.Path as Path exposing (Path)\n",
         "import Ipe.Task as Task\n\n",
+        "readBare : Path -> Task Error String\n",
+        "readBare file =\n",
+        "    File.readFileLimit file 16\n\n",
         "main : Task Error ()\n",
         "main =\n",
-        "    File.readFileLimit (path \"/tmp/ipe-probe\") 16 |> Task.andThen Io.println\n",
+        "    Path.fromString \"/tmp/ipe-probe\"\n",
+        "        |> Task.fromResult\n",
+        "        |> Task.andThen readBare\n",
+        "        |> Task.andThen Io.println\n",
     );
     let outcome = compile_main(main);
     assert!(
         outcome.as_ref().is_err_and(|e| e.contains("ByteSize")),
         "a bare-`Int` ceiling must be a type error naming `ByteSize`: {outcome:?}",
+    );
+}
+
+/// `path` is an ordinary name: a binder called `path` applied to a string
+/// literal is a plain call, whatever the literal holds.
+#[test]
+fn a_binder_named_path_applied_to_a_string_is_an_ordinary_call() {
+    let main = concat!(
+        "module Main exposing (main)\n",
+        "import Ipe.File as File\n",
+        "import Ipe.Path as Path exposing (Path)\n",
+        "import Ipe.Task as Task\n\n",
+        "truncate : Path -> Task Error ()\n",
+        "truncate path =\n",
+        "    File.writeFile path \"\"\n\n",
+        "main : Task Error ()\n",
+        "main =\n",
+        "    Path.fromString \"/tmp/ipe-probe\"\n",
+        "        |> Task.fromResult\n",
+        "        |> Task.andThen truncate\n",
+    );
+    let outcome = compile_main(main);
+    assert!(
+        outcome.is_ok(),
+        "`File.writeFile path \"\"` with a `path` binder must type-check: {:?}",
+        outcome.err(),
     );
 }
 

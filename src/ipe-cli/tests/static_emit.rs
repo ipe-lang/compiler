@@ -87,7 +87,7 @@ fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
     let _ = std::fs::remove_dir_all(&scratch);
     let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
     let out = scratch.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let statik = BuildOptions {
         static_plan: Some(dlmalloc_plan()),
@@ -134,7 +134,7 @@ fn dynamic_build_leaves_user_cargo_config_alone() {
     let _ = std::fs::remove_dir_all(&scratch);
     let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
     let out = scratch.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // The first build claims `out`; the user's config lands in the owned dir.
     ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
@@ -157,7 +157,7 @@ fn static_emit_mimalloc_optin_activates_mimalloc() {
     let _ = std::fs::remove_dir_all(&scratch);
     let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
     let out = scratch.join("out");
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let statik = BuildOptions {
         static_plan: Some(StaticPlan {
@@ -555,7 +555,7 @@ fn end_to_end_static_binary_is_static_and_runs() {
         .join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_e2e");
     let _ = std::fs::remove_dir_all(&out);
-    let runtime = ipe::resolve_runtime().expect("runtime must resolve");
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let plan = dlmalloc_plan();
     build_plan::preflight(&plan).expect("toolchain preflight (musl target + C compiler)");

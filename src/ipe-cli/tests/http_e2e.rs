@@ -92,8 +92,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
         .join(format!("http_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    let runtime = ipe::resolve_runtime()
-        .map_err(|e| -> BoxError { format!("{test_name}: runtime unavailable: {e}").into() })?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
         .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
@@ -289,7 +288,7 @@ main =
 /// Propagates any pipeline, build, or process-launch failure as a test error.
 #[test]
 fn http_get_fixture() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -330,7 +329,7 @@ fn http_get_fixture() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, or process-launch failure as a test error.
 #[test]
 fn http_post_fixture() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 
@@ -381,7 +380,7 @@ fn http_post_fixture() -> Result<(), BoxError> {
 /// Propagates any pipeline, build, or process-launch failure as a test error.
 #[test]
 fn http_ssrf_deny_loopback() -> Result<(), BoxError> {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
 

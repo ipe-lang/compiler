@@ -19,16 +19,16 @@
 //! IPE_E2E=1 cargo test -p ipe --test golden_i111_console_app_seal
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
 #[test]
 fn console_app_ipec_cargo_and_run_zero() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -38,9 +38,7 @@ fn console_app_ipec_cargo_and_run_zero() {
     let out = crate::support::scratch_root().join("ipec_i111_console_app_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(runtime.is_ok(), "runtime must resolve for E2E");
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiler must succeed (this shape can fail with IPE-L0107).
     let built = ipe::build(&entry, &out, &runtime);

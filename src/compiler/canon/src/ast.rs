@@ -181,23 +181,12 @@ pub enum Expr_ {
     Str(String),
     /// A character literal `'a'` — carries its single unescaped character's text.
     Char(String),
-    /// A `path "…"` compile-time-sealed path literal.
-    ///
-    /// The carried [`PathLitText`] exists only by passing
-    /// `PathLitText::seal` (the shared `ipe_path_core` source of truth) under
-    /// EVERY separator regime; it holds each regime's sealed form, so the
-    /// emitted program selects the host form without re-sealing. A literal any
-    /// regime refuses is a compile error (IPE-P0063) emitted before this node
-    /// is ever constructed.
-    ///
-    /// [`PathLitText`]: ipe_diagnostics::path_check::PathLitText
-    PathLit(ipe_diagnostics::path_check::PathLitText),
     /// The reserved `CustomElement.fromFile "<js-path>"` constructor — legal ONLY as the
     /// entire body of a `CustomElement`-annotated binding, applied to a single
     /// string literal. The carried [`String`] is the CLEANED, NUL-free,
     /// non-escaping relative path to the author's widget-hook JS file, validated
-    /// at canonicalisation with `ipe_diagnostics::path_check::PathLitText::seal` (the same
-    /// all-targets path seal the `path "…"` literal uses); a non-literal argument,
+    /// at canonicalisation with `ipe_diagnostics::path_check::PathLitText::seal` (the
+    /// all-targets path seal shared through `ipe_path_core`); a non-literal argument,
     /// a bare `CustomElement.fromFile` value, or a traversing path is a compile error
     /// emitted before this node is ever constructed. The file's existence is
     /// checked later, at the build stage that owns the project root.

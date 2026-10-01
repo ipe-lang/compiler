@@ -20,10 +20,10 @@
 //! IPE_E2E=1 cargo test golden_m6_server
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
-    let joined = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -41,7 +41,7 @@ fn repo_root() -> PathBuf {
 /// * `server_param(…, …clone())` / `server_get_cookie(…, …clone())`
 #[test]
 fn server_request_accessor_emit_inserts_clone() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
 
@@ -54,13 +54,7 @@ fn server_request_accessor_emit_inserts_clone() {
     let out = crate::support::scratch_root().join("ipec_m6_server_request_accessors");
     let _ = std::fs::remove_dir_all(&out);
 
-    let runtime = ipe::resolve_runtime();
-    assert!(
-        runtime.is_ok(),
-        "runtime must resolve for E2E: {:?}",
-        runtime.err()
-    );
-    let Ok(runtime) = runtime else { return };
+    let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
@@ -77,7 +71,7 @@ fn server_request_accessor_emit_inserts_clone() {
         main_rs_path.display(),
         main_rs_result.err()
     );
-    let Ok(main_rs) = main_rs_result else { return };
+    let main_rs = main_rs_result.expect("`main_rs_result` must succeed");
 
     // Each accessor must appear at a call site that includes `.clone()`.
     // The fixture calls all seven on the same `req` binding — without `.clone()`

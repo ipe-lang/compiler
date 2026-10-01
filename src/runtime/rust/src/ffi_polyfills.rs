@@ -24,6 +24,7 @@ pub fn ffi_to_any_polyfill<T>(x: T) -> T {
 // is peephole-resolved to a direct kernel call before emit.
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

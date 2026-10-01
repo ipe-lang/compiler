@@ -36,9 +36,7 @@ fn app_settings_web_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_web_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -58,9 +56,7 @@ fn hard_coded_db_url_secret_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_hardcoded_secret_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -79,9 +75,7 @@ fn non_setting_in_settings_list_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_non_setting_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -101,9 +95,7 @@ fn bare_int_host_bind_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_host_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -123,9 +115,7 @@ fn bare_int_web_csrf_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_csrf_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -145,9 +135,7 @@ fn auth_max_lifetime_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_max_lifetime_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -169,9 +157,7 @@ fn auth_slide_window_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_slide_window_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -194,9 +180,7 @@ fn auth_revocation_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_revocation_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -227,9 +211,7 @@ fn authed_route_revocation_vendored_declares_module() {
     let out = crate::support::scratch_root().join("ipec_authed_route_revocation_vendored_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // runtime unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     // Force the vendored emit model regardless of the environment default —
     // the model whose trimmed `mod.rs` template must carry the revocation append.
     let opts = ipe::BuildOptions {
@@ -263,9 +245,7 @@ fn bare_int_log_level_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_loglevel_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -286,9 +266,7 @@ fn config_binding_threads_into_web_app_and_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_config_binding_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -310,9 +288,7 @@ fn discarded_config_binding_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_discarded_config_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -333,9 +309,7 @@ fn from_env_required_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_fromenv_required_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -356,9 +330,7 @@ fn console_token_settings_seal_builds() {
     let out = crate::support::scratch_root().join("ipec_app_settings_console_token_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return; // resolver unavailable — skip
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
@@ -380,9 +352,7 @@ fn hard_coded_console_token_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_hardcoded_token_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),
@@ -403,9 +373,7 @@ fn config_binding_beside_inline_appwith_is_rejected() {
     let out = crate::support::scratch_root().join("ipec_app_settings_config_beside_inline_appwith");
     let _ = std::fs::remove_dir_all(&out);
 
-    let Ok(runtime) = ipe::resolve_runtime() else {
-        return;
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_err(),

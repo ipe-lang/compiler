@@ -486,6 +486,7 @@ pub fn list_sort_with<A: Clone>(cmp: impl Fn(A, A) -> i64, list: Vec<A>) -> Vec<
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

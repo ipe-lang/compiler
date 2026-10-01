@@ -69,16 +69,7 @@ fn assert_accepted(name: &str, source: &str) {
         return;
     };
     let out = out_dir(name);
-    let runtime = match ipe::resolve_runtime() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            assert!(
-                false_marker(),
-                "{name}: the embedded runtime could not be resolved: {err:?}"
-            );
-            return;
-        }
-    };
+    let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
         Ok(()) => crate::support::assert_seal_builds(name, &out),
         Err(CliError::Pipeline { diag, .. }) => assert!(

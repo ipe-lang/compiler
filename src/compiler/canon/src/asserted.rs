@@ -461,7 +461,6 @@ fn find_asserted_use(
         | Expr_::Str(_)
         | Expr_::MultilineStr { .. }
         | Expr_::Char(_)
-        | Expr_::PathLit(_)
         | Expr_::Unit => None,
     }
 }

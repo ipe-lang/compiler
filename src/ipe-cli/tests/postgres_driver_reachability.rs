@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
-    ipe::resolve_runtime().expect("runtime must resolve for this test")
+    e2e_support::require_runtime().into_path_buf()
 }
 
 /// Minimal Db-kernel-using Ipê program — enough to set `EmitCtx::uses_db =
@@ -118,7 +118,7 @@ fn postgres_driver_selects_postgres_config_template() {
 /// alone cannot catch a missing Cargo feature dependency.
 #[test]
 fn postgres_driver_project_cargo_builds() {
-    if ipe_env::var("IPE_E2E").is_err() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
     let dir = write_project("postgres_cargo_build", ", build = { database = Postgres }");
