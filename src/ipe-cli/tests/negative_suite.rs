@@ -2384,6 +2384,28 @@ fn exhaust_builtin_adt_toplevel_nonexhaustive() {
     assert_rejected("exhaust_builtin_toplevel", &src, "IPE-T0010");
 }
 
+/// A `case` over `ErrorKind` that covers every other kind but omits
+/// `LimitExceeded` is non-exhaustive (IPE-T0010): adding a kind breaks an
+/// exhaustive match at `ipe` time, never as a cargo E0004.
+#[test]
+fn exhaust_error_kind_missing_limit_exceeded_is_non_exhaustive() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         classify : ErrorKind -> String\n\
+         classify k =\n    case k of\n        \
+         Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
+         Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
+         PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n\n\
+         main = Io.println (classify Io)\n"
+    );
+    assert_rejected(
+        "exhaust_error_kind_missing_limit_exceeded",
+        &src,
+        "IPE-T0010",
+    );
+}
+
 /// A fold over the inbound `Ipe.Browser.Geolocation.Internals` `JsMsg` that omits
 /// a denial variant (`Denied`) is non-exhaustive (IPE-T0010) — the compiler-level
 /// guarantee that a browser permission denial can never be silently swallowed by a
