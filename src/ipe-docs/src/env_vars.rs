@@ -117,8 +117,6 @@ impl Subsystem {
 /// - Test-only variables (`IPE_TEST_*`, `IPE_BLESS`, `IPE_RUN_WITH_TEST_VAR`,
 ///   `IPE_LOAD_ENV_PROBE_VAR`, `IPE_HTTP_TEST_URL`, `IPE_ORACLE_SHARED_TARGET`,
 ///   `IPE_DEBUG_TODO_SUBPROCESS`).
-/// - Deprecated `IPE_LIVE_*` aliases (being removed; documented as "deprecated
-///   alias" in the `purpose` field of their canonical `IPE_WEB_*` replacement).
 /// - Build-time baked vars set by `option_env!` only
 ///   (`IPE_BUILD_COMMIT`, `IPE_BUILD_AT`, `IPE_VERSION`) — documented here for
 ///   operator awareness but never read via `std::env::var` at runtime.
@@ -974,7 +972,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_BANNER",
         default: "unset (on in dev)",
         purpose: "Set to `off`, `0`, or `false` to disable the reconnection-status \
-                  banner in the browser client. Deprecated alias: `IPE_LIVE_BANNER`.",
+                  banner in the browser client.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -983,8 +981,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "unset (root-mounted)",
         purpose: "Sub-app mount prefix, e.g. `/billing`. All session-cookie, \
                   CSRF-cookie, and asset paths are scoped to this prefix. Set \
-                  automatically when mounting a sub-app. Deprecated alias: \
-                  `IPE_LIVE_BASE_PATH`.",
+                  automatically when mounting a sub-app.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -992,8 +989,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_CSRF_ORIGIN_CHECK",
         default: "unset (off)",
         purpose: "Set to `on` to enforce strict `Origin`-header cross-origin checking \
-                  on top of the double-submit CSRF token. Deprecated alias: \
-                  `IPE_LIVE_CSRF_ORIGIN_CHECK`.",
+                  on top of the double-submit CSRF token.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1003,7 +999,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Space-separated `Content-Security-Policy: frame-ancestors` allow-list, \
                   e.g. `https://app.example.com`. Enables embedding this app in a \
                   third-party iframe; also sets `SameSite=None; Secure` on session \
-                  cookies. Deprecated alias: `IPE_LIVE_FRAME_ANCESTORS`.",
+                  cookies.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1011,7 +1007,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_HEARTBEAT_TTL_MS",
         default: "35000",
         purpose: "SSE heartbeat interval (ms) the browser uses to detect a stale \
-                  connection. Deprecated alias: `IPE_LIVE_HEARTBEAT_TTL_MS`.",
+                  connection.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1019,8 +1015,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_HELLO_TIMEOUT_MS",
         default: "8000",
         purpose: "Timeout (ms) for the initial SSE hello handshake. The browser \
-                  closes and retries if this deadline passes. Deprecated alias: \
-                  `IPE_LIVE_HELLO_TIMEOUT_MS`.",
+                  closes and retries if this deadline passes.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1028,8 +1023,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_MAX_BODY_BYTES",
         default: "33554432 (32 MiB)",
         purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
-                  for large file uploads; lower to tighten the DoS floor. Deprecated \
-                  alias: `IPE_LIVE_MAX_BODY_BYTES`.",
+                  for large file uploads; lower to tighten the DoS floor.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1037,8 +1031,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_MAX_SESSIONS",
         default: "50000",
         purpose: "Maximum concurrent web sessions before new connections are rejected. \
-                  Prevents unbounded memory growth under a session-creation flood. \
-                  Deprecated alias: `IPE_LIVE_MAX_SESSIONS`.",
+                  Prevents unbounded memory growth under a session-creation flood.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1055,8 +1048,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_QUEUE_MAX",
         default: "50",
-        purpose: "Maximum queued events per session before back-pressure is applied. \
-                  Deprecated alias: `IPE_LIVE_QUEUE_MAX`.",
+        purpose: "Maximum queued events per session before back-pressure is applied.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1075,7 +1067,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_RETRY_BASE_MS",
         default: "500",
         purpose: "Initial retry interval (ms) for client reconnection after a \
-                  disconnect. Deprecated alias: `IPE_LIVE_RETRY_BASE_MS`.",
+                  disconnect.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1092,23 +1084,21 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "3000",
         purpose: "Duration (ms) of the fast-retry window after a disconnect. Set to \
                   `8000` automatically by `ipe watch` to accommodate server restart \
-                  time. Deprecated alias: `IPE_LIVE_RETRY_FAST_WINDOW_MS`.",
+                  time.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_ATTEMPTS",
         default: "10",
-        purpose: "Maximum reconnection attempts before the client stops retrying. \
-                  Deprecated alias: `IPE_LIVE_RETRY_MAX_ATTEMPTS`.",
+        purpose: "Maximum reconnection attempts before the client stops retrying.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_MS",
         default: "16000",
-        purpose: "Maximum retry interval (ms) — the exponential back-off ceiling. \
-                  Deprecated alias: `IPE_LIVE_RETRY_MAX_MS`.",
+        purpose: "Maximum retry interval (ms) — the exponential back-off ceiling.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1117,7 +1107,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "1500",
         purpose: "Grace period (ms) between receiving SIGTERM and closing active \
                   connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown. Deprecated alias: `IPE_LIVE_SHUTDOWN_GRACE_MS`.",
+                  immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1125,8 +1115,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_SSE_BUFFER",
         default: "16",
         purpose: "SSE channel buffer capacity per session (clamped 1–1024). A full \
-                  buffer applies TCP backpressure rather than dropping events. \
-                  Deprecated alias: `IPE_LIVE_SSE_BUFFER`.",
+                  buffer applies TCP backpressure rather than dropping events.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1134,8 +1123,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_STATIC_DIR",
         default: "unset",
         purpose: "Directory served at `/static/*`. Populated from `package.ipe [web] \
-                  static`. Path traversal is blocked by construction. Deprecated alias: \
-                  `IPE_LIVE_STATIC_DIR`.",
+                  static`. Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1180,8 +1168,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_TTL",
         default: "1800 (30 min)",
         purpose: "Session idle TTL. Accepts seconds (`1800`) or duration strings \
-                  (`30m`, `1h`). Takes precedence over `Web.sessionTtl`. Deprecated \
-                  alias: `IPE_LIVE_TTL`.",
+                  (`30m`, `1h`). Takes precedence over `Web.sessionTtl`.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1235,7 +1222,7 @@ pub static ENV_VARS: &[EnvVar] = &[
 ];
 
 /// Set of variable names that are intentionally excluded from the drift gate
-/// because they are test-only, build-time baked, or deprecated aliases.
+/// because they are test-only or build-time baked.
 ///
 /// The drift gate checks that every `IPE_*` string literal read at runtime
 /// appears in `ENV_VARS` OR in this exclusion set.
@@ -1280,27 +1267,6 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TMP", // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
     "IPE_WINDOWS_E2E_ENV_CHILD", // Windows jail e2e: marks the env-seeded re-exec
-    // Deprecated IPE_LIVE_* aliases — documented in the canonical IPE_WEB_* entry.
-    "IPE_LIVE_BANNER",
-    "IPE_LIVE_BASE_PATH",
-    "IPE_LIVE_CSRF_ORIGIN_CHECK",
-    "IPE_LIVE_FRAME_ANCESTORS",
-    "IPE_LIVE_HEARTBEAT_TTL_MS",
-    "IPE_LIVE_HELLO_TIMEOUT_MS",
-    "IPE_LIVE_MAX_BODY_BYTES",
-    "IPE_LIVE_MAX_SESSIONS",
-    "IPE_LIVE_PORT",
-    "IPE_LIVE_QUEUE_MAX",
-    "IPE_LIVE_RETRY_BASE_MS",
-    "IPE_LIVE_RETRY_FAST_WINDOW_MS",
-    "IPE_LIVE_RETRY_MAX_ATTEMPTS",
-    "IPE_LIVE_RETRY_MAX_MS",
-    "IPE_LIVE_SHUTDOWN_GRACE_MS",
-    "IPE_LIVE_SSE_BUFFER",
-    "IPE_LIVE_STATIC_DIR",
-    "IPE_LIVE_STORE",
-    "IPE_LIVE_STORE_PATH",
-    "IPE_LIVE_TTL",
     // Dev-loop-internal listener relocation port — set by `ipe watch` and the
     // dev console proxy on the child they spawn (never operator-set); it
     // outranks the operator port vars and is never inherited by `Process.*` children.
@@ -1402,5 +1368,140 @@ mod tests {
                 "EXCLUDED_NAMES: '{name}' also appears in ENV_VARS — remove it from one",
             );
         }
+    }
+
+    /// Every `IPE_*` alias name documented in `purpose` (`alias for` / `alias:`).
+    fn aliases_in_purpose(purpose: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for marker in ["alias for `", "alias: `"] {
+            let mut rest = purpose;
+            while let Some(pos) = rest.find(marker) {
+                let Some(after) = rest.get(pos + marker.len()..) else {
+                    break;
+                };
+                let Some(end) = after.find('`') else { break };
+                let Some(name) = after.get(..end) else { break };
+                if name.starts_with("IPE_") {
+                    out.push(name);
+                }
+                let Some(next) = after.get(end + 1..) else {
+                    break;
+                };
+                rest = next;
+            }
+        }
+        out
+    }
+
+    /// Whether `s` matches `IPE_[A-Z0-9_]+` with a non-empty suffix.
+    fn is_valid_ipe_name(s: &str) -> bool {
+        let Some(suffix) = s.strip_prefix("IPE_") else {
+            return false;
+        };
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Fold every `IPE_*` string literal in `src` into `out`.
+    fn collect_ipe_literals(src: &str, out: &mut std::collections::BTreeSet<String>) {
+        let mut rest = src;
+        while let Some(pos) = rest.find("\"IPE_") {
+            let Some(after_quote) = rest.get(pos + 1..) else {
+                break;
+            };
+            rest = after_quote;
+            let end = rest.find('"').unwrap_or(rest.len());
+            let Some(candidate) = rest.get(..end) else {
+                break;
+            };
+            if is_valid_ipe_name(candidate) {
+                out.insert(candidate.to_owned());
+            }
+            let Some(next) = rest.get(end..) else { break };
+            rest = next;
+        }
+    }
+
+    /// Every `IPE_*` string literal read anywhere under `src/runtime/rust/src`.
+    ///
+    /// The runtime's own reader surface, independent of what any registry
+    /// entry claims.
+    fn runtime_reader_names() -> std::collections::BTreeSet<String> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime/rust/src");
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let skip = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('.') || n == "target");
+                    if !skip {
+                        stack.push(path);
+                    }
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && let Ok(src) = std::fs::read_to_string(&path)
+                {
+                    collect_ipe_literals(&src, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// The first alias `purpose` documents with no entry in `readers`.
+    ///
+    /// `None` when every documented alias has a runtime reader.
+    fn first_unread_alias<'a>(
+        purpose: &'a str,
+        readers: &std::collections::BTreeSet<String>,
+    ) -> Option<&'a str> {
+        aliases_in_purpose(purpose)
+            .into_iter()
+            .find(|alias| !readers.contains(*alias))
+    }
+
+    /// A documented alias must be one the runtime actually reads.
+    ///
+    /// Never a name the runtime has dropped — that would make the docs
+    /// promise a fallback that silently never fires.
+    #[test]
+    fn documented_aliases_have_a_runtime_reader() {
+        let readers = runtime_reader_names();
+        for entry in ENV_VARS {
+            let missing = first_unread_alias(entry.purpose, &readers);
+            assert!(
+                missing.is_none(),
+                "ENV_VARS: '{}' documents alias '{}' with no reader in src/runtime/rust/src",
+                entry.name,
+                missing.unwrap_or_default(),
+            );
+        }
+    }
+
+    /// Refusal: an alias the runtime does not read must fail the check above.
+    #[test]
+    fn a_registry_entry_naming_an_unread_alias_fails_the_check() {
+        let readers = runtime_reader_names();
+        let synthetic = EnvVar {
+            name: "IPE_SYNTHETIC_PROBE_CANONICAL",
+            default: "unset",
+            purpose: "Synthetic probe entry. Deprecated alias: \
+                      `IPE_SYNTHETIC_UNREAD_ALIAS_PROBE_8F2C`.",
+            subsystem: Subsystem::Web,
+            class: Class::Tunable,
+        };
+        assert_eq!(
+            first_unread_alias(synthetic.purpose, &readers),
+            Some("IPE_SYNTHETIC_UNREAD_ALIAS_PROBE_8F2C"),
+            "a synthetic alias with no runtime reader must be reported as unread",
+        );
     }
 }
