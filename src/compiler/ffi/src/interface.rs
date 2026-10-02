@@ -8,10 +8,11 @@
 //! (the kernel-registry design's OPEN DECISION 1, resolved by construction).
 //!
 //! Inclusion is gated fail-closed: a function reaches the interface only when
-//! its wrapper region actually exists in `_bindings.rs`, its signature's
-//! opaque foreign types all resolve to unambiguous Rust paths, and no foreign
-//! type shadows an Ipê reserved builtin type. Anything else is skipped with a
-//! reason (over-drop, never an under-bind that `cargo` rejects).
+//! its wrapper region actually exists in `_bindings.rs`, every word of its
+//! signature lexes as an Ipê identifier, its opaque foreign types all resolve
+//! to unambiguous Rust paths, and no foreign type shadows an Ipê reserved
+//! builtin type. Anything else is skipped with a reason (over-drop, never an
+//! under-bind that `ipe` or `cargo` rejects).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -406,6 +407,26 @@ fn valid_ipe_value_name(name: &str) -> bool {
     ipe_parse::is_identifier(name) && name.starts_with(|c: char| c.is_ascii_lowercase())
 }
 
+/// `true` when `name` is an Ipê type identifier the generated module may
+/// declare: one plain identifier token, uppercase-led.
+fn valid_ipe_type_name(name: &str) -> bool {
+    ipe_parse::is_identifier(name) && name.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// The first word of an inspected binding's Ipê signature that does not lex
+/// as one Ipê identifier, if any.
+///
+/// The signature is assembled from inspector text (a `foreign_ty`, an
+/// `ipeType` override, the receiver type) that follows Rust's Unicode
+/// identifier grammar, while the Ipê lexer admits only the ASCII
+/// [`ipe_parse::is_identifier`] shape. A word is a maximal run of scalars that
+/// are not ASCII separators, so a non-ASCII scalar stays inside the word
+/// carrying it and that word is refused whole.
+fn unlexable_signature_word(sig: &str) -> Option<&str> {
+    sig.split(|c: char| c.is_ascii() && !ipe_parse::is_ident_continue(c))
+        .find(|w| !w.is_empty() && !ipe_parse::is_identifier(w))
+}
+
 /// The classification's transparent set narrowed to the names this interface
 /// may surface. Each exclusion is fail-closed and recorded: a name that
 /// collides with a reserved builtin, a poisoned nominal, or a fn-signature
@@ -694,6 +715,16 @@ pub fn crate_interface(pkg: &PkgInfo) -> CrateInterface {
             );
             continue;
         }
+        let sig = wrapper_ipe_signature(f);
+        // Every type the generated module declares or names must lex as Ipê;
+        // a foreign `Ñandu` reaching the module would fail the whole import.
+        if let Some(bad) = unlexable_signature_word(&sig) {
+            skip(
+                &format!("signature word `{bad}` does not lex as an Ipê identifier"),
+                &mut skipped,
+            );
+            continue;
+        }
         if !survivors.contains(&ref_name) {
             skip("no wrapper region in _bindings.rs", &mut skipped);
             continue;
@@ -712,7 +743,6 @@ pub fn crate_interface(pkg: &PkgInfo) -> CrateInterface {
             );
             continue;
         }
-        let sig = wrapper_ipe_signature(f);
         // A tuple anywhere in the signature renders as a Rust tuple whose
         // integer components keep their RAW widths (`(u64, u16)`), while the
         // Ipê signature maps every integer to `Int` (i64) — the forwarder
@@ -850,6 +880,13 @@ pub fn crate_interface(pkg: &PkgInfo) -> CrateInterface {
     // mirrors `claim_nominal`'s define-vs-transparent refusal: each nominal is
     // surfaced by at most ONE surface, whichever declares it second is dropped.
     for (name, path) in pkg.declared_opaques() {
+        if !valid_ipe_type_name(name) {
+            skipped.push(SkippedBinding {
+                ref_name: format!("type {name}"),
+                reason: format!("declared opaque `{name}` is not an uppercase-led Ipê identifier"),
+            });
+            continue;
+        }
         if define_types.contains(name) {
             skipped.push(SkippedBinding {
                 ref_name: format!("type {name}"),
@@ -1424,6 +1461,120 @@ mod tests {
         }
         for good in ["alias", "port", "where", "major_field", "x1"] {
             assert!(valid_ipe_value_name(good), "{good:?} refused");
+        }
+    }
+
+    /// A signature word the Ipê lexer cannot tokenize as one identifier is
+    /// found whole; ASCII words, separators, and records pass.
+    #[test]
+    fn unlexable_signature_words_are_found_whole() {
+        for (sig, bad) in [
+            ("Int -> \u{d1}andu", "\u{d1}andu"),
+            ("List Caf\u{e9} -> Int", "Caf\u{e9}"),
+            ("Int \u{2192} Int", "\u{2192}"),
+            ("Maybe x\u{0301} -> Int", "x\u{0301}"),
+            ("foreign -> Int", "foreign"),
+        ] {
+            assert_eq!(unlexable_signature_word(sig), Some(bad), "{sig:?}");
+        }
+        for sig in [
+            "Int -> Result Error (Maybe Version)",
+            "(Int, String) -> Task Error ()",
+            "{ x : Int } -> List a -> Ipe.Json.Value",
+        ] {
+            assert_eq!(unlexable_signature_word(sig), None, "{sig:?}");
+        }
+    }
+
+    /// A foreign function whose Rust name is the Ipê keyword `foreign`, and one
+    /// whose foreign type is a non-ASCII Rust identifier, are skipped with a
+    /// recorded reason; the module never names either, so it still lexes.
+    #[test]
+    fn keyword_named_and_non_ascii_typed_bindings_are_refused() {
+        let doc = serde_json::json!({
+            "pkg": "kw",
+            "name": "kw",
+            "version": "0.1.0",
+            "functions": [
+                {
+                    "name": "foreign",
+                    "params": [{"name": "n", "type": "i64"}],
+                    "results": [{"name": "", "type": "i64"}],
+                    "effect": "pure"
+                },
+                {
+                    "name": "nandu",
+                    "params": [],
+                    "results": [{"name": "", "type": "kw::\u{d1}andu"}],
+                    "effect": "pure"
+                },
+                {
+                    "name": "shift",
+                    "params": [{"name": "n", "type": "i64"}],
+                    "results": [{"name": "", "type": "i64"}],
+                    "effect": "pure"
+                }
+            ],
+            "errors": [],
+            "transitiveDeps": [{"ident": "kw", "name": "kw", "version": "0.1.0"}]
+        });
+        let pkg = PkgInfo::decode_json(&doc.to_string()).expect("decodes");
+        let iface = crate_interface(&pkg);
+        let names: Vec<&str> = iface.bindings.iter().map(|b| b.ref_name.as_str()).collect();
+        assert_eq!(names, vec!["shift"], "{:?}", iface.skipped);
+        let reason_of = |name: &str| {
+            iface
+                .skipped
+                .iter()
+                .find(|s| s.ref_name == name)
+                .map(|s| s.reason.clone())
+        };
+        assert_eq!(
+            reason_of("foreign").as_deref(),
+            Some("name is not a legal Ipê identifier"),
+            "{:?}",
+            iface.skipped
+        );
+        assert_eq!(
+            reason_of("nandu").as_deref(),
+            Some("signature word `\u{d1}andu` does not lex as an Ipê identifier"),
+            "{:?}",
+            iface.skipped
+        );
+        assert!(!iface.opaque_types.contains_key("\u{d1}andu"));
+        assert!(iface.source.is_ascii(), "{}", iface.source);
+        assert!(
+            !iface.source.contains("foreign"),
+            "the keyword-named binding reached the module: {}",
+            iface.source
+        );
+    }
+
+    /// A declared opaque whose nominal is not an uppercase-led Ipê identifier
+    /// is skipped, never declared as a `type` the module cannot lex.
+    #[test]
+    fn a_declared_opaque_with_an_unlexable_name_is_refused() {
+        for bad in ["\u{d1}andu", "conn", "Two Words", "Caf\u{e9}"] {
+            let doc = serde_json::json!({
+                "pkg": "postgres",
+                "name": "postgres",
+                "version": "0.1.0",
+                "functions": [],
+                "errors": [],
+                "declaredOpaques": { bad: "::postgres::Client" }
+            });
+            let pkg = PkgInfo::decode_json(&doc.to_string()).expect("decodes");
+            let iface = crate_interface(&pkg);
+            assert!(!iface.opaque_types.contains_key(bad), "{bad:?} declared");
+            assert!(
+                iface
+                    .skipped
+                    .iter()
+                    .any(|s| s.ref_name == format!("type {bad}")
+                        && s.reason.contains("is not an uppercase-led Ipê identifier")),
+                "{bad:?}: {:?}",
+                iface.skipped
+            );
         }
     }
 

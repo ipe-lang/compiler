@@ -6,6 +6,7 @@ use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path,
     ffi, fs, project, render, runtime_embed, text,
 };
+use ipe_backend_rust::rust_str_lit;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -1897,11 +1898,12 @@ pub fn compile_prepared(
 /// The registration is a single `ipe_runtime::web::widget_assets::register(&[…])`
 /// call spliced in right after `install_panic_classifier();` in the generated
 /// `main()` — the first line of the entry point, before any task runs. Each
-/// `(tag, content)` is rendered as a Rust string-literal pair; the content is
-/// emitted as a raw string literal with a hash fence wide enough to clear any run
-/// of `#` in the file, so arbitrary JS (including embedded `"` / `#`) is a valid
-/// literal and no author byte can break out of the string into code (the content
-/// is DATA in the emitted program, exactly as it is data in the browser).
+/// `(tag, content)` is rendered as a Rust string-literal pair through the
+/// backend's one literal owner, `rust_str_lit`, which escapes every scalar the
+/// literal grammar cannot carry raw (`"`, `\`, a lone CR, a bidi override), so
+/// arbitrary JS is a valid literal rustc accepts and no author byte can break
+/// out of the string into code (the content is DATA in the emitted program,
+/// exactly as it is data in the browser).
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `src/main.rs` is absent
@@ -1933,9 +1935,9 @@ pub fn inject_widget_registration(
     let mut entries = String::new();
     for (tag, content) in manifest {
         entries.push_str("        (");
-        entries.push_str(&rust_str_literal(tag));
+        entries.push_str(&rust_str_lit(tag));
         entries.push_str(", ");
-        entries.push_str(&rust_raw_str_literal(content));
+        entries.push_str(&rust_str_lit(content));
         entries.push_str("),\n");
     }
     let call = format!("\n    ipe_runtime::web::widget_assets::register(&[\n{entries}    ]);\n");
@@ -2050,36 +2052,6 @@ pub fn inject_wasm_widget_bundle(
     };
     index.insert_str(pos, &scripts);
     Ok(())
-}
-
-/// Render `s` as a double-quoted Rust string literal.
-///
-/// Rust's own `Debug` grammar escapes every character a literal cannot carry
-/// raw, bidi overrides included.
-pub fn rust_str_literal(s: &str) -> String {
-    format!("{s:?}")
-}
-
-/// Render `s` as a Rust RAW string literal `r#"…"#` with a hash fence wide enough
-/// to clear any `"#` run inside `s`, so arbitrary content (author JS with quotes
-/// and hashes) is emitted verbatim as data — it can never terminate the literal
-/// early and spill into code.
-pub fn rust_raw_str_literal(s: &str) -> String {
-    // The fence must be longer than the longest run of `#` that immediately
-    // follows a `"` in the content (that is the only sequence that could close a
-    // raw literal). Computing the max `#`-run overall is a safe over-approximation.
-    let mut max_hashes = 0usize;
-    let mut run = 0usize;
-    for ch in s.chars() {
-        if ch == '#' {
-            run += 1;
-            max_hashes = max_hashes.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    let fence = "#".repeat(max_hashes + 1);
-    format!("r{fence}\"{s}\"{fence}")
 }
 
 /// Write an emitted project to `target`, vendoring the runtime module tree
@@ -2694,9 +2666,37 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A widget's JS reaches the emitted `main.rs` with every bidi override and
+    /// lone CR escaped, since rustc refuses either raw inside any string literal.
     #[test]
-    fn rust_str_literal_escapes_quotes_backslashes_and_bidi_overrides() {
-        assert_eq!(rust_str_literal("a\u{202E}\"b\\"), r#""a\u{202e}\"b\\""#);
+    fn widget_registration_escapes_bidi_and_lone_cr_in_content() {
+        let mut files = BTreeMap::new();
+        let rel = ipe_backend::RelPath::new("src/main.rs").expect("valid rel path");
+        files.insert(
+            rel,
+            "fn main() {\n    install_panic_classifier();\n}\n".to_owned(),
+        );
+        let mut emitted = ipe_backend::EmittedProject {
+            files,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        };
+        let manifest = BTreeMap::from([(
+            "x-w\u{202E}".to_owned(),
+            "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
+        )]);
+        assert!(inject_widget_registration(&mut emitted, &manifest).is_ok());
+        let main = emitted.files.get("src/main.rs").map_or("", String::as_str);
+        assert!(
+            !main.contains(['\u{202E}', '\u{2066}', '\r']),
+            "a raw bidi override or lone CR reached the emitted literal: {main}"
+        );
+        assert!(
+            main.contains(
+                r###"("x-w\u{202e}", "/* \u{202e}evil\u{2066} */ a\rb \"#\"## c\\d"),"###
+            ),
+            "the widget pair is not the Debug-escaped literal pair: {main}"
+        );
     }
 
     /// A build whose caller states no intent is a release build.

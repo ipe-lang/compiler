@@ -5,20 +5,7 @@ use crate::EmitCtx;
 use core::fmt::Write as _;
 use ipe_ir::free_vars::pat_has_str_guard_slot;
 
-/// Render `s` as a Rust double-quoted string literal through Rust's own
-/// `Debug` grammar for `str`.
-///
-/// `{s:?}` escapes every character the Rust string-literal grammar cannot
-/// carry raw: `\`, `"`, and every non-printable scalar (controls, format
-/// characters, bidi overrides) as `\u{..}`. The one-escaper-per-grammar
-/// property matters here because a raw bidi override (e.g. U+202E) in an
-/// emitted literal trips rustc's deny-by-default
-/// `text_direction_codepoint_in_literal` lint — an `ipe`-accepts-then-
-/// `cargo`-fails SEAL break — while a hand-picked `\`/`"`-only escaper lets
-/// it through. On printable ASCII, `Debug` escapes exactly `\` and `"`.
-pub fn rust_str_lit(s: &str) -> String {
-    format!("{s:?}")
-}
+pub use ipe_intern::rust_str_lit;
 
 /// Emit the scrutinee of a `Match` plus its two mode flags. A string scrutinee is
 /// matched as `&str` (so literal patterns apply) — the presence of a `Pat::Str`
