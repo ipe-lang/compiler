@@ -775,7 +775,9 @@ pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerRespo
 
 // ─── listen + axum adapter (step 4) ───────────────────────────────────────
 
-const DEFAULT_MAX_BODY: usize = 32 * 1024 * 1024; // 32 MiB
+// `pub(crate)`: read back by the `web` module's env-doc pin test, which
+// checks the `IPE_WEB_MAX_BODY_BYTES` registry entry states this value too.
+pub(crate) const DEFAULT_MAX_BODY: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Request-body cap. Overridable via `IPE_WEB_MAX_BODY_BYTES`; falls back to
 /// 32 MiB.

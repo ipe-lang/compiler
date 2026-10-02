@@ -1021,9 +1021,13 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_MAX_BODY_BYTES",
-        default: "33554432 (32 MiB)",
-        purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
-                  for large file uploads; lower to tighten the DoS floor.",
+        default: "5242880 (5 MiB) for `Web.tea` routes (`/_ipe/event`); 33554432 \
+                  (32 MiB) for `Server.listen` routes",
+        purpose: "Maximum inbound request-body size (bytes). Two surfaces share this \
+                  name with two defaults: `Web.tea`'s `/_ipe/event` endpoint (5 MiB, \
+                  covers `Event.onFile`/`Event.onImage` data-URL payloads) and plain \
+                  `Server.listen` routes (32 MiB). Raise for large file uploads; lower \
+                  to tighten the DoS floor.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

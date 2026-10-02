@@ -1668,6 +1668,11 @@ fn page_response_with_overlay(
     resp
 }
 
+// `pub(crate)`: read back by this module's env-doc pin test, which checks
+// the `IPE_WEB_MAX_BODY_BYTES` registry entry states this value too.
+#[cfg(feature = "server")]
+pub(crate) const DEFAULT_WEB_MAX_BODY: usize = 5 << 20; // 5 MiB = 5_242_880
+
 /// Maximum request body bytes for `/_ipe/event`: `IPE_WEB_MAX_BODY_BYTES`,
 /// default 5 MiB (5 << 20 = 5 242 880). The default covers `Event.onFile` /
 /// `Event.onImage` data-URL payloads; override for larger file uploads.
@@ -1677,7 +1682,7 @@ fn web_max_body_bytes() -> usize {
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(5 << 20)
+        .unwrap_or(DEFAULT_WEB_MAX_BODY)
 }
 
 #[cfg(test)]
@@ -6683,8 +6688,7 @@ mod security_env_tests {
 
     #[test]
     fn web_max_body_bytes_new_name_and_default() {
-        use super::web_max_body_bytes;
-        const DEFAULT: usize = 5 << 20;
+        use super::{DEFAULT_WEB_MAX_BODY, web_max_body_bytes};
 
         crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
 
@@ -6692,7 +6696,7 @@ mod security_env_tests {
         // would reject all /_ipe/event POSTs.
         assert_eq!(
             web_max_body_bytes(),
-            DEFAULT,
+            DEFAULT_WEB_MAX_BODY,
             "unset → 5 MiB default must be preserved"
         );
 
@@ -6706,7 +6710,54 @@ mod security_env_tests {
         crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
 
         // Restore default.
-        assert_eq!(web_max_body_bytes(), DEFAULT);
+        assert_eq!(web_max_body_bytes(), DEFAULT_WEB_MAX_BODY);
+    }
+
+    // ── IPE_WEB_MAX_BODY_BYTES doc states both defaults ──────────────────────
+    //
+    // `IPE_WEB_MAX_BODY_BYTES` has two owners with two defaults — this
+    // module's `DEFAULT_WEB_MAX_BODY` (5 MiB, `Web.tea`'s `/_ipe/event`) and
+    // `server::DEFAULT_MAX_BODY` (32 MiB, `Server.listen`) — but one env-doc
+    // entry. The doc text is read back here and checked against both
+    // constants, so a value that drifts in only one place (doc or code)
+    // fails this test instead of shipping silently wrong.
+    #[test]
+    fn ipe_web_max_body_bytes_doc_states_both_defaults() {
+        use super::DEFAULT_WEB_MAX_BODY;
+
+        let doc_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ipe-docs/src/env_vars.rs");
+        let doc = std::fs::read_to_string(&doc_path)
+            .expect("src/ipe-docs/src/env_vars.rs must be readable from the runtime crate");
+
+        let entry_start = doc
+            .find("name: \"IPE_WEB_MAX_BODY_BYTES\"")
+            .expect("IPE_WEB_MAX_BODY_BYTES entry must exist in ENV_VARS");
+        let entry_end = doc[entry_start..]
+            .find("EnvVar {")
+            .map_or(doc.len(), |rel| entry_start + rel);
+        let entry = &doc[entry_start..entry_end];
+
+        let default_start = entry
+            .find("default: \"")
+            .map(|i| i + "default: \"".len())
+            .expect("IPE_WEB_MAX_BODY_BYTES entry must have a default field");
+        let default_len = entry[default_start..]
+            .find('"')
+            .expect("default field must be a closed string literal");
+        let documented_default = &entry[default_start..default_start + default_len];
+
+        assert!(
+            documented_default.contains(&DEFAULT_WEB_MAX_BODY.to_string()),
+            "IPE_WEB_MAX_BODY_BYTES doc default {documented_default:?} must state the \
+             Web.tea /_ipe/event default ({DEFAULT_WEB_MAX_BODY} bytes)"
+        );
+        assert!(
+            documented_default.contains(&crate::server::DEFAULT_MAX_BODY.to_string()),
+            "IPE_WEB_MAX_BODY_BYTES doc default {documented_default:?} must state the \
+             Server.listen default ({} bytes)",
+            crate::server::DEFAULT_MAX_BODY
+        );
     }
 }
 
