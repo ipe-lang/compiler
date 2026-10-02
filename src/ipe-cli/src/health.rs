@@ -613,10 +613,11 @@ fn check_runtime() -> Check {
 ///
 /// The check order:
 /// 1. Already configured in `~/.cargo/config.toml` → `Ok`, nothing to do.
-/// 2. A linker is on PATH AND passes a link probe → offer the `rustflags` fix.
-/// 3. A linker is on PATH but fails the probe → report found-but-rejected
+/// 2. The host's link driver is [`LinkDriver::Msvc`] → not applicable, no fix.
+/// 3. A linker is on PATH AND passes a link probe → offer the `rustflags` fix.
+/// 4. A linker is on PATH but fails the probe → report found-but-rejected
 ///    (neutral; never offer a fix that would break the user's builds).
-/// 4. Nothing found → suggest installation.
+/// 5. Nothing found → suggest installation.
 fn check_linker() -> Check {
     // 1. Already configured: the `rustflags` key for the host target is present
     //    in `~/.cargo/config.toml` and contains a `-fuse-ld=` flag.
@@ -631,7 +632,23 @@ fn check_linker() -> Check {
         };
     }
 
-    // 2 & 3. Probe candidates in fastest-first order.
+    // 2. MSVC's `link.exe` has no `-fuse-ld` equivalent: the fast-linker axis
+    //    does not apply, so never probe or offer a `ConfigEdit` it would
+    //    ignore.
+    if host_link_driver() == LinkDriver::Msvc {
+        return Check {
+            group: Group::Linker,
+            id: "linker",
+            status: Status::Ok,
+            detail: "fast-linker selection does not apply on this toolchain (MSVC's link.exe \
+                     has no -fuse-ld equivalent)"
+                .to_owned(),
+            suggestion: None,
+            fix: None,
+        };
+    }
+
+    // 3 & 4. Probe candidates in fastest-first order.
     let candidates: &[&str] = &["mold", "ld.lld", "lld", "ld.gold"];
     for name in candidates {
         let id: &'static str = match *name {
@@ -685,7 +702,7 @@ fn check_linker() -> Check {
         }
     }
 
-    // 4. Nothing found.
+    // 5. Nothing found.
     Check {
         group: Group::Linker,
         id: "linker",
@@ -736,6 +753,48 @@ fn linker_already_configured() -> bool {
     false
 }
 
+/// The link driver a `rustc` triple's linker argument convention follows.
+///
+/// A `cc`/`gcc`-style driver accepts `-fuse-ld=<name>`; MSVC's `link.exe` has
+/// no such flag, so a fast-linker fix must be keyed on this type, never
+/// offered merely because *some* name on PATH happens to probe clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkDriver {
+    /// A `cc`/`gcc`-style driver (gnu, musl, darwin, freebsd, …): honours
+    /// `-fuse-ld=<name>`.
+    CcDriver,
+    /// MSVC's `link.exe`: no `-fuse-ld` equivalent.
+    Msvc,
+}
+
+impl LinkDriver {
+    /// Parse the link driver from a `rustc` triple (host or target).
+    ///
+    /// Every `*-msvc` triple is [`LinkDriver::Msvc`]; everything else is
+    /// [`LinkDriver::CcDriver`]. Pure and total over any triple string.
+    const fn from_triple(triple: &str) -> Self {
+        if triple.ends_with("-msvc") {
+            Self::Msvc
+        } else {
+            Self::CcDriver
+        }
+    }
+}
+
+/// The host's link driver, read from the `rustc -vV` `host:` line.
+///
+/// Absent or unparsable `rustc` output resolves to [`LinkDriver::Msvc`]: fail
+/// closed, since the unsafe direction is offering `-fuse-ld` to a driver that
+/// cannot act on it, never the reverse.
+fn host_link_driver() -> LinkDriver {
+    rustc_vv_text()
+        .as_deref()
+        .and_then(|text| text.lines().find_map(|l| l.strip_prefix("host:")))
+        .map_or(LinkDriver::Msvc, |triple| {
+            LinkDriver::from_triple(triple.trim())
+        })
+}
+
 /// Outcome of a toolchain-level linker probe.
 enum LinkerProbeResult {
     /// The toolchain accepted `-fuse-ld=<name>` and linked successfully.
@@ -760,16 +819,26 @@ fn probe_linker(name: &str) -> LinkerProbeResult {
     result
 }
 
-/// The `rustc -vV` release line, used as the cache invalidation key. `None`
-/// when `rustc` is not on PATH or its output cannot be parsed.
-fn rustc_version_string() -> Option<String> {
+/// Raw `rustc -vV` stdout.
+///
+/// `None` when `rustc` is not on PATH, exits non-zero, or its output is not
+/// valid UTF-8. Both [`rustc_version_string`] (the probe cache key) and
+/// [`host_link_driver`] (the `-fuse-ld` gate) parse this one invocation's
+/// text, rather than each shelling out to `rustc` on its own.
+fn rustc_vv_text() -> Option<String> {
     let out = Command::new("rustc").arg("-vV").output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8(out.stdout).ok()?;
+    String::from_utf8(out.stdout).ok()
+}
+
+/// The `rustc -vV` release line, used as the cache invalidation key. `None`
+/// when `rustc` is not on PATH or its output cannot be parsed.
+fn rustc_version_string() -> Option<String> {
     // The "release:" line uniquely identifies the toolchain version.
-    text.lines()
+    rustc_vv_text()?
+        .lines()
         .find(|l| l.starts_with("release:"))
         .map(str::to_owned)
 }
@@ -2082,6 +2151,34 @@ mod tests {
     }
 
     #[test]
+    fn an_msvc_host_offers_no_fuse_ld_fix() {
+        // Pure over the triple: every MSVC triple parses to LinkDriver::Msvc,
+        // the branch that short-circuits check_linker before any probe runs
+        // or any ConfigEdit fix is offered. Every other driver family stays
+        // CcDriver, so the `-fuse-ld` probe still runs for them.
+        assert_eq!(
+            LinkDriver::from_triple("x86_64-pc-windows-msvc"),
+            LinkDriver::Msvc
+        );
+        assert_eq!(
+            LinkDriver::from_triple("aarch64-pc-windows-msvc"),
+            LinkDriver::Msvc
+        );
+        assert_eq!(
+            LinkDriver::from_triple("x86_64-pc-windows-gnu"),
+            LinkDriver::CcDriver
+        );
+        assert_eq!(
+            LinkDriver::from_triple("x86_64-unknown-linux-gnu"),
+            LinkDriver::CcDriver
+        );
+        assert_eq!(
+            LinkDriver::from_triple("aarch64-apple-darwin"),
+            LinkDriver::CcDriver
+        );
+    }
+
+    #[test]
     fn linker_edit_emits_rustflags_array_not_linker_key() {
         let edit = linker_edit("mold");
         // The key must target rustflags, not linker.
@@ -2100,6 +2197,10 @@ mod tests {
         }
     }
 
+    // On an MSVC host check_linker never reaches run_link_probe (the
+    // LinkDriver::Msvc branch returns first), so this probe-level test has
+    // no guard left to prove there — it would pass vacuously.
+    #[cfg(not(target_env = "msvc"))]
     #[test]
     fn probe_rejected_linker_offers_no_fix() {
         // Simulate a probe rejection: a linker name that no toolchain has.
