@@ -245,9 +245,9 @@ never write. `<old>` for `rename-path` is the untagged repo-relative path
   tag is given once. Each tag names one directory: roots are compared by
   directory identity, not by spelling, so `a:.` with `b:./`, a `..` spelling,
   or a symbolic link to a declared root is refused as a second tag for one
-  directory. At most 64 roots may be declared (`tests/max_repos.json`), and
-  more than one root needs a platform with directory identity (Unix). Roots may
-  nest: a file belongs only to the deepest declared root that contains it, so
+  directory. The number of roots is capped by `max_repos` in
+  `tests/max_repos.json`, and more than one root needs a platform with
+  directory identity (Unix). Roots may nest: a file belongs only to the deepest declared root that contains it, so
   an outer root's walk and `update` skip everything under an inner root, which
   indexes those files under its own tag. A root that is a subdirectory of its
   work tree is diffed relative to itself (`git diff --relative`). A declared

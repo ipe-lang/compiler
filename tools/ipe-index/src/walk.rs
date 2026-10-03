@@ -172,6 +172,21 @@ pub fn shown(text: &str) -> String {
     out
 }
 
+impl Refusal {
+    /// The parsed repository-relative path the entry names, if it names one.
+    fn listed_path(&self) -> Option<&str> {
+        match self {
+            Self::SymlinkEntry { path }
+            | Self::GitlinkEntry { path }
+            | Self::UnknownMode { path, .. }
+            | Self::NestedRepository { path } => Some(path.as_str()),
+            Self::NonUtf8Name { .. }
+            | Self::NotRepoRelative { .. }
+            | Self::NotRegularOnDisk { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -517,6 +532,18 @@ fn is_claimed_dir(root: &Path, rel: &str, claimed: &[&DeclaredRoot]) -> bool {
         .is_ok_and(|md| md.is_dir() && claimed.iter().any(|c| c.id() == FileId::of(&md)))
 }
 
+/// Whether a refused entry is, or sits under, one of the `claimed` inner roots.
+///
+/// Such an entry belongs to that root, whose own walk refuses or skips it, so
+/// the outer walk neither indexes nor reports it.
+fn refused_elsewhere(root: &Path, refusal: &Refusal, claimed: &[&DeclaredRoot]) -> bool {
+    !claimed.is_empty()
+        && refusal.listed_path().is_some_and(|path| {
+            is_claimed_dir(root, path, claimed)
+                || matches!(on_disk(root, path, claimed), OnDisk::Claimed(_))
+        })
+}
+
 /// Splits listed paths into regular files on disk and refusals.
 ///
 /// Absent paths are dropped, and so is every path a `claimed` inner root owns:
@@ -530,7 +557,7 @@ fn admit(
     let mut refused = Vec::new();
     for entry in listed {
         match entry {
-            Err(Refusal::NestedRepository { path }) if is_claimed_dir(root, &path, claimed) => {}
+            Err(refusal) if refused_elsewhere(root, &refusal, claimed) => {}
             Err(refusal) => refused.push(refusal),
             Ok(path) => match on_disk(root, &path, claimed) {
                 OnDisk::Regular(_) => files.push(Tracked::at(path)),
@@ -718,11 +745,25 @@ pub fn changed(
             "--",
         ],
     )?;
-    let dir = root.root();
+    let (upserts, deletes, refused) = classify(root.root(), parse_diff(&out)?, claimed);
+    report(&refused);
+    refuse_moved_roots(&refused)?;
+    Ok((upserts, deletes))
+}
+
+/// Sorts the changes of one diff of `dir` into upserts, deletes and refusals.
+///
+/// A change at or under a `claimed` root is dropped, refusal included: that
+/// root's own diff owns it.
+fn classify(
+    dir: &Path,
+    changes: Vec<Change>,
+    claimed: &[&DeclaredRoot],
+) -> (Vec<Tracked>, Vec<String>, Vec<Refusal>) {
     let mut upserts = Vec::new();
     let mut deletes = Vec::new();
     let mut refused = Vec::new();
-    for change in parse_diff(&out)? {
+    for change in changes {
         match change {
             Change::Delete(path) => match on_disk(dir, &path, claimed) {
                 OnDisk::Claimed(_) => {}
@@ -731,6 +772,7 @@ pub fn changed(
                 }
                 OnDisk::Regular(_) | OnDisk::Absent | OnDisk::Refused(_) => deletes.push(path),
             },
+            Change::Refused(refusal) if refused_elsewhere(dir, &refusal, claimed) => {}
             Change::Refused(refusal) => refused.push(refusal),
             Change::Upsert(path) => match on_disk(dir, &path, claimed) {
                 OnDisk::Regular(_) => upserts.push(Tracked::at(path)),
@@ -749,9 +791,7 @@ pub fn changed(
             },
         }
     }
-    report(&refused);
-    refuse_moved_roots(&refused)?;
-    Ok((upserts, deletes))
+    (upserts, deletes, refused)
 }
 
 /// Why [`read_indexed`] returned no text for a path.
@@ -1520,5 +1560,66 @@ mod tests {
                 root: "in".to_string()
             })
         );
+    }
+
+    // A refused entry under a declared inner root is that root's to report: the
+    // outer walk drops it, a grandchild nested repository included, and the
+    // inner walk still refuses its own entries.
+    #[cfg(unix)]
+    #[test]
+    fn listing_refusals_under_a_claimed_root_are_its_own() {
+        let fx = Fixture::new("claimed-refusals");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        std::os::unix::fs::symlink("x.rs", fx.0.join("inner/link.rs")).unwrap();
+        fx.commit("one");
+        fx.write("inner/deep/d.rs", "fn d() {}");
+        fx.init_nested("inner/deep");
+        let set = set(&[
+            ("out", fx.root()),
+            ("in", &fx.path("inner")),
+            ("deep", &fx.path("inner/deep")),
+        ]);
+        let out = root_of(&set, "out");
+        let (files, refused) = listing(out, &set.claimed_in(out)).unwrap();
+        assert_eq!(sorted(files), ["top.rs"]);
+        assert_eq!(refused, Vec::<Refusal>::new());
+        let inner = root_of(&set, "in");
+        let (files, refused) = listing(inner, &set.claimed_in(inner)).unwrap();
+        assert_eq!(sorted(files), ["x.rs"]);
+        assert_eq!(
+            refused,
+            [Refusal::SymlinkEntry {
+                path: "link.rs".to_string()
+            }]
+        );
+    }
+
+    // A diff refusal under a declared inner root is dropped by the outer
+    // update; one outside every inner root is still reported and deleted.
+    #[cfg(unix)]
+    #[test]
+    fn diff_refusals_under_a_claimed_root_are_its_own() {
+        let fx = Fixture::new("claimed-diff-refusals");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
+        let out = root_of(&set, "out");
+        let link = |path: &str| Refusal::SymlinkEntry {
+            path: path.to_string(),
+        };
+        let (ups, dels, refused) = classify(
+            out.root(),
+            vec![
+                Change::Refused(link("inner/l.rs")),
+                Change::Delete("inner/l.rs".to_string()),
+                Change::Refused(link("l.rs")),
+                Change::Delete("l.rs".to_string()),
+            ],
+            &set.claimed_in(out),
+        );
+        assert_eq!(sorted(ups), Vec::<String>::new());
+        assert_eq!(dels, ["l.rs"]);
+        assert_eq!(refused, [link("l.rs")]);
     }
 }
