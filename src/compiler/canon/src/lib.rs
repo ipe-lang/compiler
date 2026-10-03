@@ -19,6 +19,7 @@ pub mod module_classify;
 pub mod ref_index;
 pub mod rename;
 mod resolve;
+mod scope;
 pub mod shape_runtime;
 pub mod shape_source;
 pub mod sig_delta;
@@ -4058,8 +4059,32 @@ mod tests {
     }
 
     #[test]
+    fn a_local_value_shadows_the_prelude_without_a_duplicate() {
+        let src = "module Main exposing (main)\n\
+                   max : Int -> Int -> Int\n\
+                   max a _b = a\n\
+                   main = max\n";
+        let Some((m, i)) = canon_src(src) else {
+            assert!(
+                false_marker(),
+                "a local `max` is no duplicate of the prelude's"
+            );
+            return;
+        };
+        let Some(Def::Untyped { body, .. }) = find_def(&m, &i, "main") else {
+            assert!(false_marker(), "main should be an untyped def");
+            return;
+        };
+        assert!(
+            matches!(body.value, Expr_::VarTopLevel { name, .. } if i.resolve(name) == Some("max")),
+            "a bare `max` names the local definition, got {:?}",
+            body.value
+        );
+    }
+
+    #[test]
     fn stdlib_wildcard_shadowed_by_explicit_exposing() {
-        // An explicit `exposing (color)` (higher priority, in `env.vars`) wins over
+        // An explicit `exposing (color)` (the explicit tier) wins over
         // a wildcard `color`; the pair is NOT ambiguous. Resolves to Font.color.
         let src = "module Main exposing (main)\n\
                    import Ipe.Ui.Background exposing (..)\n\

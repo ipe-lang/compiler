@@ -21,6 +21,7 @@
 //!
 //! Entry point: [`Index::build`].
 
+pub mod argv;
 pub mod env_vars;
 pub mod html;
 pub mod markdown;

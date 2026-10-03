@@ -2389,9 +2389,11 @@ mod tests {
     /// body, which fails name-resolution at every call site. Catching it here makes
     /// a declared-but-homeless export a build-time (CI) failure, pre-cargo.
     ///
-    /// Scope: VALUES only. An exported TYPE may legitimately be a kernel-provided
-    /// opaque (e.g. `Ipe.Path`'s `Path`) with no source declaration — its home is
-    /// the kernel registry, which this parse-only check cannot see. The deeper
+    /// An uppercase item names a type: a local union or alias, an import's
+    /// re-export, or a reserved builtin (e.g. `Ipe.Path`'s `Path`, a
+    /// kernel-provided opaque with no source declaration). An uppercase item that
+    /// is none of these — a constructor or an uppercase value spelled bare —
+    /// exports nothing, so it is refused here. The deeper
     /// "every export — types included — resolves through the real pipeline" guard
     /// is `compiled_source_modules_resolve_all_exports` in the `ipe` crate, which
     /// canonicalises each module against the kernel env. `exposing (..)` (export
@@ -2430,17 +2432,33 @@ mod tests {
             };
 
             for item in exposed {
-                if let Exposed::Value(name) = &item.value {
-                    let local = parsed.values.iter().any(|v| v.value.name.value == *name);
-                    let rendered = interner.resolve(*name).unwrap_or("<?>");
-                    assert!(
-                        local || imported(*name),
-                        "{}: exports value `{rendered}` but the module neither \
-                         defines a top-level binding for it nor re-exports it \
-                         from an import — a declared-but-homeless export \
-                         (source-vs-kernel drift)",
-                        m.dotted,
-                    );
+                match &item.value {
+                    Exposed::Value(name) => {
+                        let local = parsed.values.iter().any(|v| v.value.name.value == *name);
+                        let rendered = interner.resolve(*name).unwrap_or("<?>");
+                        assert!(
+                            local || imported(*name),
+                            "{}: exports value `{rendered}` but the module neither \
+                             defines a top-level binding for it nor re-exports it \
+                             from an import — a declared-but-homeless export \
+                             (source-vs-kernel drift)",
+                            m.dotted,
+                        );
+                    }
+                    Exposed::Type(name, _) => {
+                        let rendered = interner.resolve(*name).unwrap_or("<?>");
+                        let local = parsed.unions.iter().any(|u| u.value.name.value == *name)
+                            || parsed.aliases.iter().any(|a| a.value.name.value == *name);
+                        assert!(
+                            local
+                                || imported(*name)
+                                || ipe_canon::is_reserved_builtin_type_name(rendered),
+                            "{}: exposes `{rendered}` but declares no type or alias \
+                             of that name, re-exports none, and it is no reserved \
+                             builtin — the item exports nothing",
+                            m.dotted,
+                        );
+                    }
                 }
             }
         }

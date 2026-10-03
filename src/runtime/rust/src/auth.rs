@@ -345,7 +345,7 @@ pub fn auth_verify_token<E: From<String>>(
 /// token) the re-issue path structurally cannot accept a forged or caller-inflated
 /// cap, nor a replaced session id.
 #[cfg(feature = "jwt")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReissueContext {
     /// Original issue timestamp (immutable across all re-issues).
     pub iat: i64,
@@ -356,6 +356,14 @@ pub struct ReissueContext {
     /// Per-session id (immutable across all re-issues; used for session-scoped revocation).
     pub jti: String,
 }
+
+// The subject identifies the caller and the jti names the session, so `Debug`
+// masks both, as it masks a `Principal`'s identity.
+#[cfg(feature = "jwt")]
+crate::redact::redacting_debug!(ReissueContext {
+    shown: [iat, cap],
+    masked: [subject, jti],
+});
 
 /// Parse a `ReissueContext` from a signature-verified claims map (the output of
 /// `auth_verify_token`). Returns `None` when any required field is missing or
@@ -480,7 +488,7 @@ async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, 
 #[cfg(feature = "db")]
 /// Ipê `register : Db -> String -> String -> Task Error Int`.
 /// Creates a new user. Returns the new user id.
-pub fn auth_register<E: Send + From<String> + 'static>(
+pub fn auth_register<E: Send + From<String> + crate::FromUnavailable + 'static>(
     conn: Db,
     email: String,
     password: String,
@@ -500,18 +508,19 @@ pub fn auth_register<E: Send + From<String> + 'static>(
         // bcrypt is CPU-bound and BLOCKING (~250 ms at cost 12). Running it on a
         // tokio worker thread starves the async runtime (every concurrent register
         // ties up a core worker). Offload to the blocking pool.
-        let hash =
-            match tokio::task::spawn_blocking(move || auth_hash_password::<E>(password)).await {
-                Ok(IpeResult::Ok(h)) => h,
-                Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
-                Err(_) => {
-                    return IpeResult::Err(
-                        "auth.register: password-hash task failed"
-                            .to_string()
-                            .into(),
-                    );
-                }
-            };
+        let hashed = crate::threads::join_blocking("auth.register", move || {
+            auth_hash_password::<E>(password)
+        })
+        .await;
+        let hash = match hashed {
+            Ok(IpeResult::Ok(h)) => h,
+            Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
+            Err(failure) => {
+                return IpeResult::Err(
+                    failure.into_error("auth.register: password-hash task failed"),
+                );
+            }
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -542,7 +551,7 @@ pub fn auth_register<E: Send + From<String> + 'static>(
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
 /// generic "invalid credentials" error.
-pub fn auth_login<E: Send + From<String> + 'static>(
+pub fn auth_login<E: Send + From<String> + crate::FromUnavailable + 'static>(
     conn: Db,
     email: String,
     password: String,
@@ -570,27 +579,40 @@ pub fn auth_login<E: Send + From<String> + 'static>(
                 };
                 let hash: String = row.try_get(1).unwrap_or_default();
                 // bcrypt::verify is CPU-bound + blocking → blocking pool (see register).
-                let ok = tokio::task::spawn_blocking(move || {
+                // A refused thread is `Unavailable` on both email paths alike; a
+                // panicked verify fails closed as invalid credentials.
+                let verified = crate::threads::join_blocking("auth.login", move || {
                     bcrypt::verify(&password, &hash).unwrap_or(false)
                 })
-                .await
-                .unwrap_or(false);
-                if ok {
-                    IpeResult::Ok(id)
-                } else {
-                    IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                .await;
+                match verified {
+                    Ok(true) => IpeResult::Ok(id),
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(false) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
                 }
             }
             Ok(None) => {
                 // TIMING: perform an equal-cost bcrypt verify against a fixed
                 // cost-12 hash so the unknown-email path does the same hashing
                 // work as the known-email path — removing the email-enumeration
-                // timing oracle. The result is discarded.
-                let _ = tokio::task::spawn_blocking(move || {
+                // timing oracle. The verify result is discarded; a refused
+                // thread is `Unavailable`, as on the known-email path.
+                let verified = crate::threads::join_blocking("auth.login", move || {
                     bcrypt::verify(&password, dummy_bcrypt_hash())
                 })
                 .await;
-                IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                match verified {
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(_) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
+                }
             }
             Err(e) => IpeResult::Err(format!("auth.login: {}", e).into()),
         }
@@ -1103,6 +1125,20 @@ mod tests {
     }
 
     // ── Sliding re-issue (P2) ─────────────────────────────────────────────────
+
+    #[test]
+    fn reissue_context_debug_prints_neither_subject_nor_jti() {
+        let ctx = crate::auth::ReissueContext {
+            iat: 1,
+            cap: 2,
+            subject: "user-S3CR3T".to_owned(),
+            jti: "J71T0K3N".to_owned(),
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("J71T0K3N"), "{shown}");
+        assert!(shown.contains("cap: 2"), "{shown}");
+    }
 
     /// Build a ReissueContext directly from a signed+verified token.
     fn reissue_ctx_from_token(token: &str) -> crate::auth::ReissueContext {

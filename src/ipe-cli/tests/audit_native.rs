@@ -20,8 +20,24 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use e2e_support::{BoundedOutput, BoundedRun, run_bounded};
 
 mod support;
+
+/// The ceilings every child this suite starts runs under: a wedged or
+/// flooding child is killed rather than hanging or filling the runner.
+const CHILD_BOUNDS: BoundedRun = BoundedRun {
+    max_total: Duration::from_mins(30),
+    idle_window: Duration::from_mins(15),
+    out_cap: 64 * 1024 * 1024,
+};
+
+/// Run `cmd` to completion under [`CHILD_BOUNDS`].
+fn run_child(cmd: Command) -> Result<BoundedOutput, e2e_support::BoundedRunError> {
+    run_bounded(cmd, CHILD_BOUNDS)
+}
 
 // ===========================================================================
 // CLI-level: pure-Ipê skip (Tier-1 still gates) + native-bearing fail-closed
@@ -53,15 +69,14 @@ fn empty_index(tag: &str) -> PathBuf {
 }
 
 fn run_audit(pkg: &Path, index: &Path) -> (bool, String, String) {
-    let out = Command::new(support::ipe_bin())
-        .arg("package")
+    let mut cmd = Command::new(support::ipe_bin());
+    cmd.arg("package")
         .arg("audit")
         .arg(pkg)
         .arg("--index")
         .arg(index)
-        .current_dir(support::repo_root())
-        .output()
-        .expect("run ipe package audit");
+        .current_dir(support::repo_root());
+    let out = run_child(cmd).expect("run ipe package audit");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -714,7 +729,7 @@ mod real_jail {
     fn dirs_cache_root() -> PathBuf {
         ipe_env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .or_else(|| ipe_sandbox::home::home_dir().map(|h| h.join(".cache")))
+            .or_else(|| ipe_sandbox::home::home_dir().ok().map(|h| h.join(".cache")))
             .expect("HOME or XDG_CACHE_HOME set")
     }
 
@@ -863,7 +878,8 @@ mod real_jail {
             out.join("src").join("tier2_probe.rs").is_file(),
             "native_tier2 must have emitted the probe crate"
         );
-        let probe_build = std::process::Command::new(which_cargo().expect("cargo present"))
+        let mut probe_cmd = std::process::Command::new(which_cargo().expect("cargo present"));
+        probe_cmd
             .arg("build")
             .arg("--offline")
             .arg("--locked")
@@ -872,9 +888,8 @@ mod real_jail {
             .arg("--manifest-path")
             .arg(out.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(probe_target)
-            .output()
-            .expect("spawn probe build");
+            .arg(probe_target);
+        let probe_build = super::run_child(probe_cmd).expect("run probe build");
         assert!(
             probe_build.status.success(),
             "the emitted Tier-2 probe crate must compile (THE SEAL: emit ⇒ build).\n\
@@ -1042,7 +1057,8 @@ mod real_jail {
         let Some(cargo) = which_cargo() else {
             return false;
         };
-        std::process::Command::new(cargo)
+        let mut probe_cmd = std::process::Command::new(cargo);
+        probe_cmd
             .arg("build")
             .arg("--offline")
             .arg("--locked")
@@ -1051,9 +1067,8 @@ mod real_jail {
             .arg("--manifest-path")
             .arg(out.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(probe_target)
-            .output()
-            .is_ok_and(|o| o.status.success())
+            .arg(probe_target);
+        super::run_child(probe_cmd).is_ok_and(|o| o.status.success())
     }
 
     /// Write a `package.ipe` for a `Rust.Csum`-crossing app whose `declares`

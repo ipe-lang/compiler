@@ -1579,10 +1579,11 @@ impl ToolchainHomes {
     ///   toolchain the host `cargo` never uses.
     /// - [`CliError::PackageAudit`] per [`Self::from_homes`].
     pub fn of_invoker() -> Result<Self, CliError> {
+        let user_home = crate::env_dir::home().ok();
         Self::from_homes(
-            crate::env_dir::tool_home("CARGO_HOME", ".cargo")?,
-            crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?,
-            crate::env_dir::home(),
+            crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
+            crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
+            user_home,
         )
     }
 
@@ -1595,13 +1596,13 @@ impl ToolchainHomes {
     /// contains the cargo home (a Rustup home at or above it), which would
     /// expose `credentials.toml` inside the jail.
     pub fn from_homes(
-        cargo_home: Option<PathBuf>,
-        rustup_home: Option<PathBuf>,
-        user_home: Option<PathBuf>,
+        cargo_home: Option<crate::env_dir::ToolHome>,
+        rustup_home: Option<crate::env_dir::ToolHome>,
+        user_home: Option<crate::env_dir::HomeDir>,
     ) -> Result<Self, CliError> {
-        let cargo_home = existing_jail_path(cargo_home)?;
-        let rustup_home = existing_jail_path(rustup_home)?;
-        let user_home = existing_jail_path(user_home)?;
+        let cargo_home = existing_jail_path(cargo_home.map(|home| home.as_path().to_path_buf()))?;
+        let rustup_home = existing_jail_path(rustup_home.map(|home| home.as_path().to_path_buf()))?;
+        let user_home = existing_jail_path(user_home.map(|home| home.as_path().to_path_buf()))?;
         let mut ro_binds = Vec::new();
         if let Some(cargo) = &cargo_home {
             for dir in CARGO_HOME_TOOL_DIRS {
@@ -3030,14 +3031,27 @@ mod tests {
             CanonicalPath::resolve(path).expect("canonical")
         }
 
+        /// A tool home over the absolute test path `path`, spelled as given.
+        fn tool(path: &Path) -> crate::env_dir::ToolHome {
+            ipe_sandbox::home::tool_home_from("CARGO_HOME", Some(path.into()), None, ".cargo")
+                .expect("an absolute test tool home")
+                .expect("a set tool home")
+        }
+
+        /// A user home over the absolute test path `path`, spelled as given.
+        fn user(path: &Path) -> crate::env_dir::HomeDir {
+            crate::env_dir::HomeDir::try_parse(Some(path.as_os_str().to_owned()))
+                .expect("an absolute test home")
+        }
+
         #[test]
         fn the_payload_names_exactly_the_canonical_paths_the_jail_binds() {
             let tree = tree();
             let link = &tree.link;
             let toolchain = ToolchainHomes::from_homes(
-                Some(link.join("cargo")),
-                Some(link.join("rustup")),
-                Some(link.clone()),
+                Some(tool(&link.join("cargo"))),
+                Some(tool(&link.join("rustup"))),
+                Some(user(link)),
             )
             .expect("disjoint homes resolve");
             let tools = RunJailTools {
@@ -3216,7 +3230,8 @@ mod tests {
             let tree = tree();
             let cargo = tree.link.join("cargo");
             for rustup in [cargo.clone(), tree.link] {
-                let refused = ToolchainHomes::from_homes(Some(cargo.clone()), Some(rustup), None);
+                let refused =
+                    ToolchainHomes::from_homes(Some(tool(&cargo)), Some(tool(&rustup)), None);
                 assert!(
                     matches!(
                         refused,
@@ -3235,9 +3250,9 @@ mod tests {
             let tree = tree();
             let absent = tree.link.join("absent");
             let toolchain = ToolchainHomes::from_homes(
-                Some(absent.clone()),
-                Some(absent.clone()),
-                Some(absent),
+                Some(tool(&absent)),
+                Some(tool(&absent)),
+                Some(user(&absent)),
             )
             .expect("absent homes are skipped");
             assert!(toolchain.ro_binds().is_empty());

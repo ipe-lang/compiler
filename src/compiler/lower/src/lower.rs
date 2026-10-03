@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    DResult, Diagnostic, Feature, GenericAppEntryReach, Located, LowerError, MainRetName,
-    NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
+    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
@@ -9881,6 +9881,54 @@ fn reject_point_free_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
     Ok(())
 }
 
+/// The one context in which an intercept-only `Store.*` kernel's rewrite runs.
+///
+/// The projection elements are read structurally by `lower_store_select`'s
+/// projection walk; every other placeholder is rewritten by its saturated
+/// direct-call arm in `intercept_web_kernel_call`.
+const fn intercept_context(k: KernelFn) -> InterceptContext {
+    if matches!(
+        k,
+        KernelFn::StoreLiteral
+            | KernelFn::StoreUpper
+            | KernelFn::StoreLower
+            | KernelFn::StoreCoalesce
+            | KernelFn::StoreAdd
+            | KernelFn::StoreSub
+            | KernelFn::StoreMul
+    ) {
+        InterceptContext::SelectProjection
+    } else {
+        InterceptContext::SaturatedCall
+    }
+}
+
+/// Fail-closed SEAL gate for an intercept-only `Store.*` kernel applied off its intercept.
+///
+/// A saturated or over-applied placeholder reaching the uniform call path is
+/// one whose rewrite did not run: a projection element (`Store.add`,
+/// `Store.literal`, …) called outside a `Store.select` body, or any placeholder
+/// over-applied past its arity. Emitting it would name the never-defined
+/// placeholder symbol (`store_add`, …), so `ipe` would accept a program `cargo`
+/// rejects with E0425. Refused with IPE-L0146; the unsaturated shapes keep their
+/// own [`reject_point_free_store_kernel`] refusal. A no-op for every other callee.
+fn reject_off_intercept_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
+    if let Callee::Kernel(k) = callee
+        && k.is_accessor_intercept_placeholder()
+    {
+        let d = k.decl();
+        let kernel = format!("{}.{}", d.qualifier, d.name).into_boxed_str();
+        return Err(Diagnostic::Lower {
+            span,
+            msg: LowerError::AccessorKernelOffIntercept {
+                kernel,
+                context: intercept_context(*k),
+            },
+        });
+    }
+    Ok(())
+}
+
 /// Fail-closed SEAL gate for a partial or point-free capture-cloned handler kernel (`Stream.stream`).
 ///
 /// The backend re-wraps the handler argument with a per-call `.clone()` of
@@ -14152,8 +14200,8 @@ impl<'a> Lowerer<'a> {
                 ));
             };
             // Determine the result kind from the left operand's type (both
-            // operands must have the same type — enforced by the type constraint
-            // `coalesce : Projection a -> Projection a -> Projection a`).
+            // operands share one type — the kernel scheme `coalesce : a -> a -> a`
+            // unifies them).
             let result_ty = self.region_ty(left_expr.span);
             let Some(kind) = result_ty.and_then(|ty| ProjColKind::of_ty(ty, self.interner)) else {
                 let ty_label = result_ty.map_or_else(
@@ -23512,6 +23560,13 @@ impl<'a> Lowerer<'a> {
                 self.reject_fn_element_for_capability_kernel(&resolved, callee.span, args)?;
                 self.reject_nonclone_handler_capture(&resolved, args)?;
                 let arity = self.callee_arity(&resolved)?;
+                // An intercept-only placeholder that is saturated or over-applied
+                // here escaped its rewrite; refuse it before any arity shape can
+                // emit its placeholder symbol. The partial shape is refused by
+                // `eta_expand_partial` (IPE-L0146, point-free).
+                if args.len() >= arity {
+                    reject_off_intercept_store_kernel(&resolved, call_span)?;
+                }
                 // Close the `Arc`-vs-`Box` frontier at a higher-order kernel's
                 // mapper over stored functions, once, ahead of the arity split,
                 // so the saturated, partial, and over-applied shapes share one
@@ -25319,12 +25374,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::WebRevocationStore
                 // ── Server: bearer token source — arity 0 ────────────────
                 // `Server.bearerToken : TokenSource`
-                | KernelFn::ServerTokenBearer
-                // ── BackoffStrategy constructors — arity 0 ────────────────
-                | KernelFn::BackoffLinear
-                | KernelFn::BackoffLinearWithJitter
-                | KernelFn::BackoffExponential
-                | KernelFn::BackoffExponentialWithJitter,
+                | KernelFn::ServerTokenBearer,
             ) => Ok(0),
             Callee::Kernel(
                 KernelFn::StringFromInt
@@ -28137,14 +28187,6 @@ impl<'a> Lowerer<'a> {
                         Ok(Callee::Kernel(KernelFn::TaskWithMaxAttempts))
                     }
                     ("Task", "withBaseMs") => Ok(Callee::Kernel(KernelFn::TaskWithBaseMs)),
-                    ("Task", "Linear") => Ok(Callee::Kernel(KernelFn::BackoffLinear)),
-                    ("Task", "LinearWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffLinearWithJitter))
-                    }
-                    ("Task", "Exponential") => Ok(Callee::Kernel(KernelFn::BackoffExponential)),
-                    ("Task", "ExponentialWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffExponentialWithJitter))
-                    }
                     // ── Io kernels ──────────────────────────────────────
                     ("Io", "readLine") => Ok(Callee::Kernel(KernelFn::IoReadLine)),
                     ("Io", "readSecret") => Ok(Callee::Kernel(KernelFn::IoReadSecret)),

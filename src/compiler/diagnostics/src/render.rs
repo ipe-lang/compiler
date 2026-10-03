@@ -35,7 +35,7 @@ use crate::diagnostic::{
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
     Hint, IfDefect, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect, SandboxError,
     SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
-    TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
+    TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -354,7 +354,7 @@ fn parse_prose(msg: &ParseError) -> String {
                 .to_string()
         }
         ParseError::IntLiteralOutOfRange => {
-            "This whole number is too big to fit in Ipê's `Int`.".to_string()
+            "This whole number does not fit in Ipê's `Int`.".to_string()
         }
         ParseError::FloatLiteralOutOfRange => {
             "This number is too large for Ipê's `Float` to hold.".to_string()
@@ -815,6 +815,13 @@ fn lower_prose(msg: &LowerError) -> String {
                 format!("`{column}` is not a valid SQL column name.")
             }
         },
+        LowerError::AccessorKernelOffIntercept { kernel, context } => {
+            let phrase = intercept_context_phrase(*context);
+            format!(
+                "`{kernel}` has no runtime function, so it is {phrase} — it cannot be \
+                 called here."
+            )
+        }
         LowerError::PointFreeAccessorKernel { kernel } => {
             format!(
                 "`{kernel}` reads its column from a `.field` accessor, so it must \
@@ -1994,6 +2001,10 @@ fn lower_label(msg: &LowerError) -> String {
             )
         }
         LowerError::StoreEqAccessorInvalid(defect) => store_eq_accessor_label(defect),
+        LowerError::AccessorKernelOffIntercept { kernel, context } => {
+            let phrase = intercept_context_phrase(*context);
+            format!("`{kernel}` is called outside its rewrite here — it is {phrase}")
+        }
         LowerError::PointFreeAccessorKernel { kernel } => {
             format!(
                 "`{kernel}` is partially applied here — apply it directly with its \
@@ -2230,8 +2241,11 @@ fn hint_text(hint: Hint) -> String {
         }
         Hint::SeparateWithSpace => "separate the number and the name with a space".to_string(),
         Hint::IntegerLiteralRange => {
-            "integer literals must fit between -9223372036854775808 and 9223372036854775807"
-                .to_string()
+            format!(
+                "integer literals must fit between {} and {}",
+                i64::MIN,
+                i64::MAX
+            )
         }
         Hint::FloatLiteralRange => {
             "float literals must not exceed f64's maximum magnitude (~1.8e308)".to_string()
@@ -2911,6 +2925,31 @@ mod tests {
         assert!(
             !out.contains("^^^^^^^^^^"),
             "underline must not run past EOL:\n{out}"
+        );
+    }
+
+    /// The P0013 screen states the `Int` range from the type's own bounds and
+    /// never calls an out-of-range literal "too big" (it may be too small).
+    #[test]
+    fn int_range_hint_derives_from_i64_bounds() {
+        let src = "v =\n    -9223372036854775809\n";
+        let d = Diagnostic::Parse {
+            span: Span::new(8, 28),
+            msg: ParseError::IntLiteralOutOfRange,
+        };
+        let out = render(&d, "f.ipe", src);
+        assert!(
+            out.contains(&i64::MIN.to_string()),
+            "names i64::MIN:\n{out}"
+        );
+        assert!(
+            out.contains(&i64::MAX.to_string()),
+            "names i64::MAX:\n{out}"
+        );
+        assert!(!out.contains("too big"), "no \"too big\" wording:\n{out}");
+        assert!(
+            out.contains("does not fit"),
+            "says the value does not fit:\n{out}"
         );
     }
 

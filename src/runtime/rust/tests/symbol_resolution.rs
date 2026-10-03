@@ -49,10 +49,6 @@ const KNOWN_DEAD_OR_EPILOGUE: &[&str] = &[
     "task_with_jitter",
     "task_with_max_attempts",
     "task_with_retry_on",
-    "backoff_linear",
-    "backoff_linear_with_jitter",
-    "backoff_exponential",
-    "backoff_exponential_with_jitter",
     // ── Dead: emit_http_builder_call constructs an HttpRequest struct inline
     //         for these variants; the name string is never used. ─────────────
     "http_default_request",

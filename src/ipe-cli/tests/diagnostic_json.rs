@@ -202,6 +202,47 @@ fn type_check_json_contains_required_span_and_code_fields() {
     );
 }
 
+/// A field-type mismatch in the user's file, linked beside an embedded stdlib
+/// module, is framed against the user's file.
+///
+/// Every linked module shares one byte-offset space, so the file must come
+/// from the error's owning module, never from the stdlib def whose bytes
+/// happen to enclose the span.
+#[test]
+fn field_mismatch_beside_stdlib_frames_user_file() {
+    let r = run_ipe(&[
+        "type-check",
+        "--json",
+        &fixture("field_mismatch_beside_stdlib/src/Main.ipe"),
+    ]);
+    assert!(!r.ok, "a field-type mismatch must exit non-zero");
+    let stderr = r.stderr.trim();
+    assert!(
+        stderr.contains("IPE-T0001"),
+        "the fixture must be refused with IPE-T0001, got: {stderr}"
+    );
+    let files: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|diag| {
+            diag.get("primary_span")
+                .and_then(|span| span.get("file"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "the mismatch must carry a primary span file, got: {stderr}"
+    );
+    for file in &files {
+        assert!(
+            file.ends_with("Main.ipe") && !file.starts_with("<embedded-stdlib>"),
+            "the mismatch must be framed against the user's Main.ipe, got {file:?} in: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn type_check_human_output_unchanged_without_json_flag() {
     let r = run_ipe(&["type-check", &fixture("type_error.ipe")]);

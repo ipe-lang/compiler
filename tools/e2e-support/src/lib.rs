@@ -22,7 +22,7 @@ use std::io::{BufRead, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The expected-output file name inside a golden directory.
@@ -457,140 +457,309 @@ fn lock_emitted_dependencies(
     ))
 }
 
-/// The captured result of a bounded `cargo build`: its exit status and the
-/// stdout / stderr streams drained from the child.
-#[derive(Debug)]
-struct BuildCapture {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+/// The ceilings a [`run_bounded`] child runs under.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedRun {
+    /// The absolute wall-clock ceiling, a backstop for a trickle-forever child.
+    pub max_total: Duration,
+    /// How long both streams may stay silent before the child counts as wedged.
+    pub idle_window: Duration,
+    /// The most bytes each of stdout and stderr may carry.
+    pub out_cap: usize,
 }
 
-/// Spawn `cmd`, draining stdout/stderr on reader threads, and wait for it to
-/// finish. The child is killed and an `Err` returned when EITHER guard trips:
-///   * `idle_window` — the streams have been silent this long (no compile
-///     message): a wedged build, killed fast. A *progressing* build resets the
-///     window on every line, so a slow-but-healthy build is never killed —
-///     that is what makes the SEAL verdict load-independent.
-///   * `max_total` — an absolute liveness backstop for a pathological
-///     trickle-forever build; a normal build finishes far sooner and a real
-///     hang already died on `idle_window`.
+/// A [`run_bounded`] child that finished inside its ceilings.
+#[derive(Debug)]
+pub struct BoundedOutput {
+    /// The child's exit status.
+    pub status: std::process::ExitStatus,
+    /// Everything the child wrote to stdout.
+    pub stdout: Vec<u8>,
+    /// Everything the child wrote to stderr.
+    pub stderr: Vec<u8>,
+}
+
+/// One of a child's two output streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+impl std::fmt::Display for OutStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
+/// Why a [`run_bounded`] child gave no [`BoundedOutput`].
 ///
-/// A build that FAILS (non-zero exit) returns its status immediately via
-/// `try_wait`, so neither guard can mask a real cargo-build failure — they only
-/// govern killing a *live* child, never a completed one.
+/// Every variant past [`BoundedRunError::Spawn`] means the child was killed
+/// and reaped before the error came back.
+#[derive(Debug)]
+pub enum BoundedRunError {
+    /// The child could not be started.
+    Spawn(std::io::Error),
+    /// The OS refused a thread to drain one of the child's streams.
+    Drain(std::io::Error),
+    /// Waiting on the child failed.
+    Wait(std::io::Error),
+    /// Both streams stayed silent for the idle window.
+    Idle(Duration),
+    /// The child outlived the absolute ceiling.
+    Wall(Duration),
+    /// A stream carried more than the output cap.
+    OutputCap {
+        /// The stream that overflowed.
+        stream: OutStream,
+        /// The cap it crossed.
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for BoundedRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "could not start: {e}"),
+            Self::Drain(e) => write!(f, "could not start an output drain thread: {e}"),
+            Self::Wait(e) => write!(f, "waiting on the child failed: {e}"),
+            Self::Idle(window) => write!(f, "produced no output for {window:?} and was killed"),
+            Self::Wall(ceiling) => write!(f, "exceeded the {ceiling:?} ceiling and was killed"),
+            Self::OutputCap { stream, cap } => {
+                write!(f, "wrote more than {cap} bytes to {stream} and was killed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedRunError {}
+
+/// The most bytes each stream of an emitted `cargo build` may carry.
 ///
-/// The streams are drained by dedicated threads because cargo's
-/// `--message-format=json` stdout can exceed the OS pipe buffer; polling
-/// `try_wait` while the child blocks on a full pipe would otherwise deadlock.
-fn run_bounded_build(
-    mut cmd: Command,
-    golden_name: &str,
-    max_total: Duration,
-    idle_window: Duration,
-) -> Result<BuildCapture, String> {
+/// Far above what a real build's `--message-format=json` writes, so only a
+/// runaway child reaches it.
+const EMITTED_BUILD_OUTPUT_CAP: usize = 256 * 1024 * 1024;
+
+/// A stream's drain: the thread reading it and the flag it raises past the cap.
+struct Drain {
+    handle: std::thread::JoinHandle<Vec<u8>>,
+    over_cap: Arc<AtomicBool>,
+    stream: OutStream,
+}
+
+/// Kill and reap `child`, then hand back `err`.
+fn stop_child(child: &mut std::process::Child, err: BoundedRunError) -> BoundedRunError {
+    let _ = child.kill();
+    let _ = child.wait();
+    err
+}
+
+/// Run `cmd` to completion under `bounds`, draining stdout and stderr on reader threads.
+///
+/// The child is killed, reaped and an `Err` returned when any ceiling trips:
+///   * `idle_window` — the streams have been silent this long: a wedged
+///     child, killed fast. A *progressing* child resets the window on every
+///     line, so a slow-but-healthy one is never killed — that is what makes
+///     the SEAL verdict load-independent.
+///   * `max_total` — an absolute liveness backstop for a trickle-forever child.
+///   * `out_cap` — a stream carried more bytes than the cap.
+///
+/// A child that exits returns its status at once through `try_wait`, so no
+/// ceiling can mask a real non-zero exit — they only govern killing a *live*
+/// child.
+///
+/// The streams are drained on dedicated threads because a child's output can
+/// exceed the OS pipe buffer; polling `try_wait` while the child blocks on a
+/// full pipe would otherwise deadlock.
+///
+/// # Errors
+///
+/// [`BoundedRunError`] when the child cannot be started or drained, waiting
+/// on it fails, or a ceiling trips.
+pub fn run_bounded(mut cmd: Command, bounds: BoundedRun) -> Result<BoundedOutput, BoundedRunError> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{golden_name}: failed to spawn `cargo build`: {e}"))?;
+        .map_err(BoundedRunError::Spawn)?;
 
     let start = Instant::now();
     // Millis-since-`start` of the most recent byte read from either stream. A
-    // progressing `cargo build` keeps bumping this; a wedged one leaves it
-    // frozen, so `elapsed - last_activity` is the build's current idle time.
-    // Seeded at 0 (= `start`), so a build that emits nothing at all is idle from
-    // the outset and trips `idle_window` on schedule.
+    // progressing child keeps bumping this; a wedged one leaves it frozen, so
+    // `elapsed - last_activity` is the child's current idle time. Seeded at 0
+    // (= `start`), so a child that emits nothing at all is idle from the
+    // outset and trips `idle_window` on schedule.
     let last_activity = Arc::new(AtomicU64::new(0));
 
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|s| drain_stream(s, start, Arc::clone(&last_activity)));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|s| drain_stream(s, start, Arc::clone(&last_activity)));
+    let mut drains = Vec::with_capacity(2);
+    let streams: [(OutStream, Option<Box<dyn Read + Send>>); 2] = [
+        (
+            OutStream::Stdout,
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ),
+        (
+            OutStream::Stderr,
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        ),
+    ];
+    for (stream, pipe) in streams {
+        let Some(pipe) = pipe else { continue };
+        match drain_stream(
+            pipe,
+            stream,
+            start,
+            Arc::clone(&last_activity),
+            bounds.out_cap,
+        ) {
+            Ok(drain) => drains.push(drain),
+            Err(e) => return Err(stop_child(&mut child, BoundedRunError::Drain(e))),
+        }
+    }
 
     let status = loop {
+        if let Some(drain) = drains.iter().find(|d| d.over_cap.load(Ordering::Relaxed)) {
+            let err = BoundedRunError::OutputCap {
+                stream: drain.stream,
+                cap: bounds.out_cap,
+            };
+            return Err(stop_child(&mut child, err));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 let elapsed = start.elapsed();
                 let idle = elapsed
                     .saturating_sub(Duration::from_millis(last_activity.load(Ordering::Relaxed)));
-                if idle >= idle_window {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{golden_name}: emitted `cargo build` produced no output for {idle_window:?} \
-                         and was killed (inactivity watchdog: a wedged build, not a slow one — a \
-                         progressing build resets the window on every compile message; \
-                         raise IPE_E2E_BUILD_IDLE_SECS if a single unit legitimately compiles \
-                         longer in silence)"
-                    ));
+                if idle >= bounds.idle_window {
+                    let err = BoundedRunError::Idle(bounds.idle_window);
+                    return Err(stop_child(&mut child, err));
                 }
-                if elapsed >= max_total {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{golden_name}: emitted `cargo build` exceeded the {max_total:?} absolute \
-                         ceiling and was killed (liveness backstop; raise \
-                         IPE_E2E_BUILD_TIMEOUT_SECS)"
-                    ));
+                if elapsed >= bounds.max_total {
+                    let err = BoundedRunError::Wall(bounds.max_total);
+                    return Err(stop_child(&mut child, err));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{golden_name}: waiting on `cargo build` failed: {e}"
-                ));
-            }
+            Err(e) => return Err(stop_child(&mut child, BoundedRunError::Wait(e))),
         }
     };
 
-    let stdout = stdout_reader.map(join_stream).unwrap_or_default();
-    let stderr = stderr_reader.map(join_stream).unwrap_or_default();
-    Ok(BuildCapture {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for drain in drains {
+        let stream = drain.stream;
+        let bytes = drain.handle.join().unwrap_or_default();
+        // A child that exits right after flooding a stream ends the poll
+        // before the flag is seen; the cap holds all the same.
+        if drain.over_cap.load(Ordering::Relaxed) {
+            return Err(BoundedRunError::OutputCap {
+                stream,
+                cap: bounds.out_cap,
+            });
+        }
+        match stream {
+            OutStream::Stdout => stdout = bytes,
+            OutStream::Stderr => stderr = bytes,
+        }
+    }
+    Ok(BoundedOutput {
         status,
         stdout,
         stderr,
     })
 }
 
-/// Spawn a thread that reads a child stream to EOF, stamping `last_activity`
-/// (millis since `start`) on every line so the parent can tell a progressing
-/// build (bytes still arriving) from a wedged one (stream gone silent). Reads
-/// line-granular — cargo's `--message-format=json` and human stderr are both
-/// newline-delimited, so each compile message is one activity tick.
-fn drain_stream<R: Read + Send + 'static>(
-    stream: R,
-    start: Instant,
-    last_activity: Arc<AtomicU64>,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stream);
-        let mut buf = Vec::new();
-        loop {
-            let mut line = Vec::new();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    buf.extend_from_slice(&line);
-                    let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    last_activity.store(ms, Ordering::Relaxed);
-                }
-            }
+/// Run an emitted-project `cargo build` under the build ceilings, naming the golden in any error.
+fn run_bounded_build(
+    cmd: Command,
+    golden_name: &str,
+    max_total: Duration,
+    idle_window: Duration,
+) -> Result<BoundedOutput, String> {
+    let bounds = BoundedRun {
+        max_total,
+        idle_window,
+        out_cap: EMITTED_BUILD_OUTPUT_CAP,
+    };
+    run_bounded(cmd, bounds).map_err(|e| match e {
+        BoundedRunError::Spawn(e) => format!("{golden_name}: failed to spawn `cargo build`: {e}"),
+        BoundedRunError::Wait(e) => {
+            format!("{golden_name}: waiting on `cargo build` failed: {e}")
         }
-        buf
+        BoundedRunError::Idle(window) => format!(
+            "{golden_name}: emitted `cargo build` produced no output for {window:?} \
+             and was killed (inactivity watchdog: a wedged build, not a slow one — a \
+             progressing build resets the window on every compile message; \
+             raise IPE_E2E_BUILD_IDLE_SECS if a single unit legitimately compiles \
+             longer in silence)"
+        ),
+        BoundedRunError::Wall(ceiling) => format!(
+            "{golden_name}: emitted `cargo build` exceeded the {ceiling:?} absolute \
+             ceiling and was killed (liveness backstop; raise \
+             IPE_E2E_BUILD_TIMEOUT_SECS)"
+        ),
+        other @ (BoundedRunError::Drain(_) | BoundedRunError::OutputCap { .. }) => {
+            format!("{golden_name}: emitted `cargo build` {other}")
+        }
     })
 }
 
-/// Join a drain thread, returning the bytes it read (empty if the thread panicked).
-fn join_stream(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// Start a thread that reads a child stream to EOF, stopping past `cap` bytes.
+///
+/// Every line stamps `last_activity` (millis since `start`) so the parent can
+/// tell a progressing child (bytes still arriving) from a wedged one (stream
+/// gone silent). Each read is bounded by what is left of `cap`, so a flood
+/// with no line break cannot grow the buffer past it; crossing the cap raises
+/// the drain's `over_cap` flag and ends the read.
+fn drain_stream(
+    stream: Box<dyn Read + Send>,
+    which: OutStream,
+    start: Instant,
+    last_activity: Arc<AtomicU64>,
+    cap: usize,
+) -> std::io::Result<Drain> {
+    let over_cap = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&over_cap);
+    let handle = std::thread::Builder::new()
+        .name(format!("e2e-drain-{which}"))
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut buf = Vec::new();
+            loop {
+                let left = cap.saturating_sub(buf.len());
+                let budget = u64::try_from(left).unwrap_or(u64::MAX).saturating_add(1);
+                let mut line = Vec::new();
+                match reader.by_ref().take(budget).read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.extend_from_slice(&line);
+                        let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        last_activity.store(ms, Ordering::Relaxed);
+                        if buf.len() > cap {
+                            flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+            buf
+        })?;
+    Ok(Drain {
+        handle,
+        over_cap,
+        stream: which,
+    })
 }
 
 /// Build the emitted Rust project at `emitted_dir` and run the resulting binary,
@@ -732,10 +901,11 @@ fn ran_exactly_one_passing_test(stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRATE_IDENTITY_HASH_PLACEHOLDER, DEFAULT_EMITTED_BUILD_IDLE_SECS,
-        DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, emitted_build_idle, emitted_build_timeout,
-        normalize_crate_identity_hash, ran_exactly_one_passing_test, replace_package_name,
-        rerun_this_test_exact, resolve_emitted_target, run_bounded_build, wait_for,
+        BoundedRun, BoundedRunError, CRATE_IDENTITY_HASH_PLACEHOLDER,
+        DEFAULT_EMITTED_BUILD_IDLE_SECS, DEFAULT_EMITTED_BUILD_TIMEOUT_SECS, OutStream,
+        emitted_build_idle, emitted_build_timeout, normalize_crate_identity_hash,
+        ran_exactly_one_passing_test, replace_package_name, rerun_this_test_exact,
+        resolve_emitted_target, run_bounded, run_bounded_build, wait_for,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -800,6 +970,62 @@ mod tests {
         #[allow(clippy::naive_bytecount)]
         let newline_count = capture.stdout.iter().filter(|&&b| b == b'\n').count();
         assert_eq!(newline_count, 40);
+    }
+
+    #[test]
+    fn bounded_run_caps_a_flooding_process() {
+        // `yes` writes one line after another forever, well inside the idle
+        // window and the wall, so only the output cap can stop it.
+        let started = Instant::now();
+        let result = run_bounded(
+            Command::new("yes"),
+            BoundedRun {
+                max_total: Duration::from_secs(3600),
+                idle_window: Duration::from_secs(3600),
+                out_cap: 64 * 1024,
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BoundedRunError::OutputCap {
+                    stream: OutStream::Stdout,
+                    cap: 65_536,
+                })
+            ),
+            "a flooding stdout must trip the output cap, got: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the cap must stop the flood promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn bounded_run_caps_a_flood_with_no_line_break() {
+        // One unbroken line past the cap is refused the same as many lines.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 200000 /dev/zero | tr '\\0' a 1>&2");
+        let result = run_bounded(
+            cmd,
+            BoundedRun {
+                max_total: Duration::from_secs(60),
+                idle_window: Duration::from_secs(60),
+                out_cap: 1024,
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BoundedRunError::OutputCap {
+                    stream: OutStream::Stderr,
+                    ..
+                })
+            ),
+            "an unbroken stderr flood must trip the output cap, got: {result:?}"
+        );
     }
 
     #[test]

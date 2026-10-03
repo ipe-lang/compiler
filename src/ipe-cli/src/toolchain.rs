@@ -229,13 +229,14 @@ fn known_install_dirs() -> Vec<PathBuf> {
     // relative `CARGO_HOME` names no directory to probe; this is a read-only
     // hint for the "not on the `PATH`" diagnosis, so it is skipped rather than
     // reported here.
-    let mut dirs: Vec<PathBuf> = crate::env_dir::tool_home("CARGO_HOME", ".cargo")
+    let home = crate::env_dir::home().ok();
+    let mut dirs: Vec<PathBuf> = crate::env_dir::tool_home("CARGO_HOME", home.as_ref(), ".cargo")
         .ok()
         .flatten()
         .map(|cargo_home| cargo_home.join("bin"))
         .into_iter()
         .collect();
-    if let Some(default) = crate::env_dir::home().map(|home| home.join(".cargo").join("bin"))
+    if let Some(default) = home.map(|home| home.join(".cargo").join("bin"))
         && !dirs.contains(&default)
     {
         dirs.push(default);

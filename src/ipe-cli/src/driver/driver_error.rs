@@ -355,6 +355,13 @@ pub enum CliError {
     ///
     /// A process the child started still held it; that process was stopped.
     ChildPipeHeld(remote_ingest::Stream),
+    /// The OS refused a thread the command needs.
+    ///
+    /// Anything the command had started for that thread was stopped first.
+    ThreadRefused {
+        role: crate::threads::ThreadRole,
+        source: std::io::Error,
+    },
     /// A signal ended a remote transfer before it finished.
     ///
     /// Nothing it staged reached the lock, the manifest or the package cache.
@@ -496,6 +503,14 @@ impl From<build_plan::Refusal> for CliError {
     }
 }
 
+impl From<ipe_docs::argv::NonUtf8Argument> for CliError {
+    /// A command-line argument that is not UTF-8 is command-line misuse; the
+    /// refusal names its position, never its bytes.
+    fn from(refused: ipe_docs::argv::NonUtf8Argument) -> Self {
+        Self::Usage(text::Message::relay(&refused))
+    }
+}
+
 impl From<delivery::DeliveryError> for CliError {
     /// A delivery refusal is a pedagogical, user-facing message; it surfaces
     /// through the reader's named-error channel.
@@ -625,6 +640,7 @@ impl CliError {
             Self::RemoteIngestExceeded(_) => "remote-ingest-exceeded",
             Self::LocalLimitExceeded(_) => "local-limit-exceeded",
             Self::ChildPipeHeld(_) => "child-pipe-held",
+            Self::ThreadRefused { .. } => "thread-refused",
             Self::Interrupted => "interrupted",
             Self::SourceRefused { .. } => "source-refused",
             Self::PathEscape { .. } => "path-escape",
@@ -705,6 +721,7 @@ impl CliError {
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
             | Self::ChildPipeHeld(_)
+            | Self::ThreadRefused { .. }
             | Self::Interrupted
             | Self::SourceRefused { .. }
             | Self::PathEscape { .. }
@@ -941,6 +958,9 @@ impl std::fmt::Display for CliError {
             Self::RemoteIngestExceeded(refusal) => refusal.fmt(f),
             Self::LocalLimitExceeded(refusal) => refusal.fmt(f),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
+            Self::ThreadRefused { role, source } => {
+                f.write_str(&text::cli_thread_refused(role, &source.kind()))
+            }
             Self::Interrupted => f.write_str(text::cli_transfer_interrupted()),
             Self::SourceRefused { path, reason } => {
                 let path = path.display();

@@ -1,0 +1,10 @@
+module Main exposing (main)
+
+import Dep exposing (bad)
+import Ipe.Io as Io
+import Ipe.String
+
+main =
+    Io.println
+        (String.fromInt
+            (bad + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0))

@@ -4,8 +4,10 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match ipe::run_cli(&args) {
+    let outcome = ipe_docs::argv::host_args()
+        .map_err(ipe::CliError::from)
+        .and_then(|args| ipe::run_cli(&args));
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         // `--check --exit-code` carries a git-style numeric code (10/0/2); the
         // status line was already printed by `run_upgrade`. Deliver it as the

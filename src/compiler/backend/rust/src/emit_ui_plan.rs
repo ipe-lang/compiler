@@ -825,10 +825,6 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::TaskDefaultRetryPolicy
         | KernelFn::TaskWithMaxAttempts
         | KernelFn::TaskWithBaseMs
-        | KernelFn::BackoffLinear
-        | KernelFn::BackoffLinearWithJitter
-        | KernelFn::BackoffExponential
-        | KernelFn::BackoffExponentialWithJitter
         | KernelFn::IoReadLine
         | KernelFn::IoReadSecret
         | KernelFn::IoWriteStdout

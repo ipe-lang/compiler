@@ -86,8 +86,7 @@ pub fn csrf_enabled() -> bool {
 // `csrf::frame_ancestors` / `csrf::security_headers` call sites keep resolving.
 pub use crate::telemetry::{frame_ancestors, security_headers};
 
-/// Whether to mark cookies `Secure`. Production (or frame-ancestors mode, which
-/// is always HTTPS) → Secure (env `IPE_WEB_SECURE` or `X-Forwarded-Proto: https`).
+/// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.
 ///
 /// Snapshotted once into a `OnceLock` on first call (env is stable at process
 /// start; eliminates per-request `getenv` + the TOCTOU race between
@@ -95,7 +94,21 @@ pub use crate::telemetry::{frame_ancestors, security_headers};
 pub fn cookies_secure() -> bool {
     use std::sync::OnceLock;
     static SECURE: OnceLock<bool> = OnceLock::new();
-    *SECURE.get_or_init(|| telemetry::production_from_env() || frame_ancestors().is_some())
+    *SECURE.get_or_init(|| {
+        cookies_secure_with(
+            telemetry::dev_intent_from_env().as_ref(),
+            frame_ancestors().is_some(),
+        )
+    })
+}
+
+/// Whether cookies are `Secure` under an explicit dev-intent proof.
+///
+/// `Secure` unless `dev` holds; frame-ancestors mode (always HTTPS) is
+/// `Secure` even then. Every release build is therefore `Secure`.
+#[must_use]
+pub const fn cookies_secure_with(dev: Option<&telemetry::DevIntent>, framed: bool) -> bool {
+    dev.is_none() || framed
 }
 
 /// ~244 random bits (two concatenated UUIDv4s) as 64 lowercase-hex chars —
