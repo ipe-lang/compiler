@@ -10,7 +10,8 @@ the program stands on its own — no wrapper script.
 
 This app is written in Ipê, so the `ipe` compiler must be installed and on your
 `PATH`. Install it from the repo root with `./install.sh`; confirm with `ipe
-version`.
+version`. The minimum version is `0.4.0`: the app's page loader uses
+`Task.loop`, which first ships in that release.
 
 The app reviews an `ipe-index` database, so you also need one. Build it once
 from the repo root:
@@ -107,8 +108,11 @@ From this directory, against an index built at the repo root:
 IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe run
 ```
 
-`ipe run` builds and serves on <http://localhost:8000>. `ipe type-check` runs a
-fast check with no runtime, and `ipe build` compiles to a native binary.
+`ipe run` builds and serves on <http://localhost:8000>. Set `IPE_SERVER_PORT`
+to listen on another port instead, e.g. `IPE_SERVER_PORT=8123`; a value
+outside `1..=65535` (empty, non-numeric, signed, `0`, or too large) is
+ignored and `8000` is used. `ipe type-check` runs a fast check with no
+runtime, and `ipe build` compiles to a native binary.
 
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
 console at `/_ipe/console` is open only while the server binds loopback, and on
