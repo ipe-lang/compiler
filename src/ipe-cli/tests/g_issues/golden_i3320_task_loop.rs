@@ -145,7 +145,7 @@ fn assert_refused_as_function_state(name: &str, entry: &Path) {
 fn task_loop_runs_far_past_the_recursion_guard_and_reports_its_ceiling() {
     accept_and_run(
         "task_loop",
-        "150000\nInvalidInput: Task.loop ran its step 5 times, its ceiling, without reaching Done",
+        "150000\nLimitExceeded: Task.loop ran its step 5 times, its ceiling, without reaching Done",
     );
 }
 
