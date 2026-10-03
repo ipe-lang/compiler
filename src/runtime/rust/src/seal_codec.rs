@@ -50,9 +50,11 @@ pub enum SealDecodeError {
     /// the observed length and the cap so a legitimate over-limit payload is
     /// diagnosable without echoing the (untrusted, unbounded) body.
     TooLarge { len: usize, max: usize },
-    /// The JSON was syntactically invalid, or its nesting depth exceeded the
-    /// budget. `serde_json` enforces a nesting-depth limit while parsing, so a
+    /// The JSON nests containers past the depth budget. Checked by a lexical
+    /// scan before the parser runs, and again on the parsed value, so a
     /// deeply-nested document is refused here rather than blowing the stack.
+    TooDeep { max: u8 },
+    /// The JSON was syntactically invalid.
     Malformed { detail: String },
     /// The JSON parsed, but the declared-type decoder rejected it: a wrong shape,
     /// a wrong ADT tag, a wrong tuple arity, a missing required field, or an
@@ -67,6 +69,10 @@ impl core::fmt::Display for SealDecodeError {
                 f,
                 "seal decode rejected: input is {len} bytes, over the {max}-byte boundary limit"
             ),
+            SealDecodeError::TooDeep { max } => write!(
+                f,
+                "seal decode rejected: JSON nested past the {max}-level boundary limit"
+            ),
             SealDecodeError::Malformed { detail } => {
                 write!(f, "seal decode rejected: malformed JSON ({detail})")
             }
@@ -76,6 +82,18 @@ impl core::fmt::Display for SealDecodeError {
                     "seal decode rejected: value does not match the declared seal type ({detail})"
                 )
             }
+        }
+    }
+}
+
+impl SealDecodeError {
+    /// Whether a declared ceiling (the byte or depth budget) turned the input
+    /// back, as opposed to a syntax or shape refusal.
+    #[must_use]
+    pub const fn is_ceiling(&self) -> bool {
+        match self {
+            SealDecodeError::TooLarge { .. } | SealDecodeError::TooDeep { .. } => true,
+            SealDecodeError::Malformed { .. } | SealDecodeError::TypeMismatch { .. } => false,
         }
     }
 }
@@ -94,9 +112,8 @@ pub struct SealLimits {
     /// applied here at the value boundary so an off-web caller (a port, a wasm
     /// property setter) inherits the same protection.
     pub max_input_bytes: usize,
-    /// Maximum JSON nesting depth. `serde_json` refuses a document nested past
-    /// this while parsing, so an adversarial `[[[[…]]]]` is rejected as
-    /// [`SealDecodeError::Malformed`] rather than recursing without bound.
+    /// Maximum JSON nesting depth. A document nested past it is rejected as
+    /// [`SealDecodeError::TooDeep`] before the parser recurses into it.
     pub max_nesting_depth: u8,
 }
 
@@ -130,8 +147,8 @@ impl Default for SealLimits {
 ///
 /// The steps are ordered cheapest-and-most-conservative first:
 /// 1. Byte-length check — reject an oversized input before parsing allocates.
-/// 2. Depth-bounded JSON parse — a syntax error or an over-nested document is
-///    refused; `serde_json` enforces the nesting limit as it parses.
+/// 2. Depth-bounded JSON parse — an over-nested document is refused as
+///    `TooDeep` before the parser recurses, a syntax error as `Malformed`.
 /// 3. Typed decode — the declared-type decoder runs; any mismatch is a typed
 ///    rejection, never a partial value.
 ///
@@ -154,13 +171,10 @@ pub fn seal_decode<T>(
         });
     }
 
-    // 2. Depth-bounded parse into a `JsonVal`. `serde_json`'s deserializer
-    //    refuses a document nested past its depth budget; we set that budget
-    //    explicitly to the seal limit so the bound is ours, not an inherited
-    //    default. A syntax error or an over-depth document both surface as a
-    //    parse error and are rejected — the typed decoder never sees them.
-    let value = parse_depth_bounded(input, limits.max_nesting_depth)
-        .map_err(|detail| SealDecodeError::Malformed { detail })?;
+    // 2. Depth-bounded parse into a `JsonVal`: an over-nested document is
+    //    `TooDeep`, a syntax error `Malformed` — the typed decoder never sees
+    //    either.
+    let value = parse_depth_bounded(input, limits.max_nesting_depth)?;
 
     // 3. Typed decode. The declared-type decoder either yields the whole value or
     //    a typed error; on error nothing partial escapes.
@@ -207,8 +221,7 @@ pub fn seal_decode_serde<T: serde::de::DeserializeOwned>(
     // as `seal_decode`), so an adversarial `[[[[…]]]]` is refused before the
     // typed decode. `JsonVal` is `serde_json::Value`, so the parsed value feeds
     // `from_value` with no re-serialisation.
-    let value = parse_depth_bounded(input, limits.max_nesting_depth)
-        .map_err(|detail| SealDecodeError::Malformed { detail })?;
+    let value = parse_depth_bounded(input, limits.max_nesting_depth)?;
     serde_json::from_value::<T>(value).map_err(|e| SealDecodeError::TypeMismatch {
         detail: e.to_string(),
     })
@@ -231,32 +244,71 @@ pub fn seal_boundary_check(input: &str, limits: SealLimits) -> Result<(), SealDe
             max: limits.max_input_bytes,
         });
     }
-    parse_depth_bounded(input, limits.max_nesting_depth)
-        .map(|_| ())
-        .map_err(|detail| SealDecodeError::Malformed { detail })
+    parse_depth_bounded(input, limits.max_nesting_depth).map(|_| ())
 }
 
-/// Parse `input` into a [`JsonVal`] with the deserializer's recursion limit set
-/// to `max_depth`, so a document nested deeper than the seal budget is rejected
-/// as a parse error rather than recursing further. Returns the parser's own error
-/// text on failure (syntax error or depth overflow), never panics.
+/// Most containers `serde_json` nests before it refuses with its own recursion
+/// error: its deserializer starts with a remaining depth of 128 and refuses the
+/// container that brings it to 0.
 #[cfg(feature = "json")]
-fn parse_depth_bounded(input: &str, max_depth: u8) -> Result<JsonVal, String> {
-    // `serde_json`'s default depth limit is 128; the deserializer stops at the
-    // first level past its budget. To pin the seal's *own* depth cap we would
-    // normally lower the deserializer's remaining-depth, but that knob is only
-    // exposed via `disable_recursion_limit` (raise, not lower). So the built-in
-    // 128-level limit is the hard floor for the parse step, and a stricter seal
-    // budget is enforced as a post-parse structural depth check — one bound, two
-    // enforcement points, both fail-closed.
-    let value: JsonVal = serde_json::from_str(input).map_err(|e| format!("json parse: {e}"))?;
-    let depth = json_depth(&value);
-    if depth > usize::from(max_depth) {
-        return Err(format!(
-            "nesting depth {depth} exceeds the {max_depth}-level boundary limit"
-        ));
+const SERDE_CONTAINER_FLOOR: usize = 127;
+
+/// Parse `input` into a [`JsonVal`], refusing a document nested past
+/// `max_depth` as [`SealDecodeError::TooDeep`] and a syntax error as
+/// [`SealDecodeError::Malformed`]. Never panics.
+///
+/// The container nesting is checked lexically first, against the smaller of
+/// the seal budget and `serde_json`'s own floor, so the parser's recursion
+/// error (a syntax-shaped error that cannot be told apart from a typo) never
+/// refuses an over-nested document. The parsed value is then checked against
+/// the seal budget by structural depth, where a scalar leaf counts one level.
+#[cfg(feature = "json")]
+fn parse_depth_bounded(input: &str, max_depth: u8) -> Result<JsonVal, SealDecodeError> {
+    let lexical_cap = usize::from(max_depth).min(SERDE_CONTAINER_FLOOR);
+    if !containers_nest_within(input, lexical_cap) {
+        return Err(SealDecodeError::TooDeep { max: max_depth });
+    }
+    let value: JsonVal = serde_json::from_str(input).map_err(|e| SealDecodeError::Malformed {
+        detail: format!("json parse: {e}"),
+    })?;
+    if json_depth(&value) > usize::from(max_depth) {
+        return Err(SealDecodeError::TooDeep { max: max_depth });
     }
     Ok(value)
+}
+
+/// Whether `input` never has more than `cap` JSON containers (`[`, `{`) open at
+/// once, counting brackets outside string literals only. A stray closing
+/// bracket saturates at zero; the parser refuses it afterwards as a syntax
+/// error. One pass, no allocation.
+#[cfg(feature = "json")]
+fn containers_nest_within(input: &str, cap: usize) -> bool {
+    let mut open = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in input.bytes() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                (false, _) => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                open = open.saturating_add(1);
+                if open > cap {
+                    return false;
+                }
+            }
+            b']' | b'}' => open = open.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Structural nesting depth of a parsed JSON value: a scalar is depth 1, a
@@ -604,17 +656,14 @@ mod tests {
         };
         let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
         // The array-of-strings decoder would reject the innermost anyway; what we
-        // assert is that the *depth* bound fires first, as Malformed, before any
+        // assert is that the *depth* bound fires first, as TooDeep, before any
         // typed decode work.
         let got = seal_decode(
             &deep,
             &decode_list(json_decode_string::<IpeError>()),
             limits,
         );
-        assert!(
-            matches!(got, Err(SealDecodeError::Malformed { .. })),
-            "an over-nested input must reject as Malformed (bounded), got {got:?}"
-        );
+        assert_eq!(got, Err(SealDecodeError::TooDeep { max: 8 }));
     }
 
     #[test]
@@ -632,9 +681,67 @@ mod tests {
             &decode_list(json_decode_string::<IpeError>()),
             limits,
         );
+        assert_eq!(
+            got,
+            Err(SealDecodeError::TooDeep { max: 255 }),
+            "500-level nesting is a depth refusal, never serde's syntax-shaped one"
+        );
+    }
+
+    fn nested_arrays(levels: usize) -> String {
+        format!("{}{}", "[".repeat(levels), "]".repeat(levels))
+    }
+
+    #[test]
+    fn depth_refusals_are_ceilings_at_both_bounds() {
+        let tight = SealLimits {
+            max_nesting_depth: 8,
+            ..SealLimits::default()
+        };
+        assert_eq!(seal_boundary_check(&nested_arrays(8), tight), Ok(()));
+        assert_eq!(
+            seal_boundary_check(&nested_arrays(9), tight),
+            Err(SealDecodeError::TooDeep { max: 8 })
+        );
+        // At serde's own floor: 127 nested containers parse, 128 are refused
+        // by the seal as a depth ceiling before serde's recursion error.
+        let wide = SealLimits {
+            max_nesting_depth: 255,
+            ..SealLimits::default()
+        };
+        assert_eq!(seal_boundary_check(&nested_arrays(127), wide), Ok(()));
+        let past_floor = seal_boundary_check(&nested_arrays(128), wide);
+        assert_eq!(past_floor, Err(SealDecodeError::TooDeep { max: 255 }));
+        assert!(past_floor.is_err_and(|e| e.is_ceiling()));
+    }
+
+    #[test]
+    fn brackets_inside_strings_do_not_count_toward_depth() {
+        let tight = SealLimits {
+            max_nesting_depth: 2,
+            ..SealLimits::default()
+        };
+        assert_eq!(seal_boundary_check(r#"["[[[[{{{{"]"#, tight), Ok(()));
+        assert_eq!(seal_boundary_check(r#"["\"[[[[", "\\"]"#, tight), Ok(()));
+        assert_eq!(
+            seal_boundary_check(r#"["\\", [[1]]]"#, tight),
+            Err(SealDecodeError::TooDeep { max: 2 })
+        );
+    }
+
+    #[test]
+    fn only_byte_and_depth_refusals_are_ceilings() {
+        let too_large = SealDecodeError::TooLarge { len: 2, max: 1 };
+        let too_deep = SealDecodeError::TooDeep { max: 1 };
+        let malformed = seal_boundary_check("{not json", SealLimits::default());
+        assert!(too_large.is_ceiling() && too_deep.is_ceiling());
+        assert!(matches!(&malformed, Err(SealDecodeError::Malformed { .. })));
+        assert!(malformed.is_err_and(|e| !e.is_ceiling()));
         assert!(
-            matches!(got, Err(SealDecodeError::Malformed { .. })),
-            "serde's own depth floor must reject 500-level nesting, got {got:?}"
+            !SealDecodeError::TypeMismatch {
+                detail: String::new()
+            }
+            .is_ceiling()
         );
     }
 

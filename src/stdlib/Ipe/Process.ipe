@@ -87,8 +87,9 @@ runWith =
 --
 -- Captured `output` is bounded (`IPE_PROCESS_OUTPUT_MAX`, default 16 MiB); a
 -- child that floods the pty past the ceiling fails the Task with a
--- `LimitExceeded` error rather than allocating without bound. This is the same `subprocess` capability as `run`
--- (the pty is an implementation detail of running a child, not a new reach).
+-- `LimitExceeded` error rather than allocating without bound. This is the same
+-- `subprocess` capability as `run` (the pty is an implementation detail of
+-- running a child, not a new reach).
 --
 -- Unix-only: on a non-unix target the Task fails with an `unsupported` error.
 runInPty :

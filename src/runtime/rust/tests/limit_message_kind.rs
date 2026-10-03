@@ -54,13 +54,6 @@ const ADMITTED: &[Admitted] = &[
         prefix: "Money.setRate: currency code too long",
         count: 1,
     },
-    // A `SealDecodeError` is logged or checked with `is_ok`; it never reaches
-    // an Ipê `Error`.
-    Admitted {
-        file: "seal_codec.rs",
-        prefix: "nesting depth ",
-        count: 1,
-    },
 ];
 
 /// The words that name a declared ceiling in a refusal message.
