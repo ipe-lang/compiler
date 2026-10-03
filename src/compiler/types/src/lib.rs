@@ -2534,7 +2534,11 @@ fn resolve_deferred(
         let mut made_progress = false;
 
         // ── Field accesses ────────────────────────────────────────────────────
+        // Every visit of a pending item is a solver step: a pass may discharge
+        // only one of `n` items (a chain `r.f.f…f` settles one base per pass), so
+        // the fixpoint costs O(n²) visits and the solver budget is its ceiling.
         for fa in &pending_fa {
+            lift!(budget.tick());
             let root = lift!(uf.find(fa.record));
             // See [`field_access_state`] for the encoding + borrow discipline.
             match lift!(field_access_state(uf, tables, root, fa.field)) {
@@ -2591,6 +2595,7 @@ fn resolve_deferred(
             // Deferred → carry to the next pass; Discharged → progress; Error →
             // propagate. Extracted into a helper so this fixpoint driver stays
             // under the readability line-cap.
+            lift!(budget.tick());
             match resolve_one_record_update(uf, budget, interner, tables, ru)? {
                 RuOutcome::Deferred => next_ru.push(ru),
                 RuOutcome::Discharged => made_progress = true,
@@ -2649,6 +2654,15 @@ fn resolve_deferred(
                     ru.home.clone(),
                 ));
             }
+            // A pass that made no progress, settled nothing and named no failing
+            // item would repeat itself forever: fail closed instead.
+            return Err((
+                Diagnostic::CompilerBug {
+                    where_: "ipe_types::resolve_deferred",
+                    detail: "a deferred pass made no progress and reported no item".into(),
+                },
+                Vec::new(),
+            ));
         }
     }
 }
@@ -5742,13 +5756,15 @@ mod tests {
         );
     }
 
-    /// Module header importing the higher-order kernels the HOF-result tests use.
-    const HOF_HDR: &str =
-        "module Main exposing (ok)\n\nimport Ipe.List as List\nimport Ipe.Maybe as Maybe\n\n";
+    /// Module header for the deferred-base tests. The compiled-source stdlib
+    /// modules (`Ipe.List`, `Ipe.Maybe`) do not canonicalise in this crate, so
+    /// the higher-order-kernel callback-result shapes are pinned end to end in
+    /// `negative_suite.rs` and `g_misc/golden_lambda_field_access_seal.rs`.
+    const DEFERRED_HDR: &str = "module Main exposing (ok)\n\n";
 
-    /// Infer `body` under [`HOF_HDR`], returning the result.
-    fn infer_hof(body: &str) -> DResult<SolvedTypes> {
-        let (solved, ..) = infer_src(&format!("{HOF_HDR}{body}"));
+    /// Infer `body` under [`DEFERRED_HDR`], returning the result.
+    fn infer_deferred(body: &str) -> DResult<SolvedTypes> {
+        let (solved, ..) = infer_src(&format!("{DEFERRED_HDR}{body}"));
         solved
     }
 
@@ -5757,68 +5773,70 @@ mod tests {
         matches!(r, Err(Diagnostic::Type { msg, .. }) if is_msg(msg))
     }
 
-    #[test]
-    fn field_access_through_hof_result_resolves() {
-        // `u` is the HOF-result super variable of the inner `Maybe.map`; its
-        // access waits until `e.unit` pins it to `{ name : String }`.
-        let opt = infer_env_ty(
-            &format!(
-                "{HOF_HDR}ok =\n    Maybe.map (\\u -> u.name) (Maybe.map (\\e -> e.unit) \
-                 (Just {{ unit = {{ name = \"x\" }} }}))\n"
-            ),
-            "ok",
-        );
-        assert!(opt.is_some(), "ok must infer");
-        let Some((ty, i)) = opt else { return };
-        assert_eq!(ty_con_name(&ty, &i).as_deref(), Some("Maybe"), "got {ty:?}");
-        let Ty::Con { args, .. } = &ty else { return };
-        assert_eq!(args.len(), 1, "got {ty:?}");
-        let arg = args.first().map(|a| ty_con_name(a, &i));
-        assert_eq!(arg, Some(Some("String".to_owned())), "got {ty:?}");
+    /// A record of one `depth`-read chain `r.f.f…f` beside `riders` reads
+    /// `sK.a`, each on its own never-settled parameter.
+    fn chain_with_riders(depth: usize, riders: usize) -> String {
+        let params: String = (0..riders).map(|k| format!(" s{k}")).collect();
+        let reads: String = (0..riders).map(|k| format!(", a{k} = s{k}.a")).collect();
+        format!(
+            "{DEFERRED_HDR}ok r{params} =\n    {{ c = r{}{reads} }}\n",
+            ".f".repeat(depth)
+        )
+    }
+
+    /// The fewest solver steps `src` infers within; `None` when it fails for a
+    /// reason other than the budget, or needs more than `2^20` steps.
+    fn min_solver_steps(src: &str) -> Option<u64> {
+        let fits = |steps: u64| -> Option<bool> {
+            let (m, mut i) = canon_src(src)?;
+            match infer_with_budget(&m, &mut i, &mut Budget::new(steps)) {
+                Ok(_) => Some(true),
+                Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                }) => Some(false),
+                Err(_) => None,
+            }
+        };
+        let (mut lo, mut hi) = (0_u64, 1_u64 << 20);
+        if !fits(hi)? {
+            return None;
+        }
+        // `lo` does not fit, `hi` fits.
+        while hi.checked_sub(lo)? > 1 {
+            let mid = lo.checked_add(hi.checked_sub(lo)? / 2)?;
+            if fits(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(hi)
     }
 
     #[test]
-    fn field_access_through_hof_result_is_order_independent() {
-        // The piped and the nested spellings constrain the two callbacks in
-        // opposite orders; both must infer.
-        let piped = infer_hof(
-            "ok =\n    [ { unit = { name = \"x\" } } ]\n        |> List.map (\\e -> e.unit)\n        \
-             |> List.map (\\u -> u.name)\n",
-        );
-        assert!(piped.is_ok(), "piped HOF field chain must infer: {piped:?}");
-        let nested = infer_hof(
-            "ok =\n    List.map (\\u -> u.name) (List.map (\\e -> e.unit) \
-             [ { unit = { name = \"x\" } } ])\n",
-        );
+    fn deferred_fixpoint_charges_the_solver_budget() {
+        // The chain settles one base per pass, so the deferred fixpoint runs
+        // about `2 * depth` passes, and a rider read whose base nothing settles
+        // is revisited on every one of them. Each visit is a solver step, so the
+        // budget bounds the fixpoint's work, not only the unifications inside
+        // it: the riders cost at least `riders * depth` steps over the chain
+        // alone, where their own unifications cost a constant each.
+        let (depth, riders) = (64_usize, 8_usize);
+        let alone = min_solver_steps(&chain_with_riders(depth, 0));
+        let ridden = min_solver_steps(&chain_with_riders(depth, riders));
         assert!(
-            nested.is_ok(),
-            "nested HOF field chain must infer: {nested:?}"
+            alone.is_some() && ridden.is_some(),
+            "both chains must infer under some budget: {alone:?} {ridden:?}"
         );
-    }
-
-    #[test]
-    fn field_access_missing_after_hof_result_is_no_such_field() {
-        // Waiting on the super variable never invents a field: the settled
-        // record is closed and has no `nope`.
-        let r = infer_hof(
-            "ok =\n    Maybe.map (\\u -> u.nope) (Maybe.map (\\e -> e.unit) \
-             (Just { unit = { name = \"x\" } }))\n",
-        );
+        let (Some(alone), Some(ridden)) = (alone, ridden) else {
+            return;
+        };
+        let floor = u64::try_from(riders * depth).unwrap_or(u64::MAX);
         assert!(
-            is_type_error(&r, |m| matches!(m, TypeError::NoSuchField { .. })),
-            "a field the settled record lacks must be NoSuchField, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn field_access_on_hof_result_non_record_is_no_such_field() {
-        // The super variable settles to `Int`, which has no field.
-        let r = infer_hof(
-            "ok =\n    Maybe.map (\\u -> u.name) (Maybe.map (\\e -> e.unit) (Just { unit = 3 }))\n",
-        );
-        assert!(
-            is_type_error(&r, |m| matches!(m, TypeError::NoSuchField { .. })),
-            "a field on a super pinned to Int must be NoSuchField, got {r:?}"
+            ridden.saturating_sub(alone) >= floor,
+            "{riders} riders over a {depth}-deep chain cost {} steps, under {floor}",
+            ridden.saturating_sub(alone)
         );
     }
 
@@ -5826,7 +5844,7 @@ mod tests {
     fn field_access_on_number_super_is_no_such_field() {
         // A `number` super can never be a record, so the access is decided at
         // once rather than deferred.
-        let r = infer_hof("ok n =\n    n + n.x\n");
+        let r = infer_deferred("ok n =\n    n + n.x\n");
         assert!(
             is_type_error(&r, |m| matches!(m, TypeError::NoSuchField { .. })),
             "a field on a number super must be NoSuchField, got {r:?}"
@@ -5834,24 +5852,10 @@ mod tests {
     }
 
     #[test]
-    fn record_update_through_hof_result_resolves() {
-        // The update's base is the HOF-result super variable of a two-level
-        // `Maybe.map` chain; it waits until the chain settles it.
-        let r = infer_hof(
-            "ok =\n    Maybe.map (\\u -> { u | name = \"y\" }) (Maybe.map (\\e -> e.unit) \
-             (Maybe.map (\\d -> d.inner) (Just { inner = { unit = { name = \"x\" } } })))\n",
-        );
-        assert!(
-            r.is_ok(),
-            "record update through a HOF result must infer: {r:?}"
-        );
-    }
-
-    #[test]
     fn self_referential_access_is_infinite_type() {
         // The access's result is its own base: the no-progress settle goes
         // through `unify`, whose occurs check refuses the cyclic record.
-        let r = infer_hof("ok r =\n    ok r.next\n");
+        let r = infer_deferred("ok r =\n    ok r.next\n");
         assert!(
             is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
             "a self-referential field access must be InfiniteType, got {r:?}"
@@ -5862,7 +5866,7 @@ mod tests {
     fn self_referential_grow_open_is_infinite_type() {
         // `r.a` settles `r` to an open record; `r.next` then grows it with a
         // field whose type is `r` itself — refused before the write.
-        let r = infer_hof("ok r =\n    let a = r.a in ok r.next\n");
+        let r = infer_deferred("ok r =\n    let a = r.a in ok r.next\n");
         assert!(
             is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
             "a self-referential grown field must be InfiniteType, got {r:?}"
@@ -5873,7 +5877,7 @@ mod tests {
     fn super_pinned_to_containing_structure_is_infinite_type() {
         // The equality super `a` would pin to `List a`: an infinite type, not a
         // solver spin to the step budget.
-        let r = infer_hof("ok a =\n    a == [ a ]\n");
+        let r = infer_deferred("ok a =\n    a == [ a ]\n");
         assert!(
             is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
             "a super pinned to a structure containing it must be InfiniteType, got {r:?}"
@@ -5885,12 +5889,12 @@ mod tests {
         // `a` owes equality and settles to `{ x : Int }` only in the deferred
         // pass; the verdict must not depend on which operand was constrained
         // first.
-        let fwd = infer_hof("ok a =\n    a.x == 1 && a == a\n");
+        let fwd = infer_deferred("ok a =\n    a.x == 1 && a == a\n");
         assert!(
             fwd.is_ok(),
             "field read before equality must infer: {fwd:?}"
         );
-        let rev = infer_hof("ok a =\n    a == a && a.x == 1\n");
+        let rev = infer_deferred("ok a =\n    a == a && a.x == 1\n");
         assert!(
             rev.is_ok(),
             "equality before field read must infer: {rev:?}"
@@ -5902,12 +5906,12 @@ mod tests {
         // `p == p` is constrained before `n + 1` makes `n` numeric: the deep
         // equality check on `{ x = n }` must read `n` after it defaults to
         // `Int`, exactly as the reversed spelling does.
-        let rev = infer_hof("ok n =\n    (let p = { x = n } in p == p) && n + 1 > 0\n");
+        let rev = infer_deferred("ok n =\n    (let p = { x = n } in p == p) && n + 1 > 0\n");
         assert!(
             rev.is_ok(),
             "equality before the numeric use must infer: {rev:?}"
         );
-        let fwd = infer_hof("ok n =\n    n + 1 > 0 && (let p = { x = n } in p == p)\n");
+        let fwd = infer_deferred("ok n =\n    n + 1 > 0 && (let p = { x = n } in p == p)\n");
         assert!(
             fwd.is_ok(),
             "numeric use before equality must infer: {fwd:?}"
