@@ -605,7 +605,7 @@ impl CliError {
     #[must_use]
     pub const fn machine_kind(&self) -> &'static str {
         match self {
-            Self::Usage(_) => "usage",
+            Self::Usage(_) | Self::FfiPrep(_) => "usage",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
@@ -653,7 +653,6 @@ impl CliError {
             Self::OutputRefused(_) => "output-refused",
             Self::DiscoveryLimitReached { .. } => "discovery-limit-reached",
             Self::TrustRefused(_) => "trust-refused",
-            Self::FfiPrep(_) => "usage",
             Self::DeviceNamedModule { .. } => "device-named-module",
             Self::UpgradeFeedUnreachable => "upgrade-feed-unreachable",
             Self::UpgradeCheckExit { .. } => "upgrade-check-exit",

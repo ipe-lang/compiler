@@ -4766,7 +4766,7 @@ version = \"1\"
         assert!(
             refused_as(
                 &clash,
-                FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "serde".to_owned(),
                     first: "1.0.1".to_owned(),
                     second: "1.0.2".to_owned(),
@@ -4851,7 +4851,7 @@ version = \"1\"
         assert!(
             refused_as(
                 &clash,
-                FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "stripe".to_owned(),
                     first: "1.0.0".to_owned(),
                     second: "2.0.0".to_owned(),
@@ -4864,9 +4864,9 @@ version = \"1\"
     /// Whether `result` is exactly the refusal `want`.
     fn refused_as(
         result: &Result<Option<ipe_backend_rust::FfiEmit>, FfiPrepError>,
-        want: FfiPrepError,
+        want: &FfiPrepError,
     ) -> bool {
-        result.as_ref().err() == Some(&want)
+        result.as_ref().err() == Some(want)
     }
 
     /// The `syn` 2.x / 3.x pin conflict between the two [`syn_split`] members.
@@ -4928,7 +4928,7 @@ version = \"1\"
         b.bindings_source = "pub fn span() -> ::syn::Ident { ::syn::parse_str(\"x\") }".to_owned();
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, catalog_dropped_at("src/ffi.rs")),
+            refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
             "a `::syn::` path with `syn` undeclared must refuse: {refused:?}"
         );
     }
@@ -4940,7 +4940,7 @@ version = \"1\"
             .insert("Ident".to_owned(), "::syn::Ident".to_owned());
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, catalog_dropped_at("Rust.a.Ident")),
+            refused_as(&refused, &catalog_dropped_at("Rust.a.Ident")),
             "an opaque path rooted at undeclared `syn` must refuse: {refused:?}"
         );
     }
@@ -4993,7 +4993,7 @@ version = \"1\"
         assert!(
             refused_as(
                 &refused,
-                FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "async-stripe".to_owned(),
                     first: "1.0.0".to_owned(),
                     second: "2.0.0".to_owned(),
@@ -5011,7 +5011,7 @@ version = \"1\"
         b.dep_idents = BTreeMap::new();
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_pin_conflict()),
+            refused_as(&refused, &syn_pin_conflict()),
             "a conflict involving a legacy member must fail closed: {refused:?}"
         );
     }
@@ -5025,7 +5025,7 @@ version = \"1\"
         b.dep_idents.remove("syn");
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_pin_conflict()),
+            refused_as(&refused, &syn_pin_conflict()),
             "an unidentifiable dropped dep must fail closed: {refused:?}"
         );
     }
@@ -5059,7 +5059,7 @@ version = \"1\"
         a.bindings_source = "pub fn f() -> ::syn::Ident { g() }".to_owned();
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, catalog_dropped_at("src/ffi.rs")),
+            refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
             "a reference to the dropped same-major dep is refused: {refused:?}"
         );
     }
@@ -5155,7 +5155,7 @@ version = \"1\"
             b.bindings_source = body.to_owned();
             let refused = emit_of(&[a, b]);
             assert!(
-                refused_as(&refused, catalog_dropped_at("src/ffi.rs")),
+                refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
                 "{body}: {refused:?}"
             );
         }
@@ -5169,7 +5169,7 @@ version = \"1\"
         assert!(
             refused_as(
                 &refused,
-                FfiPrepError::CatalogSeal(SealRefusal::Unlexable {
+                &FfiPrepError::CatalogSeal(SealRefusal::Unlexable {
                     site: "src/ffi.rs".to_owned()
                 })
             ),
@@ -5214,7 +5214,7 @@ version = \"1\"
         );
         let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, catalog_dropped_at("Rust.A.Ident")),
+            refused_as(&refused, &catalog_dropped_at("Rust.A.Ident")),
             "{refused:?}"
         );
     }
@@ -5751,7 +5751,7 @@ version = \"1\"
         assert!(
             refused_as(
                 &clash,
-                FfiPrepError::DefineOpaqueCollision {
+                &FfiPrepError::DefineOpaqueCollision {
                     slug: "iced".to_owned(),
                     name: "Element".to_owned(),
                 }

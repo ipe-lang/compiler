@@ -152,7 +152,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
 /// serve analysis over a program `ipe build` rejects. The match names every
 /// variant with no fallback arm, so a new refusal cannot reach the editor
 /// until its disposition is decided.
-fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadError {
+const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadError {
     match refusal {
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
