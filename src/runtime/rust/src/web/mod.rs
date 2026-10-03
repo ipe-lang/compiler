@@ -747,6 +747,25 @@ fn value_to_string(v: &serde_json::Value) -> String {
 type RouteEntry<Model, Msg> =
     Arc<dyn Fn(Model, &route::DecodedPath) -> route::Entered<Model, IpeCmd<Msg>> + Send + Sync>;
 
+/// Enters `path` for a new driver of session `sid`, running `seed_cmd` before the entry Cmd.
+///
+/// Every page-handler arm that builds a driver (miss, restored, rebuilt) goes
+/// through here, so the order `[seed, entry]` and the sid scope live in one
+/// place. Relies on one invariant: constructing an `IpeCmd` performs no
+/// effect, only `run_cmd` does, so a seed built for a session that is then
+/// discarded never fires.
+#[cfg(feature = "server")]
+fn enter_session<Model, Msg>(
+    route_entry: &RouteEntry<Model, Msg>,
+    sid: &str,
+    model: Model,
+    seed_cmd: IpeCmd<Msg>,
+    path: &route::DecodedPath,
+) -> (Model, IpeCmd<Msg>) {
+    let entered = pubsub::with_session_sid(sid.to_owned(), || route_entry(model, path));
+    (entered.model, IpeCmd::Batch(vec![seed_cmd, entered.cmd]))
+}
+
 /// Pending URL entries a session driver holds before a new one is refused with 503.
 #[cfg(feature = "server")]
 const ENTER_QUEUE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(7);
@@ -3134,8 +3153,10 @@ mod handlers {
         // Cookie-based session lifecycle:
         //   * Web hit  → reuse the in-process session; its driver enters this
         //                 GET's path and runs the entry Cmd (no new driver).
-        //   * Cold hit  → a persisted model (post-restart / different replica);
+        //   * Restored  → a persisted model (post-restart / different replica);
         //                 hydrate a fresh driver seeded with it (no init).
+        //   * Rebuilt   → a persisted model spliced onto a fresh `init` across an
+        //                 additive Model change; init's Cmd runs, then the entry's.
         //   * miss      → init a new session.
         let cookie_sid = sid_from_cookie(&headers);
         // CSRF double-submit token: reuse the browser's existing well-formed
@@ -3166,18 +3187,14 @@ mod handlers {
         // value from THIS incoming GET request — the exact same `init(req)` the
         // clean-reinit miss path runs — so a reconstructed session's new fields
         // hold precisely what a fresh visit would have produced, with no
-        // synthetic request and no surprising default. It is invoked LAZILY:
+        // synthetic request and no surprising default. It runs under the
+        // cookie's sid (the sid a rebuilt session keeps) and returns init's
+        // whole `(Model, Cmd)` pair: the store hands the Cmd back beside the
+        // rebuilt model, and `enter_session` runs it. It is invoked LAZILY:
         // only on a schema-mismatched cold row, never on a live hit or a
-        // matched-schema restore, so `init` (and any side effect it carries)
-        // never fires on the hot paths. Any non-additive change (removed /
-        // retyped field), corrupt / oversized body, or pre-`v2` row falls back
-        // to the clean re-init the store's flat miss always produced.
-        let make_init = || {
-            let params = (st.param_resolver)(&path);
-            let req = req::web_req(&method, &uri, &headers, params);
-            let (m, _cmd) = (st.init)(req);
-            m
-        };
+        // matched-schema restore. Any non-additive change (removed / retyped
+        // field), corrupt / oversized body, or pre-`v2` row falls back to the
+        // clean re-init the store's flat miss always produced.
         // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
@@ -3188,11 +3205,19 @@ mod handlers {
             None
         } else {
             match cookie_sid.as_ref() {
-                Some(s) => st
-                    .store
-                    .get_reconstructing(s, &make_init)
-                    .await
-                    .map(|h| (s.clone(), h)),
+                Some(s) => {
+                    let make_init = || {
+                        pubsub::with_session_sid(s.clone(), || {
+                            let params = (st.param_resolver)(&path);
+                            let req = req::web_req(&method, &uri, &headers, params);
+                            (st.init)(req)
+                        })
+                    };
+                    st.store
+                        .get_reconstructing(s, &make_init)
+                        .await
+                        .map(|h| (s.clone(), h))
+                }
                 None => None,
             }
         };
@@ -3208,7 +3233,7 @@ mod handlers {
         }
 
         let (sid, model, cmd0) = match hit {
-            Some((sid, store::StoreHit::Web(handle))) => {
+            Some((sid, store::Rejoin::Live(handle))) => {
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
                 // serialised with its `update`s, commits, touches the store and
@@ -3242,13 +3267,20 @@ mod handlers {
                 #[cfg(not(feature = "debugger"))]
                 return page_response(&sid, &body, &csrf_tok, &headers);
             }
-            Some((sid, store::StoreHit::Cold(m))) => {
+            Some((sid, store::Rejoin::Restored(m))) => {
                 // A returning user with a valid sid cookie → not new attack
                 // volume, so NOT rejected; but count its driver so the slot it
                 // gets below is paired (decremented on the driver's exit).
                 st.session_count.fetch_add(1, Ordering::SeqCst);
-                let entered = pubsub::with_session_sid(sid.clone(), || (st.route_entry)(m, &path));
-                (sid, entered.model, entered.cmd)
+                let (m, c) = enter_session(&st.route_entry, &sid, m, IpeCmd::None, &path);
+                (sid, m, c)
+            }
+            Some((sid, store::Rejoin::Rebuilt { model, init_cmd })) => {
+                // Returning user, same slot pairing as `Restored`; the rebuilt
+                // model's `init` Cmd runs first, exactly as on a new session.
+                st.session_count.fetch_add(1, Ordering::SeqCst);
+                let (m, c) = enter_session(&st.route_entry, &sid, model, init_cmd, &path);
+                (sid, m, c)
             }
             None => {
                 // Admission control (cookieless = brand-new session = the
@@ -3283,11 +3315,8 @@ mod handlers {
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
                 let s = new_sid();
-                let (m, c) = pubsub::with_session_sid(s.clone(), || {
-                    let (m, init_cmd) = (st.init)(req);
-                    let entered = (st.route_entry)(m, &path);
-                    (entered.model, IpeCmd::Batch(vec![init_cmd, entered.cmd]))
-                });
+                let (m, init_cmd) = pubsub::with_session_sid(s.clone(), || (st.init)(req));
+                let (m, c) = enter_session(&st.route_entry, &s, m, init_cmd, &path);
                 (s, m, c)
             }
         };
@@ -10045,7 +10074,20 @@ mod route_entry_cmd_tests {
         }))
     }
 
+    thread_local! {
+        /// The session sid each fixture `init` call ran under, in call order.
+        static INIT_SIDS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Drain the sids `init` ran under on this thread since the last drain.
+    fn take_init_sids() -> Vec<String> {
+        INIT_SIDS.with(|sids| std::mem::take(&mut *sids.borrow_mut()))
+    }
+
+    /// Records the sid it runs under (where a js port binds its session), then inits.
     fn init(_req: WebReq) -> (Model, IpeCmd<Msg>) {
+        INIT_SIDS.with(|sids| sids.borrow_mut().push(pubsub::current_session_sid()));
         (
             Model {
                 page: Page::Home,
@@ -10314,6 +10356,137 @@ mod route_entry_cmd_tests {
                 m.map(|m| m.log),
                 Some(vec!["persisted".to_owned(), "enter:item-3".to_owned()]),
                 "a cold restore runs the entry Cmd and never init's"
+            );
+        });
+    }
+
+    /// The live binary's Model schema tag in the file-store fixtures.
+    #[cfg(feature = "web")]
+    const LIVE_TAG: [u8; 32] = [0x11; 32];
+    /// A previous binary's tag: a row under it was written before a Model change.
+    #[cfg(feature = "web")]
+    const OLD_TAG: [u8; 32] = [0x22; 32];
+
+    /// One checkpoint blob framed as the store writes it: `base64(tag ++ json)`.
+    #[cfg(feature = "web")]
+    fn checkpoint(tag: [u8; 32], json: &str) -> String {
+        use base64::Engine as _;
+        let mut framed = tag.to_vec();
+        framed.extend_from_slice(json.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(framed)
+    }
+
+    /// A file store under `LIVE_TAG` whose one persisted row maps `sid` to `blob`.
+    #[cfg(feature = "web")]
+    #[allow(clippy::expect_used)] // test helper — a temp-file write failure is a test environment issue
+    fn file_store_with(name: &str, sid: &str, blob: String) -> Store {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_rejoin_{name}_{}.json", std::process::id()));
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let mut map: std::collections::HashMap<String, (String, i64)> =
+            std::collections::HashMap::new();
+        map.insert(sid.to_owned(), (blob, last_seen));
+        std::fs::write(
+            &path,
+            serde_json::to_string(&map).expect("encode the seed map"),
+        )
+        .expect("write the seed map");
+        Arc::new(store::FileStore::<Model, Msg>::new(
+            path.to_str().expect("a UTF-8 temp path"),
+            Duration::from_secs(60),
+            LIVE_TAG,
+        ))
+    }
+
+    /// A session rebuilt across an additive Model change runs init's Cmd, then the entry Cmd, under its kept sid.
+    #[cfg(feature = "web")]
+    #[test]
+    fn schema_rebuilt_session_runs_init_cmd_then_entry_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // The old Model had no `log`: an additive change, so the row is rebuilt.
+            let store = file_store_with("rebuilt", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a rebuilt session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "a rebuilt session runs init's Cmd, then the entry Cmd, each once"
+            );
+        });
+    }
+
+    /// The `init` a rebuild evaluates runs under the session's sid, never the empty default.
+    #[cfg(feature = "web")]
+    #[test]
+    fn rebuilt_init_cmd_binds_session_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let store = file_store_with("bindsid", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            take_init_sids();
+            let (status, _, _, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                take_init_sids(),
+                vec![sid],
+                "init runs once, scoped to the rebuilt session's sid"
+            );
+        });
+    }
+
+    /// A same-tag checkpoint restores verbatim and never evaluates `init`.
+    #[cfg(feature = "web")]
+    #[test]
+    fn exact_tag_restore_never_calls_init() {
+        run(false, || async {
+            let sid = new_sid();
+            let store = file_store_with(
+                "exact",
+                &sid,
+                checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
+            );
+            take_init_sids();
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a restored session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:home".to_owned()]),
+                "a verbatim restore runs the entry Cmd and never init's"
+            );
+            assert!(
+                take_init_sids().is_empty(),
+                "a verbatim restore never evaluates init"
+            );
+        });
+    }
+
+    /// An undecodable row is a miss: a fresh sid, `init` evaluated exactly once under it.
+    #[cfg(feature = "web")]
+    #[test]
+    fn failed_rebuild_runs_init_once_under_new_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let store = file_store_with("undecodable", &sid, "!! not base64 !!".to_owned());
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(minted, sid, "a miss never adopts the client's sid");
+            assert_eq!(
+                take_init_sids(),
+                vec![minted.clone()],
+                "init runs exactly once, under the minted sid"
+            );
+            let m = settled(&store, &minted, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "the new session runs init's Cmd, then the entry Cmd"
             );
         });
     }

@@ -8,6 +8,7 @@
 //! checkpoint; the caller spawns a fresh driver seeded with it).
 
 use super::SessionEntry;
+use crate::tea::IpeCmd;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -114,26 +115,49 @@ fn decode_checkpoint<Model: serde::de::DeserializeOwned>(
 /// row → `None` (the caller re-inits cleanly). Never panics; the persisted
 /// body is untrusted and every failure is a typed `None`.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-fn decode_or_reconstruct_checkpoint<Model>(
+fn decode_or_reconstruct_checkpoint<Model, Seed>(
     schema_tag: &[u8; 32],
     blob: &str,
-    make_init: &(dyn Fn() -> Model + Sync),
-) -> Option<Model>
+    make_init: &(dyn Fn() -> (Model, Seed) + Sync),
+) -> Option<Decoded<Model, Seed>>
 where
     Model: serde::Serialize + serde::de::DeserializeOwned,
 {
     let (tag, body) = split_checkpoint(blob)?;
     if &tag == schema_tag {
         // Fast path: exact schema match, decode verbatim. `init` is never
-        // invoked here — an unchanged-schema restore stays behaviour-identical
-        // to the pre-reconstruction path and pays no `init` cost.
-        return serde_json::from_slice(&body).ok();
+        // invoked here — an unchanged-schema restore pays no `init` cost.
+        return serde_json::from_slice(&body).ok().map(Decoded::Verbatim);
     }
-    // A different tag is an additive candidate. Produce the live `init` value
+    // A different tag is an additive candidate. Produce the live `init` pair
     // (ONLY now — a matched restore never runs it) and splice the persisted
-    // fields onto it, keeping state ONLY on a proven additive superset.
-    let init_model = make_init();
-    super::additive::reconstruct(&body, &init_model)
+    // fields onto its model, keeping state ONLY on a proven additive superset.
+    // The seed travels with the rebuilt model; a failed splice drops both.
+    let (init_model, seed) = make_init();
+    super::additive::reconstruct(&body, &init_model).map(|model| Decoded::Rebuilt { model, seed })
+}
+
+/// A decoded checkpoint: restored verbatim, or rebuilt onto a fresh `init`.
+///
+/// `Rebuilt` carries the seed `make_init` returned beside the model it
+/// produced, so a rebuilt model cannot be separated from its `init` effect.
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+enum Decoded<Model, Seed> {
+    Verbatim(Model),
+    Rebuilt { model: Model, seed: Seed },
+}
+
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+impl<Model, Msg> From<Decoded<Model, IpeCmd<Msg>>> for Rejoin<Model, Msg> {
+    fn from(decoded: Decoded<Model, IpeCmd<Msg>>) -> Self {
+        match decoded {
+            Decoded::Verbatim(model) => Self::Restored(model),
+            Decoded::Rebuilt { model, seed } => Self::Rebuilt {
+                model,
+                init_cmd: seed,
+            },
+        }
+    }
 }
 
 /// The in-process live session (owns its driver goroutine + SSE channel).
@@ -145,6 +169,27 @@ pub type SessionHandle<Model, Msg> = Arc<Mutex<SessionEntry<Model, Msg>>>;
 pub enum StoreHit<Model, Msg> {
     Web(SessionHandle<Model, Msg>),
     Cold(Model),
+}
+
+/// Result of a page-entry lookup that may rebuild a session across a Model change.
+///
+/// `Live` = the in-process session. `Restored` = a checkpoint decoded verbatim
+/// (no `init`). `Rebuilt` = a checkpoint spliced onto a fresh `init` model;
+/// it carries that `init`'s Cmd, which the caller must run under the session's
+/// sid. A rebuilt model without its Cmd has no representation.
+pub enum Rejoin<Model, Msg> {
+    Live(SessionHandle<Model, Msg>),
+    Restored(Model),
+    Rebuilt { model: Model, init_cmd: IpeCmd<Msg> },
+}
+
+impl<Model, Msg> From<StoreHit<Model, Msg>> for Rejoin<Model, Msg> {
+    fn from(hit: StoreHit<Model, Msg>) -> Self {
+        match hit {
+            StoreHit::Web(handle) => Self::Live(handle),
+            StoreHit::Cold(model) => Self::Restored(model),
+        }
+    }
 }
 
 /// Async so persistent backends (sqlite/postgres via sqlx, redis) can do I/O;
@@ -161,26 +206,27 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// PERSISTED checkpoint's schema tag no longer matches this binary's (the
     /// Model changed), instead of the flat miss `get` returns, it attempts an
     /// additive-superset splice — decode the persisted fields, overlay them
-    /// onto the value `make_init` produces, and return `Cold` ONLY if the merge
-    /// is a proven additive superset that decodes strictly (old state kept, new
+    /// onto the model `make_init` produces, and return `Rebuilt` (that model
+    /// plus the Cmd `make_init` returned beside it) ONLY if the merge is a
+    /// proven additive superset that decodes strictly (old state kept, new
     /// fields filled from `init`). Any non-additive change, corrupt / oversized
     /// body, or pre-`v2` row → `None` (the caller re-inits cleanly).
     ///
-    /// `make_init` is a live `init` value producer, invoked LAZILY — only on a
+    /// `make_init` is a live `init` producer, invoked LAZILY — only on a
     /// schema-mismatched cold row, never on a live hit or a matched restore —
-    /// so the hot paths pay no `init` cost and no `init` side effect fires
-    /// unless a reconstruction is actually attempted.
+    /// so the hot paths pay no `init` cost. Building its Cmd fires no effect;
+    /// the effect runs only when the caller runs the returned `init_cmd`.
     ///
     /// The default delegates to [`get`](SessionStore::get): a store with no
     /// persisted body (the memory store) has nothing to reconstruct FROM, so a
-    /// schema change is a plain miss there, identical to the prior behaviour.
+    /// schema change is a plain miss there and `Rebuilt` is never returned.
     async fn get_reconstructing(
         &self,
         sid: &str,
-        make_init: &(dyn Fn() -> Model + Sync),
-    ) -> Option<StoreHit<Model, Msg>> {
+        make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+    ) -> Option<Rejoin<Model, Msg>> {
         let _ = make_init;
-        self.get(sid).await
+        self.get(sid).await.map(Rejoin::from)
     }
     /// Insert/refresh the live handle (and, for persistent backends, checkpoint
     /// the model). Called on session create and write-through on every commit.
@@ -450,8 +496,8 @@ where
     async fn get_reconstructing(
         &self,
         sid: &str,
-        make_init: &(dyn Fn() -> Model + Sync),
-    ) -> Option<StoreHit<Model, Msg>> {
+        make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+    ) -> Option<Rejoin<Model, Msg>> {
         // Live handle wins, exactly as `get` — no `init`, no reconstruction.
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
@@ -461,7 +507,7 @@ where
             })
         };
         if let Some(h) = cached {
-            return Some(StoreHit::Web(h));
+            return Some(Rejoin::Live(h));
         }
         // Cold: on an exact tag the checkpoint decodes verbatim; on a
         // schema-changed tag it is spliced onto `init` iff additive-superset.
@@ -469,8 +515,12 @@ where
             let disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
             disk.get(sid).map(|(b, _)| b.clone())
         }?;
-        let model: Model = decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init)?;
-        Some(StoreHit::Cold(model))
+        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
+            &self.schema_tag,
+            &blob,
+            make_init,
+        )?);
+        Some(rejoin)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -765,8 +815,8 @@ where
     async fn get_reconstructing(
         &self,
         sid: &str,
-        make_init: &(dyn Fn() -> Model + Sync),
-    ) -> Option<StoreHit<Model, Msg>> {
+        make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+    ) -> Option<Rejoin<Model, Msg>> {
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -780,7 +830,7 @@ where
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(StoreHit::Web(h));
+            return Some(Rejoin::Live(h));
         }
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
             .bind(sid)
@@ -788,13 +838,17 @@ where
             .await
             .ok()
             .flatten();
-        let model: Model = decode_or_reconstruct_checkpoint(&self.schema_tag, &row?.0, make_init)?;
+        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
+            &self.schema_tag,
+            &row?.0,
+            make_init,
+        )?);
         let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
             .bind(now_secs())
             .bind(sid)
             .execute(&self.pool)
             .await;
-        Some(StoreHit::Cold(model))
+        Some(rejoin)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -959,8 +1013,8 @@ where
     async fn get_reconstructing(
         &self,
         sid: &str,
-        make_init: &(dyn Fn() -> Model + Sync),
-    ) -> Option<StoreHit<Model, Msg>> {
+        make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+    ) -> Option<Rejoin<Model, Msg>> {
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -974,7 +1028,7 @@ where
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(StoreHit::Web(h));
+            return Some(Rejoin::Live(h));
         }
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = $1")
             .bind(sid)
@@ -982,13 +1036,17 @@ where
             .await
             .ok()
             .flatten();
-        let model: Model = decode_or_reconstruct_checkpoint(&self.schema_tag, &row?.0, make_init)?;
+        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
+            &self.schema_tag,
+            &row?.0,
+            make_init,
+        )?);
         let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
             .bind(now_secs())
             .bind(sid)
             .execute(&self.pool)
             .await;
-        Some(StoreHit::Cold(model))
+        Some(rejoin)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -1158,8 +1216,8 @@ where
     async fn get_reconstructing(
         &self,
         sid: &str,
-        make_init: &(dyn Fn() -> Model + Sync),
-    ) -> Option<StoreHit<Model, Msg>> {
+        make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+    ) -> Option<Rejoin<Model, Msg>> {
         use redis::AsyncCommands;
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
@@ -1171,7 +1229,7 @@ where
         let mut conn = self.conn.clone();
         if let Some(h) = cached {
             let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-            return Some(StoreHit::Web(h));
+            return Some(Rejoin::Live(h));
         }
         let blob: Option<String> = redis::cmd("HGET")
             .arg(redis_key(sid))
@@ -1179,9 +1237,13 @@ where
             .query_async(&mut conn)
             .await
             .ok()?;
-        let model: Model = decode_or_reconstruct_checkpoint(&self.schema_tag, &blob?, make_init)?;
+        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
+            &self.schema_tag,
+            &blob?,
+            make_init,
+        )?);
         let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-        Some(StoreHit::Cold(model))
+        Some(rejoin)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -2656,6 +2718,18 @@ mod tests {
     #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
     const NEW_TAG: [u8; 32] = [0xB2; 32];
 
+    // The Cmd every reconstruction test's `init` returns: distinguishable from
+    // `IpeCmd::None`, so a test proves a rebuilt model carries init's own Cmd.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    fn init_marker() -> IpeCmd<()> {
+        IpeCmd::Batch(vec![IpeCmd::None])
+    }
+
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    fn is_init_marker(cmd: &IpeCmd<()>) -> bool {
+        matches!(cmd, IpeCmd::Batch(cmds) if matches!(cmds.as_slice(), [IpeCmd::None]))
+    }
+
     // A SessionEntry for an arbitrary model, for the reconstruction tests.
     #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
     fn handle_model<M: Clone + Send + 'static>(model: M) -> SessionHandle<M, ()> {
@@ -2713,23 +2787,37 @@ mod tests {
                 s.get("s1").await.is_none(),
                 "the exact-tag gate still drops a schema-changed row"
             );
-            let init = || NewModel {
-                count: 0,
-                name: String::new(),
-                scroll: 99,
-            };
-            match s.get_reconstructing("s1", &init).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(
-                    m,
+            let init = || {
+                (
                     NewModel {
-                        count: 7,             // preserved from the checkpoint
-                        name: "alice".into(), // preserved from the checkpoint
-                        scroll: 99,           // filled from init (the new field)
+                        count: 0,
+                        name: String::new(),
+                        scroll: 99,
                     },
-                    "an additive change must keep old state and fill the new field from init"
-                ),
-                _ => panic!("expected a reconstructed Cold model across the additive change"),
-            }
+                    init_marker(),
+                )
+            };
+            let rejoin = s.get_reconstructing("s1", &init).await;
+            assert!(
+                matches!(rejoin, Some(Rejoin::Rebuilt { .. })),
+                "expected a rebuilt model across the additive change"
+            );
+            let Some(Rejoin::Rebuilt { model, init_cmd }) = rejoin else {
+                return;
+            };
+            assert_eq!(
+                model,
+                NewModel {
+                    count: 7,             // preserved from the checkpoint
+                    name: "alice".into(), // preserved from the checkpoint
+                    scroll: 99,           // filled from init (the new field)
+                },
+                "an additive change must keep old state and fill the new field from init"
+            );
+            assert!(
+                is_init_marker(&init_cmd),
+                "the rebuilt model carries the Cmd init returned beside it"
+            );
         }
         let _ = std::fs::remove_file(p);
     }
@@ -2758,9 +2846,14 @@ mod tests {
         {
             let s: FileStore<RetypedModel, ()> =
                 FileStore::new(p, Duration::from_secs(60), NEW_TAG);
-            let init = || RetypedModel {
-                count: String::new(),
-                name: String::new(),
+            let init = || {
+                (
+                    RetypedModel {
+                        count: String::new(),
+                        name: String::new(),
+                    },
+                    init_marker(),
+                )
             };
             assert!(
                 s.get_reconstructing("s1", &init).await.is_none(),
@@ -2793,7 +2886,7 @@ mod tests {
         {
             let s: FileStore<RemovedModel, ()> =
                 FileStore::new(p, Duration::from_secs(60), NEW_TAG);
-            let init = || RemovedModel { count: 0 };
+            let init = || (RemovedModel { count: 0 }, init_marker());
             assert!(
                 s.get_reconstructing("s1", &init).await.is_none(),
                 "a removed field is not an additive superset — must re-init"
@@ -2827,21 +2920,31 @@ mod tests {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
             // `init` here would be WRONG if consulted (different values); the
             // exact-tag fast path must ignore it entirely.
-            let init = || OldModel {
-                count: -1,
-                name: "wrong".to_string(),
-            };
-            match s.get_reconstructing("s1", &init).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(
-                    m,
+            let init = || {
+                (
                     OldModel {
-                        count: 7,
-                        name: "alice".into(),
+                        count: -1,
+                        name: "wrong".to_string(),
                     },
-                    "an unchanged schema restores verbatim, ignoring init"
-                ),
-                _ => panic!("expected the checkpoint restored verbatim under the same tag"),
-            }
+                    init_marker(),
+                )
+            };
+            let rejoin = s.get_reconstructing("s1", &init).await;
+            assert!(
+                matches!(rejoin, Some(Rejoin::Restored(_))),
+                "expected the checkpoint restored verbatim under the same tag, never rebuilt"
+            );
+            let Some(Rejoin::Restored(m)) = rejoin else {
+                return;
+            };
+            assert_eq!(
+                m,
+                OldModel {
+                    count: 7,
+                    name: "alice".into(),
+                },
+                "an unchanged schema restores verbatim, ignoring init"
+            );
         }
         let _ = std::fs::remove_file(p);
     }
@@ -2860,10 +2963,15 @@ mod tests {
         seed.insert("s1".to_string(), ("!! not base64 !!".to_string(), 0));
         std::fs::write(p, serde_json::to_string(&seed).unwrap()).unwrap();
         let s: FileStore<NewModel, ()> = FileStore::new(p, Duration::from_secs(60), NEW_TAG);
-        let init = || NewModel {
-            count: 0,
-            name: String::new(),
-            scroll: 0,
+        let init = || {
+            (
+                NewModel {
+                    count: 0,
+                    name: String::new(),
+                    scroll: 0,
+                },
+                init_marker(),
+            )
         };
         assert!(
             s.get_reconstructing("s1", &init).await.is_none(),
@@ -2905,30 +3013,49 @@ mod tests {
                 s.get("s1").await.is_none(),
                 "the exact-tag gate still drops a schema-changed row"
             );
-            let init = || NewModel {
-                count: 0,
-                name: String::new(),
-                scroll: 99,
-            };
-            match s.get_reconstructing("s1", &init).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(
-                    m,
+            let init = || {
+                (
                     NewModel {
-                        count: 7,
-                        name: "alice".into(),
+                        count: 0,
+                        name: String::new(),
                         scroll: 99,
-                    }
-                ),
-                _ => panic!("expected a reconstructed Cold model across the additive change"),
-            }
+                    },
+                    init_marker(),
+                )
+            };
+            let rejoin = s.get_reconstructing("s1", &init).await;
+            assert!(
+                matches!(rejoin, Some(Rejoin::Rebuilt { .. })),
+                "expected a rebuilt model across the additive change"
+            );
+            let Some(Rejoin::Rebuilt { model, init_cmd }) = rejoin else {
+                return;
+            };
+            assert_eq!(
+                model,
+                NewModel {
+                    count: 7,
+                    name: "alice".into(),
+                    scroll: 99,
+                }
+            );
+            assert!(
+                is_init_marker(&init_cmd),
+                "the rebuilt model carries the Cmd init returned beside it"
+            );
             // A non-additive (retyped) change on the SAME durable row re-inits.
             let s2: SqliteStore<RetypedModel, ()> =
                 SqliteStore::new(p, Duration::from_secs(60), NEW_TAG)
                     .await
                     .unwrap();
-            let init2 = || RetypedModel {
-                count: String::new(),
-                name: String::new(),
+            let init2 = || {
+                (
+                    RetypedModel {
+                        count: String::new(),
+                        name: String::new(),
+                    },
+                    init_marker(),
+                )
             };
             assert!(
                 s2.get_reconstructing("s1", &init2).await.is_none(),
@@ -2944,7 +3071,7 @@ mod tests {
     #[tokio::test]
     async fn memory_store_get_reconstructing_is_plain_get() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
-        let init = || ();
+        let init = || ((), IpeCmd::None);
         assert!(
             s.get_reconstructing("absent", &init).await.is_none(),
             "a memory-store miss has nothing to reconstruct from"
@@ -2953,9 +3080,9 @@ mod tests {
         assert!(
             matches!(
                 s.get_reconstructing("a", &init).await,
-                Some(StoreHit::Web(_))
+                Some(Rejoin::Live(_))
             ),
-            "a live memory handle is returned unchanged"
+            "a live memory handle is returned unchanged, never rebuilt"
         );
     }
 }
