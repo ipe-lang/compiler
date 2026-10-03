@@ -1497,8 +1497,11 @@ fn build_update(
 /// closure body fits (`move |_| rest`) and braces+breaks it when it does not
 /// (`move |_| {{ <break> rest <break> }}`).
 ///
-/// Before emitting, the effect gets the identical IR-level clone-capture rewrite
-/// the string emitter applies (`clone_targets_in_expr` over `rest`'s `free_vars`):
+/// The continuation's capture plan is already in the lowered `rest`, planned
+/// for the `Once` boundary `ipe_ir::once_closure::boundary_kind` names. Before
+/// emitting, the effect gets the identical IR-level clone-capture rewrite the
+/// string emitter applies (`clone_targets_in_expr` over `rest`'s `free_vars`),
+/// the effect/rest sharing rule:
 /// any identifier `rest` reads next but `effect`'s own left-to-right evaluation
 /// would move is rewritten to a `CloneVar`. Both effect and rest are built
 /// recursively; their leaves carry the string emitter's exact tokens, so the SEAL

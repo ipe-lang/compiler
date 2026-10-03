@@ -1,0 +1,358 @@
+module SettingsTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Set as Set
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+
+import TestSupport exposing
+    ( tableExists
+    , countReviewRows
+    , expectErr
+    , refuse
+    , seedIndex
+    , writeFileText
+    , fixtureLibRs
+    , fixtureMainIpe
+    , viewA
+    , viewB
+    , viewTag
+    , shownTextOf
+    , unitViewTag
+    , execIndex
+    , execIndexUnchecked
+    , Scratch
+    , freshScratch
+    , freshDir
+    , check
+    , indexSchemaStatements
+    , execIndexSchema
+    , seedIndexDb
+    , insertUnitRows
+    , setIndexEnv
+    , loadFirstPage
+    , checkUnits
+    , listSecond
+    , isUnitA
+    , isUnitB
+    , cleanupIndex
+    , removeFileIfAny
+    , codeText
+    , noHazard
+    , rendered
+    , renderedForeign
+    , describeText
+    , refusedFor
+    , openReadOnlyAt
+    , vectorsPath
+    , ipeIndexTestFile
+    , repoFile
+    , probeMessage
+    , probeNames
+    , maybeContains
+    )
+
+
+
+
+-- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
+-- never by echoing the value.
+dbRefusalNamesOnlyVariable : Task.Task Error Bool
+dbRefusalNamesOnlyVariable =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        refusal <- settingsRefusal ("postgres://" ++ codeText 27 ++ "]0;pwn" ++ codeText 7 ++ "/index")
+        Task.succeed
+            (refusedFor "IPE_INDEX_DB" refusal
+                && not (refusedFor "]0;pwn" refusal)
+                && not (refusedFor "postgres://" refusal)
+                && (case refusal of
+                        Just message ->
+                            noHazard message
+
+                        Nothing ->
+                            False
+                   )
+            )
+
+
+
+settingsRefusal : String -> Task.Task Error (Maybe String)
+settingsRefusal indexDb =
+    System.setenv "IPE_INDEX_DB" indexDb
+        |> Task.andThen (\_ -> Settings.indexSettings)
+        |> Task.map (\_ -> Nothing)
+        |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
+
+
+
+settingsRefused : String -> String -> Task.Task Error Bool
+settingsRefused indexDb reason =
+    settingsRefusal indexDb |> Task.map (refusedFor reason)
+
+
+
+-- `IPE_INDEX_DB` values that cannot name a SQLite database stop at the parse,
+-- each for its own reason, and no refusal repeats the value it refused.
+badIndexDbRefused : Task.Task Error Bool
+badIndexDbRefused =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        blank <- settingsRefused "" "is empty"
+        otherScheme <- settingsRefused "postgres://localhost/index" "not `sqlite://`"
+        query <- settingsRefused "index.db?mode=rwc" "file path containing"
+        fragment <- settingsRefused "index.db#x" "file path containing"
+        percent <- settingsRefused "index%2e.db" "file path containing"
+        urlQuery <- settingsRefused "sqlite:///tmp/index.db?mode=rwc" "with a query"
+        urlOtherQuery <- settingsRefused "sqlite:///tmp/index.db?cache=shared" "with a query"
+        urlEmpty <- settingsRefused "sqlite://" "naming no database"
+        urlFragment <- settingsRefused "sqlite:///tmp/index.db#x" "with a query or fragment"
+        urlEncodedQuery <- settingsRefused "sqlite://file:/tmp/x.db%3Fmode=ro" "not absolute"
+        urlEncodedImmutable <- settingsRefused "sqlite://file:/x.db%3Fmode=ro%26immutable=1" "not absolute"
+        urlMemory <- settingsRefused "sqlite://:memory:" "not absolute"
+        urlRelative <- settingsRefused "sqlite://rel.db" "not absolute"
+        urlNested <- settingsRefused "sqlite://sqlite:" "not absolute"
+        urlBadEscape <- settingsRefused "sqlite:///tmp/index%zz.db" "malformed percent-escape"
+        urlNul <- settingsRefused "sqlite:///tmp/index%00.db" "not a valid file path"
+        urlAboveRoot <- settingsRefused "sqlite:///.." "root directory"
+        urlDeepAboveRoot <- settingsRefused "sqlite:///tmp/../../.." "root directory"
+        urlRoot <- settingsRefused "sqlite:///" "root directory"
+        pathAboveRoot <- settingsRefused "/.." "root directory"
+        urlDot <- settingsRefused "sqlite:///." "root directory"
+        urlDotSlash <- settingsRefused "sqlite:///./" "root directory"
+        urlDoubleSlash <- settingsRefused "sqlite:////" "root directory"
+        urlEncodedAboveRoot <- settingsRefused "sqlite:///%2e%2e" "root directory"
+        noSlashes <- settingsRefused "sqlite:index.db" "without `//`"
+        fileNoSlashes <- settingsRefused "file:index.db" "without `//`"
+        secret <- settingsRefusal "postgres://admin:s3cr3t-pw@db/index"
+        Task.succeed
+            (blank
+                && otherScheme
+                && query
+                && fragment
+                && percent
+                && urlQuery
+                && urlOtherQuery
+                && urlEmpty
+                && urlFragment
+                && urlEncodedQuery
+                && urlEncodedImmutable
+                && urlMemory
+                && urlRelative
+                && urlNested
+                && urlBadEscape
+                && urlNul
+                && urlAboveRoot
+                && urlDeepAboveRoot
+                && urlRoot
+                && pathAboveRoot
+                && urlDot
+                && urlDotSlash
+                && urlDoubleSlash
+                && urlEncodedAboveRoot
+                && noSlashes
+                && fileNoSlashes
+                && refusedFor "IPE_INDEX_DB" secret
+                && not (refusedFor "s3cr3t-pw" secret)
+                && not (refusedFor "admin" secret)
+            )
+
+
+
+-- Every open URL carries exactly the app's mode, for a file path and a
+-- `sqlite://` URL alike, and a `sqlite://` URL parses to the same location as
+-- the plain path it names; a `+` in the URL path is a literal `+`, never a
+-- space.
+dbUrlsCarryAppMode : Task.Task Error Bool
+dbUrlsCarryAppMode =
+    do
+        file <- Settings.parseDbLocation "IPE_INDEX_DB" "/tmp/a&b/index.db"
+        url <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///tmp/index%3F.db"
+        absUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///abs/x.db"
+        absPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/abs/x.db"
+        plusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a+b.db"
+        escapedPlusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a%2Bb.db"
+        plusPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/t/a+b.db"
+        Task.succeed
+            (absUrl
+                == absPath
+                && plusUrl
+                == plusPath
+                && escapedPlusUrl
+                == plusPath
+                && Settings.reviewUrl plusUrl
+                == "sqlite:///t/a+b.db?mode=rwc"
+                && Settings.indexReadUrl absUrl
+                == "sqlite:///abs/x.db?mode=ro"
+                && Settings.indexReadUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=ro"
+                && Settings.indexWriteUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=rw"
+                && Settings.reviewUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=rwc"
+                && Settings.indexReadUrl url
+                == "sqlite:///tmp/index%3F.db?mode=ro"
+                && Settings.indexWriteUrl url
+                == "sqlite:///tmp/index%3F.db?mode=rw"
+                && Settings.reviewUrl url
+                == "sqlite:///tmp/index%3F.db?mode=rwc"
+            )
+
+
+
+-- A working directory can hold `%`, `?` or `#`; each is escaped so the joined
+-- file path survives the URL as the same name, with `%` escaped first so the
+-- other escapes are not re-encoded.
+filePathsEncodeUrlSpecials : Bool
+filePathsEncodeUrlSpecials =
+    Settings.encodeFilePath "/w/a%b?c#d/index.db"
+        == "/w/a%25b%3Fc%23d/index.db"
+        && Settings.encodeFilePath "/w/%3F"
+        == "/w/%253F"
+        && Settings.encodeFilePath "/w/plain.db"
+        == "/w/plain.db"
+
+
+
+-- ── required resources probed before listen ─────────────────────────────
+--
+-- A nonexistent index file, a database that is not an index, and an
+-- unwritable review location each fail their probe naming the variable and
+-- the file; a seeded index passes. Red if `probe` stops opening the database
+-- or stops naming the variable.
+probesNameTheirVariable : Task.Task Error Bool
+probesNameTheirVariable =
+    do
+        at <- freshScratch "ipe-index-probe"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        good <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        missing <- missingIndexProbed at
+        notIndex <- foreignDbProbed at
+        review <- reviewProbed at
+        System.setenv "IPE_INDEX_DB" at.indexDb
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (good == Nothing && missing && notIndex && review)
+
+
+
+-- A nonexistent index is refused with the build hint and is not created.
+missingIndexProbed : Scratch -> Task.Task Error Bool
+missingIndexProbed at =
+    let
+        missingDb =
+            at.repo ++ "/no-such-index.db"
+    in
+    do
+        removeFileIfAny missingDb
+        System.setenv "IPE_INDEX_DB" missingDb
+        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
+        Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
+
+
+
+-- A SQLite file with none of the index tables is refused.
+foreignDbProbed : Scratch -> Task.Task Error Bool
+foreignDbProbed at =
+    let
+        otherDb =
+            at.repo ++ "/not-an-index.db"
+    in
+    do
+        conn <- Db.open "sqlite" ("sqlite://" ++ otherDb ++ "?mode=rwc")
+        Db.exec conn "CREATE TABLE IF NOT EXISTS other (x INTEGER)" []
+        System.setenv "IPE_INDEX_DB" otherDb
+        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        removeFileIfAny otherDb
+        Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
+
+
+
+-- A review location under a missing directory is refused with its own fix.
+reviewProbed : Scratch -> Task.Task Error Bool
+reviewProbed at =
+    let
+        badReview =
+            at.repo ++ "/no-such-dir/review.db"
+    in
+    do
+        System.setenv "IPE_REVIEW_DB" badReview
+        message <- probeMessage (Settings.reviewDb |> Task.andThen LibDb.probe)
+        Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && not (maybeContains "ipe-index index" message))
+
+
+
+-- Each `IPE_INDEX_DB` refusal states its problem and exactly one fix. Red if
+-- a problem that carries its own fix gets the generic one appended again.
+dbRefusalsStateOneFix : Task.Task Error Bool
+dbRefusalsStateOneFix =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        refusals <-
+            [ ""
+            , "postgres://localhost/index"
+            , "sqlite:index.db"
+            , "index.db?mode=rwc"
+            , "sqlite:///tmp/index.db?mode=rwc"
+            , "sqlite:///tmp/index%zz.db"
+            , "sqlite://"
+            , "sqlite:///tmp/index%00.db"
+            , "sqlite://rel.db"
+            , "sqlite:///"
+            ]
+                |> List.map settingsRefusal
+                |> Task.sequence
+        Task.succeed
+            (List.all
+                (\refusal ->
+                    case refusal of
+                        Just m ->
+                            List.length (String.split "; " m) == 2
+
+                        Nothing ->
+                            False
+                )
+                refusals
+            )
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ Task.succeed ( "db file paths escape url specials", filePathsEncodeUrlSpecials )
+        , check "index db refusal names only the variable" dbRefusalNamesOnlyVariable
+        , check "unusable index db locations refused" badIndexDbRefused
+        , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
+        , check "each db refusal states one fix" dbRefusalsStateOneFix
+        , check "startup probes name the variable and the file" probesNameTheirVariable
+        ]
