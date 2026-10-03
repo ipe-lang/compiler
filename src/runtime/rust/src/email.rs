@@ -186,7 +186,7 @@ fn email_endpoint(provider: &str, def: &str) -> String {
 }
 
 /// Email.send : EmailProvider -> EmailMessage -> Task Error String
-pub fn email_send<E: From<String> + Send + 'static>(
+pub fn email_send<E: From<String> + FromLimitExceeded + Send + 'static>(
     provider: EmailProvider,
     msg: EmailMessage,
 ) -> IpeTask<E, String> {
@@ -222,7 +222,7 @@ pub fn email_send<E: From<String> + Send + 'static>(
 
 // ──────────────────── HTTP helper ────────────────────
 
-async fn email_post_json<E: From<String>>(
+async fn email_post_json<E: From<String> + FromLimitExceeded>(
     url: &str,
     headers: &[(&str, String)],
     payload: Vec<u8>,
@@ -274,11 +274,23 @@ async fn email_post_json<E: From<String>>(
 /// endpoint and is rejected rather than buffered.
 const EMAIL_RESPONSE_CAP: usize = 1024 * 1024;
 
+/// Appends `chunk` to `buf` when the total stays within `cap` bytes; otherwise
+/// the provider-response ceiling refusal, leaving `buf` unchanged.
+fn append_within_cap(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), LimitRefusal> {
+    if buf.len().saturating_add(chunk.len()) > cap {
+        return Err(LimitRefusal::new(format!(
+            "email: provider response too large (> {cap} bytes)"
+        )));
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// Read a response body into a `String`, bounding the buffered bytes at `cap` by
 /// draining the byte stream incrementally. Unlike `Content-Length`, this can't be
 /// defeated by a lying/omitted header or a chunked/compressed body — the resident
 /// buffer is bounded to `cap` regardless. UTF-8 lossy (provider bodies are JSON).
-async fn read_email_body_capped<E: From<String>>(
+async fn read_email_body_capped<E: From<String> + FromLimitExceeded>(
     resp: reqwest::Response,
     cap: usize,
 ) -> Result<String, E> {
@@ -290,10 +302,9 @@ async fn read_email_body_capped<E: From<String>>(
             Ok(b) => b,
             Err(e) => return Err(format!("email: reading provider response failed: {}", e).into()),
         };
-        if buf.len().saturating_add(bytes.len()) > cap {
-            return Err(format!("email: provider response too large (> {} bytes)", cap).into());
+        if let Err(refusal) = append_within_cap(&mut buf, &bytes, cap) {
+            return Err(refusal.into_error());
         }
-        buf.extend_from_slice(&bytes);
     }
     #[expect(
         clippy::disallowed_methods,
@@ -305,7 +316,10 @@ async fn read_email_body_capped<E: From<String>>(
 
 // ──────────────────── Resend ────────────────────
 
-async fn send_resend<E: From<String>>(api_key: &str, m: &EmailMessage) -> IpeResult<E, String> {
+async fn send_resend<E: From<String> + FromLimitExceeded>(
+    api_key: &str,
+    m: &EmailMessage,
+) -> IpeResult<E, String> {
     if api_key.is_empty() {
         return IpeResult::Err("email.send/Resend: empty API key".to_string().into());
     }
@@ -368,7 +382,10 @@ async fn send_resend<E: From<String>>(api_key: &str, m: &EmailMessage) -> IpeRes
 
 // ──────────────────── SendGrid ────────────────────
 
-async fn send_sendgrid<E: From<String>>(api_key: &str, m: &EmailMessage) -> IpeResult<E, String> {
+async fn send_sendgrid<E: From<String> + FromLimitExceeded>(
+    api_key: &str,
+    m: &EmailMessage,
+) -> IpeResult<E, String> {
     if api_key.is_empty() {
         return IpeResult::Err("email.send/SendGrid: empty API key".to_string().into());
     }
@@ -444,7 +461,10 @@ fn json_obj_set(v: &mut serde_json::Value, key: &str, val: serde_json::Value) {
 
 // ──────────────────── SES v2 (SigV4) ────────────────────
 
-async fn send_ses<E: From<String>>(cfg: &SesConfig, m: &EmailMessage) -> IpeResult<E, String> {
+async fn send_ses<E: From<String> + FromLimitExceeded>(
+    cfg: &SesConfig,
+    m: &EmailMessage,
+) -> IpeResult<E, String> {
     // Reveal the sealed secret access key ONCE, here at the send boundary — it is
     // consumed only by `ses_sign_v4` below (the SigV4 HMAC chain) and is never
     // logged or returned. The empty-key precheck reads the revealed local, not
@@ -811,6 +831,25 @@ fn addr_objs(xs: &[EmailAddress]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider body filling the cap exactly is kept; one byte more is a
+    /// `LimitExceeded` refusal.
+    #[test]
+    fn provider_response_one_byte_past_the_cap_is_limit_exceeded() {
+        let mut buf = Vec::new();
+        assert_eq!(append_within_cap(&mut buf, b"abcd", 4), Ok(()));
+        let refused: IpeError = match append_within_cap(&mut buf, b"e", 4) {
+            Ok(()) => {
+                IpeError::unexpected("a fifth byte past a 4-byte cap was admitted".to_owned())
+            }
+            Err(refusal) => refusal.into_error(),
+        };
+        assert_eq!(
+            refused,
+            IpeError::limit_exceeded("email: provider response too large (> 4 bytes)")
+        );
+        assert_eq!(buf, b"abcd");
+    }
 
     #[tokio::test]
     async fn dry_run_returns_synthetic_id() {
