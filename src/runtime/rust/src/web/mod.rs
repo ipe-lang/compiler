@@ -466,13 +466,21 @@ fn web_client_config_js() -> String {
 
 /// Whether the dev watch/status banner endpoint should be mounted.
 ///
-/// True when the banner is enabled (not explicitly disabled via `IPE_WEB_BANNER`
-/// off/0/false), the app is NOT in production, and the app is root-mounted
-/// (not a sub-app). Mirrors the three conditions the banner injection already
-/// uses so no new env var is needed.
+/// [`watch_banner_active_with`] over the process dev intent.
 #[cfg(feature = "server")]
 fn watch_banner_active(base: &str) -> bool {
-    if crate::telemetry::production_from_env() {
+    watch_banner_active_with(base, crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// Whether the banner endpoint mounts under an explicit dev-intent proof.
+///
+/// True when `dev` holds, the banner is enabled (not explicitly disabled via
+/// `IPE_WEB_BANNER` off/0/false), and the app is root-mounted (not a sub-app).
+/// Mirrors the conditions the banner injection already uses so no new env var
+/// is needed.
+#[cfg(feature = "server")]
+fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    if dev.is_none() {
         return false;
     }
     if !base.is_empty() {
@@ -1473,8 +1481,14 @@ fn normalise_base_path(raw: &str) -> String {
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
 #[cfg(feature = "server")]
 fn cookie_name_for(base: &str) -> String {
+    cookie_name_with(base, csrf::cookies_secure())
+}
+
+/// [`cookie_name_for`] under an explicit `Secure` decision.
+#[cfg(feature = "server")]
+fn cookie_name_with(base: &str, secure: bool) -> String {
     if base.is_empty() {
-        if csrf::cookies_secure() {
+        if secure {
             "__Host-ipe_sid".to_string()
         } else {
             "ipe_sid".to_string()
@@ -1582,15 +1596,15 @@ fn page_response(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let html = render_page_full(sid, &web_base_path(), body, csrf_token);
-    // Session cookie carries `Secure` in production / frame-ancestors mode, OR
+    // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
-    // `csrf::cookies_secure()` snapshots `production_from_env() ||
-    // frame_ancestors().is_some()` ONCE at process start and never inspects this
+    // `csrf::cookies_secure()` snapshots the dev intent and
+    // `frame_ancestors().is_some()` ONCE at process start and never inspects this
     // request's TLS / `X-Forwarded-Proto`, so a dev process fronted by a TLS
     // proxy would otherwise emit a non-Secure session cookie even though the
     // browser connection was HTTPS). The untrusted-proxy case (operator hasn't
-    // set `IPE_TRUSTED_PROXY`) keeps ENV-only behaviour — still SOUND, just not
+    // set `IPE_TRUSTED_PROXY`) keeps the process-wide behaviour — still SOUND, just not
     // maximally precise, because it never marks a cookie Secure incorrectly,
     // only potentially fails to mark one Secure that could safely have been.
     //
@@ -1973,12 +1987,12 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
     }
 }
 
-/// The H23 production gate over [`push_reload_to_web_sessions`]: in
-/// production (`ENV`/`IPE_ENV` set to a non-dev marker) the push path is
-/// UNREACHABLE — same one-`if` shape every other production gate in this
-/// module uses (dev-console mount, metrics auth). Split from
-/// `web_shutdown_signal` so the gate itself is unit-testable without
-/// delivering a real signal.
+/// The dev-only gate over [`push_reload_to_web_sessions`], over the process dev intent.
+///
+/// Without a [`DevIntent`](crate::telemetry::DevIntent) (a release build, or a
+/// production posture) the push path is unreachable. Split from
+/// `web_shutdown_signal` so the gate is unit-testable without delivering a
+/// real signal.
 #[cfg(feature = "server")]
 async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1986,7 +2000,20 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    if !crate::telemetry::production_from_env() {
+    let dev = crate::telemetry::dev_intent_from_env();
+    maybe_push_reload_with(store, dev.as_ref()).await;
+}
+
+/// [`maybe_push_reload_to_web_sessions`] under an explicit dev-intent proof.
+#[cfg(feature = "server")]
+async fn maybe_push_reload_with<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    dev: Option<&crate::telemetry::DevIntent>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    if dev.is_some() {
         push_reload_to_web_sessions(store).await;
     }
 }
@@ -4801,11 +4828,11 @@ where
     // Only when `http_client` is active: the console proxy uses reqwest for
     // the reverse-proxy path. Without it, always use the in-process console.
     //
-    // The bind host is resolved once, here, and its listen scope installed
-    // before any console gate reads it: the console default opens only for a
-    // dev posture on a loopback listener.
+    // The bind host is resolved once, here, and its listen scope recorded
+    // before any console gate reads it: a dev surface exists only while every
+    // app listener is loopback.
     let host = crate::app_config::resolve_host_bind();
-    crate::telemetry::ListenScope::install(&host);
+    crate::telemetry::record_bind(&host);
     #[cfg(feature = "http_client")]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
@@ -5381,44 +5408,39 @@ mod reload_push_tests {
         );
     }
 
-    /// H23: with `ENV=production` the reload push is UNREACHABLE — the
-    /// gated path pushes nothing; in dev it pushes. (The gate is tested via
-    /// `maybe_push_reload_to_web_sessions`, the exact call
-    /// `web_shutdown_signal` makes right after `mark_draining` — split out
-    /// so no real OS signal is needed here.)
+    /// Without a dev intent the reload push is unreachable; with one it
+    /// pushes. The env-driven gate under `ENV=dev` on the release test binary
+    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact call
+    /// `web_shutdown_signal` makes right after `mark_draining`, split out so no
+    /// real OS signal is needed here.)
     #[tokio::test]
-    async fn web_shutdown_signal_skips_the_reload_push_in_production() {
-        use crate::system::{locked_remove_var, locked_set_var};
-        let prior_env = crate::system::read_env_var("ENV").ok();
-        let prior_ipe_env = crate::system::read_env_var("IPE_ENV").ok();
-
+    async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store_impl.set("s", handle_with(Some(sse_tx))).await;
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
-        locked_set_var("ENV", "production");
-        maybe_push_reload_to_web_sessions(&store).await;
+        maybe_push_reload_with(&store, None).await;
         assert!(
             sse_rx.try_recv().is_err(),
-            "production must have NO reachable path that pushes the reload frame"
+            "no dev intent: NO reachable path pushes the reload frame"
         );
+        if !cfg!(feature = "dev-posture") {
+            crate::system::locked_set_var("ENV", "dev");
+            maybe_push_reload_to_web_sessions(&store).await;
+            assert!(
+                sse_rx.try_recv().is_err(),
+                "ENV=dev on a release build must not push the reload frame"
+            );
+            crate::system::locked_remove_var("ENV");
+        }
 
-        locked_set_var("ENV", "dev");
-        maybe_push_reload_to_web_sessions(&store).await;
+        let dev = crate::telemetry::test_dev_intent();
+        maybe_push_reload_with(&store, Some(&dev)).await;
         assert!(
             sse_rx.try_recv().is_ok(),
-            "dev mode must push the reload frame"
+            "a dev intent pushes the reload frame"
         );
-
-        match prior_env {
-            Some(v) => locked_set_var("ENV", &v),
-            None => locked_remove_var("ENV"),
-        }
-        match prior_ipe_env {
-            Some(v) => locked_set_var("IPE_ENV", &v),
-            None => locked_remove_var("IPE_ENV"),
-        }
     }
 }
 
@@ -5602,9 +5624,9 @@ mod dev_banner_tests {
     #[test]
     fn banner_byte_matches_go_dev_banner_markup() {
         // Same id, target/rel/title, monospace blue style, `&#128269;` ENTITY
-        // (not a literal emoji). The banner renders only under a dev posture.
-        crate::system::locked_set_var("ENV", "dev");
-        let b = dev_console_banner("");
+        // (not a literal emoji). The banner renders only under a dev surface.
+        let surface = crate::telemetry::test_dev_surface();
+        let b = crate::telemetry::dev_console_banner_with("", Some(&surface));
         let expected = "<a id=\"__ipe-dev-console\" href=\"/_ipe/console\" target=\"_blank\" \
             rel=\"noopener\" title=\"Ipe Console (dev only)\" \
             style=\"position:fixed;right:12px;bottom:12px;z-index:2147483646;\
@@ -5878,7 +5900,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "server"))]
 mod base_path_tests {
     use super::{
-        client_js_path, cookie_name_for, cookie_path_for, normalise_base_path, render_page_full,
+        client_js_path, cookie_name_for, cookie_name_with, cookie_path_for, normalise_base_path,
+        render_page_full,
     };
 
     #[test]
@@ -5898,12 +5921,28 @@ mod base_path_tests {
 
     #[test]
     fn cookie_name_is_ipe_sid_at_root_distinct_under_base() {
-        // Dev posture: the root cookie keeps its plain-http name.
-        crate::system::locked_set_var("ENV", "dev");
-        assert_eq!(cookie_name_for(""), "ipe_sid");
+        // Plain-http dev: the root cookie keeps its plain name.
+        assert_eq!(cookie_name_with("", false), "ipe_sid");
+        assert_eq!(cookie_name_with("", true), "__Host-ipe_sid");
         // Distinct from the parent's `ipe_sid` so the proxied child can't clobber it.
+        for secure in [false, true] {
+            assert_eq!(
+                cookie_name_with("/_ipe/console", secure),
+                "ipe_sid__ipe_console"
+            );
+        }
         assert_eq!(cookie_name_for("/_ipe/console"), "ipe_sid__ipe_console");
-        assert_ne!(cookie_name_for("/_ipe/console"), "ipe_sid");
+    }
+
+    // A release binary under `ENV=dev` still names its root session cookie
+    // `__Host-`: it is always `Secure`.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn session_cookie_host_prefixed_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        assert!(super::csrf::cookies_secure());
+        assert_eq!(cookie_name_for(""), "__Host-ipe_sid");
+        crate::system::locked_remove_var("ENV");
     }
 
     #[test]
@@ -7084,27 +7123,35 @@ mod watch_status_handler_tests {
 
     // ── 2. Production inertness ───────────────────────────────────────────────
 
-    /// Under `ENV=production` `watch_banner_active` returns false regardless of
-    /// banner and base settings — the gate function is the single source of truth
-    /// for whether the route is mounted.
+    /// Without a dev intent `watch_banner_active_with` is false regardless of
+    /// banner and base settings, and the env-driven gate under `ENV=dev` on
+    /// the release test binary is false too: the gate function is the single
+    /// source of truth for whether the route is mounted.
     #[test]
-    fn watch_banner_active_false_in_production() {
+    fn watch_status_unmounted_on_release_under_env_dev() {
+        locked_remove_var("IPE_WEB_BANNER");
+        assert!(!watch_banner_active_with("", None));
         locked_set_var("ENV", "production");
-        assert!(
-            !watch_banner_active(""),
-            "watch_banner_active must be false in production"
-        );
+        assert!(!watch_banner_active(""), "production: never mounted");
+        if !cfg!(feature = "dev-posture") {
+            locked_set_var("ENV", "dev");
+            locked_set_var("IPE_ENV", "dev");
+            assert!(
+                !watch_banner_active(""),
+                "ENV=dev on a release build must not mount the route"
+            );
+            locked_remove_var("IPE_ENV");
+        }
         locked_remove_var("ENV");
     }
 
-    /// In dev mode (`ENV=dev`) with banner on, `watch_banner_active` is true.
+    /// Under a dev intent with banner on, `watch_banner_active_with` is true.
     #[test]
     fn watch_banner_active_true_in_dev() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            watch_banner_active(""),
+            watch_banner_active_with("", Some(&dev)),
             "watch_banner_active must be true in dev with no overrides"
         );
     }
@@ -7112,12 +7159,11 @@ mod watch_status_handler_tests {
     /// With banner explicitly disabled, `watch_banner_active` is false even in dev.
     #[test]
     fn watch_banner_active_false_when_banner_disabled() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
+        let dev = crate::telemetry::test_dev_intent();
         for v in ["off", "0", "false"] {
             locked_set_var("IPE_WEB_BANNER", v);
             assert!(
-                !watch_banner_active(""),
+                !watch_banner_active_with("", Some(&dev)),
                 "watch_banner_active must be false when IPE_WEB_BANNER={v}"
             );
         }
@@ -7127,11 +7173,10 @@ mod watch_status_handler_tests {
     /// A non-root base (sub-app) → `watch_banner_active` is false.
     #[test]
     fn watch_banner_active_false_for_subapp() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            !watch_banner_active("/sub"),
+            !watch_banner_active_with("/sub", Some(&dev)),
             "watch_banner_active must be false for a sub-app base"
         );
     }
@@ -7869,14 +7914,14 @@ mod hot_init_session_scoping_tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Extract the `ipe_sid` value from a `Set-Cookie` response header.
+    /// Extract the session-cookie value from a `Set-Cookie` response header.
     fn extract_sid(resp: &axum::response::Response) -> String {
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
             for part in s.split(';') {
                 let part = part.trim();
                 if let Some((k, v)) = part.split_once('=')
-                    && k.trim() == "ipe_sid"
+                    && k.trim() == cookie_name_for("")
                 {
                     return v.trim().to_string();
                 }
@@ -7921,8 +7966,6 @@ mod hot_init_session_scoping_tests {
         set_dev_overlay_active_for_test(Some(true));
         clear_dev_init_for_test();
         locked_set_var("IPE_WATCH_HOT_TOKEN", "seal-token");
-        // Dev posture: the session cookie keeps its plain-http name `ipe_sid`.
-        locked_set_var("ENV", "dev");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8999,15 +9042,15 @@ mod emitted_router_behavior_tests {
         Some(after[..after.find('"')?].to_string())
     }
 
-    /// GET `path` (optionally with an `ipe_sid` cookie) and return
-    /// `(minted_sid, body)`. `minted_sid` is the `ipe_sid` from any `Set-Cookie`
+    /// GET `path` (optionally with a session cookie) and return
+    /// `(minted_sid, body)`. `minted_sid` is the session cookie from any `Set-Cookie`
     /// header (the response also sets a CSRF cookie, so scan ALL of them), or
     /// empty when none was set.
     #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn get(router: axum::Router, path: &str, cookie: Option<&str>) -> (String, String) {
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -9016,7 +9059,7 @@ mod emitted_router_behavior_tests {
         let mut sid = String::new();
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
-            if let Some(rest) = s.strip_prefix("ipe_sid=") {
+            if let Some(rest) = s.strip_prefix(&format!("{}=", cookie_name_for(""))) {
                 sid = rest.split(';').next().unwrap_or("").trim().to_string();
                 break;
             }
@@ -9038,7 +9081,7 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/event")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("ipe_sid={cookie}"))
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -9079,8 +9122,6 @@ mod emitted_router_behavior_tests {
         // Serialize env mutation across these tests; `IPE_CSRF` is process-global.
         let _g = crate::web::literal_table::overlay_test_lock();
         crate::system::locked_set_var("IPE_CSRF", "off");
-        // Dev posture: plain-http cookie names (`ipe_sid`).
-        crate::system::locked_set_var("ENV", "dev");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -9157,7 +9198,7 @@ mod emitted_router_behavior_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("ipe_sid={sid}"))
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -9262,7 +9303,7 @@ mod emitted_router_behavior_tests {
     ) -> (StatusCode, String) {
         let mut b = Request::builder().method("GET").uri(uri);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))

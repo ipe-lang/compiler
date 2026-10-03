@@ -753,8 +753,8 @@ fn find_manifest_stops_at_a_symlinked_home() {
     std::os::unix::fs::symlink(&real_home, &link_home).expect("symlink home");
     let via_real = real_home.join("src").join("Main.ipe");
     let via_link = link_home.join("src").join("Main.ipe");
-    let link_ceiling = HomeCeiling::of(Some(&link_home));
-    let real_ceiling = HomeCeiling::of(Some(&real_home));
+    let link_ceiling = HomeCeiling::of(Ok(&parsed_home(&link_home)));
+    let real_ceiling = HomeCeiling::of(Ok(&parsed_home(&real_home)));
     let real_under_link = find_manifest_bounded(&via_real, &link_ceiling, MAX_MANIFEST_WALK_DEPTH);
     let link_under_real = find_manifest_bounded(&via_link, &real_ceiling, MAX_MANIFEST_WALK_DEPTH);
     let unbounded = find_manifest_bounded(&via_link, &HomeCeiling::Absent, MAX_MANIFEST_WALK_DEPTH);
@@ -800,7 +800,7 @@ fn find_manifest_ignores_a_manifest_above_home() {
         "module Package exposing (package)\n",
     )
     .expect("write planted package.ipe");
-    let home = HomeCeiling::of(Some(&tmp.join("home")));
+    let home = HomeCeiling::of(Ok(&parsed_home(&tmp.join("home"))));
     let found = find_manifest_bounded(&main_ipe, &home, MAX_MANIFEST_WALK_DEPTH);
     let _ = fs::remove_dir_all(&tmp);
     assert!(matches!(found, Ok(None)), "{found:?}");
@@ -854,7 +854,7 @@ fn find_manifest_stops_at_an_aliased_home_above_a_symlinked_subdir() {
     std::os::unix::fs::symlink(tmp.join("data").join("code"), real_home.join("code"))
         .expect("symlink code/ into home");
     let file_under = |root: &Path| root.join("code").join("proj").join("src").join("Main.ipe");
-    let ceiling = HomeCeiling::of(Some(&home_alias));
+    let ceiling = HomeCeiling::of(Ok(&parsed_home(&home_alias)));
     let via_alias =
         find_manifest_bounded(&file_under(&home_alias), &ceiling, MAX_MANIFEST_WALK_DEPTH);
     let via_real =
@@ -890,7 +890,7 @@ fn find_manifest_follows_the_lexical_path_through_a_shallow_symlink() {
     let main_ipe = pkg.join("sub").join("deep").join("Main.ipe");
     let found = find_manifest_bounded(
         &main_ipe,
-        &HomeCeiling::of(Some(&tmp)),
+        &HomeCeiling::of(Ok(&parsed_home(&tmp))),
         MAX_MANIFEST_WALK_DEPTH,
     );
     let _ = fs::remove_dir_all(&tmp);
@@ -920,7 +920,7 @@ fn find_manifest_under_an_unreadable_home_examines_only_the_start_directory() {
     );
 }
 
-/// No configured home, or a home that does not exist, sets no ceiling.
+/// An unset home, or a home that does not exist, sets no ceiling.
 #[test]
 fn a_missing_home_sets_no_ceiling() {
     let missing = ipe_test_temp::temp_root().join(format!(
@@ -928,8 +928,64 @@ fn a_missing_home_sets_no_ceiling() {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&missing);
-    assert_eq!(HomeCeiling::of(None), HomeCeiling::Absent);
-    assert_eq!(HomeCeiling::of(Some(&missing)), HomeCeiling::Absent);
+    assert_eq!(
+        HomeCeiling::of(Err(crate::env_dir::HomeRefusal::Unset)),
+        HomeCeiling::Absent
+    );
+    assert_eq!(
+        HomeCeiling::of(Ok(&parsed_home(&missing))),
+        HomeCeiling::Absent
+    );
+}
+
+/// A home that is set but refused confines the walk to the start directory.
+///
+/// The refused value may still name the user's tree, so a `package.ipe` one
+/// level above the start is never reached; an unset home, by contrast, sets
+/// no ceiling and the same walk finds it.
+#[cfg(unix)]
+#[test]
+fn a_refused_home_never_widens_the_manifest_walk() {
+    use crate::env_dir::HomeRefusal;
+    let (tmp, main_ipe) = manifest_walk_tree("refused_home", "proj");
+    let above = tmp.join("proj").join("package.ipe");
+    fs::write(&above, "module Package exposing (package)\n").expect("write package.ipe");
+    let refusals = [
+        HomeRefusal::NotUtf8,
+        HomeRefusal::ContainsNul,
+        HomeRefusal::NotAbsolute,
+        HomeRefusal::ParentComponent,
+        HomeRefusal::WindowsDeviceOrVerbatim,
+        HomeRefusal::WindowsUnc,
+    ];
+    let walks: Vec<_> = refusals
+        .iter()
+        .map(|refusal| {
+            let ceiling = HomeCeiling::of(Err(*refusal));
+            let found = find_manifest_bounded(&main_ipe, &ceiling, MAX_MANIFEST_WALK_DEPTH);
+            (*refusal, ceiling, found)
+        })
+        .collect();
+    let unset = find_manifest_bounded(
+        &main_ipe,
+        &HomeCeiling::of(Err(HomeRefusal::Unset)),
+        MAX_MANIFEST_WALK_DEPTH,
+    );
+    let _ = fs::remove_dir_all(&tmp);
+    for (refusal, ceiling, found) in walks {
+        assert_eq!(ceiling, HomeCeiling::Unreadable, "{refusal:?}");
+        assert!(matches!(found, Ok(None)), "{refusal:?}: {found:?}");
+    }
+    assert!(
+        matches!(&unset, Ok(Some(path)) if *path == above),
+        "an unset home sets no ceiling: {unset:?}"
+    );
+}
+
+/// A parsed home over the absolute test path `path`.
+fn parsed_home(path: &Path) -> crate::env_dir::HomeDir {
+    crate::env_dir::HomeDir::try_parse(Some(path.as_os_str().to_owned()))
+        .expect("an absolute test home")
 }
 
 /// Two spellings of one directory share an identity; two directories never do.
@@ -4876,6 +4932,57 @@ fn homed_warning_with_unknown_home_is_refused() {
                     )
         ),
         "an unknown home must fail closed as a compiler bug, got {rendered:?}"
+    );
+}
+
+/// A type-checker error sited at a module with no source file is refused.
+///
+/// The refusal is a compiler bug blamed on the entry; the byte-offset guess,
+/// which would frame the error against whichever def encloses its span, is
+/// never consulted.
+#[test]
+fn sited_error_with_unknown_home_fails_closed() {
+    let main_src = "module Main exposing (main)\n\nmain =\n    1\n";
+    let mut interner = ipe_intern::Interner::new();
+    let Ok(parsed) = ipe_parse::parse_module(main_src, &mut interner) else {
+        return;
+    };
+    let Ok(linked) = ipe_canon::canonicalise(&parsed, &mut interner) else {
+        return;
+    };
+    let (Ok(main), Ok(other)) = (interner.intern("Main"), interner.intern("Other")) else {
+        return;
+    };
+    let Some(other_home) = ipe_types::ModuleHome::new(vec![other]) else {
+        return;
+    };
+    let mut home_to_source = BTreeMap::new();
+    home_to_source.insert(
+        vec![main],
+        (PathBuf::from("src/Main.ipe"), main_src.to_owned()),
+    );
+    let entry = (PathBuf::from("src/Main.ipe"), main_src.to_owned());
+    let lo = main_src
+        .rfind('1')
+        .and_then(|o| u32::try_from(o).ok())
+        .unwrap_or_default();
+    let err = ipe_db::PipelineError::Infer(ipe_types::InferError::sited(
+        redundant_red_branch_at(lo),
+        &other_home,
+    ));
+
+    let framed = attribute_post_link_error(&linked, &home_to_source, &entry, err);
+    assert!(
+        matches!(
+            &framed,
+            CliError::Pipeline { file, diag, .. }
+                if file == &entry.0
+                    && matches!(
+                        diag.as_ref(),
+                        Diagnostic::CompilerBug { where_: "driver.frame_infer_error", .. }
+                    )
+        ),
+        "an unknown sited home must fail closed as a compiler bug, got {framed:?}"
     );
 }
 

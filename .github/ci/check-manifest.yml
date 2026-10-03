@@ -150,11 +150,8 @@ checks:
     local:
       tier: affected
       run:
-        - cmd: cargo build --release -p ipe
-          differs: CI builds it once in build-tools and shares it by artifact
-        - cmd: bash tools/scripts/check-explain-examples.sh
+        - cmd: cargo nextest run -p ipe --test explain_examples --profile ci
           env:
-            IPE_BIN: "{ipe_bin}"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
   - context: "doc-string example gate"
     disposition: gate
@@ -284,6 +281,7 @@ checks:
     local:
       tier: affected
       run:
+        - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
         - cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
     guards: SEAL
     aggregates: [runtime-full-features-run]

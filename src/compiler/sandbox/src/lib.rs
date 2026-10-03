@@ -30,6 +30,10 @@ pub use covers::{JailMounts, bind_exposing, path_covers};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
 
 pub mod build_jail;
+// Names every path the root `clippy.toml` denies, so a stale path breaks the
+// test build instead of silently disabling its lint.
+#[cfg(test)]
+mod clippy_paths_resolve;
 mod covers;
 pub mod home;
 pub mod host_env;
@@ -71,6 +75,10 @@ pub enum SandboxDefect {
     /// A path the jail would mount or hand to the payload could not be
     /// resolved, or a home it must mask is unknown.
     Path(JailPathError),
+    /// The OS refused to start an output-drain thread. The child is killed
+    /// and reaped before this is returned, so the jail is never left
+    /// running.
+    DrainThread(std::io::ErrorKind),
 }
 
 impl SandboxDefect {
@@ -107,6 +115,10 @@ impl From<SandboxDefect> for SandboxError {
                     .to_owned()
             }
             SandboxDefect::Path(e) => e.to_string(),
+            SandboxDefect::DrainThread(kind) => format!(
+                "the OS refused to start an output-drain thread ({kind}); the jailed process \
+                 was killed and reaped"
+            ),
         };
         Self::BuildJail {
             detail: detail.into(),
@@ -567,18 +579,41 @@ fn drain_and_reap(
     let err_handle = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel::<DrainOutcome>();
     let out_tx = tx.clone();
-    let out_thread = std::thread::spawn(move || {
-        let _ = out_tx.send(DrainOutcome {
-            stream: Stream::Stdout,
-            result: read_bounded(out_handle, cap),
-        });
-    });
-    let err_thread = std::thread::spawn(move || {
-        let _ = tx.send(DrainOutcome {
-            stream: Stream::Stderr,
-            result: read_bounded(err_handle, cap),
-        });
-    });
+    // A refused drain thread must not leave the jailed child running
+    // unwatched: kill and reap it before returning the typed refusal.
+    let out_thread = match std::thread::Builder::new()
+        .name("ipe-jail-drain-stdout".to_owned())
+        .spawn(move || {
+            let _ = out_tx.send(DrainOutcome {
+                stream: Stream::Stdout,
+                result: read_bounded(out_handle, cap),
+            });
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let kind = e.kind();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SandboxDefect::DrainThread(kind));
+        }
+    };
+    let err_thread = match std::thread::Builder::new()
+        .name("ipe-jail-drain-stderr".to_owned())
+        .spawn(move || {
+            let _ = tx.send(DrainOutcome {
+                stream: Stream::Stderr,
+                result: read_bounded(err_handle, cap),
+            });
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let kind = e.kind();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            return Err(SandboxDefect::DrainThread(kind));
+        }
+    };
     let join_err = || SandboxDefect::Spawn {
         program: program.to_string_lossy().into_owned(),
         detail: "output-drain thread panicked".to_owned(),
@@ -786,7 +821,11 @@ mod tests {
                 CanonicalPath::resolve(&bin).expect("canonical bin"),
                 CanonicalPath::resolve(&cargo_home).expect("canonical cargo home"),
             ],
-            homes: HomeMasks::resolve(Some(&user_home), Some(&cargo_home)).expect("homes"),
+            homes: HomeMasks::resolve(
+                Ok(&crate::home::test_home(&user_home)),
+                Some(&crate::home::test_tool_home(&cargo_home)),
+            )
+            .expect("homes"),
             ..spec()
         };
         let argv = rendered_argv(&jail);
@@ -989,8 +1028,12 @@ mod tests {
         let out = b"stdout".to_vec();
         let err = vec![b'e'; 4096];
         let cap = 1024_u64;
-        let ot = std::thread::spawn(move || read_bounded(Some(&out[..]), cap));
-        let et = std::thread::spawn(move || read_bounded(Some(&err[..]), cap));
+        let ot = std::thread::Builder::new()
+            .spawn(move || read_bounded(Some(&out[..]), cap))
+            .expect("spawn test thread");
+        let et = std::thread::Builder::new()
+            .spawn(move || read_bounded(Some(&err[..]), cap))
+            .expect("spawn test thread");
         let out_r = ot.join().expect("join").expect("read");
         let err_r = et.join().expect("join").expect("read");
         assert_eq!(out_r.as_deref(), Some(&b"stdout"[..]));
@@ -1057,6 +1100,54 @@ mod tests {
         let out = drain_and_reap(child, 1024, std::ffi::OsStr::new("printf")).expect("run");
         assert_eq!(out.stdout, b"hello");
         assert_eq!(out.status, Some(0));
+    }
+
+    // RLIMIT_NPROC is a per-process soft limit: lowering THIS test process's
+    // own limit refuses only its own future thread/process creation, never
+    // another process's (each process carries its own limit value, checked
+    // against the real user ID's live thread count at `clone`/`fork` time).
+    // No bwrap is needed: the fake child only needs to exist long enough to
+    // be killed and reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_drain_thread_kills_and_reaps_the_child() {
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let Ok(child) = cmd.spawn() else {
+            return;
+        };
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid fits i32"))
+            .expect("positive pid");
+
+        let original = rustix::process::getrlimit(rustix::process::Resource::Nproc);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nproc,
+            rustix::process::Rlimit {
+                current: Some(1),
+                maximum: original.maximum,
+            },
+        )
+        .expect("lower this process's own thread budget");
+
+        let outcome = drain_and_reap(child, 1024, std::ffi::OsStr::new("sleep"));
+        // Lift the starved budget before any assertion, so a test runner that
+        // shares this process keeps its own threads.
+        let restored = rustix::process::setrlimit(rustix::process::Resource::Nproc, original);
+        assert!(restored.is_ok(), "restore the thread budget: {restored:?}");
+        assert!(
+            matches!(outcome, Err(SandboxDefect::DrainThread(_))),
+            "a starved thread budget must surface as DrainThread: {outcome:?}"
+        );
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "the child must be killed and reaped, not left running"
+        );
     }
 
     #[test]

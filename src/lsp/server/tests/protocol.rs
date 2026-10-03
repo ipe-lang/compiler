@@ -90,8 +90,9 @@ fn lint_ipe_workspace_config_is_respected() {
     let loader = WorkspaceLoader;
 
     let (server_side, client) = Connection::memory();
-    let server =
-        std::thread::spawn(move || ipe_lsp_server::run_with_connection(&server_side, &loader));
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &loader))
+        .expect("spawn test thread");
 
     // Handshake — pass the workspace folder so the server sets workspace_root.
     let ws_uri = lsp_types::Url::from_file_path(&ws_root).expect("ws uri");
@@ -278,9 +279,9 @@ fn await_diagnostics(
 #[allow(clippy::too_many_lines)] // one linear protocol script, deliberately unsplit
 fn did_open_publishes_compiler_diagnostics_and_did_change_clears_them() {
     let (server_side, client) = Connection::memory();
-    let server = std::thread::spawn(move || {
-        ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader)
-    });
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader))
+        .expect("spawn test thread");
 
     // initialize / initialized.
     client
@@ -529,9 +530,9 @@ fn recv_any_response(client: &Connection, id: i32) -> lsp_server::Response {
 #[test]
 fn cyclic_import_graph_request_returns_error_and_server_survives() {
     let (server_side, client) = Connection::memory();
-    let server = std::thread::spawn(move || {
-        ipe_lsp_server::run_with_connection(&server_side, &CyclicLoader)
-    });
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &CyclicLoader))
+        .expect("spawn test thread");
 
     // Initialize.
     client
@@ -635,9 +636,9 @@ fn cyclic_import_graph_request_returns_error_and_server_survives() {
 #[test]
 fn unknown_request_gets_method_not_found_not_a_hang() {
     let (server_side, client) = Connection::memory();
-    let server = std::thread::spawn(move || {
-        ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader)
-    });
+    let server = std::thread::Builder::new()
+        .spawn(move || ipe_lsp_server::run_with_connection(&server_side, &FixtureLoader))
+        .expect("spawn test thread");
 
     client
         .sender

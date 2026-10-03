@@ -152,6 +152,15 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// A segment that leaves the scan in `exit`, adding no depth and no space.
+    const fn passing(exit: ScanState) -> Self {
+        Self::Runs(Run {
+            exit,
+            depth_delta: 0,
+            spaces: DepthWindow::EMPTY,
+        })
+    }
+
     /// The scan through this segment, then through the segment `next` measures.
     const fn then(&self, next: &AtomScan) -> Self {
         let Self::Runs(run) = self else {
@@ -206,6 +215,37 @@ struct AtomScan {
 }
 
 impl AtomScan {
+    /// The summary of the empty segment: every scan passes through unchanged.
+    const EMPTY: Self = Self {
+        line_start: Outcome::passing(ScanState::LineStart),
+        code: Outcome::passing(ScanState::Code { after_dash: false }),
+        code_after_dash: Outcome::passing(ScanState::Code { after_dash: true }),
+        string: Outcome::passing(ScanState::Str { escaped: false }),
+        string_escaped: Outcome::passing(ScanState::Str { escaped: true }),
+    };
+
+    /// The summary of `n` spaces, without scanning them: leading whitespace is
+    /// skipped, a space outside a string is one at the top level, and a space in
+    /// a string consumes any pending escape.
+    const fn spaces(n: usize) -> Self {
+        if n == 0 {
+            return Self::EMPTY;
+        }
+        let code = Outcome::Runs(Run {
+            exit: ScanState::Code { after_dash: false },
+            depth_delta: 0,
+            spaces: DepthWindow::EMPTY.with_space(0),
+        });
+        let string = Outcome::passing(ScanState::Str { escaped: false });
+        Self {
+            line_start: Outcome::passing(ScanState::LineStart),
+            code,
+            code_after_dash: code,
+            string,
+            string_escaped: string,
+        }
+    }
+
     /// The summary of `text`, a segment holding no newline.
     fn of(text: &str) -> Self {
         Self {
@@ -268,10 +308,25 @@ pub(super) struct Frag {
     leading_blank: usize,
     /// The bytes of its trailing run of `' '`.
     trailing_spaces: usize,
+    /// The bytes of its trailing run of `' '`, `(`, `{` and `[`: what a width
+    /// verdict on its line leaves open.
+    trailing_neutral: usize,
+    /// The bytes of its trailing run of `(`, `{` and `[`.
+    trailing_openers: usize,
     /// Its last character that is not whitespace.
     last_char: Option<char>,
     /// Its atom scan.
     atom: AtomScan,
+}
+
+/// The length of the run at the end of a concatenation, from the runs and widths
+/// of its two parts.
+const fn trailing_run(head_run: usize, next_run: usize, next_width: usize) -> usize {
+    if next_run == next_width {
+        next_width.saturating_add(head_run)
+    } else {
+        next_run
+    }
 }
 
 impl Frag {
@@ -283,8 +338,25 @@ impl Frag {
             leading_spaces: width.saturating_sub(line.trim_start_matches(' ').len()),
             leading_blank: width.saturating_sub(line.trim_start().len()),
             trailing_spaces: width.saturating_sub(line.trim_end_matches(' ').len()),
+            trailing_neutral: width
+                .saturating_sub(line.trim_end_matches([' ', '(', '{', '[']).len()),
+            trailing_openers: width.saturating_sub(line.trim_end_matches(['(', '{', '[']).len()),
             last_char: line.trim_end().chars().next_back(),
             atom: AtomScan::of(line),
+        }
+    }
+
+    /// The measure of `n` spaces.
+    pub(super) const fn spaces(n: usize) -> Self {
+        Self {
+            width: n,
+            leading_spaces: n,
+            leading_blank: n,
+            trailing_spaces: n,
+            trailing_neutral: n,
+            trailing_openers: 0,
+            last_char: None,
+            atom: AtomScan::spaces(n),
         }
     }
 
@@ -303,11 +375,17 @@ impl Frag {
             } else {
                 self.leading_blank
             },
-            trailing_spaces: if next.trailing_spaces == next.width {
-                next.width.saturating_add(self.trailing_spaces)
-            } else {
-                next.trailing_spaces
-            },
+            trailing_spaces: trailing_run(self.trailing_spaces, next.trailing_spaces, next.width),
+            trailing_neutral: trailing_run(
+                self.trailing_neutral,
+                next.trailing_neutral,
+                next.width,
+            ),
+            trailing_openers: trailing_run(
+                self.trailing_openers,
+                next.trailing_openers,
+                next.width,
+            ),
             last_char: if next.last_char.is_some() {
                 next.last_char
             } else {
@@ -320,6 +398,26 @@ impl Frag {
     /// Its length in bytes.
     pub(super) const fn width(&self) -> usize {
         self.width
+    }
+
+    /// The bytes of its leading run of `' '`.
+    pub(super) const fn leading_spaces(&self) -> usize {
+        self.leading_spaces
+    }
+
+    /// The bytes of its leading run of `char::is_whitespace` characters.
+    pub(super) const fn leading_blank(&self) -> usize {
+        self.leading_blank
+    }
+
+    /// The bytes of its trailing run of `' '`, `(`, `{` and `[`.
+    pub(super) const fn trailing_neutral(&self) -> usize {
+        self.trailing_neutral
+    }
+
+    /// The bytes of its trailing run of `(`, `{` and `[`.
+    pub(super) const fn trailing_openers(&self) -> usize {
+        self.trailing_openers
     }
 
     /// Its last character that is not whitespace.
@@ -367,31 +465,36 @@ impl Frag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Interior {
     /// The widest such line without leading whitespace.
-    widest_content: usize,
+    content: usize,
+    /// The widest such line without leading whitespace nor trailing `' '`.
+    trimmed: usize,
     /// The widest such line that is an unbreakable atom, or zero.
-    widest_atom: usize,
+    atom: usize,
 }
 
 impl Interior {
     /// No line.
     const EMPTY: Self = Self {
-        widest_content: 0,
-        widest_atom: 0,
+        content: 0,
+        trimmed: 0,
+        atom: 0,
     };
 
     /// The one whole line `line` measures.
     const fn line(line: &Frag) -> Self {
         Self {
-            widest_content: line.content_len(),
-            widest_atom: if line.is_atom() { line.width } else { 0 },
+            content: line.content_len(),
+            trimmed: line.content_width(),
+            atom: if line.is_atom() { line.width } else { 0 },
         }
     }
 
     /// The lines of both.
     const fn union(self, other: Self) -> Self {
         Self {
-            widest_content: wider(self.widest_content, other.widest_content),
-            widest_atom: wider(self.widest_atom, other.widest_atom),
+            content: wider(self.content, other.content),
+            trimmed: wider(self.trimmed, other.trimmed),
+            atom: wider(self.atom, other.atom),
         }
     }
 }
@@ -441,6 +544,33 @@ pub(super) struct Shape {
 }
 
 impl Shape {
+    /// The measure of the empty text.
+    pub(super) const EMPTY: Self = Self {
+        first: Frag {
+            width: 0,
+            leading_spaces: 0,
+            leading_blank: 0,
+            trailing_spaces: 0,
+            trailing_neutral: 0,
+            trailing_openers: 0,
+            last_char: None,
+            atom: AtomScan::EMPTY,
+        },
+        tail: None,
+        has_brace: false,
+        first_byte: None,
+    };
+
+    /// The measure of `n` spaces, without writing them.
+    pub(super) const fn spaces(n: usize) -> Self {
+        Self {
+            first: Frag::spaces(n),
+            tail: None,
+            has_brace: false,
+            first_byte: if n == 0 { None } else { Some(b' ') },
+        }
+    }
+
     /// The measure of `text`.
     pub(super) fn of(text: &str) -> Self {
         let mut lines = text.split('\n');
@@ -523,15 +653,30 @@ impl Shape {
     /// The widest line after the first, without its leading whitespace.
     pub(super) fn widest_tail(&self) -> usize {
         self.tail.as_ref().map_or(0, |tail| {
-            wider(tail.interior.widest_content, tail.last.content_len())
+            wider(tail.interior.content, tail.last.content_len())
+        })
+    }
+
+    /// The widest line after the first, without its leading whitespace nor the
+    /// trailing `' '` a break trims; zero for a single line.
+    pub(super) fn widest_trimmed_tail(&self) -> usize {
+        self.tail.as_ref().map_or(0, |tail| {
+            wider(tail.interior.trimmed, tail.last.content_width())
         })
     }
 
     /// Whether some line is an unbreakable atom wider than `max_width`.
+    #[cfg(test)]
     pub(super) fn any_line_overflows_atom(&self, max_width: usize) -> bool {
-        self.first.overflows_atom(max_width)
+        self.any_line_overflows_atom_after(&Frag::spaces(0), max_width)
+    }
+
+    /// Whether some line of the text, its first line read after `line`, is an
+    /// unbreakable atom wider than `max_width`.
+    pub(super) fn any_line_overflows_atom_after(&self, line: &Frag, max_width: usize) -> bool {
+        line.then(&self.first).overflows_atom(max_width)
             || self.tail.as_ref().is_some_and(|tail| {
-                tail.interior.widest_atom > max_width || tail.last.overflows_atom(max_width)
+                tail.interior.atom > max_width || tail.last.overflows_atom(max_width)
             })
     }
 
@@ -555,7 +700,7 @@ impl Shape {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
+    use super::super::reference::{
         BodyShape, Cursor, FlatMeasure, content_width, current_line_indent,
         line_is_unbreakable_atom, widest_tail,
     };
@@ -732,6 +877,37 @@ mod tests {
             content_width(last_line),
             "{text:?}"
         );
+        let run = |line: &str, set: &[char]| line.len() - line.trim_end_matches(set).len();
+        assert_eq!(
+            shape.last().trailing_neutral(),
+            run(last_line, &[' ', '(', '{', '[']),
+            "{text:?}"
+        );
+        assert_eq!(
+            shape.last().trailing_openers(),
+            run(last_line, &['(', '{', '[']),
+            "{text:?}"
+        );
+        let first_line = text.split('\n').next().unwrap_or_default();
+        assert_eq!(
+            shape.first().leading_spaces(),
+            first_line.len() - first_line.trim_start_matches(' ').len(),
+            "{text:?}"
+        );
+        assert_eq!(
+            shape.first().leading_blank(),
+            first_line.len() - first_line.trim_start().len(),
+            "{text:?}"
+        );
+        assert_eq!(
+            shape.widest_trimmed_tail(),
+            text.split('\n')
+                .skip(1)
+                .map(content_width)
+                .max()
+                .unwrap_or_default(),
+            "{text:?}"
+        );
         for max_width in [0, 1, 2, 4, 8, 16, 100] {
             let expected = text
                 .split('\n')
@@ -741,6 +917,49 @@ mod tests {
                 expected,
                 "{text:?} at {max_width}"
             );
+        }
+    }
+
+    /// A run of spaces measured without writing it is the measure of the written
+    /// run, alone and after any text; the empty measure is the empty text's.
+    #[test]
+    fn spaces_measure_like_written_spaces() {
+        assert_eq!(Shape::EMPTY, Shape::of(""));
+        for n in 0..=130 {
+            let written = " ".repeat(n);
+            assert_eq!(Shape::spaces(n), Shape::of(&written), "{n}");
+            assert_eq!(Frag::spaces(n), Frag::of(&written), "{n}");
+            for &text in TEXTS.iter().chain(LINES) {
+                let joined = format!("{text}{written}");
+                assert_eq!(
+                    Shape::of(text).then(&Shape::spaces(n)),
+                    Shape::of(&joined),
+                    "{text:?} + {n}"
+                );
+                let joined = format!("{written}{text}");
+                assert_eq!(
+                    Shape::spaces(n).then(&Shape::of(text)),
+                    Shape::of(&joined),
+                    "{n} + {text:?}"
+                );
+            }
+        }
+    }
+
+    /// A line read before a text joins the text's first line in the atom test.
+    #[test]
+    fn overflow_after_a_line_reads_the_joined_line() {
+        for &line in LINES {
+            for &text in TEXTS.iter().chain(LINES) {
+                let joined = Shape::of(&format!("{line}{text}"));
+                for max_width in [0, 2, 4, 8, 100] {
+                    assert_eq!(
+                        Shape::of(text).any_line_overflows_atom_after(&Frag::of(line), max_width),
+                        joined.any_line_overflows_atom(max_width),
+                        "{line:?} + {text:?} at {max_width}"
+                    );
+                }
+            }
         }
     }
 

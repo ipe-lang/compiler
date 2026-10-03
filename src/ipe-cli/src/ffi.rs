@@ -837,8 +837,8 @@ fn inspector_binary() -> Result<PathBuf, CliError> {
 /// path; absent that the function fails closed rather than falling back to a
 /// world-writable or working-directory-relative path.
 fn make_scratch_dir(krate: &str) -> Result<PathBuf, CliError> {
-    let home =
-        crate::env_dir::home().ok_or(CliError::Usage(text::msg::ffi_add_home_not_absolute()))?;
+    let home = crate::env_dir::home()
+        .map_err(|_refusal| CliError::Usage(text::msg::ffi_add_home_not_absolute()))?;
     let base = home.join(".cache/ipe/ffi-scratch");
     crate::scratch::ScratchDir::new_under(&base, &format!("add-{krate}"))
         .map(crate::scratch::ScratchDir::into_path)
@@ -885,13 +885,14 @@ fn jail_path_refused(e: &ipe_sandbox::JailPathError) -> CliError {
 ///   it, a jail path does not resolve, or the user's home is unknown (see
 ///   [`toolchain_binds_from`]).
 fn toolchain_binds(inspector: &Path) -> Result<ToolchainBinds, CliError> {
-    let cargo_home = crate::env_dir::tool_home("CARGO_HOME", ".cargo")?;
-    let rustup_home = crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?;
+    let user_home = crate::env_dir::home();
+    let cargo_home = crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref().ok(), ".cargo")?;
+    let rustup_home = crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref().ok(), ".rustup")?;
     toolchain_binds_from(
         inspector,
-        cargo_home.as_deref(),
+        cargo_home.as_ref(),
         rustup_home,
-        crate::env_dir::home().as_deref(),
+        user_home.as_ref().map_err(|refusal| *refusal),
     )
 }
 
@@ -909,12 +910,12 @@ fn toolchain_binds(inspector: &Path) -> Result<ToolchainBinds, CliError> {
 /// - any read-only bind equals or contains the cargo home (a rustup home at or
 ///   above it, or an inspector directory above it): binding it would expose
 ///   `credentials.toml` inside the jail;
-/// - the user's home is unset or relative, so it cannot be masked.
+/// - the user's home is refused, so it cannot be masked.
 fn toolchain_binds_from(
     inspector: &Path,
-    cargo_home: Option<&Path>,
-    rustup_home: Option<PathBuf>,
-    user_home: Option<&Path>,
+    cargo_home: Option<&crate::env_dir::ToolHome>,
+    rustup_home: Option<crate::env_dir::ToolHome>,
+    user_home: Result<&crate::env_dir::HomeDir, crate::env_dir::HomeRefusal>,
 ) -> Result<ToolchainBinds, CliError> {
     let cargo_home =
         cargo_home.ok_or_else(|| CliError::Usage(text::msg::ffi_cargo_home_unresolved()))?;
@@ -936,18 +937,18 @@ fn toolchain_binds_from(
         // credentials.toml stays outside the jail.
         toolchain_ro_binds.push(cargo_bin);
     }
-    let rustup_home = match rustup_home.filter(|rustup| rustup.is_dir()) {
-        Some(rustup) => Some(canonical(&rustup)?),
+    let rustup_home = match rustup_home.filter(|rustup| rustup.as_path().is_dir()) {
+        Some(rustup) => Some(canonical(rustup.as_path())?),
         None => None,
     };
     if let Some(rustup) = &rustup_home {
         toolchain_ro_binds.push(rustup.clone());
     }
-    if let Some(bind) = ipe_sandbox::bind_exposing(&toolchain_ro_binds, cargo_home) {
+    if let Some(bind) = ipe_sandbox::bind_exposing(&toolchain_ro_binds, cargo_home.as_path()) {
         return Err(CliError::Usage(
             text::msg::ffi_toolchain_bind_exposes_cargo_home(
                 &bind.as_path().display(),
-                &cargo_home.display(),
+                &cargo_home.as_path().display(),
             ),
         ));
     }
@@ -4298,7 +4299,7 @@ version = \"1\"
         // HOME must be set for the sanctioned path; the test crate always has
         // one. The scratch dir lives under ~/.cache/ipe/ffi-scratch/, never
         // /tmp.
-        let Some(home) = crate::env_dir::home() else {
+        let Ok(home) = crate::env_dir::home() else {
             return;
         };
         let scratch = make_scratch_dir("semver").expect("first create succeeds");
@@ -4342,10 +4343,18 @@ version = \"1\"
     }
 
     /// A user home planted under `tmp`.
-    fn plant_user_home(tmp: &Path) -> PathBuf {
+    fn plant_user_home(tmp: &Path) -> crate::env_dir::HomeDir {
         let user_home = tmp.join("user");
         std::fs::create_dir_all(&user_home).expect("mk user home");
-        user_home
+        crate::env_dir::HomeDir::try_parse(Some(user_home.into_os_string()))
+            .expect("an absolute test home")
+    }
+
+    /// A tool home over the absolute test path `path`, spelled as given.
+    fn tool(path: &Path) -> crate::env_dir::ToolHome {
+        ipe_sandbox::home::tool_home_from("CARGO_HOME", Some(path.into()), None, ".cargo")
+            .expect("an absolute test tool home")
+            .expect("a set tool home")
     }
 
     fn canonical(path: &Path) -> ipe_sandbox::CanonicalPath {
@@ -4363,11 +4372,11 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &inspector,
-            Some(&cargo_home),
-            Some(rustup_home.clone()),
-            Some(&user_home),
+            Some(&tool(&cargo_home)),
+            Some(tool(&rustup_home)),
+            Ok(&user_home),
         );
-        let want_homes = ipe_sandbox::HomeMasks::resolve(Some(&user_home), Some(&cargo_home))
+        let want_homes = ipe_sandbox::HomeMasks::resolve(Ok(&user_home), Some(&tool(&cargo_home)))
             .expect("homes resolve");
         let want_inspector = canonical(&inspector);
         let cargo_bin = canonical(&cargo_home.join("bin"));
@@ -4403,9 +4412,9 @@ version = \"1\"
     fn assert_toolchain_refused(cargo_home: &Path, rustup_home: &Path, inspector: &Path) {
         let got = toolchain_binds_from(
             inspector,
-            Some(cargo_home),
-            Some(rustup_home.to_path_buf()),
-            None,
+            Some(&tool(cargo_home)),
+            Some(tool(rustup_home)),
+            Err(crate::env_dir::HomeRefusal::Unset),
         );
         assert!(
             matches!(&got, Err(CliError::Usage(m)) if m.contains("credentials.toml")),
@@ -4489,9 +4498,9 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &inspector,
-            Some(&cargo_home),
-            Some(rustup_home),
-            Some(&user_home),
+            Some(&tool(&cargo_home)),
+            Some(tool(&rustup_home)),
+            Ok(&user_home),
         );
         let cargo_home = canonical(&cargo_home);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4507,7 +4516,7 @@ version = \"1\"
             Path::new("/opt/ipe/bin/ipe-ffi-inspector"),
             None,
             None,
-            None,
+            Err(crate::env_dir::HomeRefusal::Unset),
         );
         assert!(
             matches!(&got, Err(CliError::Usage(m)) if m.contains("cannot locate the cargo home")),
@@ -4522,8 +4531,8 @@ version = \"1\"
         let cargo_home = tmp.join("elsewhere").join(".cargo");
         plant_cargo_home(&cargo_home);
         let inspector = plant_inspector(&tmp.join("tools"));
-        let got = toolchain_binds_from(&inspector, Some(&cargo_home), None, Some(&user_home));
-        let want = ipe_sandbox::HomeMasks::resolve(Some(&user_home), Some(&cargo_home))
+        let got = toolchain_binds_from(&inspector, Some(&tool(&cargo_home)), None, Ok(&user_home));
+        let want = ipe_sandbox::HomeMasks::resolve(Ok(&user_home), Some(&tool(&cargo_home)))
             .expect("homes resolve");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
@@ -4533,43 +4542,37 @@ version = \"1\"
     }
 
     #[test]
-    fn toolchain_binds_refuse_an_unset_or_relative_user_home() {
+    fn toolchain_binds_refuse_an_unset_user_home() {
+        use crate::env_dir::HomeRefusal;
         let tmp = toolbinds_root("no-user-home");
         let cargo_home = tmp.join(".cargo");
         plant_cargo_home(&cargo_home);
         let inspector = plant_inspector(&tmp.join("tools"));
-        let unset = toolchain_binds_from(&inspector, Some(&cargo_home), None, None);
-        let relative = toolchain_binds_from(
-            &inspector,
-            Some(&cargo_home),
-            None,
-            Some(Path::new("relative/home")),
-        );
+        let refusals = [
+            HomeRefusal::Unset,
+            HomeRefusal::NotUtf8,
+            HomeRefusal::ContainsNul,
+            HomeRefusal::NotAbsolute,
+            HomeRefusal::ParentComponent,
+            HomeRefusal::WindowsDeviceOrVerbatim,
+            HomeRefusal::WindowsUnc,
+        ];
+        let walks: Vec<_> = refusals
+            .iter()
+            .map(|refusal| {
+                let got =
+                    toolchain_binds_from(&inspector, Some(&tool(&cargo_home)), None, Err(*refusal));
+                (*refusal, got)
+            })
+            .collect();
         let _ = std::fs::remove_dir_all(&tmp);
-        for got in [unset, relative] {
+        for (refusal, got) in walks {
             assert!(
-                matches!(&got, Err(CliError::Usage(m)) if m.contains("cannot be masked")),
-                "an unknown user home cannot be masked, so the jail must be refused: {got:?}"
+                matches!(&got, Err(CliError::Usage(m))
+                    if m.contains("cannot be masked") && m.contains(&refusal.to_string())),
+                "a refused user home cannot be masked, so the jail must be refused: {got:?}"
             );
         }
-    }
-
-    #[test]
-    fn toolchain_binds_refuse_a_relative_cargo_home() {
-        let tmp = toolbinds_root("relative-cargo");
-        let inspector = plant_inspector(&tmp.join("tools"));
-        let user_home = plant_user_home(&tmp);
-        let got = toolchain_binds_from(
-            &inspector,
-            Some(Path::new("relative/.cargo")),
-            None,
-            Some(&user_home),
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(
-            matches!(&got, Err(CliError::Usage(m)) if m.contains("CARGO_HOME")),
-            "a relative cargo home names no fixed directory to mask: {got:?}"
-        );
     }
 
     #[test]
@@ -4580,9 +4583,9 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &tmp.join("missing").join("ipe-ffi-inspector"),
-            Some(&cargo_home),
+            Some(&tool(&cargo_home)),
             None,
-            Some(&user_home),
+            Ok(&user_home),
         );
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
@@ -4603,9 +4606,9 @@ version = \"1\"
         std::os::unix::fs::symlink(tmp.join("real"), &link_dir).expect("symlink");
         let got = toolchain_binds_from(
             &link_dir.join("ipe-ffi-inspector"),
-            Some(&cargo_home),
+            Some(&tool(&cargo_home)),
             None,
-            Some(&user_home),
+            Ok(&user_home),
         );
         let real_dir = canonical(&tmp.join("real"));
         let real = canonical(&real);

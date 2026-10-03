@@ -42,6 +42,11 @@ const ARGS_OS_OWNERS: &[(&str, usize, &str)] = &[
         "forwards the arguments as `OsString` to the real binary without decoding them",
     ),
     (
+        "examples/wasm/language-playground/jail-runner/src/main.rs",
+        1,
+        "the playground jail runner, outside the host crates: every argument is decoded as UTF-8 or the run is refused without echoing its bytes",
+    ),
+    (
         "src/runtime/rust/tests/spawn_fd_floor.rs",
         1,
         "compares each argument as `OsStr` with the exec-probe marker, never decoding it",
@@ -54,10 +59,6 @@ const ARGS_OS_OWNERS: &[(&str, usize, &str)] = &[
 /// A ratchet: each entry is removed once its binary reads through a decoding
 /// point, never added to.
 const ARGS_DEBT: &[(&str, usize)] = &[
-    (
-        "examples/wasm/language-playground/jail-runner/src/main.rs",
-        1,
-    ),
     ("tools/ipe-ffi-inspector/src/main.rs", 1),
     ("tools/panic-scan/src/main.rs", 1),
 ];

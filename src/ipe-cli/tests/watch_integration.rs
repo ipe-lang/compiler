@@ -157,6 +157,7 @@ impl EventSink {
     }
 }
 
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch(
     entry: &Path,
     out_dir: &Path,
@@ -181,12 +182,13 @@ fn start_watch(
         hard_cap: Duration::from_millis(600),
     };
     opts.on_event = Some(sink.as_callback());
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 /// Same as [`start_watch`] but with the blue-green proxy turned ON, so proxy
 /// ENGAGEMENT (T2) is exercised: the proxy binds `port` IFF the emitted crate
 /// binds a first-party HTTP listener; a non-HTTP shape takes the direct path.
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch_bluegreen(
     entry: &Path,
     out_dir: &Path,
@@ -206,7 +208,7 @@ fn start_watch_bluegreen(
         hard_cap: Duration::from_millis(600),
     };
     opts.on_event = Some(sink.as_callback());
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 /// A view-less worker that ticks forever — a LONG-LIVED non-HTTP shape. It emits

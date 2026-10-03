@@ -2,9 +2,9 @@ use super::{
     BuildOptions, CliError, OutTarget, attribute_canon_errors, attribute_post_link_error,
     build_loose_file_into, build_project_into, build_source_graph, build_test_into,
     capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
-    discover_manifest, emit_machine_error, emitted_bin_filename, home_to_source_map,
-    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
-    runtime_context_for_message, source_graph_for_target, typecheck_target,
+    discover_manifest, emit_machine_error, emitted_bin_filename, frame_infer_error,
+    home_to_source_map, program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir,
+    run_build, runtime_context_for_message, source_graph_for_target, typecheck_target,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
@@ -2696,14 +2696,13 @@ fn infer_entry(
             package,
             program,
         )),
-        Err((diag, home)) => Err(attribute_entry_lowering_error(
+        Err(err) => Err(attribute_entry_lowering_error(
             db,
             source_root,
             package,
             module,
             entry_file,
-            diag.clone(),
-            home,
+            err.clone(),
         )),
     }
 }
@@ -2841,8 +2840,7 @@ fn attribute_entry_lowering_error(
     package: &PackageSourceSet,
     entry: &project::DiscoveredModule,
     entry_file: ipe_db::SourceFile,
-    diag: Diagnostic,
-    home: &[ipe_intern::Symbol],
+    err: ipe_db::PipelineError,
 ) -> CliError {
     if let Err(canon_err) =
         attribute_canon_errors(db, source_root, &package.sources, entry_file, entry.path())
@@ -2858,16 +2856,22 @@ fn attribute_entry_lowering_error(
             .unwrap_or_default(),
     );
     let home_to_source = home_to_source_map(ipe_db::Db::interner(db), &package.sources);
-    if let Ok(linked) = ipe_db::linked_program(db, source_root, entry_file) {
-        attribute_post_link_error(&linked.module, &home_to_source, &entry_source, diag, home)
-    } else {
-        // A link failure has no linked program to scan: frame the lowering
-        // diagnostic against its home module when known, else the entry.
-        let (file, src) = home_to_source.get(home).cloned().unwrap_or(entry_source);
-        CliError::Pipeline {
-            file,
-            src,
-            diag: Box::new(diag),
+    match (ipe_db::linked_program(db, source_root, entry_file), err) {
+        (Ok(linked), err) => {
+            attribute_post_link_error(&linked.module, &home_to_source, &entry_source, err)
+        }
+        (Err(_), ipe_db::PipelineError::Infer(infer)) => {
+            frame_infer_error(&home_to_source, &entry_source, infer)
+        }
+        (Err(_), ipe_db::PipelineError::Lower(diag, home)) => {
+            // A link failure has no linked program to scan: frame the lowering
+            // diagnostic against its home module when known, else the entry.
+            let (file, src) = home_to_source.get(&home).cloned().unwrap_or(entry_source);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
         }
     }
 }

@@ -149,9 +149,9 @@ fn try_warm(timeout: Duration) -> Result<(), BoxError> {
     // Run the warm-up on a background thread so we can enforce the timeout
     // without blocking the test process indefinitely.
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), BoxError>>();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let _ = tx.send(warm_server_fixture_deps());
-    });
+    })?;
     rx.recv_timeout(timeout).unwrap_or_else(|_| Ok(()))
 }
 
@@ -306,7 +306,7 @@ fn watch_marker_seen(
         .take()
         .ok_or("child stderr must be piped to observe the teardown ack")?;
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let mut reader = std::io::BufReader::new(stderr);
         let mut announced = false;
         let mut line = String::new();
@@ -327,7 +327,7 @@ fn watch_marker_seen(
         if !announced {
             let _ = tx.send(false);
         }
-    });
+    })?;
     Ok(rx)
 }
 
@@ -432,7 +432,8 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let opts = ipe::watch::WatchOptions::new(ipe_dir.join("Main.ipe"), out_dir, runtime_dir);
-    let (join, handle) = ipe::watch::spawn(opts);
+    let (join, handle) = ipe::watch::spawn(opts)
+        .map_err(|e| -> BoxError { format!("spawn the watch session: {e}").into() })?;
 
     // Let the orchestrator finish setup and enter its event loop.
     std::thread::sleep(Duration::from_millis(300));

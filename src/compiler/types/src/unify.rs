@@ -32,6 +32,7 @@ use ipe_intern::Interner;
 
 use crate::constrain::zonk;
 use crate::doc::{VarNamer, ty_to_doc};
+use crate::homed::{InferError, ModuleHome};
 use crate::solve::Budget;
 use crate::ty::{Content, FlatType, Ty, TyBounds};
 use crate::unionfind::{UnionFind, VarId};
@@ -150,7 +151,10 @@ pub fn super_admits_record(bounds: TyBounds) -> bool {
 /// * [`TypeError::InfiniteType`] when a bind would create a cyclic type.
 /// * [`TypeError::StepBudgetExceeded`] when the step budget is exhausted.
 /// * [`Diagnostic::CompilerBug`] on a union-find invariant violation.
-pub fn unify(
+///
+/// Private: every caller outside this module goes through [`unify_at`], so a
+/// unification failure cannot leave without the module owning its span.
+fn unify(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
@@ -169,6 +173,27 @@ pub fn unify(
         unify_step(uf, budget, interner, span, a, b, &mut stack)?;
     }
     Ok(())
+}
+
+/// Unify `a` with `b`, siting any failure in the module `home` owning `span`.
+///
+/// The one entry point to unification outside this module: `span` belongs to
+/// `home`'s file, so a mismatch frames against exactly that file.
+///
+/// # Errors
+/// [`InferError::Sited`] at `home` for a source failure (a mismatch or an
+/// infinite type); [`InferError::Program`] for a step-budget exhaustion or a
+/// union-find invariant violation.
+pub fn unify_at(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    home: &ModuleHome,
+    span: Span,
+    a: VarId,
+    b: VarId,
+) -> Result<(), InferError> {
+    unify(uf, budget, interner, span, a, b).map_err(|diag| InferError::sited(diag, home))
 }
 
 /// Process a single `(found, expected)` obligation: agree the two heads and

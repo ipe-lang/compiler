@@ -2,23 +2,26 @@ use strum::EnumCount as _;
 
 use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, Constraint, Content, CtorScheme, DResult,
-    Diagnostic, FlatType, Generated, Interner, Rc, RefCell, RowTail, SchemeSlot, Span,
-    StdlibKernel, Symbol, Ty, TyBounds, UnionFind, VarId, canon, classify_binop, from_canon,
-    is_solver_var, pin_any_in_ty,
+    Diagnostic, FlatType, Generated, InferError, Interner, ModuleHome, Rc, RefCell, RowTail,
+    SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty, TyBounds, UnionFind, VarId, canon,
+    classify_binop, from_canon, is_solver_var, pin_any_in_ty,
 };
 
 impl<'a> Builder<'a> {
     /// Build a constraint set for the whole module.
     ///
     /// # Errors
-    /// [`Diagnostic::CompilerBug`] on an internal invariant violation (e.g. an
-    /// arity mismatch between a binding's pattern count and its annotation, or
-    /// an unbound local — both ruled out by canonicalisation).
+    /// [`InferError::Sited`] at the owning def's or union's module for a
+    /// source error in it (an annotation error, a constraint-generation
+    /// refusal); [`InferError::Program`] carrying a [`Diagnostic::CompilerBug`]
+    /// on an internal invariant violation (e.g. an arity mismatch between a
+    /// binding's pattern count and its annotation, or an unbound local — both
+    /// ruled out by canonicalisation).
     pub fn run(
         uf: &'a mut UnionFind<Content>,
         interner: &'a mut Interner,
         module: &canon::Module,
-    ) -> DResult<Generated> {
+    ) -> Result<Generated, InferError> {
         Self::run_seeded(uf, interner, module, &[], BTreeMap::new())
     }
 
@@ -40,15 +43,15 @@ impl<'a> Builder<'a> {
         module: &canon::Module,
         dep_unions: &[&canon::Union],
         seed_top_level: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>>,
-    ) -> DResult<Generated> {
-        let builtins = Builtins::new(interner)?;
+    ) -> Result<Generated, InferError> {
+        let builtins = Builtins::new(interner).map_err(InferError::unsited)?;
         let mut builder = Self {
             uf,
             interner,
             builtins,
             regions: BTreeMap::new(),
             expected: BTreeMap::new(),
-            current_home: Vec::new(),
+            current_home: None,
             constraints: Vec::new(),
             top_level: seed_top_level, // (home, name) → Ty
             untyped: BTreeMap::new(),  // (home, name) → VarId
@@ -127,7 +130,9 @@ impl<'a> Builder<'a> {
                     // so it takes the same normalisation (`Task Error a` to the
                     // internal unary `Task a`, error-channel and arity checks)
                     // before a pattern binder or constructor use unifies with it.
-                    let normalized = builder.normalize_annotation_ty(from_canon(ct), ctor.span)?;
+                    let normalized = builder
+                        .normalize_annotation_ty(from_canon(ct), ctor.span)
+                        .map_err(|d| InferError::sited_at_path(d, &union.home))?;
                     // Pin `any` wildcard fields to Dict String String so every
                     // instantiation site (pattern binder, ctor-as-value,
                     // Sub.subscribeTopic) sees the concrete carrier, never a
@@ -209,7 +214,9 @@ impl<'a> Builder<'a> {
                     } else {
                         raw
                     };
-                    let normalized = builder.normalize_annotation_ty(expanded, name.span)?;
+                    let normalized = builder
+                        .normalize_annotation_ty(expanded, name.span)
+                        .map_err(|d| InferError::sited_at_path(d, def.home()))?;
                     // A bare wildcard `any` in the annotation's RETURN position
                     // severs the body from every use (see
                     // [`Builder::tie_wildcard_any_uses_to_bodies`]); record the
@@ -224,7 +231,7 @@ impl<'a> Builder<'a> {
                         .insert((home_key, name.value), Rc::new(normalized));
                 }
                 canon::Def::Untyped { name, .. } => {
-                    let v = builder.flex()?;
+                    let v = builder.flex().map_err(InferError::unsited)?;
                     builder.untyped.insert((home_key, name.value), v);
                 }
             }
@@ -232,14 +239,18 @@ impl<'a> Builder<'a> {
 
         // Second pass: constrain each binding's body.
         for def in &module.defs {
-            builder.constrain_def(def)?;
+            builder
+                .constrain_def(def)
+                .map_err(|d| InferError::sited_at_path(d, def.home()))?;
         }
 
         // With every binding constrained, `wildcard_any_return_bodies` is
         // complete: tie every wildcard-`any`-return reference to its body so the
         // body's real type flows to each use before the solver runs, regardless
         // of the source order in which a use and its binding appeared.
-        builder.tie_wildcard_any_uses_to_bodies()?;
+        builder
+            .tie_wildcard_any_uses_to_bodies()
+            .map_err(InferError::unsited)?;
 
         // `module.defs` is already dependency-first topo order (link::link
         // concatenates each source module's whole def list in the
@@ -371,8 +382,13 @@ impl<'a> Builder<'a> {
             rigid: false,
             bounds,
         })?;
-        self.super_vars
-            .push((v, bounds, span, self.current_home.clone()));
+        let home = self.home()?;
+        self.super_vars.push(SuperVar {
+            var: v,
+            bounds,
+            span,
+            home,
+        });
         Ok(v)
     }
 
@@ -407,30 +423,30 @@ impl<'a> Builder<'a> {
                 // type; an all-variable use (`x + x`) leaves it generic, carrying
                 // the operator's obligation so generalisation emits the bound.
                 let s = self.super_var(bounds, lhs.span)?;
-                self.eq(lhs.span, lv, s);
-                self.eq(rhs.span, rv, s);
+                self.eq(lhs.span, lv, s)?;
+                self.eq(rhs.span, rv, s)?;
                 Ok(s)
             }
             BinopClass::IntDiv => {
                 let li = self.int_var()?;
-                self.eq(lhs.span, lv, li);
+                self.eq(lhs.span, lv, li)?;
                 let ri = self.int_var()?;
-                self.eq(rhs.span, rv, ri);
+                self.eq(rhs.span, rv, ri)?;
                 self.int_var()
             }
             BinopClass::FloatDiv => {
                 let lf = self.float_var()?;
-                self.eq(lhs.span, lv, lf);
+                self.eq(lhs.span, lv, lf)?;
                 let rf = self.float_var()?;
-                self.eq(rhs.span, rv, rf);
+                self.eq(rhs.span, rv, rf)?;
                 self.float_var()
             }
             BinopClass::Order => {
                 // `< > <= >=` are Comparable-polymorphic: operands share one
                 // ordered type (carrying the ordering obligation), result Bool.
                 let s = self.super_var(TyBounds::ord(), lhs.span)?;
-                self.eq(lhs.span, lv, s);
-                self.eq(rhs.span, rv, s);
+                self.eq(lhs.span, lv, s)?;
+                self.eq(rhs.span, rv, s)?;
                 self.bool_var()
             }
             BinopClass::Equality => {
@@ -442,15 +458,15 @@ impl<'a> Builder<'a> {
                 // could not compare. A function operand fails the pin and a
                 // function instantiation fails the post-solve gate (IPE-T0014).
                 let s = self.super_var(TyBounds::eq(), lhs.span)?;
-                self.eq(lhs.span, lv, s);
-                self.eq(rhs.span, rv, s);
+                self.eq(lhs.span, lv, s)?;
+                self.eq(rhs.span, rv, s)?;
                 self.bool_var()
             }
             BinopClass::Boolean => {
                 let lb = self.bool_var()?;
-                self.eq(lhs.span, lv, lb);
+                self.eq(lhs.span, lv, lb)?;
                 let rb = self.bool_var()?;
-                self.eq(rhs.span, rv, rb);
+                self.eq(rhs.span, rv, rb)?;
                 self.bool_var()
             }
             BinopClass::Append => {
@@ -461,13 +477,13 @@ impl<'a> Builder<'a> {
                 // fails at the pin and surfaces as IPE-T0014 before reaching
                 // the backend.
                 let s = self.super_var(TyBounds::appendable(), lhs.span)?;
-                self.eq(lhs.span, lv, s);
-                self.eq(rhs.span, rv, s);
+                self.eq(lhs.span, lv, s)?;
+                self.eq(rhs.span, rv, s)?;
                 Ok(s)
             }
             BinopClass::Poly => {
                 // `a -> a -> a`: operands and result share one type.
-                self.eq(rhs.span, lv, rv);
+                self.eq(rhs.span, lv, rv)?;
                 Ok(lv)
             }
         }
@@ -504,8 +520,8 @@ impl<'a> Builder<'a> {
             // Every list element expects the shared element type — an empty
             // slot in `[ ⟨|⟩ ]` where sibling elements pin `elem` completes to
             // that element type.
-            self.record_expected(e.span, elem);
-            self.eq(e.span, ev, elem);
+            self.record_expected(e.span, elem)?;
+            self.eq(e.span, ev, elem)?;
         }
         self.list_var(elem)
     }
@@ -523,18 +539,43 @@ impl<'a> Builder<'a> {
         let list = self.list_var(elem)?;
         let tail_var = self.constrain_expr(local, tail)?;
         // The tail of `head :: tail` expects `List elem`.
-        self.record_expected(tail.span, list);
-        self.eq(tail.span, tail_var, list);
+        self.record_expected(tail.span, list)?;
+        self.eq(tail.span, tail_var, list)?;
         Ok(list)
     }
 
-    pub fn eq(&mut self, span: Span, lhs: VarId, rhs: VarId) {
+    /// Constrain `lhs` to equal `rhs`, blaming `span` in the def being constrained.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when no def is being constrained.
+    pub fn eq(&mut self, span: Span, lhs: VarId, rhs: VarId) -> DResult<()> {
+        let home = self.home()?;
+        self.eq_at(home, span, lhs, rhs);
+        Ok(())
+    }
+
+    /// Constrain `lhs` to equal `rhs`, blaming `span` in the module `home`.
+    pub fn eq_at(&mut self, home: ModuleHome, span: Span, lhs: VarId, rhs: VarId) {
         self.constraints.push(Constraint {
             span,
             lhs,
             rhs,
-            home: self.current_home.clone(),
+            home,
         });
+    }
+
+    /// The module owning the def being constrained.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when no def is being constrained: a record
+    /// minted then would carry no module to frame its span against.
+    pub fn home(&self) -> DResult<ModuleHome> {
+        self.current_home
+            .clone()
+            .ok_or_else(|| Diagnostic::CompilerBug {
+                where_: "ipe_types::Builder::home",
+                detail: "a home-carrying record was minted outside any def".to_owned(),
+            })
     }
 
     /// Record the solver variable the enclosing context EXPECTS at `span` —
@@ -545,10 +586,13 @@ impl<'a> Builder<'a> {
     /// tightest (innermost-recorded) expectation for a span is kept; an outer
     /// context that revisits the same span (rare, only under span-sharing
     /// desugarings) does not overwrite it.
-    pub fn record_expected(&mut self, span: Span, var: VarId) {
-        self.expected
-            .entry((self.current_home.clone(), span))
-            .or_insert(var);
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when no def is being constrained.
+    pub fn record_expected(&mut self, span: Span, var: VarId) -> DResult<()> {
+        let home = self.home()?.into_path();
+        self.expected.entry((home, span)).or_insert(var);
+        Ok(())
     }
 
     // ── Ty ⇄ solver bridges ────────────────────────────────────────────────

@@ -25374,12 +25374,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::WebRevocationStore
                 // ── Server: bearer token source — arity 0 ────────────────
                 // `Server.bearerToken : TokenSource`
-                | KernelFn::ServerTokenBearer
-                // ── BackoffStrategy constructors — arity 0 ────────────────
-                | KernelFn::BackoffLinear
-                | KernelFn::BackoffLinearWithJitter
-                | KernelFn::BackoffExponential
-                | KernelFn::BackoffExponentialWithJitter,
+                | KernelFn::ServerTokenBearer,
             ) => Ok(0),
             Callee::Kernel(
                 KernelFn::StringFromInt
@@ -28192,14 +28187,6 @@ impl<'a> Lowerer<'a> {
                         Ok(Callee::Kernel(KernelFn::TaskWithMaxAttempts))
                     }
                     ("Task", "withBaseMs") => Ok(Callee::Kernel(KernelFn::TaskWithBaseMs)),
-                    ("Task", "Linear") => Ok(Callee::Kernel(KernelFn::BackoffLinear)),
-                    ("Task", "LinearWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffLinearWithJitter))
-                    }
-                    ("Task", "Exponential") => Ok(Callee::Kernel(KernelFn::BackoffExponential)),
-                    ("Task", "ExponentialWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffExponentialWithJitter))
-                    }
                     // ── Io kernels ──────────────────────────────────────
                     ("Io", "readLine") => Ok(Callee::Kernel(KernelFn::IoReadLine)),
                     ("Io", "readSecret") => Ok(Callee::Kernel(KernelFn::IoReadSecret)),

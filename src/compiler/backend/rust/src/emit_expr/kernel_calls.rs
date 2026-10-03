@@ -787,11 +787,7 @@ pub fn emit_task_retry_call(
         | KernelFn::TaskWithRetryOn
         | KernelFn::TaskDefaultRetryPolicy
         | KernelFn::TaskWithMaxAttempts
-        | KernelFn::TaskWithBaseMs
-        | KernelFn::BackoffLinear
-        | KernelFn::BackoffLinearWithJitter
-        | KernelFn::BackoffExponential
-        | KernelFn::BackoffExponentialWithJitter),
+        | KernelFn::TaskWithBaseMs),
     ) = callee
     else {
         return Ok(None);
@@ -921,18 +917,6 @@ pub fn emit_task_retry_call(
                 "{{ let mut __ipe_rec = ({policy_s}); __ipe_rec.baseMs = {ms_s}; __ipe_rec }}"
             )))
         }
-        KernelFn::BackoffLinear => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::Linear".to_owned(),
-        )),
-        KernelFn::BackoffLinearWithJitter => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::LinearWithJitter".to_owned(),
-        )),
-        KernelFn::BackoffExponential => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::Exponential".to_owned(),
-        )),
-        KernelFn::BackoffExponentialWithJitter => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::ExponentialWithJitter".to_owned(),
-        )),
         KernelFn::TaskRetryOn | KernelFn::TaskWithRetryOn => {
             // `retryOn pred policy` / `withRetryOn pred policy` — move-update shouldRetry.
             let pred = args.first().ok_or_else(|| Diagnostic::CompilerBug {

@@ -110,7 +110,8 @@ const DENIED_PATHS: &[&str] = &[
 ];
 
 /// The paths the runtime `clippy.toml` denies for its other rules (abrupt
-/// failure, environment and temp-root reads), which this scan does not own.
+/// failure, environment and temp-root reads, panicking thread starts), which
+/// this scan does not own.
 const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "core::option::Option::unwrap_unchecked",
     "core::result::Result::unwrap_unchecked",
@@ -122,6 +123,10 @@ const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "std::env::vars",
     "std::env::vars_os",
     "std::env::temp_dir",
+    "std::thread::spawn",
+    "std::thread::Scope::spawn",
+    "tokio::task::spawn_blocking",
+    "tokio::runtime::Handle::spawn_blocking",
 ];
 
 /// The most alias hops a path is followed through before it counts as

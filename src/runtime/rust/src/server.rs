@@ -24,13 +24,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::redact::{Redacted, redacting_debug};
+
 /// Ipe.Http.Server.Request — opaque parsed request handle.
 // camelCase field names are required because accessor kernels (server_body,
-// server_path, server_method, …) read these fields directly by name. These
-// fields are NOT part of the Ipê API — Ipê code always goes through a kernel.
+// server_path, server_method, …) read these fields directly by name, and Ipê
+// `req.<field>` access lowers to `(req).<field>.clone()` against the field
+// types of `RequestFields` in `ipe_types` — so every field keeps its plain type.
 // `build_request` populates every field exactly once at the axum boundary.
+// Every field but the method is client-supplied data that can carry a credential
+// (an `Authorization` header, a session cookie, a token in the path, query or
+// body), so `Debug` masks it.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerRequest {
     pub method: String,
     pub path: String,
@@ -42,12 +48,46 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
+redacting_debug!(ServerRequest {
+    shown: [method],
+    masked: [path, body, headers, params, query, cookies, remoteAddr],
+});
+
+/// Emitted `req.<field>` reads each field at the plain type `ipe_types`'
+/// `RequestFields` table gives it (`String`, or `Dict String String` =
+/// `HashMap<String, String>`); a field whose type changes breaks this build,
+/// not a downstream cargo build of an emitted program.
+#[allow(clippy::type_complexity)]
+const _: fn(
+    ServerRequest,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) = |r| {
+    (
+        r.method,
+        r.path,
+        r.body,
+        r.remoteAddr,
+        r.headers,
+        r.params,
+        r.query,
+        r.cookies,
+    )
+};
+
 /// Ipe.Http.Server.Response — opaque response handle built by accessor kernels.
 // camelCase field names are required because builder/emit kernels (server_text,
 // server_with_status, to_axum_response, …) write/read these fields directly.
 // These fields are NOT part of the Ipê API — Ipê code always uses builder kernels.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerResponse {
     pub status: i64,
     pub body: String,
@@ -63,11 +103,19 @@ pub struct ServerResponse {
     pub cookies: Vec<String>,
 }
 
+// The body, headers and `Set-Cookie` values can carry a session id or a token;
+// the emitter builds this struct by field name, so the masking lives in `Debug`.
+redacting_debug!(ServerResponse {
+    shown: [status, contentType],
+    masked: [body, headers, cookies],
+});
+
 /// Ipe.Http.Server.Cookie (opaque) — safe defaults applied at attach time.
+// The value is the cookie's secret half (a session id, a token); the name is not.
 #[derive(Clone, Debug)]
 pub struct ServerCookie {
     pub name: String,
-    pub value: String,
+    pub value: Redacted<String>,
 }
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
@@ -422,17 +470,29 @@ fn reissue_set_cookie(
 ) -> String {
     // The cookie-security signal lives in `web::csrf` for a program that emits the
     // web surface; a server-only program (no `web` module) falls back to the
-    // production-env signal. `feature = "web"` is the exact condition under which
+    // process `Secure` floor. `feature = "web"` is the exact condition under which
     // `crate::web` is present, so the reference is compiled out when it is absent.
     #[cfg(feature = "web")]
     let base_secure = crate::web::csrf::cookies_secure();
     #[cfg(not(feature = "web"))]
-    let base_secure = crate::telemetry::production_from_env();
-    let secure = if base_secure || is_https {
-        "; Secure"
-    } else {
-        ""
-    };
+    let base_secure = cookie_secure_floor();
+    reissue_set_cookie_with(
+        cookie_name,
+        token,
+        slide_window_secs,
+        base_secure || is_https,
+    )
+}
+
+#[cfg(feature = "jwt")]
+/// [`reissue_set_cookie`] under an explicit `Secure` decision.
+fn reissue_set_cookie_with(
+    cookie_name: &str,
+    token: &str,
+    slide_window_secs: u64,
+    secure: bool,
+) -> String {
+    let secure = if secure { "; Secure" } else { "" };
 
     // Frame-ancestors (CSP embedding) is a web-surface concept; a server-only
     // program cannot be framed, so `SameSite=Lax` is the fail-closed default.
@@ -726,7 +786,10 @@ pub fn server_method(req: ServerRequest) -> String {
 // ─── cookies ──────────────────────────────────────────────────────────────
 
 pub fn server_cookie(name: String, value: String) -> ServerCookie {
-    ServerCookie { name, value }
+    ServerCookie {
+        name,
+        value: value.into(),
+    }
 }
 
 /// Strip any byte that could smuggle extra cookie attributes or inject a header
@@ -756,11 +819,11 @@ pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerRespo
     // extra attributes or inject a second header line.
     let name = sanitise_cookie_field(&c.name);
     let value = sanitise_cookie_field(&c.value);
-    // Add `Secure` in production so an auth/session cookie is never transmitted
-    // over the cleartext proxy→app hop (SSL-strip / sniff). Omit it in dev so
-    // cookies still work over plain-http localhost. Gate matches the rest of the
-    // runtime's production detection (ENV / IPE_ENV via productionFromEnv).
-    let secure = if crate::telemetry::production_from_env() {
+    // Add `Secure` unless the process holds a dev intent, so an auth/session
+    // cookie is never transmitted over the cleartext proxy→app hop (SSL-strip /
+    // sniff). Omit it only in a dev build so cookies still work over plain-http
+    // localhost.
+    let secure = if cookie_secure_floor() {
         "; Secure"
     } else {
         ""
@@ -1549,6 +1612,8 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         // (loopback in debug, all interfaces in release). The conservative
         // loopback default keeps a dev console off the LAN by construction.
         let host = crate::app_config::resolve_host_bind();
+        // Recorded before the bind, so no dev surface outlives an exposed listener.
+        crate::telemetry::record_bind(&host);
         let addr = format!("{}:{}", host, port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -1892,19 +1957,34 @@ fn ws_cross_origin(req: &ServerRequest) -> bool {
     crate::http_header::origin_host_mismatch(origin, host)
 }
 
+/// The refusal for a WebSocket upgrade with no origin allowlist, if any.
+///
+/// Waived only under a [`DevSurface`](crate::telemetry::DevSurface): a dev
+/// build whose every listener is loopback falls back to the same-origin check.
+const fn ws_origin_decision(
+    patterns_empty: bool,
+    dev: Option<&crate::telemetry::DevSurface>,
+) -> Option<(i64, &'static str)> {
+    if patterns_empty && dev.is_none() {
+        Some((403, "websocket: origin allowlist required in production"))
+    } else {
+        None
+    }
+}
+
 /// ServerWebSocket_upgrade : Request -> WebSocketServerCfg -> Task Error Response
 pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
     req: ServerRequest,
     cfg: WsServerCfg<E>,
 ) -> IpeTask<E, ServerResponse> {
     Box::pin(async move {
-        // Origin allowlist. Production with no patterns → reject ( With
+        // Origin allowlist. No patterns and no dev surface → reject. With
         // patterns set (any mode), the request's Origin must match one of them.
-        if crate::telemetry::production_from_env() && cfg.originPatterns.is_empty() {
-            return ok_res(ws_resp(
-                403,
-                "websocket: origin allowlist required in production",
-            ));
+        if let Some((status, body)) = ws_origin_decision(
+            cfg.originPatterns.is_empty(),
+            crate::telemetry::dev_surface_from_env().as_ref(),
+        ) {
+            return ok_res(ws_resp(status, body));
         }
         if !cfg.originPatterns.is_empty() {
             let origin = req
@@ -2597,9 +2677,9 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 
 /// `__Host-` prefix requires Secure + Path=/ + no Domain — mirrors
 /// `live/csrf.rs::csrf_cookie_name`'s reasoning, gated on the SAME
-/// process-wide production signal `server_with_cookie` already uses
-/// (`telemetry::production_from_env`), so naming stays internally consistent
-/// with the rest of `server.rs`'s cookie handling.
+/// process-wide [`cookie_secure_floor`] `server_with_cookie` already uses, so
+/// naming stays internally consistent with the rest of `server.rs`'s cookie
+/// handling.
 ///
 /// This stays process-global (NOT request-scoped) deliberately, same
 /// reasoning as the session cookie's `__Host-` name decision
@@ -2609,11 +2689,26 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 /// Only the `Secure` ATTRIBUTE (`csrf_set_cookie_value`) becomes
 /// request-scoped.
 fn csrf_cookie_name() -> &'static str {
-    if crate::telemetry::production_from_env() {
+    csrf_cookie_name_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// [`csrf_cookie_name`] under an explicit dev-intent proof.
+const fn csrf_cookie_name_with(dev: Option<&crate::telemetry::DevIntent>) -> &'static str {
+    if cookie_secure_floor_with(dev) {
         "__Host-ipe_csrf"
     } else {
         "ipe_csrf"
     }
+}
+
+/// The process `Secure` floor for an `Ipe.Http.Server` cookie: [`cookie_secure_floor_with`].
+fn cookie_secure_floor() -> bool {
+    cookie_secure_floor_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// `Secure` unless `dev` proves a dev-intent binary in a dev posture.
+const fn cookie_secure_floor_with(dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    dev.is_none()
 }
 
 /// 64 lowercase-hex chars (two concatenated UUIDv4s, ~244 combined random
@@ -2654,8 +2749,8 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// cross-origin page because SOP blocks that page from reading the
 /// victim-origin cookie).
 ///
-/// `Secure` is set when EITHER `production_from_env()` is true (unconditional
-/// floor — a production deploy always gets `Secure`, matching
+/// `Secure` is set when EITHER [`cookie_secure_floor`] holds (unconditional
+/// floor — every release build and production deploy gets `Secure`, matching
 /// `server_with_cookie`'s gate and the session cookie's
 /// `csrf::cookies_secure()` half) OR `request_is_https` is true (THIS
 /// specific request arrived over TLS at a trusted proxy, opt-in via
@@ -2671,8 +2766,18 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// runs (after the handler's `Task` resolves), the request itself is gone;
 /// only the pre-captured bool survives.
 fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> String {
-    let name = csrf_cookie_name();
-    let secure = if crate::telemetry::production_from_env() || request_is_https {
+    let dev = crate::telemetry::dev_intent_from_env();
+    csrf_set_cookie_value_with(token, request_is_https, dev.as_ref())
+}
+
+/// [`csrf_set_cookie_value`] under an explicit dev-intent proof.
+fn csrf_set_cookie_value_with(
+    token: &str,
+    request_is_https: bool,
+    dev: Option<&crate::telemetry::DevIntent>,
+) -> String {
+    let name = csrf_cookie_name_with(dev);
+    let secure = if cookie_secure_floor_with(dev) || request_is_https {
         "; Secure"
     } else {
         ""
@@ -3013,6 +3118,65 @@ mod tests {
             server_header("x-missing".to_string(), req.clone()),
             IpeMaybe::Nothing
         ));
+    }
+
+    /// A request carrying a planted credential in every client-supplied field.
+    fn secret_laden_request() -> ServerRequest {
+        let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
+        ServerRequest {
+            method: "POST".to_owned(),
+            path: "/reset/P4THT0K".to_owned(),
+            body: "password=PW0RD".to_owned(),
+            headers: pair("Authorization", "Bearer S3CR3T"),
+            params: pair("id", "P4R4M"),
+            query: pair("token", "QT0K3N"),
+            cookies: pair("sid", "T0K3N"),
+            remoteAddr: "203.0.113.9".to_owned(),
+        }
+    }
+
+    const PLANTED: [&str; 7] = [
+        "S3CR3T",
+        "T0K3N",
+        "PW0RD",
+        "P4R4M",
+        "QT0K3N",
+        "203.0.113.9",
+        "P4THT0K",
+    ];
+
+    #[test]
+    fn request_debug_prints_no_client_supplied_value() {
+        let req = secret_laden_request();
+        for shown in [format!("{req:?}"), format!("{req:#?}")] {
+            for secret in PLANTED {
+                assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+            }
+            assert!(shown.contains("\"POST\""), "{shown}");
+            assert!(shown.contains(crate::redact::REDACTED));
+        }
+        assert!(matches!(
+            server_get_cookie("sid".to_owned(), req),
+            IpeMaybe::Just(ref v) if v == "T0K3N"
+        ));
+    }
+
+    #[test]
+    fn cookie_and_response_debug_print_no_secret() {
+        let cookie = server_cookie("sid".to_owned(), "T0K3N".to_owned());
+        let shown = format!("{cookie:?}");
+        assert!(!shown.contains("T0K3N"), "{shown}");
+        assert!(shown.contains("\"sid\""));
+
+        let mut resp = server_text("session=T0K3N".to_owned());
+        resp.headers
+            .insert("Authorization".to_owned(), "Bearer S3CR3T".to_owned());
+        resp.cookies.push("sid=T0K3N; Path=/; HttpOnly".to_owned());
+        let shown = format!("{resp:?}");
+        for secret in ["T0K3N", "S3CR3T"] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("status: 200"));
     }
 
     /// Run `build_request` inside a router matched on `pattern`.
@@ -3470,11 +3634,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    // A dev surface (dev build, loopback listener) emits the banner;
+    // `inject_dev_banner` runs on every text/html buffered response.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn to_axum_response_injects_dev_banner_into_html_before_body_close() {
-        // A dev posture emits the banner; injectDevBanner runs on every
-        // text/html buffered response.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -3489,6 +3656,19 @@ mod tests {
             banner_at < body_close,
             "banner must sit before </body>: {out}"
         );
+    }
+
+    // A release binary under `ENV=dev` on a loopback listener has no dev
+    // surface, so its HTML responses never carry the console banner.
+    #[cfg(not(feature = "dev-posture"))]
+    #[tokio::test]
+    async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        crate::telemetry::record_bind("127.0.0.1");
+        let html = "<html><body><h1>hi</h1></body></html>";
+        let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
+        crate::system::locked_remove_var("ENV");
+        assert_eq!(out, html, "release HTML must be verbatim");
     }
 
     #[tokio::test]
@@ -3598,11 +3778,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_upgrade_dev_rejects_cross_origin_without_allowlist() {
-        // The CSWSH default-deny path: dev posture (`ENV=dev`), empty
-        // originPatterns, cross-origin Origin/Host pair.
+    async fn ws_upgrade_rejects_cross_origin_without_allowlist() {
+        // The CSWSH default-deny path: `ENV=dev` on a loopback listener, empty
+        // originPatterns, cross-origin Origin/Host pair. A dev surface falls
+        // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -3612,39 +3794,17 @@ mod tests {
         // that PASSES the origin check would hit the `None => 400` upgrader
         // branch instead of 403 — the origin check must short-circuit before
         // that point for this assertion to distinguish the two paths.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 403,
-                "cross-origin WS upgrade must be rejected outside production too"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(403), got Err({e})"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ws_upgrade_dev_allows_same_origin_without_allowlist() {
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
-        let cfg = ws_server_default_cfg::<String>();
-        let req = mk_ws_req(&[
-            ("origin", "https://victim.example"),
-            ("host", "victim.example"),
-        ]);
-        // Same-origin passes the CSWSH check; falls through to the "no
-        // upgrader present" 400 (this unit test doesn't drive a real axum
-        // WS upgrade), which is enough to prove it did NOT hit the 403
-        // cross-origin branch.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 400,
-                "same-origin WS upgrade must pass the origin check (400 = no real upgrader in this unit test, not 403)"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(400), got Err({e})"),
-        }
+        let result = server_web_socket_upgrade::<String>(req, cfg).await;
+        crate::system::locked_remove_var("ENV");
+        let IpeResult::Ok(r) = result else {
+            assert!(matches!(result, IpeResult::Ok(_)), "upgrade returned Err");
+            return;
+        };
+        assert_eq!(r.status, 403, "cross-origin WS upgrade must be rejected");
     }
 
     /// The status a same-origin upgrade with no allowlist gets under the
-    /// given `ENV` / `IPE_ENV` (`None` = unset).
+    /// given `ENV` / `IPE_ENV` (`None` = unset), on a loopback listener.
     async fn same_origin_ws_status(env: Option<&str>, ipe_env: Option<&str>) -> i64 {
         for (key, value) in [("ENV", env), ("IPE_ENV", ipe_env)] {
             match value {
@@ -3652,6 +3812,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
+        crate::telemetry::record_bind("127.0.0.1");
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3667,16 +3828,42 @@ mod tests {
         resp.status
     }
 
-    // The WS origin gate reads the one posture parse: a release binary with
-    // nothing set is production (403 without an allowlist); an empty `ENV`
-    // defers to `IPE_ENV`.
+    // The no-allowlist refusal is waived only by a dev surface: never on a
+    // release binary, whatever dev marker `ENV`/`IPE_ENV` carry, even on a
+    // loopback listener.
     #[tokio::test]
-    async fn ws_origin_gate_reads_the_build_posture() {
+    async fn ws_origin_required_on_release_under_env_dev() {
+        let refusal = Some((403, "websocket: origin allowlist required in production"));
+        assert_eq!(ws_origin_decision(true, None), refusal);
+        assert_eq!(ws_origin_decision(false, None), None);
+        let surface = crate::telemetry::test_dev_surface();
+        assert_eq!(ws_origin_decision(true, Some(&surface)), None);
+        assert_eq!(ws_origin_decision(false, Some(&surface)), None);
         if !cfg!(feature = "dev-posture") {
-            assert_eq!(same_origin_ws_status(None, None).await, 403);
+            for (env, ipe_env) in [
+                (None, None),
+                (Some("dev"), None),
+                (Some(""), Some("dev")),
+                (Some("Development"), None),
+                (None, Some("LOCAL")),
+            ] {
+                assert_eq!(
+                    same_origin_ws_status(env, ipe_env).await,
+                    403,
+                    "{env:?} {ipe_env:?}"
+                );
+            }
         }
         assert_eq!(same_origin_ws_status(Some(""), Some("prod")).await, 403);
         assert_eq!(same_origin_ws_status(Some("staging"), None).await, 403);
+    }
+
+    // A dev build on a loopback listener passes a same-origin upgrade through
+    // the origin check (400 = no real upgrader in this unit test, not 403).
+    #[cfg(feature = "dev-posture")]
+    #[tokio::test]
+    async fn dev_posture_pin_ws_same_origin_passes_without_allowlist() {
+        assert_eq!(same_origin_ws_status(None, None).await, 400);
         assert_eq!(same_origin_ws_status(Some(""), Some("dev")).await, 400);
         assert_eq!(same_origin_ws_status(Some("dev"), None).await, 400);
     }
@@ -3686,10 +3873,8 @@ mod tests {
         // Pre-fill the live-peer registry to the ceiling, then a valid
         // same-origin upgrade must be turned away with 503 BEFORE any id/channel
         // is minted — distinguished from the `400 no-upgrader` fall-through the
-        // same-origin path would otherwise hit in a unit test. Dev posture,
-        // so the no-allowlist origin gate passes a same-origin request.
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
+        // same-origin path would otherwise hit in a unit test. The allowlist
+        // names the request's Origin, so the origin gate passes it.
         crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
         let ceiling = usize::try_from(WS_MAX_CONNECTIONS_CEILING.default_value()).unwrap();
         {
@@ -3700,7 +3885,8 @@ mod tests {
                 reg.insert(i, tx);
             }
         }
-        let cfg = ws_server_default_cfg::<String>();
+        let mut cfg = ws_server_default_cfg::<String>();
+        cfg.originPatterns = vec!["https://victim.example".to_owned()];
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3892,7 +4078,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_without_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "a".repeat(64));
+        cookies.insert(csrf_cookie_name().to_string(), "a".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
             Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
                 as IpeTask<String, ServerResponse>
@@ -3906,11 +4092,9 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_post_with_matching_cookie_and_header_allowed() {
-        // Dev posture: the CSRF cookie carries its plain-http name `ipe_csrf`.
-        crate::system::locked_set_var("ENV", "dev");
         let tok = "b".repeat(64);
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), tok.clone());
+        cookies.insert(csrf_cookie_name().to_string(), tok.clone());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), tok);
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3927,7 +4111,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_mismatched_cookie_and_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "c".repeat(64));
+        cookies.insert(csrf_cookie_name().to_string(), "c".repeat(64));
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "d".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3948,7 +4132,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_matching_but_malformed_tokens_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "x".to_string());
+        cookies.insert(csrf_cookie_name().to_string(), "x".to_string());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "x".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3991,29 +4175,64 @@ mod tests {
         assert!(!request_is_https_with_trust(&headers, true));
     }
 
-    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER
-    /// production OR the (pre-captured) request-scoped TLS signal is true.
-    /// Exercises all four (production, request_is_https) combinations —
-    /// this is the pure-function core, independent of env-var mutation.
+    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER there is
+    /// no dev intent OR the (pre-captured) request-scoped TLS signal is true.
+    /// Exercises all four (dev intent, `request_is_https`) combinations and
+    /// the cookie name — the pure-function core, independent of env mutation.
     #[test]
     fn csrf_cookie_secure_or_gate_truth_table() {
-        // production=false is simulated by calling with request_is_https
-        // directly; production is exercised via the ENV-var tests below
-        // (per-process under nextest, so mutating ENV here is safe).
         let tok = "a".repeat(64);
+        let dev = crate::telemetry::test_dev_intent();
+        // (a) dev intent, request IS https -> Secure.
+        assert!(
+            csrf_set_cookie_value_with(&tok, true, Some(&dev)).contains("; Secure"),
+            "TLS-detected request must get Secure regardless of posture"
+        );
+        // (b) dev intent, request NOT https -> no Secure (dev-mode-correct).
+        let plain = csrf_set_cookie_value_with(&tok, false, Some(&dev));
+        assert!(!plain.contains("; Secure"), "{plain}");
+        assert!(plain.starts_with("ipe_csrf="), "{plain}");
+        // (c)/(d) no dev intent -> Secure and `__Host-`, TLS or not.
+        for https in [false, true] {
+            let cookie = csrf_set_cookie_value_with(&tok, https, None);
+            assert!(cookie.contains("; Secure"), "{cookie}");
+            assert!(cookie.starts_with("__Host-ipe_csrf="), "{cookie}");
+        }
+        assert!(cookie_secure_floor_with(None));
+        assert!(!cookie_secure_floor_with(Some(&dev)));
+    }
 
+    // A release binary under `ENV=dev` keeps every `Ipe.Http.Server` cookie
+    // `Secure`, and the CSRF cookie `__Host-`-prefixed.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn cookies_secure_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
+        crate::system::locked_set_var("IPE_ENV", "dev");
+        let tok = "e".repeat(64);
+        let csrf = csrf_set_cookie_value(&tok, false);
+        let name = csrf_cookie_name();
+        let resp = server_with_cookie(
+            ServerCookie {
+                name: "sid".to_owned(),
+                value: crate::redact::Redacted::new("v".to_owned()),
+            },
+            server_text("ok".into()),
+        );
+        #[cfg(feature = "web")]
+        let web_secure = crate::web::csrf::cookies_secure();
+        #[cfg(not(feature = "web"))]
+        let web_secure = true;
+        crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        // (a) not production, request IS https -> Secure.
+        assert!(csrf.contains("; Secure"), "{csrf}");
+        assert_eq!(name, "__Host-ipe_csrf");
         assert!(
-            csrf_set_cookie_value(&tok, true).contains("; Secure"),
-            "TLS-detected request must get Secure regardless of ENV"
+            resp.cookies.iter().all(|c| c.contains("; Secure")),
+            "{:?}",
+            resp.cookies
         );
-        // (b) not production, request NOT https -> no Secure (dev-mode-correct).
-        assert!(
-            !csrf_set_cookie_value(&tok, false).contains("; Secure"),
-            "plain-HTTP dev request must NOT get Secure"
-        );
+        assert!(web_secure);
     }
 
     #[test]
@@ -4047,13 +4266,15 @@ mod tests {
 
     /// End-to-end through `middleware_with_csrf` (not just the pure
     /// `csrf_set_cookie_value` helper): a GET request carrying
-    /// `X-Forwarded-Proto: https` mints a Secure cookie when
-    /// `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
+    /// `X-Forwarded-Proto: https` on a dev build mints a non-Secure cookie
+    /// unless `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
     /// capture-before-move + thread-through-the-closure adaptation.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn csrf_middleware_mints_secure_cookie_for_trusted_https_request() {
-        // Dev posture, so `Secure` can only come from the forwarded scheme.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_csrf_middleware_ignores_untrusted_forwarded_proto() {
+        // Dev build, nothing set, so `Secure` can only come from the forwarded scheme.
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
         let mut headers = HashMap::new();
         headers.insert("x-forwarded-proto".to_string(), "https".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4066,17 +4287,20 @@ mod tests {
         // `IPE_TRUSTED_PROXY` set never trusts the header — so this test
         // documents the untrusted-by-default floor: no Secure without the
         // operator's opt-in, even though the header claims https.
-        match h(req).await {
-            IpeResult::Ok(r) => {
-                assert_eq!(r.cookies.len(), 1);
-                assert!(
-                    !r.cookies[0].contains("; Secure"),
-                    "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {}",
-                    r.cookies[0]
-                );
-            }
-            IpeResult::Err(_) => panic!("GET must never be rejected"),
-        }
+        let result = h(req).await;
+        let IpeResult::Ok(r) = result else {
+            assert!(
+                matches!(result, IpeResult::Ok(_)),
+                "GET must never be rejected"
+            );
+            return;
+        };
+        assert_eq!(r.cookies.len(), 1);
+        assert!(
+            r.cookies.iter().all(|c| !c.contains("; Secure")),
+            "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {:?}",
+            r.cookies
+        );
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────
@@ -4313,43 +4537,36 @@ mod tests {
 
         // ── reissue Secure parity ──────────────────────────────────────────
 
-        /// `reissue_set_cookie` pure-function truth-table:
-        ///   (cookies_secure=false, is_https=true)  → Secure
-        ///   (cookies_secure=false, is_https=false) → no Secure
+        /// `reissue_set_cookie_with` truth-table under a dev intent:
+        ///   (`is_https`=true)  → Secure
+        ///   (`is_https`=false) → no Secure
         /// Mirrors the combined gate in `page_response`:
         /// a re-issued cookie must never be less-Secure than the initial one.
         #[test]
         fn reissue_set_cookie_secure_matches_initial_gate() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
+            let dev = crate::telemetry::test_dev_intent();
+            let floor = cookie_secure_floor_with(Some(&dev));
 
-            // is_https=true, cookies_secure()=false → Secure must fire.
-            let c_https = reissue_set_cookie("ipe_sid", "tok", 1800, true);
+            let c_https = reissue_set_cookie_with("ipe_sid", "tok", 1800, true);
             assert!(
                 c_https.contains("; Secure"),
                 "reissue behind TLS proxy must carry Secure: {c_https}"
             );
 
-            // is_https=false, cookies_secure()=false → no Secure (dev default).
-            let c_plain = reissue_set_cookie("ipe_sid", "tok", 1800, false);
+            let c_plain = reissue_set_cookie_with("ipe_sid", "tok", 1800, floor);
             assert!(
                 !c_plain.contains("; Secure"),
                 "reissue over plain HTTP in dev must NOT carry Secure: {c_plain}"
             );
         }
 
-        /// End-to-end: a cookie-source authed route where the request carries
-        /// `X-Forwarded-Proto: https` (trusted-proxy opt-in via the testable
-        /// `request_is_https_with_trust` overload) produces a re-issued cookie
-        /// that carries `Secure`.
+        /// A trusted `X-Forwarded-Proto: https` header produces a re-issued
+        /// cookie that carries `Secure`, on every build.
         ///
         /// Uses `request_is_https_with_trust(..., true)` directly to bypass the
         /// `OnceLock`-cached `trust_proxy_headers()` without mutating process env.
         #[test]
         fn reissue_set_cookie_https_proxy_sets_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let mut headers = HashMap::new();
             headers.insert("x-forwarded-proto".to_string(), "https".to_string());
             let is_https = request_is_https_with_trust(&headers, true);
@@ -4362,17 +4579,28 @@ mod tests {
             );
         }
 
-        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure on reissue.
+        // A release binary under `ENV=dev` re-issues a `Secure` cookie even
+        // over plain HTTP.
+        #[cfg(not(feature = "dev-posture"))]
+        #[test]
+        fn reissue_set_cookie_secure_on_release_under_env_dev() {
+            crate::system::locked_set_var("ENV", "dev");
+            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, false);
+            crate::system::locked_remove_var("ENV");
+            assert!(cookie.contains("; Secure"), "{cookie}");
+        }
+
+        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure
+        /// on a dev-intent reissue.
         #[test]
         fn reissue_set_cookie_plain_http_no_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let headers = HashMap::new();
             let is_https = request_is_https_with_trust(&headers, false);
             assert!(!is_https);
 
-            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, is_https);
+            let dev = crate::telemetry::test_dev_intent();
+            let secure = cookie_secure_floor_with(Some(&dev)) || is_https;
+            let cookie = reissue_set_cookie_with("ipe_sid", "tok", 1800, secure);
             assert!(
                 !cookie.contains("; Secure"),
                 "reissue over plain HTTP must NOT carry Secure: {cookie}"

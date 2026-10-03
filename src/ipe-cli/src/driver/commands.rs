@@ -3,10 +3,11 @@ use super::{
     RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
     bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
     collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
-    create_source_root, emit_machine_error, emit_permissions, find_manifest_for_ipe_file,
-    gate_decoder_pipelines, home_to_source_map, io_err, render_capabilities,
-    resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env, single_file_cargo_name_from_env,
+    compile_prepared, create_source_root, emit_machine_error, emit_permissions,
+    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    io_err, render_capabilities, resolve_analysis_entry, resolve_analysis_target,
+    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    single_file_cargo_name_from_env,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
@@ -15,10 +16,9 @@ use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
 use crate::{
-    ALL_CODES, BTreeMap, Diagnostic, Interner, Path, PathBuf, build_plan, cli_args, delivery,
-    explain_page, ffi, fs, help, io_bounded, native_ffi_consent, package_manifest, project,
-    run_sandbox, runtime_embed, screen, style, text, title, toolchain, unsafe_ack, wasi_run, watch,
-    web_consent,
+    ALL_CODES, BTreeMap, Interner, Path, PathBuf, build_plan, cli_args, delivery, explain_page,
+    ffi, fs, help, io_bounded, native_ffi_consent, package_manifest, project, run_sandbox,
+    runtime_embed, screen, style, text, title, toolchain, unsafe_ack, wasi_run, watch, web_consent,
 };
 
 /// A request for help asks for output, not an error: it prints to stdout and
@@ -3275,7 +3275,7 @@ pub struct SourceGraph {
 
 impl SourceGraph {
     /// Run the per-module canonicalisation blame loop, then map a rejecting
-    /// query's `(diag, home)` to the source file that OWNS it — the SAME
+    /// query's [`ipe_db::PipelineError`] to the source file that OWNS it — the SAME
     /// attribution the build path uses (`attribute_canon_errors` +
     /// `attribute_post_link_error`), so `ipe type-check` and every other analysis
     /// surface frame a given diagnostic against the identical source as
@@ -3283,8 +3283,9 @@ impl SourceGraph {
     ///
     /// A canon error (e.g. IPE-N0020) surfaces from the blame loop already
     /// framed against its own module; only a post-link error reaches the
-    /// `run_query` closure, where its `home` (or the byte-offset heuristic over
-    /// the linked program) selects the owning source.
+    /// `run_query` closure, where a type-checker error's typed home (or, for a
+    /// homeless link or lowering error, the byte-offset heuristic over the
+    /// linked program) selects the owning source.
     ///
     /// # Errors
     /// [`CliError::Pipeline`] carrying the first compiler diagnostic; the query
@@ -3296,7 +3297,7 @@ impl SourceGraph {
             &ipe_db::IpeDatabase,
             ipe_db::SourceRoot,
             ipe_db::SourceFile,
-        ) -> Result<T, (Diagnostic, Vec<ipe_intern::Symbol>)>,
+        ) -> Result<T, ipe_db::PipelineError>,
     ) -> Result<T, CliError> {
         attribute_canon_errors(
             &self.db,
@@ -3305,10 +3306,11 @@ impl SourceGraph {
             self.entry_file,
             blame_path,
         )?;
-        run_query(&self.db, self.source_root, self.entry_file).map_err(|(diag, home)| {
+        run_query(&self.db, self.source_root, self.entry_file).map_err(|err| {
             // Canon succeeded, so the linked program exists; use it for the
-            // byte-offset fallback when `home` is empty. A link failure here
-            // (empty home, no linked program) frames against the entry file.
+            // byte-offset fallback when a link or lowering error's home is
+            // empty. A link failure here (no linked program) frames against the
+            // entry file.
             let entry = self
                 .sources
                 .get(&self.entry_module_path)
@@ -3316,11 +3318,17 @@ impl SourceGraph {
                 .unwrap_or_else(|| (blame_path.to_path_buf(), String::new()));
             let interner = ipe_db::Db::interner(&self.db).clone();
             let home_to_source = home_to_source_map(&interner, &self.sources);
-            match ipe_db::linked_program(&self.db, self.source_root, self.entry_file) {
-                Ok(linked) => {
-                    attribute_post_link_error(&linked.module, &home_to_source, &entry, diag, &home)
+            match (
+                ipe_db::linked_program(&self.db, self.source_root, self.entry_file),
+                err,
+            ) {
+                (Ok(linked), err) => {
+                    attribute_post_link_error(&linked.module, &home_to_source, &entry, err)
                 }
-                Err(link_diag) => {
+                (Err(_), ipe_db::PipelineError::Infer(infer)) => {
+                    frame_infer_error(&home_to_source, &entry, infer)
+                }
+                (Err(link_diag), ipe_db::PipelineError::Lower(diag, home)) => {
                     // A link error has no linked program to scan; frame the
                     // ORIGINAL query diagnostic (not the link error) against the
                     // home module if known, else the entry file.
@@ -3743,13 +3751,54 @@ fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliErro
         // path runs (`gate_decoder_pipelines`) over the linked module, so
         // `ipe type-check` rejects the hand-nested decoder footgun for the
         // earliest possible feedback rather than deferring it to `ipe build`.
-        // `linked_program` re-demands the memos `typecheck` just populated.
-        ipe_db::typecheck(db, root, file).clone()?;
         let linked = ipe_db::linked_program(db, root, file)
             .clone()
-            .map_err(|d| (d, Vec::new()))?;
+            .map_err(|d| ipe_db::PipelineError::Lower(d, Vec::new()))?;
+        ipe_db::typecheck(db, root, file)
+            .clone()
+            .map_err(ipe_db::PipelineError::from)?;
         gate_decoder_pipelines(&linked.module)
     })
+}
+
+/// Judge one loose `.ipe` entry through the whole build front end, short of cargo.
+///
+/// The entry's source graph is built as [`build_source_graph`] builds it, then
+/// run through [`compile_prepared`], the same canonicalise, link, target-gate,
+/// type-check, decoder-direction-gate, lower and emit pipeline `ipe build`
+/// runs, under a native development configuration. A refusal from any stage,
+/// lowering and emit included, surfaces as the first diagnostic, so a caller
+/// comparing its code sees the stage that actually refused the program. No
+/// project is written and cargo never runs.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying the first compiler diagnostic;
+/// [`CliError::Io`] when a source file cannot be read.
+pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
+    let graph = build_source_graph(entry)?;
+    let config = ipe_db::BuildConfig::new(
+        &graph.db,
+        ipe_backend_rust::DbDriver::default(),
+        None,
+        ipe_ir::Target::Native,
+        Vec::new(),
+        false,
+        ipe_backend_rust::BuildIntent::Development,
+        None,
+        false,
+        String::new(),
+        false,
+        false,
+    );
+    compile_prepared(
+        &graph.db,
+        graph.source_root,
+        &graph.sources,
+        &graph.entry_module_path,
+        entry,
+        config,
+    )?;
+    Ok(())
 }
 
 /// Type-check the entry an [`AnalysisTarget`] names, dispatching to the `src`-

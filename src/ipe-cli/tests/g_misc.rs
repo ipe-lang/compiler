@@ -42,6 +42,8 @@ mod golden_cmd_sub_map;
 mod golden_core_stdlib;
 #[path = "g_misc/golden_cross_module_attr_field_access.rs"]
 mod golden_cross_module_attr_field_access;
+#[path = "g_misc/golden_cross_module_attr_field_mismatch.rs"]
+mod golden_cross_module_attr_field_mismatch;
 #[path = "g_misc/golden_cross_module_attr_lowering.rs"]
 mod golden_cross_module_attr_lowering;
 #[path = "g_misc/golden_cross_module_type_res.rs"]

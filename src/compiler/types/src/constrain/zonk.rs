@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, Budget, Builder, Builtins, Content, DResult, Diagnostic, FlatType,
-    Generated, Interner, RefCell, RowTail, STAGE, SchemeKey, StdlibKernel, Symbol, Ty, UnionFind,
-    VarId, ZONK_NODE_LIMIT, tag_solver_var, unify,
+    Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, StdlibKernel, Symbol, Ty,
+    UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
 };
 
 // ===========================================================================
@@ -316,16 +316,16 @@ pub fn mint_synth_symbol(interner: &mut Interner, next: &mut u32) -> DResult<Sym
 /// A cross-module reference's instantiated scheme failing to unify against
 /// local call-site structure is a genuine `IPE-T0001`, blamed on the
 /// referencing (`use_home`) module. A union-find invariant violation is a
-/// `Diagnostic::CompilerBug` with an empty home.
+/// whole-program [`InferError::Program`] carrying a `Diagnostic::CompilerBug`.
 pub fn promote_untyped_boundaries(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &mut Interner,
     generated: &Generated,
-) -> Result<UntypedSchemes, (Diagnostic, Vec<Symbol>)> {
+) -> Result<UntypedSchemes, InferError> {
     macro_rules! lift {
         ($e:expr) => {
-            $e.map_err(|d: Diagnostic| (d, Vec::<Symbol>::new()))?
+            $e.map_err(InferError::unsited)?
         };
     }
 
@@ -388,7 +388,7 @@ pub fn promote_untyped_boundaries(
         for pi in generated
             .pending_instantiations
             .iter()
-            .filter(|pi| &pi.use_home == home)
+            .filter(|pi| pi.use_home.path() == home.as_slice())
         {
             let Some(scheme) = schemes.get(&pi.source) else {
                 // module_order is dependency-first, and a `PendingInstantiation`
@@ -396,30 +396,34 @@ pub fn promote_untyped_boundaries(
                 // source module always precedes `use_home` and always has a
                 // scheme by now. Unreachable except via a link-order invariant
                 // break; fail closed rather than panic.
-                return Err((
-                    Diagnostic::CompilerBug {
-                        where_: "ipe_types::promote_untyped_boundaries",
-                        detail: "cross-module untyped reference discharged before its source \
-                                 module was generalized"
-                            .to_owned(),
-                    },
-                    pi.use_home.clone(),
-                ));
+                return Err(InferError::unsited(Diagnostic::CompilerBug {
+                    where_: "ipe_types::promote_untyped_boundaries",
+                    detail: "cross-module untyped reference discharged before its source \
+                             module was generalized"
+                        .to_owned(),
+                }));
             };
             let root = scheme.root;
             let quantified = scheme.quantified.clone();
             let mut fresh_map = BTreeMap::new();
             let inst = copy_var(uf, budget, root, &quantified, &mut fresh_map)
-                .map_err(|d| (d, pi.use_home.clone()))?;
-            unify(uf, budget, interner, pi.span, inst, pi.placeholder)
-                .map_err(|d| (d, pi.use_home.clone()))?;
+                .map_err(|d| InferError::sited(d, &pi.use_home))?;
+            unify_at(
+                uf,
+                budget,
+                interner,
+                &pi.use_home,
+                pi.span,
+                inst,
+                pi.placeholder,
+            )?;
         }
 
         // (b) Generalize this module's own untyped defs.
         for (key, &shared) in generated.untyped.iter().filter(|(k, _)| &k.0 == home) {
             let root = lift!(uf.find(shared));
-            let candidates =
-                reachable_flex_roots(uf, budget, root).map_err(|d| (d, key.0.clone()))?;
+            let candidates = reachable_flex_roots(uf, budget, root)
+                .map_err(|d| InferError::sited_at_path(d, &key.0))?;
             let mut quantified = BTreeMap::new();
             for r in candidates {
                 if obligation_roots.contains(&r) {
@@ -888,7 +892,7 @@ impl<'a> Builder<'a> {
             builtins,
             regions: BTreeMap::new(),
             expected: BTreeMap::new(),
-            current_home: Vec::new(),
+            current_home: None,
             constraints: Vec::new(),
             top_level: BTreeMap::new(),
             untyped: BTreeMap::new(),

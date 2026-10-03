@@ -29,14 +29,21 @@ use std::collections::{HashMap, HashSet};
 
 use crate::doc::{ChainOperand, Doc, LeafNorm};
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the measures the sink-generic layout engine reads"
-    )
+mod buf;
+#[cfg(test)]
+#[allow(
+    dead_code,
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::restriction,
+    reason = "the text-reading engine the measure-reading one is proven against"
 )]
+mod reference;
 mod shape;
+
+use buf::{Buf, Frozen};
+use shape::{Frag, Shape};
 
 /// Rendering configuration. Mirrors the `rustfmt` knobs the golden harness pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,25 +139,82 @@ fn render_bounded(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize) -> St
 
 /// Lay `doc` out within `fuel`, falling back to its [`Doc::plain_layout`].
 fn render_within(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, fuel: usize) -> String {
+    render_within_spend(doc, cfg, indent, col, fuel).0
+}
+
+/// What one bounded render spent of its layout fuel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutSpend {
+    /// The fuel the layout search spent, the whole fuel when it ran out.
+    pub spent: usize,
+    /// Whether the search ran out and the render returned its plain layout.
+    pub exhausted: bool,
+}
+
+/// [`render_seeded`], also reporting what its layout search spent of [`LAYOUT_FUEL`].
+pub fn render_seeded_spend(
+    doc: &Doc,
+    cfg: RenderConfig,
+    indent: usize,
+    col: usize,
+) -> (String, LayoutSpend) {
+    render_within_spend(doc, cfg, indent, col, LAYOUT_FUEL)
+}
+
+/// [`render_within`], also reporting what its layout search spent of `fuel`.
+///
+/// A scope without its memo reads as exhausted, so the render falls back to its
+/// plain layout and the report never claims a search that did not run.
+fn render_within_spend(
+    doc: &Doc,
+    cfg: RenderConfig,
+    indent: usize,
+    col: usize,
+    fuel: usize,
+) -> (String, LayoutSpend) {
     let _scope = MemoScope::install(doc, fuel);
-    let mut out = String::new();
+    let out = render_root(doc, cfg, indent, col);
+    let spend = MEMO.with_borrow(|m| {
+        m.as_ref().map_or(
+            LayoutSpend {
+                spent: fuel,
+                exhausted: true,
+            },
+            |m| LayoutSpend {
+                spent: fuel.saturating_sub(m.fuel),
+                exhausted: m.exhausted,
+            },
+        )
+    });
+    if spend.exhausted {
+        return (doc.plain_layout(), spend);
+    }
+    (out.into_string(), spend)
+}
+
+/// Lay `doc` out under the installed memo, charging the fuel for the output the
+/// render returns: writing it out is work in its length, so the fuel bounds the
+/// output too.
+fn render_root(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize) -> Buf {
+    let mut out = Buf::new();
     render_at(doc, cfg, indent, col, false, &mut out);
-    if fuel_exhausted() {
-        return doc.plain_layout();
+    let returned = out.len();
+    if !spend_held(&out, returned) {
+        abandon(&mut out);
     }
     out
 }
 
 /// The work one render may do before it falls back to its plain layout.
 ///
-/// Counted in bytes: each layout computed or replayed spends the bytes it writes
-/// plus the line it measures its cursor on, a leaf included, and every node a
-/// shape predicate or a node fact walks spends a step, so the fuel bounds all the
-/// work a render does. Flat fit probes read cached per-node measures and cost O(1)
-/// each; the fuel bounds the probes that remain — non-flat layouts whose answer
-/// depends on the column and indent a node lands at — and a document that
-/// exhausts it gets its plain layout instead.
-const LAYOUT_FUEL: usize = 1 << 26;
+/// Counted in buffer work: each node rendered spends a step, plus the bytes it
+/// writes and the pieces it appends — a replayed layout is one piece, whatever
+/// its length — and every node a shape predicate or a node fact walks spends a
+/// step, and the output the render returns spends its length, so the fuel bounds
+/// all the work a render does. Every measure a layout decision reads of the
+/// buffer is kept as the buffer grows, so reading it costs no fuel. A document
+/// that exhausts the fuel gets its plain layout instead.
+pub const LAYOUT_FUEL: usize = 1 << 26;
 
 /// The byte ceiling on the layouts one render keeps memoized, each entry charged
 /// [`memo_entry_bytes`]. Past it the memo stops growing and later nodes render
@@ -158,46 +222,26 @@ const LAYOUT_FUEL: usize = 1 << 26;
 /// document cannot grow the memo without bound.
 const MEMO_BYTE_CEILING: usize = 64 << 20;
 
-/// What one memoized layout occupies: its bytes plus the key, the [`Layout`]
-/// header, and the hash-table slot, so a flood of empty layouts is charged too.
-const fn memo_entry_bytes(layout_len: usize) -> usize {
-    layout_len
+/// The byte ceiling on what one render's buffer holds, charged
+/// [`Buf::held_bytes`] at every spend. Past it the render is abandoned like one
+/// out of fuel, so a document that is cheap to lay out but wide cannot grow the
+/// buffer without bound: it gets its plain layout instead.
+const BUF_BYTE_CEILING: usize = 256 << 20;
+
+/// What one memoized layout occupies: the bytes and piece slots it holds of its
+/// own (see [`Frozen::own_bytes`]) plus the key and the hash-table slot, so a
+/// flood of empty layouts is charged too.
+fn memo_entry_bytes(layout: &Frozen) -> usize {
+    layout
+        .own_bytes()
         .saturating_add(size_of::<MemoKey>())
-        .saturating_add(size_of::<Layout>())
         .saturating_add(size_of::<u64>())
 }
 
 /// What one cut layout occupies: a memo entry whose key also carries its
 /// [`CutBound`].
-const fn cut_entry_bytes(layout_len: usize) -> usize {
-    memo_entry_bytes(layout_len.saturating_add(size_of::<CutBound>()))
-}
-
-/// A whole memoized layout, with the width its tail lines need.
-struct Layout {
-    text: String,
-    /// The widest line after the first, without its indentation.
-    widest_tail: usize,
-}
-
-impl Layout {
-    /// The layout `text`, its tail width measured once as it is kept. The walk
-    /// is linear in `text`, whose bytes the render that wrote it already spent.
-    fn of(text: &str) -> Self {
-        Self {
-            text: text.to_owned(),
-            widest_tail: widest_tail(text),
-        }
-    }
-}
-
-/// The widest line of `text` after its first, without its indentation.
-fn widest_tail(text: &str) -> usize {
-    text.split('\n')
-        .skip(1)
-        .map(|line| line.trim_start().len())
-        .max()
-        .unwrap_or_default()
+fn cut_entry_bytes(layout: &Frozen) -> usize {
+    memo_entry_bytes(layout).saturating_add(size_of::<CutBound>())
 }
 
 /// Every layout decision probes a subtree by a [`trial`] render before rendering
@@ -207,15 +251,15 @@ fn widest_tail(text: &str) -> usize {
 /// and budget — so the real render replays what the trial laid out. The memo
 /// makes a node's layout a pure function computed once per render: keyed by the
 /// node's address and every input its render reads — the config, the indent, the
-/// seed column, the [`Pass`], and the buffer's [`Cursor`] — it replays the bytes
-/// that render produced.
+/// seed column, the [`Pass`], and the buffer's [`Cursor`] — it replays the layout
+/// that render produced, shared rather than copied.
 ///
 /// Only nodes of the document passed to [`render`] / [`render_seeded`] are keyed:
 /// they stay borrowed for the whole render, so no other node can take their
 /// address. A document a layout builds on the fly is rendered uncached.
 struct Memo {
     nodes: HashSet<usize>,
-    layouts: HashMap<MemoKey, Layout>,
+    layouts: HashMap<MemoKey, Frozen>,
     bytes: usize,
     /// [`has_hard_break`] per node, computed once.
     hard_breaks: HashMap<usize, bool>,
@@ -229,12 +273,12 @@ struct Memo {
     flat_fixed: HashMap<usize, bool>,
     /// The single-line flat layout of each [`flat_fixed`] node, shared by every
     /// context it renders in; charged to `bytes` like `layouts`.
-    flat_layouts: HashMap<FlatKey, String>,
+    flat_layouts: HashMap<FlatKey, Frozen>,
     /// [`flat_measure`] per [`flat_fixed`] node, computed once.
     flat_measures: HashMap<FlatKey, FlatMeasure>,
     /// The first line, through its newline, of each layout a first-line [`trial`]
     /// rendered and saw break; charged to `bytes` like `layouts`.
-    first_lines: HashMap<MemoKey, String>,
+    first_lines: HashMap<MemoKey, Frozen>,
     /// Where the innermost bounded [`trial`] stops laying out.
     stop_mark: Option<StopMark>,
     /// Whether the innermost width-bounded [`trial`] has cut its layout short
@@ -243,7 +287,7 @@ struct Memo {
     /// The layouts a width-bounded [`trial`] cut short, apart from `layouts`:
     /// each is laid out only up to where the cut decided its trial, so it is
     /// replayed only under the same cut; charged [`cut_entry_bytes`] to `bytes`.
-    cuts: HashMap<CutKey, String>,
+    cuts: HashMap<CutKey, Frozen>,
     /// [`is_block_like`] per node, computed once.
     block_like: HashMap<usize, bool>,
     /// [`is_glue_shape`] per node, computed once.
@@ -254,11 +298,10 @@ struct Memo {
     chain_receivers: HashMap<usize, bool>,
     /// [`LAYOUT_FUEL`] left to spend; once spent the render is abandoned.
     fuel: usize,
+    /// The ceiling on a buffer's [`Buf::held_bytes`], [`BUF_BYTE_CEILING`] for
+    /// every production render; past it the render is abandoned.
+    buf_ceiling: usize,
     exhausted: bool,
-    /// The layout bytes charged for what the open buffers hold: every byte is
-    /// charged once, by the innermost memoized render that wrote or replayed it,
-    /// so an enclosing layout is charged only its own share.
-    charged: usize,
 }
 
 /// Everything a node's render reads besides the node itself.
@@ -293,13 +336,14 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn of(out: &str) -> Self {
-        let line = out.rsplit('\n').next().unwrap_or_default();
+    fn of(out: &Buf) -> Self {
+        let total = out.total();
+        let line = total.last();
         Self {
-            empty: out.is_empty(),
-            line_len: line.len(),
-            blank_line: line.bytes().all(|b| b == b' '),
-            trailing_spaces: out.len().saturating_sub(out.trim_end_matches(' ').len()),
+            empty: total.is_empty(),
+            line_len: line.width(),
+            blank_line: line.is_blank_line(),
+            trailing_spaces: line.trailing_spaces(),
         }
     }
 }
@@ -340,11 +384,11 @@ struct FlatMeasure {
 }
 
 impl FlatMeasure {
-    fn of(layout: &str) -> Self {
+    const fn of(first: &Line) -> Self {
         Self {
-            single_line: !layout.contains('\n'),
-            first_len: layout.find('\n').unwrap_or(layout.len()),
-            starts_paren: layout.starts_with('('),
+            single_line: !first.broke,
+            first_len: first.width(),
+            starts_paren: matches!(first.first_byte, Some(b'(')),
         }
     }
 
@@ -404,8 +448,8 @@ impl MemoScope {
             delimited_exprs: HashMap::new(),
             chain_receivers: HashMap::new(),
             fuel,
+            buf_ceiling: BUF_BYTE_CEILING,
             exhausted: false,
-            charged: 0,
         };
         Self(MEMO.replace(Some(memo)))
     }
@@ -496,10 +540,10 @@ fn collect_node_addrs(doc: &Doc, nodes: &mut HashSet<usize>) {
     nodes.insert(node_addr(doc));
 }
 
-/// The current column after the last newline in `out`, i.e. how many characters
-/// sit on the line so far. This is the live cursor the fit tests measure.
-fn current_col(out: &str) -> usize {
-    out.rfind('\n').map_or(out.len(), |nl| out.len() - nl - 1)
+/// The current column after the last newline in `out`, i.e. how many bytes sit on
+/// the line so far. This is the live cursor the fit tests measure.
+fn current_col(out: &Buf) -> usize {
+    out.total().last().width()
 }
 
 /// The column the next character will land on. Once anything has been written to
@@ -508,7 +552,7 @@ fn current_col(out: &str) -> usize {
 /// empty buffer (the render root, or a [`first_line_fresh`] measure), where there
 /// is no cursor yet. Taking `max` here would leak a pre-newline column past a
 /// break, so we deliberately prefer the live cursor.
-fn eff_col(out: &str, col: usize) -> usize {
+fn eff_col(out: &Buf, col: usize) -> usize {
     if out.is_empty() {
         col
     } else {
@@ -523,14 +567,7 @@ fn eff_col(out: &str, col: usize) -> usize {
 /// presence already forced every enclosing group broken, so it is never reached
 /// with `flat == true` in practice, but it breaks unconditionally regardless).
 /// `col` is the column the first char lands on.
-fn render_at(
-    doc: &Doc,
-    cfg: RenderConfig,
-    indent: usize,
-    col: usize,
-    flat: bool,
-    out: &mut String,
-) {
+fn render_at(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, flat: bool, out: &mut Buf) {
     if flat && is_keyed(doc) && flat_fixed(doc) {
         render_flat_shared(doc, cfg, indent, col, out);
         return;
@@ -552,11 +589,11 @@ fn is_keyed(doc: &Doc) -> bool {
 /// [`flat_fixed`]) and writes no newline, so it trims nothing before it and is the
 /// same bytes appended in every context. A multi-line one places its later lines
 /// at `indent`, so it stays with the per-context memo.
-fn render_flat_shared(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, out: &mut String) {
+fn render_flat_shared(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, out: &mut Buf) {
     // A probe past its first line keeps nothing more, and its empty append must
     // not stand in for the node's shared layout.
-    if reach(std::ptr::from_ref::<String>(out).addr(), out) == Reach::Done {
-        if !spend(1) {
+    if reach(buf_addr(out), out) == Reach::Done {
+        if !spend_work(out) {
             abandon(out);
         }
         return;
@@ -565,25 +602,25 @@ fn render_flat_shared(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, o
     let shared = MEMO.with_borrow(|m| {
         let m = m.as_ref()?;
         if m.exhausted {
-            return Some(None);
+            return Some(false);
         }
         m.flat_layouts.get(&key).map(|layout| {
-            out.push_str(layout);
-            Some(layout.len())
+            out.push_frozen(layout);
+            true
         })
     });
     match shared {
-        Some(Some(len)) => {
-            if spend(len.saturating_add(1)) {
-                hold_charged(len);
+        Some(true) => {
+            if !spend_work(out) {
+                abandon(out);
             }
             return;
         }
-        Some(None) => return,
+        Some(false) => return,
         None => {}
     }
     let start = out.len();
-    let base = out.trim_end_matches(' ').len();
+    let base = start.saturating_sub(out.total().last().trailing_spaces());
     let cut = cut_during(out, |out| {
         memoized(
             doc,
@@ -598,24 +635,30 @@ fn render_flat_shared(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, o
         );
     });
     // A layout a width bound cut short is not the one every context appends.
-    if cut {
+    if cut || fuel_exhausted() || !out.shape_from(base).is_single_line() || out.len() < start {
         return;
     }
-    let appended = out
-        .get(base..)
-        .is_some_and(|written| !written.contains('\n'));
-    let Some(layout) = out.get(start..).filter(|_| appended) else {
-        return;
-    };
+    let layout = out.freeze(start);
+    keep(memo_entry_bytes(&layout), |m| {
+        m.flat_layouts.insert(key, layout.clone());
+    });
+}
+
+/// The address of `out`, which a stop mark names its buffer by.
+fn buf_addr(out: &Buf) -> usize {
+    std::ptr::from_ref::<Buf>(out).addr()
+}
+
+/// Run `insert` on the memo when it can take `entry` more bytes, charging them.
+fn keep(entry: usize, insert: impl FnOnce(&mut Memo)) {
     MEMO.with_borrow_mut(|m| {
-        let entry = memo_entry_bytes(layout.len());
         if let Some(m) = m.as_mut()
             && !m.exhausted
             && let Some(bytes) = m.bytes.checked_add(entry)
             && bytes <= m.byte_ceiling
         {
             m.bytes = bytes;
-            m.flat_layouts.insert(key, layout.to_owned());
+            insert(m);
         }
     });
 }
@@ -641,35 +684,22 @@ struct StopMark {
     bound: StopBound,
 }
 
-/// Where a [`trial`] stops laying out, with what it has already scanned.
+/// Where a [`trial`] stops laying out.
 ///
 /// A width-bounded trial decides a verdict that fails once one byte lands past
 /// its width that no later trim can remove, so it stops there: the rest of the
-/// layout could not change the verdict. Its scan state only skips bytes already
-/// scanned — nothing below a buffer's trailing-space run is rewritten except by
-/// a nested trial's roll back, which restores it.
+/// layout could not change the verdict.
 #[derive(Clone, Copy)]
 enum StopBound {
     /// At the first newline.
     FirstLine,
     /// At the first newline, or at the first byte past `width` on the first line
-    /// that is not a space or an open delimiter; nothing below `clear` is one.
-    FirstLineWithin { width: usize, clear: usize },
-    /// Once a line after the first newline carries content wider than `width`;
-    /// every line before `tail` is scanned and fits.
-    WholeWithin { width: usize, tail: Option<usize> },
-}
-
-/// Whether a byte on a line leaves a width verdict open: a space may be trimmed,
-/// and an open delimiter ending a head is not counted in its width.
-const fn width_neutral(byte: u8) -> bool {
-    matches!(byte, b' ' | b'(' | b'{' | b'[')
-}
-
-/// The width a line's content takes: without its indentation, nor the trailing
-/// spaces a break trims.
-fn content_width(line: &str) -> usize {
-    line.trim_start().trim_end_matches(' ').len()
+    /// that is not a space or an open delimiter (a space may be trimmed, and an
+    /// open delimiter ending a head is not counted in its width).
+    FirstLineWithin { width: usize },
+    /// Once a line after the first newline carries content wider than `width`,
+    /// without its indentation nor the trailing spaces a break trims.
+    WholeWithin { width: usize },
 }
 
 impl StopMark {
@@ -680,85 +710,55 @@ impl StopMark {
     /// its last newline — a break trims trailing spaces, never a newline — so
     /// once a newline sits at or past `from` the trial's first line is final, and
     /// a byte past the width that no trim removes stays on its line.
-    fn observe(&mut self, out: &str) -> (Reach, bool) {
-        let from = self.from;
-        let last_newline = out.rfind('\n');
-        let past_first_line = last_newline.is_some_and(|nl| nl >= from);
-        match &mut self.bound {
-            StopBound::FirstLine | StopBound::FirstLineWithin { .. } if past_first_line => {
+    fn observe(&self, out: &Buf) -> (Reach, bool) {
+        let from = out.shape_from(self.from);
+        match self.bound {
+            StopBound::FirstLine | StopBound::FirstLineWithin { .. } if from.newlines() > 0 => {
                 (Reach::Done, false)
             }
             StopBound::FirstLine => (Reach::FirstLine, false),
-            StopBound::FirstLineWithin { width, clear } => {
-                let line_start = last_newline.map_or(0, |nl| nl.saturating_add(1));
-                let scan = (*clear).max(from).max(line_start.saturating_add(*width));
-                let over = out.as_bytes().get(scan..).and_then(|rest| {
-                    rest.iter()
-                        .position(|&b| !width_neutral(b))
-                        .map(|at| scan.saturating_add(at))
-                });
-                let (scanned, observed) = over.map_or_else(
-                    || (out.trim_end_matches(' ').len(), (Reach::FirstLine, false)),
-                    |at| (at, (Reach::Done, true)),
-                );
-                *clear = scanned;
-                observed
+            StopBound::FirstLineWithin { width } => {
+                // The line holds no newline at or past `from`, so it is the line
+                // the trial's first line is written on.
+                let line = out.total().last();
+                let line_start = out.len().saturating_sub(line.width());
+                let content_end = out.len().saturating_sub(line.trailing_neutral());
+                if content_end > self.from.max(line_start.saturating_add(width)) {
+                    (Reach::Done, true)
+                } else {
+                    (Reach::FirstLine, false)
+                }
             }
-            StopBound::WholeWithin { width, tail } => observe_tail(out, from, *width, tail),
+            StopBound::WholeWithin { width } => {
+                if from.widest_trimmed_tail() > width {
+                    (Reach::Done, true)
+                } else {
+                    (Reach::Whole, false)
+                }
+            }
         }
     }
 
     /// The [`CutBound`] a layout starting at `base` on `out` is cut under, or
     /// `None` when this mark's trial is not width-bounded.
-    fn cut_bound(&self, out: &str, base: usize) -> Option<CutBound> {
+    fn cut_bound(&self, out: &Buf, base: usize) -> Option<CutBound> {
         match self.bound {
             StopBound::FirstLine => None,
-            StopBound::FirstLineWithin { width, .. } => Some(CutBound::FirstLine { width }),
-            StopBound::WholeWithin { width, .. } => {
-                let prefix = out.get(..base).unwrap_or_default();
-                let newline = prefix.rfind('\n');
-                let line = newline
-                    .and_then(|nl| prefix.get(nl.saturating_add(1)..))
-                    .unwrap_or(prefix);
-                let content = line.trim_start();
-                let lead = line.len().saturating_sub(content.len());
+            StopBound::FirstLineWithin { width } => Some(CutBound::FirstLine { width }),
+            StopBound::WholeWithin { width } => {
+                let prefix = out.shape_before(base);
+                let line = prefix.last();
+                let lead = line.leading_blank();
+                let counted =
+                    base > self.from && prefix.newlines() > out.shape_before(self.from).newlines();
                 Some(CutBound::Tail {
                     width,
-                    lead: (!content.is_empty()).then_some(lead),
-                    counted: newline.is_some_and(|nl| nl >= self.from),
+                    lead: (lead < line.width()).then_some(lead),
+                    counted,
                 })
             }
         }
     }
-}
-
-/// The [`Reach`] under a [`StopBound::WholeWithin`] mark watching `out` from
-/// `from`, and whether a line past its first newline is wider than `width`.
-fn observe_tail(out: &str, from: usize, width: usize, tail: &mut Option<usize>) -> (Reach, bool) {
-    let first_tail = || {
-        out.get(from..)
-            .and_then(|rest| rest.find('\n'))
-            .map(|nl| from.saturating_add(nl).saturating_add(1))
-    };
-    let Some(start) = tail.or_else(first_tail) else {
-        return (Reach::Whole, false);
-    };
-    let Some(rest) = out.get(start..) else {
-        return (Reach::Whole, false);
-    };
-    let mut line_start = start;
-    for line in rest.split('\n') {
-        if content_width(line) > width {
-            *tail = Some(line_start);
-            return (Reach::Done, true);
-        }
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-    }
-    *tail = Some(
-        rest.rfind('\n')
-            .map_or(start, |nl| start.saturating_add(nl).saturating_add(1)),
-    );
-    (Reach::Whole, false)
 }
 
 /// A layout a width-bounded [`trial`] cut short: its node's [`MemoKey`] and the
@@ -793,14 +793,14 @@ enum CutBound {
 ///
 /// A width cut is recorded for the memoized renders open on the buffer, so none
 /// of them keeps its cut-short layout as the whole one.
-fn reach(addr: usize, out: &str) -> Reach {
+fn reach(addr: usize, out: &Buf) -> Reach {
     MEMO.with_borrow_mut(|m| {
         let Some(m) = m.as_mut() else {
             return Reach::Whole;
         };
         let observed = m
             .stop_mark
-            .as_mut()
+            .as_ref()
             .filter(|mark| mark.addr == addr)
             .map(|mark| mark.observe(out));
         observed.map_or(Reach::Whole, |(reach, cut)| {
@@ -812,7 +812,7 @@ fn reach(addr: usize, out: &str) -> Reach {
 
 /// The [`CutKey`] of a render of `key` starting at `base` on `out`, the buffer at
 /// address `addr`, when the innermost trial on `out` is width-bounded.
-fn cut_key(key: MemoKey, addr: usize, out: &str, base: usize) -> Option<CutKey> {
+fn cut_key(key: MemoKey, addr: usize, out: &Buf, base: usize) -> Option<CutKey> {
     MEMO.with_borrow(|m| {
         m.as_ref()?
             .stop_mark
@@ -824,7 +824,7 @@ fn cut_key(key: MemoKey, addr: usize, out: &str, base: usize) -> Option<CutKey> 
 
 /// Run `render` on `out` and return whether a width cut fell inside it, leaving
 /// the cut recorded for the enclosing memoized renders too.
-fn cut_during(out: &mut String, render: impl FnOnce(&mut String)) -> bool {
+fn cut_during(out: &mut Buf, render: impl FnOnce(&mut Buf)) -> bool {
     let outer = MEMO.with_borrow_mut(|m| m.as_mut().is_some_and(|m| std::mem::take(&mut m.cut)));
     render(out);
     MEMO.with_borrow_mut(|m| {
@@ -850,14 +850,6 @@ fn cut_seen() -> bool {
     MEMO.with_borrow(|m| m.as_ref().is_some_and(|m| m.cut))
 }
 
-/// `layout` up to and including its first newline, or all of it when it has none.
-fn first_line(layout: &str) -> &str {
-    layout
-        .find('\n')
-        .and_then(|nl| layout.get(..=nl))
-        .unwrap_or(layout)
-}
-
 /// How much of its layout a [`trial`] lays out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrialReach {
@@ -879,8 +871,8 @@ impl TrialReach {
         match self {
             Self::FirstLine => Some(StopBound::FirstLine),
             Self::Whole => None,
-            Self::FirstLineWithin { width } => Some(StopBound::FirstLineWithin { width, clear: 0 }),
-            Self::WholeWithin { width } => Some(StopBound::WholeWithin { width, tail: None }),
+            Self::FirstLineWithin { width } => Some(StopBound::FirstLineWithin { width }),
+            Self::WholeWithin { width } => Some(StopBound::WholeWithin { width }),
         }
     }
 }
@@ -897,10 +889,11 @@ struct Mark {
 
 impl Mark {
     /// The mark of a trial beginning on `out` now.
-    fn at(out: &str) -> Self {
+    fn at(out: &Buf) -> Self {
+        let start = out.len();
         Self {
-            start: out.len(),
-            stable: out.trim_end_matches(' ').len(),
+            start,
+            stable: start.saturating_sub(out.total().last().trailing_spaces()),
         }
     }
 
@@ -909,34 +902,72 @@ impl Mark {
     /// Nothing below the trailing-space run is ever rewritten (a break trims only
     /// that run; a replay truncates no further), so restoring the run undoes
     /// everything written since.
-    fn roll_back(self, out: &mut String) {
+    fn roll_back(self, out: &mut Buf) {
         out.truncate(self.stable);
-        out.extend(std::iter::repeat_n(
-            ' ',
-            self.start.saturating_sub(self.stable),
-        ));
+        out.push_spaces(self.start.saturating_sub(self.stable));
     }
 
-    /// Everything the trial has written so far, from the cursor it began at.
+    /// The measure of everything the trial has written so far, from the cursor
+    /// it began at.
     ///
     /// When a break trimmed the trailing spaces before the cursor, what is written
     /// begins at the newline that break wrote.
-    fn written(self, out: &str) -> &str {
-        let intact = out
-            .get(self.stable..self.start)
-            .is_some_and(|run| run.bytes().all(|b| b == b' '));
-        if intact {
-            out.get(self.start..).unwrap_or_default()
+    fn written(self, out: &Buf) -> Shape {
+        out.shape_from(self.written_from(out))
+    }
+
+    /// The byte length of what [`Mark::written`] measures.
+    fn written_len(self, out: &Buf) -> usize {
+        out.len().saturating_sub(self.written_from(out))
+    }
+
+    /// Where what the trial has written begins on `out`.
+    fn written_from(self, out: &Buf) -> usize {
+        let run = self.start.saturating_sub(self.stable);
+        let spaces = out.shape_from(self.stable).first().leading_spaces();
+        if out.len() >= self.start && spaces >= run {
+            self.start
         } else {
-            out.get(self.stable..)
-                .unwrap_or_default()
-                .trim_start_matches(' ')
+            self.stable.saturating_add(spaces)
         }
     }
 
     /// The written part of the trial's first line, through its newline if one ends it.
-    fn line(self, out: &str) -> &str {
-        first_line(self.written(out))
+    fn line(self, out: &Buf) -> Line {
+        Line::of(&self.written(out))
+    }
+}
+
+/// The measure of a layout's first line, through its newline if one ends it.
+#[derive(Clone, Copy)]
+struct Line {
+    /// The line without its newline.
+    frag: Frag,
+    /// Whether a newline ends it.
+    broke: bool,
+    /// Its first byte, the newline for an empty line that breaks.
+    first_byte: Option<u8>,
+}
+
+impl Line {
+    const fn of(layout: &Shape) -> Self {
+        Self {
+            frag: *layout.first(),
+            broke: !layout.is_single_line(),
+            first_byte: layout.first_byte(),
+        }
+    }
+
+    /// Its length, its newline included.
+    const fn len(self) -> usize {
+        self.frag
+            .width()
+            .saturating_add(if self.broke { 1 } else { 0 })
+    }
+
+    /// Its length without its newline.
+    const fn width(self) -> usize {
+        self.frag.width()
     }
 }
 
@@ -944,18 +975,12 @@ impl Mark {
 /// enclosing mark after.
 ///
 /// A caller discards what `render` writes — a [`trial`] rolls it back, a fresh
-/// buffer is dropped — so the bytes charged for it leave the held total with it:
-/// an enclosing layout never counts a probe's bytes as its children's. Only an
-/// [`attempt`] that keeps its bytes keeps their charge. A width cut inside decides
+/// buffer is dropped — unless an [`attempt`] keeps it. A width cut inside decides
 /// only what `render` reads, so it is not recorded past the trial.
-fn with_stop<T>(
-    out: &mut String,
-    reach: TrialReach,
-    render: impl FnOnce(&mut String, Mark) -> T,
-) -> T {
+fn with_stop<T>(out: &mut Buf, reach: TrialReach, render: impl FnOnce(&mut Buf, Mark) -> T) -> T {
     let mark = Mark::at(out);
     let stop = reach.bound().map(|bound| StopMark {
-        addr: std::ptr::from_ref::<String>(out).addr(),
+        addr: buf_addr(out),
         from: mark.stable,
         bound,
     });
@@ -963,16 +988,14 @@ fn with_stop<T>(
         m.as_mut().map(|m| {
             (
                 std::mem::replace(&mut m.stop_mark, stop),
-                m.charged,
                 std::mem::take(&mut m.cut),
             )
         })
     });
     let read = render(out, mark);
     MEMO.with_borrow_mut(|m| {
-        if let (Some(m), Some((stop_mark, charged, cut))) = (m.as_mut(), outer) {
+        if let (Some(m), Some((stop_mark, cut))) = (m.as_mut(), outer) {
             m.stop_mark = stop_mark;
-            m.charged = charged;
             m.cut = cut;
         }
     });
@@ -988,7 +1011,7 @@ fn with_stop<T>(
 /// replays. A [`TrialReach::FirstLine`] trial stops laying out past its first
 /// newline; a [`TrialReach::Whole`] one lays everything out even inside an
 /// enclosing first-line trial.
-fn trial<T>(out: &mut String, reach: TrialReach, render: impl FnOnce(&mut String, Mark) -> T) -> T {
+fn trial<T>(out: &mut Buf, reach: TrialReach, render: impl FnOnce(&mut Buf, Mark) -> T) -> T {
     let mark = Mark::at(out);
     let read = with_stop(out, reach, render);
     // An abandoned render's buffer is discarded whole, so it is left as it is.
@@ -1011,26 +1034,20 @@ enum Attempt {
 /// accepts it, so a probe that proves its layout is also its commit.
 ///
 /// `render` accepts only a layout none of whose lines after the first newline is
-/// wider than `width`, so the layout stops at the first such line. A kept layout
-/// keeps its charge, as the render that would replay it holds. Inside an open
+/// wider than `width`, so the layout stops at the first such line. Inside an open
 /// first-line [`trial`] the commit writes only up to its first newline, so the
 /// whole layout is rolled back for the caller to commit; `render` is told whether
 /// its layout can be kept.
-fn attempt(
-    out: &mut String,
-    width: usize,
-    render: impl FnOnce(&mut String, bool) -> bool,
-) -> Attempt {
+fn attempt(out: &mut Buf, width: usize, render: impl FnOnce(&mut Buf, bool) -> bool) -> Attempt {
     let mark = Mark::at(out);
-    let keeps = reach(std::ptr::from_ref::<String>(out).addr(), out) == Reach::Whole;
-    let mut held = None;
+    let keeps = reach(buf_addr(out), out) == Reach::Whole;
+    let mut kept = false;
     let fits = with_stop(out, TrialReach::WholeWithin { width }, |out, _| {
         let fits = render(out, keeps);
-        held = (fits && keeps && !cut_seen()).then(held_charged);
+        kept = fits && keeps && !cut_seen();
         fits
     });
-    if let Some(held) = held {
-        set_held_charged(held);
+    if kept {
         return Attempt::Kept;
     }
     if !fuel_exhausted() {
@@ -1041,20 +1058,22 @@ fn attempt(
 
 /// Whether an open first-line [`trial`] on `out` already holds its first line, so
 /// nothing more rendered into `out` is kept and no decision about it matters.
-fn first_line_done(out: &String) -> bool {
-    reach(std::ptr::from_ref::<String>(out).addr(), out) == Reach::Done
+fn first_line_done(out: &Buf) -> bool {
+    reach(buf_addr(out), out) == Reach::Done
 }
 
-/// The first line a render into a fresh buffer writes, with what `render` read.
+/// The measure of the first line a render into a fresh buffer writes, with what
+/// `render` read.
 ///
 /// Only for a layout that reads nothing of its context, which is the same bytes
 /// at every cursor.
-fn first_line_fresh<T>(render: impl FnOnce(&mut String) -> T) -> (String, T) {
-    let mut fresh = String::new();
+fn first_line_fresh<T>(render: impl FnOnce(&mut Buf) -> T) -> (Line, T) {
+    let mut fresh = Buf::new();
     let read = with_stop(&mut fresh, TrialReach::FirstLine, |probe, _| render(probe));
-    let end = first_line(&fresh).len();
-    fresh.truncate(end);
-    (fresh, read)
+    if !spend_work(&mut fresh) {
+        abandon(&mut fresh);
+    }
+    (Line::of(fresh.total()), read)
 }
 
 /// Run `render` for `doc` into `out`, or replay the bytes it produced the last time
@@ -1067,8 +1086,8 @@ fn memoized(
     indent: usize,
     col: usize,
     pass: Pass,
-    out: &mut String,
-    render: impl FnOnce(&mut String),
+    out: &mut Buf,
+    render: impl FnOnce(&mut Buf),
 ) {
     let addr = node_addr(doc);
     let Some(keyed) = MEMO.with_borrow(|m| {
@@ -1079,16 +1098,17 @@ fn memoized(
         abandon(out);
         return;
     };
-    let reach = reach(std::ptr::from_ref::<String>(out).addr(), out);
+    let reach = reach(buf_addr(out), out);
     if !keyed {
-        // A leaf's caller measures the cursor line to place it, so it is charged
-        // that line like a keyed node is.
-        if spend(1_usize.saturating_add(current_col(out))) {
-            if reach != Reach::Done {
-                render(out);
-            }
-        } else {
+        if !spend_step(out) {
             abandon(out);
+            return;
+        }
+        if reach != Reach::Done {
+            render(out);
+            if !spend_work(out) {
+                abandon(out);
+            }
         }
         return;
     }
@@ -1100,7 +1120,7 @@ fn memoized(
         pass,
         cursor: Cursor::of(out),
     };
-    if !spend(1_usize.saturating_add(key.cursor.line_len)) {
+    if !spend_step(out) {
         abandon(out);
         return;
     }
@@ -1110,37 +1130,32 @@ fn memoized(
     // A break trims only the trailing spaces before it, so everything before that
     // run is untouched and the render's effect is exactly the bytes from `base` on.
     let base = out.len().saturating_sub(key.cursor.trailing_spaces);
-    let cut_key = cut_key(key, std::ptr::from_ref::<String>(out).addr(), out, base);
-    if let Some(replayed) = replay(&key, cut_key.as_ref(), reach, out, base) {
-        if spend(replayed) {
-            hold_charged(replayed);
+    let cut_key = cut_key(key, buf_addr(out), out, base);
+    if replay(&key, cut_key.as_ref(), reach, out, base) {
+        if !spend_work(out) {
+            abandon(out);
         }
         return;
     }
     #[cfg(test)]
     RENDERED.with(|n| n.set(n.get() + 1));
-    let children = held_charged();
     let cut = cut_during(out, render);
-    let Some(layout) = out.get(base..) else {
-        return;
-    };
-    // The bytes the nested renders wrote were charged by them, so only the rest
-    // is this layout's own: the charges over a nest sum to its output, not to
+    // The nested renders spent the work they did, so only this layout's own
+    // bytes and pieces are left: the spend over a nest sums to its output, not to
     // every level's copy of its subtree.
-    let own = layout
-        .len()
-        .saturating_sub(held_charged().saturating_sub(children));
-    if !spend(own) {
+    if !spend_work(out) {
         abandon(out);
         return;
     }
-    hold_charged(own);
+    if out.len() < base {
+        return;
+    }
     if cut {
         if let Some(cut_key) = cut_key {
-            keep_cut(cut_key, layout);
+            keep_cut(cut_key, out, base);
         }
     } else {
-        keep_layout(key, reach, layout);
+        keep_layout(key, reach, out, base);
     }
 }
 
@@ -1155,121 +1170,102 @@ fn replay(
     key: &MemoKey,
     cut_key: Option<&CutKey>,
     reach: Reach,
-    out: &mut String,
+    out: &mut Buf,
     base: usize,
-) -> Option<usize> {
-    let (len, cut) = MEMO.with_borrow(|m| {
+) -> bool {
+    let found = MEMO.with_borrow(|m| {
         let m = m.as_ref()?;
-        let whole = m.layouts.get(key).map(|l| l.text.as_str());
+        let whole = m.layouts.get(key);
         let found = if reach == Reach::FirstLine {
             whole
-                .map(first_line)
-                .or_else(|| m.first_lines.get(key).map(String::as_str))
+                .map(Frozen::first_line)
+                .or_else(|| m.first_lines.get(key).cloned())
         } else {
-            whole
+            whole.cloned()
         };
-        let (layout, cut) = found.map(|l| (l, false)).or_else(|| {
+        found.map(|l| (l, false)).or_else(|| {
             cut_key
                 .and_then(|ck| m.cuts.get(ck))
-                .map(|l| (l.as_str(), true))
-        })?;
-        out.truncate(base);
-        out.push_str(layout);
-        Some((layout.len(), cut))
-    })?;
+                .map(|l| (l.clone(), true))
+        })
+    });
+    let Some((layout, cut)) = found else {
+        return false;
+    };
+    out.truncate(base);
+    out.push_frozen(&layout);
     if cut {
         mark_cut();
     }
-    Some(len)
+    true
 }
 
-/// Keep a `layout` a width bound cut short for replay under `cut_key`: up to its
-/// first newline under a first-line bound, which reads nothing past it.
-fn keep_cut(cut_key: CutKey, layout: &str) {
+/// Keep the layout on `out` from `base`, which a width bound cut short, for
+/// replay under `cut_key`: up to its first newline under a first-line bound,
+/// which reads nothing past it.
+fn keep_cut(cut_key: CutKey, out: &mut Buf, base: usize) {
+    let layout = out.freeze(base);
     let kept = match cut_key.bound {
-        CutBound::FirstLine { .. } => first_line(layout),
+        CutBound::FirstLine { .. } => layout.first_line(),
         CutBound::Tail { .. } => layout,
     };
-    MEMO.with_borrow_mut(|m| {
-        let entry = cut_entry_bytes(kept.len());
-        if let Some(m) = m.as_mut()
-            && let Some(bytes) = m.bytes.checked_add(entry)
-            && bytes <= m.byte_ceiling
-        {
-            m.bytes = bytes;
-            m.cuts.insert(cut_key, kept.to_owned());
-        }
+    keep(cut_entry_bytes(&kept), |m| {
+        m.cuts.insert(cut_key, kept.clone());
     });
 }
 
-/// The layout bytes charged for what the open buffers hold.
-fn held_charged() -> usize {
-    MEMO.with_borrow(|m| m.as_ref().map_or(0, |m| m.charged))
-}
-
-/// Set the layout bytes charged for what the open buffers hold to `bytes`.
-fn set_held_charged(bytes: usize) {
-    MEMO.with_borrow_mut(|m| {
-        if let Some(m) = m.as_mut() {
-            m.charged = bytes;
-        }
-    });
-}
-
-/// The widest tail line of `written`, the layout just rendered under `key`: read
-/// from the memo when it kept the layout, else measured and charged.
-fn written_widest_tail(key: &MemoKey, written: &str) -> usize {
-    let kept = MEMO.with_borrow(|m| {
-        m.as_ref()
-            .and_then(|m| m.layouts.get(key).map(|l| l.widest_tail))
-    });
-    kept.unwrap_or_else(|| {
-        spend(written.len());
-        widest_tail(written)
-    })
-}
-
-/// Count `bytes` just charged as held by the open buffers.
-fn hold_charged(bytes: usize) {
-    MEMO.with_borrow_mut(|m| {
-        if let Some(m) = m.as_mut() {
-            m.charged = m.charged.saturating_add(bytes);
-        }
-    });
-}
-
-/// Keep a fresh `layout` for replay under `key`: whole, or apart as its first
-/// line when a first-line [`trial`] rendered it and it broke.
+/// Keep the fresh layout on `out` from `base` for replay under `key`: whole, or
+/// apart as its first line when a first-line [`trial`] rendered it and it broke.
 ///
 /// A probe's layout without a newline was laid out in full, so it is the whole
 /// layout every other render of the key replays.
-fn keep_layout(key: MemoKey, reach: Reach, layout: &str) {
-    let partial = reach == Reach::FirstLine && layout.contains('\n');
-    let kept = if partial { first_line(layout) } else { layout };
-    MEMO.with_borrow_mut(|m| {
-        let entry = memo_entry_bytes(kept.len());
-        if let Some(m) = m.as_mut()
-            && let Some(bytes) = m.bytes.checked_add(entry)
-            && bytes <= m.byte_ceiling
-        {
-            m.bytes = bytes;
-            if partial {
-                m.first_lines.insert(key, kept.to_owned());
-            } else {
-                m.layouts.insert(key, Layout::of(kept));
-            }
-        }
-    });
+fn keep_layout(key: MemoKey, reach: Reach, out: &mut Buf, base: usize) {
+    let layout = out.freeze(base);
+    if reach == Reach::FirstLine && !layout.shape().is_single_line() {
+        let kept = layout.first_line();
+        keep(memo_entry_bytes(&kept), |m| {
+            m.first_lines.insert(key, kept.clone());
+        });
+    } else {
+        keep(memo_entry_bytes(&layout), |m| {
+            m.layouts.insert(key, layout.clone());
+        });
+    }
 }
 
 /// Drop what an abandoned render wrote to `out`.
 ///
 /// The output of a render that ran out of fuel is discarded, so emptying the
-/// buffer loses nothing; it keeps every cursor measure the unwinding layouts
-/// still take on it constant-time, so abandoning costs no more than the frames
-/// in flight.
-fn abandon(out: &mut String) {
+/// buffer loses nothing, and abandoning costs no more than the frames in flight.
+fn abandon(out: &mut Buf) {
     out.clear();
+    out.take_work();
+}
+
+/// Spend one step for a node about to render on `out`, with the work `out` has
+/// done since it was last spent; `false` once the fuel is spent.
+fn spend_step(out: &mut Buf) -> bool {
+    let cost = out.take_work().saturating_add(1);
+    spend_held(out, cost)
+}
+
+/// Spend the work `out` has done since it was last spent; `false` once the fuel
+/// is spent.
+fn spend_work(out: &mut Buf) -> bool {
+    let cost = out.take_work();
+    spend_held(out, cost)
+}
+
+/// [`spend`] `cost`, abandoning the render once `out` holds more than the
+/// buffer ceiling; `false` once either is spent.
+fn spend_held(out: &Buf, cost: usize) -> bool {
+    let held = out.held_bytes();
+    MEMO.with_borrow_mut(|m| {
+        m.as_mut().is_none_or(|m| {
+            m.exhausted = m.exhausted || held > m.buf_ceiling;
+            true
+        })
+    }) && spend(cost)
 }
 
 /// Spend `cost` of the render's [`LAYOUT_FUEL`]; `false` once it is spent, from
@@ -1462,14 +1458,7 @@ fn flat_run<'a>(pieces: impl IntoIterator<Item = (&'a Doc, usize)>, cfg: RenderC
 }
 
 /// Render one node of any variant; [`render_at`] fronts it with the memo.
-fn render_node(
-    doc: &Doc,
-    cfg: RenderConfig,
-    indent: usize,
-    col: usize,
-    flat: bool,
-    out: &mut String,
-) {
+fn render_node(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, flat: bool, out: &mut Buf) {
     match doc {
         Doc::Text(s) => out.push_str(s),
         Doc::Line => {
@@ -1597,7 +1586,7 @@ fn render_concat<D: Borrow<Doc>>(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     // The suffix of child `i` is carried to child `i + 1` by dropping that child's
     // own width when it is text, so a run of text siblings is scanned once, not
@@ -1635,7 +1624,7 @@ fn render_or_pattern(
     cfg: RenderConfig,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     // Each ` | ` between two flat alternatives is 3 columns.
@@ -1674,7 +1663,7 @@ fn render_elidable_paren(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     if inner_renders_parenthesized(inner, cfg, eff_col(out, col), indent, out) {
         render_at(inner, cfg, indent, col, flat, out);
@@ -1705,7 +1694,7 @@ fn render_method_chain(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     // The method's own line aligns with the receiver's begin-line indent — the
     // indentation of the line the receiver starts on. When the buffer is empty the
@@ -1829,7 +1818,7 @@ fn receiver_shape(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> ReceiverShape {
     if first_line_done(out) {
         return ReceiverShape::Plain;
@@ -1837,9 +1826,9 @@ fn receiver_shape(
     trial(out, TrialReach::Whole, |out, mark| {
         render_at(receiver, cfg, indent, start_col, false, out);
         let written = mark.written(out);
-        if written.contains('\n') {
+        if !written.is_single_line() {
             ReceiverShape::Multiline
-        } else if written.contains('{') {
+        } else if written.has_brace() {
             ReceiverShape::SingleLineBrace
         } else {
             ReceiverShape::Plain
@@ -1855,14 +1844,14 @@ fn inner_renders_parenthesized(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     if let Some(measure) = flat_measure(inner, cfg) {
         return measure.starts_paren;
     }
     trial(out, TrialReach::FirstLine, |out, mark| {
         render_at(inner, cfg.no_reserve(), indent, start_col, true, out);
-        mark.line(out).starts_with('(')
+        mark.line(out).first_byte == Some(b'(')
     })
 }
 
@@ -1886,7 +1875,7 @@ fn render_type_bound(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     // FLAT: an enclosing group that chose flat forces the inline form (used by the
@@ -1953,7 +1942,7 @@ struct TypeBoundPieces<'a> {
 
 impl TypeBoundPieces<'_> {
     /// Render the inline `Ptr<Head + T1 + …>` from `start_col`.
-    fn render_flat(self, cfg: RenderConfig, indent: usize, start_col: usize, out: &mut String) {
+    fn render_flat(self, cfg: RenderConfig, indent: usize, start_col: usize, out: &mut Buf) {
         render_at(
             self.ptr_open,
             cfg.no_reserve(),
@@ -1975,7 +1964,7 @@ impl TypeBoundPieces<'_> {
 
     /// Break to a fresh line at `bound_indent` and render the bound list
     /// `Head + T1 + …` on it.
-    fn render_list_line(self, cfg: RenderConfig, bound_indent: usize, out: &mut String) {
+    fn render_list_line(self, cfg: RenderConfig, bound_indent: usize, out: &mut Buf) {
         out.push('\n');
         push_indent(bound_indent, out);
         let c = current_col(out);
@@ -1995,7 +1984,7 @@ impl TypeBoundPieces<'_> {
         cfg: RenderConfig,
         indent: usize,
         start_col: usize,
-        out: &mut String,
+        out: &mut Buf,
     ) -> usize {
         let pieces = [(self.ptr_open, 0), (self.head, 0)]
             .into_iter()
@@ -2009,14 +1998,14 @@ impl TypeBoundPieces<'_> {
         }
         trial(out, TrialReach::Whole, |out, mark| {
             self.render_flat(cfg, indent, start_col, out);
-            mark.written(out).len()
+            mark.written_len(out)
         })
     }
 
     /// The flat width of the bound list `Head + T1 + …` alone (no `Ptr<` / `>`), for
     /// the angle-break-vs-bound-break decision — measured, when some piece is not
     /// [`flat_fixed`], by a [`trial`] of the list on the line it breaks to.
-    fn list_flat_width(self, cfg: RenderConfig, bound_indent: usize, out: &mut String) -> usize {
+    fn list_flat_width(self, cfg: RenderConfig, bound_indent: usize, out: &mut Buf) -> usize {
         let pieces =
             std::iter::once((self.head, 0)).chain(self.traits.iter().map(|t| (t, BOUND_SEP.len())));
         if let FlatRun::Width(w) = flat_run(pieces, cfg) {
@@ -2028,7 +2017,7 @@ impl TypeBoundPieces<'_> {
         trial(out, TrialReach::Whole, |out, mark| {
             self.render_list_line(cfg, bound_indent, out);
             let lead = 1 + bound_indent;
-            mark.written(out).len().saturating_sub(lead)
+            mark.written_len(out).saturating_sub(lead)
         })
     }
 }
@@ -2050,7 +2039,7 @@ fn render_struct_lit(
     cfg: RenderConfig,
     indent: usize,
     col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     // The `struct_lit_width` gate applies even when the enclosing group chose flat:
@@ -2075,7 +2064,7 @@ fn render_struct_lit_flat(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> (usize, usize) {
     render_at(open, cfg.no_reserve(), indent, start_col, true, out);
     let open_end = current_col(out);
@@ -2108,7 +2097,7 @@ fn struct_lit_flat_fits(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     match list_widths(open, fields, close, cfg) {
         // `open`, ` `, the fields, ` `, `close`; the `open_end..fields_end` span
@@ -2128,7 +2117,7 @@ fn struct_lit_flat_fits(
             render_struct_lit_flat(open, fields, close, cfg, indent, start_col, out);
         let line = mark.line(out);
         // The field text is the span between the braces, excluding the hugging spaces.
-        !line.contains('\n')
+        !line.broke
             && start_col + line.len() <= cfg.margin()
             && fields_end.saturating_sub(open_end) <= STRUCT_LIT_WIDTH
     })
@@ -2144,7 +2133,7 @@ fn render_brace_body(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     // A given-up block body (`inline_hard`) reproduces the ORIGINAL single-line text,
@@ -2181,7 +2170,7 @@ fn render_brace_body_broken(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     out.push('{');
     render_at(
@@ -2238,18 +2227,18 @@ fn body_broken_forces_flat(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     if first_line_done(out) {
         return false;
     }
-    let line_start = out.rfind('\n').map_or(0, |nl| nl + 1);
-    trial(out, TrialReach::Whole, |out, _| {
+    trial(out, TrialReach::Whole, |out, mark| {
         render_at(body, cfg, indent, start_col, false, out);
-        out.get(line_start..)
-            .unwrap_or_default()
-            .split('\n')
-            .any(|line| line.len() > cfg.max_width && line_is_unbreakable_atom(line))
+        // Nothing below the mark's stable length is rewritten, so the line the
+        // body begins on is that prefix followed by what the body wrote.
+        let prefix = *out.shape_before(mark.stable).last();
+        out.shape_from(mark.stable)
+            .any_line_overflows_atom_after(&prefix, cfg.max_width)
     })
 }
 
@@ -2320,7 +2309,7 @@ fn render_if_else(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let construct_width = if_else_construct_width(node, cond, then_, else_);
 
@@ -2364,56 +2353,11 @@ fn render_if_branch(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let c = eff_col(out, col);
     render_concat(&[&Doc::HardLine, branch], cfg, indent + 4, c, flat, out);
     render_at(&Doc::HardLine, cfg, indent, col, flat, out);
-}
-
-/// Whether a rendered line, trimmed of indentation, is a single UNBREAKABLE atom:
-/// a bare string literal or an identifier/path/type with no TOP-LEVEL break point —
-/// no `(` / `[` / `{` group opener and no top-level `, ` separator outside a string
-/// or bracket. Such a line cannot be split further, so an overflowing one is where
-/// `rustfmt`'s `Shape`-width recursion gives up. A breakable line (a call `f(…)`, a
-/// list, a `let … = …`) has a top-level opener/separator and is NOT an atom — its
-/// own layout, not this block's give-up, governs it.
-fn line_is_unbreakable_atom(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut depth: i32 = 0;
-    let mut prev = ' ';
-    for c in trimmed.chars() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-            prev = c;
-            continue;
-        }
-        match c {
-            '"' => in_str = true,
-            // A group opener or a top-level separator is a break point, so the line
-            // is a breakable construct (a call / list / `let`), not a single atom. A
-            // top-level space between two non-delimiter tokens (`a b`, `x = y`) is a
-            // break point too.
-            '(' | '[' | '{' | ',' => return false,
-            ' ' if depth == 0 => return false,
-            '<' => depth += 1,
-            '>' if prev != '-' => depth -= 1,
-            _ => {}
-        }
-        prev = c;
-    }
-    true
 }
 
 /// Render a [`Doc::MatchArmTail`]: the body plus its trailing comma per `rustfmt`'s
@@ -2430,7 +2374,7 @@ fn render_match_arm_tail(
     cfg: RenderConfig,
     indent: usize,
     col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     // Inline `body,` only when the body's flat form is genuinely single-line. A
@@ -2493,7 +2437,7 @@ fn body_block_wraps(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     // See through a `Group` wrapper to the delimited construct it lays out.
     let inner = match body {
@@ -2531,8 +2475,8 @@ fn arm_block_trial<T>(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
-    measure: impl FnOnce(&mut String) -> T,
+    out: &mut Buf,
+    measure: impl FnOnce(&mut Buf) -> T,
 ) -> T {
     trial(out, TrialReach::Whole, |out, _| {
         open_arm_block(cfg, indent, start_col, out);
@@ -2543,8 +2487,8 @@ fn arm_block_trial<T>(
 /// The shape of one whole layout of a match-arm body, as `rustfmt` weighs it.
 #[derive(Clone, Copy)]
 struct BodyShape {
-    /// The newlines the layout writes.
-    newlines: usize,
+    /// The newlines the layout writes, saturating.
+    newlines: u32,
     /// The last character of its first line.
     first_end: Option<char>,
     /// The width of its first line.
@@ -2553,12 +2497,11 @@ struct BodyShape {
 
 impl BodyShape {
     /// The shape of `written`, a layout that begins at its cursor.
-    fn of(written: &str) -> Self {
-        let first = written.split('\n').next().unwrap_or_default();
+    fn of(written: &Shape) -> Self {
         Self {
-            newlines: written.bytes().filter(|&b| b == b'\n').count(),
-            first_end: first.trim_end().chars().next_back(),
-            first_width: first.len(),
+            newlines: written.newlines(),
+            first_end: written.first().last_char(),
+            first_width: written.first().width(),
         }
     }
 }
@@ -2579,18 +2522,18 @@ fn arm_prefers_next_line(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     let orig = trial(out, TrialReach::Whole, |out, mark| {
         render_at(body, cfg, indent, start_col, false, out);
-        BodyShape::of(mark.written(out))
+        BodyShape::of(&mark.written(out))
     });
     let next = trial(out, TrialReach::Whole, |out, _| {
         open_arm_block(cfg, indent, start_col, out);
         with_stop(out, TrialReach::Whole, |out, mark| {
             let c = current_col(out);
             render_at(body, cfg, indent + 4, c, false, out);
-            BodyShape::of(mark.written(out))
+            BodyShape::of(&mark.written(out))
         })
     });
     let opener_lost = orig
@@ -2603,7 +2546,7 @@ fn arm_prefers_next_line(
 }
 
 /// Open a brace-wrapped match-arm body: `{`, then a fresh line one indent step in.
-fn open_arm_block(cfg: RenderConfig, indent: usize, start_col: usize, out: &mut String) {
+fn open_arm_block(cfg: RenderConfig, indent: usize, start_col: usize, out: &mut Buf) {
     out.push('{');
     render_at(
         &Doc::Nest(4, Box::new(Doc::HardLine)),
@@ -2623,14 +2566,14 @@ fn assign_rhs_fits_same_line(
     cfg: RenderConfig,
     indent: usize,
     glue_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     flat_measure(rhs, cfg).map_or_else(
         || {
             trial(out, TrialReach::FirstLine, |out, mark| {
                 render_at(rhs, cfg, indent, glue_col, true, out);
                 let line = mark.line(out);
-                !line.contains('\n')
+                !line.broke
                     && glue_col.saturating_add(line.len()).saturating_add(trailer) <= cfg.max_width
             })
         },
@@ -2658,7 +2601,7 @@ fn render_assign(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
     if flat {
@@ -2734,11 +2677,8 @@ fn render_assign(
     };
     let glue_head_core_w = trial(out, glue_reach, |out, mark| {
         render_at(rhs, cfg, indent, glue_col, false, out);
-        let head = mark.line(out);
-        head.strip_suffix('\n')
-            .unwrap_or(head)
-            .trim_end_matches(['(', '{', '['])
-            .len()
+        let head = mark.line(out).frag;
+        head.width().saturating_sub(head.trailing_openers())
     });
     let glue_viable = glue_col + glue_head_core_w + trailer <= cfg.max_width;
 
@@ -2751,11 +2691,10 @@ fn render_assign(
     // viable glue reads the tail lines, so only then is the whole RHS laid out —
     // by an [`attempt`] that keeps it, its tail width read from the memo.
     let rhs_indent = indent + CHAIN_BREAK_INDENT;
-    let head_fits = |body: &str| {
-        let head_w = body.split('\n').next().unwrap_or_default().len();
-        let head_trailer = if body.contains('\n') { 0 } else { trailer };
+    let head_fits = |body: &Shape| {
+        let head_trailer = if body.is_single_line() { trailer } else { 0 };
         rhs_indent
-            .saturating_add(head_w)
+            .saturating_add(body.first().width())
             .saturating_add(head_trailer)
             <= cfg.max_width
     };
@@ -2776,7 +2715,7 @@ fn render_assign(
             let mark = Mark::at(out);
             render_at(rhs, cfg, rhs_indent, rhs_indent, false, out);
             let body = mark.written(out);
-            head_fits(body) && written_widest_tail(&key, body) <= cfg.max_width
+            head_fits(&body) && body.widest_tail() <= cfg.max_width
         });
         match tried {
             Attempt::Kept => return,
@@ -2790,7 +2729,7 @@ fn render_assign(
             };
             with_stop(out, reach, |out, mark| {
                 render_at(rhs, cfg, rhs_indent, rhs_indent, false, out);
-                head_fits(mark.written(out))
+                head_fits(&mark.written(out))
             })
         })
     };
@@ -2811,35 +2750,29 @@ fn render_assign(
 ///
 /// It fits when `head_fits` its body and no tail line is wider than `width`. Only
 /// for an [`attempt`] that cannot keep its bytes, which reads the verdict alone:
-/// the replay it stands for would write the kept layout and measure it, so this
-/// measures the kept layout in place, charged for its first line.
+/// the replay it stands for would append the kept layout and measure it, so this
+/// measures the kept layout in place, charged as that replay.
 fn kept_rhs_break_fits(
     key: &MemoKey,
     width: usize,
-    head_fits: impl Fn(&str) -> bool,
+    head_fits: impl Fn(&Shape) -> bool,
 ) -> Option<bool> {
-    let (fits, head_len) = MEMO.with_borrow(|m| {
+    let (fits, pieces) = MEMO.with_borrow(|m| {
         let m = m.as_ref()?;
         let layout = m.layouts.get(key)?;
-        let text = layout.text.as_str();
-        let indent = key.cursor.trailing_spaces;
-        let intact = text
-            .get(..indent)
-            .is_some_and(|run| run.bytes().all(|b| b == b' '));
-        let body = if intact {
-            text.get(indent..).unwrap_or_default()
-        } else {
-            text.trim_start_matches(' ')
-        };
-        let fits = head_fits(body) && layout.widest_tail <= width;
-        Some((fits, first_line(text).len()))
+        // The body begins past the cursor's trailing spaces when the layout still
+        // carries them all, else past the spaces it carries.
+        let lead = layout.shape().first().leading_spaces();
+        let body = layout.shape_after(key.cursor.trailing_spaces.min(lead));
+        let fits = head_fits(&body) && body.widest_tail() <= width;
+        Some((fits, layout.pieces()))
     })?;
-    spend(head_len);
+    spend(pieces.saturating_add(1));
     Some(fits)
 }
 
 /// Break an assignment after its `= `, onto a fresh line at `rhs_indent`.
-fn open_rhs_break(rhs_indent: usize, out: &mut String) {
+fn open_rhs_break(rhs_indent: usize, out: &mut Buf) {
     // `rustfmt` leaves no trailing space on the `= ` line, so trim it before the
     // newline (the prefix carries the flat-case space after `=`).
     trim_trailing_spaces(out);
@@ -2876,14 +2809,14 @@ fn flat_width(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> usize {
     if let Some(measure) = flat_measure(doc, cfg) {
         return measure.first_len;
     }
     trial(out, TrialReach::FirstLine, |out, mark| {
         render_at(doc, cfg, indent, start_col, true, out);
-        mark.line(out).trim_end_matches('\n').len()
+        mark.line(out).width()
     })
 }
 
@@ -2959,23 +2892,26 @@ fn hard_break_uncached(doc: &Doc) -> bool {
 /// Whether a render that started with `out` at `before` bytes wrote a newline.
 /// `before` is the trim point: a break trims only the trailing spaces before it,
 /// so nothing below it changes.
-fn wrote_newline(out: &str, before: usize) -> bool {
-    out.get(before..).is_some_and(|s| s.contains('\n'))
+fn wrote_newline(out: &Buf, before: usize) -> bool {
+    out.shape_from(before).newlines() > 0
 }
 
 /// Push `n` spaces of indentation.
-fn push_indent(n: usize, out: &mut String) {
-    for _ in 0..n {
-        out.push(' ');
-    }
+fn push_indent(n: usize, out: &mut Buf) {
+    out.push_spaces(n);
 }
 
 /// Drop trailing spaces from the end of `out`. Used before a break so a line
 /// never ends in whitespace (`rustfmt` trims the space after `=` when the RHS
 /// moves to the next line).
-fn trim_trailing_spaces(out: &mut String) {
-    let trimmed = out.trim_end_matches(' ').len();
-    out.truncate(trimmed);
+fn trim_trailing_spaces(out: &mut Buf) {
+    out.truncate(stable_len(out));
+}
+
+/// The length of `out` without its run of trailing spaces, which a break trims.
+fn stable_len(out: &Buf) -> usize {
+    out.len()
+        .saturating_sub(out.total().last().trailing_spaces())
 }
 
 /// Whether `doc` rendered flat from column `start_col` is genuinely single-line
@@ -2996,7 +2932,7 @@ fn fits_single_line(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     if let Some(measure) = flat_measure(doc, cfg) {
         return measure
@@ -3006,7 +2942,7 @@ fn fits_single_line(
     trial(out, TrialReach::FirstLine, |out, mark| {
         render_at(doc, cfg, indent, start_col, true, out);
         let line = mark.line(out);
-        !line.contains('\n') && start_col + line.len() <= cfg.margin()
+        !line.broke && start_col + line.len() <= cfg.margin()
     })
 }
 
@@ -3020,7 +2956,7 @@ fn chain_flat_fits_single_line(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     let run = flat_run(
         operands.iter().enumerate().map(|(i, o)| {
@@ -3041,7 +2977,7 @@ fn chain_flat_fits_single_line(
     trial(out, TrialReach::FirstLine, |out, mark| {
         render_chain_flat(operands, cfg, indent, out);
         let line = mark.line(out);
-        !line.contains('\n') && start_col + line.len() <= cfg.margin()
+        !line.broke && start_col + line.len() <= cfg.margin()
     })
 }
 
@@ -3057,7 +2993,7 @@ fn render_chain(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     // Whole-chain-flat fast path: if the entire flattened chain fits on the
     // current line AND no operand carries a hard break (a statement-block always
@@ -3113,7 +3049,7 @@ fn render_chain(
     for (i, operand) in operands.iter().enumerate() {
         if i == 0 {
             let c = eff_col(out, col);
-            let before = out.trim_end_matches(' ').len();
+            let before = stable_len(out);
             render_at(&operand.doc, cfg, indent, c, false, out);
             prev_multiline = wrote_newline(out, before);
             flat_prefix = !prev_multiline;
@@ -3140,7 +3076,7 @@ fn render_chain(
                 prev_multiline && glue_fits(&operand.doc, cfg, cur, indent, op, out).0
             };
             if can_glue {
-                let before = out.trim_end_matches(' ').len();
+                let before = stable_len(out);
                 glue_operand(&operand.doc, cfg, indent, op, out);
                 prev_multiline = wrote_newline(out, before);
                 if prev_multiline {
@@ -3176,7 +3112,7 @@ fn render_call_args(
     indent: usize,
     col: usize,
     flat: bool,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     let start_col = eff_col(out, col);
 
@@ -3215,7 +3151,7 @@ fn render_call_args_broken(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     // MULTILINE-OPEN GLUE: the `open` itself renders multi-line — a `(func)(args)`
     // whose `func` is a `({ … })` block that breaks — but the flat argument list
@@ -3227,7 +3163,7 @@ fn render_call_args_broken(
         // column, and the flat argument run's fit on that line.
         let glued = trial(out, TrialReach::Whole, |out, mark| {
             render_at(open, cfg.no_reserve(), indent, start_col, false, out);
-            if !mark.written(out).contains('\n') {
+            if mark.written(out).is_single_line() {
                 return false;
             }
             let open_last = current_col(out);
@@ -3237,7 +3173,7 @@ fn render_call_args_broken(
                 FlatRun::Unmeasured => trial(out, TrialReach::FirstLine, |out, mark| {
                     render_glued_args(elems, close, cfg, indent, out);
                     let line = mark.line(out);
-                    !line.contains('\n') && open_last + line.len() <= cfg.margin()
+                    !line.broke && open_last + line.len() <= cfg.margin()
                 }),
             }
         });
@@ -3291,13 +3227,7 @@ fn render_call_args_broken(
 }
 
 /// Glue the flat argument list and `close` onto the current line.
-fn render_glued_args(
-    elems: &[Doc],
-    close: &Doc,
-    cfg: RenderConfig,
-    indent: usize,
-    out: &mut String,
-) {
+fn render_glued_args(elems: &[Doc], close: &Doc, cfg: RenderConfig, indent: usize, out: &mut Buf) {
     render_flat_elems(elems, cfg, indent, out);
     let c = current_col(out);
     render_at(close, cfg, indent, c, true, out);
@@ -3322,7 +3252,7 @@ fn render_one_per_line(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     render_at(open, cfg.no_reserve(), indent, start_col, false, out);
     let inner_indent = indent + CHAIN_BREAK_INDENT;
@@ -3357,7 +3287,7 @@ fn render_call_args_flat(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> (usize, usize) {
     render_at(open, cfg, indent, start_col, true, out);
     let open_end = current_col(out);
@@ -3387,7 +3317,7 @@ fn call_args_flat_fits(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> bool {
     // The full flat line, for the single-line + `max_width` checks: read off the
     // pieces' measures, or laid out by a first-line [`trial`] of the flat commit
@@ -3405,7 +3335,7 @@ fn call_args_flat_fits(
                 let (open_end, elems_end) =
                     render_call_args_flat(open, elems, close, cfg, indent, start_col, out);
                 let line = mark.line(out);
-                (!line.contains('\n')).then(|| {
+                (!line.broke).then(|| {
                     (
                         open_end.saturating_sub(start_col),
                         elems_end.saturating_sub(start_col),
@@ -3512,7 +3442,7 @@ fn list_widths(open: &Doc, elems: &[Doc], close: &Doc, cfg: RenderConfig) -> Lis
 
 /// Render the elements flat, separated by [`ELEM_SEP`] — the shared flat body of a
 /// [`Doc::CallArgs`] (no trailing comma, matching the string emitter's join).
-fn render_flat_elems(elems: &[Doc], cfg: RenderConfig, indent: usize, out: &mut String) {
+fn render_flat_elems(elems: &[Doc], cfg: RenderConfig, indent: usize, out: &mut Buf) {
     for (i, e) in elems.iter().enumerate() {
         if i > 0 {
             out.push_str(ELEM_SEP);
@@ -3562,7 +3492,7 @@ fn last_arg_combines(
     cfg: RenderConfig,
     start_col: usize,
     indent: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> Option<usize> {
     // A SINGLE-argument call glues its argument's head freely (the combine chain
     // "may nest further, as long as all but the innermost construct have only a
@@ -3584,7 +3514,7 @@ fn last_arg_combines(
         // The first-line head (`open a, b, `), to find where `last` lands. A
         // multiline head cannot sit on the first line.
         let open_end = render_combine_head(open, prefix, cfg, indent, start_col, out);
-        if mark.written(out).contains('\n') {
+        if !mark.written(out).is_single_line() {
             return None;
         }
         let last_col = current_col(out);
@@ -3614,7 +3544,7 @@ fn last_arg_combines(
                     trial(out, TrialReach::FirstLine, |out, mark| {
                         render_at(last, cfg, indent, last_col, true, out);
                         let line = mark.line(out);
-                        (!line.contains('\n')).then_some(line.len())
+                        (!line.broke).then_some(line.len())
                     })
                 },
                 FlatMeasure::width,
@@ -3642,7 +3572,7 @@ fn last_arg_combines(
         // `tail_budget`; its first line is the combined head's tail.
         let tail_len = trial(out, TrialReach::FirstLine, |out, mark| {
             render_forced_break(last, base, tail_budget, cfg, indent, last_col, out);
-            mark.line(out).trim_end_matches('\n').len()
+            mark.line(out).width()
         });
         let first_line_end = last_col + tail_len;
         if first_line_end > cfg.max_width {
@@ -3667,7 +3597,7 @@ fn render_combine_head(
     cfg: RenderConfig,
     indent: usize,
     start_col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) -> usize {
     render_at(open, cfg, indent, start_col, false, out);
     let open_end = current_col(out);
@@ -3692,7 +3622,7 @@ fn render_forced_break(
     cfg: RenderConfig,
     indent: usize,
     col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     // The combine probe force-breaks the last argument to measure it, then the
     // committed layout force-breaks it again: memoized, the second is a replay.
@@ -3713,7 +3643,7 @@ fn render_forced_break_node(
     cfg: RenderConfig,
     indent: usize,
     col: usize,
-    out: &mut String,
+    out: &mut Buf,
 ) {
     match doc {
         Doc::CallArgs {
@@ -3827,7 +3757,7 @@ fn render_forced_break_node(
 /// body, a bare `|…| ` closure carries a `BraceBody`). Any other doc (a statement
 /// block already carrying `HardLine`s) falls back to the standard non-flat render,
 /// which breaks it anyway.
-fn render_group_broken(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, out: &mut String) {
+fn render_group_broken(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, out: &mut Buf) {
     match doc {
         Doc::Group(inner) => {
             let start_col = eff_col(out, col);
@@ -3867,7 +3797,7 @@ static EMPTY_LEAF: Doc = Doc::Text(std::borrow::Cow::Borrowed(""));
 /// The flat-rendered length of a delimiter/head leaf (`f(`, `Box::new((`), used to
 /// shrink the recursive combining budget one nesting step.
 fn flat_leaf_len(doc: &Doc) -> usize {
-    let mut s = String::new();
+    let mut s = Buf::new();
     let cfg = RenderConfig::default();
     with_stop(&mut s, TrialReach::Whole, |s, _| {
         render_at(doc, cfg, 0, 0, true, s);
@@ -4021,7 +3951,7 @@ fn glue_fits(
     col: usize,
     indent: usize,
     op: &str,
-    out: &mut String,
+    out: &mut Buf,
 ) -> (bool, bool) {
     // Column after " op " is appended.
     let after_op = col + 1 + op.len() + 1;
@@ -4031,11 +3961,8 @@ fn glue_fits(
     trial(out, TrialReach::FirstLine, |out, mark| {
         glue_operand(operand, cfg, indent, op, out);
         let first = mark.line(out);
-        let single_line = !first.contains('\n');
-        let operand_w = first
-            .trim_end_matches('\n')
-            .len()
-            .saturating_sub(1 + op.len() + 1);
+        let single_line = !first.broke;
+        let operand_w = first.width().saturating_sub(1 + op.len() + 1);
         // The trailing-delimiter `reserve` bites only when the operand renders
         // single-line here — then this glued line IS the chain's last line and the
         // enclosing `,` sits at its end. A multiline operand ends on a later line,
@@ -4050,7 +3977,7 @@ fn glue_fits(
 }
 
 /// Glue ` op operand` onto the current line.
-fn glue_operand(operand: &Doc, cfg: RenderConfig, indent: usize, op: &str, out: &mut String) {
+fn glue_operand(operand: &Doc, cfg: RenderConfig, indent: usize, op: &str, out: &mut Buf) {
     out.push(' ');
     out.push_str(op);
     out.push(' ');
@@ -4061,26 +3988,14 @@ fn glue_operand(operand: &Doc, cfg: RenderConfig, indent: usize, op: &str, out: 
 /// The indentation (leading-space count) of the line currently being written in
 /// `out`, or `None` if the current line has non-space content already (the chain
 /// starts mid-line, e.g. after `let z = `).
-fn current_line_indent(out: &str) -> Option<usize> {
-    let line_start = out.rfind('\n').map_or(0, |nl| nl + 1);
-    let line = out.get(line_start..).unwrap_or_default();
-    if line.chars().all(|c| c == ' ') {
-        Some(line.len())
-    } else {
-        // Mid-line start: the break indent is keyed off the enclosing block, not
-        // this column. Signal by returning None so the caller falls back to the
-        // block indent.
-        None
-    }
+fn current_line_indent(out: &Buf) -> Option<usize> {
+    // Mid-line start: the break indent is keyed off the enclosing block, not this
+    // column, so `None` tells the caller to fall back to the block indent.
+    out.total().current_line_indent()
 }
 
 /// Render every operand of a chain flat (inline), operators separated by spaces.
-fn render_chain_flat(
-    operands: &[ChainOperand],
-    cfg: RenderConfig,
-    indent: usize,
-    out: &mut String,
-) {
+fn render_chain_flat(operands: &[ChainOperand], cfg: RenderConfig, indent: usize, out: &mut Buf) {
     for (i, operand) in operands.iter().enumerate() {
         if i > 0 {
             out.push(' ');
@@ -4115,7 +4030,8 @@ mod p0_tests {
     /// Render a chain doc placed after `prefix` at block `indent`, returning the
     /// whole line(s) so the mid-line start column matches rustfmt's.
     fn render_line(prefix: &str, indent: usize, operands: &[ChainOperand]) -> String {
-        let mut out = String::from(prefix);
+        let mut out = Buf::new();
+        out.push_str(prefix);
         let col = current_col(&out);
         render_chain(
             operands,
@@ -4125,7 +4041,7 @@ mod p0_tests {
             false,
             &mut out,
         );
-        out
+        out.into_string()
     }
 
     #[test]
@@ -4311,15 +4227,17 @@ mod p0_tests {
             Doc::text("tail_operand_x)"),
         ]));
         // The over-wide first operand forces the group broken.
-        let mut out = String::from("    let z = ");
+        let mut buf = Buf::new();
+        buf.push_str("    let z = ");
         render_at(
             &group,
             RenderConfig::default(),
             4,
-            current_col(&out),
+            current_col(&buf),
             false,
-            &mut out,
+            &mut buf,
         );
+        let out = buf.into_string();
         // A Group breaks ALL its Lines: the first `+` cannot glue onto the same
         // line as a following operand the way the Chain node does. So this Group
         // rendering differs from the required `hyp` layout — demonstrating the
@@ -4776,7 +4694,7 @@ mod p0_tests {
     /// accounted for. Returns the whole statement line(s), matching the column
     /// `rustfmt` captured its golden from.
     fn render_assign_stmt(indent: usize, prefix: &'static str, rhs: Doc) -> String {
-        let mut out = String::new();
+        let mut out = Buf::new();
         push_indent(indent, &mut out);
         let doc = Doc::assign(Doc::text(prefix), rhs, 1);
         render_at(
@@ -4788,7 +4706,7 @@ mod p0_tests {
             &mut out,
         );
         out.push(';');
-        out
+        out.into_string()
     }
 
     #[test]
@@ -5082,8 +5000,9 @@ mod p0_tests {
 
     /// One nesting step of each construct whose layout probes its subtree: the
     /// fit test, paren elision, if/else width, last-argument combine, the assign
-    /// right-hand side, and all of them stacked.
-    const NESTS: [(&str, Nest); 6] = [
+    /// right-hand side, all of them stacked, and the continuation chains a `Task`
+    /// sequence lowers to, bare and through a statement block.
+    const NESTS: [(&str, Nest); 8] = [
         ("group", |d| {
             Doc::group(Doc::concat(vec![Doc::text("g("), d, Doc::text(")")]))
         }),
@@ -5102,7 +5021,43 @@ mod p0_tests {
             let call = Doc::call_args(Doc::text("f("), vec![arg], Doc::text(")"), true);
             Doc::group(Doc::if_else(Doc::text("c"), call, Doc::text("y")))
         }),
+        ("task", task_step),
+        ("task_let", task_let_step),
     ];
+
+    /// One `task_and_then(first, Box::new(move |_| rest))` continuation around `d`.
+    fn task_step(d: Doc) -> Doc {
+        let cont = Doc::concat(vec![
+            Doc::text("Box::new(move |_| "),
+            Doc::brace_body(d),
+            Doc::text(")"),
+        ]);
+        Doc::call_args(
+            Doc::text("task_and_then("),
+            vec![Doc::text("ipe_std_log_info(String::from(\"step\"))"), cont],
+            Doc::text(")"),
+            true,
+        )
+    }
+
+    /// A [`task_step`] whose rest is a statement block ending in `d`.
+    fn task_let_step(d: Doc) -> Doc {
+        let body = Doc::concat(vec![
+            Doc::text("{"),
+            Doc::nest(
+                4,
+                Doc::concat(vec![
+                    Doc::HardLine,
+                    Doc::text("let v = 1;"),
+                    Doc::HardLine,
+                    d,
+                ]),
+            ),
+            Doc::HardLine,
+            Doc::text("}"),
+        ]);
+        task_step(body)
+    }
 
     fn nest(step: Nest, depth: usize) -> Doc {
         (0..depth).fold(Doc::text("x"), |d, _| step(d))
@@ -5118,29 +5073,10 @@ mod p0_tests {
     fn layout_work_within(doc: &Doc, fuel: usize) -> (usize, bool) {
         RENDERED.with(|n| n.set(0));
         let _scope = MemoScope::install(doc, fuel);
-        render_at(
-            doc,
-            RenderConfig::default(),
-            0,
-            0,
-            false,
-            &mut String::new(),
-        );
+        render_root(doc, RenderConfig::default(), 0, 0);
         MEMO.with_borrow(|m| {
             if let Some(m) = m.as_ref() {
-                let charged: usize = m
-                    .layouts
-                    .values()
-                    .map(|l| l.text.len())
-                    .chain(m.flat_layouts.values().map(String::len))
-                    .chain(m.first_lines.values().map(String::len))
-                    .chain(
-                        m.cuts
-                            .values()
-                            .map(|c| c.len().saturating_add(size_of::<CutBound>())),
-                    )
-                    .map(memo_entry_bytes)
-                    .sum();
+                let charged = memo_charged(m);
                 assert_eq!(m.bytes, charged, "memo bytes must charge every entry");
                 assert!(m.bytes <= MEMO_BYTE_CEILING, "memo past its ceiling");
             }
@@ -5166,16 +5102,10 @@ mod p0_tests {
     /// doubling a nest's depth at most doubles its layout work: no probing
     /// construct re-renders its subtree per enclosing level.
     ///
-    /// The last-argument combine and the assign right-hand side lay each level out
-    /// at the absolute column its enclosing levels set, so their bound is the one
-    /// [`column_dependent_nest_work_stays_quadratic`] pins.
     #[test]
     fn nest_layout_work_grows_linearly() {
         on_main_thread_stack(|| {
-            let linear = NESTS
-                .into_iter()
-                .filter(|(name, _)| !matches!(*name, "call" | "assign"));
-            for (name, step) in linear {
+            for (name, step) in NESTS {
                 let (work, exhausted) = layout_work(&nest(step, 64));
                 let (doubled, doubled_exhausted) = layout_work(&nest(step, 128));
                 assert!(
@@ -5193,62 +5123,117 @@ mod p0_tests {
     /// The constant layouts a nest may add per doubling beyond twice its work.
     const LINEAR_SLACK: usize = 64;
 
-    /// A nest laid out at the absolute columns its levels land on does work per
-    /// level bounded by the width, never by the subtree below it.
+    /// The refusal: layout work is linear in the output at every nesting depth.
     ///
-    /// The last-argument combine and the assign right-hand side probe each level
-    /// at a column its enclosing levels set, and a probe that proves a layout is
-    /// its commit, so no level re-renders or replays its subtree: doubling the
-    /// depth at most quadruples the layout work and the fuel, and the output —
-    /// whose indentation grows with the depth — stays within a quadratic cap.
+    /// Each node spends a bounded number of steps beyond the bytes it writes — a
+    /// replayed layout is one piece whatever its length, and every measure a
+    /// decision reads is kept as the buffer grows — and a byte of the output is
+    /// written at most once by the probes and once for real, so a nest spends at
+    /// most a constant per node plus twice its output. Doubling the depth at most
+    /// doubles the work beyond twice the output, so work that grows faster than
+    /// the nodes and the output together is refused. The depths start past the
+    /// width, where every nest has begun to break.
     #[test]
-    fn column_dependent_nest_work_stays_quadratic() {
+    fn layout_work_is_linear_in_output() {
         on_main_thread_stack(|| {
-            for (name, step) in NESTS
-                .into_iter()
-                .filter(|(name, _)| matches!(*name, "call" | "assign"))
-            {
-                let runs = [32_usize, 64, 128].map(|depth| {
+            for (name, step) in NESTS {
+                let runs = [64_usize, 128, 256].map(|depth| {
                     let doc = nest(step, depth);
-                    RENDERED.with(|n| n.set(0));
                     let stats = render_stats(&doc, LAYOUT_FUEL, MEMO_BYTE_CEILING);
-                    let work = RENDERED.with(std::cell::Cell::get);
-                    (depth, work, stats, doc.normalized_leaves().len())
+                    (depth, node_count(&doc), stats)
                 });
                 let report = runs
                     .iter()
-                    .map(|(depth, work, stats, _)| {
+                    .map(|(depth, nodes, stats)| {
                         format!(
-                            "depth {depth}: {work} layouts, {} fuel, {} bytes",
+                            "depth {depth}: {nodes} nodes, {} fuel, {} bytes",
                             stats.spent,
                             stats.out.len()
                         )
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
-                for (depth, _, stats, leaves) in &runs {
+                for (depth, nodes, stats) in &runs {
                     assert!(!stats.exhausted, "{name}: ran out of fuel: {report}");
                     assert!(
-                        stats.spent <= LAYOUT_FUEL >> 3,
-                        "{name}: depth {depth} spent past an eighth of the fuel: {report}"
-                    );
-                    assert!(
-                        stats.out.len() <= 8 * depth * depth + leaves,
-                        "{name}: depth {depth} wrote past its quadratic cap: {report}"
+                        stats.spent <= WORK_PER_NODE * nodes + 2 * stats.out.len(),
+                        "{name}: depth {depth} spent past its linear bound: {report}"
                     );
                 }
                 for pair in runs.windows(2) {
-                    let [(_, work, small, _), (depth, doubled, big, _)] = pair else {
+                    let [(_, _, small), (depth, _, big)] = pair else {
                         continue;
                     };
                     assert!(
-                        *doubled <= 4 * work + LINEAR_SLACK,
-                        "{name}: depth {depth} more than quadrupled the layouts: {report}"
+                        big.spent <= 2 * small.spent + 2 * big.out.len() + LINEAR_SLACK,
+                        "{name}: depth {depth} more than doubled the layout work: {report}"
                     );
-                    assert!(
-                        big.spent <= 4 * small.spent + LINEAR_SLACK,
-                        "{name}: depth {depth} more than quadrupled the fuel: {report}"
-                    );
+                }
+            }
+        });
+    }
+
+    /// The steps one node may spend beyond the bytes it writes.
+    ///
+    /// A node is laid out once per context it is reached in, and a context reads
+    /// the column and indent only up to the width, so the contexts per node — and
+    /// with them its work — are bounded by the width, never by the depth: an
+    /// assignment nest, whose levels each probe the right-hand side glued and
+    /// broken, reaches the most.
+    const WORK_PER_NODE: usize = 8192;
+
+    /// The measure-reading engine writes, byte for byte, what the text-reading
+    /// one it replaces writes: over every nest at every depth up to twelve, and
+    /// every stack of up to three nesting steps around each leaf, at narrow,
+    /// middling and default widths and from a fresh, an indented and a mid-line
+    /// cursor.
+    #[test]
+    fn shape_engine_matches_reference() {
+        on_main_thread_stack(|| {
+            const LEAVES: [&str; 4] = [
+                "x",
+                "a_long_identifier_that_takes_up_room_on_its_line",
+                "\"a string literal with spaces in it\"",
+                "Vec<Option<HashMap<K, V>>>",
+            ];
+            let mut docs: Vec<(String, Doc)> = Vec::new();
+            for (name, step) in NESTS {
+                for depth in 1..=12 {
+                    docs.push((format!("{name} {depth}"), nest(step, depth)));
+                }
+            }
+            docs.push(("else_if".into(), else_if_chain(12)));
+            for leaf in LEAVES {
+                for (a, first) in NESTS {
+                    docs.push((format!("{a} {leaf}"), first(Doc::text(leaf))));
+                    for (b, second) in NESTS {
+                        docs.push((format!("{a}/{b} {leaf}"), second(first(Doc::text(leaf)))));
+                        for (c, third) in NESTS {
+                            docs.push((
+                                format!("{a}/{b}/{c} {leaf}"),
+                                third(second(first(Doc::text(leaf)))),
+                            ));
+                        }
+                    }
+                }
+            }
+            for (name, doc) in &docs {
+                for max_width in [24, 60, 100] {
+                    let cfg = RenderConfig {
+                        max_width,
+                        ..RenderConfig::default()
+                    };
+                    for (indent, col) in [(0, 0), (4, 4), (8, 30)] {
+                        let (want, spend) = reference::render_seeded_spend(doc, cfg, indent, col);
+                        if spend.exhausted {
+                            continue;
+                        }
+                        assert_eq!(
+                            render_seeded(doc, cfg, indent, col),
+                            want,
+                            "{name} at width {max_width}, indent {indent}, column {col}"
+                        );
+                    }
                 }
             }
         });
@@ -5321,23 +5306,10 @@ mod p0_tests {
     /// every entry it keeps and never passes its ceiling.
     fn render_stats(doc: &Doc, fuel: usize, byte_ceiling: usize) -> Stats {
         let _scope = MemoScope::install_capped(doc, fuel, byte_ceiling);
-        let mut out = String::new();
-        render_at(doc, RenderConfig::default(), 0, 0, false, &mut out);
+        let out = render_root(doc, RenderConfig::default(), 0, 0).into_string();
         let memo = MEMO.with_borrow(|m| {
             m.as_ref().map(|m| {
-                let charged: usize = m
-                    .layouts
-                    .values()
-                    .map(|l| l.text.len())
-                    .chain(m.flat_layouts.values().map(String::len))
-                    .chain(m.first_lines.values().map(String::len))
-                    .chain(
-                        m.cuts
-                            .values()
-                            .map(|c| c.len().saturating_add(size_of::<CutBound>())),
-                    )
-                    .map(memo_entry_bytes)
-                    .sum();
+                let charged = memo_charged(m);
                 assert_eq!(m.bytes, charged, "memo bytes must charge every entry");
                 assert!(m.bytes <= byte_ceiling, "memo past its ceiling");
                 (
@@ -5358,6 +5330,17 @@ mod p0_tests {
         }
     }
 
+    /// The bytes the memo's entries occupy, each charged as the memo charges it.
+    fn memo_charged(m: &Memo) -> usize {
+        m.layouts
+            .values()
+            .chain(m.flat_layouts.values())
+            .chain(m.first_lines.values())
+            .map(memo_entry_bytes)
+            .chain(m.cuts.values().map(cut_entry_bytes))
+            .sum()
+    }
+
     /// The composite nodes of `doc`, each keyed by the memo.
     fn node_count(doc: &Doc) -> usize {
         let mut nodes = HashSet::new();
@@ -5374,7 +5357,7 @@ mod p0_tests {
     /// the memo to its ceiling exactly and no further, and the output is unchanged.
     #[test]
     fn empty_layouts_fill_the_memo_only_to_its_ceiling() {
-        let entry = memo_entry_bytes(0);
+        let entry = memo_entry_bytes(&Buf::new().freeze(0));
         assert!(entry > 0, "an empty layout must occupy memo bytes");
         let doc = empty_groups(64);
         let uncapped = render_stats(&doc, LAYOUT_FUEL, MEMO_BYTE_CEILING);
@@ -5530,6 +5513,36 @@ mod p0_tests {
         assert!(!is_block_like(&block));
         assert!(!is_glue_shape(&call));
         assert!(!has_hard_break(&hard));
+    }
+
+    /// The refusal: a render whose buffer holds more than its ceiling is
+    /// abandoned like one out of fuel, keeping nothing, while the same document
+    /// under the production ceiling lays out in full.
+    #[test]
+    fn buffer_past_its_ceiling_is_abandoned() {
+        let wide = || {
+            let items = (0..64).map(|i| Doc::owned(format!("item_{i}"))).collect();
+            Doc::call_args(Doc::text("vec!["), items, Doc::text("]"), true)
+        };
+        let doc = wide();
+        let _scope = MemoScope::install(&doc, LAYOUT_FUEL);
+        let out = render_root(&doc, RenderConfig::default(), 0, 0);
+        assert!(!fuel_exhausted(), "the production ceiling admits it");
+        let held = out.held_bytes();
+        assert!(held > 0 && held <= BUF_BYTE_CEILING);
+        let doc = wide();
+        let _scope = MemoScope::install(&doc, LAYOUT_FUEL);
+        MEMO.with_borrow_mut(|m| {
+            if let Some(m) = m.as_mut() {
+                m.buf_ceiling = held / 2;
+            }
+        });
+        let out = render_root(&doc, RenderConfig::default(), 0, 0);
+        assert!(
+            fuel_exhausted(),
+            "a buffer past its ceiling must abandon the render"
+        );
+        assert!(out.is_empty(), "an abandoned render keeps nothing");
     }
 
     /// Whitespace-free bytes of `s`: the token stream, spacing aside.

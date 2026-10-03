@@ -314,27 +314,22 @@ pub(crate) fn sanitise_identifier(name: &str) -> String {
 /// `remove_dir_all` in [`materialise`]. A name carrying a path separator, a `..`
 /// component, or an absolute prefix would resolve OUTSIDE `dist_dir` — turning a
 /// pack into an arbitrary-path write and delete. This is the fail-closed
-/// boundary: a `root_name` whose `Path` is anything other than a single
-/// [`std::path::Component::Normal`] is rejected before any layout is returned, so
-/// no untrusted manifest name can escape the distribution directory.
+/// boundary: a `root_name` that is not one name reading back as itself
+/// (`ipe_fs_open::is_one_spelled_name`: no separator, `..`, root, prefix or
+/// NUL, and on Windows no name Win32 rewrites) is rejected before any layout is
+/// returned, so no untrusted manifest name can escape the distribution
+/// directory or land under another name.
 ///
 /// `display_name` is the raw name, named only so the refusal message points at
 /// the offending manifest field.
 ///
 /// # Errors
-/// [`CliError::Usage`] when `root_name` is not a single normal path
-/// component.
+/// [`CliError::Usage`] when `root_name` is not one spelled name.
 fn reject_traversing_bundle_root(
     root_name: &str,
     display_name: &str,
 ) -> Result<(), super::super::CliError> {
-    use std::path::Component;
-    let mut components = Path::new(root_name).components();
-    let single_normal = matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    );
-    if single_normal {
+    if ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(root_name)) {
         return Ok(());
     }
     Err(super::super::CliError::Usage(
@@ -442,9 +437,10 @@ pub fn layout(
             // from the raw manifest name. That raw name reaches
             // `dist_dir.join(root_name)` and `remove_dir_all` in `materialise`, so
             // a name that is not a single, non-traversing path component
-            // (`../victim`, `a/b`, an absolute path) would let the bundler write
-            // and delete OUTSIDE dist_dir. Refuse fail-closed before any layout is
-            // returned: the bundle root must be exactly one normal path component.
+            // (`../victim`, `a/b`, an absolute path, a NUL byte) would let the
+            // bundler write and delete OUTSIDE dist_dir or under another name.
+            // Refuse fail-closed before any layout is returned: the bundle root
+            // must be exactly one name that reads back as itself.
             let root_name = format!("{}.app", identity.name);
             reject_traversing_bundle_root(&root_name, &identity.name)?;
             // The Apple platform a macOS bundle derives its permissions for —
@@ -853,12 +849,13 @@ mod tests {
             "nested/../escape",
             "/abs/root",
             "with/slash",
+            "nul\0byte",
         ] {
             let identity = BundleIdentity::new(hostile, Some("1.0.0"), None);
             let result = layout(DesktopOs::MacOs, &identity, &accepts(&[]), None);
             assert!(
-                result.is_err(),
-                "a traversing macOS bundle name `{hostile}` must be refused, not joined"
+                matches!(result, Err(crate::CliError::Usage(_))),
+                "a traversing macOS bundle name {hostile:?} must be refused, not joined, got {result:?}"
             );
         }
     }

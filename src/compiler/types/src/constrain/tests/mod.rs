@@ -116,10 +116,6 @@ mod registry_phase_c_tests {
             K::TaskDefaultRetryPolicy,
             K::TaskWithMaxAttempts,
             K::TaskWithBaseMs,
-            K::BackoffLinear,
-            K::BackoffLinearWithJitter,
-            K::BackoffExponential,
-            K::BackoffExponentialWithJitter,
             // Io (3)
             K::IoReadLine,
             K::IoWriteStdout,
@@ -1902,6 +1898,9 @@ mod registry_phase_c_tests {
         let dummy = interner.intern("_").expect("intern placeholder symbol");
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        // A kernel reference is constrained inside a def, so it walks with that
+        // def's module as its home.
+        builder.current_home = crate::ModuleHome::new(vec![dummy]);
 
         // Non-keyed Set/Dict/Cache kernels: selected by the module qualifier but
         // absent from OBLIGATION_SLOTS → must return Ok (no key bound), not L0108.
@@ -1938,6 +1937,49 @@ mod registry_phase_c_tests {
                 "{k:?}: keyed kernel must still resolve, got {r:?}"
             );
         }
+    }
+
+    /// `constrain_def` scopes its home to the walk: once a def is constrained,
+    /// a record minted outside any def is refused rather than stamped with the
+    /// last def's module, which would frame its span in the wrong file.
+    #[test]
+    fn home_does_not_outlive_its_def() {
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let dep = interner.intern("Dep").expect("intern Dep");
+        let name = interner.intern("one").expect("intern one");
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        let def = super::super::canon::Def::Untyped {
+            home: vec![dep],
+            name: ipe_diagnostics::Located {
+                span: Span::DUMMY,
+                value: name,
+            },
+            patterns: Vec::new(),
+            body: ipe_diagnostics::Located {
+                span: Span::DUMMY,
+                value: super::super::canon::Expr_::Int(1),
+            },
+        };
+        let shared = builder.flex().expect("mint the binding's shared var");
+        builder.untyped.insert((vec![dep], name), shared);
+        builder
+            .constrain_def(&def)
+            .expect("an Int literal def constrains");
+        let err = builder
+            .home()
+            .expect_err("no def is being constrained once constrain_def returns");
+        assert!(
+            matches!(
+                err,
+                Diagnostic::CompilerBug {
+                    where_: "ipe_types::Builder::home",
+                    ..
+                }
+            ),
+            "expected the homeless-mint refusal, got {err:?}",
+        );
     }
 
     /// The HOF callback-result classifier agrees with every resolved kernel scheme.

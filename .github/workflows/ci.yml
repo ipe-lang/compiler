@@ -333,35 +333,37 @@ jobs:
           bash tools/scripts/tests/test-require-tool.sh
           bash tools/scripts/lint-diagnostic-tone.sh
 
-  # Doctest-style gate: every unmarked ```ipe block in src/compiler/diagnostics/explain/*.md
-  # must type-check. A page that teaches broken syntax is worse than no page (ADR 0059).
-  # Requires `ipe` binary (type-check only — no emit, no cargo, no IPE_E2E).
-  # Fence-marker convention:
-  #   ```ipe            default — MUST type-check
-  #   ```ipe ipe:error  intentional bad example — gate fails if it compiles
-  #   ```ipe ipe:skip   pseudocode / FFI / multi-file — skipped entirely
-  # Change-gated: explain pages live under src/** (already in the `code` filter),
-  # so a prose-only PR legitimately skips this gate.
+  # Doctest-style gate (ADR 0059): every fenced ```ipe block on every registry
+  # explain page and every docs/constructs and docs/topics page is judged
+  # in-process through the build front end (`ipe::front_check_entry`), short of
+  # cargo. The checker is `src/ipe-cli/tests/explain_examples.rs`.
+  # Fence info strings:
+  #   ```ipe                      MUST be accepted
+  #   ```ipe ipe:error            explain page: refused with the page's own code
+  #   ```ipe ipe:error IPE-XNNNN  docs page: refused with exactly that code
+  #   ```ipe ipe:skip <reason>    not compiled; the reason is required
+  # Any other `ipe…` info string is refused. A known failing block is listed in
+  # `tests/explain_examples/known_rot.txt`, which may only shrink.
+  # Change-gated: explain pages live under src/** (already in the `code` filter).
   explain-examples:
     name: explain-page example gate (ADR 0059)
     runs-on: ubuntu-latest
-    needs: [changes, quick-check, build-tools]
+    needs: [changes, quick-check]
     # Change-gated: runs on a change that touches src/**.
     if: needs.changes.outputs.cheap == 'true' && needs.changes.outputs.code == 'true'
     env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          name: ci-ipe-release
-          path: ${{ runner.temp }}/ipe-release
-      - name: Mark the prebuilt ipe executable
-        run: chmod +x "$RUNNER_TEMP/ipe-release/ipe"
-      - name: Compile every explain-page example
-        env:
-          IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
-        run: bash tools/scripts/check-explain-examples.sh
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Judge every explain-page and docs-page example
+        run: cargo nextest run -p ipe --test explain_examples --profile ci
 
   # Every fenced ```ipe block in every {-| … -} doc-string in the standard
   # library must type-check. A doc-string edit that introduces a broken example
@@ -959,6 +961,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      # `dev-posture` is the dev-intent build outside `full`; its pins prove a
+      # dev build on a loopback listener opens each dev-only surface.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
       # `debugger` is a build-mode opt-in outside `full`; named here so its
       # overlay and recorder tests run.
       - run: cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci

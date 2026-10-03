@@ -38,6 +38,9 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const MOUSE_ON: &str = "\x1b[?1000;1006h";
 const MOUSE_OFF: &str = "\x1b[?1000;1006l";
 
+/// The name of the key reader thread every TUI app starts.
+const KEY_READER_THREAD: &str = "ipe-tui-keys";
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether a TUI session is currently active (terminal in raw mode + alt screen).
@@ -446,8 +449,10 @@ where
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
 
+        // A refused key reader ends the app with an `Unavailable` error; the
+        // guard restores the terminal.
         let key_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
             read_keys_loop(&key_tx, |k| {
                 // Under the debugger, fold a Ctrl modifier on Left/Right into the
                 // kind (`ctrlleft`/`ctrlright`) so the history step keys are
@@ -463,6 +468,11 @@ where
                 (kind, k.value)
             });
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(KEY_READER_THREAD, &e).into_error(),
+            );
+        }
 
         let (mut model, cmd0) = init(());
         cli_run_cmd(cmd0, &tx);
@@ -1055,8 +1065,9 @@ where
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
+        // A refused key reader ends the app as in `tui_app`.
         let key_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
             read_keys_loop(&key_tx, |k| {
                 // The (kind, value) channel is flat, so fold the ctrl modifier on
                 // Left/Right into the kind (`ctrlleft`/`ctrlright`) for the input
@@ -1069,6 +1080,11 @@ where
                 (kind, k.value)
             });
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(KEY_READER_THREAD, &e).into_error(),
+            );
+        }
 
         let (mut model, cmd0) = init(());
         cli_run_cmd(cmd0, &tx);
