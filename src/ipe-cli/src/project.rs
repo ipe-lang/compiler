@@ -208,16 +208,26 @@ impl ProjectManifest {
     /// program's declared entry-file through to a module path. A multi-program
     /// manifest builds its first program's entry; named selection of the others is
     /// not yet wired, so [`Self::multi_program_notice`] surfaces which one was
-    /// chosen and how many were declared.
+    /// chosen and how many were declared. Every program's entry goes through
+    /// [`parse_entry`], so a malformed entry on any program refuses the manifest,
+    /// not only on the one built.
     ///
     /// # Errors
-    /// [`CliError::Usage`] when a program's entry file does not map to a
-    /// valid module path (a non-module path segment).
+    /// [`CliError::Usage`] when any program's entry file is refused by
+    /// [`parse_entry`].
     pub fn resolved_entry(&self) -> Result<Vec<String>, CliError> {
-        let Some(program) = self.default_program() else {
+        let mut entries = self.programs.iter().map(|program| {
+            parse_entry(&program.entry)
+                .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))
+        });
+        let Some(built) = entries.next() else {
             return Ok(vec!["Main".to_owned()]);
         };
-        entry_file_to_module_path(&program.entry)
+        let built = built?;
+        for other in entries {
+            other?;
+        }
+        Ok(built)
     }
 
     /// The default program: the sole program of a single-program manifest, or the
@@ -306,41 +316,86 @@ impl EntryShape {
     }
 }
 
-/// Map an entry-file string (relative to the source root, e.g. `Main.ipe` or
-/// `Client/App.ipe`) to its module path (`["Main"]`, `["Client", "App"]`).
+/// Why a raw entry-file string is not an entry module path.
 ///
-/// The `.ipe` extension is stripped; each remaining path segment must be a valid
-/// Ipê module segment (`[A-Z][A-Za-z0-9_]*`). A path with a non-module segment or
-/// no segments at all is a manifest error, never a silently-dropped entry.
+/// One variant per refused spelling, so every refusal is a distinct, testable
+/// case and no spelling is silently normalised into a different module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryRefusal {
+    /// The entry string is empty.
+    Empty,
+    /// A leading, trailing, or doubled `/` leaves an empty segment.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A `\` byte: the separator is `/` on every platform.
+    Backslash,
+    /// A drive prefix (`C:`): an entry is relative to the source root.
+    DrivePrefix,
+    /// The final segment does not end in exactly `.ipe`.
+    Extension,
+    /// A segment that is not an Ipê module segment (`[A-Z][A-Za-z0-9_]*`, no
+    /// Windows device name).
+    NotModuleSegment {
+        /// The refused segment, with any `.ipe` suffix already stripped.
+        segment: String,
+    },
+}
+
+/// Parse an entry-file string relative to the source root into its module path.
+///
+/// `Main.ipe` maps to `["Main"]` and `Client/App.ipe` to `["Client", "App"]`.
+/// The raw string is split on `/` bytes and never passed through
+/// [`Path::components`], which would silently drop a `.` segment, a doubled
+/// or trailing `/`, and accept any extension; each of those is refused here, so
+/// the module path is the one reading of the string every consumer shares.
 ///
 /// # Errors
-/// [`CliError::Usage`] naming the offending entry file.
-fn entry_file_to_module_path(entry: &str) -> Result<Vec<String>, CliError> {
-    let rel = Path::new(entry);
-    let without_ext = rel.with_extension("");
-    let mut segments: Vec<String> = Vec::new();
-    for component in without_ext.components() {
-        let seg = match component {
-            std::path::Component::Normal(s) => s.to_str(),
-            _ => None,
-        };
-        let seg = seg.ok_or_else(|| {
-            CliError::Usage(text::msg::manifest_entry_invalid(&format!("{entry:?}")))
-        })?;
-        if !is_module_segment(seg) {
-            return Err(CliError::Usage(text::msg::manifest_entry_segment_invalid(
-                &format!("{entry:?}"),
-                &format!("{seg:?}"),
-            )));
+/// The [`EntryRefusal`] naming the first refused spelling.
+pub fn parse_entry(raw: &str) -> Result<crate::api_surface::ModulePath, EntryRefusal> {
+    if raw.is_empty() {
+        return Err(EntryRefusal::Empty);
+    }
+    if raw.contains('\\') {
+        return Err(EntryRefusal::Backslash);
+    }
+    if has_drive_prefix(raw) {
+        return Err(EntryRefusal::DrivePrefix);
+    }
+    let segments: Vec<&str> = raw.split('/').collect();
+    for segment in &segments {
+        match *segment {
+            "" => return Err(EntryRefusal::EmptySegment),
+            "." | ".." => return Err(EntryRefusal::DotSegment),
+            _ => {}
         }
-        segments.push(seg.to_owned());
     }
-    if segments.is_empty() {
-        return Err(CliError::Usage(text::msg::manifest_entry_no_module(
-            &format!("{entry:?}"),
-        )));
-    }
-    Ok(segments)
+    let Some((last, dirs)) = segments.split_last() else {
+        return Err(EntryRefusal::Empty);
+    };
+    let stem = last.strip_suffix(".ipe").ok_or(EntryRefusal::Extension)?;
+    dirs.iter()
+        .copied()
+        .chain(std::iter::once(stem))
+        .map(|segment| {
+            if is_module_segment(segment) {
+                Ok(segment.to_owned())
+            } else {
+                Err(EntryRefusal::NotModuleSegment {
+                    segment: segment.to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Whether `raw` opens with a drive prefix (an ASCII letter then `:`).
+fn has_drive_prefix(raw: &str) -> bool {
+    let mut bytes = raw.bytes();
+    matches!(
+        (bytes.next(), bytes.next()),
+        (Some(letter), Some(b':')) if letter.is_ascii_alphabetic()
+    )
 }
 
 /// `[wasm]` section of a `package.ipe` manifest (spec: `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q6
@@ -1045,6 +1100,132 @@ mod tests {
         assert!(!is_module_segment("_Foo"));
     }
 
+    fn module(segments: &[&str]) -> Vec<String> {
+        segments.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_entry_accepts_a_root_and_a_nested_module_file() {
+        assert_eq!(parse_entry("Main.ipe"), Ok(module(&["Main"])));
+        assert_eq!(parse_entry("Cli/Main.ipe"), Ok(module(&["Cli", "Main"])));
+    }
+
+    #[test]
+    fn parse_entry_refuses_an_empty_string() {
+        assert_eq!(parse_entry(""), Err(EntryRefusal::Empty));
+    }
+
+    #[test]
+    fn parse_entry_refuses_every_empty_segment() {
+        for raw in [
+            "/Main.ipe",
+            "Cli//Main.ipe",
+            "Cli/Main.ipe/",
+            "//host/Main.ipe",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::EmptySegment), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_dot_segment() {
+        for raw in [
+            "Cli/./Main.ipe",
+            "./Main.ipe",
+            "../Main.ipe",
+            "Cli/../Main.ipe",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::DotSegment), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_backslash() {
+        for raw in ["Cli\\Main.ipe", "\\\\host\\share\\Main.ipe"] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::Backslash), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_drive_prefix() {
+        for raw in ["C:Main.ipe", "c:/Main.ipe"] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::DrivePrefix), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_any_extension_but_ipe() {
+        for raw in [
+            "Main.rs",
+            "Main.txt",
+            "Main",
+            "Main.IPE",
+            "Cli/Main.ipe.bak",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::Extension), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_non_module_segment() {
+        for (raw, segment) in [
+            ("lower/App.ipe", "lower"),
+            ("Cli/main.ipe", "main"),
+            (".ipe", ""),
+            ("Main.ipe.ipe", "Main.ipe"),
+            ("Con.ipe", "Con"),
+            ("Cli/My Mod.ipe", "My Mod"),
+        ] {
+            assert_eq!(
+                parse_entry(raw),
+                Err(EntryRefusal::NotModuleSegment {
+                    segment: segment.to_owned()
+                }),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_entry_names_the_entry_escaped() {
+        let err = CliError::manifest_entry_refused("Cli/\u{1b}[31m.ipe", &EntryRefusal::Extension);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("\"Cli/\\u{1b}[31m.ipe\"") && !rendered.contains('\u{1b}'),
+            "the entry renders escaped, never raw: {rendered}"
+        );
+    }
+
+    #[test]
+    fn each_entry_refusal_renders_its_own_teaching_message() {
+        let cases = [
+            (EntryRefusal::Empty, "names no module"),
+            (EntryRefusal::EmptySegment, "empty path segment"),
+            (EntryRefusal::DotSegment, "`..` path segment"),
+            (EntryRefusal::Backslash, "contains a backslash"),
+            (EntryRefusal::DrivePrefix, "drive prefix"),
+            (EntryRefusal::Extension, "does not end in `.ipe`"),
+            (
+                EntryRefusal::NotModuleSegment {
+                    segment: "lower".to_owned(),
+                },
+                "segment \"lower\" that is not a valid module name",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (refusal, phrase) in cases {
+            let rendered = CliError::manifest_entry_refused("X", &refusal).to_string();
+            assert!(
+                rendered.contains(phrase),
+                "{refusal:?} must say {phrase:?}: {rendered}"
+            );
+            assert!(
+                seen.insert(rendered),
+                "{refusal:?} shares another refusal's message"
+            );
+        }
+    }
+
     #[test]
     fn windows_device_names_are_not_module_segments() {
         for name in ["CON", "Con", "PRN", "Prn", "AUX", "Aux", "NUL", "Nul"] {
@@ -1731,6 +1912,40 @@ import String
             "a single-program manifest has nothing to disambiguate"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_malformed_entry_on_a_program_not_built_still_refuses_the_manifest() {
+        let manifest_with_second_entry = |name: &str, second: &str| {
+            let root = discovery_dir(
+                name,
+                Some(&format!(
+                    "module Package exposing (package)\n\n\
+                     package =\n    \
+                     {{ name = \"multi\"\n    \
+                     , programs =\n        \
+                     [ {{ name = \"server\", entry = \"Main.ipe\" }}\n        \
+                     , {{ name = \"cli\", entry = \"{second}\" }}\n        \
+                     ]\n    \
+                     }}\n"
+                )),
+                None,
+            );
+            let manifest = parse_manifest(&root.join("package.ipe")).expect("manifest must parse");
+            let _ = fs::remove_dir_all(&root);
+            manifest
+        };
+        let legal = manifest_with_second_entry("second_entry_legal", "Cli/Main.ipe");
+        assert_eq!(legal.resolved_entry().ok(), Some(module(&["Main"])));
+        let refused = manifest_with_second_entry("second_entry_refused", "Cli/./Main.ipe");
+        let expected =
+            CliError::manifest_entry_refused("Cli/./Main.ipe", &EntryRefusal::DotSegment)
+                .to_string();
+        assert_eq!(
+            refused.resolved_entry().map_err(|err| err.to_string()),
+            Err(expected),
+            "the second program's `./` entry refuses the manifest as a dot segment"
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::redact::Redacted;
+
 /// The verified subject of an authenticated request, together with the verified
 /// claims the session token carried. The fields are private: a value of this
 /// type can only originate from [`principal_mint_with_claims`] (or, in unit
@@ -30,10 +32,14 @@ use std::collections::BTreeMap;
 /// Deliberately NOT serde: a `Principal` must never round-trip through a session
 /// store or JSON boundary, or a client could forge an authenticated identity by
 /// supplying the serialized datum. Minting is the only way in.
+///
+/// Both fields are `Redacted`: the subject and claims identify the caller, so
+/// the derived `Debug` (a log line, the stringify fallback) prints the
+/// principal's shape and never its identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Principal {
-    subject: String,
-    claims: BTreeMap<String, String>,
+    subject: Redacted<String>,
+    claims: Redacted<BTreeMap<String, String>>,
 }
 
 /// Mint a `Principal` with a subject and no claims — a unit-test fixture for
@@ -43,8 +49,8 @@ pub struct Principal {
 #[must_use]
 pub(crate) fn principal_mint(subject: String) -> Principal {
     Principal {
-        subject,
-        claims: BTreeMap::new(),
+        subject: subject.into(),
+        claims: Redacted::default(),
     }
 }
 
@@ -60,13 +66,16 @@ pub(crate) fn principal_mint_with_claims(
     subject: String,
     claims: BTreeMap<String, String>,
 ) -> Principal {
-    Principal { subject, claims }
+    Principal {
+        subject: subject.into(),
+        claims: claims.into(),
+    }
 }
 
 /// Ipê `Ipe.Auth.subject : Principal -> String` — the verified subject claim.
 #[must_use]
 pub fn principal_subject(p: Principal) -> String {
-    p.subject
+    p.subject.into_inner()
 }
 
 /// Ipê `Ipe.Auth.claim : String -> Principal -> Maybe String` — the verified
@@ -126,6 +135,15 @@ mod tests {
     fn subject_round_trips_the_minted_value() {
         let p = principal_mint("user-42".to_string());
         assert_eq!(principal_subject(p), "user-42");
+    }
+
+    #[test]
+    fn debug_prints_neither_subject_nor_claims() {
+        let p = with_claims("user-S3CR3T", &[("email", "T0K3N@example.com")]);
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("T0K3N"), "{shown}");
+        assert!(shown.contains(crate::redact::REDACTED));
     }
 
     #[test]

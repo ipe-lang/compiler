@@ -377,12 +377,10 @@ fn unrelated_module_keeps_types_while_sibling_is_red() {
     );
     let program_err = ipe_db::typecheck(&db, root, entry)
         .clone()
-        .expect_err("C's annotation mismatch must be rejected")
-        .0;
+        .expect_err("C's annotation mismatch must be rejected");
     let module_err = ipe_db::typecheck_module(&db, root, entry, c)
         .clone()
-        .expect_err("C's per-module query surfaces the failure")
-        .0;
+        .expect_err("C's per-module query surfaces the failure");
     assert_eq!(
         program_err, module_err,
         "the red module serves the whole-program diagnostic verbatim"

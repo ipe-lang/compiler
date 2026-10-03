@@ -22,7 +22,11 @@
 //!   started in its own process group (on Unix platforms with `waitid`), so a
 //!   refusal kills every process it started, not only the direct child; the
 //!   interrupt, quit, hangup, stop and continue signals reaching the CLI are
-//!   relayed to that group, except a signal the CLI inherited as ignored. The
+//!   relayed to that group, except a signal the CLI inherited as ignored, and a
+//!   termination request (`SIGTERM`) kills every group before the CLI acts on
+//!   it, so no group outlives a CLI that a signal ends. The child's pipes are
+//!   read and written on the waiting thread itself, so no thread of the CLI is
+//!   left behind by a process that keeps a pipe open. The
 //!   staged path's size and entry count are sampled at a fixed
 //!   interval and the group is killed once either crosses the budget. After the
 //!   child exits, its group is killed and one final exact measurement decides
@@ -32,14 +36,6 @@
 //!
 //! [`Git`] and [`Curl`] are the only constructors of a `git` or `curl` child in
 //! the CLI; each fixes the hardened environment and arguments once.
-//!
-//! LIMIT: a termination request (`SIGTERM`) is not relayed to the groups.
-//! `ipe watch` owns the process's `SIGTERM` disposition for its orderly
-//! shutdown, and a process holds one disposition per signal, so a relay that
-//! ended the CLI on `SIGTERM` would cut that shutdown short. A CLI ended by
-//! `SIGTERM` mid-transfer leaves the transfer's group running until it exits on
-//! its own; on Linux the direct child receives the parent-death signal, the
-//! processes it started do not.
 //!
 //! LIMIT: git's resident memory is bounded only by the transfer deadline and the
 //! group kill. Every fetch step receives the server's ref advertisement, which
@@ -52,7 +48,6 @@ use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -1244,18 +1239,27 @@ enum Mode {
     /// Its own process group: a refusal kills every process it started.
     Detached,
     /// The CLI's process group, keeping the terminal for a prompt (a signing
-    /// passphrase); a refusal kills the direct child.
+    /// passphrase); a refusal or a termination request kills the direct child.
     Attached,
+    /// A probe the signal owners run while reading the dispositions they act
+    /// on: in the CLI's process group and known to no signal owner, since
+    /// none is installed yet.
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    Probe,
 }
 
 /// Run `command`, killing it the moment it crosses a ceiling of `limits`.
 ///
-/// `stdin`, when given, is fed to the child on its own thread and the pipe is
-/// then closed; otherwise stdin is the null device. `watch`, when given, is the
-/// path the child stages its output in: its size and entry count are held to
-/// the disk ceilings while the child runs and measured exactly once it exits.
-/// The deadline is `started + limits.wall`. Stdout is held to its ceiling;
-/// stderr is truncated at [`CHILD_STDERR_MAX_BYTES`].
+/// `stdin`, when given, is fed to the child as it reads and the pipe is then
+/// closed; otherwise stdin is the null device. Every pipe is read and written
+/// on the calling thread and closed before this returns. `watch`, when given,
+/// is the path the child stages its output in: its size and entry count are
+/// held to the disk ceilings while the child runs and measured exactly once it
+/// exits.
+/// The deadline is `started + limits.wall`. Stdout is held to its ceiling and
+/// the child is killed the moment it writes past it; stderr is truncated at
+/// [`CHILD_STDERR_MAX_BYTES`]. Once the child exits, its pipes have
+/// [`PIPE_DRAIN_GRACE`] to reach their end.
 fn run_core(
     mut command: Command,
     stdin: Option<Zeroizing<Vec<u8>>>,
@@ -1277,59 +1281,98 @@ fn run_core(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut running = Running::spawn(command, mode).map_err(RunError::Spawn)?;
-    let stdout = running
-        .child
-        .stdout
-        .take()
-        .map(|pipe| spawn_capture(pipe, limits.stdout_bytes))
-        .transpose()
-        .map_err(RunError::Spawn)?;
-    let stderr = running
-        .child
-        .stderr
-        .take()
-        .map(|pipe| spawn_capture(pipe, CHILD_STDERR_MAX_BYTES))
-        .transpose()
-        .map_err(RunError::Spawn)?;
-    if let (Some(bytes), Some(pipe)) = (stdin, running.child.stdin.take()) {
-        spawn_feed(pipe, bytes).map_err(RunError::Spawn)?;
-    }
+    let mut io =
+        ChildIo::take(&mut running.child, stdin, limits.stdout_bytes).map_err(RunError::Spawn)?;
+    let stdout_over = || RunError::Exceeded(IngestLimit::Bytes(limits.stdout_bytes.get()));
+    let check_disk = |path: &Path| -> Result<(), RunError<IngestLimit>> {
+        let usage = measure_limits(path, limits).map_err(|(path, e)| RunError::Measure(path, e))?;
+        exceeded(usage, limits).map_or(Ok(()), |limit| Err(RunError::Exceeded(limit)))
+    };
 
+    let mut idle = IDLE_MIN;
+    let mut measured: Option<Instant> = None;
     let status = loop {
+        let moved = io.pump();
+        if io.stdout.is_over() {
+            return Err(stdout_over());
+        }
         if running.exited().map_err(RunError::Wait)? {
             break running.finish().map_err(RunError::Wait)?;
         }
         if out_of_time() {
             return Err(RunError::Exceeded(IngestLimit::Time(limits.wall)));
         }
-        if let Some(path) = watch {
-            let usage =
-                measure_limits(path, limits).map_err(|(path, e)| RunError::Measure(path, e))?;
-            if let Some(limit) = exceeded(usage, limits) {
-                return Err(RunError::Exceeded(limit));
-            }
+        if let Some(path) = watch
+            && measured.is_none_or(|at| at.elapsed() >= POLL_INTERVAL)
+        {
+            check_disk(path)?;
+            measured = Some(Instant::now());
         }
-        std::thread::sleep(POLL_INTERVAL);
+        idle = pause(moved, idle);
     };
 
     if let Some(path) = watch {
-        let usage = measure_limits(path, limits).map_err(|(path, e)| RunError::Measure(path, e))?;
-        if let Some(limit) = exceeded(usage, limits) {
-            return Err(RunError::Exceeded(limit));
+        check_disk(path)?;
+    }
+    io.close_stdin();
+    let exited = Instant::now();
+    let mut idle = IDLE_MIN;
+    loop {
+        let moved = io.pump();
+        if io.stdout.is_over() {
+            return Err(stdout_over());
         }
+        let Some(stream) = io.open_stream() else {
+            break;
+        };
+        if exited.elapsed() >= PIPE_DRAIN_GRACE {
+            return Err(RunError::PipeDrainTimeout(stream));
+        }
+        idle = pause(moved, idle);
     }
-    let (stdout, stdout_over) = drain(stdout.as_ref(), Stream::Stdout)?;
-    if stdout_over {
-        return Err(RunError::Exceeded(IngestLimit::Bytes(
-            limits.stdout_bytes.get(),
-        )));
-    }
-    let (stderr, _) = drain(stderr.as_ref(), Stream::Stderr)?;
+    let ChildIo { stdout, stderr, .. } = io;
     Ok(Captured {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.into_kept(),
+        stderr: stderr.into_kept(),
     })
+}
+
+/// Run a local probe attached, with no stdin, its stdout held to `stdout_bytes` and its run to `wall`.
+///
+/// It registers no signal handler, so a signal owner may run it while reading
+/// the dispositions it acts on. Any failure reads as `None`.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+pub(crate) fn run_probe(
+    command: Command,
+    stdout_bytes: ByteBudget,
+    wall: WallBudget,
+) -> Option<Captured> {
+    let limits = Limits {
+        staging: Staging::Nothing,
+        stdout_bytes,
+        wall,
+    };
+    run_core(command, None, None, &limits, Instant::now(), Mode::Probe).ok()
+}
+
+/// The most a signal owner's disposition probe may print.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+pub(crate) const PROBE_STDOUT_MAX_BYTES: ByteBudget = ByteBudget::of::<256>();
+
+/// Kill every transfer's process group and refuse every later one.
+///
+/// The termination owner calls it on every termination request, before the
+/// CLI acts on the request.
+#[cfg(unix)]
+pub(crate) fn end_transfers() {
+    group::end_all();
+}
+
+/// The process-group primitives, for the signal owners' tests.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_group {
+    pub use super::group::{exited, forget, forget_attached, kill, spawn_attached, spawn_detached};
 }
 
 /// A spawned child that is killed and reaped however the watcher leaves it.
@@ -1340,6 +1383,8 @@ fn run_core(
 struct Running {
     child: Child,
     group: Option<group::GroupId>,
+    /// The attached child, while the termination owner may kill it.
+    attached: Option<group::AttachedId>,
     reaped: bool,
 }
 
@@ -1347,13 +1392,26 @@ impl Running {
     /// Spawn `command` in `mode` through the runtime's hardened spawner, bound
     /// to the CLI's lifetime where the platform allows.
     fn spawn(command: Command, mode: Mode) -> std::io::Result<Self> {
-        let (child, group) = match mode {
-            Mode::Detached => group::spawn_detached(command)?,
-            Mode::Attached => (ipe_runtime_rust::system::spawn_hardened(command)?, None),
+        let (child, group, attached) = match mode {
+            Mode::Detached => {
+                let (child, group) = group::spawn_detached(command)?;
+                (child, group, None)
+            }
+            Mode::Attached => {
+                let (child, attached) = group::spawn_attached(command)?;
+                (child, None, attached)
+            }
+            #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+            Mode::Probe => (
+                ipe_runtime_rust::system::spawn_hardened(command)?,
+                None,
+                None,
+            ),
         };
         Ok(Self {
             child,
             group,
+            attached,
             reaped: false,
         })
     }
@@ -1369,13 +1427,16 @@ impl Running {
     /// Kill what the exited child left running in its group, then reap it.
     ///
     /// # Errors
-    /// Waiting failed, or a relayed signal ended every transfer
-    /// ([`std::io::ErrorKind::Interrupted`]): the relay may have killed the
+    /// Waiting failed, or a signal ended every transfer
+    /// ([`std::io::ErrorKind::Interrupted`]): its owner may have killed the
     /// child, so its status is not the transfer's outcome.
     fn finish(&mut self) -> std::io::Result<ExitStatus> {
         if let Some(id) = self.group.take() {
             group::kill(id);
             group::forget(id);
+        }
+        if let Some(id) = self.attached.take() {
+            group::forget_attached(id);
         }
         let status = self.child.wait();
         self.reaped = true;
@@ -1393,6 +1454,9 @@ impl Running {
         if let Some(id) = self.group.take() {
             group::kill(id);
             group::forget(id);
+        }
+        if let Some(id) = self.attached.take() {
+            group::forget_attached(id);
         }
         // The child may already have exited; either way it is reaped below.
         let _ = self.child.kill();
@@ -1419,16 +1483,23 @@ mod group {
     /// A live group's ID: its leader's process ID.
     pub type GroupId = Pid;
 
-    /// The groups spawned and not yet killed, for the signal relay.
+    /// A live attached child's process ID.
+    pub type AttachedId = Pid;
+
+    /// The groups and attached children spawned and not yet reaped, for the
+    /// signal owners.
     struct Registry {
         /// Every live group.
         live: Vec<Pid>,
-        /// Whether a relayed signal ended every transfer; no group starts after it.
+        /// Every live attached child; it shares the CLI's group, so it is
+        /// killed by its own ID.
+        attached: Vec<Pid>,
+        /// Whether a signal ended every transfer; no group starts after it.
         ended: bool,
     }
 
     impl Registry {
-        /// Admit a new group, unless a relayed signal ended every transfer.
+        /// Admit a new group, unless a signal ended every transfer.
         fn admit(&self) -> std::io::Result<()> {
             if self.ended {
                 return Err(std::io::ErrorKind::Interrupted.into());
@@ -1439,18 +1510,21 @@ mod group {
 
     static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
         live: Vec::new(),
+        attached: Vec::new(),
         ended: false,
     });
 
     /// Spawn `command` as the leader of a new process group.
     ///
-    /// The group is registered with the relay while the registry is held, so a
-    /// relayed signal either sees the group or runs before it exists.
+    /// The group is registered while the registry is held, so a signal either
+    /// sees the group or is answered before it exists.
     ///
     /// # Errors
-    /// The relay could not be installed, a relayed signal ended every transfer
-    /// ([`std::io::ErrorKind::Interrupted`]), or the spawn failed.
+    /// The termination owner or the relay could not be installed, a signal
+    /// ended every transfer ([`std::io::ErrorKind::Interrupted`]), or the
+    /// spawn failed.
     pub fn spawn_detached(mut command: Command) -> std::io::Result<(Child, Option<Pid>)> {
+        crate::terminate::ensure()?;
         super::relay::ensure()?;
         command.process_group(0);
         let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1460,6 +1534,36 @@ mod group {
         registry.live.push(pid);
         drop(registry);
         Ok((child, Some(pid)))
+    }
+
+    /// Spawn `command` in the CLI's process group, known to the termination owner.
+    ///
+    /// The child is registered while the registry is held, so a termination
+    /// request either sees it or is answered before it exists. Its ID stays
+    /// its own until it is reaped, which happens only after
+    /// [`forget_attached`].
+    ///
+    /// # Errors
+    /// The termination owner could not be installed, a signal ended every
+    /// transfer ([`std::io::ErrorKind::Interrupted`]), or the spawn failed.
+    pub fn spawn_attached(command: Command) -> std::io::Result<(Child, Option<Pid>)> {
+        crate::terminate::ensure()?;
+        let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+        registry.admit()?;
+        let child = ipe_runtime_rust::system::spawn_hardened(command)?;
+        let pid = Pid::from_child(&child);
+        registry.attached.push(pid);
+        drop(registry);
+        Ok((child, Some(pid)))
+    }
+
+    /// Deregister attached child `id`; it is reaped only after this.
+    pub fn forget_attached(id: Pid) {
+        REGISTRY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .attached
+            .retain(|live| *live != id);
     }
 
     /// Whether the leader `id` has exited, without reaping it.
@@ -1497,16 +1601,19 @@ mod group {
         }
     }
 
-    /// Kill every registered group and refuse every later one.
+    /// Kill every registered group and attached child, and refuse every later one.
     pub fn end_all() {
         let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         registry.ended = true;
         for id in &registry.live {
             let _ = rustix::process::kill_process_group(*id, Signal::Kill);
         }
+        for id in &registry.attached {
+            let _ = rustix::process::kill_process(*id, Signal::Kill);
+        }
     }
 
-    /// Whether a relayed signal ended every transfer.
+    /// Whether a signal ended every transfer.
     pub fn ended() -> bool {
         REGISTRY
             .lock()
@@ -1522,6 +1629,7 @@ mod group {
         fn an_ended_registry_refuses_every_new_group() {
             let mut registry = Registry {
                 live: Vec::new(),
+                attached: Vec::new(),
                 ended: false,
             };
             assert!(registry.admit().is_ok());
@@ -1543,9 +1651,23 @@ mod group {
     #[derive(Debug, Clone, Copy)]
     pub enum GroupId {}
 
+    /// Uninhabited: no attached child is tracked on this platform.
+    #[derive(Debug, Clone, Copy)]
+    pub enum AttachedId {}
+
     /// Spawn `command` as a plain child.
     pub fn spawn_detached(command: Command) -> std::io::Result<(Child, Option<GroupId>)> {
         Ok((ipe_runtime_rust::system::spawn_hardened(command)?, None))
+    }
+
+    /// Spawn `command` as a plain child.
+    pub fn spawn_attached(command: Command) -> std::io::Result<(Child, Option<AttachedId>)> {
+        Ok((ipe_runtime_rust::system::spawn_hardened(command)?, None))
+    }
+
+    /// Unreachable: no `AttachedId` exists.
+    pub const fn forget_attached(id: AttachedId) {
+        match id {}
     }
 
     /// Unreachable: no `GroupId` exists.
@@ -1567,6 +1689,10 @@ mod group {
     pub const fn ended() -> bool {
         false
     }
+
+    /// Nothing to end: no group is ever created on this platform.
+    #[cfg(unix)]
+    pub const fn end_all() {}
 }
 
 /// Relays the interrupt, quit, hangup, stop and continue signals to every detached group.
@@ -1580,18 +1706,18 @@ mod group {
 /// - inherited with the default action: an interrupt, quit or hangup kills
 ///   every group and the CLI then ends by the signal; a stop stops every group
 ///   and then the CLI;
-/// - inherited disposition unreadable: the signal is relayed to the groups
-///   only, and the CLI never takes a default action it may have inherited as
-///   ignored. An interrupt, quit or hangup kills every group and refuses every
-///   later one, so the command ends with an error rather than by the signal; a
-///   stop stops only the groups, which the transfer deadline still bounds.
-///   Leaving the signal unregistered instead would let a default-action
-///   interrupt end the CLI and orphan the transfer, unbounded where no
-///   parent-death signal reaches it.
+/// - caught by a handler of the host process, or unreadable: the signal is
+///   relayed to the groups only, and the CLI never takes a default action over
+///   a handler or one it may have inherited as ignored. An interrupt, quit or
+///   hangup kills every group and refuses every later one, so the command ends
+///   with an error rather than by the signal; a stop stops only the groups,
+///   which the transfer deadline still bounds. Leaving the signal unregistered
+///   instead would let a default-action interrupt end the CLI and orphan the
+///   transfer, unbounded where no parent-death signal reaches it.
 ///
 /// A continue is always relayed: the kernel resumes the CLI whatever it
-/// inherited. The inherited set is read from `/proc/self/status` on Linux and
-/// from `/bin/ps -o sigignore=` elsewhere.
+/// inherited. The inherited dispositions are the termination owner's one
+/// reading, taken before either owner registers a handler.
 #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
 mod relay {
     use std::ffi::c_int;
@@ -1601,16 +1727,7 @@ mod relay {
     use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTSTP};
     use signal_hook::iterator::Signals;
 
-    /// What a relayed signal does to the process that takes its default action.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Effect {
-        /// Ends it: an interrupt, quit or hangup.
-        Ends,
-        /// Stops it: a terminal stop.
-        Stops,
-        /// Resumes it.
-        Continues,
-    }
+    use crate::terminate::{Effect, Handling, Inherited};
 
     /// The signals relayed to the detached groups, each with its default effect.
     const RELAYED: [(c_int, Effect); 5] = [
@@ -1620,61 +1737,6 @@ mod relay {
         (SIGTSTP, Effect::Stops),
         (SIGCONT, Effect::Continues),
     ];
-
-    /// A set of signals, bit `n - 1` standing for signal `n`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct SignalSet(u64);
-
-    impl SignalSet {
-        /// Whether `signal` is in the set; a number outside `1..=64` never is.
-        fn contains(self, signal: c_int) -> bool {
-            u32::try_from(signal)
-                .ok()
-                .and_then(|number| number.checked_sub(1))
-                .and_then(|bit| 1u64.checked_shl(bit))
-                .is_some_and(|bit| self.0 & bit != 0)
-        }
-    }
-
-    /// The signal dispositions the CLI inherited.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Inherited {
-        /// The set of signals inherited as ignored; every other relayed signal
-        /// has its default action.
-        Known(SignalSet),
-        /// The inherited dispositions could not be read.
-        Unknown,
-    }
-
-    /// How the relay handles one signal.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Handling {
-        /// Not registered: the inherited disposition stays in force.
-        Unregistered,
-        /// Relayed to the groups, then the CLI takes the default action.
-        RelayThenDefault,
-        /// Relayed to the groups only.
-        RelayOnly,
-    }
-
-    impl Inherited {
-        /// The dispositions this process inherited.
-        fn read() -> Self {
-            ignored_set().map_or(Self::Unknown, Self::Known)
-        }
-
-        /// How the relay handles `signal`, whose default action has `effect`.
-        fn handling(self, signal: c_int, effect: Effect) -> Handling {
-            match effect {
-                Effect::Continues => Handling::RelayOnly,
-                Effect::Ends | Effect::Stops => match self {
-                    Self::Known(set) if set.contains(signal) => Handling::Unregistered,
-                    Self::Known(_) => Handling::RelayThenDefault,
-                    Self::Unknown => Handling::RelayOnly,
-                },
-            }
-        }
-    }
 
     /// One registered signal: its default effect and how it is handled.
     #[derive(Debug, Clone, Copy)]
@@ -1711,7 +1773,7 @@ mod relay {
 
     /// Register the relayed signals and start the relay thread.
     fn install() -> Result<(), std::io::ErrorKind> {
-        let steps = plan(Inherited::read());
+        let steps = plan(crate::terminate::inherited());
         let wanted: Vec<c_int> = steps.iter().map(|step| step.signal).collect();
         let mut signals = Signals::new(&wanted).map_err(|e| e.kind())?;
         std::thread::Builder::new()
@@ -1742,88 +1804,12 @@ mod relay {
         }
     }
 
-    /// The signals this process inherited as ignored, read from `/proc/self/status`.
-    #[cfg(target_os = "linux")]
-    fn ignored_set() -> Option<SignalSet> {
-        use std::io::Read as _;
-        let mut status = String::new();
-        std::fs::File::open("/proc/self/status")
-            .ok()?
-            .take(64 * 1024)
-            .read_to_string(&mut status)
-            .ok()?;
-        sig_ign_mask(&status).map(SignalSet)
-    }
-
-    /// The signals this process inherited as ignored, read through `ps`.
-    #[cfg(not(target_os = "linux"))]
-    fn ignored_set() -> Option<SignalSet> {
-        ps_ignored(std::process::id())
-    }
-
-    /// The `SigIgn:` mask of a `/proc/<pid>/status` text.
-    #[cfg(target_os = "linux")]
-    pub fn sig_ign_mask(status: &str) -> Option<u64> {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigIgn:"))
-            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-    }
-
-    /// The signals process `pid` ignores, as `/bin/ps -o sigignore=` reports them.
-    ///
-    /// `ps` runs attached, with an empty environment and its absolute path, so
-    /// neither `PATH` nor the environment chooses the program; a missing or
-    /// failing `ps` reads as unknown.
-    #[cfg(any(not(target_os = "linux"), test))]
-    fn ps_ignored(pid: u32) -> Option<SignalSet> {
-        let mut command = std::process::Command::new("/bin/ps");
-        command
-            .env_clear()
-            .args(["-o", "sigignore=", "-p"])
-            .arg(pid.to_string());
-        let limits = super::Limits {
-            staging: super::Staging::Nothing,
-            stdout_bytes: PS_STDOUT_MAX_BYTES,
-            wall: PS_WALL,
-        };
-        let captured = super::run_core(
-            command,
-            None,
-            None,
-            &limits,
-            std::time::Instant::now(),
-            super::Mode::Attached,
-        )
-        .ok()?;
-        if !captured.status.success() {
-            return None;
-        }
-        ps_mask(&captured.stdout).map(SignalSet)
-    }
-
-    /// The most `ps` may print for one process's mask.
-    #[cfg(any(not(target_os = "linux"), test))]
-    const PS_STDOUT_MAX_BYTES: super::ByteBudget = super::ByteBudget::of::<256>();
-
-    /// The longest `ps` may take to report one process's mask.
-    #[cfg(any(not(target_os = "linux"), test))]
-    const PS_WALL: super::WallBudget = super::WallBudget::of_secs::<5>();
-
-    /// The hexadecimal mask `ps -o sigignore=` printed: one field of hex digits.
-    #[cfg(any(not(target_os = "linux"), test))]
-    fn ps_mask(stdout: &[u8]) -> Option<u64> {
-        let text = std::str::from_utf8(stdout).ok()?.trim();
-        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return None;
-        }
-        u64::from_str_radix(text, 16).ok()
-    }
-
     #[cfg(test)]
     mod tests {
-        use super::{Effect, Handling, Inherited, SignalSet, plan, ps_mask};
+        use super::{Handling, Inherited, plan};
+        use crate::terminate::SignalSet;
         use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTSTP};
+        #[cfg(target_os = "linux")]
         use std::io::Write as _;
 
         /// The set holding exactly `signals`.
@@ -1835,53 +1821,32 @@ mod relay {
         }
 
         #[test]
-        fn a_mask_bit_marks_its_signal_ignored() {
-            assert!(SignalSet(0b10).contains(2));
-            assert!(!SignalSet(0b10).contains(1));
-            assert!(!SignalSet(u64::MAX).contains(0));
-            assert!(!SignalSet(u64::MAX).contains(-1));
-            assert!(!SignalSet(u64::MAX).contains(65));
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn the_sigign_line_parses_as_hex() {
-            let status = "Name:\tipe\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000001\n";
-            assert_eq!(super::sig_ign_mask(status), Some(1));
-            assert_eq!(super::sig_ign_mask("Name:\tipe\n"), None);
-            assert_eq!(super::sig_ign_mask("SigIgn:\tzz\n"), None);
-        }
-
-        #[test]
         fn a_known_ignored_signal_stays_unregistered() {
-            let inherited = Inherited::Known(set(&[SIGHUP, SIGTSTP]));
-            assert_eq!(
-                inherited.handling(SIGHUP, Effect::Ends),
-                Handling::Unregistered
-            );
-            assert_eq!(
-                inherited.handling(SIGTSTP, Effect::Stops),
-                Handling::Unregistered
-            );
-            assert_eq!(
-                inherited.handling(SIGINT, Effect::Ends),
-                Handling::RelayThenDefault
-            );
+            let inherited = Inherited::Known {
+                ignored: set(&[SIGHUP, SIGTSTP]),
+                caught: set(&[]),
+            };
             let registered: Vec<i32> = plan(inherited).iter().map(|step| step.signal).collect();
             assert_eq!(registered, [SIGINT, SIGQUIT, SIGCONT]);
         }
 
         #[test]
-        fn unknown_relays_ends_and_stops_without_the_default() {
-            for signal in [SIGINT, SIGQUIT, SIGHUP] {
-                assert_eq!(
-                    Inherited::Unknown.handling(signal, Effect::Ends),
-                    Handling::RelayOnly
-                );
-            }
-            assert_eq!(
-                Inherited::Unknown.handling(SIGTSTP, Effect::Stops),
-                Handling::RelayOnly
+        fn a_caught_signal_is_relayed_without_the_default() {
+            let inherited = Inherited::Known {
+                ignored: set(&[]),
+                caught: set(&[SIGINT]),
+            };
+            let steps = plan(inherited);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.signal == SIGINT && step.handling == Handling::RelayOnly)
+            );
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.signal == SIGQUIT
+                        && step.handling == Handling::RelayThenDefault)
             );
         }
 
@@ -1897,68 +1862,6 @@ mod relay {
             );
         }
 
-        #[test]
-        fn continue_is_always_relayed_without_the_default() {
-            for inherited in [
-                Inherited::Unknown,
-                Inherited::Known(set(&[])),
-                Inherited::Known(set(&[SIGCONT])),
-            ] {
-                assert_eq!(
-                    inherited.handling(SIGCONT, Effect::Continues),
-                    Handling::RelayOnly
-                );
-            }
-        }
-
-        #[test]
-        fn the_ps_mask_is_one_hex_field() {
-            assert_eq!(ps_mask(b"00001000\n"), Some(0x1000));
-            assert_eq!(ps_mask(b"  0000000000000001  \n"), Some(1));
-            assert_eq!(ps_mask(b""), None);
-            assert_eq!(ps_mask(b"\n"), None);
-            assert_eq!(ps_mask(b"+1"), None);
-            assert_eq!(ps_mask(b"1 2"), None);
-            assert_eq!(ps_mask(b"SIGHUP"), None);
-            assert_eq!(ps_mask(b"10000000000000000"), None);
-            assert_eq!(ps_mask(b"\xff"), None);
-        }
-
-        /// Poll `ps` for `pid` until it reports `signal` ignored, for at most 5 s.
-        #[cfg(target_os = "linux")]
-        fn poll_ps(pid: u32, signal: i32) -> Option<SignalSet> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let seen = super::ps_ignored(pid);
-                if seen.is_some_and(|ignored| ignored.contains(signal))
-                    || std::time::Instant::now() >= deadline
-                {
-                    return seen;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn the_ps_probe_reads_an_inherited_ignored_hangup() {
-            let mut child = std::process::Command::new("/bin/sh")
-                .args(["-c", "trap '' HUP; exec sleep 30"])
-                .spawn()
-                .expect("spawn sh");
-            let pid = child.id();
-            let seen = poll_ps(pid, SIGHUP);
-            let proc_mask = std::fs::read_to_string(format!("/proc/{pid}/status"))
-                .ok()
-                .and_then(|status| super::sig_ign_mask(&status));
-            let _ = child.kill();
-            let _ = child.wait();
-            let seen = seen.expect("ps reports a mask");
-            assert!(seen.contains(SIGHUP), "ps misses the ignored hangup");
-            let proc_mask = proc_mask.expect("a SigIgn line");
-            assert_eq!(seen.0 & 0xffff_ffff, proc_mask & 0xffff_ffff);
-        }
-
         /// Printed by [`hangup_child`] once its transfer outlived the hangup.
         #[cfg(target_os = "linux")]
         const SURVIVED: &str = "ipe-relay-hangup-survived";
@@ -1967,30 +1870,13 @@ mod relay {
         #[cfg(target_os = "linux")]
         const ARMED: &str = "ipe-relay-hangup-armed";
 
-        /// Run the ignored test `name` of this binary as a child, through `sh`
-        /// running `prelude` first.
-        #[cfg(target_os = "linux")]
-        fn run_child(prelude: &str, name: &str) -> std::process::Output {
-            let exe = std::env::current_exe().expect("the test binary");
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!("{prelude} exec \"$0\" \"$@\""))
-                .arg(exe)
-                .args([
-                    "--exact",
-                    name,
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .output()
-                .expect("run the child test")
-        }
-
         #[cfg(target_os = "linux")]
         #[test]
         fn an_inherited_ignored_hangup_leaves_the_cli_and_its_transfer_running() {
-            let output = run_child("trap '' HUP;", "remote_ingest::relay::tests::hangup_child");
+            let output = crate::terminate::tests::test_child::run(
+                "trap '' HUP;",
+                "remote_ingest::relay::tests::hangup_child",
+            );
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "child failed: {output:?}");
             assert!(stdout.contains(SURVIVED), "child output: {output:?}");
@@ -2000,13 +1886,13 @@ mod relay {
         #[test]
         fn a_default_hangup_ends_the_cli() {
             use std::os::unix::process::ExitStatusExt as _;
-            let parent = Inherited::read();
+            let parent = crate::terminate::inherited();
             if parent == Inherited::Unknown
-                || matches!(parent, Inherited::Known(ignored) if ignored.contains(SIGHUP))
+                || matches!(parent, Inherited::Known { ignored, .. } if ignored.contains(SIGHUP))
             {
                 return;
             }
-            let output = run_child(
+            let output = crate::terminate::tests::test_child::run(
                 "trap - HUP;",
                 "remote_ingest::relay::tests::hangup_child_default",
             );
@@ -2021,10 +1907,10 @@ mod relay {
         #[test]
         #[ignore = "child half of an_inherited_ignored_hangup_leaves_the_cli_and_its_transfer_running"]
         fn hangup_child() {
-            let Inherited::Known(inherited) = Inherited::read() else {
+            let Inherited::Known { ignored, .. } = crate::terminate::inherited() else {
                 return;
             };
-            if !inherited.contains(SIGHUP) {
+            if !ignored.contains(SIGHUP) {
                 return;
             }
             let mut sleeper = std::process::Command::new("sleep");
@@ -2060,62 +1946,363 @@ mod relay {
     }
 }
 
-/// A pipe being read on its own thread: the bytes kept, and whether more than `cap` arrived.
-type Capture = mpsc::Receiver<(Vec<u8>, bool)>;
+/// How many reads or writes one pump of a pipe makes at most.
+const PUMP_ROUNDS: u32 = 16;
 
-/// Read `pipe` on a thread, keeping at most `cap` bytes and draining the rest.
-fn spawn_capture(pipe: impl Read + Send + 'static, cap: ByteBudget) -> std::io::Result<Capture> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("ipe-child-capture".to_owned())
-        .spawn(move || {
-            let _ = tx.send(capture(pipe, cap));
-        })?;
-    Ok(rx)
+/// The most bytes one read takes from a pipe.
+const PUMP_CHUNK: usize = 16 * 1024;
+
+/// The pause after the first pump that moved nothing; it doubles up to [`POLL_INTERVAL`].
+const IDLE_MIN: Duration = Duration::from_millis(1);
+
+/// Pause before the next pump unless the last one moved bytes, returning the pause after that.
+///
+/// A pump that moved bytes resets the pause; one that moved nothing doubles
+/// it, up to [`POLL_INTERVAL`].
+fn pause(moved: bool, idle: Duration) -> Duration {
+    if moved {
+        return IDLE_MIN;
+    }
+    std::thread::sleep(idle);
+    idle.saturating_mul(2).min(POLL_INTERVAL)
 }
 
-/// Write `bytes` to `pipe` on a thread, then close it.
+/// A watched child's pipes, read and written by the thread that waits on it.
 ///
-/// The write runs beside the output captures, so a child that echoes more
-/// than a pipe buffer before reading the rest of its input cannot deadlock.
-fn spawn_feed(
-    mut pipe: impl std::io::Write + Send + 'static,
-    bytes: Zeroizing<Vec<u8>>,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("ipe-child-stdin".to_owned())
-        .spawn(move || {
-            // A child that exits without reading its stdin is judged by its
-            // exit status, not by this write.
-            let _ = pipe.write_all(&bytes);
+/// Stdout is held to its ceiling, stderr is truncated at
+/// [`CHILD_STDERR_MAX_BYTES`], and stdin is fed from its buffer as the child
+/// reads it. Dropping it closes every pipe it holds.
+struct ChildIo {
+    stdout: pipes::Reader,
+    stderr: pipes::Reader,
+    stdin: Option<pipes::Feed>,
+}
+
+impl ChildIo {
+    /// Take `child`'s pipes, holding stdout to `stdout_bytes`; `stdin`, when given, is fed to its stdin.
+    fn take(
+        child: &mut Child,
+        stdin: Option<Zeroizing<Vec<u8>>>,
+        stdout_bytes: ByteBudget,
+    ) -> std::io::Result<Self> {
+        let stdout = pipes::Reader::new(child.stdout.take(), stdout_bytes)?;
+        let stderr = pipes::Reader::new(child.stderr.take(), CHILD_STDERR_MAX_BYTES)?;
+        let stdin = match (stdin, child.stdin.take()) {
+            (Some(bytes), Some(pipe)) => Some(pipes::Feed::new(pipe, bytes)?),
+            _ => None,
+        };
+        Ok(Self {
+            stdout,
+            stderr,
+            stdin,
         })
-        .map(drop)
+    }
+
+    /// Move what every pipe has ready, returning whether any byte moved.
+    fn pump(&mut self) -> bool {
+        let fed = self.stdin.as_mut().is_some_and(pipes::Feed::pump);
+        let read_out = self.stdout.pump();
+        let read_err = self.stderr.pump();
+        fed || read_out || read_err
+    }
+
+    /// Stop feeding stdin and close its pipe.
+    fn close_stdin(&mut self) {
+        self.stdin = None;
+    }
+
+    /// The first output pipe not yet at its end, stdout before stderr.
+    const fn open_stream(&self) -> Option<Stream> {
+        if self.stdout.is_open() {
+            Some(Stream::Stdout)
+        } else if self.stderr.is_open() {
+            Some(Stream::Stderr)
+        } else {
+            None
+        }
+    }
 }
 
-/// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
-///
-/// The flag reports whether anything past `cap` arrived. The pipe is drained to
-/// its end so the child never blocks on a full pipe.
-fn capture(mut pipe: impl Read, cap: ByteBudget) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let _ = (&mut pipe).take(cap.get()).read_to_end(&mut kept);
-    let over = std::io::copy(&mut pipe, &mut std::io::sink()).is_ok_and(|rest| rest > 0);
-    (kept, over)
+/// A child's pipes made non-blocking, so the waiting thread moves their bytes itself.
+#[cfg(unix)]
+mod pipes {
+    use std::fs::File;
+    use std::io::{ErrorKind, Read as _, Write as _};
+    use std::os::fd::OwnedFd;
+
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use zeroize::Zeroizing;
+
+    use super::{ByteBudget, PUMP_CHUNK, PUMP_ROUNDS};
+
+    /// `pipe` as a file whose reads and writes never block.
+    fn nonblocking(pipe: impl Into<OwnedFd>) -> std::io::Result<File> {
+        let fd: OwnedFd = pipe.into();
+        let flags = fcntl_getfl(&fd)?;
+        fcntl_setfl(&fd, flags | OFlags::NONBLOCK)?;
+        Ok(File::from(fd))
+    }
+
+    /// The bytes kept from one output pipe.
+    struct Kept {
+        /// At most `cap` bytes.
+        bytes: Vec<u8>,
+        /// The most bytes kept.
+        cap: ByteBudget,
+        /// Whether more than `cap` bytes arrived.
+        over: bool,
+    }
+
+    impl Kept {
+        /// Keep what of `chunk` fits under the cap and note whether any did not.
+        fn keep(&mut self, chunk: &[u8]) {
+            let held = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+            let room = usize::try_from(self.cap.get().saturating_sub(held)).unwrap_or(usize::MAX);
+            let fits = chunk.get(..room).unwrap_or(chunk);
+            self.bytes.extend_from_slice(fits);
+            self.over |= fits.len() < chunk.len();
+        }
+    }
+
+    /// One output pipe, read until its end.
+    pub struct Reader {
+        /// The pipe, until it reaches its end or fails.
+        pipe: Option<File>,
+        kept: Kept,
+    }
+
+    impl Reader {
+        /// Read `pipe`, keeping at most `cap` bytes; no pipe is a pipe at its end.
+        pub fn new(pipe: Option<impl Into<OwnedFd>>, cap: ByteBudget) -> std::io::Result<Self> {
+            Ok(Self {
+                pipe: pipe.map(nonblocking).transpose()?,
+                kept: Kept {
+                    bytes: Vec::new(),
+                    cap,
+                    over: false,
+                },
+            })
+        }
+
+        /// Read what the pipe has ready, returning whether any byte arrived.
+        ///
+        /// The end of the pipe, or a failed read, closes it.
+        pub fn pump(&mut self) -> bool {
+            let Some(pipe) = self.pipe.as_mut() else {
+                return false;
+            };
+            let mut chunk = [0u8; PUMP_CHUNK];
+            let mut moved = false;
+            for _ in 0..PUMP_ROUNDS {
+                match pipe.read(&mut chunk) {
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Ok(0) | Err(_) => {
+                        self.pipe = None;
+                        break;
+                    }
+                    Ok(n) => {
+                        moved = true;
+                        self.kept.keep(chunk.get(..n).unwrap_or_default());
+                    }
+                }
+            }
+            moved
+        }
+
+        /// Whether the pipe has not reached its end.
+        pub const fn is_open(&self) -> bool {
+            self.pipe.is_some()
+        }
+
+        /// Whether more than the cap arrived.
+        pub const fn is_over(&self) -> bool {
+            self.kept.over
+        }
+
+        /// The bytes kept.
+        pub fn into_kept(self) -> Vec<u8> {
+            self.kept.bytes
+        }
+    }
+
+    /// A stdin pipe fed from a buffer, closed once the buffer is written.
+    pub struct Feed {
+        /// The pipe, until the buffer is written or a write fails.
+        pipe: Option<File>,
+        bytes: Zeroizing<Vec<u8>>,
+        /// How many of `bytes` were written.
+        written: usize,
+    }
+
+    impl Feed {
+        /// Feed `bytes` to `pipe`.
+        pub fn new(pipe: impl Into<OwnedFd>, bytes: Zeroizing<Vec<u8>>) -> std::io::Result<Self> {
+            Ok(Self {
+                pipe: Some(nonblocking(pipe)?),
+                bytes,
+                written: 0,
+            })
+        }
+
+        /// Write what the pipe takes, returning whether any byte was written.
+        ///
+        /// A child that exits without reading its stdin is judged by its exit
+        /// status, so a failed write only closes the pipe.
+        pub fn pump(&mut self) -> bool {
+            let Some(pipe) = self.pipe.as_mut() else {
+                return false;
+            };
+            let mut moved = false;
+            for _ in 0..PUMP_ROUNDS {
+                let rest = self.bytes.get(self.written..).unwrap_or_default();
+                if rest.is_empty() {
+                    self.pipe = None;
+                    break;
+                }
+                match pipe.write(rest) {
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Ok(0) | Err(_) => {
+                        self.pipe = None;
+                        break;
+                    }
+                    Ok(n) => {
+                        moved = true;
+                        self.written = self.written.saturating_add(n);
+                    }
+                }
+            }
+            moved
+        }
+    }
 }
 
-/// Collect a capture thread's result, giving up after [`PIPE_DRAIN_GRACE`].
-fn drain(
-    capture: Option<&Capture>,
-    stream: Stream,
-) -> Result<(Vec<u8>, bool), RunError<IngestLimit>> {
-    capture.map_or_else(
-        || Ok((Vec::new(), false)),
-        |capture| {
-            capture
-                .recv_timeout(PIPE_DRAIN_GRACE)
-                .map_err(|_| RunError::PipeDrainTimeout(stream))
-        },
-    )
+/// A child's pipes read and written on threads, where the platform has no non-blocking pipes.
+#[cfg(not(unix))]
+mod pipes {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    use zeroize::Zeroizing;
+
+    use super::ByteBudget;
+
+    /// One output pipe, read to its end on its own thread.
+    pub struct Reader {
+        /// The reading thread's result, until it arrives.
+        capture: Option<mpsc::Receiver<(Vec<u8>, bool)>>,
+        kept: Vec<u8>,
+        over: bool,
+    }
+
+    impl Reader {
+        /// Read `pipe` on a thread, keeping at most `cap` bytes; no pipe is a pipe at its end.
+        pub fn new(
+            pipe: Option<impl Read + Send + 'static>,
+            cap: ByteBudget,
+        ) -> std::io::Result<Self> {
+            let capture = pipe
+                .map(|pipe| {
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::Builder::new()
+                        .name("ipe-child-capture".to_owned())
+                        .spawn(move || {
+                            let _ = tx.send(capture(pipe, cap));
+                        })
+                        .map(|_| rx)
+                })
+                .transpose()?;
+            Ok(Self {
+                capture,
+                kept: Vec::new(),
+                over: false,
+            })
+        }
+
+        /// Collect the thread's result if it arrived, returning whether it did.
+        pub fn pump(&mut self) -> bool {
+            let Some(capture) = self.capture.as_ref() else {
+                return false;
+            };
+            match capture.try_recv() {
+                Ok((kept, over)) => {
+                    self.kept = kept;
+                    self.over = over;
+                    self.capture = None;
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.capture = None;
+                    false
+                }
+            }
+        }
+
+        /// Whether the pipe has not reached its end.
+        pub const fn is_open(&self) -> bool {
+            self.capture.is_some()
+        }
+
+        /// Whether more than the cap arrived.
+        pub const fn is_over(&self) -> bool {
+            self.over
+        }
+
+        /// The bytes kept.
+        pub fn into_kept(self) -> Vec<u8> {
+            self.kept
+        }
+    }
+
+    /// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
+    ///
+    /// The flag reports whether anything past `cap` arrived. The pipe is drained to
+    /// its end so the child never blocks on a full pipe.
+    fn capture(mut pipe: impl Read, cap: ByteBudget) -> (Vec<u8>, bool) {
+        let mut kept = Vec::new();
+        let _ = (&mut pipe).take(cap.get()).read_to_end(&mut kept);
+        let over = std::io::copy(&mut pipe, &mut std::io::sink()).is_ok_and(|rest| rest > 0);
+        (kept, over)
+    }
+
+    /// A stdin pipe fed from a buffer on its own thread.
+    pub struct Feed {
+        /// Signalled once the write ended, until it is seen.
+        done: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Feed {
+        /// Write `bytes` to `pipe` on a thread, then close it.
+        pub fn new(
+            mut pipe: impl std::io::Write + Send + 'static,
+            bytes: Zeroizing<Vec<u8>>,
+        ) -> std::io::Result<Self> {
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("ipe-child-stdin".to_owned())
+                .spawn(move || {
+                    // A child that exits without reading its stdin is judged by
+                    // its exit status, not by this write.
+                    let _ = pipe.write_all(&bytes);
+                    let _ = tx.send(());
+                })?;
+            Ok(Self { done: Some(rx) })
+        }
+
+        /// Whether the write ended since the last pump.
+        pub fn pump(&mut self) -> bool {
+            let ended = self
+                .done
+                .as_ref()
+                .is_some_and(|done| !matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            if ended {
+                self.done = None;
+            }
+            ended
+        }
+    }
 }
 
 /// The one constructor of a `git` child, with its environment and configuration fixed.
@@ -2466,11 +2653,12 @@ pub fn curl_refusal(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_BUDGETS, Budget, BudgetPairing, ByteBudget, CappedReadError, Captured, EntryBudget,
-        FetchBudget, GITHUB_API, Git, IngestLimit, IngestRefusal, IngestSource, LocalRefusal,
-        LocalSource, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES, MAX_WALL_SECS, Mode, PACKAGE_SOURCE,
-        PackageName, RefsCeiling, RunError, Staging, Stream, Transfer, TreeCeiling, Usage,
-        WallBudget, curl_limit_args, curl_refusal, measure, read_capped, run_core,
+        ALL_BUDGETS, Budget, BudgetPairing, ByteBudget, CHILD_STDERR_MAX_BYTES, CappedReadError,
+        Captured, EntryBudget, FetchBudget, GITHUB_API, Git, IngestLimit, IngestRefusal,
+        IngestSource, LocalRefusal, LocalSource, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES,
+        MAX_WALL_SECS, Mode, PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream,
+        Transfer, TreeCeiling, Usage, WallBudget, curl_limit_args, curl_refusal, measure,
+        read_capped, run_core,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -3231,6 +3419,105 @@ mod tests {
         let wide = unstaged().with_stdout(bytes(2 * 1024 * 1024));
         let run = run(sh("cat"), Some(&input), None, &wide);
         assert!(matches!(run, Ok(ref captured) if captured.stdout.len() == input.len()));
+    }
+
+    /// How many threads of this process carry a name starting with `prefix`.
+    #[cfg(target_os = "linux")]
+    fn threads_named(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("list this process's threads")
+            .filter_map(Result::ok)
+            .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+            .filter(|name| name.starts_with(prefix))
+            .count()
+    }
+
+    /// Kill the escaped process whose ID a child wrote to `pid_file`.
+    #[cfg(target_os = "linux")]
+    fn kill_escaped(pid_file: &std::path::Path) {
+        let pid = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("the child wrote the escaped process's ID");
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+    }
+
+    /// A process that left the transfer's group and holds its output pipes
+    /// ends the run within the grace, and no thread of the CLI waits on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_setsid_grandchild_holding_stdout_returns_within_the_grace_and_leaves_no_thread() {
+        let dir = scratch();
+        let pid_file = dir.path().join("escaped.pid");
+        // The escaped process writes its own ID once it has left the group, and
+        // the child exits only then: the group kill at exit cannot reach it.
+        let mut command = sh(
+            "setsid sh -c 'echo $$ > \"$0\"; exec sleep 30' \"$0\" & i=0; while [ ! -s \"$0\" ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done; exit 0",
+        );
+        command.arg(&pid_file);
+        let started = Instant::now();
+        let run = run(command, None, None, &unstaged());
+        let elapsed = started.elapsed();
+        let lingering = threads_named("ipe-child-");
+        kill_escaped(&pid_file);
+        assert!(
+            matches!(run, Err(RunError::PipeDrainTimeout(Stream::Stdout))),
+            "{run:?}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+        assert_eq!(lingering, 0, "a pipe thread outlived the run");
+    }
+
+    /// A process that left the group holding stdin unread neither hangs the
+    /// run nor leaves a thread writing to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grandchild_that_never_reads_stdin_leaves_no_feeding_thread() {
+        let dir = scratch();
+        let pid_file = dir.path().join("escaped.pid");
+        let mut command = sh(
+            "exec 3<&0; setsid sh -c 'echo $$ > \"$0\"; exec sleep 30' \"$0\" <&3 3<&- >/dev/null 2>&1 & i=0; while [ ! -s \"$0\" ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done; exit 0",
+        );
+        command.arg(&pid_file);
+        let input = vec![b'x'; 1024 * 1024];
+        let run = run(command, Some(&input), None, &unstaged());
+        let lingering = threads_named("ipe-child-");
+        kill_escaped(&pid_file);
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()),
+            "{run:?}"
+        );
+        assert_eq!(lingering, 0, "a feeding thread outlived the run");
+    }
+
+    /// Stderr past its ceiling is cut, never a refusal and never a hang.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_over_its_ceiling_alone_is_truncated_not_hung() {
+        let cap = CHILD_STDERR_MAX_BYTES.get();
+        let script = format!("head -c {} /dev/zero >&2", cap.saturating_mul(3));
+        let run = run(sh(&script), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()
+                && captured.stdout.is_empty()
+                && u64::try_from(captured.stderr.len()).ok() == Some(cap)),
+            "{run:?}"
+        );
+    }
+
+    /// A child is refused the moment its stdout passes the ceiling, not when it exits.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_writing_past_its_stdout_ceiling_is_killed_before_it_exits() {
+        let slow = unstaged().with_wall(wall(20));
+        let started = Instant::now();
+        let run = run(sh("head -c 17 /dev/zero; exec sleep 30"), None, None, &slow);
+        assert!(
+            matches!(run, Err(RunError::Exceeded(IngestLimit::Bytes(CAP)))),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// The isolated git reads no user or system configuration and runs no hook.

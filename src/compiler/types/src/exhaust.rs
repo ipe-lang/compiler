@@ -41,7 +41,7 @@ use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, SortedNames, Span, TypeError};
 use ipe_intern::{Interner, Symbol};
 
-use crate::homed::{HomedDiagnostic, HomedWarning};
+use crate::homed::{HomedWarning, InferError};
 use crate::ty::Ty;
 
 /// Solved scrutinee types, keyed the way [`crate::SolvedTypes::regions`] is:
@@ -580,7 +580,7 @@ fn check_param_irrefutable(pat: &canon::Pattern) -> DResult<()> {
 /// abort compilation. A finding [`HomedWarning::new`] refuses (any non-Warning
 /// severity) becomes the returned error instead.
 ///
-/// Every returned error carries the `home` of the definition that owns it. In a
+/// Every returned source error is sited at the `home` of the definition that owns it. In a
 /// linked program spans are byte offsets local to their own source file, so a
 /// span alone cannot name its file: two modules overlap freely, and a finding
 /// in one would otherwise be framed against whichever module's definition
@@ -591,17 +591,17 @@ fn check_param_irrefutable(pat: &canon::Pattern) -> DResult<()> {
 /// * [`TypeError::NonExhaustiveCase`] when the arms miss a value.
 /// * [`TypeError::WildcardCoversKnownConstructors`] (the first one, in
 ///   definition order) when a catch-all arm hides constructors of a closed union.
-/// * [`Diagnostic::CompilerBug`] if a constructor symbol cannot be resolved
-///   (homeless: it belongs to no single definition).
+/// * [`InferError::Program`] carrying a [`Diagnostic::CompilerBug`] if a
+///   constructor symbol cannot be resolved (it belongs to no single definition).
 pub fn check(
     module: &canon::Module,
     extra_unions: &[&canon::Union],
     regions: &Regions,
     interner: &mut Interner,
     warnings: &mut Vec<HomedWarning>,
-) -> Result<(), HomedDiagnostic> {
-    let sigs = Sigs::build(module, extra_unions, interner).map_err(|d| (d, Vec::new()))?;
-    let mut first_error: Option<HomedDiagnostic> = None;
+) -> Result<(), InferError> {
+    let sigs = Sigs::build(module, extra_unions, interner).map_err(InferError::unsited)?;
+    let mut first_error: Option<InferError> = None;
     for def in &module.defs {
         let home = def.home();
         let (patterns, body) = match def {
@@ -610,11 +610,11 @@ pub fn check(
         };
         // Every function-def head parameter is a binding position.
         for p in patterns {
-            check_param_irrefutable(p).map_err(|d| (d, home.to_vec()))?;
+            check_param_irrefutable(p).map_err(|d| InferError::sited_at_path(d, home))?;
         }
         let mut findings: Vec<Diagnostic> = Vec::new();
         check_expr(body, home, &sigs, regions, interner, &mut findings)
-            .map_err(|d| (d, home.to_vec()))?;
+            .map_err(|d| InferError::sited_at_path(d, home))?;
         for finding in findings {
             match HomedWarning::new(finding, home) {
                 Ok(warning) => warnings.push(warning),

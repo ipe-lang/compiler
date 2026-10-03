@@ -1,0 +1,16 @@
+-- fuzz-hole call
+--   base: String.length s
+--   mutant: String.nosuchfn_@sfx@ s
+-- fuzz-slot sfx : Hex4
+-- fuzz-expect IPE-N0005
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+main =
+    let
+        s = "hello"
+    in
+    Io.println (String.fromInt (@call@))

@@ -1,0 +1,15 @@
+module Lib exposing (evenLen, oddLen)
+
+
+-- Mutually-recursive untyped pair, polymorphic in the element type. The
+-- boundary promotion must generalize the GROUP so importers can use it at
+-- several element types.
+evenLen xs =
+    case xs of
+        [] -> True
+        _ :: rest -> oddLen rest
+
+oddLen xs =
+    case xs of
+        [] -> False
+        _ :: rest -> evenLen rest

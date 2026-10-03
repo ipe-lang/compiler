@@ -355,13 +355,13 @@ impl From<&str> for IpeError {
     }
 }
 
-/// A generic `E: From<String>` error sink (as `tui_app`/`tui_app_ui` take)
-/// that can ALSO classify a refusal as `Unavailable` — the retryable kind —
-/// instead of folding every string into `Unexpected` through the blanket
-/// `From<String>` bridge above. Implemented only for `IpeError`: no call site
-/// instantiates those generic functions with any other `E`, so the extra
-/// bound costs nothing while keeping the "no terminal" refusal correctly
-/// kinded for the one type that ever carries it.
+/// A generic error sink that can classify a refusal as `Unavailable`.
+///
+/// A kernel generic over `E: From<String>` (`tui_app`, the blocking-pool file
+/// and process kernels) reports a missing terminal or a refused thread through
+/// this bound instead of folding the text into `Unexpected` through the blanket
+/// `From<String>` bridge above. `IpeError` carries the retryable kind; a bare
+/// `String` sink, which has no kind, keeps the message.
 pub trait FromUnavailable {
     fn from_unavailable(message: String) -> Self;
 }
@@ -369,6 +369,12 @@ pub trait FromUnavailable {
 impl FromUnavailable for IpeError {
     fn from_unavailable(message: String) -> Self {
         Self::unavailable(message)
+    }
+}
+
+impl FromUnavailable for String {
+    fn from_unavailable(message: String) -> Self {
+        message
     }
 }
 

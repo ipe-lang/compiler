@@ -1,0 +1,148 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Result as Result
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking
+-- `Result` kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe.
+
+
+type alias Fns =
+    { step : Int -> Int
+    , check : Int -> Result String Int
+    , loud : String -> String
+    , add : Int -> Int -> Int
+    , add3 : Int -> Int -> Int -> Int
+    , add4 : Int -> Int -> Int -> Int -> Int
+    , add5 : Int -> Int -> Int -> Int -> Int -> Int
+    }
+
+
+type Holder
+    = Holder (Int -> Int)
+
+
+positive : Int -> Result String Int
+positive n =
+    if n > 0 then
+        Ok n
+
+    else
+        Err "neg"
+
+
+fns : Fns
+fns =
+    { step = \n -> n * 10
+    , check = positive
+    , loud = \s -> s ++ "!"
+    , add = \a b -> a + b
+    , add3 = \a b c -> a + b + c
+    , add4 = \a b c d -> a + b + c + d
+    , add5 = \a b c d e -> a + b + c + d + e
+    }
+
+
+two : Result String Int
+two =
+    Ok 2
+
+
+bad : Result String Int
+bad =
+    Err "e"
+
+
+show : Result String Int -> String
+show r =
+    case r of
+        Ok n ->
+            String.fromInt n
+
+        Err e ->
+            e
+
+
+showAll : Result String (List Int) -> String
+showAll r =
+    case r of
+        Ok ns ->
+            String.fromInt (List.length ns)
+
+        Err e ->
+            e
+
+
+direct : Fns -> List String
+direct f =
+    [ show (Result.map f.step two)
+    , show (Result.andThen f.check two)
+    , show (Result.mapError f.loud bad)
+    , show (Result.map2 f.add two two)
+    , show (Result.map3 f.add3 two two two)
+    , show (Result.map4 f.add4 two two two two)
+    , show (Result.map5 f.add5 two two two two two)
+    , showAll (Result.traverse f.check [ 1, 2, 3 ])
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ show ((Result.map f.step) two)
+    , show (two |> Result.andThen f.check)
+    , show (Result.mapError f.loud <| bad)
+    , show (two |> Result.map2 f.add two)
+    ]
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            show (Result.map p two)
+
+
+fromTuple : ( String -> String, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            show (Result.mapError p bad) ++ String.fromInt n
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { check } =
+    showAll (Result.traverse check [ 1, 0 ])
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.add3
+    in
+    show (Result.map3 g two two two)
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    show (Result.andThen (if flag then f.check else fns.check) bad)
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\n -> n + 1))
+                   , fromTuple ( \s -> s ++ "?", 7 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf True fns
+                   ]
+            )
+        )

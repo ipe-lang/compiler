@@ -1,0 +1,19 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+-- fuzz-slot s1 : Lower 1 6
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+type alias Point =
+    { x : Int, y : Int, label : String }
+
+
+main =
+    let
+        p0 = { x = @n1@, y = @n2@, label = "@s1@" }
+        p1 = { p0 | x = p0.x + 1, label = "updated" }
+    in
+    Io.println (String.fromInt p1.x ++ "-" ++ p1.label)

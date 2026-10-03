@@ -57,42 +57,12 @@ use crate::EmitCtx;
 use crate::doc::{ChainOperand, Doc};
 use crate::emit_expr::{
     call_has_kernel_special_case, callee_name, clone_targets_in_expr, combine_guards,
-    emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, free_vars,
+    emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, free_vars, infix,
     inlined_let_body, once_closure_bug, record_struct_name, swapped_container_clone_rewrite,
     wants_arc_ctor,
 };
 use crate::emit_types::{GenericScope, render_type};
 use ipe_ir::once_closure::{ClosureParts, ClosureSite, admitted_once_parts};
-
-/// The infix spelling of a chain-eligible operator (never `Append` / `IntDiv`
-/// / `Int{Add,Sub,Mul}` / `Add`/`Sub`/`Mul`, which are all call-shaped).
-/// Kept in step with `emit_expr::op_str`.
-const fn chain_op_str(op: BinOp) -> Option<&'static str> {
-    match op {
-        BinOp::FloatAdd => Some("+"),
-        BinOp::FloatSub => Some("-"),
-        BinOp::FloatMul => Some("*"),
-        BinOp::Div => Some("/"),
-        BinOp::Eq => Some("=="),
-        BinOp::Neq => Some("!="),
-        BinOp::Lt => Some("<"),
-        BinOp::Gt => Some(">"),
-        BinOp::Le => Some("<="),
-        BinOp::Ge => Some(">="),
-        BinOp::And => Some("&&"),
-        BinOp::Or => Some("||"),
-        // Call-shaped: never infix chain operators.
-        // `Add`/`Sub`/`Mul` emit `.ipe_wrapping_{add,sub,mul}(r)` method calls.
-        BinOp::Add
-        | BinOp::Sub
-        | BinOp::Mul
-        | BinOp::Append
-        | BinOp::IntDiv
-        | BinOp::IntAdd
-        | BinOp::IntSub
-        | BinOp::IntMul => None,
-    }
-}
 
 /// Build a [`Doc`] for `expr`. Mirrors [`emit_expr_at`]'s arm structure; the
 /// token leaves are byte-identical to the string emitter's output.
@@ -127,7 +97,7 @@ pub fn build_doc(
         // A chain-eligible infix operator: flatten the maximal left-nested
         // same-operator run into a `Doc::Chain`, carrying every paren the string
         // emitter emits as a `Text` leaf.
-        Expr::BinOp { op, lhs, rhs } if chain_op_str(*op).is_some() => {
+        Expr::BinOp { op, lhs, rhs } if infix(*op).is_some() => {
             build_binop_chain(ctx, *op, lhs, rhs, indent, child, generics)
         }
 
@@ -634,7 +604,17 @@ fn build_binop_chain(
     depth: u16,
     generics: GenericScope,
 ) -> DResult<Doc> {
-    let opstr = chain_op_str(op).unwrap_or("");
+    // `build_binop_chain` is only reached from the arm that already proved
+    // `infix(op).is_some()`; `None` here means that guard and this callee
+    // disagree, a real bug, not a routing accident — fail closed with a typed
+    // diagnostic rather than a panic or an empty-string sentinel.
+    let Some(sym) = infix(op) else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::emit_doc::build_binop_chain",
+            detail: format!("{op:?} reached build_binop_chain but `infix` returned None"),
+        });
+    };
+    let opstr = sym.spelling();
 
     // Walk down the left spine while it is the SAME operator, collecting the
     // right operands. `spine` ends up outermost..innermost; reverse to source
@@ -1906,7 +1886,7 @@ const fn arm_body_is_control(body: &Expr) -> bool {
         Expr::If { .. } | Expr::Let { .. } | Expr::Destructure { .. } | Expr::Update { .. } => true,
         // A chain-eligible binary operator renders `(a + b)` and wraps when broken;
         // the call-shaped `Append` / `IntDiv` are leaves (delimited-tail).
-        Expr::BinOp { op, .. } => chain_op_str(*op).is_some(),
+        Expr::BinOp { op, .. } => infix(*op).is_some(),
         // Delimited-tail (breaks inside its own brackets) or a single-line leaf.
         _ => false,
     }

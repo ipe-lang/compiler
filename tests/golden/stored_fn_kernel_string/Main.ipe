@@ -1,0 +1,119 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking
+-- `String` kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe.
+
+
+type alias Fns =
+    { swap : Char -> Char
+    , keep : Char -> Bool
+    , count : Char -> Int -> Int
+    }
+
+
+type Holder
+    = Holder (Char -> Bool)
+
+
+swapB : Char -> Char
+swapB c =
+    if c == 'b' then
+        'x'
+
+    else
+        c
+
+
+fns : Fns
+fns =
+    { swap = swapB
+    , keep = \c -> c /= 'a'
+    , count = \_c n -> n + 1
+    }
+
+
+word : String
+word =
+    "abba"
+
+
+boolText : Bool -> String
+boolText b =
+    if b then
+        "T"
+
+    else
+        "F"
+
+
+direct : Fns -> List String
+direct f =
+    [ String.map f.swap word
+    , String.filter f.keep word
+    , String.fromInt (String.foldl f.count 0 word)
+    , String.fromInt (String.foldr f.count 0 word)
+    , boolText (String.any f.keep word)
+    , boolText (String.all f.keep word)
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ (String.map f.swap) word
+    , word |> String.filter f.keep
+    , String.fromInt (word |> String.foldl f.count 0)
+    ]
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            String.filter p word
+
+
+fromTuple : ( Char -> Char, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            String.map p word ++ String.fromInt n
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { keep } =
+    boolText (String.any keep word)
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.count
+    in
+    String.fromInt (String.foldr g 0 word)
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    boolText (String.all (if flag then f.keep else fns.keep) "bb")
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\c -> c == 'a'))
+                   , fromTuple ( \_c -> 'z', 3 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf True fns
+                   ]
+            )
+        )

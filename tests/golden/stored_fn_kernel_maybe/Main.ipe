@@ -1,0 +1,123 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking `Maybe`
+-- kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe.
+
+
+type alias Fns =
+    { step : Int -> Int
+    , half : Int -> Maybe Int
+    , add : Int -> Int -> Int
+    , add3 : Int -> Int -> Int -> Int
+    , add4 : Int -> Int -> Int -> Int -> Int
+    , add5 : Int -> Int -> Int -> Int -> Int -> Int
+    }
+
+
+type Holder
+    = Holder (Int -> Int)
+
+
+halve : Int -> Maybe Int
+halve n =
+    if modBy 2 n == 0 then
+        Just (n // 2)
+
+    else
+        Nothing
+
+
+fns : Fns
+fns =
+    { step = \n -> n * 10
+    , half = halve
+    , add = \a b -> a + b
+    , add3 = \a b c -> a + b + c
+    , add4 = \a b c d -> a + b + c + d
+    , add5 = \a b c d e -> a + b + c + d + e
+    }
+
+
+two : Maybe Int
+two =
+    Just 2
+
+
+show : Maybe Int -> String
+show m =
+    String.fromInt (Maybe.withDefault 0 m)
+
+
+direct : Fns -> List String
+direct f =
+    [ show (Maybe.map f.step two)
+    , show (Maybe.andThen f.half two)
+    , show (Maybe.map2 f.add two two)
+    , show (Maybe.map3 f.add3 two two two)
+    , show (Maybe.map4 f.add4 two two two two)
+    , show (Maybe.map5 f.add5 two two two two two)
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ show ((Maybe.map f.step) two)
+    , show (two |> Maybe.andThen f.half)
+    , show (Maybe.map f.step <| two)
+    , show (two |> Maybe.map2 f.add two)
+    ]
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            show (Maybe.map p two)
+
+
+fromTuple : ( Int -> Maybe Int, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            show (Maybe.map (\v -> v + n) (Maybe.andThen p two))
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { add } =
+    show (Maybe.map2 add two two)
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.half
+    in
+    show (Maybe.andThen g two)
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    show (Maybe.map (if flag then f.step else fns.step) two)
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\n -> n + 1))
+                   , fromTuple ( halve, 5 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf False fns
+                   ]
+            )
+        )

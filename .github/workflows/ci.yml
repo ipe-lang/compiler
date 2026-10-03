@@ -60,13 +60,18 @@ permissions:
 
 concurrency:
   # A pull request run cancels the previous run for the same ref, so devs get
-  # fast feedback without wasting runner minutes. A push run is keyed by its
+  # fast feedback without wasting runner minutes. A merge-group run cancels
+  # too: the queue re-creates a ref only when a PR re-enters it, so a running
+  # run on the same merge-group ref is always stale and would otherwise hold
+  # its runners while the new run waits. A failed merge-group entry is
+  # re-queued, never re-run: a re-run joins its ref's group and cancels the
+  # live run of a re-entered PR. A push run is keyed by its
   # commit: GitHub replaces a queued run in a group whenever a newer one joins
   # it (whatever cancel-in-progress says), so a per-ref push group lets a
   # newer main commit discard an older one's run before it starts, leaving
   # that commit's main-required contexts never reported.
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -148,15 +153,51 @@ jobs:
   # (a target/ directory, an .rlib/.rmeta/.o/.a/.so/.dylib/.wasm blob) or any file
   # over 5 MiB turns this red. Regenerable build output committed once bloats every
   # future clone and can only be purged from history by a human-run rewrite;
-  # this keeps the tree clean going forward. No toolchain needed — pure git +
-  # shell, so it stays on the
-  # fast required PR path.
+  # this keeps the tree clean going forward. The same required job runs the CI
+  # check-disposition gate (`verify-manifest.py` and the CI tooling's refusal
+  # tests), so no CI invariant rests on an advisory context. No Rust toolchain
+  # needed — git, shell and Python only, so it stays on the fast required PR path.
   artifact-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reject committed build artifacts
         run: .github/ci/artifact-guard.sh
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install PyYAML
+        run: 'PIP_CONFIG_FILE=/dev/null python3 -m pip install --isolated --require-hashes --only-binary :all: -r "$GITHUB_WORKSPACE/.github/ci/requirements.txt"'
+      - name: Every produced check has exactly one declared disposition
+        run: python3 .github/ci/verify-manifest.py
+      - name: Prove the workflow-step refusals (unit tests)
+        run: python3 .github/ci/test_verify_manifest.py -v
+      - name: Prove the strict-YAML loader refusals (unit tests)
+        run: python3 .github/ci/test_strict_yaml.py -v
+      - name: Prove the fail-closed change-classifier refusals (unit tests)
+        run: python3 .github/ci/test_change_class.py -v
+      - name: The e2e shards and their cover run exactly the SSOT plan
+        run: python3 .github/ci/e2e_shard.py --lint
+      - name: Prove the e2e shard-partition refusals (unit tests)
+        run: python3 .github/ci/test_e2e_shard.py -v
+      - name: Reruns fire only on infrastructure; no test retries
+        run: python3 .github/ci/rerun_policy.py --lint
+      - name: Prove the rerun-policy refusals (unit tests)
+        run: python3 .github/ci/test_rerun_policy.py -v
+      - name: A red nightly blocks the next merge (nightly-green wiring)
+        run: python3 .github/ci/nightly_green.py --lint
+      - name: Prove the nightly-green refusals (unit tests)
+        run: python3 .github/ci/test_nightly_green.py -v
+      - name: Prove the trust-root parser and merge-decision refusals (unit tests)
+        run: python3 .github/ci/test_trust_roots.py -v
+      - name: Prove the local-gate refusals (unit tests)
+        run: python3 .github/ci/test_local_gate.py -v
+      - name: Prove the cargo-invocation reader refusals (unit tests)
+        run: python3 .github/ci/test_cargo_invocation.py -v
+      - name: Prove the test-claims table refusals (unit tests)
+        run: python3 .github/ci/test_claims_table.py -v
+      - name: The derived required-set is in sync with the manifest
+        run: python3 .github/ci/check_required_set.py
 
   # Cargo.lock must agree with the version Cargo.toml declares. Fail-closed
   # backstop to the release-please sync-cargo-lock job: a version-desynced tree
@@ -292,35 +333,37 @@ jobs:
           bash tools/scripts/tests/test-require-tool.sh
           bash tools/scripts/lint-diagnostic-tone.sh
 
-  # Doctest-style gate: every unmarked ```ipe block in src/compiler/diagnostics/explain/*.md
-  # must type-check. A page that teaches broken syntax is worse than no page (ADR 0059).
-  # Requires `ipe` binary (type-check only — no emit, no cargo, no IPE_E2E).
-  # Fence-marker convention:
-  #   ```ipe            default — MUST type-check
-  #   ```ipe ipe:error  intentional bad example — gate fails if it compiles
-  #   ```ipe ipe:skip   pseudocode / FFI / multi-file — skipped entirely
-  # Change-gated: explain pages live under src/** (already in the `code` filter),
-  # so a prose-only PR legitimately skips this gate.
+  # Doctest-style gate (ADR 0059): every fenced ```ipe block on every registry
+  # explain page and every docs/constructs and docs/topics page is judged
+  # in-process through the build front end (`ipe::front_check_entry`), short of
+  # cargo. The checker is `src/ipe-cli/tests/explain_examples.rs`.
+  # Fence info strings:
+  #   ```ipe                      MUST be accepted
+  #   ```ipe ipe:error            explain page: refused with the page's own code
+  #   ```ipe ipe:error IPE-XNNNN  docs page: refused with exactly that code
+  #   ```ipe ipe:skip <reason>    not compiled; the reason is required
+  # Any other `ipe…` info string is refused. A known failing block is listed in
+  # `tests/explain_examples/known_rot.txt`, which may only shrink.
+  # Change-gated: explain pages live under src/** (already in the `code` filter).
   explain-examples:
     name: explain-page example gate (ADR 0059)
     runs-on: ubuntu-latest
-    needs: [changes, quick-check, build-tools]
+    needs: [changes, quick-check]
     # Change-gated: runs on a change that touches src/**.
     if: needs.changes.outputs.cheap == 'true' && needs.changes.outputs.code == 'true'
     env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          name: ci-ipe-release
-          path: ${{ runner.temp }}/ipe-release
-      - name: Mark the prebuilt ipe executable
-        run: chmod +x "$RUNNER_TEMP/ipe-release/ipe"
-      - name: Compile every explain-page example
-        env:
-          IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
-        run: bash tools/scripts/check-explain-examples.sh
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Judge every explain-page and docs-page example
+        run: cargo nextest run -p ipe --test explain_examples --profile ci
 
   # Every fenced ```ipe block in every {-| … -} doc-string in the standard
   # library must type-check. A doc-string edit that introduces a broken example
@@ -918,6 +961,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      # `dev-posture` is the dev-intent build outside `full`; its pins prove a
+      # dev build on a loopback listener opens each dev-only surface.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
       # `debugger` is a build-mode opt-in outside `full`; named here so its
       # overlay and recorder tests run.
       - run: cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
@@ -1187,7 +1233,7 @@ jobs:
           # `.github/ci/e2e_shard.py`: shards 1-5 spread the heavy cold-build
           # goldens, shards 6-14 the heavy-free complement, all from the
           # prebuilt archive (no recompile). `seal-slice` proves the plan
-          # partitions the archive's test set exactly, and manifest-guard
+          # partitions the archive's test set exactly, and artifact-guard
           # (`e2e_shard.py --lint`) pins this matrix and this wiring.
           SHARD_FILTER: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].filter }}
           SHARD_PARTITION: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].partition }}
@@ -1752,8 +1798,8 @@ jobs:
   # fork PR rather than attempted and denied.
   #
   # `.github/ci/deterministic-checks.json` is the SSOT of (job, check step)
-  # pairs; `ci/verify-manifest.py` (run in
-  # `manifest-guard.yml`) fails the build if this job's `needs:` differs from
+  # pairs; `ci/verify-manifest.py` (run in the
+  # required `artifact-guard` job) fails the build if this job's `needs:` differs from
   # that file's job set or a listed step name is not in the job's steps.
   cancel-on-cheap-red:
     runs-on: ubuntu-latest

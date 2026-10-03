@@ -1661,6 +1661,21 @@ pub enum LowerError {
         /// The dotted kernel name that was partially applied (e.g. `Store.eq`).
         kernel: Box<str>,
     },
+    /// An intercept-only `Store.*` kernel was applied outside its rewrite context.
+    ///
+    /// `Store.add`, `Store.literal`, `Store.coalesce`, … have no runtime
+    /// function: `Store.select` reads them structurally as projection elements,
+    /// and the accessor leaves are rewritten only as a saturated direct call. A
+    /// call anywhere else (a plain forwarder `bump a b = Store.add a b`, an
+    /// over-application) would emit the never-defined placeholder symbol
+    /// (`store_add`, …), a `cargo` E0425. `kernel` is the dotted name; `context`
+    /// is the one place its rewrite runs. [IPE-L0146]
+    AccessorKernelOffIntercept {
+        /// The dotted kernel name that was misplaced (e.g. `Store.add`).
+        kernel: Box<str>,
+        /// The only context in which this kernel's rewrite runs.
+        context: InterceptContext,
+    },
     /// A kernel whose handler the backend re-wraps per call was used unsaturated.
     ///
     /// `Stream.stream` rebuilds its handler for every request and clones each
@@ -1752,6 +1767,36 @@ pub enum StoreEqAccessorDefect {
         /// The derived column name that failed the identifier charset gate.
         column: Box<str>,
     },
+}
+
+/// The only context in which an intercept-only `Store.*` kernel is rewritten.
+///
+/// Carried by [`LowerError::AccessorKernelOffIntercept`] so the help text is
+/// chosen by the kernel's role, never by matching its name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum InterceptContext {
+    /// A projection element (`Store.add`, `Store.literal`, `Store.upper`, …),
+    /// valid only as a direct element of a `Store.select` projection body.
+    SelectProjection,
+    /// An accessor leaf or builder (`Store.eq`, `Store.serial`, …), valid only
+    /// as a saturated direct call.
+    SaturatedCall,
+}
+
+/// Where an intercept-only `Store.*` kernel may appear, as one phrase.
+///
+/// The single wording source for [`InterceptContext`], shared by the help line
+/// and the rendered prose and label.
+#[must_use]
+pub const fn intercept_context_phrase(context: InterceptContext) -> &'static str {
+    match context {
+        InterceptContext::SelectProjection => {
+            "valid only as a direct element of a `Store.select` projection body"
+        }
+        InterceptContext::SaturatedCall => {
+            "valid only as a saturated direct call, with its accessor and every argument"
+        }
+    }
 }
 
 /// Why a `Store.select` projection lambda was rejected at lowering. Each variant
@@ -2433,7 +2478,8 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::WildcardAnyFieldTypeMismatch { .. } => IPE_L0143,
         LowerError::WildcardAnyArgNotRecord { .. } => IPE_L0144,
         LowerError::StoreEqAccessorInvalid(_) => IPE_L0145,
-        LowerError::PointFreeAccessorKernel { .. } => IPE_L0146,
+        LowerError::PointFreeAccessorKernel { .. }
+        | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
@@ -2905,6 +2951,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::WildcardAnyArgNotRecord { .. } => wildcard_any_arg_not_record_help(),
         LowerError::StoreEqAccessorInvalid(defect) => store_eq_accessor_invalid_help(defect),
         LowerError::PointFreeAccessorKernel { kernel } => point_free_accessor_kernel_help(kernel),
+        LowerError::AccessorKernelOffIntercept { kernel, context } => {
+            accessor_kernel_off_intercept_help(kernel, *context)
+        }
         LowerError::UnsaturatedHandlerKernel { kernel } => unsaturated_handler_kernel_help(kernel),
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
@@ -2966,6 +3015,29 @@ fn point_free_accessor_kernel_help(kernel: &str) -> Vec<HelpLine> {
              .field value`. If you need a function value (say for `List.map` or \
              `Result.map`), wrap it in a lambda that supplies the accessor: \
              `\\x -> {kernel} .field x`."
+        )
+        .into_boxed_str(),
+    )]
+}
+
+/// The help lines for [`LowerError::AccessorKernelOffIntercept`], factored out
+/// so [`lower_help`] stays a thin per-variant dispatcher.
+fn accessor_kernel_off_intercept_help(kernel: &str, context: InterceptContext) -> Vec<HelpLine> {
+    let phrase = intercept_context_phrase(context);
+    let fix = match context {
+        InterceptContext::SelectProjection => format!(
+            "move it into the projection lambda, for example \
+             `Store.select (\\( item, _ ) -> {kernel} item.price (Store.literal 1))`; \
+             outside a query, write the plain expression instead"
+        ),
+        InterceptContext::SaturatedCall => {
+            format!("apply it directly, for example `{kernel} .field value`")
+        }
+    };
+    vec![HelpLine::Note(
+        format!(
+            "`{kernel}` has no runtime function: the compiler rewrites it in place, \
+             so it is {phrase}. Here it is called somewhere else; {fix}."
         )
         .into_boxed_str(),
     )]

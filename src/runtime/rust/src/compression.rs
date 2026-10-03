@@ -8,7 +8,7 @@
 //!
 //! gzip/zstd (de)compression is CPU-bound and can take non-trivial wall time
 //! on large payloads. Every kernel here offloads its work to
-//! `tokio::task::spawn_blocking` so it can't stall the tokio worker thread
+//! tokio's blocking pool (`threads::run_blocking`) so it can't stall the tokio worker thread
 //! that's polling the returned future. Running the work INLINE on the calling
 //! thread before the future is polled would block every other task scheduled
 //! on that worker for the call's full duration. See
@@ -24,20 +24,25 @@
 use super::*;
 use std::io::{Read, Write};
 
+/// The decompression output cap: `IPE_DECOMPRESS_MAX_BYTES`, default 256 MiB;
+/// `0` admits only empty output.
+const DECOMPRESS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_DECOMPRESS_MAX_BYTES",
+    256 * 1024 * 1024,
+    crate::system::ZeroCeiling::Accepted,
+    "decimal byte count",
+);
+
 /// Returns the decompression output cap in bytes.
 ///
-/// Reads `IPE_DECOMPRESS_MAX_BYTES` from the environment once (lazily) and
-/// caches the result. Falls back to 256 MiB when the variable is absent or
-/// unparseable.
-fn decompress_max_bytes() -> u64 {
+/// Reads [`DECOMPRESS_CEILING`] once (lazily) and caches the outcome, so a
+/// malformed value fails every decompression closed rather than falling back.
+fn decompress_max_bytes() -> Result<u64, String> {
     use std::sync::OnceLock;
-    static CAP: OnceLock<u64> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        crate::system::read_env_var("IPE_DECOMPRESS_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(256 * 1024 * 1024) // 256 MiB
-    })
+    static CAP: OnceLock<Result<u64, crate::system::EnvCeilingRefusal>> = OnceLock::new();
+    CAP.get_or_init(|| DECOMPRESS_CEILING.read())
+        .clone()
+        .map_err(String::from)
 }
 
 fn gzip_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -55,7 +60,7 @@ fn gunzip_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
     // identically either way, so this is a pure completeness fix, not a
     // behavior change for the common case.
     use flate2::read::MultiGzDecoder;
-    let max = decompress_max_bytes();
+    let max = decompress_max_bytes()?;
     let d = MultiGzDecoder::new(data);
     // Read up to max+1 bytes; if we fill the buffer exactly at max+1 the
     // input would expand beyond the cap.
@@ -76,79 +81,95 @@ fn zstd_compress_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd::encode_all(data, 0).map_err(|e| e.to_string())
 }
 
+/// Runs the CPU-bound `f` for `kernel` on the blocking pool, as the caller's error.
+///
+/// Every error is prefixed with `kernel`; a pool that cannot start a thread is
+/// kinded `Unavailable`, and a panic in `f` is the `panicked` message.
+///
+/// # Errors
+///
+/// `f` failed, no thread could be started for it, or it panicked.
+async fn offloaded<E, F>(
+    kernel: &'static str,
+    panicked: &'static str,
+    f: F,
+) -> IpeResult<E, Vec<u8>>
+where
+    E: From<String> + crate::FromUnavailable,
+    F: FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+{
+    match crate::threads::run_blocking(kernel, panicked, move || {
+        f().map_err(|e| format!("{kernel}: {e}"))
+    })
+    .await
+    {
+        Ok(b) => ok_res(b),
+        Err(e) => IpeResult::Err(e),
+    }
+}
+
 /// Compression.gzip : Bytes -> Task Error Bytes
-pub fn compression_gzip<E: From<String> + Send + 'static>(data: Vec<u8>) -> IpeTask<E, Vec<u8>> {
+pub fn compression_gzip<E: From<String> + crate::FromUnavailable + Send + 'static>(
+    data: Vec<u8>,
+) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
         // gzip is CPU-bound; offload to the blocking pool so it can't
         // starve the tokio worker thread polling this future (same rationale
-        // as auth.rs's bcrypt spawn_blocking). The `compression` Cargo
-        // feature ALWAYS pulls in `tokio` (`compression = ["flate2", "zstd",
-        // "tokio"]`, runtime/Cargo.toml), so this module can call
-        // `tokio::task::spawn_blocking` unconditionally — no `cfg` needed.
-        match tokio::task::spawn_blocking(move || gzip_bytes(&data)).await {
-            Ok(Ok(b)) => ok_res(b),
-            Ok(Err(e)) => IpeResult::Err(format!("Compression.gzip: {}", e).into()),
-            Err(_) => IpeResult::Err(
-                "Compression.gzip: compression task panicked"
-                    .to_string()
-                    .into(),
-            ),
-        }
+        // as auth.rs's bcrypt offload).
+        offloaded(
+            "Compression.gzip",
+            "Compression.gzip: compression task panicked",
+            move || gzip_bytes(&data),
+        )
+        .await
     })
 }
 
 /// Compression.gunzip : Bytes -> Task Error Bytes
-pub fn compression_gunzip<E: From<String> + Send + 'static>(data: Vec<u8>) -> IpeTask<E, Vec<u8>> {
+pub fn compression_gunzip<E: From<String> + crate::FromUnavailable + Send + 'static>(
+    data: Vec<u8>,
+) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
-        match tokio::task::spawn_blocking(move || gunzip_bytes(&data)).await {
-            Ok(Ok(b)) => ok_res(b),
-            Ok(Err(e)) => IpeResult::Err(format!("Compression.gunzip: {}", e).into()),
-            Err(_) => IpeResult::Err(
-                "Compression.gunzip: decompression task panicked"
-                    .to_string()
-                    .into(),
-            ),
-        }
+        offloaded(
+            "Compression.gunzip",
+            "Compression.gunzip: decompression task panicked",
+            move || gunzip_bytes(&data),
+        )
+        .await
     })
 }
 
 /// Compression.zstdCompress : Bytes -> Task Error Bytes
-pub fn compression_zstd_compress<E: From<String> + Send + 'static>(
+pub fn compression_zstd_compress<E: From<String> + crate::FromUnavailable + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
-        match tokio::task::spawn_blocking(move || zstd_compress_bytes(&data)).await {
-            Ok(Ok(b)) => ok_res(b),
-            Ok(Err(e)) => IpeResult::Err(format!("Compression.zstdCompress: {}", e).into()),
-            Err(_) => IpeResult::Err(
-                "Compression.zstdCompress: compression task panicked"
-                    .to_string()
-                    .into(),
-            ),
-        }
+        offloaded(
+            "Compression.zstdCompress",
+            "Compression.zstdCompress: compression task panicked",
+            move || zstd_compress_bytes(&data),
+        )
+        .await
     })
 }
 
 /// Compression.zstdDecompress : Bytes -> Task Error Bytes
-pub fn compression_zstd_decompress<E: From<String> + Send + 'static>(
+pub fn compression_zstd_decompress<E: From<String> + crate::FromUnavailable + Send + 'static>(
     data: Vec<u8>,
 ) -> IpeTask<E, Vec<u8>> {
     Box::pin(async move {
-        match tokio::task::spawn_blocking(move || zstd_decompress_capped(&data)).await {
-            Ok(Ok(b)) => ok_res(b),
-            Ok(Err(e)) => IpeResult::Err(format!("Compression.zstdDecompress: {}", e).into()),
-            Err(_) => IpeResult::Err(
-                "Compression.zstdDecompress: decompression task panicked"
-                    .to_string()
-                    .into(),
-            ),
-        }
+        offloaded(
+            "Compression.zstdDecompress",
+            "Compression.zstdDecompress: decompression task panicked",
+            move || zstd_decompress_capped(&data),
+        )
+        .await
     })
 }
 
 fn zstd_decompress_capped(data: &[u8]) -> Result<Vec<u8>, String> {
     use zstd::stream::read::Decoder as ZstdDecoder;
-    let max = decompress_max_bytes();
+    let max = decompress_max_bytes()?;
     let d = ZstdDecoder::new(data).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     d.take(max.saturating_add(1))
@@ -166,6 +187,11 @@ fn zstd_decompress_capped(data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(DECOMPRESS_CEILING);
+    }
     use crate::task::task_run;
 
     #[test]

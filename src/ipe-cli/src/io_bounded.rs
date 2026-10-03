@@ -54,12 +54,6 @@ pub const BUILD_CACHE_ENTRY_CAP: u64 = 64 * 1024 * 1024;
 /// planted multi-GiB file before it is buffered.
 pub const SESSION_TRACE_READ_CAP: u64 = 16 * 1024 * 1024;
 
-/// Maximum bytes for the Tier-2 probe wrapper source.
-///
-/// The POSIX jail passes the source as one argv string, and Linux refuses a
-/// single argument past 128 KiB; 64 KiB stays under that with room for growth.
-pub const PROBE_WRAPPER_READ_CAP: u64 = 64 * 1024;
-
 /// Maximum bytes for miscellaneous small CLI-internal files (lock files,
 /// index entries, OAuth tokens, Cargo profile fragments, etc.).
 pub const SMALL_FILE_READ_CAP: u64 = 1024 * 1024;

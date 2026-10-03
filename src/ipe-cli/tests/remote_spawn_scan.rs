@@ -38,9 +38,10 @@ const COMMAND_ALIAS: &str = "Commandas";
 /// names a local tool; a variable names a program the CLI resolved itself (its
 /// own binary, the toolchain's `cargo`, a wasm tool, the FFI inspector payload,
 /// a `doctor` install `argv`, a platform opener). The `sh` site runs the
-/// installer script `remote_ingest` already downloaded within its ceilings. A
-/// mention of `Command::new` that is not called in place is listed under the
-/// empty expression.
+/// installer script `remote_ingest` already downloaded within its ceilings; the
+/// `/bin/ps` site reads the CLI's own signal dispositions through
+/// `remote_ingest::run_probe`. A mention of `Command::new` that is not called
+/// in place is listed under the empty expression.
 const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
     ("audit.rs", "\"cargo-deny\"", 2),
     ("audit_native.rs", "&cargo", 1),
@@ -78,6 +79,9 @@ const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
     ("publish.rs", "\"open\"", 1),
     ("publish.rs", "\"xdg-open\"", 1),
     ("secret_file/tests.rs", "\"mkfifo\"", 1),
+    ("terminate.rs", "\"/bin/ps\"", 1),
+    ("terminate.rs", "\"/bin/sh\"", 3),
+    ("terminate.rs", "\"sleep\"", 2),
     ("toolchain.rs", "", 1),
     ("toolchain.rs", "\"cargo\"", 1),
     ("watch.rs", "OsStr::new(\"cargo\")", 3),

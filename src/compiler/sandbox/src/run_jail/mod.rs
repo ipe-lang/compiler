@@ -1173,7 +1173,7 @@ mod tests {
             tree_bind,
             // A bind of the whole home must not survive its mask.
             vec![home_bind],
-            HomeMasks::resolve(Some(&user_home), None).expect("homes"),
+            HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
         );
         let argv: Vec<String> = run_jail_argv(
             &tools(),
@@ -1442,7 +1442,7 @@ mod tests {
                 CanonicalPath::assumed("/work/tmp-1"),
                 canonical(&tree),
                 vec![canonical(&bin)],
-                HomeMasks::resolve(Some(&user_home), None).expect("homes"),
+                HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
             );
             let argv: Vec<OsString> = run_jail_argv(
                 &tools(),

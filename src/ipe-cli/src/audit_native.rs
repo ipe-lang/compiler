@@ -645,8 +645,6 @@ pub struct NativeAudit<'a> {
     /// `src/ffi.rs` carrying the FFI wrappers, and `Cargo.toml`). The Tier-2 probe
     /// crate is emitted into it and its `cargo build` is the untrusted exercise.
     pub emitted_dir: &'a Path,
-    /// The absolute path to the wrapper-owned admission probe fixture.
-    pub probe_fixture: PathBuf,
 }
 
 /// The static-scan reachability over the package's author FFI wrapper Rust.
@@ -973,10 +971,10 @@ fn native_tier2_on_platform(audit: &NativeAudit) -> Result<Tier2Outcome, CliErro
     //    sandbox-unavailable reject (never a silent skip on a wired platform).
     let tools = establish_jail_tools()?;
 
-    // The wrapper owns the per-axis exit contract, so the jailed payload must
-    // never be able to rewrite it: its source is read once on the host and never
-    // kept in the payload-writable scratch between runs.
-    let wrapper = TrustedWrapper::read(&audit.probe_fixture)?;
+    // The wrapper owns the per-axis exit contract, so nothing on disk may stand in
+    // for it: the source is the bytes compiled into this binary, never kept in the
+    // payload-writable scratch between runs.
+    let wrapper = TrustedWrapper::embedded();
     let working_tree = scratch.as_path().join("worktree");
     std::fs::create_dir_all(&working_tree).map_err(|e| CliError::Io {
         path: working_tree.clone(),
@@ -1581,10 +1579,11 @@ impl ToolchainHomes {
     ///   toolchain the host `cargo` never uses.
     /// - [`CliError::PackageAudit`] per [`Self::from_homes`].
     pub fn of_invoker() -> Result<Self, CliError> {
+        let user_home = crate::env_dir::home().ok();
         Self::from_homes(
-            crate::env_dir::tool_home("CARGO_HOME", ".cargo")?,
-            crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?,
-            crate::env_dir::home(),
+            crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
+            crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
+            user_home,
         )
     }
 
@@ -1597,13 +1596,13 @@ impl ToolchainHomes {
     /// contains the cargo home (a Rustup home at or above it), which would
     /// expose `credentials.toml` inside the jail.
     pub fn from_homes(
-        cargo_home: Option<PathBuf>,
-        rustup_home: Option<PathBuf>,
-        user_home: Option<PathBuf>,
+        cargo_home: Option<crate::env_dir::ToolHome>,
+        rustup_home: Option<crate::env_dir::ToolHome>,
+        user_home: Option<crate::env_dir::HomeDir>,
     ) -> Result<Self, CliError> {
-        let cargo_home = existing_jail_path(cargo_home)?;
-        let rustup_home = existing_jail_path(rustup_home)?;
-        let user_home = existing_jail_path(user_home)?;
+        let cargo_home = existing_jail_path(cargo_home.map(|home| home.as_path().to_path_buf()))?;
+        let rustup_home = existing_jail_path(rustup_home.map(|home| home.as_path().to_path_buf()))?;
+        let user_home = existing_jail_path(user_home.map(|home| home.as_path().to_path_buf()))?;
         let mut ro_binds = Vec::new();
         if let Some(cargo) = &cargo_home {
             for dir in CARGO_HOME_TOOL_DIRS {
@@ -2160,11 +2159,92 @@ impl JailProbeRunner<'_> {
 ))]
 const WRAPPER_ARGV0: &str = "ipe-tier2-probe";
 
-/// The exit-owning probe wrapper's source, read once on the host.
+/// The POSIX `/bin/sh` admission probe wrapper, compiled in from the tracked fixture.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+const TIER2_PROBE_POSIX: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/admission/untrusted-build.sh"
+));
+
+/// The Windows PowerShell admission probe wrapper, compiled in from the tracked fixture.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+const TIER2_PROBE_WINDOWS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/admission/untrusted-build.ps1"
+));
+
+/// Maximum bytes of an embedded Tier-2 wrapper source.
 ///
-/// The jailed payload can write its scratch, so the wrapper never lives there
-/// between runs: POSIX passes the source inline (`sh -c`), Windows stages it per
-/// run under a fresh name no earlier run could plant.
+/// The POSIX jail passes the source as one argv string, and Linux refuses a
+/// single argument past 128 KiB; 64 KiB stays under that with room for growth.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+const PROBE_WRAPPER_INLINE_ARG_CAP: usize = 64 * 1024;
+
+// An embedded fixture past the cap would be refused by the kernel at every
+// native audit, so the build refuses it first.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an embedded Tier-2 wrapper outgrows the inline argv cap [ledger #boundary]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+const _: () = assert!(
+    TIER2_PROBE_POSIX.len() <= PROBE_WRAPPER_INLINE_ARG_CAP
+        && TIER2_PROBE_WINDOWS.len() <= PROBE_WRAPPER_INLINE_ARG_CAP
+);
+
+/// The exit-owning probe wrapper's source: the bytes compiled into this binary.
+///
+/// No constructor reads a file, so nothing on disk can stand in for the wrapper
+/// between a write and a read-back. The jailed payload can write its scratch, so
+/// the wrapper never lives there between runs: POSIX passes the source inline
+/// (`sh -c`), Windows stages it per run under a fresh name no earlier run could
+/// plant.
+///
+/// Stable rustdoc does not check a `compile_fail` error code, so the refusals
+/// below are paired with a control that compiles the same path: each refusal
+/// can only fail on the missing `read` or the private `source` field.
+///
+/// ```
+/// let source: &'static str = ipe::audit_native::TrustedWrapper::embedded().source();
+/// assert!(!source.is_empty());
+/// ```
+///
+/// ```compile_fail,E0599
+/// let _ = ipe::audit_native::TrustedWrapper::read(std::path::Path::new("w.sh"));
+/// ```
+///
+/// ```compile_fail,E0451
+/// let _ = ipe::audit_native::TrustedWrapper { source: "exit 0" };
+/// ```
 #[cfg(any(
     all(
         target_os = "linux",
@@ -2176,7 +2256,7 @@ const WRAPPER_ARGV0: &str = "ipe-tier2-probe";
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedWrapper {
-    source: String,
+    source: &'static str,
 }
 
 #[cfg(any(
@@ -2189,22 +2269,24 @@ pub struct TrustedWrapper {
     target_os = "windows"
 ))]
 impl TrustedWrapper {
-    /// Read the wrapper at `path`, a host file the jail never binds writable.
+    /// The platform-native wrapper compiled into this binary.
     ///
-    /// # Errors
-    /// [`CliError::Io`] when `path` cannot be read or is not UTF-8;
-    /// [`CliError::FileTooLarge`] past
-    /// [`crate::io_bounded::PROBE_WRAPPER_READ_CAP`], which keeps the inline
-    /// source within one argv string.
-    pub fn read(path: &Path) -> Result<Self, CliError> {
-        crate::io_bounded::read_to_string_capped(path, crate::io_bounded::PROBE_WRAPPER_READ_CAP)
-            .map(|source| Self { source })
+    /// Windows gets the PowerShell `.ps1` (its jail runs `payload[0]` with no
+    /// shell); every other wired platform gets the POSIX `/bin/sh` script.
+    #[must_use]
+    pub const fn embedded() -> Self {
+        let source = if cfg!(target_os = "windows") {
+            TIER2_PROBE_WINDOWS
+        } else {
+            TIER2_PROBE_POSIX
+        };
+        Self { source }
     }
 
     /// The wrapper source.
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
+    pub const fn source(&self) -> &'static str {
+        self.source
     }
 }
 
@@ -2805,6 +2887,53 @@ mod tests {
         );
     }
 
+    /// The trusted wrapper is the tracked fixture's bytes, compiled in.
+    ///
+    /// Each embedded constant equals its tracked file (the files stay the single
+    /// source of truth), and `embedded()` selects the platform-native one.
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    #[test]
+    fn the_trusted_wrapper_is_the_compiled_in_fixture() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/admission");
+        let posix = std::fs::read_to_string(base.join("untrusted-build.sh"))
+            .expect("read the tracked POSIX probe fixture");
+        let windows = std::fs::read_to_string(base.join("untrusted-build.ps1"))
+            .expect("read the tracked Windows probe fixture");
+        assert_eq!(
+            posix, TIER2_PROBE_POSIX,
+            "embedded POSIX wrapper = tracked file"
+        );
+        assert_eq!(
+            windows, TIER2_PROBE_WINDOWS,
+            "embedded Windows wrapper = tracked file"
+        );
+        let native = if cfg!(target_os = "windows") {
+            &windows
+        } else {
+            &posix
+        };
+        // Pins the field the `compile_fail,E0451` doctest names: `source`, a
+        // `&'static str` no runtime read can produce.
+        let field: &'static str = TrustedWrapper::embedded().source;
+        assert_eq!(
+            field,
+            native.as_str(),
+            "the wrapper Tier-2 runs is the platform-native compiled-in fixture"
+        );
+        assert_ne!(
+            posix, windows,
+            "the two platform wrappers are distinct sources"
+        );
+    }
+
     #[cfg(unix)]
     mod staged_wrapper {
         use super::*;
@@ -2902,14 +3031,27 @@ mod tests {
             CanonicalPath::resolve(path).expect("canonical")
         }
 
+        /// A tool home over the absolute test path `path`, spelled as given.
+        fn tool(path: &Path) -> crate::env_dir::ToolHome {
+            ipe_sandbox::home::tool_home_from("CARGO_HOME", Some(path.into()), None, ".cargo")
+                .expect("an absolute test tool home")
+                .expect("a set tool home")
+        }
+
+        /// A user home over the absolute test path `path`, spelled as given.
+        fn user(path: &Path) -> crate::env_dir::HomeDir {
+            crate::env_dir::HomeDir::try_parse(Some(path.as_os_str().to_owned()))
+                .expect("an absolute test home")
+        }
+
         #[test]
         fn the_payload_names_exactly_the_canonical_paths_the_jail_binds() {
             let tree = tree();
             let link = &tree.link;
             let toolchain = ToolchainHomes::from_homes(
-                Some(link.join("cargo")),
-                Some(link.join("rustup")),
-                Some(link.clone()),
+                Some(tool(&link.join("cargo"))),
+                Some(tool(&link.join("rustup"))),
+                Some(user(link)),
             )
             .expect("disjoint homes resolve");
             let tools = RunJailTools {
@@ -2919,9 +3061,7 @@ mod tests {
             };
             let exercise = ProbeExercise::real_build(vec![OsString::from("cargo")], toolchain)
                 .expect("non-empty argv");
-            let wrapper = TrustedWrapper {
-                source: String::from("exit 0"),
-            };
+            let wrapper = TrustedWrapper { source: "exit 0" };
             let runner = JailProbeRunner::new(
                 &tools,
                 wrapper,
@@ -2982,16 +3122,14 @@ mod tests {
 
         fn probe_runner<'a>(
             tools: &'a RunJailTools,
-            source: &str,
+            source: &'static str,
             scoped_tmp: CanonicalPath,
             working_tree: CanonicalPath,
             ro_binds: Vec<CanonicalPath>,
         ) -> Result<JailProbeRunner<'a>, CliError> {
             JailProbeRunner::new(
                 tools,
-                TrustedWrapper {
-                    source: String::from(source),
-                },
+                TrustedWrapper { source },
                 scoped_tmp,
                 working_tree,
                 ro_binds,
@@ -3092,7 +3230,8 @@ mod tests {
             let tree = tree();
             let cargo = tree.link.join("cargo");
             for rustup in [cargo.clone(), tree.link] {
-                let refused = ToolchainHomes::from_homes(Some(cargo.clone()), Some(rustup), None);
+                let refused =
+                    ToolchainHomes::from_homes(Some(tool(&cargo)), Some(tool(&rustup)), None);
                 assert!(
                     matches!(
                         refused,
@@ -3111,9 +3250,9 @@ mod tests {
             let tree = tree();
             let absent = tree.link.join("absent");
             let toolchain = ToolchainHomes::from_homes(
-                Some(absent.clone()),
-                Some(absent.clone()),
-                Some(absent),
+                Some(tool(&absent)),
+                Some(tool(&absent)),
+                Some(user(&absent)),
             )
             .expect("absent homes are skipped");
             assert!(toolchain.ro_binds().is_empty());

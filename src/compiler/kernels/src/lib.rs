@@ -1208,13 +1208,32 @@ const _: () = assert!(
     "a kernel's sync_obliged_scheme_vars names a variable its scheme_shape does not carry at an aligned position",
 );
 
-/// Whether every [`StdlibKernel::shared_fn_kernel_arg`] index of `kernels` is below its kernel's arity.
+/// How a function-typed kernel argument slot receives a function value.
+///
+/// A stored function (a record field, a constructor payload, a tuple component,
+/// a collection element) is carried as `Arc<dyn Fn>`, which implements no `Fn`
+/// trait. Every function-typed slot of a kernel scheme is [`Self::Direct`]
+/// unless the backend re-wraps that argument on the `Arc` carrier itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FnSlotCarrier {
+    /// The runtime parameter takes a direct `Fn` value, so a stored read is eta-converted first.
+    ///
+    /// The parameter is an `impl Fn`, a generic `F: Fn`, or a `Box<dyn Fn>`.
+    Direct,
+    /// The backend rebuilds the argument as an `Arc` callback, so a stored read passes unchanged.
+    AcceptsShared,
+}
+
+/// Whether every capture-cloned handler of `kernels` sits at an [`FnSlotCarrier::AcceptsShared`] slot.
 #[must_use]
-pub const fn shared_fn_kernel_args_fit_arity(kernels: &[StdlibKernel]) -> bool {
+pub const fn capture_cloned_handlers_accept_shared(kernels: &[StdlibKernel]) -> bool {
     let mut rest = kernels;
     while let Some((kernel, tail)) = rest.split_first() {
-        if let Some(index) = kernel.shared_fn_kernel_arg()
-            && index >= kernel.decl().arity as usize
+        if let Some(index) = kernel.capture_cloned_handler_arg()
+            && !matches!(
+                kernel.fn_slot_carrier(index),
+                Some(FnSlotCarrier::AcceptsShared)
+            )
         {
             return false;
         }
@@ -1223,11 +1242,11 @@ pub const fn shared_fn_kernel_args_fit_arity(kernels: &[StdlibKernel]) -> bool {
     true
 }
 
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a demoted bare-`impl Fn` kernel slot names an argument past its kernel's arity, which would leave a stored `Arc<dyn Fn>` undemoted (E0277) [ledger #boundary]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a handler the backend re-wraps as an `Arc` callback is not derived as an `AcceptsShared` function slot, which would eta-convert a value the backend expects to re-wrap [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
-    shared_fn_kernel_args_fit_arity(StdlibKernel::ALL),
-    "a kernel's shared_fn_kernel_arg index is not below its arity",
+    capture_cloned_handlers_accept_shared(StdlibKernel::ALL),
+    "a kernel's capture_cloned_handler_arg is not an AcceptsShared function slot",
 );
 
 /// Whether `shape`'s final result, past every arrow, is an app carrier (a `Program` or the opaque `WebApp` leaf).
@@ -2107,15 +2126,6 @@ pub enum StdlibKernel {
     TaskWithMaxAttempts,
     /// `Task.withBaseMs : Int -> RetryPolicy e -> RetryPolicy e`
     TaskWithBaseMs,
-    // ── BackoffStrategy constructors ────────────────────────────────────────
-    /// `Task.Linear : BackoffStrategy` — constant delay, no jitter.
-    BackoffLinear,
-    /// `Task.LinearWithJitter : BackoffStrategy` — constant delay with jitter.
-    BackoffLinearWithJitter,
-    /// `Task.Exponential : BackoffStrategy` — doubling delay, no jitter.
-    BackoffExponential,
-    /// `Task.ExponentialWithJitter : BackoffStrategy` — doubling delay with jitter.
-    BackoffExponentialWithJitter,
     // ── Io ──────────────────────────────────────────────────────────────────
     IoReadLine,
     /// `Io.readSecret : String -> Task Error Secret` — write a prompt, then read
@@ -4943,32 +4953,6 @@ impl StdlibKernel {
                 IpeOrder,
             ),
             Self::TaskWithBaseMs => d("Task", "withBaseMs", 2, Pure, "task_with_base_ms", IpeOrder),
-            // ── BackoffStrategy constructors ─────────────────────────────────
-            Self::BackoffLinear => d("Task", "Linear", 0, Pure, "backoff_linear", IpeOrder),
-            Self::BackoffLinearWithJitter => d(
-                "Task",
-                "LinearWithJitter",
-                0,
-                Pure,
-                "backoff_linear_with_jitter",
-                IpeOrder,
-            ),
-            Self::BackoffExponential => d(
-                "Task",
-                "Exponential",
-                0,
-                Pure,
-                "backoff_exponential",
-                IpeOrder,
-            ),
-            Self::BackoffExponentialWithJitter => d(
-                "Task",
-                "ExponentialWithJitter",
-                0,
-                Pure,
-                "backoff_exponential_with_jitter",
-                IpeOrder,
-            ),
             // ── Io ──────────────────────────────────────────────────────────
             Self::IoReadLine => d("Io", "readLine", 1, Pure, "io_read_line", IpeOrder),
             Self::IoReadSecret => d("Io", "readSecret", 1, Pure, "io_read_secret", IpeOrder),
@@ -7968,11 +7952,6 @@ impl StdlibKernel {
         Self::TaskDefaultRetryPolicy,
         Self::TaskWithMaxAttempts,
         Self::TaskWithBaseMs,
-        // BackoffStrategy constructors
-        Self::BackoffLinear,
-        Self::BackoffLinearWithJitter,
-        Self::BackoffExponential,
-        Self::BackoffExponentialWithJitter,
         // Io
         Self::IoReadLine,
         Self::IoReadSecret,
@@ -11458,8 +11437,6 @@ impl StdlibKernel {
         const RETRY_ON: TyShape = TyShape::Fun(&A_TO_BOOL, &RETRY_POLICY_TO_RETRY_POLICY);
         // `retryWith : RetryPolicy Error -> Task e a -> Task e a`. var(0) = a.
         const RETRY_WITH: TyShape = TyShape::Fun(&RETRY_POLICY_ERROR, &TASK_A_TO_TASK_A);
-        // `BackoffStrategy` nullary constructors.
-        const BACKOFF_STRATEGY_CON: TyShape = TyShape::Con(BuiltinTag::BackoffStrategy, &[]);
         // App-entry whole signatures — `cfg -> Program <shape> msg`.
         // Each entry builder returns the uniform shape carrier `Program shape msg`
         // (not `Task ()`): the phantom `shape` tag distinguishes the surface at
@@ -12866,10 +12843,6 @@ impl StdlibKernel {
             Self::TaskDefaultRetryPolicy => Some(&RETRY_POLICY),
             Self::TaskWithMaxAttempts | Self::TaskWithBaseMs => Some(&INT_TO_RETRY_TO_RETRY),
             Self::TaskRetryWith => Some(&RETRY_WITH),
-            Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter => Some(&BACKOFF_STRATEGY_CON),
             // App-entry cfg records.
             Self::WebApp => Some(&WEB_APP),
             Self::WebEmbed => Some(&WEB_EMBED),
@@ -13985,10 +13958,6 @@ impl StdlibKernel {
             | Self::TaskDefaultRetryPolicy
             | Self::TaskWithMaxAttempts
             | Self::TaskWithBaseMs
-            | Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter
             | Self::IoReadLine
             | Self::IoReadSecret
             | Self::IoWriteStdout
@@ -15559,30 +15528,16 @@ impl StdlibKernel {
     /// OFF the qualifier whitelist; their proven-pure members are admitted one
     /// by one by NAME ([`Self::is_reactor_free_time_or_system`]), so a new
     /// member of either defaults to reactor-requiring until it is audited and
-    /// listed. `Task` is likewise mixed and never gets a qualifier entry: its
-    /// reactor members are named below and its pure `BackoffStrategy`
-    /// constructors are named here.
+    /// listed. `Task` is likewise mixed and never gets a qualifier entry.
     ///
     /// Not `const`: the whole-family arms compare the kernel's canonical
     /// qualifier (`&str`), which stable Rust cannot match in a `const fn`.
     #[must_use]
     pub fn requires_async_runtime(self) -> bool {
-        // `BackoffStrategy` constructors are pure zero-arity values under the
-        // mixed `Task` qualifier; they carry no future and never touch the
-        // reactor, so they are admitted by name. Every other `Task` member —
-        // `Task.run` / `Task.perform` block on an inner task of unknown purity,
-        // `Task.parallel` spawns, `Task.retryWith` sleeps, `Task.attempt`
-        // bridges into the TEA loop — has no qualifier entry and falls to the
-        // reactor-requiring default below.
-        if matches!(
-            self,
-            Self::BackoffLinear
-                | Self::BackoffLinearWithJitter
-                | Self::BackoffExponential
-                | Self::BackoffExponentialWithJitter
-        ) {
-            return false;
-        }
+        // Every `Task` member — `Task.run` / `Task.perform` block on an inner
+        // task of unknown purity, `Task.parallel` spawns, `Task.retryWith`
+        // sleeps, `Task.attempt` bridges into the TEA loop — has no qualifier
+        // entry and falls to the reactor-requiring default below.
         // The proven-pure members of the mixed `Time` / `System` families are
         // admitted one by one by NAME, so a new member of either family
         // defaults to reactor-requiring below.
@@ -15832,21 +15787,27 @@ impl StdlibKernel {
         }
     }
 
-    /// The argument index of a bare `impl Fn` parameter that rejects a stored `Arc<dyn Fn>`.
+    /// The carrier of this kernel's argument `arg`, or `None` when `arg` is not a function slot.
     ///
-    /// `json_enc_list`'s element encoder and `task_loop`'s step are bare
-    /// `impl Fn` slots: a function read out of a storage carrier (a record
-    /// field, a `case`-bound payload — each an `Arc<dyn Fn>`) does not
-    /// `impl Fn`, so the lowerer eta-demotes it onto the `Box` carrier at this
-    /// index. The lowerer also flattens a curried spine headed by such a kernel
-    /// (`f |> Task.loop n s`, `Task.loop n s <| f`) into the saturated call
-    /// before the arity split, so the demotion sees every argument. The index
-    /// is checked against the kernel's arity at build time.
+    /// Derived from the kernel scheme alone: an argument below the arity whose
+    /// scheme position is an arrow is a function slot. It is
+    /// [`FnSlotCarrier::AcceptsShared`] when the backend re-wraps the kernel's
+    /// callback as an `Arc` ([`Self::requires_sync_capture`]), and
+    /// [`FnSlotCarrier::Direct`] otherwise. A scheme-variable position (`a`
+    /// instantiated at a function) is not a function slot.
     #[must_use]
-    pub const fn shared_fn_kernel_arg(self) -> Option<usize> {
-        match self {
-            Self::JsonEncList => Some(0),
-            Self::TaskLoop => Some(2),
+    pub const fn fn_slot_carrier(self, arg: usize) -> Option<FnSlotCarrier> {
+        if arg >= self.decl().arity as usize {
+            return None;
+        }
+        let Some(shape) = self.scheme_shape() else {
+            return None;
+        };
+        match spine_arg(shape, arg) {
+            Some(TyShape::Fun(..)) if self.requires_sync_capture() => {
+                Some(FnSlotCarrier::AcceptsShared)
+            }
+            Some(TyShape::Fun(..)) => Some(FnSlotCarrier::Direct),
             _ => None,
         }
     }
@@ -16890,13 +16851,6 @@ mod tests {
                     | StdlibKernel::SystemCwd
                     | StdlibKernel::SystemExit
             );
-            let pure_backoff = matches!(
-                k,
-                StdlibKernel::BackoffLinear
-                    | StdlibKernel::BackoffLinearWithJitter
-                    | StdlibKernel::BackoffExponential
-                    | StdlibKernel::BackoffExponentialWithJitter
-            );
             // The families that are pure in whole: every member resolves without
             // the reactor. Distinct from the qualifier list in production only
             // in that this test re-derives it from the audited-purity judgement
@@ -16932,7 +16886,7 @@ mod tests {
                     | "Io"
                     | "Sql"
             );
-            pure_time_system || pure_backoff || pure_whole_family
+            pure_time_system || pure_whole_family
         };
         for k in StdlibKernel::ALL {
             let q = k.decl().qualifier;
@@ -17643,9 +17597,35 @@ mod tests {
         // Its emit arm carries the `Step` bridge, so a point-free reference is
         // eta-expanded rather than boxed as a bare runtime function.
         assert!(StdlibKernel::TaskLoop.requires_saturated_emit());
-        // Its step is a bare `impl Fn` slot a stored `Arc<dyn Fn>` read is
-        // demoted at, directly and through a pipe.
-        assert_eq!(StdlibKernel::TaskLoop.shared_fn_kernel_arg(), Some(2));
+        // Its step is a direct function slot a stored `Arc<dyn Fn>` read is
+        // converted at.
+        assert_eq!(
+            StdlibKernel::TaskLoop.fn_slot_carrier(2),
+            Some(super::FnSlotCarrier::Direct)
+        );
+    }
+
+    /// Function slots and their carriers come from the kernel scheme, not a per-kernel list.
+    #[test]
+    fn fn_slot_carrier_is_derived_from_the_scheme() {
+        use super::FnSlotCarrier::{AcceptsShared, Direct};
+        assert_eq!(StdlibKernel::ListFilter.fn_slot_carrier(0), Some(Direct));
+        assert_eq!(StdlibKernel::JsonEncList.fn_slot_carrier(0), Some(Direct));
+        // The list argument is data, and an index past the arity is no slot.
+        assert_eq!(StdlibKernel::ListFilter.fn_slot_carrier(1), None);
+        assert_eq!(StdlibKernel::ListFilter.fn_slot_carrier(2), None);
+        // A scheme-variable payload is not a function slot.
+        assert_eq!(StdlibKernel::MaybeWithDefault.fn_slot_carrier(0), None);
+        // The backend re-wraps these callbacks as `Arc` itself.
+        assert_eq!(
+            StdlibKernel::UiOnInput.fn_slot_carrier(0),
+            Some(AcceptsShared)
+        );
+        assert_eq!(
+            StdlibKernel::StreamStream.fn_slot_carrier(1),
+            Some(AcceptsShared)
+        );
+        assert_eq!(StdlibKernel::StreamStream.fn_slot_carrier(0), None);
     }
 
     /// Verifies that no two non-internal variants in [`StdlibKernel::ALL`] share

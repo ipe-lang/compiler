@@ -743,6 +743,46 @@ could not access `{path}` — {kind}
 
 could not create a private scratch directory under the OS temp directory — {kind}
 
+## cli-thread-refused
+
+the OS refused a thread for the {role} — {kind}
+
+## thread-role-watch-session
+
+watch session
+
+## thread-role-watch-coalesce
+
+watch change coalescer
+
+## thread-role-watch-fs-relay
+
+watch filesystem relay
+
+## thread-role-watch-stop-relay
+
+watch stop relay
+
+## thread-role-watch-resolve-retry
+
+watch dependency-resolve retry
+
+## thread-role-watch-compile
+
+watch compile worker
+
+## thread-role-watch-cargo-waiter
+
+watch cargo-build waiter
+
+## thread-role-wasi-wall-clock
+
+WASI wall-clock deadline
+
+## watch-thread-refused
+
+[ipe watch] warning: {detail}; the dependency-resolve retry is skipped
+
 # Publish refusals
 
 ## publish-dirty-tree
@@ -1169,9 +1209,25 @@ package.ipe declares `{delivery}`, but `main` is a `{shape}` app. The web hosts 
 
 package.ipe: `{name}` is already a git/path escape dependency — `ipe add` records only an index requirement and never rewrites an author-written `depGit`/`depGitRev`/`depPath` entry. Edit the escape by hand, or remove it first.
 
-## manifest-entry-invalid
+## manifest-entry-empty-segment
 
-package.ipe: program entry {entry} is not a valid entry file
+package.ipe: program entry {entry} has an empty path segment (a leading, trailing, or doubled `/`). Write the entry relative to `src/`, with segments joined by a single `/`, e.g. `Cli/Main.ipe`.
+
+## manifest-entry-dot-segment
+
+package.ipe: program entry {entry} has a `.` or `..` path segment. An entry names a module file under `src/` directly, e.g. `Cli/Main.ipe`.
+
+## manifest-entry-backslash
+
+package.ipe: program entry {entry} contains a backslash. Separate path segments with `/` on every platform, e.g. `Cli/Main.ipe`.
+
+## manifest-entry-drive-prefix
+
+package.ipe: program entry {entry} starts with a drive prefix. An entry is relative to `src/`, e.g. `Cli/Main.ipe`.
+
+## manifest-entry-extension
+
+package.ipe: program entry {entry} does not end in `.ipe`. An entry names an Ipê source file, e.g. `Cli/Main.ipe`.
 
 ## manifest-entry-segment-invalid
 
@@ -1187,7 +1243,45 @@ package.ipe: program entry {entry} names no module
 
 ## bundle-name-not-a-component
 
-package.ipe: name `{name}` cannot be a macOS bundle directory — a bundle root must be a single path component, but this name introduces a path separator, a `..` traversal, or an absolute path. Choose a name without `/`, `\`, or `..`.
+package.ipe: name `{name}` cannot be a macOS bundle directory — a bundle root must be one directory name that reads back as itself, and this name holds a path separator, a `..` traversal, an absolute path, a NUL byte, or a form the host file system would rewrite (on Windows: a trailing `.` or space, a control character, one of `:*?"<>|`, or a device name such as `NUL`). Choose a plain name without `/`, `\`, `..`, or control characters.
+
+# Mobile shell bundles
+
+## mobile-bundle-no-index
+
+no index.html in the emitted wasm bundle at {dir} — expected a `--target wasm` SPA (index.html + boot script + pkg/*.wasm)
+
+## mobile-bundle-unplaceable
+
+cannot bundle {path} from the emitted wasm bundle: {reason}
+
+## mobile-bundle-too-deep
+
+the emitted wasm bundle nests directories deeper than {limit} levels at {path}
+
+## mobile-bundle-too-many
+
+the emitted wasm bundle holds more than {limit} entries
+
+## mobile-bundle-replaced
+
+the emitted wasm bundle at {path} was replaced after it was collected — build and package again
+
+## mobile-bundle-io
+
+reading {path}: {detail}
+
+## mobile-asset-not-utf8
+
+its name is not valid UTF-8, which a shell asset path cannot carry
+
+## mobile-asset-bad-name
+
+its name is not one plain entry name
+
+## mobile-asset-kind
+
+it is {kind}; only regular files and directories are bundled
 
 # ipe doc
 

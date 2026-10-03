@@ -201,6 +201,11 @@ ipe-test-temp = { path = "../../tools/test-temp" }
 e2e-support = { path = "../../tools/e2e-support" }
 # The by-path catalog reader the FFI negative tests load their own caches with.
 ipe_ffi = { path = "../compiler/ffi", features = ["testing"] }
+# Source scans that read this crate's own syntax tree (comments and literals
+# never match). The same versions and features `panic-scan` already builds into
+# this crate's graph, so no new package compiles.
+proc-macro2 = "1"
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lints]
 workspace = true

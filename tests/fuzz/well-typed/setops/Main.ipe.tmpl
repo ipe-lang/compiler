@@ -1,0 +1,19 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+-- fuzz-slot lst : IntList 1 5 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Set as Set
+import Ipe.String as String
+
+
+main =
+    let
+        s = Set.fromList @lst@
+        s2 = Set.insert @n1@ s
+        hasMember = Set.member @n2@ s2
+        sz = Set.size s2
+        result = if hasMember then sz + 1 else sz
+    in
+    Io.println (String.fromInt result)

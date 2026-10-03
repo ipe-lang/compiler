@@ -49,10 +49,6 @@ const KNOWN_DEAD_OR_EPILOGUE: &[&str] = &[
     "task_with_jitter",
     "task_with_max_attempts",
     "task_with_retry_on",
-    "backoff_linear",
-    "backoff_linear_with_jitter",
-    "backoff_exponential",
-    "backoff_exponential_with_jitter",
     // ── Dead: emit_http_builder_call constructs an HttpRequest struct inline
     //         for these variants; the name string is never used. ─────────────
     "http_default_request",
@@ -509,6 +505,304 @@ fn declared_arg_order_matches_runtime_signature() {
         "a function-taking arity-2 kernel's `ArgOrder` is not proven by its runtime function; \
          fix the row's `ArgOrder` in `StdlibKernel::identity` (the backend swaps and the \
          lowering walks reverse exactly the `ContainerFirst` rows) or the runtime signature:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// How a runtime parameter receives a function value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamCarrier {
+    /// `impl Fn…`, `Box<dyn Fn…>`, or a generic with a [`CALLABLE_BOUND`]: an `Arc<dyn Fn>` is refused.
+    Direct,
+    /// `Arc<dyn Fn…>`: a stored function passes as is.
+    Shared,
+    /// A generic with no bound (a `cfg` stub variant): any value passes.
+    Unconstrained,
+    /// Not a callable type.
+    NotCallable,
+}
+
+/// The [`ParamCarrier`] of each parameter of the runtime fn `header`.
+fn param_carriers(header: &str) -> Option<Vec<ParamCarrier>> {
+    let callable = callable_params(header)?;
+    let (generics, rest) = if header.starts_with('<') {
+        balanced_group(header, '<')?
+    } else {
+        (String::new(), header.to_string())
+    };
+    let (params, tail) = balanced_group(rest.trim_start(), '(')?;
+    let where_clause = tail.split_once("where").map_or("", |(_, w)| w);
+    let bounded: HashSet<String> = split_top_level(&generics)
+        .into_iter()
+        .chain(split_top_level(where_clause))
+        .filter_map(|g| g.split_once(':').map(|(name, _)| name.trim().to_string()))
+        .collect();
+    let unbounded: HashSet<String> = split_top_level(&generics)
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.contains(':') && !bounded.contains(g))
+        .collect();
+    let types: Vec<String> = split_top_level(&params)
+        .iter()
+        .filter_map(|p| p.split_once(':').map(|(_, ty)| ty.trim().to_string()))
+        .collect();
+    if types.len() != callable.len() {
+        return None;
+    }
+    Some(
+        types
+            .iter()
+            .zip(callable)
+            .map(|(ty, is_callable)| {
+                match (is_callable, ty.contains("Arc<"), unbounded.contains(ty)) {
+                    (false, _, true) => ParamCarrier::Unconstrained,
+                    (false, _, false) => ParamCarrier::NotCallable,
+                    (true, true, _) => ParamCarrier::Shared,
+                    (true, false, _) => ParamCarrier::Direct,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The runtime parameter index an Ipê argument fills, past `leading` emit-supplied arguments.
+const fn runtime_param_index(
+    arg: usize,
+    arity: u8,
+    order: ipe_kernels::ArgOrder,
+    leading: usize,
+) -> usize {
+    let ipe_index = match (order, arity, arg) {
+        (ipe_kernels::ArgOrder::ContainerFirst, 2, 0) => 1,
+        (ipe_kernels::ArgOrder::ContainerFirst, 2, 1) => 0,
+        _ => arg,
+    };
+    ipe_index.saturating_add(leading)
+}
+
+/// What a kernel's emit arm does to its function argument before the runtime call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EmitWrap {
+    /// Passed through as lowered.
+    Verbatim,
+    /// Re-wrapped in a fresh `move |x| (f)(x)` closure: either carrier calls through.
+    Closure,
+    /// Re-wrapped in `Arc::new(move |x| (f)(x))`: either carrier calls through.
+    ArcClosure,
+    /// Built with `Arc::new` (`wants_arc_ctor`): the lowered value must be a direct closure.
+    ArcCtor,
+}
+
+/// The emit-side adaptation of a kernel's function argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EmitAdapter {
+    /// Arguments the emit arm supplies ahead of the Ipê arguments (an event name).
+    leading: usize,
+    wrap: EmitWrap,
+}
+
+const VERBATIM: EmitAdapter = EmitAdapter {
+    leading: 0,
+    wrap: EmitWrap::Verbatim,
+};
+
+/// Kernels whose emit arm adapts the function argument.
+///
+/// Mirrors `ipe_backend_rust`'s kernel-call arms (`StreamStream`,
+/// `NativeUiEmit::OnSubmit`, the `HtmlEventShape::String` / `Bool` arms) and
+/// `wants_arc_ctor` (the WebSocket server setters). The test refuses an entry the
+/// verbatim rule already satisfies, so none outlives its need.
+const EMIT_ADAPTERS: [(ipe_kernels::StdlibKernel, EmitAdapter); 11] = {
+    use ipe_kernels::StdlibKernel as K;
+    const CLOSURE: EmitAdapter = EmitAdapter {
+        leading: 0,
+        wrap: EmitWrap::Closure,
+    };
+    const NAMED_ARC_CLOSURE: EmitAdapter = EmitAdapter {
+        leading: 1,
+        wrap: EmitWrap::ArcClosure,
+    };
+    const ARC_CTOR: EmitAdapter = EmitAdapter {
+        leading: 0,
+        wrap: EmitWrap::ArcCtor,
+    };
+    [
+        (K::StreamStream, CLOSURE),
+        (K::UiOnSubmit, CLOSURE),
+        (K::HtmlOnInput, NAMED_ARC_CLOSURE),
+        (K::HtmlOnChange, NAMED_ARC_CLOSURE),
+        (K::HtmlOnKeyDown, NAMED_ARC_CLOSURE),
+        (K::HtmlOnKeyUp, NAMED_ARC_CLOSURE),
+        (K::HtmlOnBool, NAMED_ARC_CLOSURE),
+        (K::WsWithOnConnect, ARC_CTOR),
+        (K::WsWithOnMessage, ARC_CTOR),
+        (K::WsWithOnClose, ARC_CTOR),
+        (K::WsWithOnError, ARC_CTOR),
+    ]
+};
+
+/// Whether a scheme-derived slot carrier, adapted by `wrap`, is honoured by the runtime parameter it fills.
+const fn carrier_agrees(
+    slot: ipe_kernels::FnSlotCarrier,
+    wrap: EmitWrap,
+    param: ParamCarrier,
+) -> bool {
+    use EmitWrap as W;
+    use ParamCarrier as P;
+    use ipe_kernels::FnSlotCarrier as S;
+    match (wrap, slot, param) {
+        (_, _, P::Unconstrained)
+        | (W::Verbatim, S::Direct, P::Direct)
+        | (W::Verbatim, S::AcceptsShared, P::Shared)
+        | (W::Closure, S::Direct | S::AcceptsShared, P::Direct)
+        | (W::ArcClosure, S::Direct | S::AcceptsShared, P::Shared)
+        | (W::ArcCtor, S::Direct, P::Shared) => true,
+        (_, _, P::NotCallable)
+        | (W::Verbatim, S::Direct, P::Shared)
+        | (W::Verbatim, S::AcceptsShared, P::Direct)
+        | (W::Closure, S::Direct | S::AcceptsShared, P::Shared)
+        | (W::ArcClosure, S::Direct | S::AcceptsShared, P::Direct)
+        | (W::ArcCtor, S::AcceptsShared, P::Shared)
+        | (W::ArcCtor, S::Direct | S::AcceptsShared, P::Direct) => false,
+    }
+}
+
+/// Whether each of `kernel`'s function `slots` agrees with the runtime fn `header`.
+///
+/// `Err` names a header this scan cannot read or a slot it cannot place.
+fn slot_verdicts(
+    kernel: ipe_kernels::StdlibKernel,
+    slots: &[(usize, ipe_kernels::FnSlotCarrier)],
+    header: &str,
+    adapter: EmitAdapter,
+) -> Result<Vec<bool>, String> {
+    let def = kernel.def();
+    let carriers = param_carriers(header).ok_or_else(|| {
+        format!(
+            "{kernel:?}: `{}` header unreadable: {header}",
+            def.runtime_fn
+        )
+    })?;
+    slots
+        .iter()
+        .map(|&(arg, slot)| {
+            let index = runtime_param_index(arg, def.arity, def.arg_order, adapter.leading);
+            carriers
+                .get(index)
+                .map(|&param| carrier_agrees(slot, adapter.wrap, param))
+                .ok_or_else(|| {
+                    format!(
+                        "{kernel:?}: arg {arg} fills `{}` parameter {index}, which does not exist",
+                        def.runtime_fn
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Every function slot the scheme derives (`StdlibKernel::fn_slot_carrier`) is the
+/// carrier the runtime parameter it fills takes, after its emit arm's adaptation.
+///
+/// A slot derived `Direct` whose runtime parameter is an `Arc<dyn Fn>` would have a
+/// stored read eta-converted into a `Box` the parameter refuses; a slot derived
+/// `AcceptsShared` whose parameter is an `impl Fn` would pass the `Arc` straight
+/// into it. Both are exit-0-then-cargo-fail. A kernel whose runtime fn this source
+/// scan cannot place is listed, never skipped; a kernel with no runtime fn (an
+/// accessor-intercept placeholder, [`NO_RUNTIME_FN_ARG_ORDER`]) is skipped by name.
+#[test]
+fn derived_fn_slot_carrier_matches_runtime_signature() {
+    use ipe_kernels::StdlibKernel;
+
+    let root = e2e_support::manifest_dir!();
+    let mut sources = Vec::new();
+    read_sources(&root.join("src"), &mut sources);
+    read_sources(
+        &root.join("../../compiler/backend/rust/templates"),
+        &mut sources,
+    );
+    let no_runtime_fn: HashSet<&str> = NO_RUNTIME_FN_ARG_ORDER
+        .into_iter()
+        .chain(
+            StdlibKernel::ACCESSOR_INTERCEPT_PLACEHOLDERS
+                .iter()
+                .map(|k| k.def().runtime_fn),
+        )
+        .collect();
+    let mut confirmed = 0_usize;
+    let mut failures = Vec::new();
+    let mut needed_adapters: Vec<StdlibKernel> = Vec::new();
+    for &kernel in StdlibKernel::ALL {
+        let def = kernel.def();
+        let slots: Vec<(usize, ipe_kernels::FnSlotCarrier)> = (0..usize::from(def.arity))
+            .filter_map(|arg| kernel.fn_slot_carrier(arg).map(|c| (arg, c)))
+            .collect();
+        if slots.is_empty() || no_runtime_fn.contains(def.runtime_fn) {
+            continue;
+        }
+        let adapter = EMIT_ADAPTERS
+            .iter()
+            .find(|(k, _)| *k == kernel)
+            .map_or(VERBATIM, |&(_, a)| a);
+        let headers = runtime_fn_headers(&sources, def.runtime_fn);
+        if headers.is_empty() {
+            failures.push(format!(
+                "{kernel:?}: `{}` has function slots {slots:?} but no runtime `pub fn`",
+                def.runtime_fn
+            ));
+            continue;
+        }
+        for header in &headers {
+            let Some(header) = header.as_deref() else {
+                failures.push(format!(
+                    "{kernel:?}: `{}` header unreadable",
+                    def.runtime_fn
+                ));
+                continue;
+            };
+            match slot_verdicts(kernel, &slots, header, adapter) {
+                Ok(verdicts) => {
+                    for (&(arg, slot), agrees) in slots.iter().zip(verdicts) {
+                        if agrees {
+                            confirmed += 1;
+                        } else {
+                            failures.push(format!(
+                                "{kernel:?}: arg {arg} derived {slot:?} under {adapter:?} \
+                                 disagrees with `{}`: {header}",
+                                def.runtime_fn
+                            ));
+                        }
+                    }
+                }
+                Err(e) => failures.push(e),
+            }
+            let verbatim_fails = match slot_verdicts(kernel, &slots, header, VERBATIM) {
+                Ok(verdicts) => verdicts.iter().any(|agrees| !agrees),
+                Err(_) => true,
+            };
+            if adapter != VERBATIM && verbatim_fails {
+                needed_adapters.push(kernel);
+            }
+        }
+    }
+    failures.extend(
+        EMIT_ADAPTERS
+            .iter()
+            .filter(|(k, _)| !needed_adapters.contains(k))
+            .map(|(k, _)| {
+                format!(
+                    "{k:?} in EMIT_ADAPTERS already agrees verbatim (or has no function slot); \
+                     remove it"
+                )
+            }),
+    );
+    assert!(
+        confirmed > 0,
+        "no function slot was confirmed against the runtime"
+    );
+    assert!(
+        failures.is_empty(),
+        "a scheme-derived function slot carrier disagrees with its runtime parameter; fix \
+         `StdlibKernel::fn_slot_carrier`, the kernel's emit arm, or `EMIT_ADAPTERS`:\n{}",
         failures.join("\n")
     );
 }

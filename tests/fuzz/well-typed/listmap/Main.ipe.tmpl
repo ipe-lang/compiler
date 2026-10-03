@@ -1,0 +1,11 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot lst : IntList 1 5 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+main =
+    Io.println (String.fromInt (List.length (List.map (\x -> x + @n1@) @lst@)))

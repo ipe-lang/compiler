@@ -369,13 +369,16 @@ where
     Ok(bytes)
 }
 
-/// Compact JSON that escapes every control character, not only C0.
+/// Compact JSON that escapes every log hazard (`Cc ∪ Cf ∪ Zl ∪ Zp`), not only C0.
 ///
-/// `serde_json` escapes the C0 range but writes `DEL` and the C1 controls
-/// (`U+0080`–`U+009F`, among them the single-character CSI and OSC
-/// introducers) raw. Escaping them as `\u00XX` keeps the log file free of
-/// control characters by construction, so reading it with any tool cannot
-/// drive a terminal; the decoded values are unchanged.
+/// `serde_json` escapes `"`, `\` and the C0 range but writes `DEL`, the C1
+/// controls (among them the single-character CSI and OSC introducers) and the
+/// format characters (bidi overrides, zero-width characters, the tag block)
+/// raw. Spelling every `crate::system::is_log_hazard` character through
+/// `crate::escape::JsonHazardEscape`, the runtime's one JSON hazard spelling,
+/// keeps the log file free of them by construction, so reading it with any
+/// tool can neither drive nor reorder a terminal; the decoded values are
+/// unchanged.
 struct ControlEscaping;
 
 impl serde_json::ser::Formatter for ControlEscaping {
@@ -385,8 +388,8 @@ impl serde_json::ser::Formatter for ControlEscaping {
     {
         let mut utf8 = [0u8; 4];
         for c in fragment.chars() {
-            if c.is_control() {
-                write!(writer, "\\u{:04x}", u32::from(c))?;
+            if crate::system::is_log_hazard(c) {
+                write!(writer, "{}", crate::escape::JsonHazardEscape(c))?;
             } else {
                 writer.write_all(c.encode_utf8(&mut utf8).as_bytes())?;
             }
@@ -455,7 +458,8 @@ fn bounded_plan<Msg, Model>(
 ///
 /// One plain line for the start model, one `"<msg> => <model>"` line per step,
 /// and one for the final model; each line passes through [`plain_line`], so no
-/// control byte from a decoded value reaches the output. Every `Cmd` `update`
+/// log hazard (control, bidi, zero-width or tag character) from a decoded value
+/// reaches the output. Every `Cmd` `update`
 /// returns is dropped unrun.
 #[must_use]
 pub fn render_replay<Msg, Model, F>(plan: Plan<Msg, Model>, init_model: Model, update: &F) -> String
@@ -875,6 +879,34 @@ mod tests {
             "the log must carry no raw control character: {text:?}"
         );
         assert!(text.contains("\\u009b"), "C1 CSI must be escaped: {text}");
+        let plan_result = decode_full(&bytes);
+        assert!(plan_result.is_ok(), "an escaped log must decode");
+        let Ok(plan) = plan_result else { return };
+        assert_eq!(plan.msgs, vec![Msg::Say(laced.into())]);
+    }
+
+    // Format characters (bidi override, zero-width space, a tag character) a
+    // `Msg` value holds are written escaped too, and decode back intact.
+    #[test]
+    fn encoded_log_escapes_every_format_hazard() {
+        let laced = "a\u{202e}b\u{200b}c\u{e0041}d\u{2028}e";
+        let (buf, _) = record(&[Msg::Say(laced.into())], 16);
+        let bytes = encode_full(&buf);
+        let text_result = core::str::from_utf8(&bytes);
+        assert!(text_result.is_ok(), "the log must be UTF-8");
+        let Ok(text) = text_result else { return };
+        assert!(
+            !text.chars().any(crate::system::is_log_hazard),
+            "the log must carry no raw log hazard: {text:?}"
+        );
+        assert!(
+            text.contains("\\u202e"),
+            "bidi override must be escaped: {text}"
+        );
+        assert!(
+            text.contains("\\udb40\\udc41"),
+            "tag must be a surrogate pair: {text}"
+        );
         let plan_result = decode_full(&bytes);
         assert!(plan_result.is_ok(), "an escaped log must decode");
         let Ok(plan) = plan_result else { return };

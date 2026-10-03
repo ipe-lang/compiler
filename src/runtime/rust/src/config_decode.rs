@@ -102,15 +102,20 @@ pub fn config_decode_toml<E: From<String> + 'static, T>(
 /// Default cap on a YAML source string parsed directly via `Config.decodeYaml`
 /// (the file-load path enforces its own `IPE_CONFIG_MAX_BYTES` cap before reading).
 /// 4 MiB; override via `IPE_YAML_MAX_BYTES`.
-const YAML_SOURCE_CAP_DEFAULT: usize = 4 * 1024 * 1024;
+const YAML_SOURCE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_YAML_MAX_BYTES",
+    4 * 1024 * 1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
 
-fn yaml_source_cap() -> usize {
-    crate::system::read_env_var("IPE_YAML_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(YAML_SOURCE_CAP_DEFAULT)
-}
+/// Cap on a file read by `Config.loadFromFile`: `IPE_CONFIG_MAX_BYTES`, default 16 MiB.
+const CONFIG_FILE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_CONFIG_MAX_BYTES",
+    16 * 1024 * 1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
 
 // Config.decodeYaml : String -> Decoder a -> Result Error a
 pub fn config_decode_yaml<E: From<String> + 'static, T>(
@@ -123,7 +128,10 @@ pub fn config_decode_yaml<E: From<String> + 'static, T>(
     //   2. serde_yaml 0.9 itself bounds alias/anchor EXPANSION — a recursive
     //      anchor bomb trips its built-in "repetition limit exceeded" (verified),
     //      so a small-but-exponential input cannot expand without bound.
-    let cap = yaml_source_cap();
+    let cap: usize = match YAML_SOURCE_CEILING.read() {
+        Ok(cap) => cap,
+        Err(refusal) => return IpeResult::Err(str_err(&format!("yaml parse: {refusal}"))),
+    };
     if s.len() > cap {
         return IpeResult::Err(str_err(&format!(
             "yaml parse: input is {} bytes, over the {} byte cap (IPE_YAML_MAX_BYTES)",
@@ -145,29 +153,10 @@ pub fn config_decode_yaml<E: From<String> + 'static, T>(
 // can't stall the tokio worker thread polling this future. This module is
 // gated on the `config` Cargo feature (`config = ["json", "toml",
 // "serde_yaml"]`, runtime/Cargo.toml), which does NOT pull in `tokio`, so
-// `tokio` is not guaranteed present here — same constraint `file.rs`
-// documents for its own `run_blocking` helper (see
+// `tokio` is not guaranteed present here (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
-#[cfg(feature = "tokio")]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err("background config-file task panicked".to_string()),
-    }
-}
-
-#[cfg(not(feature = "tokio"))]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    f()
-}
+// The offload is `threads::run_blocking`: a pool that cannot start a thread is
+// an `Unavailable` error, and a build without the pool reads inline.
 
 fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
     // Open first, then enforce the cap THROUGH a capped reader rather than
@@ -207,12 +196,15 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
 // Config.loadFromFile : String -> Decoder a -> Task Error a
 // Extension dispatch: .toml / .yaml|.yml / .json (default json).
 //
-// the file read is offloaded via `run_blocking` (see the module-level
-// doc comment above) so a large/slow config read can't stall the tokio
+// the file read is offloaded via `threads::run_blocking` (see the module-level
+// comment above) so a large/slow config read can't stall the tokio
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
-pub fn config_load_from_file<E: From<String> + Send + 'static, T: Send + 'static>(
+pub fn config_load_from_file<
+    E: From<String> + crate::FromUnavailable + Send + 'static,
+    T: Send + 'static,
+>(
     path: crate::path::Path,
     decoder: Decoder<E, T>,
 ) -> IpeTask<E, T> {
@@ -224,19 +216,22 @@ pub fn config_load_from_file<E: From<String> + Send + 'static, T: Send + 'static
         // Cap the file size before slurping it into memory so a Config.loadFromFile
         // on an attacker-influenced path can't force an unbounded in-memory copy
         // (memory DoS). Default 16 MiB; override via IPE_CONFIG_MAX_BYTES.
-        let cap: u64 = crate::system::read_env_var("IPE_CONFIG_MAX_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(16 * 1024 * 1024);
-        let contents = match run_blocking({
-            let path = path.clone();
-            move || config_read_capped(&path, cap)
-        })
+        let cap: u64 = match CONFIG_FILE_CEILING.read() {
+            Ok(cap) => cap,
+            Err(refusal) => return IpeResult::Err(str_err(&refusal.to_string())),
+        };
+        let contents = match crate::threads::run_blocking::<_, E, _>(
+            "Config.loadFromFile",
+            "background config-file task panicked",
+            {
+                let path = path.clone();
+                move || config_read_capped(&path, cap)
+            },
+        )
         .await
         {
             Ok(c) => c,
-            Err(e) => return IpeResult::Err(str_err(&e)),
+            Err(e) => return IpeResult::Err(e),
         };
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".toml") {
@@ -252,6 +247,12 @@ pub fn config_load_from_file<E: From<String> + Send + 'static, T: Send + 'static
 #[cfg(test)]
 mod load_from_file_tests {
     use super::*;
+
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(YAML_SOURCE_CEILING);
+        crate::system::assert_env_ceiling_contract(CONFIG_FILE_CEILING);
+    }
     use crate::json::{decode_field, json_decode_string};
 
     fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
@@ -277,8 +278,8 @@ mod load_from_file_tests {
         sealed.expect("test fixture path passes the seal")
     }
 
-    /// Functional correctness (independent of whether `run_blocking` takes
-    /// the real `spawn_blocking` path or the no-tokio-feature fallback —
+    /// Functional correctness (independent of whether the offload takes
+    /// the blocking pool or the no-tokio-feature inline fallback —
     /// both paths must return the same decoded result).
     #[test]
     fn loads_and_decodes_json() {

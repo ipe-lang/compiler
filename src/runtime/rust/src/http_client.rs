@@ -5,14 +5,14 @@
 //! these pub fields and the Ipê-built `defaultRequest` record constructs this
 //! struct directly. Field names match the Ipê records verbatim.
 //!
-//! ## SSRF protection (default-ON in production)
+//! ## SSRF protection (default-ON)
 //!
 //! The guard blocks requests whose resolved host is loopback, RFC-1918 private,
 //! link-local, unique-local (ULA), unspecified, or v4-mapped-private. It is
-//! ON by default in production (`ENV`/`IPE_ENV` not in {unset, dev, development,
-//! local}) and OFF in dev so development against `localhost` keeps working
-//! unchanged. `IPE_HTTP_DENY_PRIVATE=1`/`on`/`true` forces it ON; setting it to
-//! any other value (`0`/`off`/`false`) is the explicit production opt-out. See
+//! ON by default, and on every release build; only a dev-intent binary with no
+//! exposed listener defaults it OFF, so development against `localhost` keeps
+//! working. `IPE_HTTP_DENY_PRIVATE=0`/`off`/`false` is the explicit opt-out;
+//! `1`/`on`/`true` and every unrecognised value keep it ON. See
 //! `ssrf::ssrf_deny_private_enabled`.
 //!
 //! When ON every name goes through the one SSRF gate
@@ -43,12 +43,19 @@ use super::ssrf::{
 };
 
 /// Ipe.Http.HttpResponse — field names/types match the Ipê record alias.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpResponse {
     pub status: i64,
     pub body: String,
     pub headers: HashMap<String, String>,
 }
+
+// The body and headers can carry a token or a `Set-Cookie` session id; the Ipê
+// record fixes the field types, so the masking lives in `Debug`.
+crate::redact::redacting_debug!(HttpResponse {
+    shown: [status],
+    masked: [body, headers],
+});
 
 /// Redirect behaviour for an outbound `HttpRequest` — the Rust mirror of the
 /// `RedirectPolicy` ADT in `Ipe.Http`.  Variant names match the Ipê
@@ -132,7 +139,7 @@ pub(crate) fn method_to_reqwest(m: HttpMethod) -> reqwest::Method {
 
 /// Ipe.Http.HttpRequest — built in Ipê (defaultRequest + with* updates),
 /// so every field is pub for external struct-literal construction.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub body: String,
     pub headers: Vec<(String, String)>,
@@ -141,6 +148,14 @@ pub struct HttpRequest {
     pub timeout: i64,
     pub url: String,
 }
+
+// The body, headers (`Authorization`) and URL (an API key in the query) can
+// carry a credential; the Ipê record fixes the field types, so the masking lives
+// in `Debug`.
+crate::redact::redacting_debug!(HttpRequest {
+    shown: [method, redirects, timeout],
+    masked: [body, headers, url],
+});
 
 /// `Http.methodFromString : String -> Maybe HttpMethod` — the typed parse
 /// boundary for inbound method strings.  Returns `Just` for the seven
@@ -511,16 +526,28 @@ async fn do_request<E: From<String> + Send + 'static>(
 /// read of an attacker- or upstream-controlled response is a memory-exhaustion
 /// (OOM) vector. Override via `IPE_HTTP_MAX_BODY_BYTES` (streaming consumers that
 /// need unbounded bodies use `Ipe.Http.Stream` instead).
-#[cfg(not(target_arch = "wasm32"))]
-const HTTP_BODY_CAP_DEFAULT: usize = 100 * 1024 * 1024;
+///
+/// One ceiling serves the native arm and the browser `fetch` arm alike.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+const HTTP_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_HTTP_MAX_BODY_BYTES",
+    100 * 1024 * 1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-fn http_body_cap() -> usize {
-    crate::system::read_env_var("IPE_HTTP_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(HTTP_BODY_CAP_DEFAULT)
+/// The buffered-body cap, refused as `http: …` when the variable is malformed.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+fn http_body_cap() -> Result<usize, String> {
+    HTTP_BODY_CEILING
+        .read()
+        .map_err(|refusal| format!("http: {refusal}"))
 }
 
 /// Read a response body into a `String` with a hard byte cap. The
@@ -537,7 +564,10 @@ async fn read_body_capped<E: From<String> + Send + 'static>(
     resp: reqwest::Response,
 ) -> IpeResult<E, String> {
     use futures_util::StreamExt;
-    let cap = http_body_cap();
+    let cap = match http_body_cap() {
+        Ok(cap) => cap,
+        Err(e) => return IpeResult::Err(e.into()),
+    };
     if let Some(len) = resp.content_length()
         && len as usize > cap
     {
@@ -671,25 +701,12 @@ pub fn http_parse_query(raw: String) -> IpeResult<crate::error::IpeError, HashMa
 // rather than trapping the instance; every rejection here routes through the
 // SAME generic `Task.fail` arm — never a panic, never a silent drop.
 
-/// `IPE_HTTP_MAX_BODY_BYTES` cap, mirrored from the native arm's
-/// `http_body_cap` (same env var, same default) — `fetch`'s `.text()` buffers
-/// the whole body itself, so this is a post-hoc size guard rather than a
-/// streamed one, but it keeps the same DoS floor on both targets.
 // The browser `fetch` substitute is gated on `all(wasm32, wasm-client)`, never a
 // bare `wasm32`: the co-located WASI target (`wasm32-wasip1`, `wasm-client` off)
 // is a native-ish wasm build that has no `web-sys`/`wasm-bindgen` in its graph,
 // so a bare-`wasm32` arm would compile these browser bindings into a WASI build
 // and fail cargo. `http_client` is not WASI-viable (reqwest is native-only), so
 // on WASI this whole substitute stays absent and no kernel references it.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-fn wasm_http_body_cap() -> usize {
-    crate::system::read_env_var("IPE_HTTP_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(100 * 1024 * 1024)
-}
-
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
 async fn do_fetch<E: From<String> + 'static>(req: HttpRequest) -> IpeResult<E, HttpResponse> {
     use wasm_bindgen::{JsCast, JsValue};
@@ -788,7 +805,10 @@ async fn do_fetch<E: From<String> + 'static>(req: HttpRequest) -> IpeResult<E, H
     // `read_body_capped` incremental floor. `content_length()` is unreliable in a
     // browser (absent under transfer-encoding, or a lie), so the load-bearing
     // guard is the per-chunk cap in the loop, not a header pre-check.
-    let cap = wasm_http_body_cap();
+    let cap = match http_body_cap() {
+        Ok(cap) => cap,
+        Err(e) => return IpeResult::Err(e.into()),
+    };
     let body = match read_wasm_body_capped(&resp, cap).await {
         Ok(b) => b,
         Err(e) => return IpeResult::Err(e.into()),
@@ -901,6 +921,33 @@ pub fn http_request<E: From<String> + 'static>(req: HttpRequest) -> IpeTask<E, H
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(HTTP_BODY_CEILING);
+    }
+
+    #[test]
+    fn request_and_response_debug_print_no_credential() {
+        let req = HttpRequest {
+            body: "password=B0DYPW".to_owned(),
+            headers: vec![("Authorization".to_owned(), "Bearer H34D3R".to_owned())],
+            method: HttpMethod::Post,
+            redirects: RedirectPolicy::NoRedirects,
+            timeout: 30,
+            url: "https://api.example/v1?key=URLK3Y".to_owned(),
+        };
+        let res = HttpResponse {
+            status: 200,
+            body: "{\"token\":\"R3SB0DY\"}".to_owned(),
+            headers: HashMap::from([("set-cookie".to_owned(), "sid=S3TC00K".to_owned())]),
+        };
+        let shown = format!("{req:?} {res:?}");
+        for planted in ["B0DYPW", "H34D3R", "URLK3Y", "R3SB0DY", "S3TC00K"] {
+            assert!(!shown.contains(planted), "{planted} leaked: {shown}");
+        }
+        assert!(shown.contains("status: 200"), "{shown}");
+    }
 
     /// Wiring seal: the response-header collection loop must route
     /// every key through `http_header::canonical_header` (reqwest's

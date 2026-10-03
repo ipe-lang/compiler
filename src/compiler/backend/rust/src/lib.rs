@@ -34,6 +34,7 @@ mod emit_ui_template;
 mod emit_web;
 mod emit_webview;
 mod emit_worker;
+mod layout_sweep;
 mod naming;
 mod preamble;
 mod project;
@@ -73,6 +74,7 @@ use ipe_ir::{
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
+pub use layout_sweep::{BodyLayoutBudget, LAYOUT_FUEL, body_layout_budgets};
 pub use preamble::{epilogue, preamble};
 
 /// Which `ipe` verb family an emit serves.

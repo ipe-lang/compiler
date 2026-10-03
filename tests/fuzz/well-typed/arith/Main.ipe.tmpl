@@ -1,0 +1,11 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+-- fuzz-slot n3 : Int 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+main =
+    Io.println (String.fromInt (let x_a = @n1@ in x_a + @n2@ * @n3@))

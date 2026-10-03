@@ -355,6 +355,13 @@ pub enum CliError {
     ///
     /// A process the child started still held it; that process was stopped.
     ChildPipeHeld(remote_ingest::Stream),
+    /// The OS refused a thread the command needs.
+    ///
+    /// Anything the command had started for that thread was stopped first.
+    ThreadRefused {
+        role: crate::threads::ThreadRole,
+        source: std::io::Error,
+    },
     /// A signal ended a remote transfer before it finished.
     ///
     /// Nothing it staged reached the lock, the manifest or the package cache.
@@ -399,6 +406,12 @@ pub enum CliError {
     /// Either one steers or compiles into the build unsandboxed, so one some
     /// other user could have written is refused rather than obeyed.
     TrustRefused(crate::owner_trust::TrustRefusal),
+    /// FFI preparation refused the installed catalog or a project's use of it.
+    ///
+    /// The cause is a variant of [`crate::ffi::FfiPrepError`], never message
+    /// text, so a consumer decides how to handle it from its type. It is not
+    /// command misuse, so no help page is attached to it.
+    FfiPrep(Box<crate::ffi::FfiPrepError>),
     /// A discovered source file's module path uses a Windows reserved device name.
     ///
     /// `Aux.ipe` opens the `AUX` device on Windows, so the same tree would
@@ -496,6 +509,14 @@ impl From<build_plan::Refusal> for CliError {
     }
 }
 
+impl From<ipe_docs::argv::NonUtf8Argument> for CliError {
+    /// A command-line argument that is not UTF-8 is command-line misuse; the
+    /// refusal names its position, never its bytes.
+    fn from(refused: ipe_docs::argv::NonUtf8Argument) -> Self {
+        Self::Usage(text::Message::relay(&refused))
+    }
+}
+
 impl From<delivery::DeliveryError> for CliError {
     /// A delivery refusal is a pedagogical, user-facing message; it surfaces
     /// through the reader's named-error channel.
@@ -545,6 +566,29 @@ pub fn emit_machine_error(
 }
 
 impl CliError {
+    /// The manifest refusal for a program entry that [`parse_entry`] turned away.
+    ///
+    /// The entry and the refused segment are author text, so both render through
+    /// `{:?}` (escaped) and a control byte cannot reach the terminal raw.
+    ///
+    /// [`parse_entry`]: crate::project::parse_entry
+    #[must_use]
+    pub fn manifest_entry_refused(entry: &str, refusal: &crate::project::EntryRefusal) -> Self {
+        use crate::project::EntryRefusal;
+        let entry = format!("{entry:?}");
+        Self::Usage(match refusal {
+            EntryRefusal::Empty => text::msg::manifest_entry_no_module(&entry),
+            EntryRefusal::NotModuleSegment { segment } => {
+                text::msg::manifest_entry_segment_invalid(&entry, &format!("{segment:?}"))
+            }
+            EntryRefusal::EmptySegment => text::msg::manifest_entry_empty_segment(&entry),
+            EntryRefusal::DotSegment => text::msg::manifest_entry_dot_segment(&entry),
+            EntryRefusal::Backslash => text::msg::manifest_entry_backslash(&entry),
+            EntryRefusal::DrivePrefix => text::msg::manifest_entry_drive_prefix(&entry),
+            EntryRefusal::Extension => text::msg::manifest_entry_extension(&entry),
+        })
+    }
+
     /// The stable machine `kind` tag for this error — the fixed vocabulary word a
     /// `--json` consumer branches on, carried under `payload.kind` alongside the
     /// prose `message`.
@@ -561,7 +605,7 @@ impl CliError {
     #[must_use]
     pub const fn machine_kind(&self) -> &'static str {
         match self {
-            Self::Usage(_) => "usage",
+            Self::Usage(_) | Self::FfiPrep(_) => "usage",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
@@ -602,6 +646,7 @@ impl CliError {
             Self::RemoteIngestExceeded(_) => "remote-ingest-exceeded",
             Self::LocalLimitExceeded(_) => "local-limit-exceeded",
             Self::ChildPipeHeld(_) => "child-pipe-held",
+            Self::ThreadRefused { .. } => "thread-refused",
             Self::Interrupted => "interrupted",
             Self::SourceRefused { .. } => "source-refused",
             Self::PathEscape { .. } => "path-escape",
@@ -643,6 +688,7 @@ impl CliError {
                 }
             }
             Self::RuntimeVersionMismatch { .. } => Internal,
+            Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
             | Self::UnknownCommand { .. }
             | Self::Io { .. }
@@ -682,6 +728,7 @@ impl CliError {
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
             | Self::ChildPipeHeld(_)
+            | Self::ThreadRefused { .. }
             | Self::Interrupted
             | Self::SourceRefused { .. }
             | Self::PathEscape { .. }
@@ -918,6 +965,9 @@ impl std::fmt::Display for CliError {
             Self::RemoteIngestExceeded(refusal) => refusal.fmt(f),
             Self::LocalLimitExceeded(refusal) => refusal.fmt(f),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
+            Self::ThreadRefused { role, source } => {
+                f.write_str(&text::cli_thread_refused(role, &source.kind()))
+            }
             Self::Interrupted => f.write_str(text::cli_transfer_interrupted()),
             Self::SourceRefused { path, reason } => {
                 let path = path.display();
@@ -940,6 +990,7 @@ impl std::fmt::Display for CliError {
                 f.write_str(&text::cli_discovery_limit_reached(detail))
             }
             Self::TrustRefused(refusal) => f.write_str(&refusal.message()),
+            Self::FfiPrep(refusal) => std::fmt::Display::fmt(refusal, f),
             Self::DeviceNamedModule { path, segment } => {
                 f.write_str(&text::cli_device_named_module(&path.display(), segment))
             }
@@ -1221,6 +1272,26 @@ pub fn missing_runtime_feature(stderr: &str) -> Option<String> {
 
 impl std::error::Error for CliError {}
 
+/// Who an FFI prep refusal belongs to.
+///
+/// An emit left empty after asserted calls validated breaks a promise ipe
+/// makes ([`crate::ffi::FfiPrepError::AssertedWithoutCatalog`]); every other
+/// refusal is the user's to fix.
+const fn ffi_prep_fault(refusal: &crate::ffi::FfiPrepError) -> crate::screen::Fault {
+    use crate::ffi::FfiPrepError;
+    match refusal {
+        FfiPrepError::AssertedWithoutCatalog => crate::screen::Fault::Internal,
+        FfiPrepError::ModuleClaimed { .. }
+        | FfiPrepError::ReservedModuleExists
+        | FfiPrepError::AssertedRefused(_)
+        | FfiPrepError::AssertedShimSeal(_)
+        | FfiPrepError::DefineOpaqueCollision { .. }
+        | FfiPrepError::DependencyMerge(_)
+        | FfiPrepError::CatalogSeal(_)
+        | FfiPrepError::TransparentWithoutShape { .. } => crate::screen::Fault::User,
+    }
+}
+
 // `CliError` is the `Err` type of every driver `Result`, so its size is paid
 // in the `Err` slot of ~200 functions. Boxing the wide payloads (the `Pipeline`
 // diagnostic) keeps it under clippy's `result_large_err` threshold; the bound
@@ -1352,5 +1423,31 @@ mod tests {
         assert!(!shown.contains("/planted/root"), "{shown:?}");
         assert!(!shown.contains('\u{1b}'), "{shown:?}");
         assert_eq!(err.machine_kind(), "scratch-unavailable");
+    }
+
+    /// An FFI prep refusal keeps the `usage` machine kind, renders inside the
+    /// error frame, and is the user's fault except the internal-invariant breach.
+    #[test]
+    fn ffi_prep_machine_kind_and_fault() {
+        use crate::ffi::FfiPrepError;
+        use crate::screen::Fault;
+        let lift = |refusal| CliError::FfiPrep(Box::new(refusal));
+        let internal = lift(FfiPrepError::AssertedWithoutCatalog);
+        assert_eq!(internal.fault(), Fault::Internal);
+        for user in [
+            FfiPrepError::ReservedModuleExists,
+            FfiPrepError::DefineOpaqueCollision {
+                slug: "a".to_owned(),
+                name: "T".to_owned(),
+            },
+            FfiPrepError::ModuleClaimed {
+                module: "Rust.A".to_owned(),
+                slug: "a".to_owned(),
+            },
+        ] {
+            assert_eq!(lift(user).fault(), Fault::User);
+        }
+        assert_eq!(internal.machine_kind(), "usage");
+        assert!(!internal.renders_own_screen());
     }
 }

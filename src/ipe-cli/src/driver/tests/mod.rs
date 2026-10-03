@@ -753,8 +753,8 @@ fn find_manifest_stops_at_a_symlinked_home() {
     std::os::unix::fs::symlink(&real_home, &link_home).expect("symlink home");
     let via_real = real_home.join("src").join("Main.ipe");
     let via_link = link_home.join("src").join("Main.ipe");
-    let link_ceiling = HomeCeiling::of(Some(&link_home));
-    let real_ceiling = HomeCeiling::of(Some(&real_home));
+    let link_ceiling = HomeCeiling::of(Ok(&parsed_home(&link_home)));
+    let real_ceiling = HomeCeiling::of(Ok(&parsed_home(&real_home)));
     let real_under_link = find_manifest_bounded(&via_real, &link_ceiling, MAX_MANIFEST_WALK_DEPTH);
     let link_under_real = find_manifest_bounded(&via_link, &real_ceiling, MAX_MANIFEST_WALK_DEPTH);
     let unbounded = find_manifest_bounded(&via_link, &HomeCeiling::Absent, MAX_MANIFEST_WALK_DEPTH);
@@ -800,7 +800,7 @@ fn find_manifest_ignores_a_manifest_above_home() {
         "module Package exposing (package)\n",
     )
     .expect("write planted package.ipe");
-    let home = HomeCeiling::of(Some(&tmp.join("home")));
+    let home = HomeCeiling::of(Ok(&parsed_home(&tmp.join("home"))));
     let found = find_manifest_bounded(&main_ipe, &home, MAX_MANIFEST_WALK_DEPTH);
     let _ = fs::remove_dir_all(&tmp);
     assert!(matches!(found, Ok(None)), "{found:?}");
@@ -854,7 +854,7 @@ fn find_manifest_stops_at_an_aliased_home_above_a_symlinked_subdir() {
     std::os::unix::fs::symlink(tmp.join("data").join("code"), real_home.join("code"))
         .expect("symlink code/ into home");
     let file_under = |root: &Path| root.join("code").join("proj").join("src").join("Main.ipe");
-    let ceiling = HomeCeiling::of(Some(&home_alias));
+    let ceiling = HomeCeiling::of(Ok(&parsed_home(&home_alias)));
     let via_alias =
         find_manifest_bounded(&file_under(&home_alias), &ceiling, MAX_MANIFEST_WALK_DEPTH);
     let via_real =
@@ -890,7 +890,7 @@ fn find_manifest_follows_the_lexical_path_through_a_shallow_symlink() {
     let main_ipe = pkg.join("sub").join("deep").join("Main.ipe");
     let found = find_manifest_bounded(
         &main_ipe,
-        &HomeCeiling::of(Some(&tmp)),
+        &HomeCeiling::of(Ok(&parsed_home(&tmp))),
         MAX_MANIFEST_WALK_DEPTH,
     );
     let _ = fs::remove_dir_all(&tmp);
@@ -920,7 +920,7 @@ fn find_manifest_under_an_unreadable_home_examines_only_the_start_directory() {
     );
 }
 
-/// No configured home, or a home that does not exist, sets no ceiling.
+/// An unset home, or a home that does not exist, sets no ceiling.
 #[test]
 fn a_missing_home_sets_no_ceiling() {
     let missing = ipe_test_temp::temp_root().join(format!(
@@ -928,8 +928,64 @@ fn a_missing_home_sets_no_ceiling() {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&missing);
-    assert_eq!(HomeCeiling::of(None), HomeCeiling::Absent);
-    assert_eq!(HomeCeiling::of(Some(&missing)), HomeCeiling::Absent);
+    assert_eq!(
+        HomeCeiling::of(Err(crate::env_dir::HomeRefusal::Unset)),
+        HomeCeiling::Absent
+    );
+    assert_eq!(
+        HomeCeiling::of(Ok(&parsed_home(&missing))),
+        HomeCeiling::Absent
+    );
+}
+
+/// A home that is set but refused confines the walk to the start directory.
+///
+/// The refused value may still name the user's tree, so a `package.ipe` one
+/// level above the start is never reached; an unset home, by contrast, sets
+/// no ceiling and the same walk finds it.
+#[cfg(unix)]
+#[test]
+fn a_refused_home_never_widens_the_manifest_walk() {
+    use crate::env_dir::HomeRefusal;
+    let (tmp, main_ipe) = manifest_walk_tree("refused_home", "proj");
+    let above = tmp.join("proj").join("package.ipe");
+    fs::write(&above, "module Package exposing (package)\n").expect("write package.ipe");
+    let refusals = [
+        HomeRefusal::NotUtf8,
+        HomeRefusal::ContainsNul,
+        HomeRefusal::NotAbsolute,
+        HomeRefusal::ParentComponent,
+        HomeRefusal::WindowsDeviceOrVerbatim,
+        HomeRefusal::WindowsUnc,
+    ];
+    let walks: Vec<_> = refusals
+        .iter()
+        .map(|refusal| {
+            let ceiling = HomeCeiling::of(Err(*refusal));
+            let found = find_manifest_bounded(&main_ipe, &ceiling, MAX_MANIFEST_WALK_DEPTH);
+            (*refusal, ceiling, found)
+        })
+        .collect();
+    let unset = find_manifest_bounded(
+        &main_ipe,
+        &HomeCeiling::of(Err(HomeRefusal::Unset)),
+        MAX_MANIFEST_WALK_DEPTH,
+    );
+    let _ = fs::remove_dir_all(&tmp);
+    for (refusal, ceiling, found) in walks {
+        assert_eq!(ceiling, HomeCeiling::Unreadable, "{refusal:?}");
+        assert!(matches!(found, Ok(None)), "{refusal:?}: {found:?}");
+    }
+    assert!(
+        matches!(&unset, Ok(Some(path)) if *path == above),
+        "an unset home sets no ceiling: {unset:?}"
+    );
+}
+
+/// A parsed home over the absolute test path `path`.
+fn parsed_home(path: &Path) -> crate::env_dir::HomeDir {
+    crate::env_dir::HomeDir::try_parse(Some(path.as_os_str().to_owned()))
+        .expect("an absolute test home")
 }
 
 /// Two spellings of one directory share an identity; two directories never do.
@@ -2518,44 +2574,50 @@ fn version_flags_alias_the_version_command() {
 
 #[test]
 fn analysis_root_rejects_a_program_entry_that_escapes_the_source_root() {
-    // A manifest whose declared program entry is an absolute path (or a `..`
-    // traversal) must not let `ipe type-check` read a file outside the
-    // project: analysis_root_of routes the entry through the same containment
-    // gate the build path uses, so the escape is a typed refusal.
-    let proj = ipe_test_temp::temp_root().join("ipe_analysis_root_escape");
-    let _ = fs::remove_dir_all(&proj);
-    let proj_src = proj.join("src");
-    fs::create_dir_all(&proj_src).expect("create src/");
-    fs::write(
-        proj.join("package.ipe"),
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"escape\"\n    , programs = [ { name = \"x\", entry = \"/etc/passwd\" } ]\n    }\n",
-    )
-    .expect("pkg");
-    // No src/Main.ipe: the program entry is the analysis root candidate.
-    let manifest = project::parse_manifest(&proj.join("package.ipe")).expect("parses");
-    assert!(
-        matches!(
-            analysis_root_of(&manifest),
-            Err(CliError::PathEscape { .. })
-        ),
-        "an absolute program entry must be refused, not joined and read"
-    );
+    // An absolute or `..` program entry names no module, so the build's own
+    // entry parse refuses it before any path is joined; analysis_root_of
+    // refuses it with that same error, never a read outside the project.
+    for entry in [
+        "/etc/passwd",
+        "/etc/Main.ipe",
+        "../../secret.ipe",
+        "../../Secret.ipe",
+    ] {
+        let proj = declared_entry_project("ipe_analysis_root_escape", entry, &[]);
+        let manifest = project::parse_manifest(&proj.join("package.ipe")).expect("parses");
+        assert!(
+            matches!(manifest.resolved_entry(), Err(CliError::Usage(_))),
+            "the build refuses entry {entry:?}"
+        );
+        assert!(
+            matches!(analysis_root_of(&manifest), Err(CliError::Usage(_))),
+            "analysis refuses entry {entry:?} like the build"
+        );
+        let _ = fs::remove_dir_all(&proj);
+    }
+}
 
-    // A `..` traversal is refused the same way.
-    fs::write(
-        proj.join("package.ipe"),
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"escape\"\n    , programs = [ { name = \"x\", entry = \"../../secret.ipe\" } ]\n    }\n",
-    )
-    .expect("pkg");
+#[cfg(unix)]
+#[test]
+fn analysis_root_refuses_an_entry_module_file_linked_outside_the_source_root() {
+    // A well-formed entry module whose file is a symlink out of `src/` is
+    // refused by the containment gate, not read.
+    let outside = ipe_test_temp::temp_root().join("ipe_analysis_root_link_target.ipe");
+    fs::write(&outside, "module Main exposing (main)\n\nmain = 1\n").expect("outside file");
+    let proj = declared_entry_project("ipe_analysis_root_link", "Main.ipe", &[]);
     let manifest = project::parse_manifest(&proj.join("package.ipe")).expect("parses");
+    let link = proj.join("src").join("Main.ipe");
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(&outside, link).expect("symlink entry out of src/");
     assert!(
         matches!(
             analysis_root_of(&manifest),
             Err(CliError::PathEscape { .. })
         ),
-        "a dot-dot program entry must be refused, not joined and read"
+        "an entry file linked outside src/ must be refused"
     );
     let _ = fs::remove_dir_all(&proj);
+    let _ = fs::remove_file(&outside);
 }
 
 /// Write a manifest-governed project with a clean default `src/Main.ipe` under
@@ -2632,7 +2694,7 @@ fn type_check_of_a_non_default_src_file_is_analysed_as_itself() {
     );
     assert_eq!(
         target.expect("resolves"),
-        AnalysisTarget::SourceFile {
+        AnalysisTarget::Source {
             file: blamed,
             src_root,
         },
@@ -2640,16 +2702,22 @@ fn type_check_of_a_non_default_src_file_is_analysed_as_itself() {
     );
 }
 
-/// A DIRECTORY argument still resolves to the project's own entry.
+/// A DIRECTORY argument resolves to the project's own entry, classified
+/// exactly as a file argument naming that entry: over the manifest's `src` root.
 #[test]
 fn type_check_of_a_directory_still_resolves_the_project_entry() {
     let tmp = analysis_project("ipe_type_check_directory_resolves_project_entry");
+    let expected = AnalysisTarget::Source {
+        file: resolved(&tmp.join("src").join("Main.ipe")),
+        src_root: resolved(&tmp.join("src")),
+    };
     let target = resolve_analysis_target(&tmp);
     let result = run_type_check_body(&[tmp.to_string_lossy().into_owned()]);
     let _ = fs::remove_dir_all(&tmp);
-    assert!(
-        matches!(&target, Ok(AnalysisTarget::Project(_))),
-        "a directory argument resolves to the project's entry: {target:?}"
+    assert_eq!(
+        target.ok(),
+        Some(expected),
+        "a directory argument resolves to the project's entry over its src root"
     );
     assert!(
         result.is_ok(),
@@ -2657,7 +2725,33 @@ fn type_check_of_a_directory_still_resolves_the_project_entry() {
     );
 }
 
-/// A file under the manifest's `tests/` tree resolves to `TestFile`, carrying
+/// A DIRECTORY argument classifies its entry against the directory's own
+/// manifest, the one the build compiles from, never a manifest nested between
+/// the project root and the entry file.
+#[test]
+fn a_directory_entry_is_classified_by_its_own_manifest_not_a_nested_one() {
+    let tmp = analysis_project("ipe_type_check_directory_ignores_nested_manifest");
+    let src = tmp.join("src");
+    fs::create_dir_all(src.join("src")).expect("create nested src/src/");
+    fs::write(
+        src.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"nested\" }\n",
+    )
+    .expect("nested src/package.ipe");
+    let expected = AnalysisTarget::Source {
+        file: resolved(&src.join("Main.ipe")),
+        src_root: resolved(&src),
+    };
+    let target = resolve_analysis_target(&tmp);
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        target.ok(),
+        Some(expected),
+        "the directory form must analyse its entry over the build's src root"
+    );
+}
+
+/// A file under the manifest's `tests/` tree resolves to `AnalysisTarget::Test`, carrying
 /// the canonical `src/` and `tests/` roots.
 #[test]
 fn resolve_analysis_target_of_a_tests_file_returns_test_file() {
@@ -2666,7 +2760,7 @@ fn resolve_analysis_target_of_a_tests_file_returns_test_file() {
     fs::create_dir_all(&tests_dir).expect("create tests/");
     let tests_main = tests_dir.join("Main.ipe");
     fs::write(&tests_main, "module Main exposing (main)\nmain = 1\n").expect("tests/Main.ipe");
-    let expected = AnalysisTarget::TestFile {
+    let expected = AnalysisTarget::Test {
         file: resolved(&tests_main),
         src_root: resolved(&tmp.join("src")),
         tests_root: resolved(&tests_dir),
@@ -2677,19 +2771,19 @@ fn resolve_analysis_target_of_a_tests_file_returns_test_file() {
     assert_eq!(
         target.expect("resolves"),
         expected,
-        "a tests/-rooted file argument resolves to TestFile carrying both roots"
+        "a tests/-rooted file argument resolves to AnalysisTarget::Test carrying both roots"
     );
 }
 
 /// A `..`-bearing spelling of a `src/` file resolves to the same canonical
-/// `SourceFile` its plain spelling does.
+/// `AnalysisTarget::Source` its plain spelling does.
 #[test]
 fn resolve_analysis_target_of_a_dotdot_src_spelling_is_source_file() {
     let tmp = analysis_project("ipe_resolve_target_dotdot_src_spelling");
     let src = tmp.join("src");
     let other = src.join("Other.ipe");
     fs::write(&other, "module Other exposing (x)\nx = 1\n").expect("src/Other.ipe");
-    let expected = AnalysisTarget::SourceFile {
+    let expected = AnalysisTarget::Source {
         file: resolved(&other),
         src_root: resolved(&src),
     };
@@ -2704,7 +2798,7 @@ fn resolve_analysis_target_of_a_dotdot_src_spelling_is_source_file() {
 }
 
 /// A file reached through a symlinked project directory resolves to the
-/// canonical `SourceFile` of the real project.
+/// canonical `AnalysisTarget::Source` of the real project.
 #[cfg(unix)]
 #[test]
 fn resolve_analysis_target_through_a_symlinked_project_dir_is_source_file() {
@@ -2717,7 +2811,7 @@ fn resolve_analysis_target_through_a_symlinked_project_dir_is_source_file() {
     fs::write(&other, "module Other exposing (x)\nx = 1\n").expect("src/Other.ipe");
     let link = base.join("link");
     std::os::unix::fs::symlink(&tmp, &link).expect("symlink project");
-    let expected = AnalysisTarget::SourceFile {
+    let expected = AnalysisTarget::Source {
         file: resolved(&other),
         src_root: resolved(&src),
     };
@@ -2753,18 +2847,18 @@ fn resolve_analysis_target_refuses_a_symlink_escaping_the_project_roots() {
     let via_src = resolve_analysis_target(&tmp.join("src").join("link").join("Y.ipe"));
     let _ = fs::remove_dir_all(&base);
     assert!(
-        matches!(&via_tests, Ok(AnalysisTarget::LooseFile(_))),
-        "a tests/ symlink leaving the project must not be a TestFile: {via_tests:?}"
+        matches!(&via_tests, Ok(AnalysisTarget::Loose(_))),
+        "a tests/ symlink leaving the project must not be an AnalysisTarget::Test: {via_tests:?}"
     );
     assert!(
-        matches!(&via_src, Ok(AnalysisTarget::LooseFile(_))),
-        "a src/ symlink leaving the project must not be a SourceFile: {via_src:?}"
+        matches!(&via_src, Ok(AnalysisTarget::Loose(_))),
+        "a src/ symlink leaving the project must not be an AnalysisTarget::Source: {via_src:?}"
     );
 }
 
 /// A file the project's manifest governs but that lies under neither `src/`
-/// nor `tests/` (here `scripts/Y.ipe`) resolves loose, never `SourceFile` or
-/// `TestFile`: it clears the manifest lookup and is refused by the
+/// nor `tests/` (here `scripts/Y.ipe`) resolves loose, never `AnalysisTarget::Source` or
+/// `AnalysisTarget::Test`: it clears the manifest lookup and is refused by the
 /// `tests/` and `src/` containment checks themselves.
 #[test]
 fn resolve_analysis_target_of_an_in_project_file_outside_src_and_tests_is_loose() {
@@ -2779,7 +2873,7 @@ fn resolve_analysis_target_of_an_in_project_file_outside_src_and_tests_is_loose(
     let target = resolve_analysis_target(&script);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
+        matches!(&target, Ok(AnalysisTarget::Loose(p)) if p.as_path() == canonical),
         "a governed file outside src/ and tests/ must stay loose: {target:?}"
     );
 }
@@ -2802,16 +2896,16 @@ fn resolve_analysis_target_refuses_a_src_symlink_to_elsewhere_in_the_project() {
     let target = resolve_analysis_target(&arg);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
+        matches!(&target, Ok(AnalysisTarget::Loose(p)) if p.as_path() == canonical),
         "a src/ symlink leaving src/ for elsewhere in the project must not be a \
-         SourceFile: {target:?}"
+         AnalysisTarget::Source: {target:?}"
     );
 }
 
 /// A `tests` symlink to the project root itself is not a tests root: its
 /// canonical path equals the project root, not strictly under it, so it is
 /// dropped and `tests/X.ipe` (canonically `<proj>/X.ipe`) resolves loose,
-/// never `TestFile`.
+/// never `AnalysisTarget::Test`.
 #[cfg(unix)]
 #[test]
 fn resolve_analysis_target_drops_a_tests_root_that_is_the_project_root() {
@@ -2825,9 +2919,9 @@ fn resolve_analysis_target_drops_a_tests_root_that_is_the_project_root() {
     let target = resolve_analysis_target(&arg);
     let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&target, Ok(AnalysisTarget::LooseFile(p)) if p.as_path() == canonical),
+        matches!(&target, Ok(AnalysisTarget::Loose(p)) if p.as_path() == canonical),
         "a tests root equal to the project root must be dropped, so the file \
-         is not a TestFile: {target:?}"
+         is not an AnalysisTarget::Test: {target:?}"
     );
 }
 
@@ -2851,7 +2945,7 @@ fn resolve_analysis_target_refuses_an_unresolvable_tests_root() {
 }
 
 /// With `sourceRoot = "."` the `tests/` root lies inside the source root, so a
-/// `tests/X.ipe` is under both; the tests root wins and it resolves `TestFile`.
+/// `tests/X.ipe` is under both; the tests root wins and it resolves `AnalysisTarget::Test`.
 #[test]
 fn resolve_analysis_target_prefers_test_file_when_tests_is_inside_src_root() {
     let tmp = ipe_test_temp::temp_root().join("ipe_resolve_target_tests_inside_src_root");
@@ -2865,7 +2959,7 @@ fn resolve_analysis_target_prefers_test_file_when_tests_is_inside_src_root() {
     .expect("pkg");
     let tests_x = tests_dir.join("X.ipe");
     fs::write(&tests_x, "module X exposing (x)\nx = 1\n").expect("tests/X.ipe");
-    let expected = AnalysisTarget::TestFile {
+    let expected = AnalysisTarget::Test {
         file: resolved(&tests_x),
         src_root: resolved(&tmp),
         tests_root: resolved(&tests_dir),
@@ -2876,7 +2970,7 @@ fn resolve_analysis_target_prefers_test_file_when_tests_is_inside_src_root() {
     assert_eq!(
         target.expect("resolves"),
         expected,
-        "a file under both tests/ and the source root resolves to TestFile"
+        "a file under both tests/ and the source root resolves to AnalysisTarget::Test"
     );
 }
 
@@ -2935,6 +3029,204 @@ fn nested_src_module_importing_by_full_path_type_checks_green() {
         "a nested src/ file importing a sibling by its full module path must \
          type-check against the manifest's whole src tree: {:?}",
         result.err()
+    );
+}
+
+/// A project whose declared entry is nested under `src/`: `App.Main` importing
+/// `Shared.Util` by its full module path.
+fn nested_entry_project(name: &str, main_body: &str) -> PathBuf {
+    let tmp = ipe_test_temp::temp_root().join(name);
+    let _ = fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    fs::create_dir_all(src.join("App")).expect("create src/App/");
+    fs::create_dir_all(src.join("Shared")).expect("create src/Shared/");
+    fs::write(
+        tmp.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs = [ { name = \"app\", entry = \"App/Main.ipe\" } ]\n    }\n",
+    )
+    .expect("pkg");
+    fs::write(
+        src.join("Shared").join("Util.ipe"),
+        "module Shared.Util exposing (one)\none = 1\n",
+    )
+    .expect("src/Shared/Util.ipe");
+    fs::write(src.join("App").join("Main.ipe"), main_body).expect("src/App/Main.ipe");
+    tmp
+}
+
+/// A directory argument over a nested-entry project analyses the `src`-rooted
+/// module set the build compiles: `App.Main` importing `Shared.Util` resolves,
+/// where a closure rooted at the entry's own directory (`src/App/`) would probe
+/// `src/App/Shared/Util.ipe` and refuse a program the build accepts.
+#[test]
+fn type_check_of_a_nested_entry_project_directory_resolves_src_rooted_imports() {
+    let tmp = nested_entry_project(
+        "ipe_type_check_nested_entry_directory_src_rooted",
+        "module App.Main exposing (main)\nimport Shared.Util as Util\nmain = Util.one\n",
+    );
+    let expected = AnalysisTarget::Source {
+        file: resolved(&tmp.join("src").join("App").join("Main.ipe")),
+        src_root: resolved(&tmp.join("src")),
+    };
+    let target = resolve_analysis_target(&tmp);
+    let result = run_type_check_body(&[tmp.to_string_lossy().into_owned()]);
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        target.ok(),
+        Some(expected),
+        "a nested-entry directory resolves to its entry over the src root"
+    );
+    assert!(
+        result.is_ok(),
+        "a nested entry importing a src module by its full path must type-check \
+         via a directory argument: {:?}",
+        result.err()
+    );
+}
+
+/// A module that lives outside `src/` is not part of the build's module set, so
+/// a directory argument refuses an import of it, blamed on the entry.
+#[test]
+fn type_check_of_a_directory_refuses_an_import_from_outside_src() {
+    let tmp = nested_entry_project(
+        "ipe_type_check_directory_refuses_outside_src_import",
+        "module App.Main exposing (main)\nimport Extra\nmain = Extra.one\n",
+    );
+    fs::write(
+        tmp.join("Extra.ipe"),
+        "module Extra exposing (one)\none = 1\n",
+    )
+    .expect("Extra.ipe outside src/");
+    let entry = resolved(&tmp.join("src").join("App").join("Main.ipe"));
+    let result = run_type_check_body(&[tmp.to_string_lossy().into_owned()]);
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        matches!(&result, Err(CliError::Pipeline { file, .. }) if file == entry.as_path()),
+        "an import of a module outside src/ must be refused, blamed on the entry: {result:?}"
+    );
+}
+
+/// The analysis entry follows the build's precedence: a declared program's
+/// entry wins over a `src/Main.ipe` beside it.
+#[test]
+fn analysis_root_prefers_the_declared_program_entry_like_the_build() {
+    let tmp = nested_entry_project(
+        "ipe_analysis_root_prefers_declared_program",
+        "module App.Main exposing (main)\nmain = 1\n",
+    );
+    let src = tmp.join("src");
+    fs::write(
+        src.join("Main.ipe"),
+        "module Main exposing (main)\nmain = 1\n",
+    )
+    .expect("src/Main.ipe");
+    let manifest = project::parse_manifest(&tmp.join("package.ipe")).expect("parses");
+    let root = analysis_root_of(&manifest);
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        root.ok(),
+        Some(src.join("App").join("Main.ipe")),
+        "the declared program's entry is the analysis root, as it is the build's"
+    );
+}
+
+/// A project with a `src/Main.ipe` that defines `main` and a declared program
+/// whose `entry` is spelled `entry`, beside `extra` files under `src/`.
+fn declared_entry_project(name: &str, entry: &str, extra: &[(&str, &str)]) -> PathBuf {
+    let tmp = ipe_test_temp::temp_root().join(name);
+    let _ = fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    fs::create_dir_all(&src).expect("create src/");
+    fs::write(
+        tmp.join("package.ipe"),
+        format!(
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = \"app\"\n    , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    }}\n"
+        ),
+    )
+    .expect("pkg");
+    fs::write(
+        src.join("Main.ipe"),
+        "module Main exposing (main)\nmain = 1\n",
+    )
+    .expect("src/Main.ipe");
+    for (rel, body) in extra {
+        fs::write(src.join(rel), body).expect("extra src file");
+    }
+    tmp
+}
+
+/// The analysis root is the file of the module the build compiles, not the raw
+/// `entry` text: a nested entry roots at the `.ipe` file of its module path.
+#[test]
+fn analysis_root_is_the_file_of_the_builds_entry_module() {
+    let tmp = declared_entry_project("ipe_analysis_root_nested_entry", "Client/App.ipe", &[]);
+    let client = tmp.join("src").join("Client");
+    fs::create_dir_all(&client).expect("create src/Client/");
+    fs::write(
+        client.join("App.ipe"),
+        "module Client.App exposing (main)\nmain = 1\n",
+    )
+    .expect("src/Client/App.ipe");
+    let manifest = project::parse_manifest(&tmp.join("package.ipe")).expect("parses");
+    let built = manifest.resolved_entry();
+    let root = analysis_root_of(&manifest);
+    let expected = resolved(&client.join("App.ipe"));
+    let _ = fs::remove_dir_all(&tmp);
+    assert_eq!(
+        built.ok(),
+        Some(vec!["Client".to_owned(), "App".to_owned()]),
+        "the build compiles module `Client.App`"
+    );
+    assert_eq!(
+        root.ok(),
+        Some(expected.as_path().to_path_buf()),
+        "the analysis root must be the build's `src/Client/App.ipe`"
+    );
+}
+
+/// An entry spelled without `.ipe`, or with another extension naming a decoy
+/// file, is refused by the build and by the analysis root alike, never
+/// analysed as the decoy it spells.
+#[test]
+fn analysis_root_refuses_an_entry_without_the_ipe_extension() {
+    for (name, entry) in [
+        ("ipe_analysis_root_entry_without_extension", "Main"),
+        ("ipe_analysis_root_entry_other_extension", "Main.txt"),
+    ] {
+        let tmp = declared_entry_project(
+            name,
+            entry,
+            &[("Main.txt", "module Main exposing (one)\none = 1\n")],
+        );
+        let manifest = project::parse_manifest(&tmp.join("package.ipe")).expect("parses");
+        let built = manifest.resolved_entry();
+        let root = analysis_root_of(&manifest);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(built.is_err(), "the build refuses entry {entry:?}");
+        assert!(
+            matches!(&root, Err(CliError::Usage(_))),
+            "the analysis root must refuse entry {entry:?}: {root:?}"
+        );
+    }
+}
+
+/// An entry the build refuses (a segment that is no module name) is refused by
+/// the analysis root too, never analysed as the raw path it spells.
+#[test]
+fn analysis_root_refuses_an_entry_the_build_refuses() {
+    let tmp = declared_entry_project(
+        "ipe_analysis_root_refuses_lowercase_entry",
+        "main.ipe",
+        &[("main.ipe", "module Main exposing (main)\nmain = 1\n")],
+    );
+    let manifest = project::parse_manifest(&tmp.join("package.ipe")).expect("parses");
+    let built = manifest.resolved_entry();
+    let root = analysis_root_of(&manifest);
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(built.is_err(), "the build refuses a lowercase entry module");
+    assert!(
+        matches!(&root, Err(CliError::Usage(_))),
+        "the analysis root must refuse the entry the build refuses: {root:?}"
     );
 }
 
@@ -4640,6 +4932,57 @@ fn homed_warning_with_unknown_home_is_refused() {
                     )
         ),
         "an unknown home must fail closed as a compiler bug, got {rendered:?}"
+    );
+}
+
+/// A type-checker error sited at a module with no source file is refused.
+///
+/// The refusal is a compiler bug blamed on the entry; the byte-offset guess,
+/// which would frame the error against whichever def encloses its span, is
+/// never consulted.
+#[test]
+fn sited_error_with_unknown_home_fails_closed() {
+    let main_src = "module Main exposing (main)\n\nmain =\n    1\n";
+    let mut interner = ipe_intern::Interner::new();
+    let Ok(parsed) = ipe_parse::parse_module(main_src, &mut interner) else {
+        return;
+    };
+    let Ok(linked) = ipe_canon::canonicalise(&parsed, &mut interner) else {
+        return;
+    };
+    let (Ok(main), Ok(other)) = (interner.intern("Main"), interner.intern("Other")) else {
+        return;
+    };
+    let Some(other_home) = ipe_types::ModuleHome::new(vec![other]) else {
+        return;
+    };
+    let mut home_to_source = BTreeMap::new();
+    home_to_source.insert(
+        vec![main],
+        (PathBuf::from("src/Main.ipe"), main_src.to_owned()),
+    );
+    let entry = (PathBuf::from("src/Main.ipe"), main_src.to_owned());
+    let lo = main_src
+        .rfind('1')
+        .and_then(|o| u32::try_from(o).ok())
+        .unwrap_or_default();
+    let err = ipe_db::PipelineError::Infer(ipe_types::InferError::sited(
+        redundant_red_branch_at(lo),
+        &other_home,
+    ));
+
+    let framed = attribute_post_link_error(&linked, &home_to_source, &entry, err);
+    assert!(
+        matches!(
+            &framed,
+            CliError::Pipeline { file, diag, .. }
+                if file == &entry.0
+                    && matches!(
+                        diag.as_ref(),
+                        Diagnostic::CompilerBug { where_: "driver.frame_infer_error", .. }
+                    )
+        ),
+        "an unknown sited home must fail closed as a compiler bug, got {framed:?}"
     );
 }
 

@@ -89,6 +89,7 @@ use std::time::{Duration, Instant};
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
 use crate::project;
 use crate::text;
+use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
 
 /// A lifecycle notification from a running watch session.
@@ -259,15 +260,16 @@ enum WatchRole {
     Failure,
 }
 
-/// The single source of truth for the "first SIGTERM consumed" ack.
+/// The single source of truth for the "first SIGTERM received" ack.
 ///
-/// The forwarder emits this text once, through [`watch_line`] (so the printed
-/// line wraps it in gutter/colour escapes — match it as a substring, never for
-/// byte-equality), the moment it consumes the first SIGTERM and begins the
-/// orderly teardown. Any supervisor or test that must observe consumption waits
-/// for this line rather than a timing guess: a second SIGTERM sent only after
-/// it appears is provably after the forwarder spent its one registration, so it
-/// is guaranteed absorbed.
+/// The shutdown subscriber emits this text once, through [`watch_line`] (so the
+/// printed line wraps it in gutter/colour escapes — match it as a substring,
+/// never for byte-equality), the moment the first SIGTERM reaches it and the
+/// orderly teardown begins. Any supervisor or test that must observe the first
+/// request waits for this line rather than a timing guess: a second SIGTERM
+/// sent only after it appears is provably a later request, so it ends the
+/// process by the signal (after ending every remote transfer) instead of
+/// waiting on a teardown that may hang.
 pub const SIGTERM_TEARDOWN_MARKER: &str = "[ipe watch] SIGTERM received; shutting down";
 
 /// `text` is already-sanitised [`TerminalSafe`], mirroring [`crate::screen::error_screen`]:
@@ -714,12 +716,21 @@ const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// failure. Without this, a transient failure has no other route back into
 /// the orchestrator's event loop: the triggering save is lost until an
 /// unrelated future filesystem event happens to arrive.
+///
+/// When the OS refuses the retry's thread the session keeps running and says
+/// the retry is skipped; the next filesystem event rebuilds as usual.
 fn schedule_resolve_retry(evt_tx: &mpsc::Sender<OrchestratorEvent>) {
     let retry_tx = evt_tx.clone();
-    thread::spawn(move || {
+    let scheduled = threads::spawn_named(ThreadRole::WatchResolveRetry, move || {
         thread::sleep(RESOLVE_RETRY_DELAY);
         let _ = retry_tx.send(OrchestratorEvent::FsBatch { settle: None });
     });
+    if let Err(refused) = scheduled {
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(&text::watch_thread_refused(&refused)),
+            WatchRole::Info,
+        );
+    }
 }
 
 /// A handle to a running [`spawn`]ed watch session.
@@ -806,8 +817,13 @@ impl Drop for WatchHandle {
 /// (as an [`OrchestratorEvent::Shutdown`]), so shutdown ordering is
 /// serialised with every other event exactly like a real Ctrl-C would be —
 /// no separate code path to keep in sync.
-#[must_use]
-pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, WatchHandle) {
+///
+/// # Errors
+///
+/// [`CliError::ThreadRefused`] when the OS refuses the session's thread.
+pub fn spawn(
+    opts: WatchOptions,
+) -> Result<(thread::JoinHandle<Result<(), CliError>>, WatchHandle), CliError> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     // `done_tx` is moved into the spawned thread's own closure (never handed
     // to `run_inner` itself) and is unconditionally dropped the instant that
@@ -816,18 +832,18 @@ pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, W
     // `WatchHandle::wait_for_shutdown` therefore unblocks promptly even if
     // `run_inner` fails before ever reaching its main loop.
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let handle = thread::spawn(move || {
+    let handle = threads::spawn_named(ThreadRole::WatchSession, move || {
         let result = run_inner(&opts, Some(stop_rx));
         let _ = done_tx.send(());
         result
-    });
-    (
+    })?;
+    Ok((
         handle,
         WatchHandle {
             stop_tx,
             done_rx: Mutex::new(Some(done_rx)),
         },
-    )
+    ))
 }
 
 enum CompileOutcome {
@@ -996,13 +1012,14 @@ fn run_inner(
 
     let (batch_tx, batch_rx) = mpsc::channel::<ipe_watch::Batch>();
     let debounce_cfg = opts.debounce;
-    let coalesce_handle =
-        thread::spawn(move || ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg));
+    let coalesce_handle = threads::spawn_named(ThreadRole::WatchCoalesce, move || {
+        ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg);
+    })?;
 
     let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
     {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchFsRelay, move || {
             for batch in batch_rx {
                 // The settle window is the batch's arrival now minus when its
                 // first raw event opened the window — the true edit→settled
@@ -1013,38 +1030,38 @@ fn run_inner(
                     return;
                 }
             }
-        });
+        })?;
     }
     // SIGTERM → orderly shutdown, for the CLI `run()` path ONLY (`external_stop`
     // is `None` exactly there). A supervisor's `kill -TERM <ipe-pid>` (systemd's
     // default, PID-only — not the foreground process group Ctrl-C signals) would
-    // otherwise hard-kill this process before ANY teardown code runs, orphaning
-    // the supervised child on its port forever. The forwarder is a third instance
-    // of the existing "send into the unified event channel" pattern; the
-    // `Shutdown => break` arm below then runs the full, already-tested teardown.
+    // otherwise end this process before ANY teardown code runs, orphaning the
+    // supervised child on its port. The subscriber is a third instance of the
+    // existing "send into the unified event channel" pattern; the
+    // `Shutdown => break` arm below then runs the full teardown. The process's
+    // one SIGTERM owner (`crate::terminate`) ends every remote transfer on each
+    // request, runs this subscriber on the first, and ends the process by the
+    // signal on any later one, so a teardown that hangs is ended by a second
+    // SIGTERM.
     //
-    // NEVER installed for `spawn()` (`external_stop` is `Some`): `spawn()` runs
-    // on a same-process background thread inside an EMBEDDING HOST — installing a
-    // process-wide SIGTERM handler there would silently and permanently change
-    // the HOST's signal disposition (signal-hook does not restore the previous
-    // disposition once its action is gone). `spawn()` keeps relying exclusively
-    // on `WatchHandle`'s stop channel + `Drop` safety net.
+    // NEVER subscribed for `spawn()` (`external_stop` is `Some`): `spawn()` runs
+    // on a same-process background thread inside an EMBEDDING HOST, whose own
+    // shutdown is the host's to decide. `spawn()` keeps relying exclusively on
+    // `WatchHandle`'s stop channel + `Drop` safety net.
     if external_stop.is_none() {
         #[cfg(unix)]
         {
             let evt_tx = evt_tx.clone();
             // Errors are logged, never fatal — a platform where signal
-            // registration fails degrades to the pre-existing behaviour (no
-            // PID-only-SIGTERM handling), never a hard failure of `ipe watch`.
-            if let Err(e) = ipe_watch::install_sigterm_forwarder(move || {
-                // Announce, on the forwarder thread, that the FIRST SIGTERM has
-                // been consumed and the orderly teardown is starting — the one
-                // registration `signal-hook` holds is now spent, so every later
-                // SIGTERM is absorbed (a stuck `ipe watch` needs SIGKILL). This
-                // notice is emitted BEFORE the `Shutdown` event is sent, so its
-                // appearance is a happens-before proof that the forwarder has
-                // consumed the signal: a supervisor (or the double-SIGTERM proof
-                // test) can wait for this line as an explicit ack rather than
+            // registration fails degrades to no PID-only-SIGTERM handling,
+            // never a hard failure of `ipe watch`.
+            if let Err(e) = crate::terminate::on_shutdown(move || {
+                // Announce, on the owner's thread, that the FIRST SIGTERM has
+                // arrived and the orderly teardown is starting. This notice is
+                // emitted BEFORE the `Shutdown` event is sent, so its
+                // appearance is a happens-before proof that the first request
+                // was answered: a supervisor (or the double-SIGTERM proof test)
+                // can wait for this line as an explicit ack rather than
                 // guessing a delay. Not `--quiet`-gated: a shutdown-on-signal
                 // notice is a load-bearing operational fact, not chatter.
                 emit_watch_line(
@@ -1064,11 +1081,11 @@ fn run_inner(
     }
     if let Some(stop_rx) = external_stop {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchStopRelay, move || {
             if stop_rx.recv().is_ok() {
                 let _ = evt_tx.send(OrchestratorEvent::Shutdown);
             }
-        });
+        })?;
     }
 
     // Resolve the runtime crate root once, fail-closed, before the event loop
@@ -1351,8 +1368,8 @@ fn run_inner(
                 let db_worker = db_main.clone();
                 let entry_path = resolved.entry_path.clone();
                 let blame_path = resolved.blame_path.clone();
-                let evt_tx = evt_tx.clone();
-                compile_worker = Some(thread::spawn(move || {
+                let worker_tx = evt_tx.clone();
+                let spawned = threads::spawn_named(ThreadRole::WatchCompile, move || {
                     // Measure the salsa warm-compile on the worker thread: the
                     // orchestrator only sees the event, so the span has to be
                     // taken here at the real call boundary.
@@ -1372,12 +1389,24 @@ fn run_inner(
                             Ok(Err(e)) => CompileOutcome::Red(e.to_string()),
                             Err(_cancelled) => CompileOutcome::Cancelled,
                         };
-                    let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                    let _ = worker_tx.send(OrchestratorEvent::CompileDone {
                         generation: this_gen,
                         outcome,
                         compile: compile_started.elapsed(),
                     });
-                }));
+                });
+                // A refused worker is this generation's red compile, so the
+                // session reports it and waits for the next edit.
+                match spawned {
+                    Ok(worker) => compile_worker = Some(worker),
+                    Err(refused) => {
+                        let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                            generation: this_gen,
+                            outcome: CompileOutcome::Red(refused.to_string()),
+                            compile: Duration::ZERO,
+                        });
+                    }
+                }
             }
 
             OrchestratorEvent::CompileDone {
@@ -2779,7 +2808,7 @@ fn child_command(exe_path: &Path, env: &[(String, String)]) -> Command {
 /// Spawn the dev child through the runtime's parent-death floor.
 ///
 /// The supervisor reaps this child on every GRACEFUL path (shutdown /
-/// SIGTERM-forwarder / Drop), but a SIGKILL/OOM/panic-abort of `ipe watch`
+/// termination request / Drop), but a SIGKILL/OOM/panic-abort of `ipe watch`
 /// would otherwise orphan it holding the dev port. `spawn_hardened` forks it
 /// from the runtime's process-lifetime spawner thread, so on Linux the kernel
 /// SIGTERMs it when `ipe watch` dies by ANY means, and never earlier (the
@@ -3213,7 +3242,7 @@ fn spawn_cargo_build(
     }));
     let shared_for_waiter = Arc::clone(&shared);
 
-    thread::spawn(move || {
+    let waiter = threads::spawn_os(ThreadRole::WatchCargoWaiter, move || {
         // Both pipes drain on threads scoped to this waiter while it polls, so
         // the drains end with the build and are joined before the event goes out.
         let drained = pipes.drain_while(|| {
@@ -3266,6 +3295,15 @@ fn spawn_cargo_build(
             cargo: cargo_started.elapsed(),
         });
     });
+    if let Err(refused) = waiter {
+        // No waiter would ever reap the build, so it is stopped and reaped
+        // here before the refusal goes back.
+        let mut cargo = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = cargo.child.kill();
+        let _ = cargo.child.wait();
+        drop(cargo);
+        return Err(refused);
+    }
 
     Ok(shared)
 }
@@ -3913,29 +3951,31 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind an ephemeral loopback listener");
         let port = listener.local_addr().expect("local addr").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept the sender");
-            // Read the token record: 4-byte length prefix then the token bytes.
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).expect("read token length");
-            let token_len = u32::from_be_bytes(len_buf) as usize;
-            let mut token = vec![0u8; token_len];
-            stream.read_exact(&mut token).expect("read token body");
-            // Drain the frame record (prefix + body) so the sender's write completes.
-            stream.read_exact(&mut len_buf).expect("read frame length");
-            let frame_len = u32::from_be_bytes(len_buf) as usize;
-            let mut frame = vec![0u8; frame_len];
-            stream.read_exact(&mut frame).expect("read frame body");
-            // Reply with a positive Ack, mirroring the child's ack stub.
-            let ack = ControlFrame::Ack {
-                ok: true,
-                detail: "ack".to_string(),
-            };
-            let out = encode_frame(&ack).expect("encode the ack");
-            stream.write_all(&out).expect("write the ack");
-            stream.flush().expect("flush the ack");
-            String::from_utf8(token).expect("token is utf8")
-        });
+        let server = std::thread::Builder::new()
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept the sender");
+                // Read the token record: 4-byte length prefix then the token bytes.
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).expect("read token length");
+                let token_len = u32::from_be_bytes(len_buf) as usize;
+                let mut token = vec![0u8; token_len];
+                stream.read_exact(&mut token).expect("read token body");
+                // Drain the frame record (prefix + body) so the sender's write completes.
+                stream.read_exact(&mut len_buf).expect("read frame length");
+                let frame_len = u32::from_be_bytes(len_buf) as usize;
+                let mut frame = vec![0u8; frame_len];
+                stream.read_exact(&mut frame).expect("read frame body");
+                // Reply with a positive Ack, mirroring the child's ack stub.
+                let ack = ControlFrame::Ack {
+                    ok: true,
+                    detail: "ack".to_string(),
+                };
+                let out = encode_frame(&ack).expect("encode the ack");
+                stream.write_all(&out).expect("write the ack");
+                stream.flush().expect("flush the ack");
+                String::from_utf8(token).expect("token is utf8")
+            })
+            .expect("spawn test thread");
 
         let frame = ControlFrame::Ack {
             ok: true,
@@ -4220,6 +4260,61 @@ mod tests {
         assert!(
             matches!(outcome, Some(super::CargoOutcome::Killed)),
             "a superseded build must report Killed"
+        );
+    }
+
+    /// A build whose waiter thread the OS refuses is an error, and the build
+    /// it had started is killed and reaped before that error goes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_cargo_waiter_reaps_the_build() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchCargoWaiter);
+        let cargo = fake_cargo("waiter_refused", "exec sleep 30");
+        let out_dir = cargo.parent().expect("fake cargo has a parent dir");
+        let (tx, _rx) = mpsc::channel();
+        let spawned =
+            super::spawn_cargo_build(&cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true);
+        let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
+        let _ = std::fs::remove_dir_all(out_dir);
+        assert!(
+            spawned.is_err(),
+            "a refused waiter must fail the build start"
+        );
+        assert_eq!(
+            left.err(),
+            Some(rustix::io::Errno::CHILD),
+            "the refused build's child must already be reaped"
+        );
+    }
+
+    /// A watch session whose thread the OS refuses is a typed error, not a
+    /// panic in the embedder.
+    #[test]
+    fn a_refused_session_thread_is_a_typed_error() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchSession);
+        let opts = super::WatchOptions::new(
+            PathBuf::from("Main.ipe"),
+            PathBuf::from("out"),
+            PathBuf::from("runtime"),
+        );
+        assert!(matches!(
+            super::spawn(opts),
+            Err(crate::CliError::ThreadRefused {
+                role: crate::threads::ThreadRole::WatchSession,
+                ..
+            })
+        ));
+    }
+
+    /// A refused retry thread skips the retry and leaves the session running.
+    #[test]
+    fn a_refused_resolve_retry_is_skipped() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchResolveRetry);
+        let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
+        schedule_resolve_retry(&evt_tx);
+        assert!(
+            evt_rx.recv_timeout(RESOLVE_RETRY_DELAY * 2).is_err(),
+            "a refused retry sends nothing"
         );
     }
 

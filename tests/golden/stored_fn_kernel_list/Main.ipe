@@ -1,0 +1,155 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking `List`
+-- kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe.
+
+
+type alias Fns =
+    { keep : Int -> Bool
+    , step : Int -> Int
+    , spread : Int -> List Int
+    , half : Int -> Maybe Int
+    , add : Int -> Int -> Int
+    , at : Int -> Int -> Int
+    , add3 : Int -> Int -> Int -> Int
+    , add4 : Int -> Int -> Int -> Int -> Int
+    , add5 : Int -> Int -> Int -> Int -> Int -> Int
+    , key : Int -> Int
+    , desc : Int -> Int -> Order
+    }
+
+
+type Holder
+    = Holder (Int -> Bool)
+
+
+halve : Int -> Maybe Int
+halve n =
+    if modBy 2 n == 0 then
+        Just (n // 2)
+
+    else
+        Nothing
+
+
+fns : Fns
+fns =
+    { keep = \n -> n > 1
+    , step = \n -> n * 10
+    , spread = \n -> [ n, n ]
+    , half = halve
+    , add = \a b -> a + b
+    , at = \i n -> i * n
+    , add3 = \a b c -> a + b + c
+    , add4 = \a b c d -> a + b + c + d
+    , add5 = \a b c d e -> a + b + c + d + e
+    , key = \n -> 0 - n
+    , desc = \a b -> compare b a
+    }
+
+
+xs : List Int
+xs =
+    [ 1, 2, 3 ]
+
+
+showList : List Int -> String
+showList ys =
+    String.join "," (List.map String.fromInt ys)
+
+
+boolText : Bool -> String
+boolText b =
+    if b then
+        "T"
+
+    else
+        "F"
+
+
+direct : Fns -> List String
+direct f =
+    [ showList (List.map f.step xs)
+    , showList (List.filter f.keep xs)
+    , showList (List.concatMap f.spread xs)
+    , showList (List.filterMap f.half xs)
+    , String.fromInt (List.foldl f.add 0 xs)
+    , String.fromInt (List.foldr f.add 0 xs)
+    , showList (List.indexedMap f.at xs)
+    , boolText (List.any f.keep xs)
+    , boolText (List.all f.keep xs)
+    , String.fromInt (Maybe.withDefault 0 (List.find f.keep xs))
+    , showList (fst (List.partition f.keep xs))
+    , showList (List.sortBy f.key xs)
+    , showList (List.sortWith f.desc xs)
+    , showList (List.map2 f.add xs xs)
+    , showList (List.map3 f.add3 xs xs xs)
+    , showList (List.map4 f.add4 xs xs xs xs)
+    , showList (List.map5 f.add5 xs xs xs xs xs)
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ showList ((List.filter f.keep) xs)
+    , showList (xs |> List.filter f.keep)
+    , showList (List.map f.step <| xs)
+    , String.fromInt (xs |> List.foldl f.add 0)
+    , showList (xs |> List.map2 f.add xs)
+    ]
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            showList (List.filter p xs)
+
+
+fromTuple : ( Int -> Bool, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            String.fromInt (n + List.length (List.filter p xs))
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { step } =
+    showList (List.map step xs)
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.add
+    in
+    String.fromInt (List.foldl g 0 xs)
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    showList (List.filter (if flag then f.keep else fns.keep) xs)
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\n -> n < 3))
+                   , fromTuple ( \n -> n > 2, 1 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf True fns
+                   ]
+            )
+        )

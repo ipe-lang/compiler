@@ -1,6 +1,6 @@
 //! Regression: a numeric literal argument inside a `{{...}}` interpolation.
 //!
-//! The no-panic fuzzer (`tools/scripts/fuzz-well-typed.sh`, template `multilineinterp`)
+//! The no-panic fuzzer (template `tests/fuzz/well-typed/multilineinterp/Main.ipe.tmpl`)
 //! built the well-typed program
 //!
 //! ```ipe

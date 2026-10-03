@@ -4,7 +4,7 @@
 //! three columns inspect the crate's `src/` tree directly, without building, so
 //! they run in the fast (non-E2E) path.
 
-use crate::coverage::compiler_surface::{CompilerCrate, has_prod_panic, prod_source, rust_files};
+use crate::coverage::compiler_surface::{CompilerCrate, rust_files};
 use crate::coverage::contract::{AspectCheck, Cell};
 
 // ── tested ────────────────────────────────────────────────────────────────────
@@ -40,12 +40,15 @@ impl AspectCheck<CompilerCrate> for TestedColumn {
 
 // ── no-panic ──────────────────────────────────────────────────────────────────
 
-/// Column **no-panic**: no `unwrap()`, `expect(`, `panic!(`, or `.index(` in production source.
+/// Column **no-panic**: `panic_scan::scan_str` finds no unsanctioned panic
+/// site in production source.
 ///
-/// Production source excludes inline `#[cfg(test)]` / `mod tests { … }` blocks
-/// and the out-of-line test modules [`panic_scan::is_verified_test_path`]
-/// confirms (a `tests/` directory or `tests.rs` declared `#[cfg(test)] mod
-/// tests;`); an unconfirmed test module stays in scope.
+/// The column judges through the same AST scanner the `panic-scan` CI job runs,
+/// so it can never disagree with that gate: test-only nodes and
+/// `IPE-RUST-AUDIT:ACCEPTED` sites are exempt there and here alike, and a
+/// lint attribute such as `#[expect(clippy::x)]` is never mistaken for a call.
+/// The out-of-line test modules [`panic_scan::is_verified_test_path`] confirms
+/// are skipped; a file the scanner cannot read or parse holes the crate.
 ///
 /// Panics in production code violate the soundness principle: a well-typed Ipê
 /// program must never trigger a runtime failure in the generated Rust, and the
@@ -77,17 +80,20 @@ impl AspectCheck<CompilerCrate> for NoPanicColumn {
                     continue;
                 }
             };
-            let prod = prod_source(&src);
-            if has_prod_panic(&prod) {
-                let short = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                violations.push(short.to_owned());
+            match panic_scan::scan_str(&src) {
+                Ok(hits) if hits.is_empty() => {}
+                Ok(_) => {
+                    let short = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    violations.push(short.to_owned());
+                }
+                Err(error) => unreadable.push(format!("{} ({error})", path.display())),
             }
         }
 
         if !unreadable.is_empty() {
             return Cell::Hole(format!(
-                "`{}` cannot be audited for panic-prone patterns: unreadable \
-                 production source: {}",
+                "`{}` cannot be audited for panic-prone patterns: unreadable or \
+                 unparsable production source: {}",
                 item.name,
                 unreadable.join(", ")
             ));
@@ -139,5 +145,66 @@ impl AspectCheck<CompilerCrate> for DocumentedColumn {
                 item.name
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::NoPanicColumn;
+    use crate::coverage::compiler_surface::CompilerCrate;
+    use crate::coverage::contract::{AspectCheck, Cell};
+
+    fn crate_with_lib(tag: &str, lib: &str) -> (PathBuf, CompilerCrate) {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-no-panic-column-{tag}-{}", std::process::id()));
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), lib).unwrap();
+        let item = CompilerCrate {
+            name: "probe",
+            dir: "probe",
+            src_path: Arc::new(src),
+            crate_path: Arc::new(root.clone()),
+        };
+        (root, item)
+    }
+
+    #[test]
+    fn a_production_unwrap_holes_the_crate() {
+        let (root, item) = crate_with_lib(
+            "unwrap",
+            "pub fn f(o: Option<u8>) -> u8 {\n    o.unwrap()\n}\n",
+        );
+        let cell = NoPanicColumn.check(&item);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(cell, Cell::Hole(ref why) if why.contains("lib.rs")),
+            "{cell:?}"
+        );
+    }
+
+    #[test]
+    fn a_lint_expectation_is_not_a_panic_site() {
+        let (root, item) = crate_with_lib(
+            "expect-attr",
+            "#[expect(clippy::needless_pass_by_value)]\npub fn f(s: String) -> usize {\n    s.len()\n}\n",
+        );
+        let cell = NoPanicColumn.check(&item);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(cell, Cell::Ok), "{cell:?}");
+    }
+
+    #[test]
+    fn unparsable_source_holes_the_crate() {
+        let (root, item) = crate_with_lib("unparsable", "pub fn f( {\n");
+        let cell = NoPanicColumn.check(&item);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(cell, Cell::Hole(ref why) if why.contains("unparsable")),
+            "{cell:?}"
+        );
     }
 }

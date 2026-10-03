@@ -72,7 +72,19 @@
 #   IPE_SMOKE_POLL_SECS    admission/resolution poll budget in seconds, used by
 #                          BOTH legs (default 600).
 #   IPE_BIN                path to the built `ipe` binary (default: `ipe` on PATH).
+#   GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT  set by Actions; they tag the probe
+#                          versions so two Actions runs in one second never
+#                          collide. Off CI the shell's pid and attempt 0 stand
+#                          in: distinct from every Actions tag (attempts start
+#                          at 1) and from runs live at once in one pid
+#                          namespace, but not across hosts or containers.
 #
+# Every value above except the token and IPE_BIN is parsed once by
+# `lib/smoke-inputs.sh`; a value off its grammar exits 2 naming the input. The
+# probe programs are the tracked fixtures under `tests/fixtures/registry-smoke/`
+# (`src/ipe-cli/tests/registry_smoke_probes.rs` builds each one).
+#
+# Exit 2 = an input refused by its parser (nothing was pushed).
 # Exit 0 = BOTH legs held: the clean probe's push→admission→resolution path AND
 #          the bad probe's admission REJECTION, then cleanup.
 # Exit non-zero = a real failure (a good probe refused, a bad probe admitted, an
@@ -88,29 +100,41 @@ neg_log()  { printf '%s %s\n' "[smoke][neg]" "$*"; }
 neg_fail() { printf '%s %s\n' "[smoke][neg][FAIL]" "$*" >&2; exit 1; }
 
 # ── Config ──────────────────────────────────────────────────────────────────
-INDEX_REPO="${IPE_SMOKE_INDEX_REPO:-arthurmaciel/ipe-registry}"
+# Every operator value is parsed ONCE here, by the typed parsers in
+# `lib/smoke-inputs.sh`, before any of it reaches an Ipê manifest, the askpass
+# helper, or a URL. A value off its grammar exits 2, naming the input.
+SMOKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/smoke-inputs.sh
+. "$SMOKE_DIR/lib/smoke-inputs.sh"
+FIXTURES="$(cd "$SMOKE_DIR/../../.." && pwd)/tests/fixtures/registry-smoke"
+
+INDEX_REPO="$(parse_repo_slug IPE_SMOKE_INDEX_REPO "${IPE_SMOKE_INDEX_REPO:-arthurmaciel/ipe-registry}")"
 INDEX_OWNER="${INDEX_REPO%%/*}"
-FORK_OWNER="${IPE_SMOKE_FORK:-$INDEX_OWNER}"
-REGISTRY_URL="${IPE_REGISTRY_URL:-https://arthurmaciel.github.io/ipe-registry}"
-PACKAGE="${IPE_SMOKE_PACKAGE:-ipe-registry-smoke-probe}"
-SOURCE_REPO="${IPE_SMOKE_SOURCE_REPO:-$FORK_OWNER/$PACKAGE}"
-POLL_SECS="${IPE_SMOKE_POLL_SECS:-600}"
+FORK_OWNER="$(parse_gh_owner IPE_SMOKE_FORK "${IPE_SMOKE_FORK:-$INDEX_OWNER}")"
+REGISTRY_URL="$(parse_https_url IPE_REGISTRY_URL "${IPE_REGISTRY_URL:-https://arthurmaciel.github.io/ipe-registry}")"
+PACKAGE="$(parse_package_name IPE_SMOKE_PACKAGE "${IPE_SMOKE_PACKAGE:-$PROBE_DEFAULT_NAME}")"
+SOURCE_REPO="$(parse_repo_slug IPE_SMOKE_SOURCE_REPO "${IPE_SMOKE_SOURCE_REPO:-$FORK_OWNER/$PACKAGE}")"
+POLL_SECS="$(parse_poll_secs IPE_SMOKE_POLL_SECS "${IPE_SMOKE_POLL_SECS:-600}")"
 IPE="${IPE_BIN:-ipe}"
 
 # The negative leg's DISTINCT reserved probe — a separate name so a bad probe can
 # never collide with or pollute the clean probe (or a real package). Its source is
 # a separate disposable repo (or the `-bad` sibling of the clean source).
-BAD_PACKAGE="${IPE_SMOKE_BAD_PACKAGE:-ipe-registry-smoke-probe-bad}"
-BAD_SOURCE_REPO="${IPE_SMOKE_BAD_SOURCE_REPO:-$FORK_OWNER/$BAD_PACKAGE}"
+BAD_PACKAGE="$(parse_package_name IPE_SMOKE_BAD_PACKAGE "${IPE_SMOKE_BAD_PACKAGE:-$PROBE_DEFAULT_BAD_NAME}")"
+BAD_SOURCE_REPO="$(parse_repo_slug IPE_SMOKE_BAD_SOURCE_REPO "${IPE_SMOKE_BAD_SOURCE_REPO:-$FORK_OWNER/$BAD_PACKAGE}")"
 
-# A fresh, monotonically-increasing prerelease version per run: a smoke run never
-# collides with a prior run's version (which admission would reject as immutable),
-# and every version this reserved package ever carries is a `0.0.0-smoke.*`
-# prerelease that no real consumer would ever depend on.
-VERSION="0.0.0-smoke.$(date -u +%Y%m%d%H%M%S)"
+# A fresh prerelease version per run: a smoke run never collides with a prior
+# run's version (which admission would reject as immutable), and every version
+# this reserved package ever carries is a `0.0.0-smoke.*` prerelease no real
+# consumer would depend on. The UTC stamp orders runs; the run tag (the GitHub
+# run id + attempt, or this shell's pid + 0 off CI) keeps two runs started in
+# the same second apart (off CI, only within one pid namespace).
+STAMP="$(date -u +%Y%m%d%H%M%S)"
+RUN_TAG="$(parse_run_tag "${GITHUB_RUN_ID:-$$}" "${GITHUB_RUN_ATTEMPT:-0}")"
+VERSION="$(probe_version smoke "$STAMP" "$RUN_TAG")"
 BRANCH="publish/${PACKAGE}-${VERSION}"
 # The negative probe's own prerelease version + branch (same disposable scheme).
-BAD_VERSION="0.0.0-smokebad.$(date -u +%Y%m%d%H%M%S)"
+BAD_VERSION="$(probe_version smokebad "$STAMP" "$RUN_TAG")"
 BAD_BRANCH="publish/${BAD_PACKAGE}-${BAD_VERSION}"
 
 # The token must exist and never be printed. Its presence is checked, its value
@@ -132,22 +156,13 @@ log "package: $PACKAGE  version: $VERSION  fork: $FORK_OWNER  source: $SOURCE_RE
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ipe-smoke-XXXXXX")"
 ASKPASS="$WORK/askpass.sh"
 # The askpass helper prints the token to stdout when git asks for a password and
-# the fork owner when git asks for a username. git reads it via GIT_ASKPASS, so
-# the token never appears on any command line. The file is mode 0700 in a
-# per-run temp dir and removed on cleanup.
-#
-# The `$1`, `$IPE_SMOKE_TOKEN` in the single-quoted printf templates below are the
-# GENERATED script's own runtime references — they must NOT expand at generation
-# time, so single quotes are correct here (shellcheck SC2016 is expected).
-# shellcheck disable=SC2016
-{
-  printf '#!/usr/bin/env bash\n'
-  printf 'case "$1" in\n'
-  printf '  *Username*) printf "%%s" "%s" ;;\n' "$FORK_OWNER"
-  printf '  *Password*) printf "%%s" "$IPE_SMOKE_TOKEN" ;;\n'
-  printf 'esac\n'
-} > "$ASKPASS"
-chmod 700 "$ASKPASS"
+# the fork owner when git asks for a username. Its text is fixed (`write_askpass`):
+# both values are read from its environment when git runs it, so no value is
+# spliced into generated code. git reads it via GIT_ASKPASS, so the token never
+# appears on any command line. The file is mode 0700 in a per-run temp dir and
+# removed on cleanup.
+write_askpass "$ASKPASS"
+export IPE_SMOKE_ASKPASS_USER="$FORK_OWNER"
 export GIT_ASKPASS="$ASKPASS"
 export GIT_TERMINAL_PROMPT=0
 # The askpass child reads IPE_SMOKE_TOKEN from its inherited environment; export
@@ -210,27 +225,8 @@ trap cleanup EXIT
 # committed, pushed revision. The source repo is the disposable IPE_SMOKE_SOURCE_REPO.
 PKG="$WORK/pkg"
 mkdir -p "$PKG/src"
-cat > "$PKG/package.ipe" <<EOF
-module Package exposing (package)
-
-import Ipe.Package exposing (..)
-
-
-package : Package
-package =
-    { name = "$PACKAGE"
-    , version = "$VERSION"
-    }
-EOF
-cat > "$PKG/src/Main.ipe" <<'EOF'
-module Main exposing (main)
-
-import Ipe.Io as Io
-
-
-main =
-    Io.println "registry smoke probe"
-EOF
+render_probe_manifest "$FIXTURES/package.ipe.tmpl" "$PACKAGE" "$VERSION" > "$PKG/package.ipe"
+cp "$FIXTURES/good/src/Main.ipe" "$PKG/src/Main.ipe"
 
 git -C "$PKG" init --quiet
 git -C "$PKG" -c user.name=ipe-smoke -c user.email=smoke@ipe-lang.invalid add .
@@ -348,32 +344,13 @@ without it a rejection cannot be observed — refusing to assert a hollow pass (
 
 BAD_PKG="$WORK/pkg-bad"
 mkdir -p "$BAD_PKG/src"
-cat > "$BAD_PKG/package.ipe" <<EOF
-module Package exposing (package)
-
-import Ipe.Package exposing (..)
-
-
-package : Package
-package =
-    { name = "$BAD_PACKAGE"
-    , version = "$BAD_VERSION"
-    }
-EOF
+render_probe_manifest "$FIXTURES/package.ipe.tmpl" "$BAD_PACKAGE" "$BAD_VERSION" > "$BAD_PKG/package.ipe"
 # The REGISTERED source: the tree the pin will falsely name. It is committed and
 # pushed under an IMMUTABLE per-version tag so admission can fetch it by the pinned
 # SHA. Its exact bytes only need to DIFFER from the working tree hashed below — the
 # spoof is source≠pin, not anything about this file — so it is a clean, consistent
 # program (it must never itself be the reason for a rejection).
-cat > "$BAD_PKG/src/Main.ipe" <<'EOF'
-module Main exposing (main)
-
-import Ipe.Io as Io
-
-
-main =
-    Io.println "registry smoke probe (registered source — the spoof target)"
-EOF
+cp "$FIXTURES/bad-registered/src/Main.ipe" "$BAD_PKG/src/Main.ipe"
 
 git -C "$BAD_PKG" init --quiet
 git -C "$BAD_PKG" -c user.name=ipe-smoke -c user.email=smoke@ipe-lang.invalid add .
@@ -393,15 +370,7 @@ git -C "$BAD_PKG" push --force --quiet origin "$BAD_SRC_HEAD:refs/heads/smoke-ba
 # the pinned `sha256` = the hash of THIS tree — deliberately != the pushed source
 # above. Commit so the tree is pristine (belt-and-braces; the `--rev` path runs no
 # dirty-tree guard).
-cat > "$BAD_PKG/src/Main.ipe" <<'EOF'
-module Main exposing (main)
-
-import Ipe.Io as Io
-
-
-main =
-    Io.println "registry smoke probe (working tree — hashed into the pin, != the pinned source)"
-EOF
+cp "$FIXTURES/bad-working/src/Main.ipe" "$BAD_PKG/src/Main.ipe"
 git -C "$BAD_PKG" -c user.name=ipe-smoke -c user.email=smoke@ipe-lang.invalid \
   commit --quiet -am "smoke-bad diverged working tree $BAD_VERSION"
 

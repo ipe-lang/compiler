@@ -1,0 +1,17 @@
+-- fuzz-hole call
+--   base: Nothing
+--   mutant: Nothing @n1@
+-- fuzz-slot n1 : Int 1 9999
+-- fuzz-expect IPE-T0001
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+main =
+    let
+        val = Maybe.withDefault 0 (@call@)
+    in
+    Io.println (String.fromInt val)

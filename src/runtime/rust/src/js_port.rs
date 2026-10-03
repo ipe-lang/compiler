@@ -59,9 +59,11 @@ use crate::tea::{IpeCmd, IpeSub};
 /// boundary — the per-call `is_empty()` guards in the native registry fall
 /// away entirely.
 ///
-/// `Display`/`Debug` expose the raw hex string so the store can use it as a
-/// map key and the dispatch loop can pass it to [`js_send`] via
-/// `IpeCmd::Publish`'s `origin: &str` argument.
+/// `Display` and [`SessionId::as_str`] expose the raw hex string so the store
+/// can use it as a map key and the dispatch loop can pass it to [`js_send`] via
+/// `IpeCmd::Publish`'s `origin: &str` argument. `Debug` prints
+/// `SessionId(<redacted>)`: the id is a bearer credential, so no `{:?}` (a log
+/// line, the stringify fallback) can print it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
@@ -97,7 +99,9 @@ impl std::fmt::Display for SessionId {
 
 impl std::fmt::Debug for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.debug_tuple("SessionId")
+            .field(&crate::redact::Redacted::new(()))
+            .finish()
     }
 }
 
@@ -1511,6 +1515,13 @@ mod tests {
         let sid = SessionId::parse(raw).expect("valid hex must parse");
         assert_eq!(sid.as_str(), raw);
         assert_eq!(sid.to_string(), raw);
+    }
+
+    #[test]
+    fn session_id_debug_prints_no_token() {
+        let raw = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+        let shown = format!("{:?}", SessionId::parse(raw));
+        assert_eq!(shown, "Some(SessionId(<redacted>))");
     }
 
     // ── Feature-independent: canonical seal encoding ───────────────────────────

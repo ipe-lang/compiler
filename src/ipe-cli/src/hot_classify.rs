@@ -522,7 +522,7 @@ fn scan_msg_set_located(src: &str) -> Option<(String, MaskSpan)> {
         return None;
     }
     let inner_start = arg_at + 1;
-    let (json, next) = parse_string_literal(bytes, arg_at)?;
+    let (json, next) = parse_string_literal(src, arg_at)?;
     Some((
         json,
         MaskSpan {
@@ -628,7 +628,7 @@ fn scan_transition_data(src: &str) -> Option<Vec<TransitionData>> {
             return None;
         }
         let inner_start = arg_at + 1;
-        let (json, next) = parse_string_literal(bytes, arg_at)?;
+        let (json, next) = parse_string_literal(src, arg_at)?;
         // `next` is just past the closing quote; the closing quote is `next - 1`.
         out.push(TransitionData {
             inner_start,
@@ -665,7 +665,7 @@ fn scan_sub_data(src: &str) -> Option<Vec<TransitionData>> {
             return None;
         }
         let inner_start = arg_at + 1;
-        let (json, next) = parse_string_literal(bytes, arg_at)?;
+        let (json, next) = parse_string_literal(src, arg_at)?;
         out.push(TransitionData {
             inner_start,
             inner_end: next - 1,
@@ -723,7 +723,7 @@ fn scan_init_data(src: &str) -> Option<Vec<InitData>> {
             return None;
         }
         let json_inner_start = arg_at + 1;
-        let (json, after_str) = parse_string_literal(bytes, arg_at)?;
+        let (json, after_str) = parse_string_literal(src, arg_at)?;
         // A comma separates the two arguments.
         let comma = skip_ws(bytes, after_str);
         if *bytes.get(comma)? != b',' {
@@ -734,7 +734,7 @@ fn scan_init_data(src: &str) -> Option<Vec<InitData>> {
         // matching close paren to bound the second argument. `match_close_paren`
         // takes the offset just past the opening `(`.
         let call_open = open + INIT_OPEN.len();
-        let close = match_close_paren(bytes, call_open)?;
+        let close = match_close_paren(src, call_open)?;
         // The second argument runs from `arg2_start` up to the closing `)`.
         if close < arg2_start {
             return None;
@@ -776,7 +776,7 @@ fn scan_wiring_data(src: &str) -> Option<Vec<TransitionData>> {
             return None;
         }
         let inner_start = arg_at + 1;
-        let (json, next) = parse_string_literal(bytes, arg_at)?;
+        let (json, next) = parse_string_literal(src, arg_at)?;
         out.push(TransitionData {
             inner_start,
             inner_end: next - 1,
@@ -907,7 +907,6 @@ const UNWRAP_OR_OPEN: &str = ".unwrap_or(";
 /// it contributes nothing. Returns `None` if an `unwrap_or` cannot be balanced,
 /// so a malformed shape falls to `Logic`.
 fn scan_hoisted_read_fallbacks(src: &str) -> Option<Vec<MaskSpan>> {
-    let bytes = src.as_bytes();
     let mut spans = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = src[from..].find(HOISTED_READ_OPEN) {
@@ -920,7 +919,7 @@ fn scan_hoisted_read_fallbacks(src: &str) -> Option<Vec<MaskSpan>> {
             .map_or(src.len(), |n| after_read + n);
         if let Some(u_rel) = src[after_read..window_end].find(UNWRAP_OR_OPEN) {
             let arg_start = after_read + u_rel + UNWRAP_OR_OPEN.len();
-            let arg_end = match_close_paren(bytes, arg_start)?;
+            let arg_end = match_close_paren(src, arg_start)?;
             spans.push(MaskSpan {
                 start: arg_start,
                 end: arg_end,
@@ -935,12 +934,13 @@ fn scan_hoisted_read_fallbacks(src: &str) -> Option<Vec<MaskSpan>> {
 /// `)` (the byte AT the close). Balances nested parens; ignores parens inside
 /// string literals so a `")"` in a fallback string does not miscount. Returns
 /// `None` if unbalanced (⇒ conservative `Logic`).
-fn match_close_paren(bytes: &[u8], mut pos: usize) -> Option<usize> {
+fn match_close_paren(src: &str, mut pos: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
     let mut depth: usize = 1;
     while let Some(&b) = bytes.get(pos) {
         match b {
             b'"' => {
-                let (_s, next) = parse_string_literal(bytes, pos)?;
+                let (_s, next) = parse_string_literal(src, pos)?;
                 pos = next;
                 continue;
             }
@@ -964,13 +964,12 @@ fn match_close_paren(bytes: &[u8], mut pos: usize) -> Option<usize> {
 /// as a well-formed list of Rust string literals — never a guess. A file with no
 /// occurrences returns `Some(empty)`.
 fn scan_defaults_arrays(src: &str) -> Option<Vec<DefaultsArray>> {
-    let bytes = src.as_bytes();
     let mut arrays = Vec::new();
     let mut search_from = 0usize;
-    while let Some(rel) = src[search_from..].find(DEFAULTS_OPEN) {
+    while let Some(rel) = src.get(search_from..)?.find(DEFAULTS_OPEN) {
         let open = search_from + rel;
         let inner_start = open + DEFAULTS_OPEN.len();
-        let (values, inner_end) = parse_string_array(bytes, inner_start)?;
+        let (values, inner_end) = parse_string_array(src, inner_start)?;
         arrays.push(DefaultsArray {
             inner_start,
             inner_end,
@@ -989,14 +988,15 @@ fn scan_defaults_arrays(src: &str) -> Option<Vec<DefaultsArray>> {
 /// Only the escapes the emitter can produce via `{:?}` on a `String` are handled:
 /// `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, and `\u{…}`. Any other escape or a
 /// non-string element yields `None`.
-fn parse_string_array(bytes: &[u8], mut pos: usize) -> Option<(Vec<String>, usize)> {
+fn parse_string_array(src: &str, mut pos: usize) -> Option<(Vec<String>, usize)> {
+    let bytes = src.as_bytes();
     let mut values = Vec::new();
     loop {
         pos = skip_ws(bytes, pos);
         match bytes.get(pos)? {
             b']' => return Some((values, pos)),
             b'"' => {
-                let (s, next) = parse_string_literal(bytes, pos)?;
+                let (s, next) = parse_string_literal(src, pos)?;
                 values.push(s);
                 pos = skip_ws(bytes, next);
                 match bytes.get(pos)? {
@@ -1024,9 +1024,15 @@ fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-/// Parse one Rust double-quoted string literal beginning at `bytes[pos] == '"'`.
-/// Returns the unescaped `String` and the offset just past the closing quote.
-fn parse_string_literal(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
+/// Parse one Rust double-quoted string literal in `src` starting at `pos`.
+///
+/// `src.as_bytes()[pos]` must be `b'"'`. Returns the unescaped `String` and the
+/// offset just past the closing quote. `src` stays a `&str` end to end, so the
+/// UTF-8 proof the caller already holds travels in the type: decoding a raw
+/// char here costs O(1), inspecting at most 4 bytes and never re-validating
+/// the remainder of `src`.
+fn parse_string_literal(src: &str, pos: usize) -> Option<(String, usize)> {
+    let bytes = src.as_bytes();
     if *bytes.get(pos)? != b'"' {
         return None;
     }
@@ -1055,11 +1061,13 @@ fn parse_string_literal(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
                 }
                 i += 2;
             }
-            // A raw byte in the string body. Recover the char via UTF-8 so
-            // multi-byte source values (e.g. an accented CSS content string)
-            // round-trip; a lone continuation byte is invalid → None.
+            // A raw byte in the string body. `src` is already proven UTF-8, so
+            // decode the scalar directly at this offset — an O(1) boundary
+            // check plus one scalar decode, never a revalidation of the tail.
+            // An offset off a char boundary (a lone continuation byte) yields
+            // `None` here, exactly as the old whole-tail decode did.
             _ => {
-                let ch = next_utf8_char(bytes, i)?;
+                let ch = src.get(i..)?.chars().next()?;
                 let len = ch.len_utf8();
                 out.push(ch);
                 i += len;
@@ -1094,15 +1102,6 @@ fn parse_unicode_escape(bytes: &[u8], pos: usize) -> Option<(char, usize)> {
         i += 1;
     }
     None
-}
-
-/// Decode the UTF-8 char beginning at `bytes[pos]`, or `None` if the bytes are
-/// not a valid UTF-8 sequence there.
-fn next_utf8_char(bytes: &[u8], pos: usize) -> Option<char> {
-    let rest = bytes.get(pos..)?;
-    std::str::from_utf8(rest)
-        .ok()
-        .and_then(|s| s.chars().next())
 }
 
 #[cfg(test)]
@@ -1877,10 +1876,57 @@ mod tests {
             let lit = ipe_intern::rust_str_lit(text);
             let source = format!("{lit}, trailing");
             assert_eq!(
-                parse_string_literal(source.as_bytes(), 0),
+                parse_string_literal(&source, 0),
                 Some((text.to_owned(), lit.len())),
                 "{lit} did not round-trip"
             );
         }
+    }
+
+    // ── one character decoded costs O(1), not O(remaining file length) ───
+
+    // A literal with a 4-byte scalar (the longest UTF-8 encoding) decodes
+    // correctly; the same `pos` moved one byte into that scalar — off its char
+    // boundary, and not the literal's opening quote — refuses rather than
+    // guessing at a different character from whatever bytes follow.
+    #[test]
+    fn decode_reads_at_most_one_scalar() {
+        let src = "\"\u{1F600} more text\"";
+        let (s, next) = parse_string_literal(src, 0).expect("literal with a 4-byte scalar parses");
+        assert_eq!(s, "\u{1F600} more text");
+        assert_eq!(next, src.len());
+
+        // Byte 2 is the second byte of the 4-byte scalar: off its char
+        // boundary, so the decode refuses instead of decoding past it.
+        assert_eq!(parse_string_literal(src, 2), None);
+    }
+
+    // A 4 MiB "é…é" literal (2,000,000 two-byte scalars), followed by a later
+    // transition datum so the remaining-file tail stays long for every scalar
+    // the OLD whole-tail-revalidating decode would re-walk. Quadratic cost
+    // here is ~4×10^12 byte checks (minutes to hours); linear cost is
+    // milliseconds — a six-order-of-magnitude margin, so the wall budget
+    // cannot flake on a slow runner.
+    #[test]
+    fn large_non_ascii_literal_classifies_in_linear_work() {
+        let big = "é".repeat(2_000_000);
+        let prev_src = format!("{} {}", table(&[big.as_str()]), transition_arm(INC1));
+        let next_src = format!("{} {}", table(&[big.as_str()]), transition_arm(INC2));
+        let prev = project(&[("src/main.rs", &prev_src)], "cargo");
+        let next = project(&[("src/main.rs", &next_src)], "cargo");
+
+        let start = std::time::Instant::now();
+        let got = classify(&prev, &next);
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(got, Classification::HotSwappable(_)),
+            "expected HotSwappable, got {got:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "classification took {elapsed:?}; expected O(1)-per-scalar decoding \
+             to finish well under 10s"
+        );
     }
 }

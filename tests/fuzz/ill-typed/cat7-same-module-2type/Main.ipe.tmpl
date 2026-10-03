@@ -1,0 +1,16 @@
+-- fuzz-hole use
+--   base: String.fromInt (ident @n1@)
+--   mutant: ident "s@n1@"
+-- fuzz-slot n1 : Int 1 90
+-- fuzz-expect IPE-T0001
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+ident x = x
+
+
+main =
+    Io.println (String.fromInt (ident @n1@) ++ @use@)

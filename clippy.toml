@@ -36,4 +36,8 @@ disallowed-methods = [
     { path = "tempfile::NamedTempFile::with_prefix", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile`", allow-invalid = true },
     { path = "tempfile::Builder::tempdir", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchDir` or `Builder::tempdir_in`", allow-invalid = true },
     { path = "tempfile::Builder::tempfile", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile` or `Builder::tempfile_in`", allow-invalid = true },
+    # A refused OS thread must come back as an error the caller routes, never
+    # a panic: every thread starts through `std::thread::Builder`.
+    { path = "std::thread::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn` and route the `io::Error`" },
+    { path = "std::thread::Scope::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn_scoped` and route the `io::Error`" },
 ]

@@ -107,11 +107,12 @@ pub async fn enable_from_env() {
         );
         return;
     }
-    let interval_ms = ExporterEnv::HubInterval
-        .read()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INTERVAL_MS)
-        .max(MIN_INTERVAL_MS);
+    let interval_ms: u64 = match ExporterEnv::HubInterval
+        .read_ceiling::<u64>(DEFAULT_INTERVAL_MS, "decimal millisecond count")
+    {
+        Ok(ms) => ms.max(MIN_INTERVAL_MS),
+        Err(refusal) => return super::push_exporter::log_refused_ceiling("hub", &refusal),
+    };
     let service = match ExporterEnv::ServiceName.read() {
         Some(s) if !s.is_empty() => s,
         _ => "app".to_string(),

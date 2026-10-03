@@ -127,6 +127,7 @@ relayable!(
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
     ipe_watch::ScopeError,
+    ipe_docs::argv::NonUtf8Argument,
     ipe_lint::ConfigError,
     ipe_sandbox::run_jail::RunJailDefect,
     ipe_ffi::diag::Diagnostic,
@@ -964,6 +965,26 @@ messages! {
     cli_io_other(path, kind) = "cli-io-other";
     /// No private scratch directory could be created under the OS temp root.
     cli_scratch_unavailable(kind) = "cli-scratch-unavailable";
+    /// The OS refused to start a thread the command needs.
+    cli_thread_refused(role, kind) = "cli-thread-refused";
+    /// The thread that runs an `ipe watch` session.
+    thread_role_watch_session = "thread-role-watch-session";
+    /// The thread that coalesces `ipe watch` file events.
+    thread_role_watch_coalesce = "thread-role-watch-coalesce";
+    /// The thread that relays filesystem events to `ipe watch`.
+    thread_role_watch_fs_relay = "thread-role-watch-fs-relay";
+    /// The thread that relays a stop request to `ipe watch`.
+    thread_role_watch_stop_relay = "thread-role-watch-stop-relay";
+    /// The thread that retries an `ipe watch` dependency resolve.
+    thread_role_watch_resolve_retry = "thread-role-watch-resolve-retry";
+    /// The thread that runs an `ipe watch` compile.
+    thread_role_watch_compile = "thread-role-watch-compile";
+    /// The thread that waits on an `ipe watch` cargo build.
+    thread_role_watch_cargo_waiter = "thread-role-watch-cargo-waiter";
+    /// The thread that enforces a WASI run's wall-clock ceiling.
+    thread_role_wasi_wall_clock = "thread-role-wasi-wall-clock";
+    /// `ipe watch` could not start its dependency-resolve retry thread.
+    watch_thread_refused(detail) = "watch-thread-refused";
     /// Publish from a dirty working tree.
     publish_dirty_tree(source_root) = "publish-dirty-tree";
     /// Publish of an unpushed HEAD.
@@ -1141,8 +1162,16 @@ messages! {
     ships_shape_mismatch(delivery, shape) = "ships-shape-mismatch";
     /// `ipe add` found the package already declared as an escape dependency.
     pkg_add_escape_dependency(name) = "pkg-add-escape-dependency";
-    /// A `package.ipe` program entry is not a valid entry file.
-    manifest_entry_invalid(entry) = "manifest-entry-invalid";
+    /// A `package.ipe` program entry has an empty path segment.
+    manifest_entry_empty_segment(entry) = "manifest-entry-empty-segment";
+    /// A `package.ipe` program entry has a `.` or `..` path segment.
+    manifest_entry_dot_segment(entry) = "manifest-entry-dot-segment";
+    /// A `package.ipe` program entry contains a backslash.
+    manifest_entry_backslash(entry) = "manifest-entry-backslash";
+    /// A `package.ipe` program entry opens with a drive prefix.
+    manifest_entry_drive_prefix(entry) = "manifest-entry-drive-prefix";
+    /// A `package.ipe` program entry does not end in `.ipe`.
+    manifest_entry_extension(entry) = "manifest-entry-extension";
     /// A `package.ipe` program entry has an invalid module segment.
     manifest_entry_segment_invalid(entry, segment) = "manifest-entry-segment-invalid";
     /// A `package.ipe` program entry names no module.
@@ -1151,6 +1180,24 @@ messages! {
     manifest_not_package_ipe(path, hint) = "manifest-not-package-ipe";
     /// A package name is not a single path component for a bundle.
     bundle_name_not_a_component(name) = "bundle-name-not-a-component";
+    /// The emitted wasm bundle has no top-level `index.html`.
+    mobile_bundle_no_index(dir) = "mobile-bundle-no-index";
+    /// An entry of the emitted wasm bundle a mobile shell cannot place.
+    mobile_bundle_unplaceable(path, reason) = "mobile-bundle-unplaceable";
+    /// The emitted wasm bundle nests directories past the walk's depth ceiling.
+    mobile_bundle_too_deep(limit, path) = "mobile-bundle-too-deep";
+    /// The emitted wasm bundle holds more entries than the walk's ceiling.
+    mobile_bundle_too_many(limit) = "mobile-bundle-too-many";
+    /// The emitted wasm bundle was replaced between its collection and its copy.
+    mobile_bundle_replaced(path) = "mobile-bundle-replaced";
+    /// A filesystem failure while walking the emitted wasm bundle.
+    mobile_bundle_io(path, detail) = "mobile-bundle-io";
+    /// A bundle entry's name is not UTF-8.
+    mobile_asset_not_utf8 = "mobile-asset-not-utf8";
+    /// A bundle entry's name is not one plain entry name.
+    mobile_asset_bad_name = "mobile-asset-bad-name";
+    /// A bundle entry is neither a regular file nor a directory.
+    mobile_asset_kind(kind) = "mobile-asset-kind";
     /// A generate-only flag was given to an `ipe doc` subcommand.
     doc_generate_only_flag(sub, flag) = "doc-generate-only-flag";
     /// `--port` was given to an `ipe doc` subcommand other than `serve`.

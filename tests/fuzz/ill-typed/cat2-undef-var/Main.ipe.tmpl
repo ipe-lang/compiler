@@ -1,0 +1,17 @@
+-- fuzz-hole addend
+--   base: 0
+--   mutant: undef_@sfx@
+-- fuzz-slot sfx : Hex4
+-- fuzz-expect IPE-N0001
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+main =
+    let
+        x = 5
+        y = 10
+    in
+    Io.println (String.fromInt (x + y + @addend@))

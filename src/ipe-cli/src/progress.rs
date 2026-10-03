@@ -17,8 +17,17 @@
 //! (piped, redirected, `--plain`, `NO_COLOR`) each stage is a single flush-left
 //! plain line with no spinner, no rewrite, and no escape codes, so logs and
 //! scripts stay clean.
+//!
+//! A label or outcome message often quotes foreign text (a crate name from a
+//! manifest, an OS error naming a path), so [`Stage`] parses each one into an
+//! `ipe_diagnostics::terminal::TerminalLine` once, at entry, and the line
+//! renderers take only that type: no ANSI sequence, control, bidi, zero-width
+//! or tag character, and no newline or tab, reaches a progress line. The
+//! character set dropped is the one the runtime's replay dump drops too.
 
 use std::io::{IsTerminal, Write};
+
+use ipe_diagnostics::terminal::TerminalLine;
 
 use crate::style::{self, GUTTER, Outcome, Palette};
 
@@ -70,7 +79,7 @@ const CLEAR_TO_EOL: &str = "\x1b[0K";
 /// this same line. Plain: the gutter and the bare label on its own line (no
 /// spinner, no colour, no carriage return), emitted once when the stage starts.
 #[must_use]
-pub fn running_line(mode: Mode, label: &str, frame_index: usize) -> String {
+pub fn running_line(mode: Mode, label: &TerminalLine, frame_index: usize) -> String {
     let p = mode.palette();
     match mode {
         Mode::Terminal => {
@@ -93,7 +102,7 @@ pub fn running_line(mode: Mode, label: &str, frame_index: usize) -> String {
 /// settles the finished line. Plain: the gutter, the check glyph, and the plain
 /// message on their own line.
 #[must_use]
-pub fn success_line(mode: Mode, msg: &str) -> String {
+pub fn success_line(mode: Mode, msg: &TerminalLine) -> String {
     outcome_line(mode, Outcome::Success, msg)
 }
 
@@ -103,7 +112,7 @@ pub fn success_line(mode: Mode, msg: &str) -> String {
 /// cross glyph, the light-red message, a clear-to-end, and a settling newline.
 /// Plain: the gutter, the cross glyph, and the plain message on their own line.
 #[must_use]
-pub fn failure_line(mode: Mode, msg: &str) -> String {
+pub fn failure_line(mode: Mode, msg: &TerminalLine) -> String {
     outcome_line(mode, Outcome::Failure, msg)
 }
 
@@ -113,7 +122,7 @@ pub fn failure_line(mode: Mode, msg: &str) -> String {
 /// The glyph and tint both come from `outcome` via the [`crate::style`] SSOT,
 /// so a success is a green check and a failure a red cross by one decision, not
 /// a per-site pairing.
-fn outcome_line(mode: Mode, outcome: Outcome, msg: &str) -> String {
+fn outcome_line(mode: Mode, outcome: Outcome, msg: &TerminalLine) -> String {
     let p = mode.palette();
     let (glyph, color) = outcome.glyph_and_tint(p);
     match mode {
@@ -150,7 +159,7 @@ fn spinner_frame(frame_index: usize) -> &'static str {
 pub struct Stage<W: Write> {
     writer: W,
     mode: Mode,
-    label: String,
+    label: TerminalLine,
     frame_index: usize,
     /// Set once an outcome (or an explicit settle) has been written, so `Drop`
     /// does not settle a line the caller already closed.
@@ -172,10 +181,10 @@ impl<W: Write + IsTerminal> Stage<W> {
 
 impl<W: Write> Stage<W> {
     /// Begin a stage on `writer` in an explicit [`Mode`], painting the running
-    /// line at once. Used where the destination's terminal-ness is already known
+    /// line at once; `label` is parsed into a [`TerminalLine`] here. Used where the destination's terminal-ness is already known
     /// (or fixed, as in tests) rather than derived from the writer.
     pub fn with_mode(mut writer: W, mode: Mode, label: impl Into<String>) -> Self {
-        let label = label.into();
+        let label = TerminalLine::sanitize(&label.into());
         let _ = write!(writer, "{}", running_line(mode, &label, 0));
         let _ = writer.flush();
         Self {
@@ -206,7 +215,11 @@ impl<W: Write> Stage<W> {
     /// light-green check and `msg`.
     pub fn success(mut self, msg: impl AsRef<str>) {
         self.finished = true;
-        let _ = write!(self.writer, "{}", success_line(self.mode, msg.as_ref()));
+        let _ = write!(
+            self.writer,
+            "{}",
+            success_line(self.mode, &TerminalLine::sanitize(msg.as_ref()))
+        );
         let _ = self.writer.flush();
     }
 
@@ -215,7 +228,11 @@ impl<W: Write> Stage<W> {
     /// caller's decision — this only renders the line.
     pub fn failure(mut self, msg: impl AsRef<str>) {
         self.finished = true;
-        let _ = write!(self.writer, "{}", failure_line(self.mode, msg.as_ref()));
+        let _ = write!(
+            self.writer,
+            "{}",
+            failure_line(self.mode, &TerminalLine::sanitize(msg.as_ref()))
+        );
         let _ = self.writer.flush();
     }
 }
@@ -239,11 +256,18 @@ mod tests {
 
     #[test]
     fn plain_mode_is_one_flush_left_line_per_stage_with_no_ansi() {
-        let running = running_line(Mode::Plain, "Resolving the latest release…", 3);
+        let running = running_line(
+            Mode::Plain,
+            &TerminalLine::from("Resolving the latest release…"),
+            3,
+        );
         assert_eq!(running, "  Resolving the latest release…\n");
-        let ok = success_line(Mode::Plain, "Found ipe-v0.1.36");
+        let ok = success_line(Mode::Plain, &TerminalLine::from("Found ipe-v0.1.36"));
         assert_eq!(ok, "  ✓ Found ipe-v0.1.36\n");
-        let bad = failure_line(Mode::Plain, "Binary not found — set IPE_VERSION");
+        let bad = failure_line(
+            Mode::Plain,
+            &TerminalLine::from("Binary not found — set IPE_VERSION"),
+        );
         assert_eq!(bad, "  ✗ Binary not found — set IPE_VERSION\n");
         // No escape byte anywhere in plain output.
         for line in [running, ok, bad] {
@@ -253,7 +277,11 @@ mod tests {
 
     #[test]
     fn terminal_running_line_rewrites_in_place_in_light_yellow() {
-        let line = running_line(Mode::Terminal, "Resolving the latest release…", 1);
+        let line = running_line(
+            Mode::Terminal,
+            &TerminalLine::from("Resolving the latest release…"),
+            1,
+        );
         // A carriage return opens the rewrite; no trailing newline, so the next
         // frame or the outcome overwrites the same line.
         assert!(line.starts_with('\r'));
@@ -271,7 +299,7 @@ mod tests {
 
     #[test]
     fn terminal_success_is_light_green_and_settles_with_a_newline() {
-        let line = success_line(Mode::Terminal, "Found ipe-v0.1.36");
+        let line = success_line(Mode::Terminal, &TerminalLine::from("Found ipe-v0.1.36"));
         assert!(line.starts_with('\r'));
         assert!(line.ends_with('\n'));
         assert!(line.contains(style::glyph::OK));
@@ -282,7 +310,10 @@ mod tests {
 
     #[test]
     fn terminal_failure_is_light_red_and_settles_with_a_newline() {
-        let line = failure_line(Mode::Terminal, "Binary for latest release not found");
+        let line = failure_line(
+            Mode::Terminal,
+            &TerminalLine::from("Binary for latest release not found"),
+        );
         assert!(line.starts_with('\r'));
         assert!(line.ends_with('\n'));
         assert!(line.contains(style::glyph::FAIL));
@@ -345,5 +376,56 @@ mod tests {
         }
         let text = String::from_utf8(buf).expect("stage output is utf-8");
         assert_eq!(text, "  Working…\n");
+    }
+
+    /// Foreign label and outcome text reach a plain stage as one terminal line each.
+    #[test]
+    fn plain_stage_lines_are_terminal_lines() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let stage = Stage::with_mode(&mut buf, Mode::Plain, "x\u{202E}y\n\x1b[2J");
+            stage.failure("a\u{200B}b\nc");
+        }
+        let text = String::from_utf8(buf).expect("stage output is utf-8");
+        assert_eq!(text, "  xy\n  ✗ abc\n");
+    }
+
+    /// On a terminal the only escapes are the palette's own and each line settles once.
+    #[test]
+    fn terminal_stage_lines_carry_only_palette_escapes() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let stage = Stage::with_mode(&mut buf, Mode::Terminal, "x\u{202E}y\n\x1b[2J");
+            stage.failure("a\u{200B}b\nc\x1b]8;;https://evil\x07");
+        }
+        let mut text = String::from_utf8(buf).expect("stage output is utf-8");
+        assert!(
+            !text.contains('\u{202E}') && !text.contains('\u{200B}'),
+            "{text:?}"
+        );
+        let p = Palette::COLOR;
+        for own in [
+            CLEAR_TO_EOL,
+            p.yellow,
+            p.bright_yellow,
+            p.dim,
+            p.green,
+            p.red,
+            p.light_red,
+            p.orange,
+            p.white,
+            p.bold,
+            p.reset,
+        ] {
+            if !own.is_empty() {
+                text = text.replace(own, "");
+            }
+        }
+        assert!(
+            !text.contains('\x1b'),
+            "a foreign escape survived: {text:?}"
+        );
+        assert_eq!(text.matches('\n').count(), 1, "one settled line: {text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
     }
 }

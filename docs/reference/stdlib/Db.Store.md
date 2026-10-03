@@ -2005,12 +2005,14 @@ coalesce : a -> a -> a
 
 `coalesce left right` — inside a `Store.select` projection lambda, emits
 `COALESCE(a, b) AS pN` in the SELECT list, returning the first non-null
-value. Both operands must share the same scalar type `a` (the type variable
-is unified by the constraint scheme). Each operand is either a bare
-`side.field` column reference or a `Store.literal` value; a computed
-expression is a fail-closed build error (IPE-L0149). The operand types must
-agree; a mismatch is a compile-time type error. Every column identifier is
-validated at compile time and re-checked by the runtime.
+value. Both operands share one scalar type `a` — `String`, `Int`, `Float`
+or `Bool` — unified by the constraint scheme; `ipe` rejects a mismatched
+pair at type-check, before any Rust is emitted. A `Maybe` or other
+non-scalar operand is rejected at lowering instead (IPE-L0149). Each
+operand is either a bare `side.field` column reference or a
+`Store.literal` value; a computed expression is the same lowering refusal.
+Every column identifier is validated at compile time and re-checked by the
+runtime.
 
 Example:
 
@@ -2027,11 +2029,13 @@ add : a -> a -> a
 
 `add left right` — inside a `Store.select` projection lambda, emits
 `(a + b) AS pN` in the SELECT list over two numeric operands. Both operands
-share one numeric type (`Int` or `Float`); a non-numeric operand is a
-compile-time type error. Each operand is either a bare `side.field` column
-reference or a `Store.literal` value; a computed expression is a fail-closed
-build error (IPE-L0149). Every column identifier is validated at compile time
-and re-checked by the runtime.
+share one numeric type `a`, which must be `Int` or `Float`; `ipe` rejects
+any other operand type — including an `Int`/`Float` mismatch between the
+two operands — at type-check, before any Rust is emitted. Each operand is
+either a bare `side.field` column reference or a `Store.literal` value; a
+computed expression is rejected at lowering instead (IPE-L0149). Every
+column identifier is validated at compile time and re-checked by the
+runtime.
 
 Example:
 
@@ -2047,7 +2051,8 @@ sub : a -> a -> a
 ```
 
 `sub left right` — subtraction counterpart to `add`: emits `(a - b) AS pN`.
-The same operand and numeric-type restrictions apply.
+The same shared numeric type (`Int` or `Float`), type-check-time rejection,
+and lowering-time computed-operand rejection (IPE-L0149) apply.
 
 ## `mul`
 
@@ -2056,7 +2061,9 @@ mul : a -> a -> a
 ```
 
 `mul left right` — multiplication counterpart to `add`: emits
-`(a * b) AS pN`. The same operand and numeric-type restrictions apply.
+`(a * b) AS pN`. The same shared numeric type (`Int` or `Float`),
+type-check-time rejection, and lowering-time computed-operand rejection
+(IPE-L0149) apply.
 
 ## `selectToList`
 

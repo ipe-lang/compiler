@@ -1,0 +1,7 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+main =
+    Io.println "registry smoke probe"

@@ -1,0 +1,16 @@
+-- fuzz-slot lst : IntList 1 5 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+sumList : List Int -> Int -> Int
+sumList xs acc =
+    case xs of
+        [] -> acc
+        (h :: t) -> sumList t (acc + h)
+
+
+main =
+    Io.println (String.fromInt (sumList @lst@ 0))

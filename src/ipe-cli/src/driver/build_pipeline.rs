@@ -1,4 +1,5 @@
 use super::{CliError, diag_span, io_err};
+use crate::env_dir::{HomeDir, HomeRefusal};
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
@@ -742,14 +743,15 @@ fn names_no_directory(err: &std::io::Error) -> bool {
 /// How the user's home bounds a manifest walk.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HomeCeiling {
-    /// No home directory is configured, or none exists at the configured path.
+    /// The home variable is unset, or no directory exists at the home it names.
     ///
     /// A directory that does not exist is no ancestor of any file, so only
     /// version-control roots and the depth cap bound the walk.
     Absent,
     /// The walk stops at the directory with this identity.
     At(DirIdentity),
-    /// A home exists but its identity cannot be read.
+    /// A home exists but its identity cannot be read, or the home variable is
+    /// set to a value the parser refuses.
     ///
     /// No directory above the start can be shown to lie below the home, so
     /// the walk examines the start directory alone.
@@ -757,14 +759,29 @@ pub enum HomeCeiling {
 }
 
 impl HomeCeiling {
-    /// The ceiling a configured `home` sets, read once.
+    /// The ceiling the parsed `home` sets, read once.
+    ///
+    /// Only an unset home widens the walk to [`Self::Absent`]: a home that is
+    /// set but refused may still name the user's tree, so it fails closed to
+    /// [`Self::Unreadable`] rather than letting the walk climb past it.
     #[must_use]
-    pub fn of(home: Option<&Path>) -> Self {
-        home.map_or(Self::Absent, |dir| match DirIdentity::read(dir) {
-            Ok(identity) => Self::At(identity),
-            Err(err) if names_no_directory(&err) => Self::Absent,
-            Err(_) => Self::Unreadable,
-        })
+    pub fn of(home: Result<&HomeDir, HomeRefusal>) -> Self {
+        match home {
+            Ok(dir) => match DirIdentity::read(dir.as_path()) {
+                Ok(identity) => Self::At(identity),
+                Err(err) if names_no_directory(&err) => Self::Absent,
+                Err(_) => Self::Unreadable,
+            },
+            Err(HomeRefusal::Unset) => Self::Absent,
+            Err(
+                HomeRefusal::NotUtf8
+                | HomeRefusal::ContainsNul
+                | HomeRefusal::NotAbsolute
+                | HomeRefusal::ParentComponent
+                | HomeRefusal::WindowsDeviceOrVerbatim
+                | HomeRefusal::WindowsUnc,
+            ) => Self::Unreadable,
+        }
     }
 
     /// Whether the walk ends at `here` once its manifest has been looked for.
@@ -800,7 +817,7 @@ impl HomeCeiling {
 ///
 /// As [`find_manifest_bounded`].
 pub fn find_manifest_for_ipe_file(ipe_file: &Path) -> Result<Option<PathBuf>, CliError> {
-    let home = HomeCeiling::of(crate::env_dir::home().as_deref());
+    let home = HomeCeiling::of(crate::env_dir::home().as_ref().map_err(|refusal| *refusal));
     find_manifest_bounded(ipe_file, &home, MAX_MANIFEST_WALK_DEPTH)
 }
 
@@ -1318,31 +1335,72 @@ pub fn source_for_span_in_linked(
         .unwrap_or_else(|| entry.clone())
 }
 
-/// Attribute a `(diag, home)` query error to the source file that OWNS it.
+/// Attribute a post-link pipeline error to the source file that OWNS it.
 ///
-/// A non-empty `home` resolves DIRECTLY via `home_to_source` (O(log N), exact);
-/// an empty home (homeless backend/emit error, or a non-solver error) falls
-/// back to the byte-offset heuristic over the linked program. This is the
-/// single attribution rule every post-link pipeline error shares, so `ipe build`
-/// and `ipe type-check` frame the identical diagnostic against the identical source.
+/// A type-checker error is framed by [`frame_infer_error`]: its typed home
+/// names the file exactly, and no byte offset is consulted. A link or lowering
+/// error with a non-empty `home` resolves DIRECTLY via `home_to_source`; only
+/// one with an empty home falls back to the byte-offset heuristic over the
+/// linked program. This is the single attribution rule every post-link
+/// pipeline error shares, so `ipe build` and `ipe type-check` frame the
+/// identical diagnostic against the identical source.
 pub fn attribute_post_link_error(
     linked: &ipe_canon::ast::Module,
     home_to_source: &BTreeMap<Vec<ipe_intern::Symbol>, (PathBuf, String)>,
     entry: &(PathBuf, String),
-    diag: Diagnostic,
-    home: &[ipe_intern::Symbol],
+    err: ipe_db::PipelineError,
 ) -> CliError {
-    let (file, src) = if home.is_empty() {
-        source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
-    } else {
-        home_to_source.get(home).cloned().unwrap_or_else(|| {
-            source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
-        })
-    };
-    CliError::Pipeline {
-        file,
-        src,
-        diag: Box::new(diag),
+    match err {
+        ipe_db::PipelineError::Infer(infer) => frame_infer_error(home_to_source, entry, infer),
+        ipe_db::PipelineError::Lower(diag, home) => {
+            let (file, src) = if home.is_empty() {
+                source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
+            } else {
+                home_to_source.get(&home).cloned().unwrap_or_else(|| {
+                    source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
+                })
+            };
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
+        }
+    }
+}
+
+/// Frame a type-checker error against the file its typed home names.
+///
+/// A sited error resolves exactly through `home_to_source`. A home naming no
+/// module there is refused as [`Diagnostic::CompilerBug`] blamed on `entry`,
+/// never handed to a byte-offset guess. A whole-program error is framed against
+/// the entry with no snippet, since it belongs to no single source.
+pub fn frame_infer_error(
+    home_to_source: &BTreeMap<Vec<ipe_intern::Symbol>, (PathBuf, String)>,
+    entry: &(PathBuf, String),
+    err: ipe_types::InferError,
+) -> CliError {
+    match err {
+        ipe_types::InferError::Sited { diag, home } => home_to_source.get(home.path()).map_or_else(
+            || CliError::Pipeline {
+                file: entry.0.clone(),
+                src: entry.1.clone(),
+                diag: Box::new(Diagnostic::CompilerBug {
+                    where_: "driver.frame_infer_error",
+                    detail: "a type-checker error names a module with no source file".to_owned(),
+                }),
+            },
+            |(file, src)| CliError::Pipeline {
+                file: file.clone(),
+                src: src.clone(),
+                diag: Box::new(diag),
+            },
+        ),
+        ipe_types::InferError::Program(program) => CliError::Pipeline {
+            file: entry.0.clone(),
+            src: String::new(),
+            diag: Box::new(program.into_diagnostic()),
+        },
     }
 }
 
@@ -1381,8 +1439,8 @@ pub fn render_homed_warnings(
 }
 
 /// Run the canon decoder-pipeline direction gate (IPE-N0040) over the linked
-/// program, returning the rejection in the post-link `(diag, home)` shape both
-/// the build and the type-check surfaces attribute through.
+/// program, returning the rejection in the post-link [`ipe_db::PipelineError`]
+/// shape both the build and the type-check surfaces attribute through.
 ///
 /// The gate rejects the reverse-associated hand-nested spelling of the
 /// `required` / `optional` / `requiredAt` / `custom` decoder combinators, which
@@ -1395,9 +1453,9 @@ pub fn render_homed_warnings(
 /// the other homeless post-link errors already use.
 pub fn gate_decoder_pipelines(
     linked: &ipe_canon::ast::Module,
-) -> Result<(), ipe_types::HomedDiagnostic> {
+) -> Result<(), ipe_db::PipelineError> {
     ipe_canon::decoder_pipeline_gate::check_decoder_pipelines(linked)
-        .map_err(|diag| (diag, Vec::new()))
+        .map_err(|diag| ipe_db::PipelineError::Lower(diag, Vec::new()))
 }
 
 /// Demand `canonicalize` for every module in dep-first order, attributing a
@@ -1769,16 +1827,9 @@ pub fn compile_prepared(
         })?;
     }
 
-    // Use the attributed variant so cross-module type errors are attributed to
-    // the correct source file via the `home` carried on the failing constraint,
-    // rather than relying solely on the byte-offset heuristic (`source_for_span`)
-    // which can mis-attribute when two merged modules share overlapping numeric
-    // span ranges.
-    //
-    // When `home` is non-empty we look it up in `home_to_source` directly —
-    // O(log N) and exact (solver and exhaustiveness errors carry their owning
-    // def's home). When the home is empty (non-solver errors: constraint
-    // generation, field-access pass) we fall back to the byte-offset heuristic.
+    // Every type-checker error names its owning module by construction, so it
+    // is framed by an exact `home_to_source` lookup; a span's byte offsets are
+    // shared by every linked module and never select its file.
     //
     // `ipe_db::typecheck` is the memoized
     // SEAM over `ipe_types::infer_attributed`: same whole-program computation,
@@ -1786,9 +1837,7 @@ pub fn compile_prepared(
     // this demand — the query takes its own lock internally.
     let types = ipe_db::typecheck(db, source_root, entry_file)
         .clone()
-        .map_err(|(diag, home)| {
-            attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
-        })?;
+        .map_err(|err| attribute_post_link_error(linked, &home_to_source, &entry, err.into()))?;
     // Print non-fatal warnings (e.g. IPE-T0011 RedundantCaseBranch) to stderr,
     // each framed against its home module's file. These are Severity::Warning:
     // the build continues and exit code stays 0.
@@ -1810,8 +1859,11 @@ pub fn compile_prepared(
     // Main.ipe def whose byte range coincidentally overlaps the failing span.
     // An empty `home` (homeless backend diagnostic, or a pre-def lowering
     // error) falls back to the byte-offset heuristic `source_for_span`.
-    let span_attributed_err = |(diag, home): ipe_types::HomedDiagnostic| {
-        attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
+    let span_attributed_err = |err: ipe_db::PipelineError| {
+        attribute_post_link_error(linked, &home_to_source, &entry, err)
+    };
+    let homed_err = |(diag, home): (Diagnostic, Vec<ipe_intern::Symbol>)| {
+        span_attributed_err(ipe_db::PipelineError::Lower(diag, home))
     };
 
     // Decoder-pipeline direction gate (IPE-N0040): reject the hand-nested
@@ -1839,7 +1891,7 @@ pub fn compile_prepared(
     // analysis cannot go undetected.
     ipe_db::program_metadata(db, source_root, entry_file)
         .clone()
-        .map_err(span_attributed_err)?;
+        .map_err(homed_err)?;
 
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:
@@ -1856,7 +1908,7 @@ pub fn compile_prepared(
     // config field flows through unchanged.
     let emitted = ipe_db::emit_manifest(db, source_root, entry_file, config)
         .clone()
-        .map_err(span_attributed_err)?;
+        .map_err(homed_err)?;
     let mut emitted = (*emitted).clone();
 
     // Thread the widget manifest into the emitted program. The emit query is a
