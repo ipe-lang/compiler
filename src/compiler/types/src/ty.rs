@@ -122,6 +122,40 @@ pub const fn is_solver_var(raw: u32) -> bool {
     raw & SOLVER_VAR_TAG != 0
 }
 
+/// A solver variable as a table key: always the tagged raw `zonk` writes into a [`Ty::Var`].
+///
+/// The field is private, so a key is built only from a [`VarId`] (tagging
+/// it) or from a raw that already carries the tag; an annotation-symbol raw
+/// has no `SolverVar`. A table keyed by solver variables
+/// (`SolvedTypes::poly_var_map`) therefore cannot hold, or be probed with,
+/// an untagged raw.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SolverVar(u32);
+
+impl SolverVar {
+    /// The key of a union-find variable.
+    #[must_use]
+    pub const fn from_var(id: VarId) -> Self {
+        Self(tag_solver_var(id))
+    }
+
+    /// The key a [`Ty::Var`] raw names, or `None` for an annotation-symbol raw.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if is_solver_var(raw) {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// The tagged [`Ty::Var`] raw.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// The tail of a record type's row variable — whether the record is closed
 /// (field set exact) or open (extra fields flow into a named row variable).
 ///
@@ -583,7 +617,25 @@ pub fn from_canon(t: &canon::Type) -> Ty {
 
 #[cfg(test)]
 mod aud13_tag_tests {
-    use super::{is_solver_var, tag_solver_var};
+    use super::{SolverVar, is_solver_var, tag_solver_var};
+
+    /// An annotation-symbol raw has no solver-variable key; a tagged raw is the key of its variable.
+    #[test]
+    fn solver_var_key_refuses_an_untagged_raw() {
+        for id in [0u32, 7, 1_000_000, u32::MAX >> 1] {
+            assert_eq!(
+                SolverVar::from_raw(id),
+                None,
+                "untagged raw {id} is a symbol"
+            );
+            assert_eq!(
+                SolverVar::from_raw(tag_solver_var(id)),
+                Some(SolverVar::from_var(id)),
+                "tagged raw names the key of variable {id}"
+            );
+            assert_eq!(SolverVar::from_var(id).raw(), tag_solver_var(id));
+        }
+    }
 
     #[test]
     fn tag_is_detectable_and_preserves_the_id_bits() {

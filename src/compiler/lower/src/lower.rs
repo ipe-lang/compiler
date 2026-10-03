@@ -10747,7 +10747,7 @@ pub struct Lowerer<'a> {
     /// to `IrType::Unit`, causing E0308 (`Attribute<()>` vs `Attribute<T1>`) in
     /// the Rust emitted for polymorphic functions such as
     /// `view : (Msg -> parentMsg) -> Counter -> Html parentMsg`.
-    current_poly_tvars: std::cell::RefCell<BTreeMap<u32, Symbol>>,
+    current_poly_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, Symbol>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -16531,27 +16531,27 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(u32, Symbol)> = if let IrType::Generic(sym) = &ret
-                {
-                    if self.interner.resolve(*sym) == Some("any") {
-                        self.types
-                            .regions
-                            .get(&(def.home().to_vec(), body.span))
-                            .and_then(|body_ty| {
-                                let Ty::Con { args, .. } = body_ty else {
-                                    return None;
-                                };
-                                let Some(Ty::Var(uv)) = args.first() else {
-                                    return None;
-                                };
-                                Some((*uv, *sym))
-                            })
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
+                    if let IrType::Generic(sym) = &ret {
+                        if self.interner.resolve(*sym) == Some("any") {
+                            self.types
+                                .regions
+                                .get(&(def.home().to_vec(), body.span))
+                                .and_then(|body_ty| {
+                                    let Ty::Con { args, .. } = body_ty else {
+                                        return None;
+                                    };
+                                    let Some(Ty::Var(uv)) = args.first() else {
+                                        return None;
+                                    };
+                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
+                                })
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -18880,7 +18880,11 @@ impl<'a> Lowerer<'a> {
     /// The previous map is restored once `f` returns, whatever path `f` exits
     /// by, so a definition's generics can never stay in scope for the next
     /// definition. `None` leaves the current map untouched.
-    fn with_poly_tvars<T>(&self, poly: Option<BTreeMap<u32, Symbol>>, f: impl FnOnce() -> T) -> T {
+    fn with_poly_tvars<T>(
+        &self,
+        poly: Option<BTreeMap<ipe_types::SolverVar, Symbol>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
         let Some(poly) = poly else {
             return f();
         };
@@ -19402,17 +19406,15 @@ impl<'a> Lowerer<'a> {
 
     /// The enclosing definition's generic named by a `Ty::Var` raw.
     ///
-    /// Every [`Self::current_poly_tvars`] key is a solver-tagged raw
-    /// ([`ipe_types::tag_solver_var`]), the form `zonk` writes into every
-    /// solved `Ty::Var`, so a tagged raw is answered by exact lookup. An
-    /// untagged raw is an annotation symbol, never a solver variable, and
-    /// names no generic: it returns `None`, so a symbol id equal to a
-    /// variable's bare id cannot pick up that variable's generic.
+    /// Every [`Self::current_poly_tvars`] key is an [`ipe_types::SolverVar`],
+    /// the tagged form `zonk` writes into every solved `Ty::Var`, so a tagged
+    /// raw is answered by exact lookup. An untagged raw is an annotation
+    /// symbol, never a solver variable, and has no key: it returns `None`, so
+    /// a symbol id equal to a variable's bare id cannot pick up that
+    /// variable's generic.
     fn poly_tvar_symbol(&self, raw: u32) -> Option<Symbol> {
-        if !ipe_types::is_solver_var(raw) {
-            return None;
-        }
-        self.current_poly_tvars.borrow().get(&raw).copied()
+        let key = ipe_types::SolverVar::from_raw(raw)?;
+        self.current_poly_tvars.borrow().get(&key).copied()
     }
 
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
@@ -31845,7 +31847,7 @@ mod tests {
     fn poly_tvar_lookup_never_reads_a_symbol_raw_as_a_variable_key() {
         const BARE_VAR: u32 = 7;
         with_binder_type_lowerer(|lowerer, generic| {
-            let poly = BTreeMap::from([(ipe_types::tag_solver_var(BARE_VAR), generic)]);
+            let poly = BTreeMap::from([(ipe_types::SolverVar::from_var(BARE_VAR), generic)]);
             lowerer.with_poly_tvars(Some(poly), || {
                 assert_eq!(
                     lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),

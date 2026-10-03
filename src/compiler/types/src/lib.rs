@@ -51,7 +51,9 @@ pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
-pub use ty::{RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var};
+pub use ty::{
+    RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, is_solver_var, tag_solver_var,
+};
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
@@ -147,7 +149,7 @@ pub struct SolvedTypes {
     /// map the lowerer fell back to `IrType::Unit` (the `Attribute<()>` path),
     /// producing E0308 in the emitted Rust.  With it, the lowerer emits
     /// `IrType::Generic(parentMsg_sym)` → `Attribute<T1>`.
-    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>>,
+    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>>,
     /// Generalized type-variable symbols of each untyped top-level binding
     /// that Boundary Scheme Promotion generalized, in synthesis order (`"a"`,
     /// `"b"`, …), keyed by `(home, def_name)`. Absent or empty for a def that
@@ -862,13 +864,14 @@ fn infer_core(
     // placeholder" when lowering attribute-list element types inside polymorphic
     // functions.
     let mut bounds: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>> = BTreeMap::new();
-    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>> = BTreeMap::new();
+    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>> =
+        BTreeMap::new();
     for ((home, def_name), var_rigids) in &generated.typed_rigids {
         let mut var_bounds = BTreeMap::new();
-        let mut rep_to_sym: BTreeMap<u32, Symbol> = BTreeMap::new();
+        let mut rep_to_sym: BTreeMap<SolverVar, Symbol> = BTreeMap::new();
         for (var_sym, rigid) in var_rigids {
             let rep = lift!(uf.find(*rigid));
-            rep_to_sym.insert(tag_solver_var(rep), *var_sym);
+            rep_to_sym.insert(SolverVar::from_var(rep), *var_sym);
             if let Content::Super { bounds: b, .. } = lift!(uf.content(*rigid))
                 && !b.is_empty()
             {
@@ -1086,9 +1089,9 @@ fn infer_core(
         if quantified.is_empty() {
             continue;
         }
-        let tagged: BTreeMap<u32, Symbol> = quantified
+        let tagged: BTreeMap<SolverVar, Symbol> = quantified
             .iter()
-            .map(|(&root, &sym)| (tag_solver_var(root), sym))
+            .map(|(&root, &sym)| (SolverVar::from_var(root), sym))
             .collect();
         untyped_type_params.insert(key.clone(), quantified.values().copied().collect());
         poly_var_map.insert(key.clone(), tagged);
@@ -1661,7 +1664,7 @@ fn classify_param_wildcard(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
-    rigid_names: Option<&BTreeMap<u32, Symbol>>,
+    rigid_names: Option<&BTreeMap<SolverVar, Symbol>>,
     wildcard: VarId,
     bare: bool,
 ) -> DResult<WildcardFact> {
@@ -1670,7 +1673,7 @@ fn classify_param_wildcard(
         Content::Rigid | Content::Super { rigid: true, .. } => {
             let root = uf.find(wildcard)?;
             let name = rigid_names
-                .and_then(|names| names.get(&tag_solver_var(root)))
+                .and_then(|names| names.get(&SolverVar::from_var(root)))
                 .and_then(|sym| interner.resolve(*sym))
                 .map(Box::from);
             Ok(WildcardFact::Dependent(WildcardDependence::TypeVariable {
@@ -2974,21 +2977,17 @@ mod tests {
             "identity's generic must be recorded"
         );
         let Some(keys) = keys else { return };
-        assert!(
-            keys.keys().all(|&raw| is_solver_var(raw)),
-            "every poly_var_map key is solver-tagged: {keys:?}"
-        );
-        let region_vars: BTreeSet<u32> = solved
+        let region_vars: BTreeSet<SolverVar> = solved
             .regions
             .iter()
             .filter(|((home, _), _)| *home == identity.0)
             .filter_map(|(_, ty)| match ty {
-                Ty::Var(raw) => Some(*raw),
+                Ty::Var(raw) => SolverVar::from_raw(*raw),
                 _ => None,
             })
             .collect();
         assert!(
-            keys.keys().any(|raw| region_vars.contains(raw)),
+            keys.keys().any(|key| region_vars.contains(key)),
             "the body's region var is a key verbatim: keys {keys:?}, region vars {region_vars:?}"
         );
     }
