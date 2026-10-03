@@ -74,15 +74,18 @@ CREATE TABLE IF NOT EXISTS reviewed (
 ) WITHOUT ROWID;
 ";
 
-/// Current schema version: v5 `file` units attest their residual (the lines no
-/// other unit of the file covers) in `body_hash` and leave `residual_hash`
-/// NULL; v4 `file` units attest the whole file in `body_hash` and the residual
+/// Current schema version: v6 rows are the v5 format, extracted only from
+/// regular files named by their exact bytes; v5 rows may hold the units of a
+/// tracked symbolic link's target, a submodule path, or a lossily decoded name,
+/// which an incremental `update` would keep for every unchanged path. v5 `file`
+/// units attest their residual (the lines no other unit of the file covers) in
+/// `body_hash` and leave `residual_hash` NULL; v4 `file` units attest the whole file in `body_hash` and the residual
 /// in `residual_hash`; v3 rows carry `sha256:` view attestations in
 /// `body_hash` and no residual; v2 rows a bare blake3 of the span. `open`
 /// stamps it only on a DB with no units yet, so a stamp always describes the
 /// rows beside it; a DB holding rows of another version keeps its stamp until
 /// `index` rebuilds it.
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 
 /// Stable unit id: blake3 of `path|kind|qualified`. Content-stable across
 /// re-indexes; a rename of the symbol or path changes the id by design.
@@ -493,18 +496,18 @@ mod tests {
     }
 
     // A DB stamped with the previous version is not current, so `update`
-    // refuses to run incrementally over it, and the full rebuild stamps it 5.
+    // refuses to run incrementally over it, and the full rebuild stamps it 6.
     #[test]
-    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_5() {
-        assert_eq!(SCHEMA_VERSION, "5");
+    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_6() {
+        assert_eq!(SCHEMA_VERSION, "6");
         let s = Store::open(":memory:").unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
-        s.set_meta("schema_version", "4").unwrap();
+        s.set_meta("schema_version", "5").unwrap();
         ensure_schema_version(&s.conn).unwrap();
         assert!(!s.schema_is_current().unwrap());
         s.reset_index().unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("5"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("6"));
         assert!(s.schema_is_current().unwrap());
     }
 

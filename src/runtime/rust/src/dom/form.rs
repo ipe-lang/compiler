@@ -46,7 +46,10 @@ pub fn decode_form<T: serde::de::DeserializeOwned>(fd: FormData) -> Result<T, Fo
     // `encoded` is this function's own output: every escape is well-formed and
     // the bytes are UTF-8, so the lenient reader reproduces `pairs` exactly and
     // no URL component from the wire is decoded here.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "re-reads this function's own encoder output, never a URL component from the wire"
+    )]
     let decoded = serde_urlencoded::from_str::<T>(&encoded);
     decoded.map_err(FormDecodeError::Decode)
 }
