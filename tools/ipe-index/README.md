@@ -242,7 +242,19 @@ never write. `<old>` for `rename-path` is the untagged repo-relative path
 - `--repo <tag:path>` — repeatable; override the indexed repo set. Default is
   `ipe:.`. A tag is non-empty and holds no `/` and no `:` (the tags a stored
   `tag:path` reads back as; pinned by `tests/repo_tag_vectors.json`), and each
-  tag is given once.
+  tag is given once. Each tag names one directory: roots are compared by
+  directory identity, not by spelling, so `a:.` with `b:./`, a `..` spelling,
+  or a symbolic link to a declared root is refused as a second tag for one
+  directory. At most 64 roots may be declared (`tests/max_repos.json`), and
+  more than one root needs a platform with directory identity (Unix). Roots may
+  nest: a file belongs only to the deepest declared root that contains it, so
+  an outer root's walk and `update` skip everything under an inner root, which
+  indexes those files under its own tag. A root that is a subdirectory of its
+  work tree is diffed relative to itself (`git diff --relative`). A declared
+  root replaced by another directory between parsing and the walk fails the
+  run. The index records the root set it was built under; any change to that
+  set makes `update` rebuild the whole index, and units whose owning root moved
+  are re-queued under their new tagged path (deleted under the old one).
 
 ---
 

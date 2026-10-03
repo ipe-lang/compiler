@@ -12,7 +12,8 @@
 //! refuses a handle whose file is not the one that check saw, and reads at
 //! most [`MAX_FILE_BYTES`] from the held handle.
 
-use crate::model::{Lang, Role, lang_of, role_of};
+use crate::model::{Lang, RepoTag, Role, lang_of, role_of};
+use crate::repo_set::DeclaredRoot;
 use anyhow::{Result, bail};
 use std::fmt::{self, Write as _};
 use std::fs::File;
@@ -146,6 +147,9 @@ pub enum DiskRefusal {
     NotAFile,
     /// The metadata read failed for a reason other than absence.
     Unreadable { kind: io::ErrorKind },
+    /// A directory above the path sits where the declared root `root` was
+    /// parsed, but it is no longer that directory.
+    RootMoved { root: String },
 }
 
 /// Renders untrusted text injectively in printable ASCII.
@@ -206,6 +210,10 @@ fn disk_why(found: &DiskRefusal) -> String {
         }
         DiskRefusal::NotAFile => "is not a regular file".to_string(),
         DiskRefusal::Unreadable { kind } => format!("cannot be inspected ({kind})"),
+        DiskRefusal::RootMoved { root } => format!(
+            "sits where the declared root `{}` was, which changed after the root set was parsed",
+            shown(root)
+        ),
     }
 }
 
@@ -359,9 +367,9 @@ pub fn parse_untracked(out: &[u8]) -> Result<Vec<Listed>, WalkError> {
 /// The identity of a file: device and inode on unix.
 ///
 /// Off unix every file compares equal, so the handle check in [`read_held`]
-/// is the no-follow check alone there.
+/// is the no-follow check alone there, and a [`RepoSet`](crate::repo_set::RepoSet) refuses a second root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileId {
+pub struct FileId {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -370,7 +378,7 @@ struct FileId {
 
 impl FileId {
     #[cfg(unix)]
-    fn of(md: &std::fs::Metadata) -> Self {
+    pub fn of(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         Self {
             dev: md.dev(),
@@ -379,7 +387,7 @@ impl FileId {
     }
 
     #[cfg(not(unix))]
-    fn of(_md: &std::fs::Metadata) -> Self {
+    pub fn of(_md: &std::fs::Metadata) -> Self {
         Self {}
     }
 }
@@ -391,12 +399,26 @@ enum OnDisk {
     Regular(FileId),
     /// Nothing at the path (deleted in the working tree).
     Absent,
+    /// A directory above the path is the declared root this tag names, which owns it.
+    Claimed(RepoTag),
     /// Something other than a regular file.
     Refused(DiskRefusal),
 }
 
+/// The refusal for a path at `inner`'s declared place that is no longer `inner`.
+fn moved(inner: &DeclaredRoot) -> OnDisk {
+    OnDisk::Refused(DiskRefusal::RootMoved {
+        root: inner.tag().as_str().to_string(),
+    })
+}
+
 /// Classifies `root/rel` without following any link, at the leaf or above it.
-fn on_disk(root: &Path, rel: &str) -> OnDisk {
+///
+/// A directory above the leaf whose identity is one of `claimed` (the roots
+/// declared directly inside `root`) makes the path [`OnDisk::Claimed`]: it
+/// belongs to that deeper root alone. A directory at a claimed root's prefix
+/// that is not that root is [`DiskRefusal::RootMoved`].
+fn on_disk(root: &Path, rel: &str, claimed: &[&DeclaredRoot]) -> OnDisk {
     let mut at = PathBuf::from(root);
     let (dirs, leaf) = rel.rsplit_once('/').unwrap_or(("", rel));
     let mut ancestor = String::new();
@@ -406,8 +428,26 @@ fn on_disk(root: &Path, rel: &str) -> OnDisk {
             ancestor.push('/');
         }
         ancestor.push_str(seg);
-        match std::fs::symlink_metadata(&at) {
-            Ok(md) if md.file_type().is_dir() => {}
+        let declared_here = claimed
+            .iter()
+            .find(|c| c.within().is_some_and(|w| w.prefix().as_str() == ancestor));
+        let found = std::fs::symlink_metadata(&at);
+        if let Ok(md) = &found
+            && md.file_type().is_dir()
+        {
+            let id = FileId::of(md);
+            if let Some(owner) = claimed.iter().find(|c| c.id() == id) {
+                return OnDisk::Claimed(owner.tag().clone());
+            }
+            if let Some(inner) = declared_here {
+                return moved(inner);
+            }
+            continue;
+        }
+        if let Some(inner) = declared_here {
+            return moved(inner);
+        }
+        match found {
             Ok(_) => return OnDisk::Refused(DiskRefusal::LinkedAncestor { ancestor }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return OnDisk::Absent,
             Err(e) => return OnDisk::Refused(DiskRefusal::Unreadable { kind: e.kind() }),
@@ -471,16 +511,30 @@ fn report(refused: &[Refusal]) {
     }
 }
 
-/// Splits listed paths into regular files on disk and refusals; absent paths are dropped.
-fn admit(root: &Path, listed: Vec<Listed>) -> (Vec<Tracked>, Vec<Refusal>) {
+/// Whether `root/rel` is the directory of one of the `claimed` inner roots.
+fn is_claimed_dir(root: &Path, rel: &str, claimed: &[&DeclaredRoot]) -> bool {
+    std::fs::symlink_metadata(root.join(rel))
+        .is_ok_and(|md| md.is_dir() && claimed.iter().any(|c| c.id() == FileId::of(&md)))
+}
+
+/// Splits listed paths into regular files on disk and refusals.
+///
+/// Absent paths are dropped, and so is every path a `claimed` inner root owns:
+/// it is indexed under that root's tag alone.
+fn admit(
+    root: &Path,
+    listed: Vec<Listed>,
+    claimed: &[&DeclaredRoot],
+) -> (Vec<Tracked>, Vec<Refusal>) {
     let mut files = Vec::new();
     let mut refused = Vec::new();
     for entry in listed {
         match entry {
+            Err(Refusal::NestedRepository { path }) if is_claimed_dir(root, &path, claimed) => {}
             Err(refusal) => refused.push(refusal),
-            Ok(path) => match on_disk(root, &path) {
+            Ok(path) => match on_disk(root, &path, claimed) {
                 OnDisk::Regular(_) => files.push(Tracked::at(path)),
-                OnDisk::Absent => {}
+                OnDisk::Absent | OnDisk::Claimed(_) => {}
                 OnDisk::Refused(found) => refused.push(Refusal::NotRegularOnDisk { path, found }),
             },
         }
@@ -488,7 +542,50 @@ fn admit(root: &Path, listed: Vec<Listed>) -> (Vec<Tracked>, Vec<Refusal>) {
     (files, refused)
 }
 
-/// All git-tracked AND untracked-but-not-ignored regular files in `repo`.
+/// Fails the run when the walk met a declared root that changed after parsing.
+///
+/// Which root owns a path is no longer known then, so no path is stored.
+fn refuse_moved_roots(refused: &[Refusal]) -> Result<()> {
+    for refusal in refused {
+        if let Refusal::NotRegularOnDisk {
+            found: DiskRefusal::RootMoved { .. },
+            ..
+        } = refusal
+        {
+            bail!("ipe-index: {refusal}; re-run with the current roots");
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a walk of `root` once its directory is not the one the set parsed.
+fn verify_root(root: &DeclaredRoot) -> Result<()> {
+    let same = std::fs::symlink_metadata(root.root())
+        .is_ok_and(|md| md.is_dir() && FileId::of(&md) == root.id());
+    if !same {
+        bail!(
+            "ipe-index: the declared root `{}` changed after the root set was parsed; re-run with the current roots",
+            shown(root.tag().as_str())
+        );
+    }
+    Ok(())
+}
+
+/// The admitted files and the refusals of one walk of `root`.
+fn listing(root: &DeclaredRoot, claimed: &[&DeclaredRoot]) -> Result<(Vec<Tracked>, Vec<Refusal>)> {
+    verify_root(root)?;
+    let repo = root.root_str();
+    let mut listed = parse_staged(&git_stdout(repo, &["ls-files", "-z", "-s"])?)?;
+    listed.extend(parse_untracked(&git_stdout(
+        repo,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )?)?);
+    let (files, refused) = admit(root.root(), listed, claimed);
+    refuse_moved_roots(&refused)?;
+    Ok((files, refused))
+}
+
+/// All git-tracked AND untracked-but-not-ignored regular files in `root`.
 ///
 /// Respects .gitignore via `--exclude-standard`, so generated dirs stay
 /// excluded — bounded, no OOM risk. Including untracked-non-ignored files
@@ -497,14 +594,10 @@ fn admit(root: &Path, listed: Vec<Listed>) -> (Vec<Tracked>, Vec<Refusal>) {
 /// false "missing" results. `--others` (untracked) is disjoint from the
 /// tracked listing, so the two concatenate without dedup. Symbolic links,
 /// submodules, non-UTF-8 names and anything that is not a regular file on disk
-/// are refused (reported on stderr, never indexed).
-pub fn tracked(repo: &str) -> Result<Vec<Tracked>> {
-    let mut listed = parse_staged(&git_stdout(repo, &["ls-files", "-z", "-s"])?)?;
-    listed.extend(parse_untracked(&git_stdout(
-        repo,
-        &["ls-files", "-z", "--others", "--exclude-standard"],
-    )?)?);
-    let (files, refused) = admit(Path::new(repo), listed);
+/// are refused (reported on stderr, never indexed). Paths under a `claimed`
+/// root (one declared directly inside `root`) are skipped: that root owns them.
+pub fn tracked(root: &DeclaredRoot, claimed: &[&DeclaredRoot]) -> Result<Vec<Tracked>> {
+    let (files, refused) = listing(root, claimed)?;
     report(&refused);
     Ok(files)
 }
@@ -587,7 +680,14 @@ pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
 ///
 /// A path that is no longer a regular file (a link or submodule at HEAD, or
 /// not a regular file on disk) is a delete, so its stale units leave the index.
-pub fn changed(repo: &str, since: &str) -> Result<(Vec<Tracked>, Vec<String>)> {
+/// The diff is `--relative`: only paths under `root` are listed, relative to
+/// it, even when `root` is a subdirectory of its work tree. A path under a
+/// `claimed` root is neither upserted nor deleted here: that root owns it.
+pub fn changed(
+    root: &DeclaredRoot,
+    since: &str,
+    claimed: &[&DeclaredRoot],
+) -> Result<(Vec<Tracked>, Vec<String>)> {
     // `since` is interpolated into a positional commit-range token
     // (`{since}..HEAD`). Reject anything that git could parse as an option
     // (leading '-', e.g. `--output=…`) or that carries path/shell-hostile
@@ -605,18 +705,40 @@ pub fn changed(repo: &str, since: &str) -> Result<(Vec<Tracked>, Vec<String>)> {
     let range = format!("{since}..HEAD");
     // `--` ends the revisions, so a range git cannot resolve is an error,
     // never a pathspec naming a file called `<since>..HEAD`.
-    let out = git_stdout(repo, &["diff", "--raw", "-z", "--no-renames", &range, "--"])?;
-    let root = Path::new(repo);
+    verify_root(root)?;
+    let out = git_stdout(
+        root.root_str(),
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--relative",
+            &range,
+            "--",
+        ],
+    )?;
+    let dir = root.root();
     let mut upserts = Vec::new();
     let mut deletes = Vec::new();
     let mut refused = Vec::new();
     for change in parse_diff(&out)? {
         match change {
-            Change::Delete(path) => deletes.push(path),
+            Change::Delete(path) => match on_disk(dir, &path, claimed) {
+                OnDisk::Claimed(_) => {}
+                OnDisk::Refused(found @ DiskRefusal::RootMoved { .. }) => {
+                    refused.push(Refusal::NotRegularOnDisk { path, found });
+                }
+                OnDisk::Regular(_) | OnDisk::Absent | OnDisk::Refused(_) => deletes.push(path),
+            },
             Change::Refused(refusal) => refused.push(refusal),
-            Change::Upsert(path) => match on_disk(root, &path) {
+            Change::Upsert(path) => match on_disk(dir, &path, claimed) {
                 OnDisk::Regular(_) => upserts.push(Tracked::at(path)),
                 OnDisk::Absent => deletes.push(path),
+                OnDisk::Claimed(_) => {}
+                OnDisk::Refused(found @ DiskRefusal::RootMoved { .. }) => {
+                    refused.push(Refusal::NotRegularOnDisk { path, found });
+                }
                 OnDisk::Refused(found) => {
                     refused.push(Refusal::NotRegularOnDisk {
                         path: path.clone(),
@@ -628,6 +750,7 @@ pub fn changed(repo: &str, since: &str) -> Result<(Vec<Tracked>, Vec<String>)> {
         }
     }
     report(&refused);
+    refuse_moved_roots(&refused)?;
     Ok((upserts, deletes))
 }
 
@@ -642,6 +765,8 @@ pub enum ReadRefusal {
     NotRegular(DiskRefusal),
     /// The opened handle names another file than the no-follow check saw.
     Replaced,
+    /// A directory above the path is the declared root this tag names, which owns it.
+    Claimed(RepoTag),
     /// The file holds more than [`MAX_FILE_BYTES`]; `at_least` bytes were seen.
     TooLarge { at_least: u64 },
     /// The content is not UTF-8 (a binary file).
@@ -658,6 +783,7 @@ impl ReadRefusal {
             Self::Name(_)
             | Self::NotRegular(_)
             | Self::Replaced
+            | Self::Claimed(_)
             | Self::TooLarge { .. }
             | Self::Io(_) => true,
         }
@@ -671,6 +797,9 @@ impl fmt::Display for ReadRefusal {
             Self::Absent => f.write_str("absent"),
             Self::NotRegular(found) => f.write_str(&disk_why(found)),
             Self::Replaced => f.write_str("replaced while it was opened"),
+            Self::Claimed(tag) => {
+                write!(f, "owned by the declared root `{}`", shown(tag.as_str()))
+            }
             Self::TooLarge { at_least } => write!(
                 f,
                 "larger than the {MAX_FILE_BYTES}-byte read ceiling ({at_least}+ bytes)"
@@ -687,10 +816,21 @@ impl fmt::Display for ReadRefusal {
 /// every directory above it are checked without following links; the opened
 /// handle must be the file that check saw; at most [`MAX_FILE_BYTES`] are read.
 pub fn read_indexed(root: &Path, rel: &str) -> Result<String, ReadRefusal> {
+    read_owned(root, rel, &[])
+}
+
+/// [`read_indexed`] for a walked root: a path under one of the `claimed` roots
+/// declared inside `root` is refused, since only the root that owns it reads it.
+pub fn read_owned(
+    root: &Path,
+    rel: &str,
+    claimed: &[&DeclaredRoot],
+) -> Result<String, ReadRefusal> {
     let rel = path_of(rel.as_bytes()).map_err(ReadRefusal::Name)?;
-    let seen = match on_disk(root, &rel) {
+    let seen = match on_disk(root, &rel, claimed) {
         OnDisk::Regular(id) => id,
         OnDisk::Absent => return Err(ReadRefusal::Absent),
+        OnDisk::Claimed(tag) => return Err(ReadRefusal::Claimed(tag)),
         OnDisk::Refused(found) => return Err(ReadRefusal::NotRegular(found)),
     };
     let file = File::open(root.join(&rel)).map_err(|e| match e.kind() {
@@ -728,8 +868,130 @@ pub fn head_sha(repo: &str) -> Result<String> {
     Ok(sha.trim().to_string())
 }
 
+/// Git repositories for the tests of this crate.
+#[cfg(all(test, unix))]
+pub(crate) mod fixture {
+    use super::{git_command, tracked};
+    use crate::model::{RepoSpec, RepoTag};
+    use crate::repo_set::{DeclaredRoot, RepoSet};
+    use std::path::PathBuf;
+    use std::process::Stdio;
+
+    /// A git repository beside the test binary, inside the build's own target directory.
+    pub struct Fixture(pub PathBuf);
+
+    impl Fixture {
+        #[allow(clippy::expect_used)] // a fixture that cannot be built fails the test
+        pub fn new(name: &str) -> Self {
+            let exe = std::env::current_exe().expect("test binary path");
+            let root = exe
+                .parent()
+                .expect("test binary dir")
+                .join("walk-fixtures")
+                .join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create fixture");
+            let fx = Self(root);
+            fx.git(&["init", "-q"]);
+            fx
+        }
+
+        pub fn root(&self) -> &str {
+            self.0.to_str().unwrap_or_default()
+        }
+
+        /// `rel` inside the fixture, as UTF-8 text.
+        pub fn path(&self, rel: &str) -> String {
+            self.0.join(rel).to_str().unwrap_or_default().to_string()
+        }
+
+        #[allow(clippy::expect_used)] // a fixture command that fails fails the test
+        fn git_in(dir: &str, args: &[&str]) {
+            let ok = git_command(dir)
+                .args(args)
+                .stdout(Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+
+        pub fn git(&self, args: &[&str]) {
+            Self::git_in(self.root(), args);
+        }
+
+        /// Makes `rel` a repository of its own, nested in this one.
+        pub fn init_nested(&self, rel: &str) {
+            Self::git_in(&self.path(rel), &["init", "-q"]);
+        }
+
+        #[allow(clippy::expect_used)] // a fixture file that cannot be written fails the test
+        pub fn write(&self, rel: &str, text: &str) {
+            let at = self.0.join(rel);
+            if let Some(dir) = at.parent() {
+                std::fs::create_dir_all(dir).expect("create fixture dir");
+            }
+            std::fs::write(at, text).expect("write fixture file");
+        }
+
+        /// Commits the whole work tree.
+        pub fn commit(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        }
+
+        /// The sorted paths a walk of this repository, declared alone, admits.
+        pub fn paths(&self) -> Vec<String> {
+            let set = set(&[("ipe", self.root())]);
+            let root = root_of(&set, "ipe");
+            let mut v: Vec<String> = tracked(root, &set.claimed_in(root))
+                .unwrap()
+                .into_iter()
+                .map(|t| t.path)
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The parsed set of `(tag, root)` pairs.
+    pub fn set(specs: &[(&str, &str)]) -> RepoSet {
+        let specs: Vec<RepoSpec> = specs
+            .iter()
+            .map(|(tag, root)| RepoSpec {
+                tag: RepoTag::parse(tag).unwrap(),
+                root: (*root).to_string(),
+            })
+            .collect();
+        RepoSet::parse(&specs).unwrap()
+    }
+
+    /// The declared root of `set` tagged `tag`.
+    pub fn root_of<'a>(set: &'a RepoSet, tag: &str) -> &'a DeclaredRoot {
+        set.iter().find(|r| r.tag().as_str() == tag).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::fixture::{Fixture, root_of, set};
     use super::*;
 
     const SHA: &str = "6178079822d17af2d34fce4cfbdf355568324720";
@@ -1038,60 +1300,6 @@ mod tests {
         );
     }
 
-    /// A git repository beside the test binary, inside the build's own target directory.
-    #[cfg(unix)]
-    struct Fixture(PathBuf);
-
-    #[cfg(unix)]
-    impl Fixture {
-        #[allow(clippy::expect_used)] // a fixture that cannot be built fails the test
-        fn new(name: &str) -> Self {
-            let exe = std::env::current_exe().expect("test binary path");
-            let root = exe
-                .parent()
-                .expect("test binary dir")
-                .join("walk-fixtures")
-                .join(format!("{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("create fixture");
-            let fx = Self(root);
-            fx.git(&["init", "-q"]);
-            fx
-        }
-
-        fn root(&self) -> &str {
-            self.0.to_str().unwrap_or_default()
-        }
-
-        #[allow(clippy::expect_used)] // a fixture command that fails fails the test
-        fn git(&self, args: &[&str]) {
-            let ok = git_command(self.root())
-                .args(args)
-                .stdout(Stdio::null())
-                .status()
-                .expect("run git")
-                .success();
-            assert!(ok, "git {args:?} failed");
-        }
-
-        fn paths(&self) -> Vec<String> {
-            let mut v: Vec<String> = tracked(self.root())
-                .unwrap()
-                .into_iter()
-                .map(|t| t.path)
-                .collect();
-            v.sort();
-            v
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn an_untracked_symlink_is_skipped() {
@@ -1103,7 +1311,7 @@ mod tests {
         std::fs::write(fx.0.join("real/r.rs"), "fn r() {}").unwrap();
         symlink(fx.0.join("real"), fx.0.join("linked")).unwrap();
         assert_eq!(
-            on_disk(&fx.0, "leak.rs"),
+            on_disk(&fx.0, "leak.rs", &[]),
             OnDisk::Refused(DiskRefusal::Symlink)
         );
         assert_eq!(fx.paths(), ["ok.rs", "real/r.rs"]);
@@ -1136,12 +1344,12 @@ mod tests {
         std::fs::rename(fx.0.join("dir"), fx.0.join("moved")).unwrap();
         symlink(fx.0.join("moved"), fx.0.join("dir")).unwrap();
         assert_eq!(
-            on_disk(&fx.0, "dir/a.rs"),
+            on_disk(&fx.0, "dir/a.rs", &[]),
             OnDisk::Refused(DiskRefusal::LinkedAncestor {
                 ancestor: "dir".to_string()
             })
         );
-        assert_eq!(on_disk(&fx.0, "gone.rs"), OnDisk::Absent);
+        assert_eq!(on_disk(&fx.0, "gone.rs", &[]), OnDisk::Absent);
         assert_eq!(fx.paths(), ["moved/a.rs"]);
         assert_eq!(
             read_indexed(&fx.0, "b.rs"),
@@ -1183,6 +1391,134 @@ mod tests {
         let fx = Fixture::new("since-pathspec");
         std::fs::write(fx.0.join("abc..HEAD"), "x").unwrap();
         fx.git(&["add", "abc..HEAD"]);
-        assert!(changed(fx.root(), "abc").is_err());
+        let set = set(&[("ipe", fx.root())]);
+        assert!(changed(root_of(&set, "ipe"), "abc", &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    fn sorted(files: Vec<Tracked>) -> Vec<String> {
+        let mut v: Vec<String> = files.into_iter().map(|t| t.path).collect();
+        v.sort();
+        v
+    }
+
+    // A nested repository nobody declared is still refused; the declared one is
+    // skipped, because its own root owns it.
+    #[cfg(unix)]
+    #[test]
+    fn nested_untracked_repo_still_refused() {
+        let fx = Fixture::new("nested-repo");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        fx.write("other/y.rs", "fn y() {}");
+        fx.init_nested("inner");
+        fx.init_nested("other");
+        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
+        let out = root_of(&set, "out");
+        let (files, refused) = listing(out, &set.claimed_in(out)).unwrap();
+        assert_eq!(sorted(files), ["top.rs"]);
+        assert_eq!(
+            refused,
+            [Refusal::NestedRepository {
+                path: "other".to_string()
+            }]
+        );
+    }
+
+    // A declared root inside the outer work tree owns its files: the outer walk
+    // skips them and the inner walk lists them relative to the inner root.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_root_in_one_work_tree_owns_its_files() {
+        let fx = Fixture::new("nested-dir");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
+        let out = root_of(&set, "out");
+        let inner = root_of(&set, "in");
+        assert_eq!(
+            sorted(tracked(out, &set.claimed_in(out)).unwrap()),
+            ["top.rs"]
+        );
+        assert_eq!(
+            sorted(tracked(inner, &set.claimed_in(inner)).unwrap()),
+            ["x.rs"]
+        );
+        assert_eq!(
+            read_owned(out.root(), "inner/x.rs", &set.claimed_in(out)),
+            Err(ReadRefusal::Claimed(inner.tag().clone()))
+        );
+    }
+
+    // A root below the top of its work tree diffs relative to itself: a change
+    // outside it never appears, and a change inside it is named from the root.
+    #[cfg(unix)]
+    #[test]
+    fn update_in_subdir_root_is_root_relative() {
+        let fx = Fixture::new("subdir-update");
+        fx.write("sub/x.rs", "fn a() {}");
+        fx.write("top.rs", "fn t() {}");
+        fx.commit("one");
+        let first = head_sha(fx.root()).unwrap();
+        fx.write("sub/x.rs", "fn b() {}");
+        fx.write("top.rs", "fn u() {}");
+        fx.commit("two");
+        let set = set(&[("sub", &fx.path("sub"))]);
+        let (ups, dels) = changed(root_of(&set, "sub"), &first, &[]).unwrap();
+        assert_eq!(sorted(ups), ["x.rs"]);
+        assert_eq!(dels, Vec::<String>::new());
+    }
+
+    // A change under a declared inner root is neither upserted nor deleted by
+    // the outer root's update.
+    #[cfg(unix)]
+    #[test]
+    fn update_skips_claimed_paths() {
+        let fx = Fixture::new("claimed-update");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        fx.write("inner/y.rs", "fn y() {}");
+        fx.commit("one");
+        let first = head_sha(fx.root()).unwrap();
+        fx.write("top.rs", "fn u() {}");
+        fx.write("inner/x.rs", "fn z() {}");
+        std::fs::remove_file(fx.0.join("inner/y.rs")).unwrap();
+        fx.commit("two");
+        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
+        let out = root_of(&set, "out");
+        let (ups, dels) = changed(out, &first, &set.claimed_in(out)).unwrap();
+        assert_eq!(sorted(ups), ["top.rs"]);
+        assert_eq!(dels, Vec::<String>::new());
+    }
+
+    // An inner root swapped for another directory of the same name after the
+    // set was parsed fails the walk: which root owns its files is unknown.
+    #[cfg(unix)]
+    #[test]
+    fn root_moved_between_parse_and_walk_refused() {
+        let fx = Fixture::new("root-moved");
+        fx.write("top.rs", "fn t() {}");
+        fx.write("inner/x.rs", "fn x() {}");
+        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
+        std::fs::rename(fx.0.join("inner"), fx.0.join("inner-old")).unwrap();
+        fx.write("inner/x.rs", "fn other() {}");
+        let out = root_of(&set, "out");
+        let moved = tracked(out, &set.claimed_in(out))
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            moved
+                .as_deref()
+                .is_some_and(|e| e.contains("sits where the declared root `in` was")),
+            "{moved:?}"
+        );
+        let inner = root_of(&set, "in");
+        assert!(tracked(inner, &[]).is_err());
+        assert_eq!(
+            on_disk(out.root(), "inner/x.rs", &set.claimed_in(out)),
+            OnDisk::Refused(DiskRefusal::RootMoved {
+                root: "in".to_string()
+            })
+        );
     }
 }
