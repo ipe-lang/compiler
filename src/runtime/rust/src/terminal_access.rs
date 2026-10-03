@@ -94,8 +94,10 @@ pub fn decide(facts: &TerminalFacts) -> TerminalAccess {
 pub fn probe() -> TerminalAccess {
     let stdout_tty = std::io::stdout().is_terminal();
     let stdin_tty = std::io::stdin().is_terminal();
-    #[allow(clippy::disallowed_methods)]
-    // crossterm reads the real env directly; this probe must observe the same, overlay or not
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "crossterm reads the real env directly; this probe must observe the same, overlay or not"
+    )]
     let term = std::env::var_os("TERM");
     let dev_tty_opens = stdin_tty || open_dev_tty();
     decide(&TerminalFacts {

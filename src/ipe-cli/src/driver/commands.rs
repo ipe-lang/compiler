@@ -4109,3 +4109,24 @@ mod held_crate_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+#[cfg(test)]
+mod help_on_misuse_tests {
+    use super::with_help_on_misuse;
+    use crate::CliError;
+    use crate::ffi::FfiPrepError;
+
+    /// An FFI prep refusal is not command misuse: it passes through without the help page.
+    #[test]
+    fn with_help_on_misuse_leaves_ffi_prep_untouched() {
+        let refusal = || FfiPrepError::DefineOpaqueCollision {
+            slug: "a".to_owned(),
+            name: "T".to_owned(),
+        };
+        let got = with_help_on_misuse("build", Err(CliError::FfiPrep(Box::new(refusal()))));
+        assert!(
+            matches!(&got, Err(CliError::FfiPrep(inner)) if **inner == refusal()),
+            "{got:?}"
+        );
+    }
+}
