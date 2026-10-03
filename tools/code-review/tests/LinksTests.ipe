@@ -1,0 +1,400 @@
+module LinksTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Hidden(..), Link(..), Reach(..), Reference(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, loadUnitNow, indexConn)
+
+
+-- ── bounded, indexed links ──────────────────────────────────────────────
+--
+-- A unit page's links come from two bounded, indexed lookups: the unit's
+-- callgraph edges, and the qualified names its shown references spell under
+-- ipe-index's callee rule. The fixture below seeds a scratch index whose one
+-- Rust unit `u-src` calls into every case, and one Ipê unit `u-ipe` writes a
+-- call with no space before its argument list.
+rustLines : List String
+rustLines =
+    [ "fn caller() {"
+    , "    helper();"
+    , "    app::util::exact(x);"
+    , "    shared();"
+    , "    dup::twin();"
+    , "    dup::pair();"
+    , "    app::links::caller();"
+    , "}"
+    ]
+
+
+ipeLines : List String
+ipeLines =
+    [ "run x ="
+    , "    Foo.bar(x)"
+    ]
+
+
+type alias FixtureUnit =
+    { uid : String
+    , path : String
+    , kind : String
+    , name : String
+    , qualified : String
+    , lines : Int
+    , hash : String
+    }
+
+
+-- A unit the fixture never loads: its hash attests nothing.
+other : String -> String -> String -> String -> FixtureUnit
+other uid path name qualified =
+    { uid = uid, path = path, kind = "fn", name = name, qualified = qualified, lines = 1, hash = "unloaded" }
+
+
+-- In insertion (rowid) order: each duplicate pair puts the unit that must
+-- not win first, so a lookup that keeps the first row it reads links it.
+fixtureUnits : List FixtureUnit
+fixtureUnits =
+    [ { uid = "u-src", path = "ipe:src/links.rs", kind = "fn", name = "caller", qualified = "app::links::caller", lines = List.length rustLines, hash = Index.attest (String.join "\n" rustLines) }
+    , { uid = "u-ipe", path = "ipe:src/Feature.ipe", kind = "fn", name = "run", qualified = "Feature.run", lines = List.length ipeLines, hash = Index.attest (String.join "\n" ipeLines) }
+    , other "u-helper" "ipe:src/links.rs" "helper" "app::links::helper"
+    , other "u-exact" "ipe:src/util.rs" "exact" "app::util::exact"
+    , other "u-shared" "ipe:src/other.rs" "shared" "app::other::shared"
+    , other "u-twin-a" "ipe:src/dup.rs" "twin" "dup::twin"
+    , other "u-twin-z" "ipe:src/links.rs" "twin" "dup::twin"
+    , other "u-pair-b" "ipe:src/dup.rs" "pair" "dup::pair"
+    , other "u-pair-a" "ipe:src/dup2.rs" "pair" "dup::pair"
+    , other "u-edge" "ipe:src/edge.rs" "edge" "zzz::edge"
+    , other "u-foo" "ipe:src/Foo.ipe" "bar" "Foo.bar"
+    ]
+
+
+insertFixtureUnit : String -> FixtureUnit -> Task.Task Error ()
+insertFixtureUnit indexDb u =
+    execIndex indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ SqlString u.uid
+        , SqlString u.path
+        , SqlString u.kind
+        , SqlString u.name
+        , SqlString u.qualified
+        , SqlInt 1
+        , SqlInt u.lines
+        , SqlString "internal"
+        , SqlString "purpose"
+        , SqlString u.hash
+        , SqlString "sha"
+        ]
+
+
+-- `u-src` calls `u-edge`, which its source never names, and itself.
+fixtureRows : String -> Task.Task Error ()
+fixtureRows indexDb =
+    Task.sequence
+        (List.map (insertFixtureUnit indexDb) fixtureUnits
+            ++ [ execIndex indexDb "INSERT INTO files (path, lang) VALUES (?, ?), (?, ?)" [ SqlString "ipe:src/links.rs", SqlString "rs", SqlString "ipe:src/Feature.ipe", SqlString "ipe" ]
+            , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ SqlString "u-src", SqlString "u-edge", SqlString "u-src", SqlString "u-src" ]
+            ]
+        )
+        |> Task.map (\_ -> ())
+
+
+type alias Loaded =
+    { rust : List String
+    , rustHidden : Maybe Hidden
+    , ipe : List String
+    , plan : List String
+    }
+
+
+keysOf : Maybe Index.UnitView -> List String
+keysOf found =
+    case found of
+        Just loaded ->
+            List.map Links.linkKey loaded.links.links
+
+        Nothing ->
+            [ "missing" ]
+
+
+-- The query plan of the candidate lookup `u-src` makes.
+candidatePlan : Task.Task Error (List String)
+candidatePlan =
+    case Index.candidateQuery "ipe:src/links.rs" "u-src" [ "helper", "app::links::helper", "dup::twin" ] of
+        ( sql, params ) ->
+            indexConn
+                |> Task.andThen
+                    (\conn ->
+                        Db.queryDecode conn
+                            ("EXPLAIN QUERY PLAN " ++ sql)
+                            params
+                            (Db.Decode.succeed identity |> Db.Decode.required "detail" (Db.Decode.string "detail"))
+                    )
+
+
+linksFixture : Task.Task Error Loaded
+linksFixture =
+    do
+        at <- freshScratch "links-bounded"
+        seedIndex at.indexDb at.repo
+        writeFileText (at.repo ++ "/src/links.rs") (String.join "\n" rustLines ++ "\n")
+        writeFileText (at.repo ++ "/src/Feature.ipe") (String.join "\n" ipeLines ++ "\n")
+        fixtureRows at.indexDb
+        rust <- loadUnitNow "u-src"
+        ipe <- loadUnitNow "u-ipe"
+        plan <- candidatePlan
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny (at.repo ++ "/src/links.rs")
+        removeFileIfAny (at.repo ++ "/src/Feature.ipe")
+        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan }
+
+
+fixtureChecks : Loaded -> List ( String, Bool )
+fixtureChecks got =
+    [ ( "a callgraph edge links the callee", List.member "i:u-edge" got.rust )
+    , ( "an exact qualified reference links", List.member "i:u-exact" got.rust )
+    , ( "a bare reference links to its own module's unit", List.member "i:u-helper" got.rust )
+    , ( "a bare reference never links to another module's unit of the same name", not (List.member "i:u-shared" got.rust) )
+    , ( "a duplicate qualified name links the same-path unit, then the lowest uid"
+    , List.member "i:u-twin-z" got.rust
+        && not (List.member "i:u-twin-a" got.rust)
+        && List.member "i:u-pair-a" got.rust
+        && not (List.member "i:u-pair-b" got.rust)
+    )
+    , ( "a unit never links to itself", not (List.member "i:u-src" got.rust) )
+    , ( "links are edges first, then references in first-occurrence order, nothing hidden"
+    , got.rust
+        == [ "i:u-edge", "i:u-helper", "i:u-exact", "i:u-twin-z", "i:u-pair-a" ]
+        && got.rustHidden
+        == Just NoneHidden
+    )
+    , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ "i:u-foo" ] )
+    , ( "the candidate query uses i_units_qual", List.any (String.contains "i_units_qual") got.plan )
+    ]
+
+
+-- ── pure link rules ─────────────────────────────────────────────────────
+-- One bare reference per name, `n` of them, in a Rust unit with no module.
+manyNames : Int -> Links.Candidates
+manyNames n =
+    Links.candidates Highlight.Rust
+        { kind = "fn", name = "f", qualified = "f" }
+        (Links.references Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
+
+
+candidateCeiling : Bool
+candidateCeiling =
+    let
+        over =
+            manyNames (Links.linkCandidateCeiling + 44)
+
+        atCeiling =
+            manyNames Links.linkCandidateCeiling
+
+        bound =
+            case Index.candidateQuery "p" "u" over.names of
+                ( _, params ) ->
+                    List.length params
+    in
+    List.length over.names
+        == Links.linkCandidateCeiling
+        && over.reach
+        == Capped
+        && bound
+        == Links.linkCandidateCeiling
+        + 2
+        && (Links.assemble { edges = Complete, candidates = over.reach } [] [] []).hidden
+        == AtLeast 0
+        && List.length atCeiling.names
+        == Links.linkCandidateCeiling
+        && atCeiling.reach
+        == Complete
+
+
+internalLinks : Int -> List Link
+internalLinks n =
+    List.map (\i -> Links.internal ("q" ++ String.fromInt i) ("u" ++ String.fromInt i)) (List.range 1 n)
+
+
+linkCeilingCut : Bool
+linkCeilingCut =
+    let
+        complete =
+            { edges = Complete, candidates = Complete }
+
+        over =
+            Links.assemble complete (internalLinks 60) (internalLinks (Links.linkCeiling + 3)) []
+
+        full =
+            Links.assemble complete (internalLinks Links.linkCeiling) [] []
+
+        edgesCut =
+            Links.assemble { edges = Capped, candidates = Complete } (internalLinks (Links.linkCeiling + 1)) [] []
+
+        note hidden =
+            Maybe.map SafeText.toString (Links.hiddenNote hidden)
+    in
+    List.length over.links
+        == Links.linkCeiling
+        && over.hidden
+        == Exactly 3
+        && note over.hidden
+        == Just "+3 more"
+        && full.hidden
+        == NoneHidden
+        && note full.hidden
+        == Nothing
+        && edgesCut.hidden
+        == AtLeast 1
+        && note edgesCut.hidden
+        == Just "+1 or more"
+
+
+firstOccurrence : Bool
+firstOccurrence =
+    let
+        wanted =
+            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
+
+        resolved =
+            Links.resolveCandidates wanted.lookups [ ( "c", "u-c" ), ( "a", "u-a" ), ( "b", "u-b" ) ]
+
+        assembled =
+            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" "u-a" ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
+    in
+    wanted.names
+        == [ "b", "a", "c" ]
+        && List.map Links.linkKey resolved
+        == [ "i:u-b", "i:u-a", "i:u-c" ]
+        && List.map Links.linkKey assembled.links
+        == [ "i:u-a", "i:u-b", "i:u-c", "e:https://x.io" ]
+
+
+candidateRule : Bool
+candidateRule =
+    let
+        namesFor lang unit refs =
+            (Links.candidates lang unit refs).names
+    in
+    namesFor Highlight.Rust { kind = "fn", name = "caller", qualified = "app::links::caller#2" } [ Bare "helper" ]
+        == [ "helper", "app::links::helper" ]
+        && namesFor Highlight.Ipe { kind = "fn", name = "run", qualified = "Feature.run" } [ Bare "go", Path "Foo.bar" ]
+        == [ "go", "Feature.go", "Foo.bar" ]
+        && namesFor Highlight.Rust { kind = "file", name = "FILE", qualified = "app::links::FILE" } [ Bare "helper" ]
+        == [ "helper" ]
+        && namesFor Highlight.Rust { kind = "fn", name = "other", qualified = "app::links::caller" } [ Bare "helper" ]
+        == [ "helper" ]
+        && namesFor Highlight.Rust { kind = "fn", name = "f", qualified = "mycrate::m::f" } [ Path "crate::util::g" ]
+        == [ "mycrate::util::g" ]
+
+
+-- A Rust `.` is a field or method access, never a path: `a.b.c` names `a`
+-- alone and `self.go` names nothing, so no lookup is spent on a name no Rust
+-- unit can hold. A `..` range starts no member, so its end still names.
+referencesFollowTokens : Bool
+referencesFollowTokens =
+    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
+        == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
+        && Links.references Highlight.Ipe "Foo.bar(x) model.count"
+        == [ Path "Foo.bar", Bare "x", Path "model.count" ]
+        && List.isEmpty (Links.references Highlight.Shell "Foo.bar x")
+        && List.isEmpty (Links.references Highlight.Unknown "Foo.bar x")
+
+
+candidateSqlBound : Bool
+candidateSqlBound =
+    case Index.candidateQuery "ipe:p" "u-self" [ "evil'); DROP TABLE units; --", "b" ] of
+        ( sql, params ) ->
+            not (String.contains "evil" sql)
+                && String.contains "IN (?, ?)" sql
+                && params
+                == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", SqlString "u-self" ]
+                && Index.placeholders 3
+                == "?, ?, ?"
+                && Index.placeholders 0
+                == ""
+
+
+-- One row of ipe-index's `tests/callee_vectors.json`: a caller unit's stored
+-- identity, a callee as written, and the names ipe-index's callee rule looks
+-- it up as.
+type alias CalleeVector =
+    { unit : Links.UnitName
+    , callee : String
+    , candidates : List String
+    }
+
+
+-- Every row's candidates, read through this page's own references and
+-- candidate rule, are ipe-index's. Red if the vectors file is absent or empty,
+-- or if the two rules drift.
+calleeVectorsHold : Task.Task Error Bool
+calleeVectorsHold =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "callee_vectors.json"))
+        text <- File.readFileLimit path (ByteSize.kib 16)
+        vectors <- Task.fromResult (Decode.decodeString (Decode.list calleeVectorDecoder) text)
+        Task.succeed (not (List.isEmpty vectors) && List.all calleeVectorHolds vectors)
+
+
+calleeVectorHolds : CalleeVector -> Bool
+calleeVectorHolds v =
+    (Links.candidates Highlight.Rust v.unit (List.take 1 (Links.references Highlight.Rust v.callee))).names == v.candidates
+
+
+calleeVectorDecoder : Decode.Decoder CalleeVector
+calleeVectorDecoder =
+    Decode.map3
+        (\unit callee wanted -> { unit = unit, callee = callee, candidates = wanted })
+        (Decode.map3
+            (\kind name qualified -> { kind = kind, name = name, qualified = qualified })
+            (Decode.field "kind" Decode.string)
+            (Decode.field "name" Decode.string)
+            (Decode.field "qualified" Decode.string)
+        )
+        (Decode.field "callee" Decode.string)
+        (Decode.field "candidates" (Decode.list Decode.string))
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.map2 (\got callee -> ( got, callee )) linksFixture calleeVectorsHold
+        |> Task.map
+            (\( got, callee ) ->
+                [ ( "a source with more distinct references than the candidate ceiling binds only the ceiling and sets hidden to AtLeast", candidateCeiling )
+                , ( "candidates match the shared ipe-index callee vectors", callee )
+                , ( "links past the link ceiling set hidden to Exactly the cut count", linkCeilingCut )
+                , ( "first occurrence wins across candidates, resolved links and urls", firstOccurrence )
+                , ( "candidates follow ipe-index's callee rule", candidateRule )
+                , ( "references follow the shown tokens", referencesFollowTokens )
+                , ( "candidate names are bound, never spliced into the SQL text", candidateSqlBound )
+                ]
+                    ++ fixtureChecks got
+            )
