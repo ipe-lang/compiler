@@ -186,9 +186,9 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 
 /// The Ipê `Error` for a refused connect.
 ///
-/// A driver failure keeps its classification; every other refusal is a
-/// configuration or policy refusal and keeps its plain message. `context`
-/// prefixes the message.
+/// A driver failure keeps its classification; the dial-target ceiling is a
+/// `LimitExceeded` refusal; every other refusal is a configuration or policy
+/// refusal and keeps its plain message. `context` prefixes the message.
 pub(crate) fn connect_refusal<E: From<String> + crate::FromIpeError>(
     context: &str,
     engine: DbEngine,
@@ -205,9 +205,11 @@ pub(crate) fn connect_refusal<E: From<String> + crate::FromIpeError>(
             );
             E::from_ipe_error(IpeError::database(failure.failure(), message))
         }
+        DbConnectError::TooManyDialTargets { .. } => {
+            E::from_ipe_error(IpeError::limit_exceeded(format!("{context}{refused}")))
+        }
         DbConnectError::InvalidUrl
         | DbConnectError::MisplacedUserinfo
-        | DbConnectError::TooManyDialTargets { .. }
         | DbConnectError::UnsupportedScheme
         | DbConnectError::EngineMismatch { .. }
         | DbConnectError::HostRefused(_)
@@ -2066,7 +2068,7 @@ async fn build_pool<E: Send + From<String> + crate::FromIpeError + 'static>(
 ) -> IpeResult<E, Db> {
     let db_url = match DbUrl::parse(url) {
         Ok(db_url) => db_url,
-        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+        Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
     };
     let max_connections: u32 = match DB_CONNECTIONS_CEILING.read() {
         Ok(cap) => cap,
@@ -6864,6 +6866,38 @@ mod tests {
         );
         assert!(
             DbUrl::parse(&url_with(MAX_POSTGRES_DIAL_TARGETS + 1)).is_err_and(|e| e == too_many)
+        );
+        assert_eq!(
+            connect_refusal::<IpeError>("external connect: ", DbEngine::Postgres, &too_many),
+            IpeError::limit_exceeded(format!(
+                "external connect: db: the connection URL names more than \
+                 {MAX_POSTGRES_DIAL_TARGETS} hosts to dial"
+            ))
+        );
+        assert_eq!(
+            connect_refusal::<IpeError>("", DbEngine::Postgres, &DbConnectError::InvalidUrl),
+            IpeError::unexpected("db: invalid connection URL".to_owned()),
+            "a refusal that is no ceiling keeps its plain kind"
+        );
+    }
+
+    /// A connection URL one target past the dial-target ceiling fails the
+    /// connect with a `LimitExceeded` error, its message unchanged.
+    #[tokio::test]
+    async fn build_pool_past_the_dial_target_ceiling_is_limit_exceeded() {
+        let hosts: Vec<String> = (0..MAX_POSTGRES_DIAL_TARGETS)
+            .map(|i| format!("host=h{i}.example"))
+            .collect();
+        let url = format!("postgres://db.example/app?{}", hosts.join("&"));
+        let refused = match build_pool::<IpeError>(&url).await {
+            IpeResult::Err(e) => Some(e),
+            IpeResult::Ok(_) => None,
+        };
+        assert_eq!(
+            refused,
+            Some(IpeError::limit_exceeded(format!(
+                "db: the connection URL names more than {MAX_POSTGRES_DIAL_TARGETS} hosts to dial"
+            )))
         );
     }
 
