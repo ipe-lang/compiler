@@ -2213,6 +2213,51 @@ fn type_field_missing_after_hof_result() {
     assert_rejected("type_field_missing_after_hof_result", &src, "IPE-T0012");
 }
 
+/// A callback result that settles to `Int` has no field: waiting on the
+/// result variable ends in a decided "no field", never an acceptance.
+#[test]
+fn type_field_on_hof_result_pinned_to_int() {
+    let src = format!(
+        "{HEAD}import Ipe.Maybe\n\n\
+         main =\n    Maybe.map (\\u -> u.name) (Maybe.map (\\e -> e.unit) (Just {{ unit = 3 }}))\n"
+    );
+    assert_rejected("type_field_on_hof_result_pinned_to_int", &src, "IPE-T0012");
+}
+
+/// A record update on a callback result that settles to `Int` is a decided
+/// "no field", never a deferral that runs out.
+#[test]
+fn type_update_on_hof_result_pinned_to_int() {
+    let src = format!(
+        "{HEAD}import Ipe.Maybe\n\n\
+         main =\n    Maybe.map (\\u -> {{ u | name = 1 }}) \
+         (Maybe.map (\\e -> e.unit) (Just {{ unit = 3 }}))\n"
+    );
+    assert_rejected("type_update_on_hof_result_pinned_to_int", &src, "IPE-T0012");
+}
+
+/// The nested spelling constrains the outer callback before the inner one;
+/// the outer read waits for the inner result instead of refusing.
+#[test]
+fn type_field_access_nested_list_map_compiles() {
+    let src = format!(
+        "{HEAD}\
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+names : List String
+names =
+    List.map (\\u -> u.name) (List.map (\\e -> e.unit) [ {{ unit = {{ name = \"x\" }} }} ])
+
+main : Task Error ()
+main =
+    Io.println (String.join \",\" names)
+"
+    );
+    assert_compiles("type_field_access_nested_list_map", &src);
+}
+
 /// A field access whose result is its own base is an infinite type (the
 /// occurs check), never a cyclic record the read-back trips over.
 #[test]

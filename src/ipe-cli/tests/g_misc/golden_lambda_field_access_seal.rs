@@ -145,6 +145,22 @@ main =
     Io.println (if sameX { x = 1 } then "same" else "differs")
 "#;
 
+/// An equality-owing base whose field type is never pinned inside the
+/// function: the field's equality must be decided per call site.
+const EQ_ON_UNPINNED_FIELD: &str = r#"module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+pair a =
+    a == a && a.x == a.x
+
+
+main : Task Error ()
+main =
+    Io.println (if pair { x = "q" } then "same" else "differs")
+"#;
+
 #[test]
 fn find_then_field_builds() {
     assert_accepted_and_builds("find_then_field", FIND_THEN_FIELD);
@@ -176,6 +192,11 @@ fn eq_on_deferred_base_builds() {
 }
 
 /// `source` must be accepted by `ipe`, and under `IPE_E2E` its crate must `cargo build`.
+#[test]
+fn eq_on_unpinned_field_builds() {
+    assert_accepted_and_builds("eq_on_unpinned_field", EQ_ON_UNPINNED_FIELD);
+}
+
 fn assert_accepted_and_builds(name: &str, source: &str) {
     let Some((built, out)) = build_fixture(name, source) else {
         return;
