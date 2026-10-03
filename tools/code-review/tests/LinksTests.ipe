@@ -125,7 +125,7 @@ fixtureRows indexDb =
         |> Task.map (\_ -> ())
 
 
-type alias Loaded =
+type alias LinksFixture =
     { rust : List String
     , rustHidden : Maybe Hidden
     , ipe : List String
@@ -158,7 +158,7 @@ candidatePlan =
                     )
 
 
-linksFixture : Task.Task Error Loaded
+linksFixture : Task.Task Error LinksFixture
 linksFixture =
     do
         at <- freshScratch "links-bounded"
@@ -175,7 +175,7 @@ linksFixture =
         Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan }
 
 
-fixtureChecks : Loaded -> List ( String, Bool )
+fixtureChecks : LinksFixture -> List ( String, Bool )
 fixtureChecks got =
     [ ( "a callgraph edge links the callee", List.member "i:u-edge" got.rust )
     , ( "an exact qualified reference links", List.member "i:u-exact" got.rust )
