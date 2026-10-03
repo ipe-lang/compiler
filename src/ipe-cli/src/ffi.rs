@@ -5007,7 +5007,7 @@ version = \"1\"
     fn an_underscore_named_direct_crate_conflict_is_refused() {
         // The direct set and the dependency keys compare one typed package-name
         // spelling, so `foo_bar` is direct on both sides and never deferred.
-        let refused = assemble_emit(&[
+        let refused = emit_of(&[
             typed_crate("foo_bar", "foo_bar", &["foo_bar = \"=1.0.0\""]),
             typed_crate(
                 "other",
@@ -5018,11 +5018,11 @@ version = \"1\"
         assert!(
             refused_as(
                 &refused,
-                DependencyRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "foo_bar".to_owned(),
                     first: "1.0.0".to_owned(),
                     second: "2.0.0".to_owned(),
-                }
+                })
             ),
             "a direct crate named with `_` must refuse its conflict: {refused:?}"
         );
