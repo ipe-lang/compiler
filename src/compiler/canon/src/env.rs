@@ -220,31 +220,64 @@ impl ModuleCatalog {
         self.modules.iter().map(|m| &**m)
     }
 
-    /// The modules other than `home` a bare `import` of which binds `qualifier`.
+    /// Every module other than `home` a bare `import` of which binds `qualifier`.
     ///
-    /// A bare import binds the forms of `import_qualifier_forms(false, len)`:
-    /// the last segment, plus the dotted path when the path has more than one
-    /// segment. Sorted and deduplicated (the catalog is a set).
+    /// The one candidate source for an unimported qualifier: every catalog
+    /// entry is tested against [`bare_import_binds`], so two modules sharing a
+    /// last segment (a kernel `Ipe.Tea.Tui` and a compiled `Ipe.Ui.Tui`) are
+    /// both listed. Sorted and deduplicated (the catalog is a set).
     #[must_use]
     pub fn modules_bound_by(&self, qualifier: &str, home: &str) -> Box<[Box<str>]> {
         self.modules
             .iter()
-            .filter(|module| &***module != home && binds(module, qualifier))
+            .filter(|module| &***module != home && bare_import_binds(module, qualifier))
             .cloned()
             .collect()
     }
 }
 
 /// `true` when a bare `import module` registers `qualifier`.
-fn binds(module: &str, qualifier: &str) -> bool {
-    let len = module.split('.').count();
-    import_qualifier_forms(false, len)
+///
+/// A kernel stdlib module (a [`STDLIB_MODULE_QUALIFIERS`] path) binds its
+/// canonical qualifier, plus its last segment when
+/// [`kernel_import_binds_last_segment`] allows it. Any other module binds the
+/// forms of `import_qualifier_forms(false, len)`: the last segment, plus the
+/// dotted path when the path has more than one segment.
+#[must_use]
+pub fn bare_import_binds(module: &str, qualifier: &str) -> bool {
+    let segments: Vec<&str> = module.split('.').collect();
+    let last = segments.last().copied();
+    if let Some(canonical) = stdlib_canonical_qualifier(&segments) {
+        return qualifier == canonical
+            || last.is_some_and(|last| {
+                last == qualifier && kernel_import_binds_last_segment(last, canonical)
+            });
+    }
+    import_qualifier_forms(false, segments.len())
         .iter()
         .any(|form| match form {
-            QualifierForm::LastSegment => module.rsplit('.').next() == Some(qualifier),
+            QualifierForm::LastSegment => last == Some(qualifier),
             QualifierForm::DottedPath => module == qualifier,
             QualifierForm::Alias => false,
         })
+}
+
+/// `true` when a bare import of the kernel module with canonical qualifier
+/// `canonical` also binds its last path segment `last`.
+///
+/// It does unless `last` is a DIFFERENT kernel module's canonical qualifier:
+/// binding it would unlock that foreign module's import gate
+/// (`import Ipe.Server.Http` must not unlock client `Http`).
+#[must_use]
+pub fn kernel_import_binds_last_segment(last: &str, canonical: &str) -> bool {
+    last == canonical || !is_canonical_qualifier_text(last)
+}
+
+/// `true` when `name` is the canonical qualifier of some kernel stdlib module.
+fn is_canonical_qualifier_text(name: &str) -> bool {
+    STDLIB_MODULE_QUALIFIERS
+        .iter()
+        .any(|(_, canonical)| *canonical == name)
 }
 
 /// `true` when `name` is the canonical short qualifier of some stdlib module in
@@ -256,11 +289,9 @@ fn binds(module: &str, qualifier: &str) -> bool {
 /// `Cmd` / `Sub` are absent from the table, so aliasing to them stays allowed.
 #[must_use]
 pub fn is_stdlib_canonical_qualifier(interner: &Interner, name: Symbol) -> bool {
-    interner.resolve(name).is_some_and(|n| {
-        STDLIB_MODULE_QUALIFIERS
-            .iter()
-            .any(|(_, canon)| *canon == n)
-    })
+    interner
+        .resolve(name)
+        .is_some_and(is_canonical_qualifier_text)
 }
 
 /// The reserved kernel-alias qualifier path. `import Ipe.Ffi.Kernel as Kernel`
@@ -1293,9 +1324,11 @@ impl Env {
     /// segment exhausts the interner.
     fn freeze_stdlib_import_gate(&mut self, interner: &mut Interner) -> DResult<()> {
         let basics = interner.intern("Basics")?;
-        // canonical short-name → its preferred `Ipe.*` import path. The FIRST
-        // table entry naming a canonical wins, so a module with several import
-        // paths (rare) suggests its primary one deterministically.
+        // canonical short-name → its primary `Ipe.*` import path (the FIRST
+        // table entry naming it). The path is the gate's verdict only: the
+        // IPE-N0034 candidate list is every catalog module whose bare import
+        // binds the qualifier (`ModuleCatalog::modules_bound_by`), so a
+        // canonical with several paths lists them all.
         let mut canon_to_path: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
         for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
             let canon_sym = interner.intern(canonical)?;

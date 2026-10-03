@@ -2399,9 +2399,13 @@ fn register_stdlib_import_aliases(
         // closed: skip the mark for that foreign-canonical case. The member-clone
         // below still runs, so the bare import's own members resolve, and its
         // canonical is still marked via the `import.alias.is_none()` branch.
+        // The same predicate decides which modules an IPE-N0034 lists for an
+        // unimported qualifier (`crate::env::bare_import_binds`).
         let alias_is_foreign_gated_canonical = import.alias.is_none()
-            && alias != canonical
-            && crate::env::is_stdlib_canonical_qualifier(interner, alias);
+            && !crate::env::kernel_import_binds_last_segment(
+                &name_str(interner, alias)?,
+                &name_str(interner, canonical)?,
+            );
         if !alias_is_foreign_gated_canonical {
             env.mark_stdlib_qualifier_imported(alias);
         }
@@ -5940,6 +5944,31 @@ fn unbound_qualifier(
     })
 }
 
+/// Every module a bare `import` of which binds the Tier-C gated `qualifier`.
+///
+/// The catalog ([`crate::ModuleCatalog::modules_bound_by`]) is the one source:
+/// it lists every kernel AND compiled-source module the qualifier names, so a
+/// compiled `Ipe.Ui.Tui` stands beside the kernel `Ipe.Tea.Tui` for `Tui`.
+/// `gate_path`, the gate's own kernel path, is always one of them; it is
+/// unioned in so the set is never empty even over a kernel-only catalog.
+/// Sorted and deduplicated.
+fn gated_import_candidates(
+    qualifier: &str,
+    gate_path: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) -> Box<[Box<str>]> {
+    let home = path_to_dot_string(interner, &env.home);
+    let mut modules: BTreeSet<Box<str>> = env
+        .module_catalog
+        .modules_bound_by(qualifier, &home)
+        .into_vec()
+        .into_iter()
+        .collect();
+    modules.insert(path_to_dot_string(interner, gate_path));
+    modules.into_iter().collect()
+}
+
 /// The verdict for `qualifier`, which a bare `import` of each of `modules`
 /// (non-empty, sorted) would bind but no import in this module binds.
 ///
@@ -6057,13 +6086,9 @@ fn resolve_qual_var(
     // members are present regardless of import.
     let token = qualified_token(span, qualifier_text, name_text);
     if let Some(import_path) = env.stdlib_import_required(qualifier) {
-        return Err(import_required(
-            name_str(interner, qualifier)?,
-            Box::new([path_to_dot_string(interner, import_path)]),
-            span,
-            token,
-            env,
-        ));
+        let qualifier_s = name_str(interner, qualifier)?;
+        let modules = gated_import_candidates(&qualifier_s, import_path, env, interner);
+        return Err(import_required(qualifier_s, modules, span, token, env));
     }
     let Some(members) = env.qual_members(qualifier) else {
         return Err(unbound_qualifier(qualifier, span, token, env, interner)?);
@@ -6827,7 +6852,7 @@ fn canonicalise_type(
                 if let Some(import_path) = ctx.env.stdlib_import_required(*qualifier) {
                     return Err(import_required(
                         qualifier_str.into(),
-                        Box::new([path_to_dot_string(ctx.interner, import_path)]),
+                        gated_import_candidates(qualifier_str, import_path, ctx.env, ctx.interner),
                         ctx.ann_span,
                         None,
                         ctx.env,

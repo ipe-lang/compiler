@@ -321,31 +321,42 @@ fn import_candidates_data(diag: &Diagnostic) -> Option<serde_json::Value> {
 }
 
 /// The most import actions one diagnostic's `data` can produce.
-const MAX_IMPORT_CANDIDATES: usize = 64;
+pub(crate) const MAX_IMPORT_CANDIDATES: usize = 64;
 
 /// The candidate modules an LSP diagnostic's `data` carries, in order; empty
 /// when it carries none.
 ///
 /// The client echoes `data` back, so it is untrusted input bound for the
-/// document text: only an entry that is a dotted module path (each segment an
-/// uppercase-initial identifier) survives, and at most
-/// [`MAX_IMPORT_CANDIDATES`] of them. Anything else — a newline, a space, a
-/// backtick, a control or bidi character — is dropped, never inserted.
+/// document text. The list is taken whole or not at all: it must be at most
+/// [`MAX_IMPORT_CANDIDATES`] entries, each a dotted module path (each segment
+/// an uppercase-initial identifier), strictly ascending (the producer's sorted,
+/// deduplicated order). Any other shape — a newline, a space, a backtick, a
+/// control or bidi character, a duplicate, a non-string — yields no
+/// candidates, so a partly-dropped list can never shrink an ambiguous
+/// qualifier to one "preferred" import.
 #[must_use]
 pub fn import_candidates(diag: &lsp_types::Diagnostic) -> Vec<String> {
-    diag.data
+    let Some(entries) = diag
+        .data
         .as_ref()
         .and_then(|d| d.get(IMPORT_CANDIDATES_KEY))
         .and_then(serde_json::Value::as_array)
-        .map(|ms| {
-            ms.iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|m| is_module_path(m))
-                .take(MAX_IMPORT_CANDIDATES)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    if entries.len() > MAX_IMPORT_CANDIDATES {
+        return Vec::new();
+    }
+    let modules: Option<Vec<&str>> = entries
+        .iter()
+        .map(|m| m.as_str().filter(|m| is_module_path(m)))
+        .collect();
+    match modules {
+        Some(modules) if modules.windows(2).all(|pair| pair.first() < pair.last()) => {
+            modules.into_iter().map(str::to_owned).collect()
+        }
+        Some(_) | None => Vec::new(),
+    }
 }
 
 /// `true` when `text` is `Seg(.Seg)*`, each segment an ASCII uppercase letter
