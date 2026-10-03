@@ -618,11 +618,9 @@ mod native {
                 if let Some(ports) = owner_sid.as_ref().and_then(|s| g.get_mut(&s.0))
                     && ports.pending.len() >= MAX_OUTSTANDING
                 {
-                    return crate::core::IpeResult::Err(
-                        "js_request: outstanding waiter ceiling reached"
-                            .to_string()
-                            .into(),
-                    );
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_request: outstanding waiter ceiling reached".to_owned(),
+                    ));
                 }
             }
 
@@ -731,11 +729,9 @@ mod native {
                 let mut g = lock_sessions();
                 let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
                 if ports.streams.len() >= MAX_OPEN_SESSIONS {
-                    return crate::core::IpeResult::Err(
-                        "js_open_session: open-session ceiling reached"
-                            .to_string()
-                            .into(),
-                    );
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_open_session: open-session ceiling reached".to_owned(),
+                    ));
                 }
                 ports.streams.insert(
                     session_id,
@@ -1199,11 +1195,9 @@ mod wasm {
             // Refuse when the ceiling is already reached.
             let at_limit = PENDING.with(|p| p.borrow().len() >= MAX_OUTSTANDING);
             if at_limit {
-                return crate::core::IpeResult::Err(
-                    "js_request: outstanding waiter ceiling reached"
-                        .to_string()
-                        .into(),
-                );
+                return crate::core::IpeResult::Err(IpeError::unavailable(
+                    "js_request: outstanding waiter ceiling reached".to_owned(),
+                ));
             }
 
             // Serialize and wrap with the correlation id.
@@ -1306,11 +1300,9 @@ mod wasm {
         Box::pin(async move {
             let at_limit = SESSIONS.with(|s| s.borrow().len() >= MAX_OPEN_SESSIONS);
             if at_limit {
-                return crate::core::IpeResult::Err(
-                    "js_open_session: open-session ceiling reached"
-                        .to_string()
-                        .into(),
-                );
+                return crate::core::IpeResult::Err(IpeError::unavailable(
+                    "js_open_session: open-session ceiling reached".to_owned(),
+                ));
             }
             SESSIONS.with(|s| {
                 s.borrow_mut().insert(
@@ -2049,8 +2041,10 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(result, crate::IpeResult::Err(_)),
-                "ceiling breach must immediately return Err"
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    "js_request: outstanding waiter ceiling reached".to_owned()
+                )),
+                "a ceiling breach is refused at once as Unavailable: it frees as replies arrive"
             );
             session_close(&sid);
         }
@@ -2332,8 +2326,10 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(over, crate::IpeResult::Err(_)),
-                "open past the ceiling must be refused with Err"
+                matches!(&over, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    "js_open_session: open-session ceiling reached".to_owned()
+                )),
+                "an open past the ceiling is refused as Unavailable: it frees as sessions close"
             );
             session_close(&sid);
         }
