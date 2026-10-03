@@ -10,11 +10,19 @@ module Main exposing (main)
 -- Checks (one line each):
 --   no-key          no primary key and no unique column is refused
 --   serial-key      a key the database fills (serial) is refused
+--   several-unique  several unique columns and no primary key is refused
 --   first-write     inserting an absent composite key affects one row
 --   second-write    inserting the same key again affects no row
 --   other-key       a key differing in one composite column is inserted
 --   row-unchanged   the first write's values survive the second write
 --   row-count       two distinct keys leave exactly two rows
+--   unique-first-write   a store keyed on its one unique column inserts
+--   unique-second-write  the same unique value again affects no row
+--   unique-row-unchanged the first write's values survive the second write
+--   token-first-write    a primary-keyed store with a second unique column inserts
+--   other-unique-conflict a row conflicting only on the non-target unique column
+--                        is the database's typed error, never a silent skip
+--   token-row-count      the refused row added nothing
 
 import Ipe.Db as Db exposing (Db)
 import Ipe.Db.Store as Store exposing (Store)
@@ -107,6 +115,16 @@ insertRefused conn label needle built row =
                 (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) (Store.insertIfAbsent conn store row))
 
 
+contactColumns : List Store.Column
+contactColumns =
+    [ Store.textColumn "email", Store.textColumn "name", Store.textColumn "phone" ]
+
+
+contactRow : String -> String -> String -> Store.Row
+contactRow email name phone =
+    Dict.fromList [ ( "email", email ), ( "name", name ), ( "phone", phone ) ]
+
+
 refusalChecks : Db -> List (Task Error String)
 refusalChecks conn =
     [ insertRefused conn
@@ -114,6 +132,11 @@ refusalChecks conn =
         "insertIfAbsent requires a declared primary key or unique column"
         (rowStore "notes" noteColumns (\d -> d))
         (noteRow "a" "b")
+    , insertRefused conn
+        "several-unique"
+        "insertIfAbsent found several unique columns"
+        (rowStore "contacts" contactColumns (\d -> StoreU.unique "phone" (StoreU.unique "email" d)))
+        (contactRow "a@x" "Ann" "p1")
     , insertRefused conn
         "serial-key"
         "insertIfAbsent cannot match a conflict on column"
@@ -206,15 +229,99 @@ writeChecks conn =
                 (Store.create conn store)
 
 
+-- A store keyed on its one `unique` column: the conflict target is that column.
+emailStore : Result Error (Store Store.Row)
+emailStore =
+    rowStore "emails"
+        [ Store.textColumn "email", Store.textColumn "name" ]
+        (\d -> StoreU.unique "email" d)
+
+
+emailRow : String -> String -> Store.Row
+emailRow email name =
+    Dict.fromList [ ( "email", email ), ( "name", name ) ]
+
+
+-- A store keyed on `id` that also declares `token` unique: `ON CONFLICT (id)`
+-- absorbs only a key conflict, so a `token` conflict must surface.
+tokenStore : Result Error (Store Store.Row)
+tokenStore =
+    rowStore "tokens"
+        [ Store.textColumn "id", Store.textColumn "token", Store.textColumn "owner" ]
+        (\d -> StoreU.primaryKey "id" (StoreU.unique "token" d))
+
+
+tokenRow : String -> String -> String -> Store.Row
+tokenRow id token owner =
+    Dict.fromList [ ( "id", id ), ( "token", token ), ( "owner", owner ) ]
+
+
+emailUnchangedLine : List Store.Row -> String
+emailUnchangedLine rows =
+    case List.filter (\row -> rowField "email" row == "a@x") rows of
+        [ row ] ->
+            if rowField "name" row == "Ann" then
+                "unique-row-unchanged:ok"
+
+            else
+                String.concat [ "unique-row-unchanged:FAIL-name:", rowField "name" row ]
+
+        _ ->
+            "unique-row-unchanged:FAIL-missing"
+
+
+-- `label:rejected` when `task` fails with a message containing `needle`.
+refusedOn : String -> String -> Task Error Int -> Task Error String
+refusedOn label needle task =
+    Task.onError
+        (\e ->
+            if String.contains needle (Error.message e) then
+                Task.succeed (String.concat [ label, ":rejected" ])
+
+            else
+                Task.succeed (String.concat [ label, ":FAIL-wrong-error:", Error.message e ])
+        )
+        (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)
+
+
+uniqueChecks : Db -> Task Error (List String)
+uniqueChecks conn =
+    case emailStore of
+        Err e ->
+            Task.succeed [ String.concat [ "unique-first-write:FAIL-store:", Error.toString e ] ]
+
+        Ok emails ->
+            case tokenStore of
+                Err e ->
+                    Task.succeed [ String.concat [ "token-first-write:FAIL-store:", Error.toString e ] ]
+
+                Ok tokens ->
+                    do
+                        _ <- Store.create conn emails
+                        firstEmail <- Store.insertIfAbsent conn emails (emailRow "a@x" "Ann")
+                        secondEmail <- Store.insertIfAbsent conn emails (emailRow "a@x" "Bob")
+                        emailRows <- Store.all conn emails
+                        _ <- Store.create conn tokens
+                        firstToken <- Store.insertIfAbsent conn tokens (tokenRow "1" "t" "alice")
+                        conflict <- refusedOn "other-unique-conflict" "db: database error [2067]" (Store.insertIfAbsent conn tokens (tokenRow "2" "t" "bob"))
+                        tokenRows <- Store.all conn tokens
+                        Task.succeed
+                            [ countLine "unique-first-write" 1 firstEmail
+                            , countLine "unique-second-write" 0 secondEmail
+                            , emailUnchangedLine emailRows
+                            , countLine "token-first-write" 1 firstToken
+                            , conflict
+                            , countLine "token-row-count" 1 (List.length tokenRows)
+                            ]
+
+
 runChecks : Db -> Task Error ()
 runChecks conn =
-    Task.andThen
-        (\refusals ->
-            Task.andThen
-                (\writes -> Io.println (String.join "\n" (List.concat [ refusals, writes ])))
-                (writeChecks conn)
-        )
-        (sequenceLines (refusalChecks conn))
+    do
+        refusals <- sequenceLines (refusalChecks conn)
+        writes <- writeChecks conn
+        uniques <- uniqueChecks conn
+        Io.println (String.join "\n" (List.concat [ refusals, writes, uniques ]))
 
 
 main : Task Error ()

@@ -1,7 +1,14 @@
 no-key:ok
 serial-key:ok
+several-unique:ok
 first-write:ok
 second-write:ok
 other-key:ok
 row-unchanged:ok
 row-count:ok
+unique-first-write:ok
+unique-second-write:ok
+unique-row-unchanged:ok
+token-first-write:ok
+other-unique-conflict:rejected
+token-row-count:ok

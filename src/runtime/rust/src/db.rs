@@ -9310,6 +9310,42 @@ mod tests {
         );
     }
 
+    /// `ON CONFLICT (<target>) DO NOTHING` absorbs only a conflict on the
+    /// target: a row colliding on another `UNIQUE` column is the engine's
+    /// error, never a silent `0` (an `INSERT OR IGNORE` would swallow it).
+    #[tokio::test]
+    async fn insert_fields_if_absent_non_target_unique_conflict_is_err() {
+        let db = fresh_db().await;
+        let mk: IpeResult<String, i64> = db_exec_raw(
+            db.clone(),
+            "CREATE TABLE kt (k TEXT PRIMARY KEY, u TEXT UNIQUE)".to_string(),
+        )
+        .await;
+        assert!(matches!(mk, IpeResult::Ok(_)), "create: {mk:?}");
+        let put = |k: &str, u: &str| {
+            db_insert_fields_if_absent::<String>(
+                db.clone(),
+                "kt".to_string(),
+                vec!["k".to_string()],
+                vec![
+                    ("k".to_string(), Some(SqlParam::Text(k.to_string()))),
+                    ("u".to_string(), Some(SqlParam::Text(u.to_string()))),
+                ],
+            )
+        };
+        let first = put("a", "x").await;
+        assert!(matches!(first, IpeResult::Ok(1)), "insert: {first:?}");
+        let clash = put("b", "x").await;
+        assert!(
+            matches!(clash, IpeResult::Err(_)),
+            "a non-target UNIQUE conflict must be an Err, got {clash:?}"
+        );
+        let rows: IpeResult<String, Vec<HashMap<String, String>>> =
+            db_query_params(db.clone(), "SELECT k FROM kt".to_string(), Vec::new()).await;
+        let rows = rows.with_default(Vec::new());
+        assert_eq!(rows.len(), 1, "the refused row must add nothing: {rows:?}");
+    }
+
     /// The statement is the one standard form both engines share: SET covers
     /// every `SetField` column except the conflict target, as `excluded.<col>`;
     /// an `OmitField` column appears nowhere.
