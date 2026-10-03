@@ -311,17 +311,33 @@ fn emit_doc_links(store: &Store, uid: &str, links: &[(String, i64)]) -> Result<(
     Ok(())
 }
 
-/// The callee name of a `call_expression` — the text of its `function` field.
-/// A Rust turbofish (`foo::<T>(…)`) is stripped so the name matches the unit's
-/// qualified name.
-fn call_function_name(call: Node, src: &str) -> Option<String> {
+/// The callee text of a `call_expression` — the text of its `function` field.
+fn call_function_name<'s>(call: Node, src: &'s str) -> Option<&'s str> {
     let f = call.child_by_field_name("function")?;
-    let text = &src[f.byte_range()];
-    let text = match text.find("::<") {
-        Some(i) => &text[..i],
-        None => text,
+    src.get(f.byte_range())
+}
+
+/// The qualified names a call's callee text is looked up as, in order — the
+/// callee rule `tests/callee_vectors.json` pins and code-review's `Links`
+/// mirrors. A Rust turbofish (`foo::<T>`) is stripped. A Rust `crate::`
+/// prefix names the caller's own crate, so it is rewritten to `crate_root`. A
+/// path (`a::b`, `a.b`) is looked up exactly; a bare name exactly, then in the
+/// caller's module `base_qual`.
+fn callee_candidates(callee: &str, base_qual: &str, crate_root: Option<&str>) -> Vec<String> {
+    let callee = match callee.find("::<") {
+        Some(i) => callee.get(..i).unwrap_or(callee),
+        None => callee,
     };
-    Some(text.to_string())
+    let callee = match (crate_root, callee.strip_prefix("crate::")) {
+        (Some(root), Some(rest)) => format!("{root}::{rest}"),
+        _ => callee.to_string(),
+    };
+    if callee.contains("::") || callee.contains('.') {
+        vec![callee]
+    } else {
+        let local = format!("{base_qual}::{callee}");
+        vec![callee, local]
+    }
 }
 
 /// The uid of the smallest emitted unit whose item span contains `node` — the
@@ -450,13 +466,12 @@ pub fn extract(
         }
     }
 
-    // Pass 2 — callgraph edges. The callee lookup is an exact match on the unit's
-    // qualified name (`uid_for_qualified`); an unqualified callee additionally
-    // tries the same-module name (`{base_qual}::{callee}` — units use `::`
-    // separators for every language). A Rust `crate::` prefix in the source
-    // names *this* crate, so it is rewritten to the caller's crate root to keep
-    // a same-named symbol in another crate out of the match. The caller is the
-    // innermost emitted unit whose item span contains the call.
+    // Pass 2 — callgraph edges. Each callee resolves to the first of its
+    // `callee_candidates` some unit's qualified name matches exactly
+    // (`uid_for_qualified`; units use `::` separators for every language).
+    // A Rust `crate::` rewrite keeps a same-named symbol in another crate out
+    // of the match. The caller is the innermost emitted unit whose item span
+    // contains the call.
     let crate_root = if lang == Lang::Rust {
         let (_tag, rel) = crate::model::split_tag(path);
         Some(super::rust_crate_root(rel))
@@ -467,20 +482,13 @@ pub fn extract(
         let Some(callee) = call_function_name(node, src) else {
             continue;
         };
-        let callee = match &crate_root {
-            Some(root) => match callee.strip_prefix("crate::") {
-                Some(rest) => format!("{root}::{rest}"),
-                None => callee,
-            },
-            None => callee,
-        };
-        let callee_uid = if callee.contains("::") || callee.contains('.') {
-            store.uid_for_qualified(&callee, path)?
-        } else {
-            store
-                .uid_for_qualified(&callee, path)?
-                .or(store.uid_for_qualified(&format!("{base_qual}::{callee}"), path)?)
-        };
+        let mut callee_uid = None;
+        for candidate in callee_candidates(callee, &base_qual, crate_root.as_deref()) {
+            callee_uid = store.uid_for_qualified(&candidate, path)?;
+            if callee_uid.is_some() {
+                break;
+            }
+        }
         if let Some(callee_uid) = callee_uid
             && let Some(caller_uid) = enclosing_unit_uid(node, &unit_spans)
         {
@@ -505,6 +513,42 @@ mod tests {
     fn do_extract(s: &Store, path: &str, lang: Lang, src: &str) {
         let mut ord: HashMap<(String, String), i64> = HashMap::new();
         extract(s, path, lang, src, "sha", &mut ord).unwrap();
+    }
+
+    const CALLEE_VECTORS: &str = include_str!("../../tests/callee_vectors.json");
+
+    // Every row of the shared callee fixture code-review's `Links` reads:
+    // the unit's stored qualified name is the one this extractor builds from
+    // its path (so code-review's module, read back from that name, is this
+    // `base_qual`), and the callee's candidates are `callee_candidates`'s.
+    #[test]
+    fn callee_vectors_follow_the_callee_rule() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(CALLEE_VECTORS).unwrap();
+        assert!(!rows.is_empty(), "callee_vectors.json has no rows");
+        for row in &rows {
+            let field = |k: &str| row[k].as_str().unwrap_or_else(|| panic!("`{k}` in {row}"));
+            let path = field("path");
+            let (_tag, rel) = crate::model::split_tag(path);
+            let base = module_path(path, Lang::Rust);
+            let root = crate::extract::rust_crate_root(rel);
+            let qualified = field("qualified");
+            let unordinal = match qualified.rsplit_once('#') {
+                Some((q, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => q,
+                _ => qualified,
+            };
+            assert_eq!(unordinal, format!("{base}::{}", field("name")), "{row}");
+            let want: Vec<String> = row["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                callee_candidates(field("callee"), &base, Some(&root)),
+                want,
+                "{row}"
+            );
+        }
     }
 
     #[test]

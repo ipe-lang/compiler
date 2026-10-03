@@ -26,23 +26,26 @@ type Token
     | Plain String
 
 
+-- The highlighting language of a file, from the language ipe-index stores
+-- in `files.lang`: one arm per stored value, plus one for text outside that
+-- vocabulary. A language this tokenizer has no rules for is `Unknown`.
 langFor : String -> Lang
-langFor kind =
-    case kind of
-        "rust" ->
+langFor stored =
+    case stored of
+        "rs" ->
             Rust
-
-        "shell" ->
-            Shell
 
         "sh" ->
             Shell
 
-        "bash" ->
-            Shell
-
         "ipe" ->
             Ipe
+
+        "ts" ->
+            Unknown
+
+        "other" ->
+            Unknown
 
         _ ->
             Unknown
@@ -96,86 +99,156 @@ tokenize lang text =
         [ Plain text ]
 
     else
-        scan lang (String.toList text) []
+        finish lang (String.foldl (step lang) ( Start, "", [] ) text)
 
 
-scan : Lang -> List Char -> List Token -> List Token
-scan lang chars acc =
-    case chars of
-        [] ->
-            List.reverse acc
+-- The lexeme the tokenizer is inside, from the characters read so far.
+-- One state per partial token, so each character is read exactly once and
+-- the run is linear in the source length.
+type Lexing
+    = Start
+    | InNum
+    | InWord
+    | InStr
+    | InStrEscape
+    | AfterSlash
+    | InLineComment
+    | InBlock
+    | InBlockStar
 
-        c :: rest ->
-            if Char.isDigit c then
-                let
-                    ( num, rest2 ) =
-                        spanWhile isNumChar rest
-                in
-                scan lang rest2 (Num (String.fromList (c :: num)) :: acc)
 
-            else if c == '"' then
-                let
-                    ( consumed, rest2, closed ) =
-                        takeString rest
-                in
-                if closed then
-                    scan lang rest2 (Str (String.fromList ('"' :: consumed)) :: acc)
+-- ( lexing state, the open lexeme's text, the tokens closed so far ).
+type alias Lexer =
+    ( Lexing, String, List Token )
 
-                else
-                    scan lang [] (Plain (String.fromList ('"' :: consumed)) :: acc)
 
-            else if c == '/' then
-                case rest of
-                    '/' :: rest2 ->
-                        let
-                            ( consumed, rest3 ) =
-                                spanWhile
-                                    (\ch ->
-                                        ch
-                                            /= '\n'
-                                    )
-                                    rest2
-                        in
-                        scan lang rest3 (Comment (String.fromList ('/' :: '/' :: consumed)) :: acc)
+step : Lang -> Char -> Lexer -> Lexer
+step lang c ( lexing, buf, toks ) =
+    case lexing of
+        Start ->
+            begin c toks
 
-                    '*' :: _ ->
-                        let
-                            ( consumed, rest2, closed ) =
-                                takeBlock rest
-                        in
-                        if closed then
-                            scan lang rest2 (Comment (String.fromList ('/' :: consumed)) :: acc)
-
-                        else
-                            scan lang [] (Plain (String.fromList ('/' :: consumed)) :: acc)
-
-                    _ ->
-                        scan lang rest (Plain "/" :: acc)
-
-            else if isWordStart c then
-                let
-                    ( word, rest2 ) =
-                        spanWhile isWordChar rest
-
-                    w =
-                        String.fromList (c :: word)
-                in
-                if List.member w (keywords lang) then
-                    scan lang rest2 (Keyword w :: acc)
-
-                else
-                    scan lang rest2 (Ident w :: acc)
+        InNum ->
+            if isNumChar c then
+                ( InNum, String.append buf (String.fromChar c), toks )
 
             else
-                scan lang rest (Plain (String.fromChar c) :: acc)
+                begin c (toks ++ [ Num buf ])
+
+        InWord ->
+            if isWordChar c then
+                ( InWord, String.append buf (String.fromChar c), toks )
+
+            else
+                begin c (toks ++ [ word lang buf ])
+
+        InStr ->
+            if c == '"' then
+                ( Start, "", toks ++ [ Str (String.append buf "\"") ] )
+
+            else if c == backslashChar then
+                ( InStrEscape, String.append buf (String.fromChar c), toks )
+
+            else
+                ( InStr, String.append buf (String.fromChar c), toks )
+
+        InStrEscape ->
+            ( InStr, String.append buf (String.fromChar c), toks )
+
+        AfterSlash ->
+            if c == '/' then
+                ( InLineComment, "//", toks )
+
+            else if c == '*' then
+                ( InBlock, "/*", toks )
+
+            else
+                begin c (toks ++ [ Plain "/" ])
+
+        InLineComment ->
+            if c == '\n' then
+                begin c (toks ++ [ Comment buf ])
+
+            else
+                ( InLineComment, String.append buf (String.fromChar c), toks )
+
+        InBlock ->
+            if c == '*' then
+                ( InBlockStar, String.append buf "*", toks )
+
+            else
+                ( InBlock, String.append buf (String.fromChar c), toks )
+
+        InBlockStar ->
+            if c == '/' then
+                ( Start, "", toks ++ [ Comment (String.append buf "/") ] )
+
+            else if c == '*' then
+                ( InBlockStar, String.append buf "*", toks )
+
+            else
+                ( InBlock, String.append buf (String.fromChar c), toks )
 
 
--- Consumes a double-quoted literal. Returns (consumed-inner, remaining,
--- closed); `closed = False` on end-of-input before the closing quote, so the
--- caller can degrade the unterminated literal to Plain.
-takeString : List Char -> ( List Char, List Char, Bool )
-takeString chars =
-    stringGo chars [] True
+-- The state after reading `c` with no lexeme open.
+begin : Char -> List Token -> Lexer
+begin c toks =
+    if Char.isDigit c then
+        ( InNum, String.fromChar c, toks )
+
+    else if c == '"' then
+        ( InStr, "\"", toks )
+
+    else if c == '/' then
+        ( AfterSlash, "/", toks )
+
+    else if isWordStart c then
+        ( InWord, String.fromChar c, toks )
+
+    else
+        ( Start, "", toks ++ [ Plain (String.fromChar c) ] )
+
+
+-- Closes the lexeme open at end of input. An unterminated string or block
+-- comment degrades to Plain: it claims no color the source does not have.
+finish : Lang -> Lexer -> List Token
+finish lang ( lexing, buf, toks ) =
+    case lexing of
+        Start ->
+            toks
+
+        InNum ->
+            toks ++ [ Num buf ]
+
+        InWord ->
+            toks ++ [ word lang buf ]
+
+        InStr ->
+            toks ++ [ Plain buf ]
+
+        InStrEscape ->
+            toks ++ [ Plain buf ]
+
+        AfterSlash ->
+            toks ++ [ Plain buf ]
+
+        InLineComment ->
+            toks ++ [ Comment buf ]
+
+        InBlock ->
+            toks ++ [ Plain buf ]
+
+        InBlockStar ->
+            toks ++ [ Plain buf ]
+
+
+word : Lang -> String -> Token
+word lang w =
+    if List.member w (keywords lang) then
+        Keyword w
+
+    else
+        Ident w
 
 
 -- The backslash character, derived from a string instead of the `'\\'` char
@@ -183,66 +256,6 @@ takeString chars =
 backslashChar : Char
 backslashChar =
     Maybe.withDefault ' ' (List.head (String.toList "\\"))
-
-
-stringGo : List Char -> List Char -> Bool -> ( List Char, List Char, Bool )
-stringGo chars acc closed =
-    case chars of
-        [] ->
-            ( List.reverse acc, [], False )
-
-        '"' :: rest ->
-            ( List.reverse ('"' :: acc), rest, True )
-
-        c :: rest ->
-            if c == backslashChar then
-                case rest of
-                    next :: rest2 ->
-                        stringGo rest2 (next :: c :: acc) closed
-
-                    [] ->
-                        ( List.reverse (c :: acc), [], False )
-
-            else
-                stringGo rest (c :: acc) closed
-
-
--- Consumes a /* ... */ block comment; unclosed comments return closed = False.
-takeBlock : List Char -> ( List Char, List Char, Bool )
-takeBlock chars =
-    blockGo chars []
-
-
-blockGo : List Char -> List Char -> ( List Char, List Char, Bool )
-blockGo chars acc =
-    case chars of
-        [] ->
-            ( List.reverse acc, [], False )
-
-        '*' :: '/' :: rest ->
-            ( List.reverse ('*' :: '/' :: acc), rest, True )
-
-        c :: rest ->
-            blockGo rest (c :: acc)
-
-
-spanWhile : (Char -> Bool) -> List Char -> ( List Char, List Char )
-spanWhile pred chars =
-    spanGo pred chars []
-
-
-spanGo : (Char -> Bool) -> List Char -> List Char -> ( List Char, List Char )
-spanGo pred chars acc =
-    case chars of
-        [] ->
-            ( List.reverse acc, [] )
-
-        c :: rest ->
-            if pred c then
-                spanGo pred rest (c :: acc)
-
-            else
-                ( List.reverse acc, chars )
 
 
 isWordStart : Char -> Bool

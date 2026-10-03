@@ -754,11 +754,15 @@ pub fn emit_expr_at(
         // effect type or non-unit rest type.
         Expr::TaskSeq { effect, rest } => {
             let child = depth + 1;
-            // Clone any identifier that `rest` (the move-closure continuation)
-            // would capture but `effect` already moves.  Rust evaluates function
-            // args left-to-right, so a String/record passed by value into
-            // `effect_s` is moved before the closure in the second argument is
-            // constructed.
+            // The continuation is the `move |_|` closure handed to the runtime's
+            // `FnOnce` `task_and_then` slot: the `Once` boundary
+            // `ipe_ir::once_closure::boundary_kind` names for this node, so its
+            // capture plan (pre-clones, carriers, refusals) is already in the
+            // lowered `rest`. This clone is only the effect/rest sharing rule:
+            // clone any identifier that `rest` would capture but `effect`
+            // already moves. Rust evaluates function args left-to-right, so a
+            // String/record passed by value into `effect_s` is moved before the
+            // closure in the second argument is constructed.
             //
             // AUD-04: this rewrite runs on the IR, BEFORE `effect` is emitted to
             // text — `free_vars`/`clone_targets_in_expr` only ever touch genuine

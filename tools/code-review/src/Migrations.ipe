@@ -30,4 +30,7 @@ all =
     , { name = "0003_review_history_order"
       , sql = "CREATE INDEX review_history_order ON review (reviewed_at DESC, uid, body_hash);"
       }
+    , { name = "0004_drop_drain_cursor"
+      , sql = "DROP TABLE IF EXISTS drain_cursor;"
+      }
     ]

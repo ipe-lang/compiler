@@ -1,0 +1,7 @@
+[
+  { "stored": "rs", "highlight": "Rust" },
+  { "stored": "sh", "highlight": "Shell" },
+  { "stored": "ts", "highlight": "Unknown" },
+  { "stored": "ipe", "highlight": "Ipe" },
+  { "stored": "other", "highlight": "Unknown" }
+]
