@@ -342,6 +342,73 @@ largeTokenTokenizes =
 
 
 
+-- Whether a token is a string or character literal.
+isStrToken : Token -> Bool
+isStrToken tok =
+    case tok of
+        Str _ ->
+            True
+
+        Keyword _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+-- The text of each numbered line, from the line's tokens alone.
+lineTexts : List Highlight.SourceLine -> List String
+lineTexts sourceLines =
+    List.map (\line -> String.concat (List.map rawText line.tokens)) sourceLines
+
+
+-- The numbered lines of `src` spell `src` cut at every `\n`, one line per
+-- `\n` plus one, numbered from `start`: the display folds over the one token
+-- list the references read. Red if a line is lexed apart from the whole
+-- view, or a token spanning lines is dropped or left whole on one line.
+linesFollowTokens : Lang -> Int -> String -> Bool
+linesFollowTokens lang start src =
+    let
+        sourceLines =
+            Highlight.lines start (Highlight.tokenize lang src)
+    in
+    lineTexts sourceLines
+        == String.split "\n" src
+        && List.map (\line -> line.number) sourceLines
+        == List.range start (start + List.length (String.split "\n" src) - 1)
+
+
+-- A 400 000-character source tokenizes whole, its lines cut, and its
+-- references fold over the same tokens in one pass. Red if the lexer, the
+-- line cut, or the reference walk copies the unread input or the output so
+-- far per step (quadratic: the run never ends).
+largeSourceLinks : Bool
+largeSourceLinks =
+    let
+        src =
+            String.repeat 10000 "fn f() { Foo::bar(x.y, 'c', \"s\") } // c\n"
+
+        tokens =
+            Highlight.tokenize Highlight.Rust src
+    in
+    String.length src
+        == 400000
+        && reassembles Highlight.Rust src
+        && List.length (Highlight.lines 1 tokens)
+        == 10001
+        && List.length (Links.references Highlight.Rust tokens)
+        == 30000
+
+
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r
 -- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
 -- confirm/cancel an open refuse panel, and every key is ignored while the
@@ -440,4 +507,100 @@ checks =
                 && Highlight.tokenize Highlight.Rust "/**/1.5_"
                 == [ Comment "/**/", Num "1.5_" ]
             )
+        , Task.succeed
+            ( "a shown view's lines fold over its one token list"
+            , linesFollowTokens Highlight.Rust 3 "pub fn a() {\n    /* x\n y */\n    \"s\n t\"\n}\n"
+                && linesFollowTokens Highlight.Ipe 1 "f x =\n    {- a\n b -}\n    x // 2\n"
+                && linesFollowTokens Highlight.Shell 7 "echo a # b\r\n\nls"
+                && linesFollowTokens Highlight.Unknown 1 "a\nb"
+            )
+        , Task.succeed
+            ( "a rust block comment spanning lines draws as a comment on each line"
+            , Highlight.lines 1 (Highlight.tokenize Highlight.Rust "/* a\n b */")
+                == [ { number = 1, tokens = [ Comment "/* a" ] }, { number = 2, tokens = [ Comment " b */" ] } ]
+                && Highlight.tokenize Highlight.Rust "/* a /* b */ c */ d"
+                == [ Comment "/* a /* b */ c */", Plain " ", Ident "d" ]
+            )
+        , Task.succeed
+            ( "ipe `//` is integer division and `--` and `{- -}` are comments"
+            , Highlight.tokenize Highlight.Ipe "a // b"
+                == [ Ident "a", Plain " ", Plain "/", Plain "/", Plain " ", Ident "b" ]
+                && Highlight.tokenize Highlight.Ipe "-- x"
+                == [ Comment "-- x" ]
+                && Highlight.tokenize Highlight.Ipe "{- x -}"
+                == [ Comment "{- x -}" ]
+                && Highlight.tokenize Highlight.Ipe "{- a {- b -} c -} d"
+                == [ Comment "{- a {- b -} c -}", Plain " ", Ident "d" ]
+                && Highlight.tokenize Highlight.Ipe "a - b {x}"
+                == [ Ident "a", Plain " ", Plain "-", Plain " ", Ident "b", Plain " ", Plain "{", Ident "x", Plain "}" ]
+                && Highlight.tokenize Highlight.Ipe "x -- c\ny"
+                == [ Ident "x", Plain " ", Comment "-- c", Plain "\n", Ident "y" ]
+                && Highlight.tokenize Highlight.Ipe "/* a */"
+                == [ Plain "/", Plain "*", Plain " ", Ident "a", Plain " ", Plain "*", Plain "/" ]
+            )
+        , Task.succeed
+            ( "ipe strings: one line, triple-quoted bodies, char literals"
+            , Highlight.tokenize Highlight.Ipe "\"a -- b\" c"
+                == [ Str "\"a -- b\"", Plain " ", Ident "c" ]
+                && Highlight.tokenize Highlight.Ipe "\"\" x"
+                == [ Str "\"\"", Plain " ", Ident "x" ]
+                && Highlight.tokenize Highlight.Ipe "\"\"\"a\n\"b\"\"\" x"
+                == [ Str "\"\"\"a\n\"b\"\"\"", Plain " ", Ident "x" ]
+                && Highlight.tokenize Highlight.Ipe "\"a\nb"
+                == [ Plain "\"a", Plain "\n", Ident "b" ]
+                && Highlight.tokenize Highlight.Ipe "'\"' '\\n' x"
+                == [ Str "'\"'", Plain " ", Str "'\\n'", Plain " ", Ident "x" ]
+            )
+        , Task.succeed
+            ( "a rust char literal closes and a lifetime opens no literal"
+            , Highlight.tokenize Highlight.Rust "'\"' fn"
+                == [ Str "'\"'", Plain " ", Keyword "fn" ]
+                && Highlight.tokenize Highlight.Rust "'a b"
+                == [ Plain "'a", Plain " ", Ident "b" ]
+                && Highlight.tokenize Highlight.Rust "&'static str"
+                == [ Plain "&", Plain "'static", Plain " ", Ident "str" ]
+                && Highlight.tokenize Highlight.Rust "'\\'' fn"
+                == [ Str "'\\''", Plain " ", Keyword "fn" ]
+                && List.any (isKeyword "fn") (Highlight.tokenize Highlight.Rust "fn f<'a>(x: &'a str) -> &'a str { x }\nfn g() {}")
+                && not (List.any isStrToken (Highlight.tokenize Highlight.Rust "fn f<'a>(x: &'a str) -> &'a str { x }\nfn g() {}"))
+            )
+        , Task.succeed
+            ( "a shell `#` starting a word is a comment"
+            , Highlight.tokenize Highlight.Shell "# x"
+                == [ Comment "# x" ]
+                && Highlight.tokenize Highlight.Shell "echo a # b\nls"
+                == [ Keyword "echo", Plain " ", Ident "a", Plain " ", Comment "# b", Plain "\n", Ident "ls" ]
+                && Highlight.tokenize Highlight.Shell "a#b $#"
+                == [ Ident "a", Plain "#", Ident "b", Plain " ", Plain "$", Plain "#" ]
+                && Highlight.tokenize Highlight.Shell "echo 'a # b' // c"
+                == [ Keyword "echo", Plain " ", Str "'a # b'", Plain " ", Plain "/", Plain "/", Plain " ", Ident "c" ]
+            )
+        , Task.succeed
+            ( "ipe keywords are the compiler's reserved words"
+            , Highlight.tokenize Highlight.Ipe "do x"
+                == [ Keyword "do", Plain " ", Ident "x" ]
+                && Highlight.tokenize Highlight.Ipe "alias"
+                == [ Ident "alias" ]
+                && Highlight.tokenize Highlight.Ipe "fn"
+                == [ Ident "fn" ]
+            )
+        , Task.succeed
+            ( "every lexer case reassembles its source"
+            , List.all identity
+                [ reassembles Highlight.Rust "/* a\n b */"
+                , reassembles Highlight.Rust "/* a /* b */ c"
+                , reassembles Highlight.Rust "'\"' fn 'a b &'static '\\'' ''"
+                , reassembles Highlight.Rust "'"
+                , reassembles Highlight.Rust "'a"
+                , reassembles Highlight.Rust "'\\"
+                , reassembles Highlight.Ipe "a // b -- x\n{- x -} {- {- -}"
+                , reassembles Highlight.Ipe "\"\" \"\"\"a\"\" \"a\nb' 'x' 'ab"
+                , reassembles Highlight.Ipe "\"\"\"open"
+                , reassembles Highlight.Ipe "{-"
+                , reassembles Highlight.Ipe "-"
+                , reassembles Highlight.Shell "# x\necho a#b $# 'a # b' 'open"
+                , reassembles Highlight.Ipe "do x"
+                ]
+            )
+        , Task.succeed ( "a 400 000-character source tokenizes and its references resolve", largeSourceLinks )
         ]

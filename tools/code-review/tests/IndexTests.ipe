@@ -232,6 +232,25 @@ unitPageLoad =
 
 
 
+-- A shown view carries the one lex of its text: its tokens are the text's
+-- tokens, and its lines are those same tokens numbered from the unit's first
+-- line. Red if the page lexes the view twice or per line.
+shownLexIs : Lang -> Int -> String -> Index.SourceView -> Bool
+shownLexIs lang lineStart text view =
+    case view of
+        Shown shown ->
+            Index.shownTokens shown
+                == Highlight.tokenize lang text
+                && Index.shownLines shown
+                == Highlight.lines lineStart (Highlight.tokenize lang text)
+
+        Stale _ ->
+            False
+
+        Unreadable _ ->
+            False
+
+
 unitPageLoadIn : String -> Task.Task Error Bool
 unitPageLoadIn base =
     let
@@ -262,6 +281,7 @@ unitPageLoadIn base =
                                             == "Lib.answer"
                                             && shownTextOf loaded.view
                                             == Just viewA
+                                            && shownLexIs Highlight.Rust 3 viewA loaded.view
                                             && List.isEmpty loaded.links.links
                                             && loaded.links.hidden
                                             == Links.NoneHidden

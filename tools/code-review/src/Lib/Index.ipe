@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Cursor(..), DecidedPair, PendingRow, ProgressRow, QueuedChange, ShownSource, SourceView(..), StaleReason(..), Unit, UnitView, attest, attestedHash, attestedUid, candidateQuery, countPending, dbBytes, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadPendingPage, loadProgress, loadView, nameFor, pageSize, placeholders, probe, readConnection, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Cursor(..), DecidedPair, PendingRow, ProgressRow, QueuedChange, ShownSource, SourceView(..), StaleReason(..), Unit, UnitView, attest, attestedHash, attestedUid, candidateQuery, countPending, dbBytes, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadPendingPage, loadProgress, loadView, nameFor, pageSize, placeholders, probe, readConnection, rebuildReviewed, reverify, shortHash, shownHash, shownLines, shownText, shownTokens, storedHash, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Crypto as Crypto
@@ -101,11 +101,8 @@ linksOf conn row view =
                 lang =
                     langOf row.lang
 
-                source =
-                    shownText shown
-
                 wanted =
-                    Links.candidates lang { kind = row.kind, name = row.name, qualified = row.qualified } (Links.references lang source)
+                    Links.candidates lang { kind = row.kind, name = row.name, qualified = row.qualified } (Links.references lang (shownTokens shown))
             in
             do
                 edges <- edgeLinks conn row.uid
@@ -115,7 +112,7 @@ linksOf conn row view =
                         { edges = edgeReach edges, candidates = wanted.reach }
                         (List.map (\( uid, qualified ) -> Links.internal qualified uid) edges)
                         (Links.resolveCandidates wanted.lookups resolved)
-                        (Links.sourceUrls source)
+                        (Links.sourceUrls (shownText shown))
                     )
 
         Stale _ ->
@@ -661,7 +658,7 @@ viewOf roots row =
 
                 Ok path ->
                     File.readFileLimit path sourceCeiling
-                        |> Task.map (\text -> verifyView row.uid stored (viewText row.lineStart row.lineEnd text))
+                        |> Task.map (\text -> verifyView row.uid (langOf row.lang) row.lineStart stored (viewText row.lineStart row.lineEnd text))
                         |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
 
 
@@ -681,15 +678,22 @@ readFailure stored e =
         e
 
 
-verifyView : String -> String -> Result StaleReason String -> SourceView
-verifyView uid stored sliced =
+-- A slice proved equal to its attestation is lexed here, once: the page
+-- draws `lines` and links the references of `tokens`, both from this one
+-- token list.
+verifyView : String -> Highlight.Lang -> Int -> String -> Result StaleReason String -> SourceView
+verifyView uid lang lineStart stored sliced =
     case sliced of
         Err reason ->
             Stale reason
 
         Ok view ->
             if attest view == stored then
-                Shown (ShownSource { uid = uid, text = view, hash = stored })
+                let
+                    tokens =
+                        Highlight.tokenize lang view
+                in
+                Shown (ShownSource { uid = uid, text = view, hash = stored, tokens = tokens, lines = Highlight.lines lineStart tokens })
 
             else
                 Stale Drifted
@@ -779,10 +783,11 @@ hashDigits attested =
             other
 
 
--- Source text proved equal to its attestation. Opaque: built only by
--- `viewOf`, so holding one means the bytes were re-hashed.
+-- Source text proved equal to its attestation, with its one lex: the tokens
+-- of the whole text and the same tokens cut into numbered lines. Opaque:
+-- built only by `viewOf`, so holding one means the bytes were re-hashed.
 type ShownSource
-    = ShownSource { uid : String, text : String, hash : String }
+    = ShownSource { uid : String, text : String, hash : String, tokens : List Highlight.Token, lines : List Highlight.SourceLine }
 
 
 shownText : ShownSource -> String
@@ -790,6 +795,22 @@ shownText shown =
     case shown of
         ShownSource s ->
             s.text
+
+
+-- The tokens of the shown text, in source order.
+shownTokens : ShownSource -> List Highlight.Token
+shownTokens shown =
+    case shown of
+        ShownSource s ->
+            s.tokens
+
+
+-- The shown text's numbered lines, drawn from `shownTokens`.
+shownLines : ShownSource -> List Highlight.SourceLine
+shownLines shown =
+    case shown of
+        ShownSource s ->
+            s.lines
 
 
 shownHash : ShownSource -> String

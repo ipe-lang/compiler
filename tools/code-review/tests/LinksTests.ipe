@@ -200,12 +200,18 @@ fixtureChecks got =
 
 
 -- ── pure link rules ─────────────────────────────────────────────────────
+-- The references of `src`, read from its one lex as a shown view reads them.
+refsOf : Lang -> String -> List Reference
+refsOf lang src =
+    Links.references lang (Highlight.tokenize lang src)
+
+
 -- One bare reference per name, `n` of them, in a Rust unit with no module.
 manyNames : Int -> Links.Candidates
 manyNames n =
     Links.candidates Highlight.Rust
         { kind = "fn", name = "f", qualified = "f" }
-        (Links.references Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
+        (refsOf Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
 
 
 candidateCeiling : Bool
@@ -280,7 +286,7 @@ firstOccurrence : Bool
 firstOccurrence =
     let
         wanted =
-            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
+            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (refsOf Highlight.Ipe "b a b c a")
 
         resolved =
             Links.resolveCandidates wanted.lookups [ ( "c", "u-c" ), ( "a", "u-a" ), ( "b", "u-b" ) ]
@@ -319,12 +325,12 @@ candidateRule =
 -- unit can hold. A `..` range starts no member, so its end still names.
 referencesFollowTokens : Bool
 referencesFollowTokens =
-    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
+    refsOf Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
         == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
-        && Links.references Highlight.Ipe "Foo.bar(x) model.count"
+        && refsOf Highlight.Ipe "Foo.bar(x) model.count"
         == [ Path "Foo.bar", Bare "x", Path "model.count" ]
-        && List.isEmpty (Links.references Highlight.Shell "Foo.bar x")
-        && List.isEmpty (Links.references Highlight.Unknown "Foo.bar x")
+        && List.isEmpty (refsOf Highlight.Shell "Foo.bar x")
+        && List.isEmpty (refsOf Highlight.Unknown "Foo.bar x")
 
 
 candidateSqlBound : Bool
@@ -366,7 +372,7 @@ calleeVectorsHold =
 
 calleeVectorHolds : CalleeVector -> Bool
 calleeVectorHolds v =
-    (Links.candidates Highlight.Rust v.unit (List.take 1 (Links.references Highlight.Rust v.callee))).names == v.candidates
+    (Links.candidates Highlight.Rust v.unit (List.take 1 (refsOf Highlight.Rust v.callee))).names == v.candidates
 
 
 calleeVectorDecoder : Decode.Decoder CalleeVector

@@ -1,8 +1,7 @@
-module Lib.Highlight exposing (Lang(..), Token(..), langFor, sourceTokenStyle, tokenText, tokenize)
+module Lib.Highlight exposing (Lang(..), SourceLine, Token(..), langFor, lines, sourceTokenStyle, tokenText, tokenize)
 
 import Ipe.Char as Char
 import Ipe.List as List
-import Ipe.Maybe as Maybe
 import Ipe.String as String
 import Lib.SafeText as SafeText exposing (SafeText)
 
@@ -90,31 +89,124 @@ tokenSource tok =
             s
 
 
--- Tokens a whole source snippet (newlines come through as Plain). Unknown
--- languages degrade to a single Plain token: readable, never panics, and no
--- color claims the code does not have.
+-- Tokens a whole source snippet in one left-to-right pass (newlines come
+-- through as Plain). Unknown languages degrade to a single Plain token:
+-- readable, never panics, and no color claims the code does not have.
 tokenize : Lang -> String -> List Token
 tokenize lang text =
     if lang == Unknown then
         [ Plain text ]
 
     else
-        finish lang (String.foldl (step lang) ( Start, "", [] ) text)
+        finish lang (String.foldl (step lang) ( Start AfterSpace, "", [] ) text)
+
+
+-- One numbered line of a shown source and the tokens drawn on it.
+type alias SourceLine =
+    { number : Int
+    , tokens : List Token
+    }
+
+
+-- The tokens of one source cut at every `\n`, numbered from `start`: a token
+-- that spans lines (a block comment, a Rust string) is split into same-kind
+-- pieces, one per line, so every line is drawn from the one token stream of
+-- the whole view. The pieces of line n, in order, spell line n of the source
+-- split on `\n` (a `\r` stays in its line); the line count is the source's
+-- `\n` count plus one.
+lines : Int -> List Token -> List SourceLine
+lines start tokens =
+    case List.foldl addLineToken ( [], [] ) tokens of
+        ( open, closed ) ->
+            List.indexedMap (\i toks -> { number = start + i, tokens = toks }) (closed ++ [ open ])
+
+
+-- ( the open line's tokens, every closed line ).
+addLineToken : Token -> ( List Token, List (List Token) ) -> ( List Token, List (List Token) )
+addLineToken tok ( open, closed ) =
+    if String.contains "\n" (tokenSource tok) then
+        case List.foldl (addPiece tok) ( True, open, closed ) (String.split "\n" (tokenSource tok)) of
+            ( _, nowOpen, nowClosed ) ->
+                ( nowOpen, nowClosed )
+
+    else
+        ( open ++ [ tok ], closed )
+
+
+-- One `\n`-separated piece of `tok`: every piece after the first closes the
+-- open line first. An empty piece draws nothing.
+addPiece : Token -> String -> ( Bool, List Token, List (List Token) ) -> ( Bool, List Token, List (List Token) )
+addPiece tok piece ( first, open, closed ) =
+    if first then
+        ( False, withPiece tok piece open, closed )
+
+    else
+        ( False, withPiece tok piece [], closed ++ [ open ] )
+
+
+withPiece : Token -> String -> List Token -> List Token
+withPiece tok piece open =
+    if piece == "" then
+        open
+
+    else
+        open ++ [ retext tok piece ]
+
+
+-- `tok`'s kind over other text.
+retext : Token -> String -> Token
+retext tok text =
+    case tok of
+        Keyword _ ->
+            Keyword text
+
+        Str _ ->
+            Str text
+
+        Comment _ ->
+            Comment text
+
+        Num _ ->
+            Num text
+
+        Ident _ ->
+            Ident text
+
+        Plain _ ->
+            Plain text
+
+
+-- Whether the character before an unopened lexeme ends a shell word, so a
+-- `#` there starts a comment (`a # b`) and one inside a word does not
+-- (`$#`, `a#b`).
+type Gap
+    = AfterSpace
+    | AfterText
 
 
 -- The lexeme the tokenizer is inside, from the characters read so far.
 -- One state per partial token, so each character is read exactly once and
--- the run is linear in the source length.
+-- the run is linear in the source length. A block comment carries its
+-- nesting depth (Rust and Ipê block comments nest).
 type Lexing
-    = Start
+    = Start Gap
     | InNum
     | InWord
     | InStr
     | InStrEscape
-    | AfterSlash
+    | AfterEmptyStr
+    | InTriple Int
+    | InRawStr
+    | AfterTick
+    | AfterTickChar Char
+    | InChar
+    | InCharEscape
+    | InLifetime
+    | AfterOpener Char
     | InLineComment
-    | InBlock
-    | InBlockStar
+    | InBlock Int
+    | BlockOpenHalf Int
+    | BlockCloseHalf Int
 
 
 -- ( lexing state, the open lexeme's text, the tokens closed so far ).
@@ -122,99 +214,401 @@ type alias Lexer =
     ( Lexing, String, List Token )
 
 
+-- How a language reads `'`: a char literal or a Rust lifetime, an Ipê char
+-- literal, a shell raw string, or plain punctuation.
+type Tick
+    = CharOrLifetime
+    | CharLiteral
+    | RawString
+    | NoTick
+
+
+-- The two characters that open, then the two that close, a block comment.
+type BlockRule
+    = Block { open1 : Char, open2 : Char, close1 : Char, close2 : Char }
+    | NoBlock
+
+
+-- How a language starts a line comment: one character twice (`//`, `--`),
+-- or a `#` that starts a shell word.
+type LineRule
+    = Doubled Char
+    | HashAtWordStart
+    | NoLineComment
+
+
+-- The per-language lexical rules, one arm per `Lang` in each table. They
+-- are interim rules for display and references only, not the compilers'
+-- lexers.
+tickRule : Lang -> Tick
+tickRule lang =
+    case lang of
+        Rust ->
+            CharOrLifetime
+
+        Ipe ->
+            CharLiteral
+
+        Shell ->
+            RawString
+
+        Unknown ->
+            NoTick
+
+
+blockRule : Lang -> BlockRule
+blockRule lang =
+    case lang of
+        Rust ->
+            Block { open1 = '/', open2 = '*', close1 = '*', close2 = '/' }
+
+        Ipe ->
+            Block { open1 = '{', open2 = '-', close1 = '-', close2 = '}' }
+
+        Shell ->
+            NoBlock
+
+        Unknown ->
+            NoBlock
+
+
+lineRule : Lang -> LineRule
+lineRule lang =
+    case lang of
+        Rust ->
+            Doubled '/'
+
+        Ipe ->
+            Doubled '-'
+
+        Shell ->
+            HashAtWordStart
+
+        Unknown ->
+            NoLineComment
+
+
+-- Whether a `"…"` string may run past a newline: an Ipê one may not (a
+-- multi-line body is `"""…"""`), a Rust or shell one may.
+stringSpansLines : Lang -> Bool
+stringSpansLines lang =
+    case lang of
+        Rust ->
+            True
+
+        Shell ->
+            True
+
+        Ipe ->
+            False
+
+        Unknown ->
+            False
+
+
+-- Whether `c` may be the first character of a comment opener in `lang`
+-- (`/` of `//` or `/*` in Rust, `-` of `--` or `{` of `{-` in Ipê).
+opensComment : Lang -> Char -> Bool
+opensComment lang c =
+    let
+        line =
+            case lineRule lang of
+                Doubled d ->
+                    c == d
+
+                HashAtWordStart ->
+                    False
+
+                NoLineComment ->
+                    False
+
+        block =
+            case blockRule lang of
+                Block b ->
+                    c == b.open1
+
+                NoBlock ->
+                    False
+    in
+    line || block
+
+
 step : Lang -> Char -> Lexer -> Lexer
 step lang c ( lexing, buf, toks ) =
     case lexing of
-        Start ->
-            begin c toks
+        Start gap ->
+            begin lang gap c toks
 
         InNum ->
             if isNumChar c then
                 ( InNum, String.append buf (String.fromChar c), toks )
 
             else
-                begin c (toks ++ [ Num buf ])
+                begin lang AfterText c (toks ++ [ Num buf ])
 
         InWord ->
             if isWordChar c then
                 ( InWord, String.append buf (String.fromChar c), toks )
 
             else
-                begin c (toks ++ [ word lang buf ])
+                begin lang AfterText c (toks ++ [ word lang buf ])
 
         InStr ->
-            if c == '"' then
-                ( Start, "", toks ++ [ Str (String.append buf "\"") ] )
+            if c == '"' && buf == "\"" && not (stringSpansLines lang) then
+                ( AfterEmptyStr, "\"\"", toks )
 
-            else if c == backslashChar then
-                ( InStrEscape, String.append buf (String.fromChar c), toks )
+            else if c == '"' then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "\"") ] )
+
+            else if c == '\\' then
+                ( InStrEscape, String.append buf "\\", toks )
+
+            else if c == '\n' && not (stringSpansLines lang) then
+                begin lang AfterText c (toks ++ [ Plain buf ])
 
             else
                 ( InStr, String.append buf (String.fromChar c), toks )
 
         InStrEscape ->
-            ( InStr, String.append buf (String.fromChar c), toks )
-
-        AfterSlash ->
-            if c == '/' then
-                ( InLineComment, "//", toks )
-
-            else if c == '*' then
-                ( InBlock, "/*", toks )
+            if c == '\n' && not (stringSpansLines lang) then
+                begin lang AfterText c (toks ++ [ Plain buf ])
 
             else
-                begin c (toks ++ [ Plain "/" ])
+                ( InStr, String.append buf (String.fromChar c), toks )
+
+        AfterEmptyStr ->
+            if c == '"' then
+                ( InTriple 0, "\"\"\"", toks )
+
+            else
+                begin lang AfterText c (toks ++ [ Str buf ])
+
+        InTriple quotes ->
+            if c == '"' && quotes >= 2 then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "\"") ] )
+
+            else if c == '"' then
+                ( InTriple (quotes + 1), String.append buf "\"", toks )
+
+            else
+                ( InTriple 0, String.append buf (String.fromChar c), toks )
+
+        InRawStr ->
+            if c == '\'' then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "'") ] )
+
+            else
+                ( InRawStr, String.append buf (String.fromChar c), toks )
+
+        AfterTick ->
+            if c == '\\' then
+                ( InCharEscape, String.append buf "\\", toks )
+
+            else if c == '\n' then
+                begin lang AfterText c (toks ++ [ Plain buf ])
+
+            else if c == '\'' then
+                ( Start AfterText, "", toks ++ [ Plain "''" ] )
+
+            else
+                ( AfterTickChar c, String.append buf (String.fromChar c), toks )
+
+        AfterTickChar first ->
+            if c == '\'' then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "'") ] )
+
+            else if tickRule lang == CharOrLifetime && isWordStart first then
+                if isWordChar c then
+                    ( InLifetime, String.append buf (String.fromChar c), toks )
+
+                else
+                    begin lang AfterText c (toks ++ [ Plain buf ])
+
+            else
+                step lang c (begin lang AfterText first (toks ++ [ Plain "'" ]))
+
+        InChar ->
+            if c == '\'' then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "'") ] )
+
+            else if c == '\n' then
+                begin lang AfterText c (toks ++ [ Plain buf ])
+
+            else
+                ( InChar, String.append buf (String.fromChar c), toks )
+
+        InCharEscape ->
+            if c == '\n' then
+                begin lang AfterText c (toks ++ [ Plain buf ])
+
+            else
+                ( InChar, String.append buf (String.fromChar c), toks )
+
+        InLifetime ->
+            if isWordChar c then
+                ( InLifetime, String.append buf (String.fromChar c), toks )
+
+            else
+                begin lang AfterText c (toks ++ [ Plain buf ])
+
+        AfterOpener first ->
+            afterOpener lang first c buf toks
 
         InLineComment ->
             if c == '\n' then
-                begin c (toks ++ [ Comment buf ])
+                begin lang AfterText c (toks ++ [ Comment buf ])
 
             else
                 ( InLineComment, String.append buf (String.fromChar c), toks )
 
-        InBlock ->
-            if c == '*' then
-                ( InBlockStar, String.append buf "*", toks )
+        InBlock depth ->
+            inBlock lang depth c buf toks
+
+        BlockOpenHalf depth ->
+            case blockRule lang of
+                Block b ->
+                    if c == b.open2 then
+                        ( InBlock (depth + 1), String.append buf (String.fromChar c), toks )
+
+                    else
+                        inBlock lang depth c buf toks
+
+                NoBlock ->
+                    inBlock lang depth c buf toks
+
+        BlockCloseHalf depth ->
+            case blockRule lang of
+                Block b ->
+                    if c == b.close2 && depth <= 1 then
+                        ( Start AfterText, "", toks ++ [ Comment (String.append buf (String.fromChar c)) ] )
+
+                    else if c == b.close2 then
+                        ( InBlock (depth - 1), String.append buf (String.fromChar c), toks )
+
+                    else
+                        inBlock lang depth c buf toks
+
+                NoBlock ->
+                    inBlock lang depth c buf toks
+
+
+-- `c` inside a block comment `depth` deep: the first character of a nested
+-- opener or of the closer is held until the next one decides.
+inBlock : Lang -> Int -> Char -> String -> List Token -> Lexer
+inBlock lang depth c buf toks =
+    let
+        text =
+            String.append buf (String.fromChar c)
+    in
+    case blockRule lang of
+        Block b ->
+            if c == b.open1 then
+                ( BlockOpenHalf depth, text, toks )
+
+            else if c == b.close1 then
+                ( BlockCloseHalf depth, text, toks )
 
             else
-                ( InBlock, String.append buf (String.fromChar c), toks )
+                ( InBlock depth, text, toks )
 
-        InBlockStar ->
-            if c == '/' then
-                ( Start, "", toks ++ [ Comment (String.append buf "/") ] )
-
-            else if c == '*' then
-                ( InBlockStar, String.append buf "*", toks )
-
-            else
-                ( InBlock, String.append buf (String.fromChar c), toks )
+        NoBlock ->
+            ( InBlock depth, text, toks )
 
 
--- The state after reading `c` with no lexeme open.
-begin : Char -> List Token -> Lexer
-begin c toks =
+-- `c` after a possible comment opener's first character `first`: the second
+-- character of a line or block opener starts that comment; anything else
+-- makes `first` punctuation and starts afresh at `c`.
+afterOpener : Lang -> Char -> Char -> String -> List Token -> Lexer
+afterOpener lang first c buf toks =
+    let
+        opensLine =
+            case lineRule lang of
+                Doubled d ->
+                    first == d && c == d
+
+                HashAtWordStart ->
+                    False
+
+                NoLineComment ->
+                    False
+
+        opensBlock =
+            case blockRule lang of
+                Block b ->
+                    first == b.open1 && c == b.open2
+
+                NoBlock ->
+                    False
+    in
+    if opensLine then
+        ( InLineComment, String.append buf (String.fromChar c), toks )
+
+    else if opensBlock then
+        ( InBlock 1, String.append buf (String.fromChar c), toks )
+
+    else
+        begin lang AfterText c (toks ++ [ Plain buf ])
+
+
+-- The state after reading `c` with no lexeme open; `gap` says whether the
+-- character before `c` ended a shell word.
+begin : Lang -> Gap -> Char -> List Token -> Lexer
+begin lang gap c toks =
     if Char.isDigit c then
         ( InNum, String.fromChar c, toks )
-
-    else if c == '"' then
-        ( InStr, "\"", toks )
-
-    else if c == '/' then
-        ( AfterSlash, "/", toks )
 
     else if isWordStart c then
         ( InWord, String.fromChar c, toks )
 
+    else if c == '"' then
+        ( InStr, "\"", toks )
+
+    else if c == '\'' then
+        beginTick lang toks
+
+    else if opensComment lang c then
+        ( AfterOpener c, String.fromChar c, toks )
+
+    else if c == '#' && lineRule lang == HashAtWordStart && gap == AfterSpace then
+        ( InLineComment, "#", toks )
+
     else
-        ( Start, "", toks ++ [ Plain (String.fromChar c) ] )
+        ( Start (gapAfter c), "", toks ++ [ Plain (String.fromChar c) ] )
 
 
--- Closes the lexeme open at end of input. An unterminated string or block
--- comment degrades to Plain: it claims no color the source does not have.
+beginTick : Lang -> List Token -> Lexer
+beginTick lang toks =
+    case tickRule lang of
+        CharOrLifetime ->
+            ( AfterTick, "'", toks )
+
+        CharLiteral ->
+            ( AfterTick, "'", toks )
+
+        RawString ->
+            ( InRawStr, "'", toks )
+
+        NoTick ->
+            ( Start AfterText, "", toks ++ [ Plain "'" ] )
+
+
+-- A shell word ends at whitespace and at the metacharacters `;&|()<>`.
+gapAfter : Char -> Gap
+gapAfter c =
+    if String.contains (String.fromChar c) " \t\n\r;&|()<>" then
+        AfterSpace
+
+    else
+        AfterText
+
+
+-- Closes the lexeme open at end of input. An unterminated string, character,
+-- or block comment degrades to Plain: it claims no color the source does
+-- not have.
 finish : Lang -> Lexer -> List Token
 finish lang ( lexing, buf, toks ) =
     case lexing of
-        Start ->
+        Start _ ->
             toks
 
         InNum ->
@@ -229,33 +623,53 @@ finish lang ( lexing, buf, toks ) =
         InStrEscape ->
             toks ++ [ Plain buf ]
 
-        AfterSlash ->
+        AfterEmptyStr ->
+            toks ++ [ Str buf ]
+
+        InTriple _ ->
+            toks ++ [ Plain buf ]
+
+        InRawStr ->
+            toks ++ [ Plain buf ]
+
+        AfterTick ->
+            toks ++ [ Plain buf ]
+
+        AfterTickChar _ ->
+            toks ++ [ Plain buf ]
+
+        InChar ->
+            toks ++ [ Plain buf ]
+
+        InCharEscape ->
+            toks ++ [ Plain buf ]
+
+        InLifetime ->
+            toks ++ [ Plain buf ]
+
+        AfterOpener _ ->
             toks ++ [ Plain buf ]
 
         InLineComment ->
             toks ++ [ Comment buf ]
 
-        InBlock ->
+        InBlock _ ->
             toks ++ [ Plain buf ]
 
-        InBlockStar ->
+        BlockOpenHalf _ ->
+            toks ++ [ Plain buf ]
+
+        BlockCloseHalf _ ->
             toks ++ [ Plain buf ]
 
 
 word : Lang -> String -> Token
 word lang w =
-    if List.member w (keywords lang) then
+    if isKeyword lang w then
         Keyword w
 
     else
         Ident w
-
-
--- The backslash character, derived from a string instead of the `'\\'` char
--- literal (the formatter ICEs on that escape today).
-backslashChar : Char
-backslashChar =
-    Maybe.withDefault ' ' (List.head (String.toList "\\"))
 
 
 isWordStart : Char -> Bool
@@ -273,91 +687,266 @@ isNumChar c =
     Char.isDigit c || c == '_' || c == '.'
 
 
-keywords : Lang -> List String
-keywords lang =
+-- The reserved words of each language, one `case` per `Lang`: a keyword
+-- test is one string match, never a walk over a list. Ipê's are the
+-- compiler's `KEYWORDS` (`src/compiler/parse/src/lexer.rs`).
+isKeyword : Lang -> String -> Bool
+isKeyword lang w =
     case lang of
         Rust ->
-            [ "fn"
-            , "let"
-            , "mut"
-            , "pub"
-            , "struct"
-            , "enum"
-            , "impl"
-            , "match"
-            , "if"
-            , "else"
-            , "for"
-            , "while"
-            , "return"
-            , "use"
-            , "mod"
-            , "type"
-            , "trait"
-            , "const"
-            , "static"
-            , "async"
-            , "await"
-            , "move"
-            , "ref"
-            , "unsafe"
-            , "where"
-            , "loop"
-            , "break"
-            , "continue"
-            , "in"
-            , "as"
-            , "dyn"
-            , "crate"
-            , "super"
-            , "self"
-            , "true"
-            , "false"
-            ]
+            isRustKeyword w
 
         Shell ->
-            [ "if"
-            , "then"
-            , "else"
-            , "elif"
-            , "fi"
-            , "for"
-            , "while"
-            , "do"
-            , "done"
-            , "case"
-            , "esac"
-            , "in"
-            , "function"
-            , "echo"
-            , "export"
-            , "local"
-            , "return"
-            , "read"
-            , "set"
-            , "unset"
-            , "cd"
-            , "pwd"
-            , "true"
-            , "false"
-            , "null"
-            ]
+            isShellKeyword w
 
         Ipe ->
-            [ "module"
-            , "import"
-            , "exposing"
-            , "type"
-            , "alias"
-            , "as"
-            , "case"
-            , "of"
-            , "if"
-            , "then"
-            , "else"
-            , "let"
-            , "in"
-            ]
+            isIpeKeyword w
 
         Unknown ->
-            []
+            False
+
+
+isRustKeyword : String -> Bool
+isRustKeyword w =
+    case w of
+        "fn" ->
+            True
+
+        "let" ->
+            True
+
+        "mut" ->
+            True
+
+        "pub" ->
+            True
+
+        "struct" ->
+            True
+
+        "enum" ->
+            True
+
+        "impl" ->
+            True
+
+        "match" ->
+            True
+
+        "if" ->
+            True
+
+        "else" ->
+            True
+
+        "for" ->
+            True
+
+        "while" ->
+            True
+
+        "return" ->
+            True
+
+        "use" ->
+            True
+
+        "mod" ->
+            True
+
+        "type" ->
+            True
+
+        "trait" ->
+            True
+
+        "const" ->
+            True
+
+        "static" ->
+            True
+
+        "async" ->
+            True
+
+        "await" ->
+            True
+
+        "move" ->
+            True
+
+        "ref" ->
+            True
+
+        "unsafe" ->
+            True
+
+        "where" ->
+            True
+
+        "loop" ->
+            True
+
+        "break" ->
+            True
+
+        "continue" ->
+            True
+
+        "in" ->
+            True
+
+        "as" ->
+            True
+
+        "dyn" ->
+            True
+
+        "crate" ->
+            True
+
+        "super" ->
+            True
+
+        "self" ->
+            True
+
+        "true" ->
+            True
+
+        "false" ->
+            True
+
+        _ ->
+            False
+
+
+isShellKeyword : String -> Bool
+isShellKeyword w =
+    case w of
+        "if" ->
+            True
+
+        "then" ->
+            True
+
+        "else" ->
+            True
+
+        "elif" ->
+            True
+
+        "fi" ->
+            True
+
+        "for" ->
+            True
+
+        "while" ->
+            True
+
+        "do" ->
+            True
+
+        "done" ->
+            True
+
+        "case" ->
+            True
+
+        "esac" ->
+            True
+
+        "in" ->
+            True
+
+        "function" ->
+            True
+
+        "echo" ->
+            True
+
+        "export" ->
+            True
+
+        "local" ->
+            True
+
+        "return" ->
+            True
+
+        "read" ->
+            True
+
+        "set" ->
+            True
+
+        "unset" ->
+            True
+
+        "cd" ->
+            True
+
+        "pwd" ->
+            True
+
+        "true" ->
+            True
+
+        "false" ->
+            True
+
+        "null" ->
+            True
+
+        _ ->
+            False
+
+
+isIpeKeyword : String -> Bool
+isIpeKeyword w =
+    case w of
+        "module" ->
+            True
+
+        "import" ->
+            True
+
+        "exposing" ->
+            True
+
+        "as" ->
+            True
+
+        "type" ->
+            True
+
+        "foreign" ->
+            True
+
+        "case" ->
+            True
+
+        "of" ->
+            True
+
+        "let" ->
+            True
+
+        "in" ->
+            True
+
+        "if" ->
+            True
+
+        "then" ->
+            True
+
+        "else" ->
+            True
+
+        "do" ->
+            True
+
+        _ ->
+            False
