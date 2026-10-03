@@ -82,7 +82,7 @@ fn ws_close_code(code: i64) -> WsCloseCode {
 enum WsEvent {
     Message(WsClientMessage),
     Closed(i64),
-    Error(String),
+    Error(WsFailure),
 }
 
 /// Ipe.WebSocket.WebSocketCfg — built in Ipê (defaultCfg + with*).
@@ -207,6 +207,37 @@ impl WsFailure {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl WsFailure {
+    /// Whether this failure is a declared size ceiling turning the traffic back.
+    const fn is_ceiling(self) -> bool {
+        match self {
+            Self::Capacity => true,
+            Self::Dial(_)
+            | Self::Closed
+            | Self::Io(_)
+            | Self::Tls
+            | Self::Protocol
+            | Self::WriteBufferFull
+            | Self::Utf8
+            | Self::AttackAttempt
+            | Self::Url
+            | Self::HttpStatus(_)
+            | Self::HttpFormat => false,
+        }
+    }
+
+    /// This read failure as the `onError` subscriber's error.
+    fn into_read_error<E: From<String> + FromLimitExceeded>(self) -> E {
+        let message = format!("ws read error: {self}");
+        if self.is_ceiling() {
+            E::from_limit_exceeded(message)
+        } else {
+            message.into()
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for WsFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -304,9 +335,28 @@ impl std::fmt::Display for WsConnectError {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl WsConnectError {
+    /// Whether this failure is a declared size ceiling turning the handshake back.
+    const fn is_ceiling(&self) -> bool {
+        match self {
+            Self::Failed { failure, .. } => failure.is_ceiling(),
+            Self::Refused(_)
+            | Self::Ceiling(_)
+            | Self::BadUrl(_)
+            | Self::InvalidHeaderName { .. }
+            | Self::InvalidHeaderValue { .. }
+            | Self::TlsUnderPin(_)
+            | Self::TimedOut { .. } => false,
+        }
+    }
+
     /// This failure as the task's error.
-    fn into_task<E: From<String>>(self) -> IpeResult<E, i64> {
-        IpeResult::Err(self.to_string().into())
+    fn into_task<E: From<String> + FromLimitExceeded>(self) -> IpeResult<E, i64> {
+        let message = self.to_string();
+        IpeResult::Err(if self.is_ceiling() {
+            E::from_limit_exceeded(message)
+        } else {
+            message.into()
+        })
     }
 }
 
@@ -320,7 +370,7 @@ const WS_MESSAGE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling:
 );
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn do_connect<E: From<String> + Send + 'static>(
+async fn do_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
     url: String,
     headers: Vec<(String, String)>,
     timeout_ms: i64,
@@ -537,8 +587,7 @@ async fn do_connect<E: From<String> + Send + 'static>(
                     break;
                 }
                 Err(e) => {
-                    let failure = WsFailure::of(&e);
-                    let _ = frames.send(WsEvent::Error(format!("ws read error: {failure}")));
+                    let _ = frames.send(WsEvent::Error(WsFailure::of(&e)));
                     break;
                 }
                 _ => {} // Ping/Pong handled by tungstenite
@@ -562,7 +611,9 @@ async fn do_connect<E: From<String> + Send + 'static>(
 
 /// WebSocket.connect : String -> Task Error Int (raw id; Ipê wraps in WebSocket)
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_connect<E: From<String> + Send + 'static>(url: String) -> IpeTask<E, i64> {
+pub fn web_socket_connect<E: From<String> + FromLimitExceeded + Send + 'static>(
+    url: String,
+) -> IpeTask<E, i64> {
     Box::pin(do_connect(url, Vec::new(), 30000, 0))
 }
 
@@ -571,7 +622,7 @@ pub fn web_socket_connect<E: From<String> + Send + 'static>(url: String) -> IpeT
 /// sends a periodic Ping frame to keep the connection alive through idle proxies;
 /// tungstenite auto-pongs inbound pings on the read side).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn web_socket_connect_with<E: From<String> + Send + 'static>(
+pub fn web_socket_connect_with<E: From<String> + FromLimitExceeded + Send + 'static>(
     cfg: WsClientCfg,
 ) -> IpeTask<E, i64> {
     Box::pin(do_connect(
@@ -838,7 +889,7 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 pub fn sub_subscribe_ws_error<E, M, F>(socket_id: i64, to_msg: F) -> IpeSub<M>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + FromLimitExceeded + Send + 'static,
     M: Send + 'static,
     F: Fn(E) -> M + Send + 'static,
 {
@@ -851,8 +902,8 @@ where
                 };
                 loop {
                     match rx.recv().await {
-                        Ok(WsEvent::Error(s)) => {
-                            emit(to_msg(s.into()));
+                        Ok(WsEvent::Error(failure)) => {
+                            emit(to_msg(failure.into_read_error()));
                             break;
                         }
                         Ok(_) => {}
@@ -973,6 +1024,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A frame past the message ceiling is a `LimitExceeded` refusal at the
+    /// handshake and on the read side; every other class keeps its kind.
+    #[test]
+    fn capacity_failures_are_limit_exceeded() {
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+        let too_long =
+            tokio_tungstenite::tungstenite::Error::Capacity(CapacityError::MessageTooLong {
+                size: 1025,
+                max_size: 1024,
+            });
+        let failure = WsFailure::of(&too_long);
+        assert_eq!(failure, WsFailure::Capacity);
+        let url = super::super::ssrf::DisplayableUrl::of("ws://x.example/");
+        let refused: IpeResult<IpeError, i64> = WsConnectError::Failed {
+            url: url.clone(),
+            failure,
+        }
+        .into_task();
+        assert_eq!(
+            refused,
+            IpeResult::Err(IpeError::limit_exceeded(format!(
+                "WebSocket.connect {url}: message or frame exceeds the size limit"
+            )))
+        );
+        assert_eq!(
+            failure.into_read_error::<IpeError>(),
+            IpeError::limit_exceeded("ws read error: message or frame exceeds the size limit")
+        );
+        assert_eq!(
+            WsFailure::Protocol.into_read_error::<IpeError>(),
+            IpeError::unexpected("ws read error: WebSocket protocol error".to_owned())
+        );
+        let timed_out = WsConnectError::TimedOut { url, after_ms: 5 };
+        let shown = timed_out.to_string();
+        assert_eq!(
+            timed_out.into_task::<IpeError>(),
+            IpeResult::Err(IpeError::unexpected(shown)),
+            "a failure that is no ceiling keeps the Unexpected kind"
+        );
     }
 
     /// A transport failure keeps only its class, never the error's text.
