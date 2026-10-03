@@ -58,10 +58,10 @@ pub enum Ty {
     ///
     /// A `Ty` containing a tagged (solver-space) `Var` must never be fed to
     /// `instantiate_in`/`instantiate_tracked`/`instantiate_logging_wildcards` — those
-    /// only handle annotation-space ids. No current consumer needs to
-    /// recover the underlying [`crate::unionfind::VarId`] from a tagged raw
-    /// (`crate::doc::ty_to_doc`'s `VarNamer` treats it as an opaque key);
-    /// mask off [`SOLVER_VAR_TAG`] if one ever does.
+    /// only handle annotation-space ids. A tagged raw is an opaque key
+    /// (`crate::doc::ty_to_doc`'s `VarNamer`, `SolvedTypes::poly_var_map`):
+    /// readers compare it whole and never recover the bare
+    /// [`crate::unionfind::VarId`].
     Var(u32),
     /// A function `arg -> result`.
     Fun(Box<Self>, Box<Self>),
@@ -106,35 +106,17 @@ pub const fn tag_solver_var(id: VarId) -> u32 {
     id | SOLVER_VAR_TAG
 }
 
-/// Strip [`SOLVER_VAR_TAG`] from a [`Ty::Var`] raw, recovering the bare
-/// union-find [`VarId`]. A no-op on a raw that was never tagged.
-///
-/// SEAL fix: `SolvedTypes::poly_var_map`'s "typed-rigids" entries
-/// (`ipe_types::lib.rs` around line 347) are keyed by the BARE union-find
-/// representative — a typed binding's own `params`/`ret` are read straight
-/// from its annotation, never zonked, so they were never tagged in the first
-/// place. But a `Ty::Var` read back from a ZONKED region (`SolvedTypes::regions`,
-/// e.g. a nested lambda's return-type slot inside that same typed binding's
-/// body) IS tagged, because `zonk` always tags an unresolved representative
-/// before storing it. Consumers in `ipe_lower` that probe `current_poly_tvars`
-/// with a region-sourced raw MUST strip the tag first (or try both forms) or
-/// the lookup silently misses for every typed (not boundary-scheme-promoted)
-/// enclosing binding — the exact gap that let `withErrorReporting : String ->
-/// Task Error a -> Task Error a`'s internal closures fall back to
-/// `IrType::Json` instead of `IrType::Generic(a)`, an E0308 exit-0-then-
-/// cargo-fail (examples/18-job-queue).
-#[must_use]
-pub const fn untag_solver_var(raw: u32) -> u32 {
-    raw & !SOLVER_VAR_TAG
-}
-
 /// True iff a [`Ty::Var`] raw is solver-representative space.
 ///
 /// I.e. tagged by [`tag_solver_var`] rather than an annotation-symbol raw.
 /// Callers that resolve a `Ty::Var` raw through the interner (e.g. the
 /// wildcard-`"any"` check) MUST skip that resolution when this returns
 /// true — a tagged raw is structurally guaranteed to never be a real
-/// interned symbol.
+/// interned symbol. Every table keyed by solver variables
+/// (`SolvedTypes::poly_var_map`) stores the tagged form only, so a reader
+/// answers for a tagged raw by exact lookup and for an untagged raw (an
+/// annotation symbol) not at all; probing both forms would match a symbol
+/// against a variable key.
 #[must_use]
 pub const fn is_solver_var(raw: u32) -> bool {
     raw & SOLVER_VAR_TAG != 0

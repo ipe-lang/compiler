@@ -51,9 +51,7 @@ pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
-pub use ty::{
-    RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var, untag_solver_var,
-};
+pub use ty::{RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var};
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
@@ -129,13 +127,16 @@ pub struct SolvedTypes {
     /// severity is refused at construction and returned as the inference error,
     /// so a `SolvedTypes` witnesses a program that compiles.
     pub warnings: Vec<HomedWarning>,
-    /// Per-typed-binding map from union-find representative id to annotation
-    /// variable symbol, keyed by `(home, def_name)`.
+    /// Per-binding map from solver-tagged union-find representative to
+    /// annotation variable symbol, keyed by `(home, def_name)`.
     ///
     /// After solving, every annotation type variable for a `Def::Typed` binding
     /// is represented as a `Ty::Var(u32)` in the zonked region types, where the
-    /// `u32` is the union-find representative of the rigid (skolem) that was
-    /// used while checking the binding's body.  This map records that
+    /// `u32` is [`tag_solver_var`] of the union-find representative of the
+    /// rigid (skolem) that was used while checking the binding's body.  Every
+    /// key is in that tagged form, for typed and boundary-promoted untyped
+    /// bindings alike, so a lookup is exact: an untagged raw is an annotation
+    /// symbol and never names a key.  This map records that
     /// correspondence so the lowerer can tell apart a "this `Ty::Var` is a
     /// generic type parameter of the enclosing function" from a "this `Ty::Var`
     /// is a truly unconstrained, message-free subtree placeholder".
@@ -852,8 +853,10 @@ fn infer_core(
     // the skolems its body constrained. A variable the body never constrained
     // stays a plain rigid (no obligation, absent from the map).
     //
-    // Also build `poly_var_map`: the reverse mapping from union-find representative
-    // id → annotation var symbol, keyed by `(home, def_name)`.  The lowerer uses
+    // Also build `poly_var_map`: the reverse mapping from the solver-tagged
+    // union-find representative (`tag_solver_var(rep)`, the raw `zonk` writes
+    // into every region `Ty::Var`) → annotation var symbol, keyed by
+    // `(home, def_name)`.  The lowerer uses
     // this to distinguish "this `Ty::Var` is a generic type parameter of the
     // enclosing function" from "this `Ty::Var` is a message-free UI subtree
     // placeholder" when lowering attribute-list element types inside polymorphic
@@ -865,7 +868,7 @@ fn infer_core(
         let mut rep_to_sym: BTreeMap<u32, Symbol> = BTreeMap::new();
         for (var_sym, rigid) in var_rigids {
             let rep = lift!(uf.find(*rigid));
-            rep_to_sym.insert(rep, *var_sym);
+            rep_to_sym.insert(tag_solver_var(rep), *var_sym);
             if let Content::Super { bounds: b, .. } = lift!(uf.content(*rigid))
                 && !b.is_empty()
             {
@@ -966,14 +969,9 @@ fn infer_core(
 
     // Fold each Boundary-Scheme-Promoted untyped def's quantified vars into
     // `untyped_type_params` / `poly_var_map`, alongside the typed bindings'
-    // entries above. Region/env `Ty::Var`s for these defs come from `zonk`
-    // (see the `env` read-back below), which always tags a solver
-    // representative with `tag_solver_var` before storing it — so these
-    // `poly_var_map` keys must be tagged too, or `current_poly_tvars` lookups
-    // in the lowerer would never match (unlike the typed-rigids loop above,
-    // which is keyed by the untagged skolem representative because a typed
-    // binding's own `params`/`ret` are read from its ANNOTATION type, never
-    // zonked).
+    // entries above. Every `poly_var_map` key is a solver-tagged raw, the one
+    // form `zonk` writes into region/env `Ty::Var`s, so the lowerer's lookup is
+    // exact and an annotation-symbol raw can never match a variable key.
     // Unconstrained UI-msg defaulting for UNTYPED bindings -- the counterpart of
     // the typed `msg_defaulted_vars` computation above. A fully unannotated
     // message-free view helper (`nav = Html.div [] [ Html.text "x" ]`, no
@@ -1656,7 +1654,8 @@ enum WildcardFact {
 
 /// Classify one parameter wildcard by its solved root.
 ///
-/// `rigid_names` maps the binding's signature-variable roots to their names;
+/// `rigid_names` maps the binding's solver-tagged signature-variable roots to
+/// their names;
 /// `bare` says whether the wildcard is the parameter's whole annotation.
 fn classify_param_wildcard(
     uf: &mut UnionFind<Content>,
@@ -1671,7 +1670,7 @@ fn classify_param_wildcard(
         Content::Rigid | Content::Super { rigid: true, .. } => {
             let root = uf.find(wildcard)?;
             let name = rigid_names
-                .and_then(|names| names.get(&root))
+                .and_then(|names| names.get(&tag_solver_var(root)))
                 .and_then(|sym| interner.resolve(*sym))
                 .map(Box::from);
             Ok(WildcardFact::Dependent(WildcardDependence::TypeVariable {
@@ -2950,6 +2949,49 @@ mod tests {
     }
 
     const M2C_HDR: &str = "module Main exposing (main)\n\n";
+
+    /// A typed binding's generic-variable keys are solver-tagged, the form its zonked regions carry.
+    ///
+    /// The lowerer looks a region `Ty::Var` up by exact key, so an untagged
+    /// key would leave the binding's generic unfound in its own body.
+    #[test]
+    fn typed_binding_poly_var_keys_are_solver_tagged_region_vars() {
+        let src = format!("{M2C_HDR}identity : a -> a\nidentity x =\n    x\n\nmain = identity 1\n");
+        let (solved, i, m) = infer_src(&src);
+        assert!(
+            matches!((&solved, &m), (Ok(_), Some(_))),
+            "identity must typecheck: {solved:?}"
+        );
+        let (Ok(solved), Some(m)) = (solved, m) else {
+            return;
+        };
+        let identity = def_key(&i, &m, "identity");
+        assert!(identity.is_some(), "identity must be defined in canon");
+        let Some(identity) = identity else { return };
+        let keys = solved.poly_var_map.get(&identity);
+        assert!(
+            keys.is_some_and(|k| !k.is_empty()),
+            "identity's generic must be recorded"
+        );
+        let Some(keys) = keys else { return };
+        assert!(
+            keys.keys().all(|&raw| is_solver_var(raw)),
+            "every poly_var_map key is solver-tagged: {keys:?}"
+        );
+        let region_vars: BTreeSet<u32> = solved
+            .regions
+            .iter()
+            .filter(|((home, _), _)| *home == identity.0)
+            .filter_map(|(_, ty)| match ty {
+                Ty::Var(raw) => Some(*raw),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.keys().any(|raw| region_vars.contains(raw)),
+            "the body's region var is a key verbatim: keys {keys:?}, region vars {region_vars:?}"
+        );
+    }
 
     #[test]
     fn generic_record_signature_typechecks() {

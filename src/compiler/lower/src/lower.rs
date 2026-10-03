@@ -10733,8 +10733,8 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
-    /// Reverse map from union-find representative id to annotation variable
-    /// symbol for the typed def currently being lowered.  Populated by
+    /// Reverse map from solver-tagged union-find representative to annotation
+    /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
     /// into the body; cleared (restored to empty) afterward.
     ///
@@ -19400,36 +19400,19 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Look up a `Ty::Var` raw union-find representative against
-    /// [`Self::current_poly_tvars`], tolerating either tagged or untagged
-    /// input.
+    /// The enclosing definition's generic named by a `Ty::Var` raw.
     ///
-    /// SEAL fix: `SolvedTypes::poly_var_map` populates
-    /// `current_poly_tvars` two different ways depending on the enclosing
-    /// binding's shape — see the doc comment on
-    /// [`ipe_types::untag_solver_var`] for the full rationale. In short: a
-    /// **typed** binding's own quantified vars are keyed by the BARE
-    /// union-find representative (its `params`/`ret` are read straight from
-    /// the annotation, never zonked), while a **boundary-scheme-promoted
-    /// untyped** binding's are keyed by the TAGGED representative (their
-    /// region/env types always come back through `zonk`, which tags). A
-    /// `Ty::Var` raw arriving HERE may be either form too — a nested lambda's
-    /// return-type slot (`region_ty`, always zonked/tagged) inside a
-    /// *typed* enclosing function needs to match against that function's
-    /// BARE keys, so a single fixed-representation lookup silently misses.
-    /// Probing both the raw and its tag-toggled form closes that gap
-    /// regardless of which side is tagged.
+    /// Every [`Self::current_poly_tvars`] key is a solver-tagged raw
+    /// ([`ipe_types::tag_solver_var`]), the form `zonk` writes into every
+    /// solved `Ty::Var`, so a tagged raw is answered by exact lookup. An
+    /// untagged raw is an annotation symbol, never a solver variable, and
+    /// names no generic: it returns `None`, so a symbol id equal to a
+    /// variable's bare id cannot pick up that variable's generic.
     fn poly_tvar_symbol(&self, raw: u32) -> Option<Symbol> {
-        let map = self.current_poly_tvars.borrow();
-        if let Some(&sym) = map.get(&raw) {
-            return Some(sym);
+        if !ipe_types::is_solver_var(raw) {
+            return None;
         }
-        let toggled = if ipe_types::is_solver_var(raw) {
-            ipe_types::untag_solver_var(raw)
-        } else {
-            ipe_types::tag_solver_var(raw)
-        };
-        map.get(&toggled).copied()
+        self.current_poly_tvars.borrow().get(&raw).copied()
     }
 
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
@@ -20393,8 +20376,9 @@ impl<'a> Lowerer<'a> {
             //   (a) an enclosing annotated function's generic type parameter —
             //       e.g. `parentMsg` in `view : (Msg -> parentMsg) -> Counter ->
             //       Html parentMsg`.  Region types inside the body carry this as
-            //       `Ty::Var(uf_rep)` where `uf_rep` is the union-find
-            //       representative of the rigid (skolem) created for `parentMsg`.
+            //       `Ty::Var(tag_solver_var(uf_rep))` where `uf_rep` is the
+            //       union-find representative of the rigid (skolem) created for
+            //       `parentMsg`.
             //       → emit `IrType::Generic(sym)` so the backend produces
             //       `Attribute<T1>` rather than `Attribute<()>`, avoiding E0308.
             //
@@ -20405,7 +20389,8 @@ impl<'a> Lowerer<'a> {
             //
             // `current_poly_tvars` (populated by `lower_def` for each `Def::Typed`
             // before it recurses into the body, and restored afterward) maps
-            // uf_rep → annotation var symbol for the current enclosing function.
+            // tagged uf_rep → annotation var symbol for the current enclosing
+            // function.
             // An empty map (unannotated or non-polymorphic context) always falls
             // through to `IrType::Unit`.
             Ty::Var(v) => self
@@ -31848,6 +31833,36 @@ mod tests {
                 lowerer.binder_ir_type(Some(UNIT_SPAN)),
                 Ok(Some(super::BinderType::Resolved(super::IrType::Unit)))
             ));
+        });
+    }
+
+    /// An untagged raw equal to a generic's bare variable id is a symbol and names no generic.
+    ///
+    /// The generic map is keyed by the tagged variable; probing the raw's
+    /// tag-flipped form would read the symbol as that variable and lower it to
+    /// the enclosing generic.
+    #[test]
+    fn poly_tvar_lookup_never_reads_a_symbol_raw_as_a_variable_key() {
+        const BARE_VAR: u32 = 7;
+        with_binder_type_lowerer(|lowerer, generic| {
+            let poly = BTreeMap::from([(ipe_types::tag_solver_var(BARE_VAR), generic)]);
+            lowerer.with_poly_tvars(Some(poly), || {
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),
+                    Some(generic),
+                    "the tagged variable names its generic"
+                );
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(BARE_VAR),
+                    None,
+                    "an untagged raw is an annotation symbol, never a variable key"
+                );
+                let msg_slot = lowerer.ir_type_from_ty_ui_msg(&Ty::Var(BARE_VAR), UNIT_SPAN);
+                assert!(
+                    matches!(msg_slot, Ok(super::IrType::Unit)),
+                    "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
+                );
+            });
         });
     }
 
