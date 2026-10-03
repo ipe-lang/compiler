@@ -10377,11 +10377,19 @@ mod route_entry_cmd_tests {
     }
 
     /// A file store under `LIVE_TAG` whose one persisted row maps `sid` to `blob`.
+    ///
+    /// The map lives in a private scratch directory the returned guard removes
+    /// on drop, so no fixture writes through a name another local user can plant.
     #[cfg(feature = "web")]
     #[allow(clippy::expect_used)] // test helper — a temp-file write failure is a test environment issue
-    fn file_store_with(name: &str, sid: &str, blob: String) -> Store {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_rejoin_{name}_{}.json", std::process::id()));
+    fn file_store_with(
+        name: &str,
+        sid: &str,
+        blob: String,
+    ) -> (Store, crate::scratch_core::ScratchDir) {
+        let dir = crate::scratch_core::ScratchDir::new(&format!("ipetest-rejoin-{name}"))
+            .expect("a private scratch dir");
+        let path = dir.path().join("sessions.json");
         let last_seen = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -10393,11 +10401,12 @@ mod route_entry_cmd_tests {
             serde_json::to_string(&map).expect("encode the seed map"),
         )
         .expect("write the seed map");
-        Arc::new(store::FileStore::<Model, Msg>::new(
+        let store: Store = Arc::new(store::FileStore::<Model, Msg>::new(
             path.to_str().expect("a UTF-8 temp path"),
             Duration::from_secs(60),
             LIVE_TAG,
-        ))
+        ));
+        (store, dir)
     }
 
     /// A session rebuilt across an additive Model change runs init's Cmd, then the entry Cmd, under its kept sid.
@@ -10407,7 +10416,8 @@ mod route_entry_cmd_tests {
         run(false, || async {
             let sid = new_sid();
             // The old Model had no `log`: an additive change, so the row is rebuilt.
-            let store = file_store_with("rebuilt", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let (store, _dir) =
+                file_store_with("rebuilt", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
             let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(cookie_sid, sid, "a rebuilt session keeps the cookie's sid");
@@ -10426,7 +10436,8 @@ mod route_entry_cmd_tests {
     fn rebuilt_init_cmd_binds_session_sid() {
         run(false, || async {
             let sid = new_sid();
-            let store = file_store_with("bindsid", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let (store, _dir) =
+                file_store_with("bindsid", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
             take_init_sids();
             let (status, _, _, _) = get(&store, "/", Some(&sid)).await;
             assert_eq!(status, StatusCode::OK);
@@ -10444,7 +10455,7 @@ mod route_entry_cmd_tests {
     fn exact_tag_restore_never_calls_init() {
         run(false, || async {
             let sid = new_sid();
-            let store = file_store_with(
+            let (store, _dir) = file_store_with(
                 "exact",
                 &sid,
                 checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
@@ -10472,7 +10483,7 @@ mod route_entry_cmd_tests {
     fn failed_rebuild_runs_init_once_under_new_sid() {
         run(false, || async {
             let sid = new_sid();
-            let store = file_store_with("undecodable", &sid, "!! not base64 !!".to_owned());
+            let (store, _dir) = file_store_with("undecodable", &sid, "!! not base64 !!".to_owned());
             take_init_sids();
             let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
             assert_eq!(status, StatusCode::OK);
@@ -10487,6 +10498,40 @@ mod route_entry_cmd_tests {
                 m.map(|m| m.log),
                 Some(vec!["init".to_owned(), "enter:home".to_owned()]),
                 "the new session runs init's Cmd, then the entry Cmd"
+            );
+        });
+    }
+
+    /// A non-additive old row evaluates `init` for the rebuild attempt, drops that Cmd unrun, and re-inits once.
+    #[cfg(feature = "web")]
+    #[test]
+    fn non_additive_rebuild_discards_its_init_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // `log` retyped (a number where the live Model holds a list): not additive.
+            let (store, _dir) = file_store_with(
+                "retyped",
+                &sid,
+                checkpoint(OLD_TAG, r#"{"page":"Home","log":5}"#),
+            );
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(
+                minted, sid,
+                "a failed rebuild never adopts the client's sid"
+            );
+            assert_eq!(
+                take_init_sids(),
+                vec![sid, minted.clone()],
+                "the rebuild attempt evaluates init under the cookie's sid, the re-init under the minted one"
+            );
+            // Wait past the expected length: a leaked rebuild Cmd would land a second "init".
+            let m = settled(&store, &minted, 3).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "only the re-init's Cmd runs; the discarded rebuild's Cmd never does"
             );
         });
     }
