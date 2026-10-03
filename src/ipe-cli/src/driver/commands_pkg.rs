@@ -2944,15 +2944,15 @@ pub fn select_non_overlapping(mut suggestions: Vec<Suggestion>, src_len: usize) 
 /// Apply `fixes` to `src`, returning the patched text.
 ///
 /// `fixes` are assumed non-overlapping and ordered back-to-front. Returns `None`
-/// if any span is out of bounds or not on a UTF-8 char boundary. Never indexes
-/// raw bytes.
+/// if any span is out of bounds, not on a UTF-8 char boundary, or holds text
+/// other than the suggestion's `replaces`. Never indexes raw bytes.
 #[must_use]
 pub fn apply_fixes(src: &str, fixes: &[Suggestion]) -> Option<String> {
     let mut out = src.to_owned();
     for s in fixes {
         let lo = usize::try_from(s.span.lo).ok()?;
         let hi = usize::try_from(s.span.hi).ok()?;
-        if lo > hi || hi > out.len() || !out.is_char_boundary(lo) || !out.is_char_boundary(hi) {
+        if out.get(lo..hi) != Some(&*s.replaces) {
             return None;
         }
         let before = out.get(..lo)?;
