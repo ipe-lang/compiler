@@ -167,14 +167,16 @@ enum Cmd {
     },
 }
 
+/// The text of an admitted file, or `None` (reported when worth a line) when
+/// [`walk::read_indexed`] refuses it.
 fn read_capped(repo: &str, rel: &str) -> Option<String> {
-    let p = std::path::Path::new(repo).join(rel);
-    let md = std::fs::metadata(&p).ok()?;
-    if md.len() > walk::MAX_FILE_BYTES {
-        eprintln!("ipe-index: skipping oversized {rel} ({} bytes)", md.len());
-        return None;
-    }
-    std::fs::read_to_string(&p).ok()
+    walk::read_indexed(std::path::Path::new(repo), rel)
+        .inspect_err(|refusal| {
+            if refusal.is_reported() {
+                eprintln!("ipe-index: not reading {}: {refusal}", walk::shown(rel));
+            }
+        })
+        .ok()
 }
 
 /// Default repo set: this repo (`ipe:.`).
