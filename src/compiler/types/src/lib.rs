@@ -52,7 +52,8 @@ pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
-    RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, is_solver_var, tag_solver_var,
+    RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, VarCeiling, is_solver_var,
+    tag_solver_var,
 };
 
 use constrain::{
@@ -195,6 +196,270 @@ pub struct SignatureWildcards {
     /// ([`ty_is_ground`]). A pinned wildcard lowers to that concrete type, so
     /// every use must instantiate it at exactly that type.
     pub pins: BTreeMap<usize, Ty>,
+}
+
+/// Which solver variables a renumbering treats as one variable.
+///
+/// A solver variable's raw id is only meaningful inside the solve that
+/// minted it, so the same raw in two modules' slices names two variables
+/// unless those slices came from one joint solve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarScope {
+    /// One raw id is one variable across every module: the joint solve's
+    /// numbering, where a variable shared by two modules stays one variable.
+    Program,
+    /// One raw id is one variable only within its owning module: slices that
+    /// were solved separately and merged, so equal raws in different modules
+    /// are distinct variables.
+    PerHome,
+}
+
+/// A renumbering ran out of ids below its [`VarCeiling`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CanonicalizeError {
+    /// More distinct solver variables than the ceiling admits.
+    VarSpaceExhausted,
+}
+
+/// A [`SolvedTypes`] in canonical form.
+///
+/// Its solver variables are densely numbered in the first-encounter order of
+/// [`canonicalize`] and its warnings are in canonical order. Built only by
+/// [`canonicalize`], so two producers of the same typed program that both pass
+/// through it agree byte for byte.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CanonicalTypes(SolvedTypes);
+
+impl CanonicalTypes {
+    /// The canonical typed program.
+    #[must_use]
+    pub const fn as_solved(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CanonicalTypes {
+    type Target = SolvedTypes;
+
+    fn deref(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+/// Dense ids for the solver variables of one typed program.
+///
+/// The one walker over every position that holds a solver-variable id: `Ty`
+/// values and the `poly_var_map` keys are renumbered through the same table.
+struct Renumbering {
+    scope: VarScope,
+    ceiling: VarCeiling,
+    /// Dense index of each owning-module key; under [`VarScope::Program`]
+    /// every module shares the one empty key.
+    homes: BTreeMap<Vec<Symbol>, u32>,
+    /// The dense variable assigned to each `(home index, original variable)`.
+    assigned: BTreeMap<(u32, SolverVar), SolverVar>,
+}
+
+impl Renumbering {
+    const fn new(scope: VarScope, ceiling: VarCeiling) -> Self {
+        Self {
+            scope,
+            ceiling,
+            homes: BTreeMap::new(),
+            assigned: BTreeMap::new(),
+        }
+    }
+
+    /// The dense index of the module owning a key.
+    fn home(&mut self, home: &[Symbol]) -> Result<u32, CanonicalizeError> {
+        let key: &[Symbol] = match self.scope {
+            VarScope::Program => &[],
+            VarScope::PerHome => home,
+        };
+        if let Some(&index) = self.homes.get(key) {
+            return Ok(index);
+        }
+        let index =
+            u32::try_from(self.homes.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        self.homes.insert(key.to_vec(), index);
+        Ok(index)
+    }
+
+    /// The dense variable for `var` in module `home`, minting the next id on first sight.
+    fn var(&mut self, home: u32, var: SolverVar) -> Result<SolverVar, CanonicalizeError> {
+        if let Some(&dense) = self.assigned.get(&(home, var)) {
+            return Ok(dense);
+        }
+        let next =
+            u32::try_from(self.assigned.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        if next >= self.ceiling.get() {
+            return Err(CanonicalizeError::VarSpaceExhausted);
+        }
+        let dense = SolverVar::from_var(next);
+        self.assigned.insert((home, var), dense);
+        Ok(dense)
+    }
+
+    /// A raw id from the [`Ty::Var`] id space.
+    ///
+    /// A solver variable is renumbered; an annotation-symbol raw is kept.
+    fn raw(&mut self, home: u32, raw: u32) -> Result<u32, CanonicalizeError> {
+        let Some(var) = SolverVar::from_raw(raw) else {
+            return Ok(raw);
+        };
+        Ok(self.var(home, var)?.raw())
+    }
+
+    fn ty(&mut self, home: u32, ty: &Ty) -> Result<Ty, CanonicalizeError> {
+        Ok(match ty {
+            Ty::Var(raw) => Ty::Var(self.raw(home, *raw)?),
+            Ty::Unit => Ty::Unit,
+            Ty::Fun(arg, result) => Ty::Fun(
+                Box::new(self.ty(home, arg)?),
+                Box::new(self.ty(home, result)?),
+            ),
+            Ty::Tuple(elems) => Ty::Tuple(
+                elems
+                    .iter()
+                    .map(|elem| self.ty(home, elem))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Ty::Record(fields, tail) => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, field)| -> Result<_, CanonicalizeError> {
+                        Ok((*name, self.ty(home, field)?))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let tail = match tail {
+                    RowTail::Closed => RowTail::Closed,
+                    RowTail::Open(raw) => RowTail::Open(self.raw(home, *raw)?),
+                };
+                Ty::Record(fields, tail)
+            }
+            Ty::Con { module, name, args } => Ty::Con {
+                module: module.clone(),
+                name: *name,
+                args: args
+                    .iter()
+                    .map(|arg| self.ty(home, arg))
+                    .collect::<Result<_, _>>()?,
+            },
+        })
+    }
+
+    /// Renumber every `Ty` value of a map whose key names its owning module.
+    fn ty_map<K: Clone + Ord>(
+        &mut self,
+        map: &BTreeMap<K, Ty>,
+        home_of: impl Fn(&K) -> &[Symbol],
+    ) -> Result<BTreeMap<K, Ty>, CanonicalizeError> {
+        map.iter()
+            .map(|(key, ty)| -> Result<_, CanonicalizeError> {
+                let home = self.home(home_of(key))?;
+                Ok((key.clone(), self.ty(home, ty)?))
+            })
+            .collect()
+    }
+}
+
+/// The canonical order of warnings: owning module, then span, then code.
+fn sort_warnings(mut warnings: Vec<HomedWarning>) -> Vec<HomedWarning> {
+    fn key(warning: &HomedWarning) -> (&[Symbol], u32, u32, &'static str) {
+        let span = warning.diagnostic().primary_span();
+        (
+            warning.home(),
+            span.lo,
+            span.hi,
+            warning.diagnostic().code().as_str(),
+        )
+    }
+    warnings.sort_by(|a, b| key(a).cmp(&key(b)));
+    warnings
+}
+
+/// Put a typed program into canonical form.
+///
+/// Solver variables are renumbered densely from 0 in first-encounter order
+/// over a fixed traversal: `env`, `regions`, `expected`, the
+/// `signature_wildcards` pins, then the `poly_var_map` keys, each in map
+/// order. The `Ty` values and the `poly_var_map` keys share one table, so a
+/// generic keyed in `poly_var_map` stays the variable its region types name.
+/// Only solver-tagged raws are renumbered; an untagged raw is an annotation
+/// symbol and is kept. Warnings are put in canonical order.
+///
+/// `scope` decides whether equal raws in different modules are one variable
+/// ([`VarScope::Program`]) or two ([`VarScope::PerHome`]); a program in which
+/// a variable is shared between modules numbers differently under the two.
+///
+/// # Errors
+/// [`CanonicalizeError::VarSpaceExhausted`] when the program holds more
+/// distinct solver variables than `ceiling` admits. The count never
+/// saturates, so no two variables ever share an id.
+pub fn canonicalize(
+    types: SolvedTypes,
+    scope: VarScope,
+    ceiling: VarCeiling,
+) -> Result<CanonicalTypes, CanonicalizeError> {
+    let SolvedTypes {
+        env,
+        regions,
+        expected,
+        bounds,
+        warnings,
+        poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        signature_wildcards,
+    } = types;
+    let mut table = Renumbering::new(scope, ceiling);
+    let env = table.ty_map(&env, |key| key.0.as_slice())?;
+    let regions = table.ty_map(&regions, |key| key.0.as_slice())?;
+    let expected = table.ty_map(&expected, |key| key.0.as_slice())?;
+    let signature_wildcards = signature_wildcards
+        .iter()
+        .map(|(key, wildcards)| -> Result<_, CanonicalizeError> {
+            let SignatureWildcards { param_counts, pins } = wildcards;
+            let home = table.home(key.0.as_slice())?;
+            let pins = pins
+                .iter()
+                .map(|(index, pin)| -> Result<_, CanonicalizeError> {
+                    Ok((*index, table.ty(home, pin)?))
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((
+                key.clone(),
+                SignatureWildcards {
+                    param_counts: param_counts.clone(),
+                    pins,
+                },
+            ))
+        })
+        .collect::<Result<_, CanonicalizeError>>()?;
+    let poly_var_map = poly_var_map
+        .iter()
+        .map(|(key, vars)| -> Result<_, CanonicalizeError> {
+            let home = table.home(key.0.as_slice())?;
+            let vars = vars
+                .iter()
+                .map(|(var, name)| -> Result<_, CanonicalizeError> {
+                    Ok((table.var(home, *var)?, *name))
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((key.clone(), vars))
+        })
+        .collect::<Result<_, CanonicalizeError>>()?;
+    Ok(CanonicalTypes(SolvedTypes {
+        env,
+        regions,
+        expected,
+        bounds,
+        warnings: sort_warnings(warnings),
+        poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        signature_wildcards,
+    }))
 }
 
 /// Infer the types of a canonical module.
@@ -7304,5 +7569,381 @@ h x =
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::*;
+    use ipe_diagnostics::{NameError, ParseError};
+    use std::num::NonZeroU32;
+
+    fn syms<const N: usize>(names: [&str; N]) -> Result<[Symbol; N], String> {
+        let mut interner = Interner::new();
+        let minted = names
+            .iter()
+            .map(|name| interner.intern(name).map_err(|e| format!("{e:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        minted
+            .try_into()
+            .map_err(|_| "symbol count drifted".to_owned())
+    }
+
+    fn empty() -> SolvedTypes {
+        SolvedTypes {
+            env: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            expected: BTreeMap::new(),
+            bounds: BTreeMap::new(),
+            warnings: Vec::new(),
+            poly_var_map: BTreeMap::new(),
+            untyped_type_params: BTreeMap::new(),
+            msg_defaulted_vars: BTreeMap::new(),
+            signature_wildcards: BTreeMap::new(),
+        }
+    }
+
+    /// The `Ty::Var` of solver variable `id`.
+    fn tv(id: u32) -> Ty {
+        Ty::Var(SolverVar::from_var(id).raw())
+    }
+
+    const fn at(lo: u32) -> Span {
+        Span { lo, hi: lo + 1 }
+    }
+
+    fn ceiling(n: u32) -> Result<VarCeiling, String> {
+        NonZeroU32::new(n)
+            .map(VarCeiling::at_most)
+            .ok_or_else(|| "zero ceiling".to_owned())
+    }
+
+    fn run(
+        types: SolvedTypes,
+        scope: VarScope,
+        ceiling: VarCeiling,
+    ) -> Result<CanonicalTypes, String> {
+        canonicalize(types, scope, ceiling).map_err(|e| format!("{e:?}"))
+    }
+
+    fn region_values(types: &CanonicalTypes) -> Vec<Ty> {
+        types.regions.values().cloned().collect()
+    }
+
+    /// Equal raws in two modules are one variable under `Program` and two under `PerHome`.
+    ///
+    /// The two scopes therefore disagree exactly when a variable is shared
+    /// between modules, which is what makes an equality oracle between a
+    /// joint solve and a per-module merge catch cross-module sharing.
+    #[test]
+    fn a_variable_shared_between_homes_numbers_differently_per_scope() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        let mut shared = empty();
+        shared.regions.insert((vec![a], at(0)), tv(5));
+        shared.regions.insert((vec![b], at(0)), tv(5));
+
+        let program = run(shared.clone(), VarScope::Program, VarCeiling::SOLVER)?;
+        let per_home = run(shared, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(region_values(&program), vec![tv(0), tv(0)]);
+        assert_eq!(region_values(&per_home), vec![tv(0), tv(1)]);
+        assert_ne!(program, per_home);
+
+        let mut distinct = empty();
+        distinct.regions.insert((vec![a], at(0)), tv(5));
+        distinct.regions.insert((vec![b], at(0)), tv(6));
+        assert_eq!(
+            run(distinct.clone(), VarScope::Program, VarCeiling::SOLVER)?,
+            run(distinct, VarScope::PerHome, VarCeiling::SOLVER)?,
+            "without sharing the two scopes agree"
+        );
+        Ok(())
+    }
+
+    /// More distinct variables than the ceiling admits is refused, never wrapped or saturated.
+    #[test]
+    fn a_program_with_more_variables_than_the_ceiling_is_refused() -> Result<(), String> {
+        let [a, f] = syms(["A", "f"])?;
+        let mut types = empty();
+        types.regions.insert((vec![a], at(0)), tv(1));
+        types.regions.insert((vec![a], at(1)), tv(2));
+        types.regions.insert((vec![a], at(2)), tv(3));
+
+        let refused = canonicalize(types.clone(), VarScope::Program, ceiling(2)?);
+        assert_eq!(refused, Err(CanonicalizeError::VarSpaceExhausted));
+        assert!(canonicalize(types, VarScope::Program, ceiling(3)?).is_ok());
+
+        let mut keyed = empty();
+        keyed.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([
+                (SolverVar::from_var(1), f),
+                (SolverVar::from_var(2), f),
+                (SolverVar::from_var(3), f),
+            ]),
+        );
+        assert_eq!(
+            canonicalize(keyed, VarScope::Program, ceiling(2)?),
+            Err(CanonicalizeError::VarSpaceExhausted),
+            "a `poly_var_map` key counts against the ceiling"
+        );
+        Ok(())
+    }
+
+    /// A `poly_var_map` key is renumbered through the table its region types use.
+    #[test]
+    fn poly_var_keys_and_region_vars_share_one_table() -> Result<(), String> {
+        let [a, f, g, name] = syms(["A", "f", "g", "t"])?;
+        let mut types = empty();
+        types
+            .regions
+            .insert((vec![a], at(0)), Ty::Fun(Box::new(tv(9)), Box::new(tv(4))));
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(4), name)]),
+        );
+        types.poly_var_map.insert(
+            (vec![a], g),
+            BTreeMap::from([(SolverVar::from_var(77), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![Ty::Fun(Box::new(tv(0)), Box::new(tv(1)))]
+        );
+        let keys_of = |def: Symbol| -> Vec<SolverVar> {
+            canonical
+                .poly_var_map
+                .get(&(vec![a], def))
+                .map(|vars| vars.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            keys_of(f),
+            vec![SolverVar::from_var(1)],
+            "the key stays the variable its region type names"
+        );
+        assert_eq!(
+            keys_of(g),
+            vec![SolverVar::from_var(2)],
+            "a key no region names takes the next fresh id"
+        );
+        Ok(())
+    }
+
+    /// An annotation-symbol raw is kept and takes no dense id; a row tail shares the variable table.
+    #[test]
+    fn untagged_raws_are_kept_and_row_tails_are_renumbered() -> Result<(), String> {
+        let [a, field, con] = syms(["A", "x", "T"])?;
+        let mut types = empty();
+        types.regions.insert(
+            (vec![a], at(0)),
+            Ty::Con {
+                module: Vec::new(),
+                name: con,
+                args: vec![Ty::Var(7), tv(3)],
+            },
+        );
+        types.regions.insert(
+            (vec![a], at(1)),
+            Ty::Record(
+                BTreeMap::from([(field, tv(4))]),
+                RowTail::Open(SolverVar::from_var(4).raw()),
+            ),
+        );
+        types.regions.insert(
+            (vec![a], at(2)),
+            Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![
+                Ty::Con {
+                    module: Vec::new(),
+                    name: con,
+                    args: vec![Ty::Var(7), tv(0)],
+                },
+                Ty::Record(
+                    BTreeMap::from([(field, tv(1))]),
+                    RowTail::Open(SolverVar::from_var(1).raw()),
+                ),
+                Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Two programs that differ only in their raw solver ids canonicalize equal, and the form is a fixed point.
+    #[test]
+    fn canonical_form_ignores_raw_ids_and_is_idempotent() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let build = |first: u32, second: u32| {
+            let mut types = empty();
+            types.regions.insert(
+                (vec![a], at(0)),
+                Ty::Fun(Box::new(tv(first)), Box::new(tv(second))),
+            );
+            types.poly_var_map.insert(
+                (vec![a], f),
+                BTreeMap::from([(SolverVar::from_var(second), name)]),
+            );
+            types
+        };
+        let one = run(build(5, 9), VarScope::PerHome, VarCeiling::SOLVER)?;
+        let other = run(build(100, 3), VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(one, other);
+        let again = run(
+            one.as_solved().clone(),
+            VarScope::PerHome,
+            VarCeiling::SOLVER,
+        )?;
+        assert_eq!(one, again);
+        Ok(())
+    }
+
+    fn warning(diagnostic: Diagnostic, home: Symbol) -> Result<HomedWarning, String> {
+        HomedWarning::new(diagnostic, &[home]).map_err(|e| format!("{e:?}"))
+    }
+
+    fn redundant(lo: u32, hi: u32) -> Diagnostic {
+        Diagnostic::Type {
+            span: Span { lo, hi },
+            msg: TypeError::RedundantCaseBranch {
+                constructor: "Red".into(),
+            },
+        }
+    }
+
+    /// Warnings come out ordered by home, then span, then code, whatever order they arrived in.
+    #[test]
+    fn warnings_are_sorted_by_home_span_then_code() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        assert!(a < b, "the ordering below relies on interning order");
+        let mut types = empty();
+        types.warnings = vec![
+            warning(redundant(0, 1), b)?,
+            warning(redundant(5, 6), a)?,
+            warning(redundant(0, 9), a)?,
+            warning(redundant(0, 2), a)?,
+            warning(
+                Diagnostic::Parse {
+                    span: Span { lo: 0, hi: 2 },
+                    msg: ParseError::DocOnUnexported { name: "f".into() },
+                },
+                a,
+            )?,
+        ];
+        let canonical = run(types, VarScope::Program, VarCeiling::SOLVER)?;
+        let order: Vec<(Symbol, u32, u32, &str)> = canonical
+            .warnings
+            .iter()
+            .map(|w| {
+                let span = w.diagnostic().primary_span();
+                let home = w.home().first().copied().unwrap_or(a);
+                (home, span.lo, span.hi, w.diagnostic().code().as_str())
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (a, 0, 2, "IPE-P0066"),
+                (a, 0, 2, "IPE-T0011"),
+                (a, 0, 9, "IPE-T0011"),
+                (a, 5, 6, "IPE-T0011"),
+                (b, 0, 1, "IPE-T0011"),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Reads every field of each warning-severity variant with its concrete type.
+    ///
+    /// A warning is compared and sorted by `(home, span, code)` alone because
+    /// no warning payload can hold a solver variable: the diagnostics crate
+    /// cannot name [`Ty`]. Adding a field to one of these variants breaks this
+    /// destructure (it names every field, with no `..`), so the new field has
+    /// to be classified here before it can ship.
+    fn warning_payload_is_ty_free(diagnostic: &Diagnostic) -> bool {
+        match diagnostic {
+            Diagnostic::Parse {
+                span: _,
+                msg: ParseError::DocOnUnexported { name } | ParseError::MissingDocString { name },
+            } => {
+                let _: &str = name;
+                true
+            }
+            Diagnostic::Name {
+                span: _,
+                msg:
+                    NameError::ScriptImportsShapeView {
+                        shape_ui_module,
+                        shape,
+                        entry,
+                    },
+            } => {
+                let _: [&str; 3] = [shape_ui_module, shape, entry];
+                true
+            }
+            Diagnostic::Type {
+                span: _,
+                msg: TypeError::RedundantCaseBranch { constructor },
+            } => {
+                let _: &str = constructor;
+                true
+            }
+            Diagnostic::Lower {
+                span: _,
+                msg: LowerError::RoutedAppMissingPageField { route_count },
+            } => {
+                let _: &usize = route_count;
+                true
+            }
+            Diagnostic::Parse { .. }
+            | Diagnostic::Name { .. }
+            | Diagnostic::Type { .. }
+            | Diagnostic::Lower { .. }
+            | Diagnostic::CompilerBug { .. }
+            | Diagnostic::Ffi { .. }
+            | Diagnostic::Sandbox { .. }
+            | Diagnostic::Consent { .. }
+            | Diagnostic::RegistryUnreachable { .. } => false,
+        }
+    }
+
+    /// The five warning-severity variants are exactly the ones whose payload is `Ty`-free.
+    #[test]
+    fn no_warning_variant_embeds_a_ty() -> Result<(), String> {
+        let [home] = syms(["A"])?;
+        let span = Span { lo: 0, hi: 1 };
+        let warnings = [
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::DocOnUnexported { name: "f".into() },
+            },
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::MissingDocString { name: "f".into() },
+            },
+            Diagnostic::Name {
+                span,
+                msg: NameError::ScriptImportsShapeView {
+                    shape_ui_module: "M".into(),
+                    shape: "S".into(),
+                    entry: "e".into(),
+                },
+            },
+            redundant(0, 1),
+            Diagnostic::Lower {
+                span,
+                msg: LowerError::RoutedAppMissingPageField { route_count: 2 },
+            },
+        ];
+        for diagnostic in warnings {
+            assert!(warning_payload_is_ty_free(&diagnostic), "{diagnostic:?}");
+            warning(diagnostic, home)?;
+        }
+        Ok(())
     }
 }

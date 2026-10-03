@@ -26,6 +26,7 @@
 //! without forcing every app to enumerate empty optionals.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use ipe_canon::ast as canon;
 use ipe_intern::Symbol;
@@ -96,6 +97,11 @@ pub enum Ty {
 /// bit can never collide with a genuine id from either space.
 const SOLVER_VAR_TAG: u32 = 1 << 31;
 
+// The tag is a single non-zero bit, so every id below it is untagged and
+// `VarCeiling::SOLVER` is exactly the count of distinct tagged ids.
+// IPE-RUST-AUDIT:ACCEPTED — compile-time `const` assertion (not a runtime panic); it fails the build if the tag stops being a single non-zero bit
+const _: () = assert!(SOLVER_VAR_TAG.is_power_of_two() && SOLVER_VAR_TAG > 0);
+
 /// Tag a solver [`VarId`] for storage in a [`Ty::Var`].
 ///
 /// Marks it as solver-representative space (from [`crate::constrain::zonk`])
@@ -152,6 +158,35 @@ impl SolverVar {
     /// The tagged [`Ty::Var`] raw.
     #[must_use]
     pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// The exclusive upper bound on the dense ids a renumbering may mint.
+///
+/// Held in `1..=SOLVER_VAR_TAG`: an id below the bound never carries the tag
+/// bit, so tagging it can neither alias another id nor read back as an
+/// annotation symbol. Built only through [`Self::SOLVER`] or [`Self::at_most`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct VarCeiling(u32);
+
+impl VarCeiling {
+    /// The full solver-variable space: ids `0..2^31`.
+    pub const SOLVER: Self = Self(SOLVER_VAR_TAG);
+
+    /// A ceiling of `n` ids, clamped to the solver-variable space.
+    #[must_use]
+    pub const fn at_most(n: NonZeroU32) -> Self {
+        if n.get() > SOLVER_VAR_TAG {
+            Self::SOLVER
+        } else {
+            Self(n.get())
+        }
+    }
+
+    /// The exclusive upper bound.
+    #[must_use]
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
@@ -660,6 +695,35 @@ mod aud13_tag_tests {
                 !is_solver_var(raw),
                 "a plain annotation-symbol raw must never look tagged"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod var_ceiling_tests {
+    use super::{SOLVER_VAR_TAG, VarCeiling};
+    use std::num::NonZeroU32;
+
+    /// A ceiling above the solver tag would let a dense id carry the tag bit, so it clamps to the tag.
+    #[test]
+    fn ceiling_never_exceeds_the_solver_tag() {
+        for n in [SOLVER_VAR_TAG + 1, u32::MAX] {
+            let Some(n) = NonZeroU32::new(n) else {
+                return;
+            };
+            assert_eq!(VarCeiling::at_most(n), VarCeiling::SOLVER);
+        }
+        assert_eq!(VarCeiling::SOLVER.get(), SOLVER_VAR_TAG);
+    }
+
+    /// A ceiling at or below the tag is kept exactly.
+    #[test]
+    fn ceiling_below_the_tag_is_kept() {
+        for n in [1, 2, 1_000, SOLVER_VAR_TAG] {
+            let Some(nz) = NonZeroU32::new(n) else {
+                return;
+            };
+            assert_eq!(VarCeiling::at_most(nz).get(), n);
         }
     }
 }
