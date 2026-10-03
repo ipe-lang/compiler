@@ -1992,7 +1992,7 @@ upsert conn store row =
             Task.fail e
 
         Ok w ->
-            Db.upsertFields conn w.table w.target w.fields
+            Db.upsertFields conn w.table (conflictColumns w.target) w.fields
 
 
 -- | `insertIfAbsent conn store row` — insert `row` unless a row with the same
@@ -2032,7 +2032,7 @@ insertIfAbsent conn store row =
             Task.fail e
 
         Ok w ->
-            Db.insertFieldsIfAbsent conn w.table w.target w.fields
+            Db.insertFieldsIfAbsent conn w.table (conflictColumns w.target) w.fields
 
 
 -- The keyed write a conflict-target refusal names.
@@ -2055,7 +2055,7 @@ conflictOpName op =
 -- target derived from the store's key, and the OmitField-aware fields.
 type alias ConflictWrite =
     { table : String
-    , target : List String
+    , target : ConflictTarget
     , fields : List ( String, SqlField )
     }
 
@@ -2083,7 +2083,7 @@ conflictWrite op store row =
                                 Nothing ->
                                     Ok
                                         { table = r.table
-                                        , target = conflictColumns target
+                                        , target = target
                                         , fields = insertFields (liveSpecs store) binds
                                         }
 
