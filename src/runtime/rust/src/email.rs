@@ -241,7 +241,8 @@ async fn email_post_json<E: From<String> + FromLimitExceeded>(
     )
     .await
     {
-        Ok(b) => b,
+        // `NoRedirects` never spends a redirect budget.
+        Ok((b, _)) => b,
         Err(refusal) => return Err(format!("http: {refusal}").into()),
     };
     let client = match builder.build() {
