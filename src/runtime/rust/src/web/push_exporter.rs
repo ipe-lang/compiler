@@ -973,7 +973,7 @@ mod tests {
     }
 
     /// A loopback ingest gated by the console's own receiver decision with
-    /// `want` configured and `dev_open` false (a Release child under any
+    /// `want` configured and no dev surface (a Release child under any
     /// posture). Returns its port, its ingest URL and its count of admitted
     /// pushes.
     #[cfg(feature = "server")]
@@ -985,7 +985,7 @@ mod tests {
             State((want, accepted)): State<(String, Arc<AtomicUsize>)>,
             headers: axum::http::HeaderMap,
         ) -> axum::response::Response {
-            match super::super::console::ingest_decision(&headers, Some(&want), false) {
+            match super::super::console::ingest_decision(&headers, Some(&want), None) {
                 Some(refusal) => refusal,
                 None => {
                     accepted.fetch_add(1, Ordering::SeqCst);

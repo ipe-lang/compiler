@@ -226,14 +226,20 @@ fn spawn_and_wait_ready(
                     // listener after it has already bound — the connect then races
                     // an about-to-die server. Draining keeps the pipe open and
                     // empty, so the child never blocks or faults on a log write.
-                    std::thread::spawn(move || {
+                    let drain = std::thread::Builder::new().spawn(move || {
                         let mut sink = reader;
                         let mut buf = String::new();
                         while sink.read_line(&mut buf).is_ok_and(|n| n > 0) {
                             buf.clear();
                         }
                     });
-                    return Ok(ProcessGuard(child));
+                    // The guard owns the child before the drain verdict, so a
+                    // refused drain thread still kills and reaps the server.
+                    let guard = ProcessGuard(child);
+                    drain.map_err(|e| -> BoxError {
+                        format!("{test_name}: cannot start the stderr drain: {e}").into()
+                    })?;
+                    return Ok(guard);
                 }
             }
             Err(e) => {

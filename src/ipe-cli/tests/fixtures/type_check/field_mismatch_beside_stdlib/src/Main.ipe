@@ -1,0 +1,19 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Money as Money exposing (Money)
+
+-- `note` is a `String`, compared here against an `Int`: a field-type mismatch
+-- in this file, linked beside the embedded `Ipe.Money` module.
+type alias Order =
+    { total : Money
+    , note : String
+    }
+
+isApproved : Order -> Bool
+isApproved order =
+    order.note == 1
+
+main : Task ()
+main =
+    Io.println "approved"

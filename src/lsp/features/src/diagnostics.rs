@@ -9,11 +9,13 @@
 //! - parse/canonicalize diagnostics belong to the module that produced them;
 //!   an importer of a red dependency inherits the dep's failure *silently*
 //!   (the dep already reported it at its own file);
-//! - a `typecheck`/`lower_program` error carries its home module path
-//!   (`ipe_types::infer_attributed`) — an exact map lookup, never a guess;
-//! - a homeless diagnostic (constraint-generation, exhaustiveness, backend)
-//!   falls back to the span heuristic over the linked program's defs — the
-//!   same closest-`lo` rule the CLI driver renders with.
+//! - a `typecheck` error names its owning module by construction
+//!   (`ipe_types::InferError`) — an exact lookup, never a guess; a home naming
+//!   no project module is refused as a compiler bug on the entry, and a
+//!   whole-program error belongs to the entry;
+//! - only a link or lowering error with no home falls back to the span
+//!   heuristic over the linked program's defs — the same closest-`lo` rule the
+//!   CLI driver renders with.
 //!
 //! Every module in the project appears in the result (with an empty list
 //! when clean), so a consumer can clear stale diagnostics for files that
@@ -106,9 +108,12 @@ pub fn collect(
     }
 
     match ipe_db::typecheck(db, root, entry) {
-        Err((diag, home)) => {
-            let owner = attribute(db, root, entry, home, diag.primary_span(), &entry_module);
-            push(&mut by_module, &owner, diag.clone());
+        Err(ipe_db::TypecheckError::Link(diag)) => {
+            push(&mut by_module, &entry_module, diag.clone());
+        }
+        Err(ipe_db::TypecheckError::Infer(err)) => {
+            let (owner, diag) = attribute_infer(db, &by_module, err, &entry_module);
+            push(&mut by_module, &owner, diag);
         }
         Ok(solved) => {
             for warning in &solved.warnings {
@@ -123,9 +128,17 @@ pub fn collect(
                 );
                 push(&mut by_module, &owner, diag.clone());
             }
-            if let Err((diag, home)) = ipe_db::lower_program(db, root, entry) {
-                let owner = attribute(db, root, entry, home, diag.primary_span(), &entry_module);
-                push(&mut by_module, &owner, diag.clone());
+            match ipe_db::lower_program(db, root, entry) {
+                Ok(_) => {}
+                Err(ipe_db::PipelineError::Infer(err)) => {
+                    let (owner, diag) = attribute_infer(db, &by_module, err, &entry_module);
+                    push(&mut by_module, &owner, diag);
+                }
+                Err(ipe_db::PipelineError::Lower(diag, home)) => {
+                    let owner =
+                        attribute(db, root, entry, home, diag.primary_span(), &entry_module);
+                    push(&mut by_module, &owner, diag.clone());
+                }
             }
         }
     }
@@ -151,9 +164,41 @@ fn flatten(by_module: BTreeMap<Vec<String>, Vec<Diagnostic>>) -> Vec<ModuleDiagn
         .collect()
 }
 
-/// Resolve a diagnostic's owning module: an exact `home` lookup when the
-/// solver attributed one, else the span heuristic over the linked program,
-/// else the entry module.
+/// Resolve a type-checker error's owning module from its typed home.
+///
+/// A sited error belongs to the project module its home names. A home naming
+/// no project module is refused as [`Diagnostic::CompilerBug`] on the entry,
+/// never handed to the span heuristic. A whole-program error belongs to the
+/// entry.
+fn attribute_infer(
+    db: &IpeDatabase,
+    by_module: &BTreeMap<Vec<String>, Vec<Diagnostic>>,
+    err: &ipe_types::InferError,
+    entry_module: &[String],
+) -> (Vec<String>, Diagnostic) {
+    let Some(home) = err.home() else {
+        return (entry_module.to_vec(), err.diagnostic().clone());
+    };
+    resolve_module_path(db, home.path())
+        .filter(|path| by_module.contains_key(path))
+        .map_or_else(
+            || {
+                (
+                    entry_module.to_vec(),
+                    Diagnostic::CompilerBug {
+                        where_: "lsp.attribute_infer",
+                        detail: "a type-checker error names a module with no source file"
+                            .to_owned(),
+                    },
+                )
+            },
+            |path| (path, err.diagnostic().clone()),
+        )
+}
+
+/// Resolve a link or lowering diagnostic's owning module: an exact `home`
+/// lookup when the lowerer attributed one, else the span heuristic over the
+/// linked program, else the entry module.
 fn attribute(
     db: &IpeDatabase,
     root: SourceRoot,
@@ -275,21 +320,54 @@ fn import_candidates_data(diag: &Diagnostic) -> Option<serde_json::Value> {
     Some(serde_json::json!({ IMPORT_CANDIDATES_KEY: modules }))
 }
 
+/// The most import actions one diagnostic's `data` can produce.
+pub(crate) const MAX_IMPORT_CANDIDATES: usize = 64;
+
 /// The candidate modules an LSP diagnostic's `data` carries, in order; empty
 /// when it carries none.
+///
+/// The client echoes `data` back, so it is untrusted input bound for the
+/// document text. The list is taken whole or not at all: it must be at most
+/// [`MAX_IMPORT_CANDIDATES`] entries, each a dotted module path (each segment
+/// an uppercase-initial identifier), strictly ascending (the producer's sorted,
+/// deduplicated order). Any other shape — a newline, a space, a backtick, a
+/// control or bidi character, a duplicate, a non-string — yields no
+/// candidates, so a partly-dropped list can never shrink an ambiguous
+/// qualifier to one "preferred" import.
 #[must_use]
 pub fn import_candidates(diag: &lsp_types::Diagnostic) -> Vec<String> {
-    diag.data
+    let Some(entries) = diag
+        .data
         .as_ref()
         .and_then(|d| d.get(IMPORT_CANDIDATES_KEY))
         .and_then(serde_json::Value::as_array)
-        .map(|ms| {
-            ms.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    if entries.len() > MAX_IMPORT_CANDIDATES {
+        return Vec::new();
+    }
+    let modules: Option<Vec<&str>> = entries
+        .iter()
+        .map(|m| m.as_str().filter(|m| is_module_path(m)))
+        .collect();
+    match modules {
+        Some(modules) if modules.windows(2).all(|pair| pair.first() < pair.last()) => {
+            modules.into_iter().map(str::to_owned).collect()
+        }
+        Some(_) | None => Vec::new(),
+    }
+}
+
+/// `true` when `text` is `Seg(.Seg)*`, each segment an ASCII uppercase letter
+/// then ASCII letters, digits or `_` (the parser's module-name grammar, so no
+/// homoglyph of a real module survives).
+fn is_module_path(text: &str) -> bool {
+    text.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Run the linter over the project's user modules and return each finding as an

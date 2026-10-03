@@ -1157,4 +1157,61 @@ mod tests {
             "prose never drives an import fix"
         );
     }
+
+    /// The candidates `data` decodes to.
+    fn decoded(data: &serde_json::Value) -> Vec<String> {
+        let mut diag = diag_at(5, "IPE-N0034");
+        diag.data = Some(serde_json::json!({ "importCandidates": data }));
+        crate::diagnostics::import_candidates(&diag)
+    }
+
+    /// The client echoes `data` back: an entry that is not a dotted module path
+    /// (a newline smuggling a second line, a space, a lowercase segment, an
+    /// empty segment, a bidi override, a Cyrillic homoglyph, a non-string)
+    /// never becomes an inserted import — and it voids the whole list, so a
+    /// valid sibling is never left standing as the sole, preferred fix.
+    #[test]
+    fn add_import_action_refuses_a_non_module_candidate() {
+        for bad in [
+            serde_json::json!("Lib.Utils\nmain = evil"),
+            serde_json::json!("Lib Utils"),
+            serde_json::json!("lib.Utils"),
+            serde_json::json!("Lib..Utils"),
+            serde_json::json!(""),
+            serde_json::json!("Lib.\u{202e}Utils"),
+            serde_json::json!("Lib.\u{0423}tils"),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                decoded(&serde_json::json!([bad.clone(), "Lib.Utils"])),
+                Vec::<String>::new(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            decoded(&serde_json::json!(["App.Utils", "Lib.Utils"])),
+            ["App.Utils".to_owned(), "Lib.Utils".to_owned()]
+        );
+    }
+
+    /// A list out of the producer's strictly ascending order (reordered or
+    /// duplicated) or over the cap is refused whole; the cap itself passes.
+    #[test]
+    fn add_import_candidates_are_all_or_none() {
+        assert_eq!(
+            decoded(&serde_json::json!(["Lib.Utils", "App.Utils"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            decoded(&serde_json::json!(["Lib.Utils", "Lib.Utils"])),
+            Vec::<String>::new()
+        );
+        let names = |n: usize| -> Vec<String> { (0..n).map(|i| format!("M{i:03}")).collect() };
+        let cap = crate::diagnostics::MAX_IMPORT_CANDIDATES;
+        assert_eq!(decoded(&serde_json::json!(names(cap))), names(cap));
+        assert_eq!(
+            decoded(&serde_json::json!(names(cap + 1))),
+            Vec::<String>::new()
+        );
+    }
 }

@@ -401,7 +401,7 @@ pub fn resolve_host_bind() -> String {
         }
     }
     let default_bind = || {
-        if crate::telemetry::production_from_env() {
+        if crate::telemetry::posture_is_production() {
             "0.0.0.0".to_owned()
         } else {
             "127.0.0.1".to_owned()

@@ -1,0 +1,2 @@
+module ModB exposing (..)
+type Shape = Circle | Triangle

@@ -43,14 +43,14 @@ use ipe_docs::{Entry, EntryKind, Index};
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = ipe_docs::argv::host_args().map_err(|e| e.to_string())?;
     let (out_dir, explain_dir, content_dir) = parse_args(&args)?;
 
     // No commands are known from this binary's context; the caller (ipe CLI)
     // would inject them.  The binary accepts an optional fourth argument with
     // a colon-separated list of `name=summary` pairs for testing; omit in
     // production.
-    let commands = parse_commands(args.get(4).map(String::as_str));
+    let commands = parse_commands(args.get(3).map(String::as_str));
 
     let index = Index::build(&explain_dir, &content_dir, &commands)
         .map_err(|e| format!("index build failed: {e}"))?;
@@ -62,15 +62,12 @@ fn main() -> Result<(), String> {
 
 fn parse_args(args: &[String]) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     match args {
-        [_, out, explain, content] | [_, out, explain, content, _] => Ok((
+        [out, explain, content] | [out, explain, content, _] => Ok((
             PathBuf::from(out),
             PathBuf::from(explain),
             PathBuf::from(content),
         )),
-        _ => Err(format!(
-            "usage: {} <out-dir> <explain-dir> <content-dir> [commands]",
-            args.first().map_or("gen_site", String::as_str)
-        )),
+        _ => Err("usage: gen_site <out-dir> <explain-dir> <content-dir> [commands]".to_owned()),
     }
 }
 

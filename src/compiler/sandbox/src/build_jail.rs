@@ -1185,22 +1185,27 @@ pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
 /// The user-private root for per-run FreeBSD jail scratch dirs, under `home`.
 ///
 /// PURE over the parsed home so the refusal is unit-testable on any host. The
-/// scratch must live under a user-private root: with no absolute home it
-/// refuses rather than fall back to a world-writable `/tmp` (a cross-user
-/// symlink-plant vector at an intermediate ancestor under a root-run jail) or
-/// a relative path (resolved against whatever the working directory is).
+/// scratch must live under a user-private root: with no [`HomeDir`] it refuses,
+/// naming the [`HomeRefusal`], rather than fall back to a world-writable `/tmp`
+/// (a cross-user symlink-plant vector at an intermediate ancestor under a
+/// root-run jail) or a relative path (resolved against whatever the working
+/// directory is).
+///
+/// [`HomeDir`]: crate::home::HomeDir
+/// [`HomeRefusal`]: crate::home::HomeRefusal
 #[cfg(any(target_os = "freebsd", test))]
-pub(crate) fn freebsd_jail_cache_root(home: Option<PathBuf>) -> Result<PathBuf, RunJailDefect> {
-    let tail = Path::new(".cache").join("ipe").join("jail");
-    let Some(home) = home else {
-        return Err(RunJailDefect::MountFailed {
-            target: tail,
-            detail: "HOME is unset or not an absolute path; refusing a jail scratch root \
-                     outside the user-private home"
-                .to_owned(),
-        });
-    };
-    Ok(home.join(tail))
+pub(crate) fn freebsd_jail_cache_root(
+    home: Result<crate::home::HomeDir, crate::home::HomeRefusal>,
+) -> Result<PathBuf, RunJailDefect> {
+    match home {
+        Ok(home) => Ok(home.join(".cache").join("ipe").join("jail")),
+        Err(refusal) => Err(RunJailDefect::MountFailed {
+            target: Path::new(".cache").join("ipe").join("jail"),
+            detail: format!(
+                "{refusal}; refusing a jail scratch root outside the user-private home"
+            ),
+        }),
+    }
 }
 
 /// The FreeBSD jail's network-axis parameters for the given grant.
@@ -3171,21 +3176,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_freebsd_jail_cache_root_lives_under_the_absolute_home() {
-        let got = freebsd_jail_cache_root(Some(PathBuf::from("/home/u")));
+        let home = crate::home::test_home(Path::new("/home/u"));
+        let got = freebsd_jail_cache_root(Ok(home));
         assert_eq!(got, Ok(PathBuf::from("/home/u/.cache/ipe/jail")));
     }
 
     #[test]
-    fn the_freebsd_jail_cache_root_refuses_an_unset_or_relative_home() {
-        // A relative home never reaches the root: the accessor parses it to
-        // `None`, which the root refuses rather than resolving it against the
+    fn freebsd_cache_root_names_the_home_refusal() {
+        // A refused home never reaches the root: the root refuses with the
+        // parser's reason rather than resolving a relative value against the
         // working directory or falling back to a world-writable `/tmp`.
-        for raw in [None, Some(""), Some("home/u"), Some("./home")] {
-            let home = crate::home::home_dir_from(raw.map(OsString::from));
-            let got = freebsd_jail_cache_root(home);
+        for raw in [
+            None,
+            Some(""),
+            Some("home/u"),
+            Some("./home"),
+            Some("/home/u\0x"),
+        ] {
+            let refusal = crate::home::HomeDir::try_parse(raw.map(OsString::from))
+                .expect_err("the raw value is refused");
+            let got = freebsd_jail_cache_root(Err(refusal));
             assert!(
-                matches!(got, Err(RunJailDefect::MountFailed { .. })),
+                matches!(&got, Err(RunJailDefect::MountFailed { detail, .. })
+                    if detail.starts_with(&refusal.to_string())),
                 "{raw:?}: {got:?}"
             );
         }
@@ -3643,7 +3658,11 @@ mod tests {
             std::fs::create_dir_all(dir).expect("fixture subdir");
         }
         let canonical = |path: &Path| CanonicalPath::resolve(path).expect("fixture path resolves");
-        let homes = HomeMasks::resolve(Some(&user), Some(&cargo)).expect("fixture homes");
+        let homes = HomeMasks::resolve(
+            Ok(&crate::home::test_home(&user)),
+            Some(&crate::home::test_tool_home(&cargo)),
+        )
+        .expect("fixture homes");
         let mounts = crate::JailMounts::checked_against(
             canonical(&scratch),
             canonical(&tree),

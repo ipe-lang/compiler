@@ -194,21 +194,19 @@ fn decode_csi(buf: &[u8]) -> (TuiKey, usize) {
 }
 
 fn decode_char(buf: &[u8]) -> (TuiKey, usize) {
-    // Decode one UTF-8 scalar from the front of buf (total).
-    match std::str::from_utf8(buf).ok().and_then(|s| s.chars().next()) {
-        Some(c) => (TuiKey::val("char", c.to_string()), c.len_utf8()),
-        None => {
-            // Try the maximal valid prefix; else consume 1 byte as "other".
-            for n in (1..=buf.len().min(4)).rev() {
-                if let Some(s) = buf.get(..n).and_then(|b| std::str::from_utf8(b).ok())
-                    && let Some(c) = s.chars().next()
-                {
-                    return (TuiKey::val("char", c.to_string()), c.len_utf8());
-                }
-            }
-            (TuiKey::val("other", lossy(buf.get(..1).unwrap_or(&[]))), 1)
+    // Decode one UTF-8 scalar from the front of buf: try the maximal valid
+    // prefix of at most 4 bytes (one scalar's longest encoding), down to 1
+    // byte. Bounded to 4 bytes — never re-validates the whole read buffer to
+    // find the first character. Falls to "other" (1 byte) if no prefix in
+    // that window is valid, e.g. a lone continuation byte.
+    for n in (1..=buf.len().min(4)).rev() {
+        if let Some(s) = buf.get(..n).and_then(|b| std::str::from_utf8(b).ok())
+            && let Some(c) = s.chars().next()
+        {
+            return (TuiKey::val("char", c.to_string()), c.len_utf8());
         }
     }
+    (TuiKey::val("other", lossy(buf.get(..1).unwrap_or(&[]))), 1)
 }
 
 #[cfg(test)]
@@ -246,5 +244,26 @@ mod tests {
         assert_eq!(decode_key(b"\x1b[3~"), (TuiKey::of("delete"), 4));
         assert_eq!(decode_key(b"\x1b[5~"), (TuiKey::of("pageup"), 4));
         assert_eq!(decode_key(&[]), (TuiKey::of("other"), 0));
+    }
+
+    // `é` (2 bytes) followed by the lead byte of an unrelated, incomplete
+    // 3-byte scalar: the bounded prefix decode must still find `é` as the
+    // first character, consuming exactly its 2 bytes — pinning that the
+    // 4-byte-window decode agrees with the old whole-buffer-first attempt.
+    #[test]
+    fn char_followed_by_split_multibyte_decodes_first() {
+        let mut buf = "é".as_bytes().to_vec();
+        buf.push(0xe2); // lead byte of a 3-byte sequence, no continuation bytes
+        let (k, n) = decode_key(&buf);
+        assert_eq!((k.kind.as_str(), k.value.as_str(), n), ("char", "é", 2));
+    }
+
+    // A lone continuation byte (no valid prefix at any window length) falls to
+    // "other", consuming 1 byte — the unchanged fallback.
+    #[test]
+    fn lone_continuation_byte_is_other() {
+        let (k, n) = decode_key(&[0x80]);
+        assert_eq!(k.kind.as_str(), "other");
+        assert_eq!(n, 1);
     }
 }

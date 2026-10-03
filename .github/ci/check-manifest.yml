@@ -111,6 +111,21 @@ checks:
       tier: quick
       run:
         - .github/ci/artifact-guard.sh
+        - python3 .github/ci/verify-manifest.py
+        - python3 .github/ci/test_verify_manifest.py -v
+        - python3 .github/ci/test_strict_yaml.py -v
+        - python3 .github/ci/test_change_class.py -v
+        - python3 .github/ci/e2e_shard.py --lint
+        - python3 .github/ci/test_e2e_shard.py -v
+        - python3 .github/ci/rerun_policy.py --lint
+        - python3 .github/ci/test_rerun_policy.py -v
+        - python3 .github/ci/nightly_green.py --lint
+        - python3 .github/ci/test_nightly_green.py -v
+        - python3 .github/ci/test_trust_roots.py -v
+        - python3 .github/ci/test_local_gate.py -v
+        - python3 .github/ci/test_cargo_invocation.py -v
+        - python3 .github/ci/test_claims_table.py -v
+        - python3 .github/ci/check_required_set.py
   - context: manifest-lock-consistency
     disposition: gate
     producer: ci.yml
@@ -135,11 +150,8 @@ checks:
     local:
       tier: affected
       run:
-        - cmd: cargo build --release -p ipe
-          differs: CI builds it once in build-tools and shares it by artifact
-        - cmd: bash tools/scripts/check-explain-examples.sh
+        - cmd: cargo nextest run -p ipe --test explain_examples --profile ci
           env:
-            IPE_BIN: "{ipe_bin}"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
   - context: "doc-string example gate"
     disposition: gate
@@ -269,6 +281,7 @@ checks:
     local:
       tier: affected
       run:
+        - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
         - cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
     guards: SEAL
     aggregates: [runtime-full-features-run]

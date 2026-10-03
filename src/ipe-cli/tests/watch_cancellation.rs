@@ -144,18 +144,20 @@ fn compile_worker_is_cancelled_by_a_concurrent_input_edit() {
 
     let db_worker = db.clone();
     let entry_for_worker = main_path;
-    let worker = thread::spawn(move || {
-        salsa::Cancelled::catch(AssertUnwindSafe(|| {
-            ipe::compile_prepared(
-                &db_worker,
-                root,
-                &sources,
-                &entry_for_worker,
-                Path::new("<test>"),
-                config,
-            )
-        }))
-    });
+    let worker = thread::Builder::new()
+        .spawn(move || {
+            salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                ipe::compile_prepared(
+                    &db_worker,
+                    root,
+                    &sources,
+                    &entry_for_worker,
+                    Path::new("<test>"),
+                    config,
+                )
+            }))
+        })
+        .expect("spawn test thread");
 
     first_exec_rx
         .recv_timeout(Duration::from_secs(10))

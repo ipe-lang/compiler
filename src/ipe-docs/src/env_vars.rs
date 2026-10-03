@@ -730,11 +730,14 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_DENY_PRIVATE",
-        default: "unset (auto: on in production, off in dev)",
+        default: "unset (on, except a development binary with no exposed listener)",
         purpose: "Set to `1`, `on`, or `true` to block all outbound HTTP / SMTP / \
                   database connections to RFC-1918 private, loopback, and link-local \
-                  addresses, closing the SSRF attack surface. In production the guard \
-                  is on by default; set to `0` to disable explicitly in dev.",
+                  addresses, closing the SSRF attack surface; `0`, `off`, or `false` \
+                  disables it. Unset, the guard is on in every `ipe release` artifact \
+                  and production posture, and off only in a development binary in a \
+                  dev posture that has bound no listener beyond loopback. Any other \
+                  value turns the guard on and logs one warning.",
         subsystem: Subsystem::Http,
         class: Class::SecurityTunable,
     },
@@ -795,7 +798,9 @@ pub static ENV_VARS: &[EnvVar] = &[
                   console requires a token, Secure cookies, no dev banner. Unset, the \
                   build decides: `ipe build`, `ipe run`, `ipe test` and `ipe watch` \
                   binaries read as development, `ipe release` artifacts as production. \
-                  Also accepted as bare `ENV`.",
+                  An `ipe release` artifact is production whatever this says: a dev \
+                  marker there opens no dev-only surface and logs one notice. Also \
+                  accepted as bare `ENV`.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },

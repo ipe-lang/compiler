@@ -168,3 +168,77 @@ fn imported_qualifier_still_suggested() {
     };
     assert!(names.contains(&"Util"), "{names:?}");
 }
+
+/// The applicable edit and names of an unknown-module diagnostic.
+const fn unknown_module_candidates(diag: &Diagnostic) -> Option<&ipe_diagnostics::Candidates> {
+    match diag {
+        Diagnostic::Name {
+            msg: NameError::UnknownModule { suggestions, .. },
+            ..
+        } => Some(suggestions),
+        _ => None,
+    }
+}
+
+/// A module imported under an alias is not missing its import: spelling its
+/// own name points at the alias, with the edit overwriting only the qualifier.
+#[test]
+fn aliased_module_spelled_by_name_points_at_the_alias() {
+    let src =
+        "module Main exposing (main)\n\nimport Lib.Util as U\n\nmain : Int\nmain =\n    Util.f 1\n";
+    let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
+    assert!(diag.is_some(), "expected an unknown-module diagnostic");
+    let Some(diag) = diag else {
+        return;
+    };
+    assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
+    let candidates = unknown_module_candidates(&diag);
+    assert!(candidates.is_some(), "{diag:?}");
+    let Some(candidates) = candidates else {
+        return;
+    };
+    assert_eq!(&*candidates.names, &[Box::<str>::from("U")], "{diag:?}");
+    let lo = u32::try_from(src.find("Util.f").unwrap_or(0)).unwrap_or(0);
+    let token = ipe_diagnostics::Span::new(lo, lo.saturating_add(6));
+    assert_eq!(
+        candidates.region,
+        ipe_diagnostics::EditTarget::prefix(token, "Util"),
+        "{diag:?}"
+    );
+    assert!(candidates.region.is_some(), "{diag:?}");
+}
+
+/// The same holds for a gated kernel module imported under an alias.
+#[test]
+fn aliased_kernel_module_spelled_by_name_points_at_the_alias() {
+    let src = "module Main exposing (main)\n\nimport Ipe.Crypto as C\n\nmain =\n    Crypto.sha256 \"x\"\n";
+    let diag = last_error(&[src], &["Main"]);
+    assert!(diag.is_some(), "expected an unknown-module diagnostic");
+    let Some(diag) = diag else {
+        return;
+    };
+    assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
+    assert_eq!(
+        unknown_module_suggestions(&diag),
+        Some(vec!["C"]),
+        "{diag:?}"
+    );
+}
+
+/// `Crpyto` is one transposition from the gated kernel qualifier `Crypto`; with
+/// no `import Ipe.Crypto` it is never offered.
+#[test]
+fn gated_unimported_kernel_qualifier_never_suggested() {
+    let src = "module Main exposing (main)\n\nmain =\n    Crpyto.sha256 \"x\"\n";
+    let diag = last_error(&[src], &["Main"]);
+    assert!(diag.is_some(), "expected an unknown-module diagnostic");
+    let Some(diag) = diag else {
+        return;
+    };
+    let names = unknown_module_suggestions(&diag);
+    assert!(names.is_some(), "expected IPE-N0004, got {diag:?}");
+    let Some(names) = names else {
+        return;
+    };
+    assert!(!names.contains(&"Crypto"), "{names:?}");
+}

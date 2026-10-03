@@ -19,6 +19,7 @@ pub mod module_classify;
 pub mod ref_index;
 pub mod rename;
 mod resolve;
+mod scope;
 pub mod shape_runtime;
 pub mod shape_source;
 pub mod sig_delta;
@@ -30,7 +31,8 @@ use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
 pub use env::{
-    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, stdlib_canonical_qualifier,
+    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, bare_import_binds,
+    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
     ModuleOrigin, QualifierForm, RESERVED_BUILTIN_TYPES, builtin_empty_home_arity,
@@ -4058,8 +4060,32 @@ mod tests {
     }
 
     #[test]
+    fn a_local_value_shadows_the_prelude_without_a_duplicate() {
+        let src = "module Main exposing (main)\n\
+                   max : Int -> Int -> Int\n\
+                   max a _b = a\n\
+                   main = max\n";
+        let Some((m, i)) = canon_src(src) else {
+            assert!(
+                false_marker(),
+                "a local `max` is no duplicate of the prelude's"
+            );
+            return;
+        };
+        let Some(Def::Untyped { body, .. }) = find_def(&m, &i, "main") else {
+            assert!(false_marker(), "main should be an untyped def");
+            return;
+        };
+        assert!(
+            matches!(body.value, Expr_::VarTopLevel { name, .. } if i.resolve(name) == Some("max")),
+            "a bare `max` names the local definition, got {:?}",
+            body.value
+        );
+    }
+
+    #[test]
     fn stdlib_wildcard_shadowed_by_explicit_exposing() {
-        // An explicit `exposing (color)` (higher priority, in `env.vars`) wins over
+        // An explicit `exposing (color)` (the explicit tier) wins over
         // a wildcard `color`; the pair is NOT ambiguous. Resolves to Font.color.
         let src = "module Main exposing (main)\n\
                    import Ipe.Ui.Background exposing (..)\n\
@@ -4502,6 +4528,63 @@ mod tests {
             ),
             "user module without import must still be IPE-N0034, got {err:?}"
         );
+    }
+
+    /// The IPE-N0034 candidate rule (`bare_import_binds`) agrees with what a
+    /// bare import of every kernel module actually binds.
+    ///
+    /// For each kernel path and each spelling a use site may try (canonical,
+    /// last segment, dotted path) that the gate refuses with no import, `import
+    /// P` then `Q.member` resolves the qualifier exactly when the rule says the
+    /// import binds it. A candidate the import would not bind (an applied fix
+    /// that still fails), or a binding import left out of the list, goes red
+    /// here. A spelling that resolves with no import never raises IPE-N0034, so
+    /// no candidate list is built for it.
+    #[test]
+    fn candidate_rule_matches_kernel_import_binding() {
+        let mut checked = 0usize;
+        for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
+            let module = path.join(".");
+            let last = path.last().copied().unwrap_or(&module);
+            for qualifier in [*canonical, last, &module] {
+                if qualifier_bound("", qualifier).0 != Some(false) {
+                    continue;
+                }
+                checked += 1;
+                let (bound, result) = qualifier_bound(&format!("import {module}\n"), qualifier);
+                assert_eq!(
+                    bound,
+                    Some(bare_import_binds(&module, qualifier)),
+                    "import {module}; {qualifier}.member: {result:?}"
+                );
+            }
+        }
+        assert!(checked > 0, "no gated kernel spelling was exercised");
+    }
+
+    /// Whether `qualifier.zzAbsentMember` reaches the qualifier's member table
+    /// after `imports`: `Some(true)` resolved (or missed only the member),
+    /// `Some(false)` the qualifier is gated or unknown, `None` anything else.
+    fn qualifier_bound(
+        imports: &str,
+        qualifier: &str,
+    ) -> (Option<bool>, DResult<(ast::Module, ModuleExports)>) {
+        let src =
+            format!("module Main exposing (main)\n{imports}main = {qualifier}.zzAbsentMember\n");
+        let result = canon_with_origin(&src, ModuleOrigin::User);
+        let bound = match &result {
+            Ok(_)
+            | Err(Diagnostic::Name {
+                msg: NameError::NoSuchMember { .. },
+                ..
+            }) => Some(true),
+            Err(Diagnostic::Name {
+                msg: NameError::ImportRequired { .. } | NameError::UnknownModule { .. },
+                ..
+            }) => Some(false),
+            Err(_) => None,
+        };
+        (bound, result)
     }
 
     #[test]

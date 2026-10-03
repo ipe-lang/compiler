@@ -27,7 +27,6 @@ module Ipe.Task exposing
     , lazy
     , Step(..), loop
     , BackoffStrategy
-    , Linear, LinearWithJitter, Exponential, ExponentialWithJitter
     , RetryPolicy
     , linearBackoff, exponentialBackoff
     , withJitter
@@ -276,22 +275,6 @@ type BackoffStrategy
     | LinearWithJitter
     | Exponential
     | ExponentialWithJitter
-
-{-| The `Linear` backoff-strategy constructor. -}
-Linear : BackoffStrategy
-Linear = Kernel.kernel "Task_Linear"
-
-{-| The `LinearWithJitter` backoff-strategy constructor. -}
-LinearWithJitter : BackoffStrategy
-LinearWithJitter = Kernel.kernel "Task_LinearWithJitter"
-
-{-| The `Exponential` backoff-strategy constructor. -}
-Exponential : BackoffStrategy
-Exponential = Kernel.kernel "Task_Exponential"
-
-{-| The `ExponentialWithJitter` backoff-strategy constructor. -}
-ExponentialWithJitter : BackoffStrategy
-ExponentialWithJitter = Kernel.kernel "Task_ExponentialWithJitter"
 
 {-| Retry configuration for `retryWith`, built with the `linearBackoff` /
 `exponentialBackoff` constructors and refined with the `with*` combinators.

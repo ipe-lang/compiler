@@ -990,6 +990,221 @@ fn canon_open_import_sweep_over_the_stdlib_registry_compiles() {
     assert_compiles("canon_open_import_sweep", &src);
 }
 
+/// Build the `import {dotted} as OpenN exposing (..)` block admitted into
+/// `placement`, skipping `Ipe.Tea.*` (a non-Script shape importing a
+/// DIFFERENT shape's Tea surface is its own refusal, IPE-N0033, not this
+/// sweep's concern). Mirrors the admission rule
+/// `canon_open_import_sweep_over_the_stdlib_registry_compiles` hand-rolls for
+/// `Shape::Script`, reused below for every OTHER shape with a sole placement.
+fn open_import_sweep_block(
+    placement: ipe_canon::shape_runtime::Placement,
+) -> (String, Vec<&'static str>) {
+    use ipe_canon::shape_runtime::{Admissibility, allowed_in, classify};
+    let mut block = String::new();
+    let mut joined: Vec<&'static str> = Vec::new();
+    for module in ipe_stdlib::COMPILED_STD_MODULES {
+        let admitted = matches!(
+            allowed_in(classify(module.dotted), placement),
+            Admissibility::Allow
+        );
+        if !admitted || module.dotted.starts_with("Ipe.Tea.") {
+            continue;
+        }
+        let _ = writeln!(
+            block,
+            "import {} as Open{} exposing (..)",
+            module.dotted,
+            joined.len()
+        );
+        joined.push(module.dotted);
+    }
+    (block, joined)
+}
+
+/// Every `COMPILED_STD_MODULES` entry `allowed_in` the Tui
+/// placement opens cleanly alongside a minimal well-typed Tui `main`. The one
+/// axis that differs from Script is `BrowserHost` (`Allow` for Script,
+/// `Deny` for Tui), so this also pins that no `Ipe.Browser.*` module sneaks
+/// into a Tui sweep, and that `Ipe.Ui.Tui` / `Ipe.Ui.Cells` — Tui-only UI
+/// helpers a stale per-shape list could otherwise miss — are admitted.
+#[test]
+fn canon_open_import_per_shape_sweep_tui_compiles() {
+    use ipe_canon::shape_runtime::{Placement, Shape};
+    let placement = Placement::sole_for(Shape::Tui);
+    assert!(placement.is_some(), "Tui has one placement");
+    #[allow(clippy::expect_used)] // `is_some` is asserted just above
+    let placement = placement.expect("asserted present above");
+    let (block, joined) = open_import_sweep_block(placement);
+
+    let mut src = format!(
+        "{HEAD}\n\
+         import Ipe.Tea.Tui as Tui\n\
+         import Ipe.Ui.Cells as Cells\n\
+         import Ipe.Ui.Cells exposing (Screen)\n\
+         import Ipe.Tea.Tui.Cmd\n\
+         import Ipe.Tea.Tui.Sub\n"
+    );
+    src.push_str(&block);
+    src.push_str(
+        "\ntype Msg = NoOp\n\n\
+         type alias Model = { count : Int }\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { count = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         view : Model -> Screen Msg\n\
+         view _model =\n    Cells.text \"hello\"\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Tui.tea\n        { init = init, update = update, view = view\n        , subscriptions = subscriptions\n        }\n",
+    );
+
+    for pinned in ["Ipe.Ui.Tui", "Ipe.Ui.Cells"] {
+        assert!(
+            joined.contains(&pinned),
+            "the Tui sweep must open `{pinned}`, opened {joined:?}"
+        );
+    }
+    assert!(
+        joined.iter().all(|m| !m.starts_with("Ipe.Browser.")),
+        "Tui must not admit any Ipe.Browser.* module (BrowserHost denied for Tui); \
+         admitted {joined:?}"
+    );
+    assert_compiles("canon_open_import_per_shape_sweep_tui", &src);
+}
+
+/// Parallel to the Tui sweep above, for the Cli placement. Pins
+/// `Ipe.Ui.Cli` (the Cli-only UI helper module) and the same `BrowserHost`
+/// exclusion.
+#[test]
+fn canon_open_import_per_shape_sweep_cli_compiles() {
+    use ipe_canon::shape_runtime::{Placement, Shape};
+    let placement = Placement::sole_for(Shape::Cli);
+    assert!(placement.is_some(), "Cli has one placement");
+    #[allow(clippy::expect_used)] // `is_some` is asserted just above
+    let placement = placement.expect("asserted present above");
+    let (block, joined) = open_import_sweep_block(placement);
+
+    let mut src = format!(
+        "{HEAD}\n\
+         import Ipe.Tea.Cli as Cli\n\
+         import Ipe.Tea.Cli.Cmd\n\
+         import Ipe.Tea.Cli.Sub\n\
+         import Ipe.Ui.Cli as Ui\n\
+         import Ipe.Ui.Cli exposing (Lines)\n"
+    );
+    src.push_str(&block);
+    src.push_str(
+        "\ntype Msg = NoOp\n\n\
+         type alias Model = { count : Int }\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { count = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         view : Model -> Lines Msg\n\
+         view _model =\n    Ui.text \"ok\"\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Cli.tea\n        { init = init, update = update, view = view\n        , subscriptions = subscriptions\n        }\n",
+    );
+
+    assert!(
+        joined.contains(&"Ipe.Ui.Cli"),
+        "the Cli sweep must open `Ipe.Ui.Cli`, opened {joined:?}"
+    );
+    assert!(
+        joined.iter().all(|m| !m.starts_with("Ipe.Browser.")),
+        "Cli must not admit any Ipe.Browser.* module (BrowserHost denied for Cli); \
+         admitted {joined:?}"
+    );
+    assert_compiles("canon_open_import_per_shape_sweep_cli", &src);
+}
+
+/// Parallel to the Tui/Cli sweeps above, for the view-less
+/// Worker placement (no `view` field in its `tea` record).
+#[test]
+fn canon_open_import_per_shape_sweep_worker_compiles() {
+    use ipe_canon::shape_runtime::{Placement, Shape};
+    let placement = Placement::sole_for(Shape::Worker);
+    assert!(placement.is_some(), "Worker has one placement");
+    #[allow(clippy::expect_used)] // `is_some` is asserted just above
+    let placement = placement.expect("asserted present above");
+    let (block, joined) = open_import_sweep_block(placement);
+
+    let mut src = format!(
+        "{HEAD}\n\
+         import Ipe.Tea.Worker as Worker\n\
+         import Ipe.Tea.Worker.Cmd\n\
+         import Ipe.Tea.Worker.Sub\n"
+    );
+    src.push_str(&block);
+    src.push_str(
+        "\ntype Msg = NoOp\n\n\
+         type alias Model = { ticks : Int }\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { ticks = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Worker.tea { init = init, update = update, subscriptions = subscriptions }\n",
+    );
+
+    assert!(
+        joined.iter().all(|m| !m.starts_with("Ipe.Browser.")),
+        "Worker must not admit any Ipe.Browser.* module (BrowserHost denied for Worker); \
+         admitted {joined:?}"
+    );
+    assert_compiles("canon_open_import_per_shape_sweep_worker", &src);
+}
+
+/// Staleness guard: the per-shape sweeps cover Script and Tui/Cli/Worker —
+/// every `Shape` with a sole
+/// `Placement`. `Shape::Web` is deliberately excluded (it admits both
+/// `Served` and `Solo` runtimes, so `sole_for` returns `None`, see
+/// `shape_runtime`'s own `sole_placement_is_none_for_web_some_otherwise`
+/// unit test). If `Web` ever gains a sole placement this assertion goes red,
+/// so the exclusion cannot go silently stale.
+#[test]
+fn canon_open_import_per_shape_sweep_excludes_web_for_cause() {
+    use ipe_canon::shape_runtime::{Placement, Shape};
+    assert!(
+        Placement::sole_for(Shape::Web).is_none(),
+        "Shape::Web now has a sole placement — add it to the per-shape open-import \
+         sweep alongside Script/Tui/Cli/Worker instead of leaving it excluded"
+    );
+}
+
+/// `Ipe.Ui.Tui` and `Ipe.Ui.Cells` both expose `column` (each defined as the
+/// one kernel `UiCells_column`) and `Screen` (Cells re-exports Tui's). Two
+/// open imports of ONE definition are one origin, never a clash: a bare
+/// `column` and a bare `Screen` in a Tui program resolve without IPE-N0024.
+/// Keying an origin by its importing module instead of its definition makes
+/// this program a false ambiguity.
+#[test]
+fn canon_open_imports_tui_and_cells_share_column_and_compile() {
+    let mut src = HEAD.to_owned();
+    src.push_str(
+        "\nimport Ipe.Tea.Tui as Tui\n\
+         import Ipe.Ui.Tui exposing (..)\n\
+         import Ipe.Ui.Cells exposing (..)\n\
+         import Ipe.Tea.Tui.Cmd\n\
+         import Ipe.Tea.Tui.Sub\n\n\
+         type Msg = NoOp\n\n\
+         type alias Model = { count : Int }\n\n\
+         init : () -> ( Model, Cmd Msg )\n\
+         init _unit =\n    ( { count = 0 }, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    ( model, Cmd.none )\n\n\
+         view : Model -> Screen Msg\n\
+         view _model =\n    column [] []\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    Sub.none\n\n\
+         main =\n    Tui.tea\n        { init = init, update = update, view = view\n        , subscriptions = subscriptions\n        }\n",
+    );
+    assert_compiles("canon_open_tui_cells_column", &src);
+}
+
 /// The shape app-leaf names (`WebApp` / `TuiApp` / `CliApp`) are
 /// deliberately NOT reserved — a user program may soundly declare
 /// `type WebApp = …` and use it, and the lowerer's empty-home guard keeps that

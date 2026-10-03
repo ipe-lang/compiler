@@ -125,6 +125,7 @@ pub const fn wall_ceiling_secs(profile: &SandboxProfile) -> u64 {
 #[cfg(feature = "wasi_run")]
 mod engine {
     use super::{FsGrant, MODULE_ARGV0, memory_ceiling_bytes, wall_ceiling_secs};
+    use crate::threads::{self, ThreadRole};
     use crate::{CliError, Path};
     use ipe_sandbox::run_jail::SandboxProfile;
     use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -163,12 +164,15 @@ mod engine {
 
     impl WallDeadline {
         /// Arm the deadline against `engine` for `wall_secs` seconds.
-        fn arm(engine: &Engine, wall_secs: u64) -> Self {
+        ///
+        /// A guest never starts without its deadline: an OS refusal of the
+        /// watchdog thread is the run's error.
+        fn arm(engine: &Engine, wall_secs: u64) -> Result<Self, CliError> {
             let done =
                 std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
             let watchdog_done = std::sync::Arc::clone(&done);
             let watchdog_engine = engine.clone();
-            let watchdog = std::thread::spawn(move || {
+            let watchdog = threads::spawn_named(ThreadRole::WasiWallClock, move || {
                 let (lock, cvar) = &*watchdog_done;
                 let mut finished = lock
                     .lock()
@@ -191,11 +195,11 @@ mod engine {
                     // is 1.
                     watchdog_engine.increment_epoch();
                 }
-            });
-            Self {
+            })?;
+            Ok(Self {
                 done,
                 watchdog: Some(watchdog),
-            }
+            })
         }
     }
 
@@ -376,7 +380,7 @@ mod engine {
         // Arm the wall-clock deadline; it disarms (signals + joins the watchdog)
         // when `_deadline` drops at the end of this scope, whichever path we
         // leave by — a `?` error return included.
-        let _deadline = WallDeadline::arm(&engine, wall_ceiling_secs(profile));
+        let _deadline = WallDeadline::arm(&engine, wall_ceiling_secs(profile))?;
 
         let instance =
             linker
@@ -420,6 +424,31 @@ mod engine {
                     )),
                 })
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::WallDeadline;
+        use crate::CliError;
+        use crate::threads::{ThreadRole, refusal};
+        use wasmtime::{Config, Engine};
+
+        #[test]
+        fn a_refused_wall_clock_thread_refuses_the_run() {
+            refusal::refuse(ThreadRole::WasiWallClock);
+            let mut config = Config::new();
+            config.epoch_interruption(true);
+            let engine = Engine::new(&config);
+            assert!(engine.is_ok(), "the test engine builds");
+            let Ok(engine) = engine else { return };
+            assert!(matches!(
+                WallDeadline::arm(&engine, 1),
+                Err(CliError::ThreadRefused {
+                    role: ThreadRole::WasiWallClock,
+                    ..
+                })
+            ));
         }
     }
 }

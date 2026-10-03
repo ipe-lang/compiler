@@ -719,10 +719,35 @@ pub fn kernel_types(db: &dyn Db, root: SourceRoot) -> KernelTypesResult {
 // Tracked queries: typecheck + lower — the coarse per-program SEAM
 // ---------------------------------------------------------------------------
 
-/// The memoized result of type-checking [`linked_program`]'s whole-program
-/// merge, or the failing diagnostic paired with its constraint's home module
-/// path (see [`ipe_types::infer_attributed`]).
-pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, (Diagnostic, Vec<Symbol>)>;
+/// Why [`typecheck`] produced no solved program.
+///
+/// A link refusal and a type-checker refusal are distinct stages: the link
+/// diagnostic is [`linked_program`]'s own, carried verbatim, and is never
+/// re-classified as a type-checker error (which must name its owning module).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypecheckError {
+    /// [`linked_program`] refused the program, so the type checker never ran.
+    Link(Diagnostic),
+    /// The type checker refused the linked program.
+    Infer(ipe_types::InferError),
+}
+
+impl TypecheckError {
+    /// The refusing diagnostic, whichever stage produced it.
+    #[must_use]
+    pub const fn diagnostic(&self) -> &Diagnostic {
+        match self {
+            Self::Link(diag) => diag,
+            Self::Infer(err) => err.diagnostic(),
+        }
+    }
+}
+
+/// The memoized result of type-checking [`linked_program`]'s merge.
+///
+/// The error is why it was refused: the link diagnostic, or the type-checker
+/// error sited at its owning module (see [`ipe_types::infer_attributed`]).
+pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, TypecheckError>;
 
 /// Type-check the linked whole-program module.
 ///
@@ -751,9 +776,11 @@ pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, (Diagnostic, Vec<
 pub fn typecheck(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> TypecheckResult {
     let linked = linked_program(db, root, entry)
         .clone()
-        .map_err(|d| (d, Vec::new()))?;
+        .map_err(TypecheckError::Link)?;
     let mut interner = db.interner().lock();
-    ipe_types::infer_attributed(&linked.module, &mut interner).map(Arc::new)
+    ipe_types::infer_attributed(&linked.module, &mut interner)
+        .map(Arc::new)
+        .map_err(TypecheckError::Infer)
 }
 
 /// The type-checker's results for ONE module, projected out of the
@@ -785,7 +812,7 @@ pub struct ModuleTypes {
 /// On the scoped path the module's own solve; on the fallback path the
 /// whole-program projection, including the whole-program failure (the same
 /// error a whole-program demand surfaces).
-pub type ModuleTypesResult = Result<Arc<ModuleTypes>, (Diagnostic, Vec<Symbol>)>;
+pub type ModuleTypesResult = Result<Arc<ModuleTypes>, TypecheckError>;
 
 /// One module's `(home, _)`-slice of a whole-program
 /// [`ipe_types::SolvedTypes`] — the [`ModuleTypes`] projection.
@@ -1079,7 +1106,7 @@ pub fn typecheck_module(
                     .iter()
                     .map(|segment| interner.intern(segment))
                     .collect::<Result<_, _>>()
-                    .map_err(|d| (d, Vec::new()))?
+                    .map_err(|d| TypecheckError::Infer(ipe_types::InferError::unsited(d)))?
             };
             Ok(Arc::new(normalize_module_types(project_module_types(
                 &solved, &home,
@@ -1088,9 +1115,48 @@ pub fn typecheck_module(
     }
 }
 
+/// Why the pipeline up to lowering refused a program.
+///
+/// A type-checker error keeps its typed site; a link or lowering error is the
+/// diagnostic paired with the module path the lowerer blamed, empty when it
+/// blamed none.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PipelineError {
+    /// The type checker refused the program.
+    Infer(ipe_types::InferError),
+    /// Linking or lowering refused the program.
+    Lower(Diagnostic, Vec<Symbol>),
+}
+
+impl From<TypecheckError> for PipelineError {
+    /// A link refusal is the link diagnostic with no blamed module, exactly as
+    /// [`lower_program`] reports a link refusal of its own.
+    fn from(err: TypecheckError) -> Self {
+        match err {
+            TypecheckError::Link(diag) => Self::Lower(diag, Vec::new()),
+            TypecheckError::Infer(err) => Self::Infer(err),
+        }
+    }
+}
+
+impl From<PipelineError> for (Diagnostic, Vec<Symbol>) {
+    /// The diagnostic with its owning module path, empty for a whole-program one.
+    fn from(err: PipelineError) -> Self {
+        match err {
+            PipelineError::Infer(ipe_types::InferError::Sited { diag, home }) => {
+                (diag, home.into_path())
+            }
+            PipelineError::Infer(ipe_types::InferError::Program(program)) => {
+                (program.into_diagnostic(), Vec::new())
+            }
+            PipelineError::Lower(diag, home) => (diag, home),
+        }
+    }
+}
+
 /// The memoized result of lowering [`linked_program`]'s whole-program merge
 /// against [`typecheck`]'s solved types into the backend-agnostic IR.
-pub type LowerResult = Result<Arc<ipe_ir::Program>, (Diagnostic, Vec<Symbol>)>;
+pub type LowerResult = Result<Arc<ipe_ir::Program>, PipelineError>;
 
 /// Lower the linked whole-program module.
 ///
@@ -1114,15 +1180,19 @@ pub type LowerResult = Result<Arc<ipe_ir::Program>, (Diagnostic, Vec<Symbol>)>;
 pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerResult {
     let linked = linked_program(db, root, entry)
         .clone()
-        .map_err(|d| (d, Vec::new()))?;
-    let types = typecheck(db, root, entry).clone()?;
+        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    let types = typecheck(db, root, entry)
+        .clone()
+        .map_err(PipelineError::from)?;
     let mut interner = db.interner().lock();
     // Provide the entry file's display path and source text so the lowerer
     // can inject `<file>:<line>` into `Debug.todo` call sites.
     let src_path = entry.module_path(db).join(".");
     let src_path = format!("{src_path}.ipe");
     let src_text = entry.text(db).clone();
-    ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text).map(Arc::new)
+    ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
+        .map(Arc::new)
+        .map_err(|(diag, home)| PipelineError::Lower(diag, home))
 }
 
 /// [`lower_program`]'s IR after Phase-2 partial evaluation — the ONE program the

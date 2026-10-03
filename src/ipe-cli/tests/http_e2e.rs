@@ -157,7 +157,7 @@ fn start_fixture_with_accept_timeout(
         format!("{test_name}: cannot set fixture listener non-blocking: {e}").into()
     })?;
 
-    let handle = thread::spawn(move || {
+    let handle = thread::Builder::new().spawn(move || {
         // Accept exactly one connection within the deadline. If none arrives
         // (a wedged or broken client) the fixture thread exits when the
         // deadline elapses; the running binary then produces no/short stdout
@@ -195,7 +195,7 @@ fn start_fixture_with_accept_timeout(
                 Err(_) => break,
             }
         }
-    });
+    })?;
 
     Ok((url, handle))
 }

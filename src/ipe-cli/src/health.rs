@@ -180,7 +180,10 @@ impl ConfigTarget {
 /// # Errors
 /// See [`cargo_config_path_from`].
 fn cargo_config_path() -> Result<PathBuf, CliError> {
-    cargo_config_path_from(ipe_env::var_os("CARGO_HOME"), crate::env_dir::home())
+    cargo_config_path_from(
+        ipe_env::var_os("CARGO_HOME"),
+        crate::env_dir::home().ok().as_ref(),
+    )
 }
 
 /// Resolve the Cargo config path from the raw `CARGO_HOME` value and the home.
@@ -192,7 +195,7 @@ fn cargo_config_path() -> Result<PathBuf, CliError> {
 /// [`CliError::Usage`] when `CARGO_HOME` is unset and no home resolves.
 fn cargo_config_path_from(
     cargo_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
+    home: Option<&crate::env_dir::HomeDir>,
 ) -> Result<PathBuf, CliError> {
     let cargo_home = crate::env_dir::tool_home_from("CARGO_HOME", cargo_home, home, ".cargo")?
         .ok_or_else(|| CliError::Usage(crate::text::msg::health_home_unknown()))?;
@@ -1920,14 +1923,15 @@ mod tests {
             ConfigValue::StrList(vec!["-C".to_owned(), "link-arg=-fuse-ld=mold".to_owned()]);
 
         for raw in ["rel/cargo", "./cargo", "../cargo"] {
-            let got = cargo_config_path_from(Some(raw.into()), Some(home.path().to_path_buf()))
-                .and_then(|path| {
-                    apply_config_edit(
-                        &path,
-                        &["target", "x86_64-unknown-linux-gnu", "rustflags"],
-                        &value,
-                    )
-                });
+            let parsed = crate::env_dir::HomeDir::try_parse(Some(home.path().into()))
+                .expect("an absolute test home");
+            let got = cargo_config_path_from(Some(raw.into()), Some(&parsed)).and_then(|path| {
+                apply_config_edit(
+                    &path,
+                    &["target", "x86_64-unknown-linux-gnu", "rustflags"],
+                    &value,
+                )
+            });
             assert!(
                 matches!(got, Err(CliError::EnvDirNotAbsolute { var: "CARGO_HOME" })),
                 "relative CARGO_HOME `{raw}` must be refused"
@@ -1941,12 +1945,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn cargo_config_path_honours_an_absolute_cargo_home_and_defaults_when_unset_or_empty() {
-        let home = PathBuf::from("/home/u");
-        let got = cargo_config_path_from(Some("/opt/cargo".into()), Some(home.clone()));
+        let home = crate::env_dir::HomeDir::try_parse(Some("/home/u".into()))
+            .expect("an absolute test home");
+        let got = cargo_config_path_from(Some("/opt/cargo".into()), Some(&home));
         assert!(matches!(got, Ok(p) if p == std::path::Path::new("/opt/cargo/config.toml")));
         for raw in [None, Some("")] {
-            let got = cargo_config_path_from(raw.map(std::ffi::OsString::from), Some(home.clone()));
+            let got = cargo_config_path_from(raw.map(std::ffi::OsString::from), Some(&home));
             assert!(
                 matches!(&got, Ok(p) if p == &PathBuf::from("/home/u/.cargo/config.toml")),
                 "{raw:?}"

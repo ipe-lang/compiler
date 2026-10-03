@@ -8,11 +8,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use ipe_diagnostics::DResult;
+use ipe_diagnostics::{DResult, Diagnostic, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::StdlibKernel;
 
 use crate::resolve::{ModuleOrigin, QualifierForm, import_qualifier_forms};
+use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentity};
 
 /// Authoritative map from a stdlib module's full import path to its canonical
 /// qualifier short-name.
@@ -219,31 +220,64 @@ impl ModuleCatalog {
         self.modules.iter().map(|m| &**m)
     }
 
-    /// The modules other than `home` a bare `import` of which binds `qualifier`.
+    /// Every module other than `home` a bare `import` of which binds `qualifier`.
     ///
-    /// A bare import binds the forms of `import_qualifier_forms(false, len)`:
-    /// the last segment, plus the dotted path when the path has more than one
-    /// segment. Sorted and deduplicated (the catalog is a set).
+    /// The one candidate source for an unimported qualifier: every catalog
+    /// entry is tested against [`bare_import_binds`], so two modules sharing a
+    /// last segment (a kernel `Ipe.Tea.Tui` and a compiled `Ipe.Ui.Tui`) are
+    /// both listed. Sorted and deduplicated (the catalog is a set).
     #[must_use]
     pub fn modules_bound_by(&self, qualifier: &str, home: &str) -> Box<[Box<str>]> {
         self.modules
             .iter()
-            .filter(|module| &***module != home && binds(module, qualifier))
+            .filter(|module| &***module != home && bare_import_binds(module, qualifier))
             .cloned()
             .collect()
     }
 }
 
 /// `true` when a bare `import module` registers `qualifier`.
-fn binds(module: &str, qualifier: &str) -> bool {
-    let len = module.split('.').count();
-    import_qualifier_forms(false, len)
+///
+/// A kernel stdlib module (a [`STDLIB_MODULE_QUALIFIERS`] path) binds its
+/// canonical qualifier, plus its last segment when
+/// [`kernel_import_binds_last_segment`] allows it. Any other module binds the
+/// forms of `import_qualifier_forms(false, len)`: the last segment, plus the
+/// dotted path when the path has more than one segment.
+#[must_use]
+pub fn bare_import_binds(module: &str, qualifier: &str) -> bool {
+    let segments: Vec<&str> = module.split('.').collect();
+    let last = segments.last().copied();
+    if let Some(canonical) = stdlib_canonical_qualifier(&segments) {
+        return qualifier == canonical
+            || last.is_some_and(|last| {
+                last == qualifier && kernel_import_binds_last_segment(last, canonical)
+            });
+    }
+    import_qualifier_forms(false, segments.len())
         .iter()
         .any(|form| match form {
-            QualifierForm::LastSegment => module.rsplit('.').next() == Some(qualifier),
+            QualifierForm::LastSegment => last == Some(qualifier),
             QualifierForm::DottedPath => module == qualifier,
             QualifierForm::Alias => false,
         })
+}
+
+/// `true` when a bare import of the kernel module with canonical qualifier
+/// `canonical` also binds its last path segment `last`.
+///
+/// It does unless `last` is a DIFFERENT kernel module's canonical qualifier:
+/// binding it would unlock that foreign module's import gate
+/// (`import Ipe.Server.Http` must not unlock client `Http`).
+#[must_use]
+pub fn kernel_import_binds_last_segment(last: &str, canonical: &str) -> bool {
+    last == canonical || !is_canonical_qualifier_text(last)
+}
+
+/// `true` when `name` is the canonical qualifier of some kernel stdlib module.
+fn is_canonical_qualifier_text(name: &str) -> bool {
+    STDLIB_MODULE_QUALIFIERS
+        .iter()
+        .any(|(_, canonical)| *canonical == name)
 }
 
 /// `true` when `name` is the canonical short qualifier of some stdlib module in
@@ -255,11 +289,9 @@ fn binds(module: &str, qualifier: &str) -> bool {
 /// `Cmd` / `Sub` are absent from the table, so aliasing to them stays allowed.
 #[must_use]
 pub fn is_stdlib_canonical_qualifier(interner: &Interner, name: Symbol) -> bool {
-    interner.resolve(name).is_some_and(|n| {
-        STDLIB_MODULE_QUALIFIERS
-            .iter()
-            .any(|(_, canon)| *canon == n)
-    })
+    interner
+        .resolve(name)
+        .is_some_and(is_canonical_qualifier_text)
 }
 
 /// The reserved kernel-alias qualifier path. `import Ipe.Ffi.Kernel as Kernel`
@@ -333,21 +365,6 @@ pub enum VarHome {
     ReservedKernel { module: Symbol, name: Symbol },
 }
 
-/// One origin of a wildcard-exposed stdlib value member.
-///
-/// Records the resolved kernel [`VarHome`] together with the user's import
-/// `dep_path` (e.g. `["Ipe", "Html"]`) so an ambiguous bare use can name every
-/// contributing module in its diagnostic without re-deriving the path.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct WildcardOrigin {
-    /// The kernel home cloned from the canonical qualifier's member table — the
-    /// SAME `VarHome::Kernel` a qualified `M.member` reference resolves to, so
-    /// lowering is identical whether the call site is qualified or unqualified.
-    pub home: VarHome,
-    /// The user's import path, used only to render the ambiguity diagnostic.
-    pub dep_path: Vec<Symbol>,
-}
-
 /// Resolve a qualifier member's `(module, name)` to its [`VarHome`], choosing
 /// the variant by whether a backing [`StdlibKernel`] exists in `index`.
 ///
@@ -389,60 +406,24 @@ pub struct CtorIdentity {
     pub type_name: Symbol,
 }
 
-/// One origin of a constructor brought in by an open (`exposing (..)`) stdlib
-/// import.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct WildcardCtorOrigin {
-    /// The constructor the origin resolves to.
-    pub ctor: CtorHome,
-    /// Every importing module path that brought this origin in, used only to
-    /// name the modules in an ambiguity diagnostic.
-    pub dep_paths: BTreeSet<Vec<Symbol>>,
-}
-
-/// The result of resolving a bare constructor name.
-///
-/// Total by construction: an ambiguous open-import name is its own variant, so
-/// no caller can read it as "not found" or silently pick one origin.
-#[derive(Clone, Copy, Debug)]
-pub enum CtorLookup<'a> {
-    /// Exactly one constructor answers the name.
-    Found(&'a CtorHome),
-    /// Two or more open imports with distinct defining homes expose the name and
-    /// no higher tier shadows it.
-    Ambiguous(&'a BTreeMap<CtorIdentity, WildcardCtorOrigin>),
-    /// No tier binds the name.
-    Missing,
-}
-
 /// The name-resolution environment.
 #[derive(Clone, Debug, Default)]
 pub struct Env {
     /// The module being canonicalised.
     pub home: Vec<Symbol>,
-    /// Unqualified variable bindings.
+    /// The lexical binders in scope (function parameters, `let` and `case`
+    /// bindings), each [`VarHome::Local`].
     ///
-    /// The one genuinely scope-local table — it stays owned so per-scope
-    /// entry (`env.clone()` in `resolve.rs`) copies only the current local
-    /// bindings. Every other (large, setup-time-immutable) table below is
-    /// behind an `Rc`, making the per-scope clone a refcount bump instead of
-    /// a deep copy of the ~600-entry kernel registry (efficiency-audit §5
-    /// high). Setup-phase writes go through `Rc::make_mut` (refcount 1 →
-    /// in-place, no copy). Same maps read with the same `BTreeMap` ordering →
-    /// identical resolution + diagnostic order.
+    /// The one genuinely scope-local table: it stays owned so a per-scope
+    /// `env.clone()` copies only the current binders. Every other table below
+    /// is set up once and sits behind an `Rc`, so the per-scope clone is a
+    /// refcount bump. A lexical binder shadows every module-level name.
     pub vars: BTreeMap<Symbol, VarHome>,
-    /// Unqualified constructor bindings of the local and explicit-import tiers:
-    /// this module's unions and `import M exposing (T(..))`.
-    pub ctors: Rc<BTreeMap<Symbol, CtorHome>>,
-    /// Constructors of the open-import tier (`import M exposing (..)` of a stdlib
-    /// module): name → defining identity → origin. Consulted only after
-    /// [`Self::ctors`] misses; two identities for one bare use are IPE-N0024 at
-    /// that use.
-    pub wildcard_ctors: Rc<BTreeMap<Symbol, BTreeMap<CtorIdentity, WildcardCtorOrigin>>>,
-    /// The ambient built-in constructors (`Just`, `Ok`, `True`, `ChunkEvent`'s
-    /// `Done`, …), the lowest tier: any import or local declaration of the same
-    /// spelling shadows them.
-    pub ambient_ctors: Rc<BTreeMap<Symbol, CtorHome>>,
+    /// Every bare module-level name, in its two namespaces, each bound and read
+    /// through the one ladder in [`crate::scope`].
+    ///
+    /// Written only during module setup, through `Rc::make_mut`.
+    pub module_scope: Rc<ModuleScope>,
     /// Qualified variable bindings: qualifier → (name → home).
     pub qual_vars: Rc<BTreeMap<Symbol, BTreeMap<Symbol, VarHome>>>,
     /// Qualified constructor bindings: qualifier → (`ctor_name` → home).
@@ -452,27 +433,6 @@ pub struct Env {
     /// to `VarCtor` — needed for compiled-source ADTs like `Ipe.Money`'s
     /// `Currency` constructors accessed as `Money.USD`, `Money.EUR`, etc.
     pub qual_ctors: Rc<BTreeMap<Symbol, BTreeMap<Symbol, CtorHome>>>,
-    /// **Low-priority wildcard-exposed stdlib value members.**
-    ///
-    /// A bare value name maps to the set of stdlib modules that flooded it into
-    /// unqualified scope via `import M exposing (..)`, keyed by the module's FULL
-    /// dotted path so re-importing the same module (or importing it under an
-    /// alias) dedups to a single origin, while two distinct modules that share a
-    /// leaf segment (`Ipe.A.Input` vs `Ipe.B.Input`) stay separate origins.
-    ///
-    /// The full path — not the leaf segment — is the origin key precisely so a
-    /// same-leaf/different-path pair can never collapse to one entry and silently
-    /// mask a genuine cross-module ambiguity.
-    ///
-    /// This is a strictly LOWER-priority tier than [`Self::vars`] /
-    /// [`Self::ctors`]: [`resolve_var`](crate::resolve) consults it ONLY after a
-    /// local, top-level binding, explicit `exposing (name)`, synth record-alias
-    /// constructor, or prelude builtin of the same spelling all miss — so any of
-    /// those SILENTLY shadow a wildcard member (no `DuplicateValue`, unlike the
-    /// explicit-list path). When two or more distinct modules survive for a bare
-    /// use, that use is `AmbiguousImport` (IPE-N0024) AT THE USE SITE, never a
-    /// silent last-wins.
-    pub wildcard_vars: Rc<BTreeMap<Symbol, BTreeMap<Vec<Symbol>, WildcardOrigin>>>,
     /// **Parse-once registry index.**  Maps `(qualifier_sym, name_sym)`
     /// to the typed [`StdlibKernel`] variant, built anti-drift from
     /// [`StdlibKernel::ALL`] in `install_prelude_qualifiers`.
@@ -511,6 +471,10 @@ pub struct Env {
     pub internal_quals: Rc<BTreeSet<Symbol>>,
     /// Every module this module could import, for the unbound-qualifier verdict.
     pub module_catalog: ModuleCatalog,
+    /// Each module this module imports under an `as` alias (dotted path), with
+    /// those aliases: an unbound qualifier spelling such a module's own name is
+    /// pointed at its alias, never told to import a module already imported.
+    pub import_aliases: Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>,
     /// The module's driver-vouched trust provenance. `Ffi.binding` bodies
     /// resolve ONLY under [`ModuleOrigin::FfiInterface`]; any other origin
     /// falls through to ordinary qualified-name resolution (and fails there —
@@ -1360,9 +1324,11 @@ impl Env {
     /// segment exhausts the interner.
     fn freeze_stdlib_import_gate(&mut self, interner: &mut Interner) -> DResult<()> {
         let basics = interner.intern("Basics")?;
-        // canonical short-name → its preferred `Ipe.*` import path. The FIRST
-        // table entry naming a canonical wins, so a module with several import
-        // paths (rare) suggests its primary one deterministically.
+        // canonical short-name → its primary `Ipe.*` import path (the FIRST
+        // table entry naming it). The path is the gate's verdict only: the
+        // IPE-N0034 candidate list is every catalog module whose bare import
+        // binds the qualifier (`ModuleCatalog::modules_bound_by`), so a
+        // canonical with several paths lists them all.
         let mut canon_to_path: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
         for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
             let canon_sym = interner.intern(canonical)?;
@@ -1462,22 +1428,34 @@ impl Env {
                     index,
                     arity,
                 };
-                match qualifier {
-                    // A built-in union with a `qualified_home` (e.g. `HttpMethod`
-                    // -> `Http`) is import-scoped: its constructors are reachable
-                    // ONLY as `Http.Post`, never ambient unqualified, so a user's
-                    // own `Post`/`Get`/… constructor is not silently shadowed.
-                    Some(qsym) => {
-                        Rc::make_mut(&mut self.qual_ctors)
-                            .entry(qsym)
-                            .or_default()
-                            .insert(name, ctor_home);
-                    }
+                // A built-in union with a `qualified_home` (e.g. `HttpMethod`
+                // -> `Http`) is import-scoped: its constructors are reachable
+                // ONLY as `Http.Post`, never ambient unqualified, so a user's
+                // own `Post`/`Get`/… constructor is not silently shadowed.
+                if let Some(qsym) = qualifier {
+                    Rc::make_mut(&mut self.qual_ctors)
+                        .entry(qsym)
+                        .or_default()
+                        .insert(name, ctor_home);
+                } else {
                     // A home-less built-in (`Just`/`Nothing`/`Ok`/`Err`/`True`/
-                    // `False`) has no user module and stays ambient unqualified.
-                    None => {
-                        Rc::make_mut(&mut self.ambient_ctors).insert(name, ctor_home);
-                    }
+                    // `False`) has no user module and binds at the ambient tier.
+                    let origin = Origin {
+                        identity: Identity::Ctor(CtorIdentity {
+                            home: Vec::new(),
+                            type_name,
+                        }),
+                        target: ExprTarget::Ctor(ctor_home),
+                        importers: BTreeSet::new(),
+                        span: Span::DUMMY,
+                    };
+                    Rc::make_mut(&mut self.module_scope)
+                        .expr
+                        .bind(name, Tier::Ambient, origin)
+                        .map_err(|_| Diagnostic::CompilerBug {
+                            where_: "canon.builtin_ctor_twice",
+                            detail: "a built-in constructor name is installed twice".to_owned(),
+                        })?;
                 }
             }
         }
@@ -1493,55 +1471,6 @@ impl Env {
     #[must_use]
     pub fn lookup_var(&self, name: Symbol) -> Option<&VarHome> {
         self.vars.get(&name)
-    }
-
-    /// Look up an unqualified constructor through its tiers: local and explicit
-    /// imports, then open imports, then the ambient built-ins.
-    ///
-    /// An open-import name with two or more defining identities is
-    /// [`CtorLookup::Ambiguous`] and never falls back to an ambient entry.
-    #[must_use]
-    pub fn lookup_ctor(&self, name: Symbol) -> CtorLookup<'_> {
-        if let Some(ctor) = self.ctors.get(&name) {
-            return CtorLookup::Found(ctor);
-        }
-        match self.lookup_open_ctor(name) {
-            CtorLookup::Missing => self
-                .ambient_ctors
-                .get(&name)
-                .map_or(CtorLookup::Missing, CtorLookup::Found),
-            found_or_ambiguous => found_or_ambiguous,
-        }
-    }
-
-    /// Look up a bare constructor in the open-import tier alone
-    /// ([`Self::wildcard_ctors`]): one defining identity is
-    /// [`CtorLookup::Found`], two or more are [`CtorLookup::Ambiguous`].
-    ///
-    /// Expression resolution ranks this tier below the local and explicit
-    /// VALUE bindings (a record alias's auto-constructor), which
-    /// [`Self::lookup_ctor`] does not see.
-    #[must_use]
-    pub fn lookup_open_ctor(&self, name: Symbol) -> CtorLookup<'_> {
-        let Some(origins) = self.wildcard_ctors.get(&name) else {
-            return CtorLookup::Missing;
-        };
-        let mut each = origins.values();
-        match (each.next(), each.next()) {
-            (Some(only), None) => CtorLookup::Found(&only.ctor),
-            (Some(_), Some(_)) => CtorLookup::Ambiguous(origins),
-            // An empty origin set is never written; it binds nothing.
-            (None, _) => CtorLookup::Missing,
-        }
-    }
-
-    /// Every bare constructor name any tier binds, for a did-you-mean pool.
-    pub fn ctor_names(&self) -> impl Iterator<Item = Symbol> + '_ {
-        self.ctors
-            .keys()
-            .chain(self.wildcard_ctors.keys())
-            .chain(self.ambient_ctors.keys())
-            .copied()
     }
 
     /// Look up a qualified variable (`Qualifier.name`).
@@ -1633,6 +1562,11 @@ impl Env {
     fn install_builtin_vars(&mut self, interner: &mut Interner) -> DResult<()> {
         let basics = interner.intern("Basics")?;
         let error_sym = interner.intern("Error")?;
+        let basics_path = vec![interner.intern("Ipe")?, basics];
+        let prelude_bug = || Diagnostic::CompilerBug {
+            where_: "canon.prelude_value",
+            detail: "a prelude value has no module-level identity".to_owned(),
+        };
         for (name, module, func) in [
             ("identity", basics, "identity"),
             ("always", basics, "always"),
@@ -1660,8 +1594,21 @@ impl Env {
         ] {
             let key = interner.intern(name)?;
             let func_sym = interner.intern(func)?;
-            self.vars
-                .insert(key, kernel_home(&self.stdlib_index, module, func_sym));
+            let home = kernel_home(&self.stdlib_index, module, func_sym);
+            let identity = ValueIdentity::of(&home, key).ok_or_else(prelude_bug)?;
+            let origin = Origin {
+                identity: Identity::Value(identity),
+                target: ExprTarget::Value(home),
+                importers: BTreeSet::from([basics_path.clone()]),
+                span: Span::DUMMY,
+            };
+            // The prelude values bind as an open import of `Ipe.Basics`: a local
+            // declaration or an explicit import of the same spelling outranks
+            // them, and an open import of another definition is ambiguous.
+            Rc::make_mut(&mut self.module_scope)
+                .expr
+                .bind(key, Tier::Open, origin)
+                .map_err(|_| prelude_bug())?;
         }
         Ok(())
     }
@@ -2003,7 +1950,8 @@ mod builtin_ctor_registration_tests {
     //! would shadow a user's own same-spelled constructor. The home-less
     //! built-ins (`Just`/`Nothing`/`Ok`/`Err`/`True`/`False`) stay ambient.
 
-    use super::{CtorLookup, Env};
+    use super::Env;
+    use crate::scope::{ExprTarget, Resolved, Tier};
     use ipe_intern::Interner;
 
     /// The `HttpMethod` verbs must NOT be ambient unqualified — a user's own
@@ -2015,7 +1963,7 @@ mod builtin_ctor_registration_tests {
         for verb in ["Get", "Post", "Put", "Delete", "Patch", "Head", "Options"] {
             let sym = interner.intern(verb).expect("intern");
             assert!(
-                matches!(env.lookup_ctor(sym), CtorLookup::Missing),
+                matches!(env.module_scope.expr.resolve(sym), Resolved::Missing),
                 "`{verb}` must not be an ambient unqualified constructor \
                  (it would shadow a user's own `{verb}` ctor)"
             );
@@ -2049,7 +1997,11 @@ mod builtin_ctor_registration_tests {
         for ctor in ["Just", "Nothing", "Ok", "Err", "True", "False"] {
             let sym = interner.intern(ctor).expect("intern");
             assert!(
-                matches!(env.lookup_ctor(sym), CtorLookup::Found(_)),
+                matches!(
+                    env.module_scope.expr.resolve(sym),
+                    Resolved::Found(origin, Tier::Ambient)
+                        if matches!(origin.target, ExprTarget::Ctor(_))
+                ),
                 "`{ctor}` must stay an ambient unqualified constructor"
             );
         }

@@ -7,8 +7,9 @@ use super::{
     emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_loop_call, emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template,
-    emit_update, float_literal, free_vars, indent_of, inlined_let_body, ir_type_is_definitely_copy,
-    once_closure_bug, op_str, render_type, rust_str_lit, swapped_container_clone_rewrite,
+    emit_update, float_literal, free_vars, indent_of, infix, inlined_let_body, int_literal,
+    ir_type_is_definitely_copy, once_closure_bug, render_type, rust_str_lit,
+    swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
@@ -41,8 +42,9 @@ pub fn emit_expr_at(
         // explicit even when rustc cannot infer it from context alone (e.g. a
         // polymorphic value argument whose type parameter is not constrained by
         // the return type — as in `Cache.put cache key 42` where `T2` is only
-        // constrained by the stored value, not the result).
-        Expr::Int(n) => Ok(format!("{n}i64")),
+        // constrained by the stored value, not the result). [`int_literal`]
+        // parenthesises a negative value so the leaf stays a primary expression.
+        Expr::Int(n) => Ok(int_literal(*n)),
         // A float literal renders as an f64-typed Rust literal. A whole-number
         // value keeps its decimal point (`3.0`) so Rust never types it as an
         // integer; see [`float_literal`].
@@ -130,7 +132,15 @@ pub fn emit_expr_at(
                 | BinOp::Le
                 | BinOp::Ge
                 | BinOp::And
-                | BinOp::Or => Ok(format!("({} {} {})", l, op_str(*op), r)),
+                | BinOp::Or => {
+                    let Some(sym) = infix(*op) else {
+                        return Err(Diagnostic::CompilerBug {
+                            where_: "ipe_backend_rust::emit_expr::expr::emit_expr_at",
+                            detail: format!("{op:?} matched the infix arm but `infix` returned None"),
+                        });
+                    };
+                    Ok(format!("({} {} {})", l, sym.spelling(), r))
+                }
                 // Generic (polymorphic `Number a`) `+`/`-`/`*`: route through
                 // `IpeWrappingAdd/Sub/Mul` method calls. The bound in
                 // `render_bounds` is already set to the wrapping trait, so the
