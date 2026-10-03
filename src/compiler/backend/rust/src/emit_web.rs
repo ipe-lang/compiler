@@ -500,8 +500,15 @@ fn emit_web_app_inner(
 }
 
 /// The env-read store kind + path and the schema-tag const every served web entry takes last.
-const WEB_STORE_ARGS: &str = "::std::env::var(\"IPE_WEB_STORE\").unwrap_or_else(|_| \"memory\".to_string()), \
-     ::std::env::var(\"IPE_WEB_STORE_PATH\").unwrap_or_else(|_| ::std::string::String::new()), \
+///
+/// Both reads go through the runtime's overlay-first accessor
+/// (`system::system_getenv_or`, the one `System.getenvOr` uses), so a value the
+/// program set or loaded is observed and no emitted read bypasses the runtime's
+/// env policy.
+const WEB_STORE_ARGS: &str = "ipe_runtime::system::system_getenv_or(\
+     ::std::string::String::from(\"IPE_WEB_STORE\"), ::std::string::String::from(\"memory\")), \
+     ipe_runtime::system::system_getenv_or(\
+     ::std::string::String::from(\"IPE_WEB_STORE_PATH\"), ::std::string::String::new()), \
      IPE_WEB_MODEL_SCHEMA_TAG";
 
 /// Emit the routed (`Model` has a `page` field) `WebApp` leaf.
@@ -3692,5 +3699,27 @@ mod route_table_tests {
         assert!(!param_decodes(&IrType::Bool, "1"));
         assert!(param_decodes(&IrType::Float, "NaN"));
         assert!(!param_decodes(&IrType::Unit, "x"));
+    }
+}
+
+#[cfg(test)]
+mod web_store_args_tests {
+    use super::WEB_STORE_ARGS;
+
+    /// The served entry's store reads go through the runtime's overlay-first
+    /// accessor; a raw process-environment read would bypass the overlay.
+    #[test]
+    fn web_store_reads_route_through_the_runtime_accessor() {
+        assert!(
+            !WEB_STORE_ARGS.contains("std::env::"),
+            "an emitted store read bypasses the runtime env accessor: {WEB_STORE_ARGS}"
+        );
+        assert_eq!(
+            WEB_STORE_ARGS
+                .matches("ipe_runtime::system::system_getenv_or(")
+                .count(),
+            2,
+            "both store reads must use `system::system_getenv_or`: {WEB_STORE_ARGS}"
+        );
     }
 }
