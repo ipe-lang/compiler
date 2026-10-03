@@ -570,6 +570,11 @@ fn infer_core(
     // nor a kernel-alias route, marks the whole interface open — fail closed.
     let mut reified_untyped: BTreeMap<Symbol, Ty> = BTreeMap::new();
     let mut interface_open = false;
+    // Scoped solve only: whether `key` is one of this module's exported values
+    // (a binding an importer's use sites can reach).
+    let exported_by_scoped_module = |key: &(Vec<Symbol>, Symbol)| {
+        scoped.is_some_and(|ctx| key.0 == m.name && ctx.exports.values.contains(&key.1))
+    };
     if let Some(ctx) = scoped {
         for name in &ctx.exports.values {
             if ctx.exports.kernel_aliases.contains_key(name) {
@@ -801,6 +806,12 @@ fn infer_core(
                 .collect();
             if candidates.is_empty() {
                 continue;
+            }
+            // Whether a candidate defaults depends on EVERY use site, importers'
+            // included, so an exported candidate makes this module's own solved
+            // facts importer-dependent: no per-module result is faithful.
+            if exported_by_scoped_module(key) {
+                interface_open = true;
             }
             let empty = Vec::new();
             let apps = apps_by_binding.get(key).unwrap_or(&empty);
@@ -1047,6 +1058,11 @@ fn infer_core(
             let tagged_sym = Symbol::from_raw(tag_solver_var(root));
             let msg_only = ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym);
             if msg_only {
+                // A cross-module use may pin this slot in the joint solve, so an
+                // exported msg-only root leaves no per-module result faithful.
+                if exported_by_scoped_module(key) {
+                    interface_open = true;
+                }
                 let rep = lift!(uf.find(root));
                 lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
             }
