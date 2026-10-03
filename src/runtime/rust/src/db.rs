@@ -9247,7 +9247,8 @@ mod tests {
         );
     }
 
-    /// `Ignore` shares every refusal of the upsert builder.
+    /// `Ignore` shares every refusal of the upsert builder, each with its own
+    /// typed reason.
     #[test]
     fn insert_if_absent_sql_refuses_malformed_requests() {
         let key = || ("k", Some(SqlParam::Text("a".to_string())));
@@ -9259,18 +9260,52 @@ mod tests {
                     vec![key(), ("v = 1; --", Some(SqlParam::Int(1)))],
                     ConflictAction::Ignore,
                 ),
+                invalid(IdentSlot::Column(ColumnList::Fields), "v = 1; --"),
+            ),
+            (
+                "hostile conflict-target column",
+                conflict_sql(
+                    &["k) DO UPDATE SET v = 1; --"],
+                    vec![key()],
+                    ConflictAction::Ignore,
+                ),
+                invalid(
+                    IdentSlot::Column(ColumnList::ConflictTarget),
+                    "k) DO UPDATE SET v = 1; --",
+                ),
             ),
             (
                 "empty conflict target",
                 conflict_sql(&[], vec![key()], ConflictAction::Ignore),
+                DbBuildError::EmptyTarget,
             ),
             (
                 "conflict-target column is OmitField",
                 conflict_sql(&["id"], vec![key(), ("id", None)], ConflictAction::Ignore),
+                DbBuildError::TargetNotSupplied {
+                    name: "id".to_string(),
+                },
+            ),
+            (
+                "conflict-target column is SqlNull",
+                conflict_sql(
+                    &["k"],
+                    vec![(
+                        "k",
+                        Some(SqlParam::Null(Box::new(SqlParam::Text(String::new())))),
+                    )],
+                    ConflictAction::Ignore,
+                ),
+                DbBuildError::NullTarget {
+                    name: "k".to_string(),
+                },
             ),
         ];
-        for (label, built) in cases {
-            assert!(built.is_err(), "{label} must be refused, got {built:?}");
+        for (label, built, want) in cases {
+            assert!(
+                matches!(&built, Err(got) if *got == want),
+                "{label} must be refused with {want:?}, got {built:?}"
+            );
         }
     }
 
