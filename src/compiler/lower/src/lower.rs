@@ -1318,7 +1318,7 @@ fn row_value_escapes_direct_access(body: &Expr, row_syms: &BTreeSet<Symbol>) -> 
 //       `CloneVar` (`.clone()`) and return IPE-L0125 for `NonClone` captures
 //       outside direct callee position.
 //
-// `Lowerer::captured_locals` drives (a)+(b) and returns the classified
+// `Lowerer::captured_locals_at` drives (a)+(b) and returns the classified
 // capture list consumed by (c).
 
 /// Collect all symbols bound by `pat` into `bound`.
@@ -1432,7 +1432,7 @@ fn arm_binder_scope(arm_syms: &[Symbol]) -> BinderScope {
 
 /// Walk `expr` collecting `VarLocal` symbols free relative to `bound`.
 /// Records each free symbol's first-seen use-site span (for region-type
-/// lookup by [`Lowerer::captured_locals`]).
+/// lookup by [`Lowerer::captured_locals_at`]).
 ///
 /// Shadow discipline: `Let` bindings accumulate names sequentially before the
 /// continuation body; `Case` arm patterns shadow inside that arm; inner
@@ -18762,22 +18762,10 @@ impl<'a> Lowerer<'a> {
     ///
     /// Walks `canon_body` collecting every `VarLocal` free relative to
     /// `lambda_param_pats` (all flattened param patterns of the enclosing
-    /// closure), paired with its IR type resolved at its first use site through
-    /// [`Self::binder_ir_type`]. A capture is a use, so a capture whose type
-    /// does not resolve refuses rather than going unclassified.
-    fn captured_locals(
-        &self,
-        lambda_param_pats: &[&canon::Pattern],
-        canon_body: &canon::Expr,
-    ) -> DResult<Vec<(Symbol, BinderType)>> {
-        Ok(self
-            .captured_locals_at(lambda_param_pats, canon_body)?
-            .into_iter()
-            .map(|(sym, _, ty)| (sym, ty))
-            .collect())
-    }
-
-    /// [`Self::captured_locals`] with each capture's use-site span, for a diagnostic at the capture.
+    /// closure), paired with its use-site span and its IR type resolved at its
+    /// first use site through [`Self::binder_ir_type`]. A capture is a use, so a
+    /// capture whose type does not resolve refuses rather than going
+    /// unclassified.
     fn captured_locals_at(
         &self,
         lambda_param_pats: &[&canon::Pattern],
@@ -29783,7 +29771,7 @@ impl<'a> Lowerer<'a> {
     /// deliberately does not have.
     ///
     /// `canon_value` is the CANON (pre-lowering) expression the binding
-    /// evaluates — [`Self::captured_locals`] needs it (not the lowered
+    /// evaluates — [`Self::captured_locals_at`] needs it (not the lowered
     /// `value`) for the T3 capture-clone analysis on the thunk body,
     /// exactly as [`Self::lower_let`]'s `PVar` Decoder arm does.
     fn build_destructure_or_decoder_thunk(
@@ -31999,7 +31987,7 @@ mod tests {
     fn captured_locals_refuses_unlowerable_capture() {
         with_binder_type_lowerer(|lowerer, sym| {
             let body = Located::new(FUN_FREE_VAR_SPAN, canon::Expr_::VarLocal(sym));
-            let got = lowerer.captured_locals(&[], &body);
+            let got = lowerer.captured_locals_at(&[], &body);
             assert!(
                 matches!(
                     got,
@@ -32018,7 +32006,7 @@ mod tests {
     fn captured_locals_refuses_untyped_capture() {
         with_binder_type_lowerer(|lowerer, sym| {
             let body = Located::new(UNTYPED_SPAN, canon::Expr_::VarLocal(sym));
-            let got = lowerer.captured_locals(&[], &body);
+            let got = lowerer.captured_locals_at(&[], &body);
             assert!(
                 matches!(got, Err(super::Diagnostic::CompilerBug { .. })),
                 "an untyped capture must refuse, got {got:?}"
@@ -32031,11 +32019,11 @@ mod tests {
     fn captured_locals_types_lowerable_capture() {
         with_binder_type_lowerer(|lowerer, sym| {
             let body = Located::new(UNIT_SPAN, canon::Expr_::VarLocal(sym));
-            let got = lowerer.captured_locals(&[], &body);
+            let got = lowerer.captured_locals_at(&[], &body);
             assert!(
                 matches!(
                     got.as_deref(),
-                    Ok([(s, super::BinderType::Resolved(super::IrType::Unit))]) if *s == sym
+                    Ok([(s, _, super::BinderType::Resolved(super::IrType::Unit))]) if *s == sym
                 ),
                 "a lowerable capture must carry its type, got {got:?}"
             );
