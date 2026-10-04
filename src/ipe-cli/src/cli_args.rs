@@ -2365,7 +2365,7 @@ mod tests {
             let err = parse_release_build(&s(&[flag]));
             assert!(
                 matches!(&err, Err(CliError::Usage(m))
-                    if m.to_string() == format!("ipe release build: unknown flag `{flag}`")),
+                    if *m == format!("ipe release build: unknown flag `{flag}`")),
                 "{flag}: {err:?}"
             );
         }
@@ -2403,7 +2403,7 @@ mod tests {
         let err = parse_build(&s(&["--emit-permissions", "ios"]));
         assert!(
             matches!(&err, Err(CliError::Usage(m))
-                if m.to_string() == "ipe dev build: unknown flag `--emit-permissions`"),
+                if m == "ipe dev build: unknown flag `--emit-permissions`"),
             "{err:?}"
         );
         let a = parse_release_build(&s(&["--emit-permissions", "ios"])).expect("release build");

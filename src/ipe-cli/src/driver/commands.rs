@@ -4149,12 +4149,11 @@ mod capability_resolution_once_tests {
         // one resolution site; `ipe capabilities` is the inspection form.
         assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 1);
         assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
-        for site in ["consent_to_capabilities"] {
-            let body = fn_body(site);
-            assert!(body.is_some(), "{site} is defined in this module");
-            let Some(body) = body else { return };
-            assert_eq!(body.matches(RESOLVE_CALL).count(), 1, "{site}");
-        }
+        let site = "consent_to_capabilities";
+        let body = fn_body(site);
+        assert!(body.is_some(), "{site} is defined in this module");
+        let Some(body) = body else { return };
+        assert_eq!(body.matches(RESOLVE_CALL).count(), 1, "{site}");
     }
 
     #[test]
