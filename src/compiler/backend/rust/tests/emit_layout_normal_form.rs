@@ -9,7 +9,8 @@
 //! - a block opened by `{` never starts with a blank line, and a closing `}`
 //!   never follows one (so an empty body renders `{}`);
 //! - never two consecutive blank lines (rustfmt's maximum is one);
-//! - no trailing whitespace, and exactly one final newline.
+//! - no trailing whitespace, and exactly one final newline;
+//! - an empty brace pair renders `{}`, never `{ }`.
 //!
 //! The goldens are regenerated from the emitter (`cargo run -p regen-goldens`,
 //! drift-checked in CI), so walking them checks the emitter's output for every
@@ -25,6 +26,10 @@ const ITEM_STARTS: &[&str] = &[
     "async fn ",
     "impl",
     "#[",
+    "#![",
+    "extern ",
+    "macro_rules!",
+    "unsafe ",
     "//",
     "struct ",
     "enum ",
@@ -88,6 +93,12 @@ fn layout_violations(text: &str) -> Vec<Violation> {
             found.push(Violation {
                 line: idx + 1,
                 rule: "no trailing whitespace",
+            });
+        }
+        if line.contains("{ }") || line.contains("{  }") {
+            found.push(Violation {
+                line: idx + 1,
+                rule: "an empty brace pair holds no space",
             });
         }
     }
@@ -207,6 +218,19 @@ fn a_missing_or_doubled_final_newline_is_refused() {
             layout_violations(text)
                 .iter()
                 .any(|v| v.rule == "the file ends with exactly one newline")
+        );
+    }
+}
+
+#[test]
+fn a_spaced_empty_brace_pair_is_refused() {
+    for text in ["let r = Rec_ {  };\n", "let r = Rec_ { };\n"] {
+        assert_eq!(
+            layout_violations(text),
+            vec![Violation {
+                line: 1,
+                rule: "an empty brace pair holds no space",
+            }]
         );
     }
 }
