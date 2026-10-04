@@ -636,7 +636,7 @@ impl PublicEnvAllowlist {
 
     /// Whether no name is allowlisted.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
 
@@ -1860,7 +1860,9 @@ import String
 
     #[test]
     fn public_env_name_parse_classifies_each_refusal() {
-        let cases: [(&str, fn(&PublicEnvRefusal) -> bool); 6] = [
+        /// Whether a refusal is the expected arm for its entry.
+        type RefusalCheck = fn(&PublicEnvRefusal) -> bool;
+        let cases: [(&str, RefusalCheck); 6] = [
             (
                 "TMPDIR",
                 |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "TMPDIR"),
