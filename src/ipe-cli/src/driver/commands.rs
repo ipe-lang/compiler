@@ -1,5 +1,5 @@
 use super::{
-    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, OutTarget,
+    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget,
     RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
     bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
     collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
@@ -854,11 +854,11 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     let native_artifact = match compile_target {
         CompileTarget::WasmClient => {
-            bundle_wasm(&crate_dir)?;
+            bundle_wasm(crate_dir.dir())?;
             None
         }
         CompileTarget::WasmWasi => {
-            bundle_wasi(&crate_dir)?;
+            bundle_wasi(crate_dir.dir())?;
             None
         }
         CompileTarget::Native => Some(compile_and_finalize_native_build(
@@ -907,7 +907,7 @@ fn emit_into(
     target: &EmitTarget,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let out = OutTarget::Proven(target);
     match manifest {
         Some(m) => build_project_into(m, out, runtime_dir, &options),
@@ -946,13 +946,24 @@ pub enum NativeFinish<'a> {
     },
 }
 
+impl NativeFinish<'_> {
+    /// The posture's name in an internal-bug diagnostic.
+    const fn posture(&self) -> &'static str {
+        match self {
+            Self::Dev => "development",
+            Self::Release { .. } => "release",
+        }
+    }
+}
+
 /// The cargo build of an emitted native crate in its [`NativeFinish`]
 /// posture: the one path every dev and release native build takes.
 pub struct FlooredBuild<'a> {
     /// The resolved `cargo`.
     pub(crate) cargo: &'a toolchain::CargoBin,
-    /// The emitted crate, both floored and built.
-    pub(crate) crate_dir: &'a OwnedDir,
+    /// The emitted crate, both floored and built; the floor line it was
+    /// written with must be the one [`Self::finish`] builds.
+    pub(crate) crate_dir: &'a EmittedCrate,
     /// The posture: it decides the floor and picks the cargo profile, so a
     /// release floor is never built as a debug binary and a dev build carries
     /// only the development marker.
@@ -975,24 +986,44 @@ impl FlooredBuild<'_> {
     /// constant development marker, with no capability inference.
     ///
     /// # Errors
-    /// The errors of [`run_sandbox::build_profile`],
+    /// [`CliError::Pipeline`] (an internal bug) when the crate was emitted
+    /// with a floor line other than the one the finish builds, before anything
+    /// is written or cargo runs; the errors of [`run_sandbox::build_profile`],
     /// [`run_sandbox::write_build_artifacts`],
     /// [`run_sandbox::write_dev_floor_marker`] and [`CargoBuild::run`].
     pub(crate) fn run(self) -> Result<String, CliError> {
-        let profile = match self.finish {
-            NativeFinish::Dev => {
-                run_sandbox::write_dev_floor_marker(self.crate_dir)?;
+        let crate_dir = self.crate_dir.dir();
+        let profile = match (self.crate_dir.floor(), self.finish) {
+            (run_sandbox::EmitFloor::DevelopmentMarker, NativeFinish::Dev) => {
+                run_sandbox::write_dev_floor_marker(crate_dir)?;
                 CargoProfile::Dev
             }
-            NativeFinish::Release { consented, driver } => {
+            (
+                run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+                NativeFinish::Release { consented, driver },
+            ) => {
                 let floor = run_sandbox::build_profile(consented.resolved(), driver)?;
-                run_sandbox::write_build_artifacts(self.crate_dir, &floor)?;
+                run_sandbox::write_build_artifacts(crate_dir, &floor)?;
                 CargoProfile::Release
+            }
+            (floor @ run_sandbox::EmitFloor::NoNativeBinary, finish)
+            | (
+                floor @ run_sandbox::EmitFloor::DevelopmentMarker,
+                finish @ NativeFinish::Release { .. },
+            )
+            | (floor @ run_sandbox::EmitFloor::ReleaseFloorAtBuild, finish @ NativeFinish::Dev) => {
+                return Err(super::build_pipeline::floor_mismatch_bug(
+                    "ipe_cli::FlooredBuild::run",
+                    format!(
+                        "a {} native build was handed a crate emitted with {floor:?}",
+                        finish.posture()
+                    ),
+                ));
             }
         };
         CargoBuild {
             cargo: self.cargo,
-            krate: CargoCrate::Emitted(self.crate_dir),
+            krate: CargoCrate::Emitted(crate_dir),
             profile,
             target: self.target,
             output: self.output,
@@ -1010,7 +1041,7 @@ impl FlooredBuild<'_> {
 /// The errors of [`FlooredBuild::run`].
 fn build_pure_native_release(
     cargo: &toolchain::CargoBin,
-    crate_dir: &OwnedDir,
+    crate_dir: &EmittedCrate,
     consented: &ConsentedCapabilities,
     driver: ipe_backend_rust::DbDriver,
     triple: ipe_backend_rust::static_build::StaticTriple,
@@ -1052,7 +1083,7 @@ fn build_pure_native_release(
 /// - The toolchain and manifest-parse errors of the steps it composes.
 pub fn compile_and_finalize_native_build(
     output: &OutputRoot,
-    crate_dir: &OwnedDir,
+    crate_dir: &EmittedCrate,
     build: NativeBuild,
     manifest: Option<&Path>,
 ) -> Result<PathBuf, CliError> {
@@ -1610,7 +1641,7 @@ pub fn release_pipeline(
                 &runtime_dir,
                 options,
             )?;
-            bundle_wasm(&crate_dir)?;
+            bundle_wasm(crate_dir.dir())?;
             if show_progress {
                 crate::screen::chatter(
                     crate::screen::Stream::Stderr,
@@ -2860,13 +2891,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     //     EXECUTE it under embedded wasmtime with the dev ambient context.
     //   * Native — fall through to the cargo build + exec below.
     match compile_target {
-        CompileTarget::WasmClient => return bundle_wasm(&crate_dir),
+        CompileTarget::WasmClient => return bundle_wasm(crate_dir.dir()),
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
             // reaching here means the embedded engine is linked. Build the module
             // first — a green build is THE SEAL (ipe-accepts ⇒ cargo-builds for
             // the target) — then run it.
-            let module = bundle_wasi(&crate_dir)?;
+            let module = bundle_wasi(crate_dir.dir())?;
             let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
                 path: PathBuf::from("."),
                 source: e,
@@ -4363,10 +4394,14 @@ mod held_crate_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A claimed crate holding a bare `src/main.rs`, and a stub `cargo` that
-    /// records the `main.rs` and the arguments it was handed, then fails the
-    /// build. Returns `(base, crate, cargo, seen main.rs, seen arguments)`.
-    fn floor_recording_build(tag: &str) -> (PathBuf, OwnedDir, PathBuf, PathBuf, PathBuf) {
+    /// A claimed crate holding a bare `src/main.rs`, staged as emitted with
+    /// `floor`, and a stub `cargo` that records the `main.rs` and the
+    /// arguments it was handed, then fails the build. Returns
+    /// `(base, crate, cargo, seen main.rs, seen arguments)`.
+    fn floor_recording_build(
+        tag: &str,
+        floor: crate::run_sandbox::EmitFloor,
+    ) -> (PathBuf, super::EmittedCrate, PathBuf, PathBuf, PathBuf) {
         let (base, crate_dir) = scratch(tag);
         let src = crate_dir.path().join("src");
         std::fs::create_dir_all(&src).expect("src dir");
@@ -4384,7 +4419,13 @@ mod held_crate_tests {
                 seen_args.display()
             ),
         );
-        (base, crate_dir, cargo, seen, seen_args)
+        (
+            base,
+            super::EmittedCrate::assume_written(crate_dir, floor),
+            cargo,
+            seen,
+            seen_args,
+        )
     }
 
     /// The resolved capabilities of a native-bearing program.
@@ -4411,7 +4452,10 @@ mod held_crate_tests {
             FloorIntent, FloorRefusal, SandboxProfile, scan_capfloor, verify_release_floor,
         };
 
-        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("dev-marker");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "dev-marker",
+            crate::run_sandbox::EmitFloor::DevelopmentMarker,
+        );
         let project = base.join("project");
         std::fs::create_dir_all(&project).expect("project dir");
         let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
@@ -4486,7 +4530,10 @@ mod held_crate_tests {
         use ipe_backend_rust::static_build::StaticTriple;
         use ipe_sandbox::run_jail::FloorIntent;
 
-        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("release-floor");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "release-floor",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+        );
         let consented = ConsentedCapabilities {
             resolved: native_bearing(),
         };
@@ -4542,7 +4589,10 @@ mod held_crate_tests {
         use ipe_backend_rust::static_build::StaticTriple;
         use ipe_sandbox::run_jail::FloorIntent;
 
-        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("pure-native");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "pure-native",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+        );
         let consented = ConsentedCapabilities {
             resolved: crate::run_sandbox::ResolvedCapabilities {
                 inferred: std::collections::BTreeSet::new(),
@@ -4587,6 +4637,132 @@ mod held_crate_tests {
             "the pure-native release is built --release for its static target: {args}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Run a floored build of a crate emitted with `floor` in `finish`, and
+    /// assert it is refused as an internal bug before anything is written or
+    /// cargo runs.
+    fn assert_mismatch_refused(
+        tag: &str,
+        floor: crate::run_sandbox::EmitFloor,
+        finish: impl FnOnce(&super::ConsentedCapabilities) -> super::NativeFinish<'_>,
+    ) {
+        use super::{ConsentedCapabilities, FlooredBuild};
+
+        let (base, crate_dir, cargo, seen, _) = floor_recording_build(tag, floor);
+        let main_rs = crate_dir.path().join("src").join("main.rs");
+        let before = std::fs::read_to_string(&main_rs).expect("main.rs");
+        let consented = ConsentedCapabilities {
+            resolved: native_bearing(),
+        };
+        let built = FlooredBuild {
+            cargo: &CargoBin::stub(cargo),
+            crate_dir: &crate_dir,
+            finish: finish(&consented),
+            target: CargoTarget::Host,
+            output: CargoOutput::Human(Verbosity::Quiet),
+            what: "the emitted program",
+            runtime: None,
+        }
+        .run();
+        assert!(
+            matches!(
+                &built,
+                Err(CliError::Pipeline { diag, .. })
+                    if matches!(**diag, ipe_diagnostics::Diagnostic::CompilerBug { .. })
+            ),
+            "a {floor:?} crate in the wrong finish is an internal bug: {built:?}"
+        );
+        assert!(!seen.exists(), "cargo never runs over a mismatched crate");
+        assert_eq!(
+            std::fs::read_to_string(&main_rs).expect("main.rs"),
+            before,
+            "a mismatched crate is left unwritten"
+        );
+        assert!(
+            !crate_dir.path().join("ipe.profile").exists(),
+            "a mismatched crate gets no profile"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A crate emitted with the development marker is never built in the
+    /// release finish: its release floor would sit beside the marker.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_dev_marked_crate_is_refused_by_the_release_finish() {
+        assert_mismatch_refused(
+            "mismatch-dev-in-release",
+            crate::run_sandbox::EmitFloor::DevelopmentMarker,
+            |consented| super::NativeFinish::Release {
+                consented,
+                driver: ipe_backend_rust::DbDriver::Sqlite,
+            },
+        );
+    }
+
+    /// A crate emitted for the release floor is never built in the dev finish:
+    /// it would ship a debug binary from a release-intent emit.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_release_emit_is_refused_by_the_dev_finish() {
+        assert_mismatch_refused(
+            "mismatch-release-in-dev",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+            |_| super::NativeFinish::Dev,
+        );
+    }
+
+    /// A wasm emit is never built as a native binary in either finish.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_wasm_emit_is_refused_by_both_native_finishes() {
+        assert_mismatch_refused(
+            "mismatch-wasm-in-dev",
+            crate::run_sandbox::EmitFloor::NoNativeBinary,
+            |_| super::NativeFinish::Dev,
+        );
+        assert_mismatch_refused(
+            "mismatch-wasm-in-release",
+            crate::run_sandbox::EmitFloor::NoNativeBinary,
+            |consented| super::NativeFinish::Release {
+                consented,
+                driver: ipe_backend_rust::DbDriver::Sqlite,
+            },
+        );
+    }
+
+    /// Only a crate emitted with the development marker yields a dev-marked
+    /// witness for a development cargo step outside the floored build.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn only_a_dev_marked_emit_yields_a_dev_marked_crate() {
+        use crate::run_sandbox::EmitFloor;
+        for (tag, floor, admitted) in [
+            ("witness-dev", EmitFloor::DevelopmentMarker, true),
+            ("witness-release", EmitFloor::ReleaseFloorAtBuild, false),
+            ("witness-wasm", EmitFloor::NoNativeBinary, false),
+        ] {
+            let (base, crate_dir) = scratch(tag);
+            let emitted = super::EmittedCrate::assume_written(crate_dir, floor);
+            let marked = emitted.dev_marked();
+            assert_eq!(
+                marked.is_ok(),
+                admitted,
+                "{floor:?} yields a dev-marked crate only when it is the marker: {marked:?}"
+            );
+            if !admitted {
+                assert!(
+                    matches!(
+                        &marked,
+                        Err(CliError::Pipeline { diag, .. })
+                            if matches!(**diag, ipe_diagnostics::Diagnostic::CompilerBug { .. })
+                    ),
+                    "{marked:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
 

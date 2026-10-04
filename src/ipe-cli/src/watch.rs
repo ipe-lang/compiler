@@ -1647,6 +1647,20 @@ fn run_inner(
                                 continue;
                             }
                         };
+                        // The watch cargo step compiles only a crate written
+                        // with the development marker.
+                        let marked = match crate_dir.dev_marked() {
+                            Ok(marked) => marked,
+                            Err(e) => {
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(&format!(
+                                        "[ipe dev watch] failed to write emitted project: {e}"
+                                    )),
+                                    WatchRole::Failure,
+                                );
+                                continue;
+                            }
+                        };
                         timings.write = Some(write_started.elapsed());
                         // This emit is about to be compiled into the new running
                         // binary, so it becomes the classifier's baseline for the
@@ -1694,7 +1708,7 @@ fn run_inner(
                         }
                         match spawn_cargo_build(
                             &opts.cargo_path,
-                            crate_dir.path(),
+                            marked,
                             opts.target_dir.as_deref(),
                             generation,
                             evt_tx.clone(),
@@ -1702,7 +1716,7 @@ fn run_inner(
                         ) {
                             Ok(child) => {
                                 cargo_child = Some(child);
-                                building = Some(crate_dir);
+                                building = Some(crate_dir.into_dir());
                             }
                             Err(e) => emit_watch_line(
                                 &crate::style::TerminalSafe::sanitize(&format!(
@@ -3228,16 +3242,16 @@ fn env_flag_on(name: &str) -> bool {
 /// An I/O error if the `cargo` process itself cannot be spawned.
 fn spawn_cargo_build(
     cargo_path: &Path,
-    out_dir: &Path,
+    krate: crate::DevMarkedCrate<'_>,
     target_dir: Option<&Path>,
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
-    let accel = choose_build_accel(out_dir, target_dir, env_flag_on(NO_INCREMENTAL_ENV));
+    let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
     let build = crate::cargo_step::WatchBuild {
         cargo: cargo_path,
-        crate_dir: out_dir,
+        krate,
         target_dir,
         accel: &accel,
         verbosity: crate::cargo_step::Verbosity::of_quiet(quiet),
@@ -4234,9 +4248,15 @@ mod tests {
     ) -> Option<super::CargoOutcome> {
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, rx) = mpsc::channel();
-        let child =
-            super::spawn_cargo_build(cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true)
-                .expect("spawn fake cargo");
+        let child = super::spawn_cargo_build(
+            cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        )
+        .expect("spawn fake cargo");
         before_exit(child.as_ref());
         let event = rx.recv_timeout(Duration::from_secs(30));
         let _ = std::fs::remove_dir_all(out_dir);
@@ -4283,8 +4303,14 @@ mod tests {
         let cargo = fake_cargo("waiter_refused", "exec sleep 30");
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, _rx) = mpsc::channel();
-        let spawned =
-            super::spawn_cargo_build(&cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true);
+        let spawned = super::spawn_cargo_build(
+            &cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        );
         let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
         let _ = std::fs::remove_dir_all(out_dir);
         assert!(
@@ -4415,6 +4441,10 @@ mod tests {
             false,
             super::REBUILD_FLOOR,
         )?;
+        assert!(
+            written.dev_marked().is_ok(),
+            "a watch rebuild's crate is dev-marked for its cargo step"
+        );
         let main_rs = std::fs::read_to_string(written.path().join("src").join("main.rs"))?;
         assert!(
             main_rs.contains(&crate::run_sandbox::dev_floor_marker_source()),

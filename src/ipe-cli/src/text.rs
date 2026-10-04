@@ -130,6 +130,7 @@ relayable!(
     ipe_docs::argv::NonUtf8Argument,
     ipe_lint::ConfigError,
     ipe_sandbox::run_jail::RunJailDefect,
+    ipe_sandbox::run_jail::FloorRefusal,
     ipe_ffi::diag::Diagnostic,
     ipe_ffi::diag::WireDefect,
 );
@@ -1475,12 +1476,12 @@ messages! {
     publish_fresh_refused(name) = "publish-fresh-refused";
     /// The emitted `fn main` anchor is absent from the build.
     run_main_anchor_absent = "run-main-anchor-absent";
+    /// The emitted source holds more than one `fn main` anchor line.
+    run_main_anchor_ambiguous = "run-main-anchor-ambiguous";
+    /// An emitted source's prior floor block is not one ipe wrote.
+    run_floor_block_malformed = "run-floor-block-malformed";
     /// A jail profile does not parse.
     run_profile_unparsable(code, detail) = "run-profile-unparsable";
-    /// A binary carries no readable capability floor.
-    run_floor_unreadable(code) = "run-floor-unreadable";
-    /// A binary's capability floor was embedded by a development build.
-    run_floor_not_release(code) = "run-floor-not-release";
     /// A declared program entry outside `Main` is not yet buildable.
     build_entry_not_main(module) = "build-entry-not-main";
     /// `ipe pack` is retired.

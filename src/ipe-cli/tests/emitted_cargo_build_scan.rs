@@ -1,60 +1,122 @@
 #![forbid(unsafe_code)]
-//! Refuses every `CargoCrate::Emitted` built outside its listed sites.
+//! Refuses every cargo build of an emitted crate outside its listed sites.
 //!
 //! A native binary built from an emitted crate is a binary `ipe release run`
-//! reads a capability floor from, so every such build goes through
-//! `FlooredBuild::run`, which embeds the floor its posture decides before cargo
-//! starts. The wasm bundlers build crates no native reader runs, so they are
-//! the only other sites. A `CargoCrate::Emitted` constructed anywhere else is a
-//! native build that could skip the floor, and is refused.
+//! reads a capability floor from, so the build must start from a crate whose
+//! floor line is known. Two acts are held, at the act itself:
+//!
+//! - building the `cargo build` command — `build_command`, called only by
+//!   `CargoBuild::command` and `WatchBuild::command` (every other cargo child
+//!   is held by `cargo_step_scan`);
+//! - constructing each value those two commands build from: a
+//!   `CargoCrate::Emitted` (only in `FlooredBuild::run`, which embeds the floor
+//!   its posture decides, and the wasm bundlers, whose crates no native reader
+//!   runs), a `WatchBuild` (only in the watch loop's `spawn_cargo_build`, from a
+//!   `DevMarkedCrate`), an `EmittedCrate` (only in `write_emitted_project`, which
+//!   wrote the floor it records) and a `DevMarkedCrate` (only in
+//!   `EmittedCrate::dev_marked`, which checks that floor).
 //!
 //! The scan walks the `ipe` crate's module tree from each crate root, parsing
 //! every reached file with `syn`. An item, impl item, trait item or `mod`
 //! declaration under an exact `#[cfg(test)]` is skipped with everything inside
 //! it; any other `cfg` is scanned, so an unrecognised shape can only turn the
-//! scan red. A site is any expression path or struct path whose last segment
-//! is `Emitted`, whatever its prefix (`CargoCrate::`, `Self::`, an alias, a
-//! glob import), and any `Emitted` token inside a macro body. A `use` naming
-//! `Emitted` and a `#[path]` module are refused outright, as is `include!`,
-//! which would pull in source the walk never sees. Each site is keyed by its
-//! file and its enclosing item path and held to [`ADMITTED`] exactly.
+//! scan red. A site is any expression path, struct path or method name whose
+//! last segment is a held name, whatever its prefix (`CargoCrate::`, `Self::`,
+//! a glob import), a `Self { .. }` inside an `impl` of a held type, and any held
+//! token inside a macro body. A `use` naming `Emitted` or `build_command`, a
+//! renaming `use` and a type alias of any held name, a `#[path]` module and an
+//! `include!` (which would pull in source the walk never sees) are refused
+//! outright. Each site is keyed by its file, its enclosing item path and the
+//! held name, and held to [`ADMITTED`] exactly.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
-use syn::{Attribute, Expr, ImplItem, Item, ItemImpl, ItemMod, Macro, TraitItem, Type, UseTree};
+use syn::{
+    Attribute, Expr, ImplItem, ImplItemType, Item, ItemImpl, ItemMod, ItemType, Macro, TraitItem,
+    TraitItemType, Type, UseTree,
+};
 
-/// The variant whose construction is held.
-const VARIANT: &str = "Emitted";
+/// How a `use` of a held name is judged.
+#[derive(Clone, Copy)]
+enum UsePolicy {
+    /// Any `use` naming it is refused: it is reached only by its own path.
+    Refused,
+    /// A plain `use` is admitted; a renaming one is refused.
+    RenameRefused,
+}
+
+/// Every held name, with how a `use` of it is judged. A name held with
+/// [`UsePolicy::RenameRefused`] is a type, so a type alias of it is refused too.
+const HELD: &[(&str, UsePolicy)] = &[
+    ("Emitted", UsePolicy::Refused),
+    ("build_command", UsePolicy::Refused),
+    ("WatchBuild", UsePolicy::RenameRefused),
+    ("EmittedCrate", UsePolicy::RenameRefused),
+    ("DevMarkedCrate", UsePolicy::RenameRefused),
+];
 
 /// The macro that splices a file the walk does not reach.
 const INCLUDE_MACRO: &str = "include";
 
 /// Every admitted site: the file relative to `src/`, the enclosing item path,
-/// and how often it constructs the variant.
-const ADMITTED: &[(&str, &str, usize)] = &[
-    ("driver/commands.rs", "FlooredBuild::run", 1),
-    ("driver/commands.rs", "bundle_wasm", 1),
-    ("driver/commands.rs", "bundle_wasi", 1),
+/// the held name, and how often it occurs there.
+const ADMITTED: &[(&str, &str, &str, usize)] = &[
+    ("cargo_step.rs", "CargoBuild::command", "build_command", 1),
+    ("cargo_step.rs", "WatchBuild::command", "build_command", 1),
+    (
+        "driver/build_pipeline.rs",
+        "EmittedCrate::dev_marked",
+        "DevMarkedCrate",
+        1,
+    ),
+    (
+        "driver/build_pipeline.rs",
+        "write_emitted_project",
+        "EmittedCrate",
+        1,
+    ),
+    ("driver/commands.rs", "FlooredBuild::run", "Emitted", 1),
+    ("driver/commands.rs", "bundle_wasm", "Emitted", 1),
+    ("driver/commands.rs", "bundle_wasi", "Emitted", 1),
+    ("watch.rs", "spawn_cargo_build", "WatchBuild", 1),
 ];
 
 /// Module nesting the walk descends before refusing to go deeper.
 const MAX_DEPTH: usize = 32;
 
-/// One site: file relative to `src/`, enclosing item path.
-type Site = (String, String);
+/// One site: file relative to `src/`, enclosing item path, held name.
+type Site = (String, String, String);
 
-/// What one parsed file contributes: its sites, its refusals, and the module
-/// files it declares, each with the directory its own children resolve in.
+/// What one parsed file contributes: its sites (enclosing item path, held
+/// name), its refusals, and the module files it declares, each with the
+/// directory its own children resolve in.
 #[derive(Default)]
 struct FileScan {
-    sites: Vec<String>,
+    sites: Vec<(String, String)>,
     refusals: Vec<String>,
     children: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The held name `spelled` is, if any.
+fn held(spelled: &str) -> Option<&'static str> {
+    HELD.iter()
+        .map(|(name, _)| *name)
+        .find(|name| *name == spelled)
+}
+
+/// The use policy of the held name `ident` spells, if any.
+fn use_policy(ident: &Ident) -> Option<(&'static str, UsePolicy)> {
+    HELD.iter().copied().find(|(name, _)| ident == name)
+}
+
+/// Whether `ident` spells a held type name.
+fn is_held_type(ident: &Ident) -> bool {
+    use_policy(ident).is_some_and(|(_, policy)| matches!(policy, UsePolicy::RenameRefused))
 }
 
 /// Whether `attrs` hold an exact `#[cfg(test)]`.
@@ -98,14 +160,20 @@ struct Scanner<'a> {
     dir: PathBuf,
     /// The enclosing item path.
     context: Vec<String>,
+    /// The self type of each enclosing `impl`, innermost last.
+    impl_self: Vec<String>,
+    /// How many type aliases enclose the current node.
+    in_alias: usize,
     /// The file's display name, for refusals.
     file: &'a str,
     out: FileScan,
 }
 
 impl Scanner<'_> {
-    fn site(&mut self) {
-        self.out.sites.push(self.context.join("::"));
+    fn site(&mut self, name: &str) {
+        self.out
+            .sites
+            .push((self.context.join("::"), name.to_owned()));
     }
 
     fn refuse(&mut self, what: &str) {
@@ -116,13 +184,17 @@ impl Scanner<'_> {
         ));
     }
 
-    /// Count every `Emitted` token in `tokens`, nested groups included.
+    /// Count every held token in `tokens`, nested groups included.
     fn scan_tokens(&mut self, tokens: TokenStream) {
         for tree in tokens {
             match tree {
-                TokenTree::Ident(ident) if ident == VARIANT => self.site(),
+                TokenTree::Ident(ident) => {
+                    if let Some(name) = held(&ident.to_string()) {
+                        self.site(name);
+                    }
+                }
                 TokenTree::Group(group) => self.scan_tokens(group.stream()),
-                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                TokenTree::Punct(_) | TokenTree::Literal(_) => {}
             }
         }
     }
@@ -131,6 +203,12 @@ impl Scanner<'_> {
         self.context.push(name);
         walk(self);
         self.context.pop();
+    }
+
+    fn aliasing(&mut self, walk: impl FnOnce(&mut Self)) {
+        self.in_alias = self.in_alias.saturating_add(1);
+        walk(self);
+        self.in_alias = self.in_alias.saturating_sub(1);
     }
 }
 
@@ -186,19 +264,21 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
+        let self_name = type_name(&item.self_ty);
         let name = item.trait_.as_ref().map_or_else(
-            || type_name(&item.self_ty),
+            || self_name.clone(),
             |(path, _)| {
                 format!(
-                    "<{} as {}>",
-                    type_name(&item.self_ty),
+                    "<{self_name} as {}>",
                     path.segments
                         .last()
                         .map_or_else(String::new, |seg| seg.ident.to_string())
                 )
             },
         );
+        self.impl_self.push(self_name);
         self.within(name, |s| visit::visit_item_impl(s, item));
+        self.impl_self.pop();
     }
 
     fn visit_impl_item(&mut self, item: &'ast ImplItem) {
@@ -208,7 +288,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 self.within(name, |s| visit::visit_impl_item_fn(s, f));
             }
             ImplItem::Const(c) if !is_test_only(&c.attrs) => visit::visit_impl_item_const(self, c),
-            ImplItem::Type(t) if !is_test_only(&t.attrs) => visit::visit_impl_item_type(self, t),
+            ImplItem::Type(t) if !is_test_only(&t.attrs) => self.visit_impl_item_type(t),
             ImplItem::Macro(m) if !is_test_only(&m.attrs) => visit::visit_impl_item_macro(self, m),
             ImplItem::Verbatim(tokens) => self.scan_tokens(tokens.clone()),
             ImplItem::Fn(_) | ImplItem::Const(_) | ImplItem::Type(_) | ImplItem::Macro(_) => {}
@@ -225,13 +305,31 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             TraitItem::Const(c) if !is_test_only(&c.attrs) => {
                 visit::visit_trait_item_const(self, c);
             }
-            TraitItem::Type(t) if !is_test_only(&t.attrs) => visit::visit_trait_item_type(self, t),
+            TraitItem::Type(t) if !is_test_only(&t.attrs) => self.visit_trait_item_type(t),
             TraitItem::Macro(m) if !is_test_only(&m.attrs) => {
                 visit::visit_trait_item_macro(self, m);
             }
             TraitItem::Verbatim(tokens) => self.scan_tokens(tokens.clone()),
             TraitItem::Fn(_) | TraitItem::Const(_) | TraitItem::Type(_) | TraitItem::Macro(_) => {}
             _ => self.refuse("a trait item shape this scan does not know"),
+        }
+    }
+
+    fn visit_item_type(&mut self, item: &'ast ItemType) {
+        self.aliasing(|s| visit::visit_item_type(s, item));
+    }
+
+    fn visit_impl_item_type(&mut self, item: &'ast ImplItemType) {
+        self.aliasing(|s| visit::visit_impl_item_type(s, item));
+    }
+
+    fn visit_trait_item_type(&mut self, item: &'ast TraitItemType) {
+        self.aliasing(|s| visit::visit_trait_item_type(s, item));
+    }
+
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        if self.in_alias > 0 && is_held_type(ident) {
+            self.refuse(&format!("a type alias of `{ident}`"));
         }
     }
 
@@ -261,25 +359,33 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
 
     fn visit_use_tree(&mut self, tree: &'ast UseTree) {
         match tree {
-            UseTree::Name(name) if name.ident == VARIANT => self.refuse("a `use` of `Emitted`"),
-            UseTree::Rename(rename) if rename.ident == VARIANT => {
-                self.refuse("a renaming `use` of `Emitted`");
+            UseTree::Name(name) => {
+                if let Some((held, UsePolicy::Refused)) = use_policy(&name.ident) {
+                    self.refuse(&format!("a `use` of `{held}`"));
+                }
             }
-            _ => visit::visit_use_tree(self, tree),
+            UseTree::Rename(rename) => {
+                if let Some((held, _)) = use_policy(&rename.ident) {
+                    self.refuse(&format!("a renaming `use` of `{held}`"));
+                }
+            }
+            UseTree::Path(_) | UseTree::Glob(_) | UseTree::Group(_) => {
+                visit::visit_use_tree(self, tree);
+            }
         }
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        let path = match expr {
-            Expr::Path(path) => Some(&path.path),
-            Expr::Struct(strukt) => Some(&strukt.path),
+        let last = match expr {
+            Expr::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+            // `Self { .. }` constructs the enclosing impl's self type.
+            Expr::Struct(strukt) if strukt.path.is_ident("Self") => self.impl_self.last().cloned(),
+            Expr::Struct(strukt) => strukt.path.segments.last().map(|seg| seg.ident.to_string()),
+            Expr::MethodCall(call) => Some(call.method.to_string()),
             _ => None,
         };
-        if path
-            .and_then(|path| path.segments.last())
-            .is_some_and(|seg| seg.ident == VARIANT)
-        {
-            self.site();
+        if let Some(name) = last.as_deref().and_then(held) {
+            self.site(name);
         }
         visit::visit_expr(self, expr);
     }
@@ -298,6 +404,8 @@ fn scan_file(file: &str, dir: PathBuf, syntax: &syn::File) -> FileScan {
     let mut scanner = Scanner {
         dir,
         context: Vec::new(),
+        impl_self: Vec::new(),
+        in_alias: 0,
         file,
         out: FileScan::default(),
     };
@@ -339,6 +447,14 @@ struct Walked {
     reached: BTreeSet<String>,
 }
 
+/// Add one file's sites to `sites`, keyed by `rel`.
+fn tally(sites: &mut BTreeMap<Site, usize>, rel: &str, found: Vec<(String, String)>) {
+    for (context, name) in found {
+        let seen = sites.entry((rel.to_owned(), context, name)).or_default();
+        *seen = seen.saturating_add(1);
+    }
+}
+
 /// The sites and refusals of every file reached from `roots`, keyed relative to `root`.
 fn walk(root: &Path, roots: Vec<(PathBuf, PathBuf)>) -> Result<Walked, Box<dyn std::error::Error>> {
     let mut sites: BTreeMap<Site, usize> = BTreeMap::new();
@@ -362,10 +478,7 @@ fn walk(root: &Path, roots: Vec<(PathBuf, PathBuf)>) -> Result<Walked, Box<dyn s
         }
         let syntax = syn::parse_file(&std::fs::read_to_string(&file)?)?;
         let scan = scan_file(&rel, dir, &syntax);
-        for context in scan.sites {
-            let seen = sites.entry((rel.clone(), context)).or_default();
-            *seen = seen.saturating_add(1);
-        }
+        tally(&mut sites, &rel, scan.sites);
         refusals.extend(scan.refusals);
         let next = depth.saturating_add(1);
         queue.extend(
@@ -381,11 +494,22 @@ fn walk(root: &Path, roots: Vec<(PathBuf, PathBuf)>) -> Result<Walked, Box<dyn s
     })
 }
 
-/// Every difference between `sites` and [`ADMITTED`], one line each.
-fn drift(sites: &BTreeMap<Site, usize>) -> Vec<String> {
+/// Every difference between `sites` and the [`ADMITTED`] rows `files` selects,
+/// one line each.
+fn drift(sites: &BTreeMap<Site, usize>, files: impl Fn(&str) -> bool) -> Vec<String> {
     let expected: BTreeMap<Site, usize> = ADMITTED
         .iter()
-        .map(|(file, context, count)| (((*file).to_owned(), (*context).to_owned()), *count))
+        .filter(|(file, ..)| files(file))
+        .map(|(file, context, name, count)| {
+            (
+                (
+                    (*file).to_owned(),
+                    (*context).to_owned(),
+                    (*name).to_owned(),
+                ),
+                *count,
+            )
+        })
         .collect();
     let keys: BTreeSet<&Site> = sites.keys().chain(expected.keys()).collect();
     keys.into_iter()
@@ -394,38 +518,68 @@ fn drift(sites: &BTreeMap<Site, usize>) -> Vec<String> {
             let want = expected.get(key).copied().unwrap_or(0);
             (got != want).then(|| {
                 format!(
-                    "{}: `{VARIANT}` constructed in `{}` x{got} (admitted: {want})",
-                    key.0, key.1
+                    "{}: `{}` in `{}` x{got} (admitted: {want})",
+                    key.0, key.2, key.1
                 )
             })
         })
         .collect()
 }
 
-/// The sites and refusals of `source` parsed as the file `rel`.
-fn scan_source(rel: &str, source: &str) -> syn::Result<(BTreeMap<Site, usize>, Vec<String>)> {
+/// The sites and refusals of `source` parsed as the file `rel`, and the drift
+/// from the [`ADMITTED`] rows of `rel` alone.
+fn scan_source(rel: &str, source: &str) -> syn::Result<(Vec<String>, Vec<String>)> {
     let syntax = syn::parse_file(source)?;
     let scan = scan_file(rel, PathBuf::from("/nonexistent"), &syntax);
     let mut sites = BTreeMap::new();
-    for context in scan.sites {
-        let seen: &mut usize = sites.entry((rel.to_owned(), context)).or_default();
-        *seen = seen.saturating_add(1);
-    }
-    Ok((sites, scan.refusals))
+    tally(&mut sites, rel, scan.sites);
+    Ok((drift(&sites, |file| file == rel), scan.refusals))
 }
 
-/// The admitted sites as `driver/commands.rs` source, with `extra` appended.
-fn commands_with(extra: &str) -> String {
-    format!(
-        "impl<'a> FlooredBuild<'a> {{ fn run(self) {{ let _ = CargoCrate::Emitted(self.crate_dir); }} }}\n\
-         pub fn bundle_wasm(d: &OwnedDir) {{ let _ = CargoCrate::Emitted(d); }}\n\
-         pub fn bundle_wasi(d: &OwnedDir) {{ let _ = CargoCrate::Emitted(d); }}\n\
-         {extra}"
-    )
+/// The admitted sites of `rel` as source, with `extra` appended.
+fn admitted_with(rel: &str, extra: &str) -> String {
+    let admitted = match rel {
+        "driver/commands.rs" => {
+            "impl<'a> FlooredBuild<'a> { fn run(self) { let _ = CargoCrate::Emitted(self.crate_dir); } }\n\
+             pub fn bundle_wasm(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n\
+             pub fn bundle_wasi(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n"
+        }
+        "cargo_step.rs" => {
+            "impl CargoBuild<'_> { fn command(&self) -> Command { build_command(self.cargo.path(), d) } }\n\
+             impl WatchBuild<'_> { fn command(&self) -> Command { build_command(self.cargo, d) } }\n\
+             fn build_command(cargo: &Path, dir: &Path) -> Command { Command::new(cargo) }\n"
+        }
+        "watch.rs" => {
+            "fn spawn_cargo_build(krate: crate::DevMarkedCrate<'_>) {\n\
+             let build = crate::cargo_step::WatchBuild { cargo, krate, target_dir, accel, verbosity };\n\
+             }\n"
+        }
+        "driver/build_pipeline.rs" => {
+            "pub fn write_emitted_project() -> Result<EmittedCrate, CliError> {\n\
+             Ok(EmittedCrate { dir: crate_dir, floor })\n\
+             }\n\
+             impl EmittedCrate {\n\
+             pub fn dev_marked(&self) -> Result<DevMarkedCrate<'_>, CliError> {\n\
+             Ok(DevMarkedCrate { path: self.dir.path() })\n\
+             }\n\
+             #[cfg(test)] pub(crate) const fn assume_written(dir: OwnedDir, floor: EmitFloor) -> Self { Self { dir, floor } }\n\
+             }\n"
+        }
+        _ => "",
+    };
+    format!("{admitted}{extra}")
 }
+
+/// Every file holding an admitted site.
+const ADMITTED_FILES: &[&str] = &[
+    "cargo_step.rs",
+    "driver/build_pipeline.rs",
+    "driver/commands.rs",
+    "watch.rs",
+];
 
 #[test]
-fn emitted_cargo_build_only_runs_through_floored_build() {
+fn emitted_cargo_build_only_runs_through_its_admitted_sites() {
     let root = src_root();
     let roots = crate_roots(&root).expect("crate roots listable");
     let Walked {
@@ -433,37 +587,33 @@ fn emitted_cargo_build_only_runs_through_floored_build() {
         refusals,
         reached,
     } = walk(&root, roots).expect("module tree walkable");
-    for file in [
-        "cargo_step.rs",
-        "driver/commands.rs",
-        "driver/commands_pkg.rs",
-        "watch.rs",
-    ] {
+    for file in ADMITTED_FILES.iter().chain(&["driver/commands_pkg.rs"]) {
         assert!(
-            reached.contains(file),
+            reached.contains(*file),
             "the walk must reach src/{file}, or it is walking the wrong tree"
         );
     }
     let mut found = refusals;
-    found.extend(drift(&sites));
+    found.extend(drift(&sites, |_| true));
     assert!(
         found.is_empty(),
-        "every native build of an emitted crate goes through `FlooredBuild::run`, which \
-         embeds the floor its posture decides; `CargoCrate::Emitted` must match ADMITTED:\n{}",
+        "every cargo build of an emitted crate starts from a crate whose floor line is \
+         known; each held name must match ADMITTED:\n{}",
         found.join("\n")
     );
 }
 
 #[test]
 fn the_admitted_sites_alone_pass() {
-    let (sites, refusals) =
-        scan_source("driver/commands.rs", &commands_with("")).expect("sample parses");
-    assert!(refusals.is_empty(), "{refusals:?}");
-    assert!(drift(&sites).is_empty(), "{:?}", drift(&sites));
+    for rel in ADMITTED_FILES {
+        let (drift, refusals) = scan_source(rel, &admitted_with(rel, "")).expect("sample parses");
+        assert!(refusals.is_empty(), "{rel}: {refusals:?}");
+        assert!(drift.is_empty(), "{rel}: {drift:?}");
+    }
 }
 
 #[test]
-fn an_emitted_crate_built_elsewhere_is_refused() {
+fn a_held_act_elsewhere_is_refused() {
     let refused = [
         (
             "driver/commands.rs",
@@ -509,39 +659,133 @@ fn an_emitted_crate_built_elsewhere_is_refused() {
             "driver/commands.rs",
             "fn f() { #[cfg(test)] let _ = CargoCrate::Emitted(d); }",
         ),
+        (
+            "driver/commands_pkg.rs",
+            "fn assemble_desktop() { let _ = Self::Emitted(d); }",
+        ),
+        // The watch build, constructed outside the watch loop.
+        (
+            "watch.rs",
+            "fn f() { let _ = WatchBuild { cargo, crate_dir, .. }; }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = WatchBuild { cargo, crate_dir, .. }; }",
+        ),
+        (
+            "cargo_step.rs",
+            "impl WatchBuild<'_> { fn again(&self) -> Self { Self { ..*self } } }",
+        ),
+        (
+            "watch.rs",
+            "fn f() { let _ = vec![crate::cargo_step::WatchBuild { cargo }]; }",
+        ),
+        ("watch.rs", "use crate::cargo_step::WatchBuild as W;"),
+        (
+            "watch.rs",
+            "type W<'a> = crate::cargo_step::WatchBuild<'a>;",
+        ),
+        // The cargo build command, built outside the two admitted commands.
+        (
+            "cargo_step.rs",
+            "fn f() { let _ = build_command(cargo, dir, p, t, o); }",
+        ),
+        (
+            "cargo_step.rs",
+            "impl WatchBuild<'_> { fn spawn(&self) { let _ = build_command(self.cargo, d); } }",
+        ),
+        (
+            "cargo_step.rs",
+            "impl CargoBuild<'_> { fn command(&self) { let _ = build_command(a, b); } }",
+        ),
+        ("cargo_step.rs", "fn f() { let g = build_command; }"),
+        ("cargo_step.rs", "fn f() { let _ = x.build_command(); }"),
+        (
+            "cargo_step.rs",
+            "fn f() { let _ = format!(\"{:?}\", build_command(a, b)); }",
+        ),
+        ("watch.rs", "use crate::cargo_step::build_command;"),
+        // The floor witnesses, constructed outside the code that proves them.
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = EmittedCrate { dir, floor }; }",
+        ),
+        (
+            "driver/build_pipeline.rs",
+            "impl EmittedCrate { fn forge(dir: OwnedDir) -> Self { Self { dir, floor: EmitFloor::DevelopmentMarker } } }",
+        ),
+        (
+            "driver/build_pipeline.rs",
+            "fn f() { let _ = DevMarkedCrate { path }; }",
+        ),
+        ("driver/build_pipeline.rs", "type Witness = EmittedCrate;"),
+        (
+            "driver/commands.rs",
+            "use crate::driver::DevMarkedCrate as Dev;",
+        ),
+        (
+            "driver/build_pipeline.rs",
+            "impl Tr for X { type W<'a> = DevMarkedCrate<'a>; }",
+        ),
     ];
     for (rel, sample) in refused {
-        let (sites, refusals) = scan_source(rel, &commands_with(sample)).expect("sample parses");
+        let (drift, refusals) =
+            scan_source(rel, &admitted_with(rel, sample)).expect("sample parses");
         assert!(
-            !refusals.is_empty() || !drift(&sites).is_empty(),
+            !refusals.is_empty() || !drift.is_empty(),
             "the scan must refuse in {rel}: {sample}"
         );
     }
-    let (sites, refusals) = scan_source(
-        "driver/commands_pkg.rs",
-        "fn assemble_desktop() { let _ = Self::Emitted(d); }",
-    )
-    .expect("sample parses");
-    assert!(
-        !refusals.is_empty() || !drift(&sites).is_empty(),
-        "the scan must refuse a site in another file"
-    );
 }
 
 #[test]
-fn a_test_only_construction_and_a_pattern_are_not_sites() {
+fn a_test_only_construction_a_pattern_and_a_type_position_are_not_sites() {
     let admitted = [
-        "#[cfg(test)] mod tests { fn t() { let _ = CargoCrate::Emitted(d); } }",
-        "#[cfg(test)] fn helper() { let _ = CargoCrate::Emitted(d); }",
-        "impl CargoCrate<'_> { fn path(&self) { match self { Self::Emitted(d) => d, _ => x } } }",
-        "fn f(k: CargoCrate) { if let CargoCrate::Emitted(d) = k {} }",
-        "/// See [`CargoCrate::Emitted`].\nfn documented() {}",
-        "fn f() { let _ = \"CargoCrate::Emitted\"; }",
+        (
+            "driver/commands.rs",
+            "#[cfg(test)] mod tests { fn t() { let _ = CargoCrate::Emitted(d); } }",
+        ),
+        (
+            "driver/commands.rs",
+            "#[cfg(test)] fn helper() { let _ = CargoCrate::Emitted(d); }",
+        ),
+        (
+            "driver/commands.rs",
+            "impl CargoCrate<'_> { fn path(&self) { match self { Self::Emitted(d) => d, _ => x } } }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f(k: CargoCrate) { if let CargoCrate::Emitted(d) = k {} }",
+        ),
+        (
+            "driver/commands.rs",
+            "/// See [`CargoCrate::Emitted`].\nfn documented() {}",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f() { let _ = \"CargoCrate::Emitted\"; }",
+        ),
+        (
+            "driver/commands.rs",
+            "fn f(c: &EmittedCrate) -> Result<EmittedCrate, CliError> { let _ = c.dir(); x }",
+        ),
+        (
+            "driver/commands.rs",
+            "use super::{EmittedCrate, OutTarget};",
+        ),
+        (
+            "cargo_step.rs",
+            "#[cfg(test)] mod tests { fn t() { let _ = super::build_command(a, b); let _ = WatchBuild { cargo }; } }",
+        ),
+        (
+            "watch.rs",
+            "fn g(k: crate::DevMarkedCrate<'_>) { let _ = k.path(); }",
+        ),
     ];
-    for sample in admitted {
-        let (sites, refusals) =
-            scan_source("driver/commands.rs", &commands_with(sample)).expect("sample parses");
-        assert!(refusals.is_empty(), "{sample}: {refusals:?}");
-        assert!(drift(&sites).is_empty(), "{sample}: {:?}", drift(&sites));
+    for (rel, sample) in admitted {
+        let (drift, refusals) =
+            scan_source(rel, &admitted_with(rel, sample)).expect("sample parses");
+        assert!(refusals.is_empty(), "{rel}: {sample}: {refusals:?}");
+        assert!(drift.is_empty(), "{rel}: {sample}: {drift:?}");
     }
 }

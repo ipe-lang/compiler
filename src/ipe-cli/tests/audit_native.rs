@@ -1100,11 +1100,11 @@ mod real_jail {
         pkg
     }
 
-    /// The build-time consent gate REFUSES a `Rust.` crossing when the app's
-    /// `[capabilities] declares` set does not grant `native-ffi` — a fail-closed,
-    /// typed refusal (IPE-S0003) naming the disclosing `Rust.<Crate>` module,
-    /// fired BEFORE any emit or cargo build. This is the increment-3 consent gate:
-    /// an un-granted native capability is a compile error naming the dep.
+    /// The `ipe release build` consent gate REFUSES a `Rust.` crossing when the
+    /// app's `[capabilities] declares` set does not grant `native-ffi` — a
+    /// fail-closed, typed refusal (IPE-S0003) naming the disclosing
+    /// `Rust.<Crate>` module, fired BEFORE any emit or cargo build: an
+    /// un-granted native capability is a compile error naming the dep.
     #[test]
     fn build_refuses_an_ungranted_native_crossing_naming_the_dep() {
         if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -1116,7 +1116,7 @@ mod real_jail {
         let pkg = write_native_crossing_package(&base, "");
         let out = base.join("out");
         let args = vec![
-            "dev".to_owned(),
+            "release".to_owned(),
             "build".to_owned(),
             pkg.join("package.ipe").display().to_string(),
             "--out".to_owned(),
@@ -1149,7 +1149,7 @@ mod real_jail {
         let pkg = write_native_crossing_package(&base, "NativeFfi");
         let out = base.join("out");
         let args = vec![
-            "dev".to_owned(),
+            "release".to_owned(),
             "build".to_owned(),
             pkg.join("package.ipe").display().to_string(),
             "--out".to_owned(),
@@ -1164,6 +1164,35 @@ mod real_jail {
             assert!(
                 !msg.contains("IPE-S0003"),
                 "a granted native crossing must pass the consent gate, got: {msg}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A development build asks no consent: the SAME ungranted crossing the
+    /// release build refuses is never refused by the consent gate under
+    /// `ipe dev build` (any later error is a cargo concern, never IPE-S0003).
+    #[test]
+    fn dev_build_of_an_ungranted_native_crossing_asks_no_consent() {
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+            return;
+        }
+        let _runtime = e2e_support::require_runtime();
+        let base = non_tmp_base("consent-dev");
+        let pkg = write_native_crossing_package(&base, "");
+        let out = base.join("out");
+        let args = vec![
+            "dev".to_owned(),
+            "build".to_owned(),
+            pkg.join("package.ipe").display().to_string(),
+            "--out".to_owned(),
+            out.display().to_string(),
+        ];
+        if let Err(err) = ipe::run_cli(&args) {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("IPE-S0003"),
+                "a dev build never runs the consent gate, got: {msg}"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -1574,7 +1603,8 @@ mod real_jail {
             "a dev build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stderr.contains("built by `ipe dev build`") && stderr.contains("ipe release build"),
+            stderr.contains("is a development build (`ipe dev`)")
+                && stderr.contains("ipe release build"),
             "the refusal names the development build and the remedy:\nstderr:\n{stderr}"
         );
     }
@@ -1609,7 +1639,7 @@ mod real_jail {
             "a forged release literal never runs a dev build:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stderr.contains("built by `ipe dev build`"),
+            stderr.contains("is a development build (`ipe dev`)"),
             "the refusal names the development build:\nstderr:\n{stderr}"
         );
     }
@@ -1732,7 +1762,7 @@ mod real_jail {
             "a forged release literal never runs a dev run binary:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stderr.contains("built by `ipe dev build`"),
+            stderr.contains("is a development build (`ipe dev`)"),
             "the refusal names the development build:\nstderr:\n{stderr}"
         );
     }

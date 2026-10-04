@@ -5372,7 +5372,7 @@ fn group_required_sanitizes_attempted() {
 const DEBUG_LOG_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Debug as Debug\n\nshout : String -> String\nshout s =\n    Debug.log \"shout\" s\n\nmain : Task Error ()\nmain =\n    Io.println (shout \"hi\")\n";
 
 /// Compile [`DEBUG_LOG_MAIN`] under `verb`'s posture, uncached.
-fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::output_dir::OwnedDir, CliError> {
+fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::EmittedCrate, CliError> {
     let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp = ipe_test_temp::temp_root()
         .join(format!("ipec-verb-posture-{label}-{}", std::process::id()));

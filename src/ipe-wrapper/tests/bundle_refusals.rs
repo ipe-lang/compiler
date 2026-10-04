@@ -144,7 +144,7 @@ fn the_wrapper_refuses_a_floorless_and_a_development_app() -> TestResult {
         "a development app never runs:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("built by `ipe dev build`")
+        stderr.contains("is a development build (`ipe dev`)")
             && stderr.contains("rebuild it with `ipe release build`"),
         "the development refusal names the build and the remedy:\nstderr:\n{stderr}"
     );
@@ -159,7 +159,8 @@ fn the_wrapper_refuses_a_floorless_and_a_development_app() -> TestResult {
     let (_, _, stderr) = run_wrapper(&release)?;
     let _ = std::fs::remove_dir_all(&release);
     assert!(
-        !stderr.contains("capability floor") && !stderr.contains("built by `ipe dev build`"),
+        !stderr.contains("capability floor")
+            && !stderr.contains("is a development build (`ipe dev`)"),
         "a release app passes the floor check (control):\nstderr:\n{stderr}"
     );
     Ok(())

@@ -22,9 +22,7 @@ use std::path::Path;
 
 use ipe_diagnostics::Diagnostic as SharedDiag;
 use ipe_ir::Capability;
-use ipe_sandbox::run_jail::{
-    self, DatabaseAxis, FloorIntent, FloorRefusal, RunJailDefect, SandboxProfile,
-};
+use ipe_sandbox::run_jail::{self, DatabaseAxis, FloorIntent, RunJailDefect, SandboxProfile};
 
 use crate::CliError;
 use crate::project::ProjectManifest;
@@ -215,15 +213,57 @@ pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> 
     // scanning the binary for the unique `ipe-capfloor` marker — see
     // `ipe_sandbox::run_jail::scan_capfloor`.
     format!(
-        "\n// The runtime capability FLOOR, embedded read-only in `.rodata` so a\n\
-         // tampered ipe.profile cannot request less isolation than this binary was\n\
-         // built for. `ipe release run` scans this out of the binary WITHOUT running it.\n\
-         // `.rodata` survives `strip`; a custom link-section would not.\n\
-         #[used]\n\
-         #[unsafe(no_mangle)]\n\
-         pub static IPE_CAPABILITY_FLOOR: [u8; {}] = [{arr}];\n",
+        "{FLOOR_BLOCK_MARKER}{FLOOR_BLOCK_HEAD}{}{FLOOR_BLOCK_LENGTH_END}{arr}{FLOOR_BLOCK_END}",
         bytes.len()
     )
+}
+
+/// The line a floor block opens with; the strip finds a prior block by it.
+const FLOOR_BLOCK_MARKER: &str = "\n// The runtime capability FLOOR, embedded read-only";
+
+/// The rest of a floor block's fixed head, up to its byte length.
+const FLOOR_BLOCK_HEAD: &str = " in `.rodata` so a\n\
+     // tampered ipe.profile cannot request less isolation than this binary was\n\
+     // built for. `ipe release run` scans this out of the binary WITHOUT running it.\n\
+     // `.rodata` survives `strip`; a custom link-section would not.\n\
+     #[used]\n\
+     #[unsafe(no_mangle)]\n\
+     pub static IPE_CAPABILITY_FLOOR: [u8; ";
+
+/// What separates a floor block's byte length from its bytes.
+const FLOOR_BLOCK_LENGTH_END: &str = "] = [";
+
+/// What closes a floor block, and with it the source.
+const FLOOR_BLOCK_END: &str = "];\n";
+
+/// Whether `block` is exactly a floor block [`capfloor_static_source`]
+/// writes: its fixed head, a decimal length, that many decimal bytes, and
+/// nothing after its close.
+fn is_floor_block(block: &str) -> bool {
+    let decimal = |digits: &str| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    let Some(sized) = block
+        .strip_prefix(FLOOR_BLOCK_MARKER)
+        .and_then(|rest| rest.strip_prefix(FLOOR_BLOCK_HEAD))
+    else {
+        return false;
+    };
+    let Some((length, rest)) = sized.split_once(FLOOR_BLOCK_LENGTH_END) else {
+        return false;
+    };
+    let Some(body) = rest.strip_suffix(FLOOR_BLOCK_END) else {
+        return false;
+    };
+    let Some(length) = decimal(length)
+        .then(|| length.parse::<usize>().ok())
+        .flatten()
+    else {
+        return false;
+    };
+    body.split(", ")
+        .try_fold(0_usize, |count, byte| {
+            (decimal(byte) && byte.parse::<u8>().is_ok()).then_some(count.saturating_add(1))
+        })
+        .is_some_and(|count| count == length)
 }
 
 /// Write the deployable enforcement artifacts into an emitted native project.
@@ -260,7 +300,7 @@ pub fn write_build_artifacts(
 ///
 /// A dev build infers no capabilities and writes no `ipe.profile`. The marker
 /// makes a release reader refuse the binary as a development build
-/// ([`FloorRefusal::NotRelease`], which names the remedy). It also closes the
+/// ([`run_jail::FloorRefusal::NotRelease`], which names the remedy). It also closes the
 /// self-attested grant: [`run_jail::scan_capfloor`] reads a binary as a
 /// release build only when every floor line in it names release, so a
 /// release-shaped line the program carries in its own data never stands alone.
@@ -354,9 +394,11 @@ fn embed_floor(
 ///
 /// # Errors
 ///
-/// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
+/// [`CliError::Usage`] when the emitted `fn main` anchor is absent or not
+/// unique, or when a prior floor block is not exactly one
+/// [`embed_floor_text`] wrote.
 pub fn embed_floor_text(main_rs: &str, floor_static: &str) -> Result<String, CliError> {
-    let base = strip_capfloor_block(main_rs);
+    let base = strip_capfloor_block(main_rs)?;
     let referenced = inject_floor_reference(&base)?;
     Ok(format!("{referenced}{floor_static}"))
 }
@@ -364,12 +406,31 @@ pub fn embed_floor_text(main_rs: &str, floor_static: &str) -> Result<String, Cli
 /// Remove a previously-embedded floor block and its `fn main` reference, so
 /// re-embedding is idempotent. Only the exact text [`embed_floor_text`] wrote
 /// is removed: a program line that merely names the floor stays.
-fn strip_capfloor_block(src: &str) -> String {
-    const BLOCK_MARKER: &str = "\n// The runtime capability FLOOR, embedded read-only";
-    let without_block = src
-        .rsplit_once(BLOCK_MARKER)
-        .map_or(src, |(before, _)| before);
-    without_block.replacen(FLOOR_REFERENCE, "", 1)
+///
+/// # Errors
+///
+/// [`CliError::Usage`] when the source holds more than one floor block, a
+/// block that is not exactly a floor static closing the source, or a floor
+/// reference without its one block: a floor the strip cannot account for is
+/// never left beside the one about to be written.
+fn strip_capfloor_block(src: &str) -> Result<String, CliError> {
+    let malformed = || CliError::Usage(crate::text::msg::run_floor_block_malformed());
+    let mut blocks = src.match_indices(FLOOR_BLOCK_MARKER).map(|(at, _)| at);
+    let Some(at) = blocks.next() else {
+        return if src.contains(FLOOR_REFERENCE) {
+            Err(malformed())
+        } else {
+            Ok(src.to_owned())
+        };
+    };
+    if blocks.next().is_some() {
+        return Err(malformed());
+    }
+    let (before, block) = src.split_at_checked(at).ok_or_else(malformed)?;
+    if !is_floor_block(block) || before.matches(FLOOR_REFERENCE).count() != 1 {
+        return Err(malformed());
+    }
+    Ok(before.replacen(FLOOR_REFERENCE, "", 1))
 }
 
 /// The line the linker retains the floor by: a `black_box` read of the static at
@@ -381,17 +442,31 @@ const FLOOR_REFERENCE: &str = "    // Retain the embedded capability floor (keep
 ///
 /// # Errors
 ///
-/// [`CliError::Usage`] if the `fn main` anchor is absent (the emitted
+/// [`CliError::Usage`] if the `fn main` anchor line is absent (the emitted
 /// program shape has drifted — refuse rather than emit an unreferenced floor
-/// that a linker would collect).
+/// that a linker would collect), or if more than one line is the anchor (the
+/// reference would have no single home).
 fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     const ANCHOR: &str = "fn main() {\n";
-    let (before, after) = src
-        .split_once(ANCHOR)
-        .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
+    let absent = || CliError::Usage(crate::text::msg::run_main_anchor_absent());
+    let mut anchors = src
+        .split_inclusive('\n')
+        .scan(0_usize, |offset, line| {
+            let start = *offset;
+            *offset = offset.saturating_add(line.len());
+            Some((start, line))
+        })
+        .filter(|(_, line)| *line == ANCHOR)
+        .map(|(start, _)| start.saturating_add(ANCHOR.len()));
+    let body = anchors.next().ok_or_else(absent)?;
+    if anchors.next().is_some() {
+        return Err(CliError::Usage(
+            crate::text::msg::run_main_anchor_ambiguous(),
+        ));
+    }
+    let (head, after) = src.split_at_checked(body).ok_or_else(absent)?;
     let mut out = String::with_capacity(src.len().saturating_add(FLOOR_REFERENCE.len()));
-    out.push_str(before);
-    out.push_str(ANCHOR);
+    out.push_str(head);
     out.push_str(FLOOR_REFERENCE);
     out.push_str(after);
     Ok(out)
@@ -463,15 +538,10 @@ fn verify_artifact_under(
     // a release build's, and no narrower than the profile — the one check the
     // release wrapper applies too.
     let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
+    // The refusal's text is the jail's own, the one the release wrapper
+    // prints too.
     if let Err(refusal) = run_jail::verify_release_floor(&profile, &bytes) {
-        let code = RunJailDefect::ProfileWeakerThanFloor.code();
-        return Err(CliError::Usage(match refusal {
-            FloorRefusal::Unreadable => crate::text::msg::run_floor_unreadable(&code.as_str()),
-            FloorRefusal::NotRelease => crate::text::msg::run_floor_not_release(&code.as_str()),
-            FloorRefusal::ProfileWider => {
-                crate::text::Message::relay(&RunJailDefect::ProfileWeakerThanFloor)
-            }
-        }));
+        return Err(CliError::Usage(crate::text::Message::relay(&refusal)));
     }
     Ok(VerifiedArtifact {
         profile,
@@ -741,6 +811,49 @@ mod tests {
         );
     }
 
+    /// `ipe release run` refuses a development or floorless binary with the
+    /// jail's own refusal text, the one the release wrapper prints, so the two
+    /// readers of one floor can never describe it differently.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_refused_floor_is_reported_in_the_jails_own_words() {
+        use run_jail::FloorRefusal;
+
+        let dir = ScratchDir::new("ipe-verify-refusal-text").expect("scratch dir");
+        let profile = SandboxProfile::maximally_isolated();
+        let profile_path = dir.path().join("ipe.profile");
+        std::fs::write(&profile_path, profile.to_profile_string()).expect("write profile");
+        let mut development = profile
+            .to_capfloor_line(FloorIntent::Development)
+            .into_bytes();
+        development.push(b'\n');
+        for (name, binary, refusal) in [
+            ("ipe-dev-app", development, FloorRefusal::NotRelease),
+            (
+                "ipe-floorless-app",
+                b"\x7fELF fn main() {}".to_vec(),
+                FloorRefusal::Unreadable,
+            ),
+        ] {
+            let binary_path = dir.path().join(name);
+            std::fs::write(&binary_path, &binary).expect("write binary");
+            let refused = verify_artifact_under(&profile_path, &binary_path, 4096);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(CliError::Usage(message)) if message.as_str() == refusal.to_string()
+                ),
+                "{name} is refused as {refusal:?} in the jail's words: {refused:?}"
+            );
+        }
+        assert!(
+            FloorRefusal::NotRelease
+                .to_string()
+                .contains("is a development build (`ipe dev`)"),
+            "the refusal names the development posture, not a removed verb"
+        );
+    }
+
     #[test]
     fn inject_floor_reference_is_idempotent_under_strip_and_reinject() {
         // A minimal emitted-main shape.
@@ -754,7 +867,7 @@ mod tests {
         );
         assert!(once.contains("black_box(&IPE_CAPABILITY_FLOOR)"));
         // Re-emitting: strip then re-inject must not stack a second block.
-        let stripped = strip_capfloor_block(&once);
+        let stripped = strip_capfloor_block(&once).expect("the block it wrote");
         assert!(
             !stripped.contains("IPE_CAPABILITY_FLOOR"),
             "strip removed the ref+static"
@@ -779,6 +892,60 @@ mod tests {
     #[test]
     fn inject_floor_reference_refuses_a_missing_main_anchor() {
         assert!(inject_floor_reference("fn not_main() {}\n").is_err());
+        // The anchor is a whole line: a longer line that ends with it is not one.
+        assert!(inject_floor_reference("pub fn main() {\n}\n").is_err());
+    }
+
+    /// Two `fn main` anchor lines leave the floor reference no single home;
+    /// the embed refuses rather than pick one.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn embed_floor_text_refuses_two_main_anchors() {
+        let twice = "fn main() {\n    run();\n}\nfn main() {\n    run();\n}\n";
+        let refused = embed_floor_text(twice, &dev_floor_marker_source());
+        assert!(
+            matches!(&refused, Err(CliError::Usage(m)) if m.as_str().contains("more than one")),
+            "two anchors are refused: {refused:?}"
+        );
+        let one = embed_floor_text("fn main() {\n    run();\n}\n", &dev_floor_marker_source())
+            .expect("one anchor embeds");
+        assert_eq!(one.matches("black_box(&IPE_CAPABILITY_FLOOR)").count(), 1);
+    }
+
+    /// A prior floor block followed by any other text, a second block, a
+    /// block whose length disagrees with its bytes, or a reference without
+    /// its block is refused: the embed never leaves a floor it cannot account
+    /// for beside the one it writes.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn embed_floor_text_refuses_a_floor_block_it_did_not_write() {
+        let base = "fn ipe_main() {}\n\nfn main() {\n    run();\n}\n";
+        let marker = dev_floor_marker_source();
+        let once = embed_floor_text(base, &marker).expect("a fresh embed");
+        let release = capfloor_static_source(
+            &SandboxProfile {
+                network: true,
+                ..SandboxProfile::maximally_isolated()
+            },
+            FloorIntent::Release,
+        );
+        let referenced = inject_floor_reference(base).expect("anchor present");
+        let short_length = once.replacen("[u8; ", "[u8; 1", 1);
+        for (what, src) in [
+            (
+                "text after the block",
+                format!("{once}fn smuggled() {{}}\n"),
+            ),
+            ("a second block", format!("{once}{release}")),
+            ("a length its bytes disagree with", short_length),
+            ("a reference without its block", referenced),
+        ] {
+            let refused = embed_floor_text(&src, &marker);
+            assert!(
+                matches!(&refused, Err(CliError::Usage(m)) if m.as_str().contains("floor block")),
+                "{what} is refused: {refused:?}"
+            );
+        }
     }
 
     #[test]

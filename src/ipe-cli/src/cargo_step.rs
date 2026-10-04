@@ -316,8 +316,9 @@ pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, C
 pub struct WatchBuild<'a> {
     /// The `cargo` to run ([`crate::watch::WatchOptions::cargo_path`]).
     pub cargo: &'a Path,
-    /// The emitted crate; cargo runs with it as its working directory.
-    pub crate_dir: &'a Path,
+    /// The emitted crate, proven to carry the development marker; cargo runs
+    /// with it as its working directory.
+    pub krate: crate::DevMarkedCrate<'a>,
     /// A target directory overriding the inherited `CARGO_TARGET_DIR`.
     pub target_dir: Option<&'a Path>,
     /// The compiler acceleration for this rebuild.
@@ -331,7 +332,7 @@ impl WatchBuild<'_> {
     fn command(&self) -> Command {
         let mut cmd = build_command(
             self.cargo,
-            self.crate_dir,
+            self.krate.path(),
             CargoProfile::Dev,
             CargoTarget::Host,
             CargoOutput::JsonStream(self.verbosity),
@@ -773,7 +774,7 @@ mod tests {
         let accel = BuildAccel::MachineDefault;
         let watch = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: None,
             accel: &accel,
             verbosity: Verbosity::Progress,
@@ -862,7 +863,7 @@ mod tests {
         let accel = BuildAccel::WarmIncremental;
         let cmd = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: Some(Path::new("/t")),
             accel: &accel,
             verbosity: Verbosity::Quiet,
