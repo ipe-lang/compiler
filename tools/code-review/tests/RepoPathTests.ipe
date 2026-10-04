@@ -181,6 +181,15 @@ refusalName err =
         DuplicateTag _ ->
             "duplicate-tag"
 
+        DuplicateRoot ->
+            "duplicate-root"
+
+        ClaimedByDeeperRoot _ ->
+            "claimed-by-deeper-root"
+
+        TooManyRoots ->
+            "too-many-roots"
+
 
 
 refusedAs : String -> Result PathError Path.Path -> Bool
@@ -248,12 +257,19 @@ relativeFromCwd abs =
 -- A root map binding each `( tag, root )`, failing the task on a refusal.
 mapOf : List ( String, Root ) -> Task.Task Error RootMap
 mapOf bindings =
+    mapResult bindings
+        |> Result.mapError RepoPath.toError
+        |> Task.fromResult
+
+
+
+-- The map `bindings` build, or the refusal that stopped it.
+mapResult : List ( String, Root ) -> Result PathError RootMap
+mapResult bindings =
     bindings
         |> List.map (\( name, root ) -> RepoPath.parseTag name |> Result.map (\tag -> ( tag, root )))
         |> Result.combine
         |> Result.andThen RepoPath.rootMap
-        |> Result.mapError RepoPath.toError
-        |> Task.fromResult
 
 
 
@@ -383,12 +399,13 @@ tagSelectsItsRoot =
 tagGrammarMatchesWriter : Task.Task Error Bool
 tagGrammarMatchesWriter =
     do
-        cwd <- System.cwd ()
-        cwdRoot <- RepoPath.parseRoot cwd
-        roots <- mapOf [ ( "ipe", cwdRoot ), ( "a", cwdRoot ) ]
+        dirs <- freshRootBase
+        ipeRoot <- RepoPath.parseRoot (dirs ++ "/a")
+        aRoot <- RepoPath.parseRoot (dirs ++ "/b")
+        roots <- mapOf [ ( "ipe", ipeRoot ), ( "a", aRoot ) ]
         let
             base =
-                Path.toString (RepoPath.rootPath cwdRoot)
+                Path.toString (RepoPath.rootPath ipeRoot)
         in
         Task.succeed
             (List.all identity
@@ -569,6 +586,15 @@ withForeign stored e err =
         DuplicateTag _ ->
             DuplicateTag stored
 
+        DuplicateRoot ->
+            DuplicateRoot
+
+        ClaimedByDeeperRoot _ ->
+            ClaimedByDeeperRoot stored
+
+        TooManyRoots ->
+            TooManyRoots
+
 
 
 allPathErrors : List PathError
@@ -577,7 +603,16 @@ allPathErrors =
         e =
             Error.unexpected ""
     in
-    [ MissingTag "", UnknownTag "", InvalidRelative "" e, NotUnderRoot "" e, NoRoots, DuplicateTag "" ]
+    [ MissingTag ""
+    , UnknownTag ""
+    , InvalidRelative "" e
+    , NotUnderRoot "" e
+    , NoRoots
+    , DuplicateTag ""
+    , DuplicateRoot
+    , ClaimedByDeeperRoot ""
+    , TooManyRoots
+    ]
 
 
 
@@ -608,8 +643,10 @@ diagnosticsNeverRaw =
         cwd <- System.cwd ()
         cwdRoot <- RepoPath.parseRoot cwd
         roots <- mapOf [ ( "ipe", cwdRoot ) ]
+        nested <- freshNested
+        nestedRoots <- mapOf [ ( "out", nested.outer ), ( "in", nested.inner ) ]
         Task.succeed
-            (List.length allPathErrors == 6
+            (List.length allPathErrors == 9
                 && List.all (\err -> clean (withForeign hazards nested err)) allPathErrors
                 && List.all (resolvedClean roots)
                     [ hazards
@@ -619,6 +656,235 @@ diagnosticsNeverRaw =
                     , "ipe:../" ++ hazards
                     , hazards ++ "/x:y"
                     ]
+                && resolvedClean nestedRoots ("out:inner/" ++ hazards)
+            )
+
+
+
+-- A directory tree for nested roots: `outer`, `outer/inner`,
+-- `outer/inner/deep`, and `outer/inner2`, a sibling of `inner` whose name
+-- begins with it.
+type alias Nested =
+    { outer : Root
+    , inner : Root
+    , deep : Root
+    , sibling : Root
+    }
+
+
+
+makeDir : String -> Task.Task Error ()
+makeDir dir =
+    Task.fromResult (Path.fromString dir) |> Task.andThen File.mkdirAll
+
+
+
+freshNested : Task.Task Error Nested
+freshNested =
+    do
+        base <- File.tempDir "ipe-review-nested-roots-"
+        makeDir (base ++ "/r/inner/deep")
+        makeDir (base ++ "/r/inner2")
+        outer <- RepoPath.parseRoot (base ++ "/r")
+        inner <- RepoPath.parseRoot (base ++ "/r/inner")
+        deep <- RepoPath.parseRoot (base ++ "/r/inner/deep")
+        sibling <- RepoPath.parseRoot (base ++ "/r/inner2")
+        Task.succeed { outer = outer, inner = inner, deep = deep, sibling = sibling }
+
+
+
+-- The result is `Ok` of `root`'s directory followed by `rel`.
+resolvesBelow : Root -> String -> Result PathError Path.Path -> Bool
+resolvesBelow root rel result =
+    resolvesTo (Path.toString (RepoPath.rootPath root) ++ rel) result
+
+
+claimed : Result PathError Path.Path -> Bool
+claimed result =
+    refusedAs "claimed-by-deeper-root" result
+
+
+
+-- Two tags on one directory are refused however the directory is spelled; a
+-- root below another is not the same directory.
+sameRootTwoTagsRefused : Task.Task Error Bool
+sameRootTwoTagsRefused =
+    do
+        base <- freshRootBase
+        plain <- RepoPath.parseRoot (base ++ "/a")
+        slash <- RepoPath.parseRoot (base ++ "/a/")
+        dotted <- RepoPath.parseRoot (base ++ "/b/../a")
+        other <- RepoPath.parseRoot (base ++ "/b")
+        Task.succeed
+            (mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "b", slash ) ])
+                && mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "b", dotted ) ])
+                && mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "c", other ), ( "b", slash ) ])
+                && not (mapRefused (mapResult [ ( "a", plain ), ( "b", other ) ]))
+            )
+
+
+
+mapRefused : Result PathError RootMap -> Bool
+mapRefused result =
+    case result of
+        Ok _ ->
+            False
+
+        Err _ ->
+            True
+
+
+
+-- With `out` at `r` and `in` at `r/inner`, a path under `inner` belongs to
+-- `in` alone: `out` refuses it, `in` resolves it, and the rest of `out` is
+-- still `out`'s, whatever the binding order.
+deeperRootClaimsPath : Task.Task Error Bool
+deeperRootClaimsPath =
+    do
+        n <- freshNested
+        outFirst <- mapOf [ ( "out", n.outer ), ( "in", n.inner ) ]
+        inFirst <- mapOf [ ( "in", n.inner ), ( "out", n.outer ) ]
+        Task.succeed
+            (List.all
+                (\roots ->
+                    claimed (RepoPath.resolve roots "out:inner/x")
+                        && refusalNames "deeper configured repo root" (RepoPath.resolve roots "out:inner/x")
+                        && claimed (RepoPath.resolve roots "out:inner/sub/dir/x")
+                        && claimed (RepoPath.resolve roots "out:inner/../inner/x")
+                        && resolvesBelow n.inner "/x" (RepoPath.resolve roots "in:x")
+                        && resolvesBelow n.outer "/y" (RepoPath.resolve roots "out:y")
+                        && resolvesBelow n.outer "/y" (RepoPath.resolve roots "out:inner/../y")
+                )
+                [ outFirst, inFirst ]
+            )
+
+
+
+-- The directory of a deeper root is itself owned by that root.
+deeperRootClaimsItsOwnDir : Task.Task Error Bool
+deeperRootClaimsItsOwnDir =
+    do
+        n <- freshNested
+        roots <- mapOf [ ( "out", n.outer ), ( "in", n.inner ) ]
+        Task.succeed
+            (List.all identity
+                [ claimed (RepoPath.resolve roots "out:inner")
+                , claimed (RepoPath.resolve roots "out:inner/")
+                , claimed (RepoPath.resolve roots "out:./inner")
+                , claimed (RepoPath.resolve roots "out:a/../inner")
+                ]
+            )
+
+
+
+-- Ownership is judged over whole path components: `inner2` begins with
+-- `inner` as text but is not below it.
+siblingPrefixNotClaimed : Task.Task Error Bool
+siblingPrefixNotClaimed =
+    do
+        n <- freshNested
+        roots <- mapOf [ ( "out", n.outer ), ( "in", n.inner ) ]
+        Task.succeed
+            (List.all identity
+                [ resolvesBelow n.sibling "/x" (RepoPath.resolve roots "out:inner2/x")
+                , resolvesBelow n.sibling "" (RepoPath.resolve roots "out:inner2")
+                , resolvesBelow n.outer "/innerx" (RepoPath.resolve roots "out:innerx")
+                , claimed (RepoPath.resolve roots "out:inner2/../inner/x")
+                ]
+            )
+
+
+
+-- With three nested roots, each path resolves only under the deepest root
+-- that contains it, in any binding order.
+grandchildOwnedByDeepest : Task.Task Error Bool
+grandchildOwnedByDeepest =
+    do
+        n <- freshNested
+        outerFirst <- mapOf [ ( "a", n.outer ), ( "b", n.inner ), ( "c", n.deep ) ]
+        deepFirst <- mapOf [ ( "c", n.deep ), ( "a", n.outer ), ( "b", n.inner ) ]
+        Task.succeed
+            (List.all
+                (\roots ->
+                    List.all identity
+                        [ claimed (RepoPath.resolve roots "a:inner/x")
+                        , claimed (RepoPath.resolve roots "a:inner/deep")
+                        , claimed (RepoPath.resolve roots "a:inner/deep/x")
+                        , resolvesBelow n.outer "/y" (RepoPath.resolve roots "a:y")
+                        , resolvesBelow n.sibling "/z" (RepoPath.resolve roots "a:inner2/z")
+                        , claimed (RepoPath.resolve roots "b:deep")
+                        , claimed (RepoPath.resolve roots "b:deep/x")
+                        , resolvesBelow n.inner "/x" (RepoPath.resolve roots "b:x")
+                        , resolvesBelow n.inner "/z/w" (RepoPath.resolve roots "b:z/w")
+                        , resolvesBelow n.deep "/x" (RepoPath.resolve roots "c:x")
+                        ]
+                )
+                [ outerFirst, deepFirst ]
+            )
+
+
+
+-- A `..` climbing out of an inner root is refused as an invalid path, not
+-- resolved into the outer root and not read as a claimed path.
+dotdotFromInnerStillRefused : Task.Task Error Bool
+dotdotFromInnerStillRefused =
+    do
+        n <- freshNested
+        roots <- mapOf [ ( "out", n.outer ), ( "in", n.inner ) ]
+        Task.succeed
+            (List.all identity
+                [ refusedAs "invalid" (RepoPath.resolve roots "in:../y")
+                , refusedAs "invalid" (RepoPath.resolve roots "in:x/../../y")
+                , refusedAs "invalid" (RepoPath.resolve roots "out:../y")
+                , refusedAs "not-under-root" (RepoPath.resolve roots "in:/y")
+                ]
+            )
+
+
+
+-- One decimal integer: the ceiling ipe-index's writer holds as `MAX_REPOS`.
+maxReposVector : Task.Task Error Int
+maxReposVector =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "max_repos.json"))
+        text <- File.readFileLimit path (ByteSize.kib 4)
+        Task.fromResult (Decode.decodeString (Decode.field "max_repos" Decode.int) text)
+
+
+
+-- `count` roots tagged `t0`, `t1`, ..., each on its own new directory.
+distinctRoots : Int -> Task.Task Error (List ( String, Root ))
+distinctRoots count =
+    do
+        base <- File.tempDir "ipe-review-root-ceiling-"
+        List.range 0 (count - 1)
+            |> List.map
+                (\i ->
+                    let
+                        dir =
+                            base ++ "/d" ++ String.fromInt i
+                    in
+                    makeDir dir
+                        |> Task.andThen (\_ -> RepoPath.parseRoot dir)
+                        |> Task.map (\root -> ( "t" ++ String.fromInt i, root ))
+                )
+            |> Task.sequence
+
+
+
+-- A map holds `maxRoots` roots and refuses one more; `maxRoots` is the
+-- number in the shared vector file, so the two ceilings cannot drift.
+tooManyRootsRefused : Task.Task Error Bool
+tooManyRootsRefused =
+    do
+        limit <- maxReposVector
+        roots <- distinctRoots (limit + 1)
+        Task.succeed
+            (limit >= 1
+                && RepoPath.maxRoots == limit
+                && mapRefusedAs "too-many-roots" (mapResult roots)
+                && not (mapRefused (mapResult (List.take limit roots)))
             )
 
 
@@ -698,4 +964,11 @@ checks =
         , check "blank, missing and non-directory roots refused" badRootsRefused
         , check "relative root loads the queue" relativeRootLoadsQueue
         , check "tag grammar matches the shared ipe-index tag vectors" tagGrammarMatchesVectors
+        , check "two tags on one directory refused" sameRootTwoTagsRefused
+        , check "a deeper root claims the paths under it" deeperRootClaimsPath
+        , check "a deeper root claims its own directory" deeperRootClaimsItsOwnDir
+        , check "a sibling whose name starts like a root is not claimed" siblingPrefixNotClaimed
+        , check "nested roots resolve under the deepest owner" grandchildOwnedByDeepest
+        , check "dotdot out of an inner root stays refused" dotdotFromInnerStillRefused
+        , check "root ceiling matches the shared ipe-index vector" tooManyRootsRefused
         ]
