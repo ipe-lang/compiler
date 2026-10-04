@@ -355,7 +355,7 @@ fn scan_dir(root: &Path, dir: &Path, hits: &mut BTreeMap<Site, usize>) -> Result
 /// hand-built literal fails, and so does an allowlist entry gone stale.
 #[test]
 fn backend_splices_text_only_through_the_literal_owner() -> Result<(), String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = e2e_support::manifest_dir!().join("src");
     let mut found = BTreeMap::new();
     scan_dir(&root, &root, &mut found)?;
     let allowed: BTreeMap<Site, usize> = ALLOWED
