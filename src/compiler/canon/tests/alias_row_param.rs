@@ -165,18 +165,12 @@ fn row_param_imported_parity() {
 #[test]
 fn exported_body_has_no_source_param() {
     let (result, i) = canonicalise_chain(&[NAMED]);
-    let Ok((_, exports)) = result else {
-        assert!(result.is_ok(), "Lib.Named must canonicalise: {result:?}");
-        return;
-    };
+    let (_, exports) = result.expect("Lib.Named must canonicalise");
     let alias = exports
         .aliases
         .iter()
-        .find_map(|(n, a)| (i.resolve(*n) == Some("Named")).then_some(a));
-    let Some(alias) = alias else {
-        assert!(alias.is_some(), "`Named` must be exported");
-        return;
-    };
+        .find_map(|(n, a)| (i.resolve(*n) == Some("Named")).then_some(a))
+        .expect("`Named` must be exported");
     assert!(
         matches!(&alias.body, Type::RecordOpen(row, _) if alias.param_slots.first() == Some(row)),
         "the exported row must be the parameter's slot, got {:?}",
