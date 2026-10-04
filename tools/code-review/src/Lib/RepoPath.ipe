@@ -150,20 +150,19 @@ parseRoot raw =
 
     else
         do
-            path <-
-                absolutize raw
-                    |> Task.mapError
-                        (\e ->
-                            Error.invalidInput
-                                (rootRefusal raw
-                                    (SafeText.concat
-                                        [ SafeText.literal "is not a valid path ("
-                                        , SafeText.render (Error.message e)
-                                        , SafeText.literal ")"
-                                        ]
-                                    )
+            path <- absolutize raw
+                |> Task.mapError
+                    (\e ->
+                        Error.invalidInput
+                            (rootRefusal raw
+                                (SafeText.concat
+                                    [ SafeText.literal "is not a valid path ("
+                                    , SafeText.render (Error.message e)
+                                    , SafeText.literal ")"
+                                    ]
                                 )
-                        )
+                            )
+                    )
             isDir <- File.isDir path |> Task.onError (\_ -> Task.succeed False)
             if isDir then
                 Task.succeed (Root path)

@@ -6,9 +6,9 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, CmdSubShapeMismatch, CodecAutoRejection, DResult, Diagnostic, Located,
-    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, SealRejection,
-    SortedNames, Span, TypeError,
+    AliasExpansionKind, Candidates, CmdSubShapeMismatch, CodecAutoRejection, DResult, Diagnostic,
+    EditTarget, Located, ModulePlacementReason, ModulePlacementRejection, NameError, ParseError,
+    SealRejection, SortedNames, Span, TypeError,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
@@ -1005,22 +1005,11 @@ pub fn canonicalise_module_with_origin(
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
     // Legacy entry point: dep exports arrive as an owned map and the
-    // known-module universe for IPE-N0020 did-you-mean IS that map's key set —
-    // the pre-incremental behaviour, preserved for non-driver callers.
+    // importable-module catalog is that map's key set plus the kernel paths.
     let dep_refs: BTreeMap<Vec<Symbol>, &crate::ModuleExports> =
         deps.iter().map(|(k, v)| (k.clone(), v)).collect();
-    let known_modules: BTreeSet<Box<str>> = deps
-        .keys()
-        .map(|p| path_to_dot_string(interner, p))
-        .collect();
-    canonicalise_module_in_project(
-        m,
-        expected_path,
-        &dep_refs,
-        &known_modules,
-        origin,
-        interner,
-    )
+    let catalog = crate::ModuleCatalog::new(deps.keys().map(|p| path_to_dot_string(interner, p)));
+    canonicalise_module_in_project(m, expected_path, &dep_refs, &catalog, origin, interner)
 }
 
 /// Canonicalise a module against per-dep export references plus an explicit
@@ -1062,7 +1051,7 @@ pub fn canonicalise_module_in_project(
     m: &src::Module,
     expected_path: &[Symbol],
     deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
-    known_modules: &BTreeSet<Box<str>>,
+    catalog: &crate::ModuleCatalog,
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
@@ -1107,15 +1096,25 @@ pub fn canonicalise_module_in_project(
 
     let mut env = Env::initial(home.clone(), interner)?;
     env.origin = origin;
+    env.module_catalog = catalog.clone();
+    let mut import_aliases: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
+    for import in &m.imports {
+        if let Some(alias) = import.alias {
+            import_aliases
+                .entry(path_to_dot_string(interner, &import.name.value))
+                .or_default()
+                .insert(name_str(interner, alias)?);
+        }
+    }
+    env.import_aliases = Rc::new(import_aliases);
     // Fail closed at the boundary on an `Ipe.*` import that names neither a
     // kernel stdlib module nor a compiled-source dep (a typo such as
     // `Ipe.Strng`), before alias registration and the dep loop silently skip it.
-    // Runs first so the did-you-mean can rank over the project's known modules.
-    let known_module_pool: Vec<Box<str>> = known_modules.iter().cloned().collect();
+    // Runs first so the did-you-mean can rank over the importable-module catalog.
     reject_unknown_ipe_import_with_candidates(
         &m.imports,
         |p| deps.contains_key(p),
-        &known_module_pool,
+        catalog,
         interner,
     )?;
     // Register user import aliases for stdlib (`Ipê.*` / `Ipe.*`) modules BEFORE
@@ -1164,12 +1163,12 @@ pub fn canonicalise_module_in_project(
             // only — never intern on this path). An unrelated import
             // (`Rust.Firestore` against the project's own modules) is beyond the
             // edit-distance ceiling, so it yields none rather than the whole list.
-            let sugg = rank_suggestions(&name, known_modules.iter().map(Box::as_ref));
+            let sugg = rank_suggestions(&name, catalog.paths());
             Diagnostic::Name {
                 span: import.name.span,
                 msg: NameError::ModuleNotFound {
+                    suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                     name,
-                    suggestions: sugg,
                 },
             }
         })?;
@@ -2277,9 +2276,9 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 /// ([`crate::env::is_kernel_stdlib_module`]) or a compiled-source module the
 /// build driver supplied as a dep (`is_known_dep`). Anything else is a typo
 /// (`Ipe.Strng`) that must fail closed at the boundary rather than being
-/// silently dropped. Suggestions are ranked over the kernel dot-paths plus
-/// `extra_candidates` (the project's known user + compiled-source module
-/// dot-paths), strings only — never interning.
+/// silently dropped. Suggestions are ranked over the importable-module
+/// `catalog` (kernel, compiled-source, and project dot-paths), strings only —
+/// never interning.
 ///
 /// Only the project entry (which carries the resolved `deps` universe) can
 /// classify a compiled-source `Ipe.*` module, so this runs there. The bare
@@ -2292,7 +2291,7 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 fn reject_unknown_ipe_import_with_candidates(
     imports: &[src::Import],
     is_known_dep: impl Fn(&[Symbol]) -> bool,
-    extra_candidates: &[Box<str>],
+    catalog: &crate::ModuleCatalog,
     interner: &mut Interner,
 ) -> DResult<()> {
     let ipe_sym = interner.intern("Ipe")?;
@@ -2305,14 +2304,12 @@ fn reject_unknown_ipe_import_with_candidates(
             continue;
         }
         let name = path_to_dot_string(interner, dep_path);
-        let mut candidates: Vec<Box<str>> = crate::env::stdlib_module_dot_paths();
-        candidates.extend(extra_candidates.iter().cloned());
-        let sugg = rank_suggestions(&name, candidates.iter().map(Box::as_ref));
+        let sugg = rank_suggestions(&name, catalog.paths());
         return Err(Diagnostic::Name {
             span: import.name.span,
             msg: NameError::ModuleNotFound {
+                suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                 name,
-                suggestions: sugg,
             },
         });
     }
@@ -2418,9 +2415,13 @@ fn register_stdlib_import_aliases(
         // closed: skip the mark for that foreign-canonical case. The member-clone
         // below still runs, so the bare import's own members resolve, and its
         // canonical is still marked via the `import.alias.is_none()` branch.
+        // The same predicate decides which modules an IPE-N0034 lists for an
+        // unimported qualifier (`crate::env::bare_import_binds`).
         let alias_is_foreign_gated_canonical = import.alias.is_none()
-            && alias != canonical
-            && crate::env::is_stdlib_canonical_qualifier(interner, alias);
+            && !crate::env::kernel_import_binds_last_segment(
+                &name_str(interner, alias)?,
+                &name_str(interner, canonical)?,
+            );
         if !alias_is_foreign_gated_canonical {
             env.mark_stdlib_qualifier_imported(alias);
         }
@@ -2521,15 +2522,19 @@ fn bind_stdlib_kernel_import(
                             .find(|(n, _)| *n == name)
                             .map(|(_, h)| h.clone())
                         else {
+                            let name_s = name_str(interner, name)?;
                             return Err(Diagnostic::Name {
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: path_to_dot_string(interner, dep_path),
-                                    name: name_str(interner, name)?,
-                                    suggestions: suggestions(
-                                        name,
-                                        members.iter().map(|(n, _)| *n),
-                                        interner,
+                                    name: name_s.clone(),
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        suggestions(
+                                            name,
+                                            members.iter().map(|(n, _)| *n),
+                                            interner,
+                                        ),
                                     ),
                                 },
                             });
@@ -4687,8 +4692,11 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
@@ -4706,8 +4714,11 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::prefix(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
@@ -5413,9 +5424,11 @@ fn collect_binders_no_dup(
 /// Resolve a constructor pattern's bare name. A pattern reads the expression
 /// namespace's one ladder: a value its first answering tier binds (a record
 /// alias's auto-constructor) shadows any lower-tier constructor, and is no
-/// constructor to match on.
+/// constructor to match on. `unqualified` is whether the pattern's source token
+/// is the bare name, so a did-you-mean may edit it.
 fn resolve_pattern_ctor<'e>(
     name: Symbol,
+    unqualified: bool,
     span: Span,
     env: &'e Env,
     interner: &Interner,
@@ -5432,19 +5445,13 @@ fn resolve_pattern_ctor<'e>(
             let modules = importer_names(&importers, interner);
             Err(ambiguous_import(name, span, modules, interner)?)
         }
-        Resolved::Found(..) | Resolved::Missing => {
-            let ctor_names = env
-                .module_scope
-                .expr
-                .names_where(|target| matches!(target, ExprTarget::Ctor(_)));
-            Err(Diagnostic::Name {
-                span,
-                msg: NameError::ConstructorNotFound {
-                    name: name_str(interner, name)?,
-                    suggestions: suggestions(name, ctor_names, interner),
-                },
-            })
-        }
+        Resolved::Found(..) | Resolved::Missing => Err(ctor_pattern_not_found(
+            name,
+            unqualified,
+            span,
+            env,
+            interner,
+        )?),
     }
 }
 
@@ -5460,8 +5467,8 @@ fn canonicalise_pattern(
         src::Pattern_::PDebugAnything => canon::Pattern_::PDebugAnything,
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
-        src::Pattern_::PCtor(name, _, args) => {
-            let ctor = resolve_pattern_ctor(*name, span, env, interner)?;
+        src::Pattern_::PCtor(name, segments, args) => {
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, interner)?;
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
             let index = ctor.index;
@@ -5807,18 +5814,22 @@ fn value_not_found(
     env: &Env,
     interner: &Interner,
 ) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
     Ok(Diagnostic::Name {
         span,
         msg: NameError::ValueNotFound {
-            name: name_str(interner, name)?,
-            suggestions: suggestions(
-                name,
-                env.vars
-                    .keys()
-                    .copied()
-                    .chain(env.module_scope.expr.names()),
-                interner,
+            suggestions: Candidates::at(
+                EditTarget::whole(span, &name_s),
+                suggestions(
+                    name,
+                    env.vars
+                        .keys()
+                        .copied()
+                        .chain(env.module_scope.expr.names()),
+                    interner,
+                ),
             ),
+            name: name_s,
         },
     })
 }
@@ -5866,6 +5877,154 @@ fn reject_bare_reserved_constructor(
         });
     }
     None
+}
+
+/// The diagnostic for a constructor pattern naming no constructor in scope.
+///
+/// An unqualified constructor pattern starts with its name, so a sole
+/// did-you-mean may overwrite that prefix; a qualified one starts with the
+/// module, so it has no edit region.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `name` is not interned.
+fn ctor_pattern_not_found(
+    name: Symbol,
+    unqualified: bool,
+    span: Span,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
+    let region = if unqualified {
+        EditTarget::prefix(span, &name_s)
+    } else {
+        None
+    };
+    let ctor_names = env
+        .module_scope
+        .expr
+        .names_where(|target| matches!(target, ExprTarget::Ctor(_)));
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::ConstructorNotFound {
+            suggestions: Candidates::at(region, suggestions(name, ctor_names, interner)),
+            name: name_s,
+        },
+    })
+}
+
+/// `span` when it is exactly the source token `qualifier.member`.
+///
+/// A reference the parser synthesised (an operator desugared to a qualified
+/// name) carries a span of a different width; it gets no edit region.
+fn qualified_token(span: Span, qualifier: Option<&str>, member: Option<&str>) -> Option<Span> {
+    let width = qualifier?
+        .len()
+        .checked_add(1)?
+        .checked_add(member?.len())?;
+    (usize::try_from(span.hi.checked_sub(span.lo)?).ok()? == width).then_some(span)
+}
+
+/// The diagnostic for a qualifier no import or ambient table binds.
+///
+/// A qualifier a bare `import` of some catalog module would bind is IPE-N0034
+/// naming every such module; anything else is IPE-N0004 ranked over the
+/// qualifiers this module can actually use. `token` is the `qualifier.member`
+/// source token when one exists (value position), giving the did-you-mean its
+/// edit region; a type annotation has none.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `qualifier` is not interned.
+fn unbound_qualifier(
+    qualifier: Symbol,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let qualifier_s = name_str(interner, qualifier)?;
+    let home = path_to_dot_string(interner, &env.home);
+    let modules = env.module_catalog.modules_bound_by(&qualifier_s, &home);
+    if !modules.is_empty() {
+        return Ok(import_required(qualifier_s, modules, span, token, env));
+    }
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::UnknownModule {
+            suggestions: Candidates::at(
+                token.and_then(|t| EditTarget::prefix(t, &qualifier_s)),
+                suggestions(qualifier, env.usable_qualifiers(), interner),
+            ),
+            qualifier: qualifier_s,
+        },
+    })
+}
+
+/// Every module a bare `import` of which binds the Tier-C gated `qualifier`.
+///
+/// The catalog ([`crate::ModuleCatalog::modules_bound_by`]) is the one source:
+/// it lists every kernel AND compiled-source module the qualifier names, so a
+/// compiled `Ipe.Ui.Tui` stands beside the kernel `Ipe.Tea.Tui` for `Tui`.
+/// `gate_path`, the gate's own kernel path, is always one of them; it is
+/// unioned in so the set is never empty even over a kernel-only catalog.
+/// Sorted and deduplicated.
+fn gated_import_candidates(
+    qualifier: &str,
+    gate_path: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) -> Box<[Box<str>]> {
+    let home = path_to_dot_string(interner, &env.home);
+    let mut modules: BTreeSet<Box<str>> = env
+        .module_catalog
+        .modules_bound_by(qualifier, &home)
+        .into_vec()
+        .into_iter()
+        .collect();
+    modules.insert(path_to_dot_string(interner, gate_path));
+    modules.into_iter().collect()
+}
+
+/// The verdict for `qualifier`, which a bare `import` of each of `modules`
+/// (non-empty, sorted) would bind but no import in this module binds.
+///
+/// A module already imported under an `as` alias is not missing an import: the
+/// use site spelled the module's name instead of its alias, so the verdict is
+/// IPE-N0004 offering the alias (an applicable edit only when exactly one
+/// module and one alias answer). Otherwise it is IPE-N0034 naming `modules`.
+fn import_required(
+    qualifier: Box<str>,
+    modules: Box<[Box<str>]>,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+) -> Diagnostic {
+    let aliases: BTreeSet<&Box<str>> = modules
+        .iter()
+        .filter_map(|module| env.import_aliases.get(module))
+        .flatten()
+        .collect();
+    if aliases.is_empty() {
+        return Diagnostic::Name {
+            span,
+            msg: NameError::ImportRequired {
+                qualifier,
+                candidates: modules,
+            },
+        };
+    }
+    let region = if modules.len() == 1 && aliases.len() == 1 {
+        token.and_then(|t| EditTarget::prefix(t, &qualifier))
+    } else {
+        None
+    };
+    Diagnostic::Name {
+        span,
+        msg: NameError::UnknownModule {
+            suggestions: Candidates::at(region, aliases.into_iter().cloned().collect()),
+            qualifier,
+        },
+    }
 }
 
 /// Resolve a qualified name `Qualifier.name`. Distinguishes an unknown
@@ -5941,25 +6100,14 @@ fn resolve_qual_var(
     // catalog, and NOT the generic "unknown module" (the module is known; the
     // import is missing). Checked before the member lookup, since the catalog
     // members are present regardless of import.
+    let token = qualified_token(span, qualifier_text, name_text);
     if let Some(import_path) = env.stdlib_import_required(qualifier) {
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::StdlibImportRequired {
-                qualifier: name_str(interner, qualifier)?,
-                import_path: path_to_dot_string(interner, import_path),
-            },
-        });
+        let qualifier_s = name_str(interner, qualifier)?;
+        let modules = gated_import_candidates(&qualifier_s, import_path, env, interner);
+        return Err(import_required(qualifier_s, modules, span, token, env));
     }
     let Some(members) = env.qual_members(qualifier) else {
-        // The qualifier itself is unknown: suggest from the known qualifiers
-        // (kernel modules + import aliases).
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::UnknownModule {
-                qualifier: name_str(interner, qualifier)?,
-                suggestions: suggestions(qualifier, env.qual_vars.keys().copied(), interner),
-            },
-        });
+        return Err(unbound_qualifier(qualifier, span, token, env, interner)?);
     };
     match members.get(&name) {
         Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
@@ -5992,19 +6140,23 @@ fn resolve_qual_var(
                     index: ch.index,
                 });
             }
+            let member = name_str(interner, name)?;
             Err(Diagnostic::Name {
                 span,
                 msg: NameError::NoSuchMember {
                     module: name_str(interner, qualifier)?,
-                    member: name_str(interner, name)?,
-                    suggestions: suggestions(
-                        name,
-                        members
-                            .keys()
-                            .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
-                            .copied(),
-                        interner,
+                    suggestions: Candidates::at(
+                        token.and_then(|t| EditTarget::suffix(t, &member)),
+                        suggestions(
+                            name,
+                            members
+                                .keys()
+                                .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
+                                .copied(),
+                            interner,
+                        ),
                     ),
+                    member,
                 },
             })
         }
@@ -6364,7 +6516,7 @@ fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
         span: ctx.ann_span,
         msg: NameError::TypeNotFound {
             name: name_s.into(),
-            suggestions: suggestions(name, candidates, ctx.interner),
+            suggestions: Candidates::hints(suggestions(name, candidates, ctx.interner)),
         },
     })
 }
@@ -6714,24 +6866,22 @@ fn canonicalise_type(
                 // before the unknown-qualifier fallback, since the catalog
                 // qualifier is present in `qual_vars` regardless of import.
                 if let Some(import_path) = ctx.env.stdlib_import_required(*qualifier) {
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::StdlibImportRequired {
-                            qualifier: qualifier_str.into(),
-                            import_path: path_to_dot_string(ctx.interner, import_path),
-                        },
-                    });
+                    return Err(import_required(
+                        qualifier_str.into(),
+                        gated_import_candidates(qualifier_str, import_path, ctx.env, ctx.interner),
+                        ctx.ann_span,
+                        None,
+                        ctx.env,
+                    ));
                 }
                 if !ctx.env.qual_vars.contains_key(qualifier) {
-                    let sugg =
-                        suggestions(*qualifier, ctx.env.qual_vars.keys().copied(), ctx.interner);
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::UnknownModule {
-                            qualifier: qualifier_str.into(),
-                            suggestions: sugg,
-                        },
-                    });
+                    return Err(unbound_qualifier(
+                        *qualifier,
+                        ctx.ann_span,
+                        None,
+                        ctx.env,
+                        ctx.interner,
+                    )?);
                 }
             }
             // `View engine msg` — the engine-tagged view carrier and SSOT view
@@ -6773,7 +6923,7 @@ fn canonicalise_type(
                             span: ctx.ann_span,
                             msg: NameError::TypeNotFound {
                                 name: name_str(ctx.interner, engine)?,
-                                suggestions: Box::new([]),
+                                suggestions: Candidates::default(),
                             },
                         });
                     }

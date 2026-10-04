@@ -145,39 +145,36 @@ type alias ReviewRow =
 reviewCodec : Codec ReviewRow
 reviewCodec =
     Codec
-        { enc =
-            \row ->
-                Encode.object
-                    [ ( "uid", Encode.string row.uid )
-                    , ( "body_hash", Encode.string row.bodyHash )
-                    , ( "decision", Encode.string row.decision )
-                    , ( "reason"
-                      , case row.reason of
-                            Just r ->
-                                Encode.string (storedReasonString r)
+        { enc = \row ->
+            Encode.object
+                [ ( "uid", Encode.string row.uid )
+                , ( "body_hash", Encode.string row.bodyHash )
+                , ( "decision", Encode.string row.decision )
+                , ( "reason"
+                , case row.reason of
+                    Just r ->
+                        Encode.string (storedReasonString r)
 
-                            Nothing ->
-                                Encode.null
-                      )
-                    , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
-                    ]
-        , mkDec =
-            \_ ->
-                Config.map5 makeRow
-                    (Config.field "uid" Config.string)
-                    (Config.field "body_hash" Config.string)
-                    (Config.field "decision" Config.string)
-                    (Config.field "reason" (Config.nullable Config.string))
-                    (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
-                    |> Config.map rowFromStored
-        , shp =
-            SRecord
-                [ ( "uid", CText )
-                , ( "body_hash", CText )
-                , ( "decision", CText )
-                , ( "reason", CNull CText )
-                , ( "reviewed_at", CTime )
+                    Nothing ->
+                        Encode.null
+                )
+                , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
                 ]
+        , mkDec = \_ ->
+            Config.map5 makeRow
+                (Config.field "uid" Config.string)
+                (Config.field "body_hash" Config.string)
+                (Config.field "decision" Config.string)
+                (Config.field "reason" (Config.nullable Config.string))
+                (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
+                |> Config.map rowFromStored
+        , shp = SRecord
+            [ ( "uid", CText )
+            , ( "body_hash", CText )
+            , ( "decision", CText )
+            , ( "reason", CNull CText )
+            , ( "reviewed_at", CTime )
+            ]
         }
 
 
@@ -208,12 +205,11 @@ rowFromStored stored =
     { uid = stored.uid
     , bodyHash = stored.bodyHash
     , decision = stored.decision
-    , reason =
-        if stored.decision == "refuse" then
-            Just (storedReason (Maybe.withDefault "" stored.reason))
+    , reason = if stored.decision == "refuse" then
+        Just (storedReason (Maybe.withDefault "" stored.reason))
 
-        else
-            Nothing
+    else
+        Nothing
     , reviewedAt = stored.reviewedAt
     }
 
