@@ -877,6 +877,8 @@ pub fn scan(
         scopes: 0,
         remotes: BTreeMap::new(),
         deferred: Vec::new(),
+        network_urls: Vec::new(),
+        helper_remote: false,
     };
     run.seed(roots)?;
     while let Some(item) = run.pending.pop() {
@@ -1006,7 +1008,11 @@ enum Role {
     Exempt,
     /// Every word is judged.
     Words,
-    /// Every word, and this text as one command path whatever its shape.
+    /// The words of this text, and this text as one command path whatever its shape.
+    ///
+    /// The text is the part of the value the tool runs or loads: the whole
+    /// value for Git, a Mercurial extension's path without the `!` that
+    /// disables it, a `python:` hook's file without its function.
     Forced(String),
     /// The whole value as one path to a file that is then read, as this include reads it.
     Include(Reading),
@@ -1357,6 +1363,10 @@ struct Scan<'s> {
     remotes: BTreeMap<(Scope, String), RemoteUrls>,
     /// Remote-name values waiting for every remote to be known.
     deferred: Vec<Deferred>,
+    /// Remote URL values admitted as network URLs, judged again as paths when a remote names a helper.
+    network_urls: Vec<Deferred>,
+    /// Whether any file read sets `remote.<name>.vcs`, which hands a remote's URL verbatim to `git-remote-<vcs>`.
+    helper_remote: bool,
 }
 
 impl Scan<'_> {
@@ -1856,6 +1866,19 @@ impl Scan<'_> {
         Ok(Resolved { path: real, end })
     }
 
+    /// Refuse the regular file `name` of `dir`, reached for `at`, when it has more than one name.
+    ///
+    /// An entry that is gone or not a regular file (a device, a FIFO) is
+    /// left to the tool: it runs no rewritable file.
+    fn single_named(&self, at: &Path, dir: &HeldDir, name: &EntryName) -> Result<(), Stop> {
+        match dir.open_regular(name).and_then(|file| file.link_count()) {
+            Ok(count) if count <= 1 => Ok(()),
+            Ok(_) => Err(unproven(Unprovable::HardLinked)),
+            Err(OpenRefusal::Absent | OpenRefusal::NotRegular(_)) => Ok(()),
+            Err(refusal) => Err(Stop::Refused(self.unreadable(at, fault_of(refusal)))),
+        }
+    }
+
     /// Refuse a file with more than one name.
     fn single_link(&self, at: &Path, file: &RegularFile) -> Result<(), ConfigRefusal> {
         match file.link_count() {
@@ -2034,6 +2057,13 @@ impl Scan<'_> {
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
+            if is_remote_url(ctx.syntax, &entry.setting) && is_network_url(&entry.value, true) {
+                self.network_urls.push(Deferred {
+                    ctx: ctx.clone(),
+                    setting: entry.setting.clone(),
+                    value: entry.value.clone(),
+                });
+            }
             match route {
                 Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
                 Route::RemoteName => {
@@ -2075,14 +2105,22 @@ impl Scan<'_> {
     /// URL only from a file the tool always reads, since a value the tool may
     /// never read cannot make the name stop naming a path.
     fn note_remote(&mut self, ctx: &FileCtx, setting: &Setting, value: &str) {
-        if let Setting::Key {
+        let Setting::Key {
             section,
             subsection: Some(name),
             key,
         } = setting
-            && &**section == "remote"
-            && key.eq_ignore_ascii_case("url")
-        {
+        else {
+            return;
+        };
+        if &**section != "remote" {
+            return;
+        }
+        // A helper named from any file, read always or not, counts.
+        if key.eq_ignore_ascii_case("vcs") {
+            self.helper_remote = true;
+        }
+        if key.eq_ignore_ascii_case("url") {
             let urls = match (value.is_empty(), ctx.reading) {
                 (true, Reading::Always | Reading::Conditional) => RemoteUrls::Cleared,
                 (false, Reading::Always) => RemoteUrls::Set,
@@ -2100,12 +2138,24 @@ impl Scan<'_> {
         }
     }
 
-    /// Judge every remote-name value naming no remote its scope sees as a URL.
+    /// Judge every remote-name value naming no remote its scope sees as a URL,
+    /// and every network remote URL as a path once a remote names a helper.
     ///
     /// A remote is defined when a scope the name is looked up in sets a URL
-    /// for it and none clears its URLs.
+    /// for it and none clears its URLs. A helper (`remote.<name>.vcs`) is
+    /// handed the URL verbatim and may read it as a local path, so with one
+    /// set anywhere no remote URL is admitted for its network shape.
     fn judge_deferred(&mut self) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
+        let network_urls = std::mem::take(&mut self.network_urls);
+        if self.helper_remote {
+            for item in network_urls {
+                self.judge(&item.ctx, &Role::Forced(item.value.clone()), &item.value)
+                    .map_err(|stop| {
+                        stop.into_refusal(kind, &item.ctx.source, || item.setting.public())
+                    })?;
+            }
+        }
         for item in std::mem::take(&mut self.deferred) {
             let looked_up = item.ctx.scope;
             let mut set = false;
@@ -2199,7 +2249,7 @@ impl Scan<'_> {
             Role::Exempt => Ok(()),
             Role::Words => self.judge_words(ctx, value),
             Role::Forced(path) => {
-                self.judge_words(ctx, value)?;
+                self.judge_words(ctx, path)?;
                 self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
             Role::Include(include) => {
@@ -2244,9 +2294,13 @@ impl Scan<'_> {
 
     /// Judge every word of the command line `value`.
     fn judge_words(&mut self, ctx: &FileCtx, value: &str) -> Result<(), Stop> {
+        let tilde = match ctx.syntax {
+            Syntax::Git | Syntax::Hg | Syntax::Darcs | Syntax::GitRemote => Tilde::Shell,
+            Syntax::Toml => Tilde::Verbatim,
+        };
         let mut words = Words::default();
         words
-            .push_split(value, Position::Program)
+            .push_split(value, Position::Program, tilde)
             .map_err(unproven)?;
         self.judge_queue(ctx, &mut words)
     }
@@ -2255,7 +2309,9 @@ impl Scan<'_> {
     fn judge_word(&mut self, ctx: &FileCtx, text: &str, position: Position) -> Result<(), Stop> {
         value_checks(text).map_err(unproven)?;
         let mut words = Words::default();
-        words.push(text.to_owned(), position).map_err(unproven)?;
+        words
+            .push_forms(text.to_owned(), position)
+            .map_err(unproven)?;
         self.judge_queue(ctx, &mut words)
     }
 
@@ -2294,7 +2350,9 @@ impl Scan<'_> {
                 words
                     .push_staged(word, position, Stage::ArgumentQueued)
                     .map_err(unproven)?;
-                words.push(argument, Position::Argument).map_err(unproven)?;
+                words
+                    .push_forms(argument, Position::Argument)
+                    .map_err(unproven)?;
                 continue;
             }
             let text = command_text(&word, position);
@@ -2303,12 +2361,18 @@ impl Scan<'_> {
             }
             if text.contains(is_c_space) {
                 words
-                    .push_split(text, Position::Program)
+                    .push_split(text, Position::Program, Tilde::Shell)
                     .map_err(unproven)?;
             }
             let shaped = is_path_shaped(text);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
+            }
+            if text.len() != word.len() && is_path_shaped(&word) {
+                // A tool that consumes no runner prefix runs the word as
+                // written: `!/x` is then the path `!/x`, relative to the
+                // directory it runs in.
+                self.judge_path(ctx, &word, Reach::Command)?;
             }
             if text.contains(is_word_separator) {
                 words.push_pieces(text, position).map_err(unproven)?;
@@ -2347,7 +2411,10 @@ impl Scan<'_> {
 
     /// Walk `word` from every base, refusing a place inside a grant reached lexically or by the walk.
     ///
-    /// Each candidate path comes back with what its walk reached.
+    /// A regular file reached is refused when it has a second name: a hard
+    /// link the jail holds in a grant rewrites the file the tool runs, and its
+    /// other names cannot be found. Each candidate path comes back with what
+    /// its walk reached.
     fn judge_path(
         &mut self,
         ctx: &FileCtx,
@@ -2361,6 +2428,9 @@ impl Scan<'_> {
             let found = self.walk(&candidate, &ctx.source).map_err(Stop::from)?;
             if self.grants.covers(&candidate) {
                 return Err(Stop::Named(Named::InGrant(lexical(&candidate))));
+            }
+            if let End::Entry(dir, name) = &found.end {
+                self.single_named(&candidate, dir, name)?;
             }
             resolved.push((candidate, found));
         }
@@ -2424,6 +2494,15 @@ enum Stage {
     ArgumentQueued,
 }
 
+/// How a tool runs the words of a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tilde {
+    /// Through a shell, which expands a word's unquoted leading `~` to the home directory.
+    Shell,
+    /// Split like a shell line but run as written (Jujutsu): a leading `~` may be a relative path's first character.
+    Verbatim,
+}
+
 /// The words of one value still to judge, bounded by [`MAX_WORDS`].
 #[derive(Default)]
 struct Words {
@@ -2454,15 +2533,37 @@ impl Words {
         Ok(())
     }
 
+    /// Push one word, and when it starts with `~` that word read verbatim too.
+    ///
+    /// A `~` no shell expands (a piece after a separator, an option's
+    /// argument, a word a tool runs without a shell) is the first character
+    /// of a relative path, and some shells expand one at those places:
+    /// both readings are judged.
+    fn push_forms(&mut self, word: String, position: Position) -> Result<(), Unprovable> {
+        let verbatim = word.starts_with('~').then(|| format!("./{word}"));
+        self.push(word, position)?;
+        if let Some(verbatim) = verbatim {
+            self.push(verbatim, position)?;
+        }
+        Ok(())
+    }
+
     /// Push the shell words of `text`, the first at `first` and the rest as arguments.
-    fn push_split(&mut self, text: &str, first: Position) -> Result<(), Unprovable> {
+    ///
+    /// A word whose leading `~` was quoted or escaped arrives as `./~...`
+    /// ([`shell_words`]); one whose leading `~` was not is read as the shell
+    /// reads it under [`Tilde::Shell`], and both ways under [`Tilde::Verbatim`].
+    fn push_split(&mut self, text: &str, first: Position, tilde: Tilde) -> Result<(), Unprovable> {
         for (index, word) in shell_words(text).into_iter().enumerate().rev() {
             let position = if index == 0 {
                 first
             } else {
                 Position::Argument
             };
-            self.push(word, position)?;
+            match tilde {
+                Tilde::Shell => self.push(word, position)?,
+                Tilde::Verbatim => self.push_forms(word, position)?,
+            }
         }
         Ok(())
     }
@@ -2488,7 +2589,7 @@ impl Words {
             }
         }
         for (piece, at) in pieces.into_iter().rev() {
-            self.push(piece.to_owned(), at)?;
+            self.push_forms(piece.to_owned(), at)?;
         }
         Ok(())
     }
@@ -2588,8 +2689,13 @@ fn host_ok(authority: &str) -> bool {
 }
 
 /// Whether `value` is a network URL: a known scheme with a host, or with `scp` Git's `host:path` form.
+///
+/// A value holding `::` is never one: Git reads `<helper>::<address>`
+/// before either form and runs the program `git-remote-<helper>` on the
+/// address (`hg::/tree/repo` runs Mercurial on a repository the jail
+/// writes), so such a value is judged as a path.
 fn is_network_url(value: &str, scp: bool) -> bool {
-    if value.is_empty() || value.contains(char::is_whitespace) {
+    if value.is_empty() || value.contains(char::is_whitespace) || value.contains("::") {
         return false;
     }
     if let Some((scheme, rest)) = value.split_once("://") {
@@ -2701,12 +2807,24 @@ fn is_path_shaped(word: &str) -> bool {
 /// `value` split into shell words: quotes group, a backslash escapes, whitespace separates.
 ///
 /// An unterminated quote ends the last word at the end of the value, so its
-/// text is still judged.
+/// text is still judged. The shell expands a leading `~` only when the word's
+/// first character is that unquoted `~`; a word starting with a quoted or
+/// escaped `~` (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`) names the relative path
+/// `~/x`, so it comes back as `./~/x`.
 fn shell_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    // Whether the word being read started with an unquoted `~`.
+    let mut home = false;
     let mut quote: Option<char> = None;
+    let finish = |word: String, home: bool| {
+        if word.starts_with('~') && !home {
+            format!("./{word}")
+        } else {
+            word
+        }
+    };
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
         match (quote, c) {
@@ -2724,18 +2842,22 @@ fn shell_words(value: &str) -> Vec<String> {
             }
             (None, other) if is_c_space(other) => {
                 if in_word {
-                    words.push(std::mem::take(&mut word));
+                    words.push(finish(std::mem::take(&mut word), home));
                     in_word = false;
+                    home = false;
                 }
             }
             (None, other) => {
+                if !in_word {
+                    home = other == '~';
+                }
                 in_word = true;
                 word.push(other);
             }
         }
     }
     if in_word {
-        words.push(word);
+        words.push(finish(word, home));
     }
     words
 }
@@ -2790,6 +2912,25 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         Route::Judge(Role::Exempt)
     } else {
         Route::Judge(Role::Words)
+    }
+}
+
+/// Whether `setting` of a file in `syntax` gives a Git remote a URL: `remote.<name>.url` or `pushurl`, or a line of a `remotes/` or `branches/` file.
+fn is_remote_url(syntax: Syntax, setting: &Setting) -> bool {
+    match (syntax, setting) {
+        (Syntax::GitRemote, _) => true,
+        (
+            Syntax::Git,
+            Setting::Key {
+                section,
+                subsection: Some(_),
+                key,
+            },
+        ) => {
+            &**section == "remote"
+                && (key.eq_ignore_ascii_case("url") || key.eq_ignore_ascii_case("pushurl"))
+        }
+        (Syntax::Git | Syntax::Hg | Syntax::Toml | Syntax::Darcs, _) => false,
     }
 }
 
@@ -3525,7 +3666,7 @@ mod tests {
         }
         git_config(&f, &format!("[alias]\n\tx = \"!evil\r{out}/x\"\n"));
         assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::OddSpace));
-        git_config(&f, &format!("[alias]\n\tx = !{out}/x\r\n"));
+        git_config(&f, &format!("[core]\n\tpager = {out}/x\r\n"));
         assert_eq!(scan_git(&f), Ok(()));
     }
 
@@ -3551,9 +3692,9 @@ mod tests {
     #[test]
     fn tilde_user_refused() {
         let f = fixture("tildeuser");
-        git_config(&f, "[alias]\n\tx = !~root/bin/x\n");
+        git_config(&f, "[core]\n\tpager = ~root/bin/x\n");
         assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::TildeUser));
-        git_config(&f, "[alias]\n\tx = !~/bin/x\n");
+        git_config(&f, "[core]\n\tpager = ~/bin/x\n");
         assert_eq!(scan_git(&f), Ok(()));
         let tree = canonical(&f.tree);
         let git = canonical(&f.tree.join(".git"));
@@ -3573,7 +3714,7 @@ mod tests {
         git_config(&f, &format!("[alias]\n\tx = !{out}/missing/../evil\n"));
         assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::DotDot));
         make_dir(&f.out.join("present"));
-        git_config(&f, &format!("[alias]\n\tx = !{out}/present/../evil\n"));
+        git_config(&f, &format!("[core]\n\tpager = {out}/present/../evil\n"));
         assert_eq!(scan_git(&f), Ok(()));
     }
 
@@ -4188,7 +4329,7 @@ mod tests {
                 "{value:?}"
             );
         }
-        git_config(&f, &format!("[alias]\n\tx = !{out}/a\n"));
+        git_config(&f, &format!("[alias]\n\tx = {out}/a\n"));
         assert_eq!(scan_git(&f), Ok(()));
 
         // An include path is a file name, never a command: `!` there is the
@@ -4521,7 +4662,7 @@ mod tests {
         );
 
         let out = f.out.display();
-        git_config(&f, &format!("[alias]\n\tx = !{out}/a {out}/b\n"));
+        git_config(&f, &format!("[core]\n\tpager = {out}/a {out}/b\n"));
         let two_paths = limits_with(|l| l.paths = nonzero_u32(2));
         assert_eq!(scan_git_limited(&f, two_paths), Ok(()));
         let one_path = limits_with(|l| l.paths = nonzero_u32(1));
@@ -4542,6 +4683,141 @@ mod tests {
             fault(&scan_git_limited(&f, one_listed)),
             Some(ConfigFault::Open(OpenRefusal::TooManyEntries(one_entry)))
         );
+    }
+
+    #[test]
+    fn helper_transport_url_judged_as_a_path() {
+        let f = fixture("helperurl");
+        let tree = f.tree.display();
+        for text in [
+            format!("[remote \"o\"]\n\turl = hg::{tree}/r\n"),
+            "[remote \"o\"]\n\turl = hg::vendor/x\n".to_owned(),
+            format!("[remote \"o\"]\n\tpushurl = gcrypt::{tree}/r\n"),
+            format!("[submodule \"s\"]\n\turl = hg::{tree}/r\n"),
+            format!("[branch \"main\"]\n\tremote = hg::{tree}/r\n"),
+            format!("[url \"hg::{tree}/r\"]\n\tinsteadOf = x\n"),
+            "[remote \"o\"]\n\tvcs = hg\n\turl = https://example.com/x\n".to_owned(),
+            "[remote \"o\"]\n\turl = https://example.com/x\n[remote \"p\"]\n\tvcs = hg\n"
+                .to_owned(),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        write(
+            &f.tree.join(".git/remotes/o"),
+            "URL: https://example.com/x\n",
+        );
+        git_config(&f, "[remote \"o\"]\n\tvcs = hg\n");
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        std::fs::remove_file(f.tree.join(".git/remotes/o")).expect("remove remote file");
+
+        git_config(
+            &f,
+            "[remote \"o\"]\n\turl = https://example.com/x\n\tpushurl = host:repo\n\
+             [branch \"main\"]\n\tremote = o\n",
+        );
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn quoted_leading_tilde_judged_as_a_relative_path() {
+        let f = fixture("quotedtilde");
+        for value in [
+            "'~/bin/less'",
+            "\"~/bin/less\"",
+            "\\~/bin/less",
+            "''~/bin/less",
+        ] {
+            git_config(&f, &format!("[core]\n\tpager = {}\n", git_quoted(value)));
+            assert_eq!(
+                in_grant(&scan_git(&f)),
+                Some(f.tree.join("~/bin/less").as_path()),
+                "{value:?}"
+            );
+        }
+        git_config(&f, "[core]\n\tpager = less --log-file=~/log\n");
+        assert_eq!(
+            in_grant(&scan_git(&f)),
+            Some(f.tree.join("~/log").as_path())
+        );
+        git_config(&f, "[core]\n\tpager = ~/bin/less -R ~/x\n");
+        assert_eq!(scan_git(&f), Ok(()));
+
+        let dot_jj = f.tree.join(".jj");
+        let repo = dot_jj.join("repo");
+        make_dir(&repo);
+        let roots = ConfigRoots::Jujutsu {
+            dot_jj: &dot_jj,
+            repo: &repo,
+        };
+        for text in [
+            "[ui]\npager = [\"~/bin/less\"]\n",
+            "[ui]\npager = [\"less\", \"~/x\"]\n",
+            "[ui]\npager = \"~/bin/less\"\n",
+        ] {
+            write(&repo.join("config.toml"), text);
+            let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(f.tree.join("~"))),
+                "{text:?}: {result:?}"
+            );
+        }
+        write(&repo.join("config.toml"), "[ui]\npager = \"less -R\"\n");
+        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+    }
+
+    #[test]
+    fn runner_prefixed_program_word_judged_as_written_too() {
+        let f = fixture("runnerwhole");
+        let out = f.out.display();
+        for text in [
+            format!("[core]\n\tpager = !{out}/less\n"),
+            format!("[core]\n\tpager = ={out}/less\n"),
+            format!("[core]\n\teditor = !{out}/e\n"),
+            format!("[alias]\n\tx = !!{out}/x\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        git_config(&f, "[alias]\n\tst = !git\n");
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_program_refused() {
+        let f = fixture("hardprogram");
+        let out = f.out.display();
+        write(&f.out.join("single"), "#!/bin/sh\n");
+        git_config(&f, &format!("[core]\n\tpager = {out}/single -R\n"));
+        assert_eq!(scan_git(&f), Ok(()));
+
+        write(&f.tree.join("pager"), "#!/bin/sh\n");
+        std::fs::hard_link(f.tree.join("pager"), f.out.join("pager")).expect("hard link");
+        for text in [
+            format!("[core]\n\tpager = {out}/pager\n"),
+            format!("[core]\n\tpager = less {out}/pager\n"),
+            format!("[init]\n\ttemplateDir = {out}/pager\n"),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::HardLinked),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
