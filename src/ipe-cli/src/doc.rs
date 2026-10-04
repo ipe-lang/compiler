@@ -3195,7 +3195,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
     out
 }
 
-/// The `CARGO_TARGET_DIR` an `ipe run` child spawned by the doc-example gate
+/// The `CARGO_TARGET_DIR` an `ipe dev run` child spawned by the doc-example gate
 /// should inherit so its build links against the warm shared dependency target.
 ///
 /// Resolution mirrors the E2E harness's fail-safe: an absolute
@@ -3204,7 +3204,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
 /// so a bare local run stays hermetic). A non-absolute shared value fails safe
 /// to the ambient value rather than pinning a relative target.
 ///
-/// This translation lives in the doc-gate test path only — production `ipe run`
+/// This translation lives in the doc-gate test path only — production `ipe dev run`
 /// never reads `IPE_ORACLE_SHARED_TARGET`; it honours an inherited
 /// `CARGO_TARGET_DIR`, which is exactly what this sets on the child.
 fn child_shared_target_dir() -> Option<std::ffi::OsString> {
@@ -3228,7 +3228,7 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
 /// Run the compiled example at `snippet_path` and assert its output matches the
 /// `-->` annotated results (one per line, in order).
 ///
-/// Spawns the current binary as `ipe run <snippet_path>` and compares stdout
+/// Spawns the current binary as `ipe dev run <snippet_path>` and compares stdout
 /// against the expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
@@ -3238,16 +3238,16 @@ fn run_example_and_check(
 ) -> Result<(), String> {
     use std::process::Command;
 
-    // Locate this binary (we re-invoke ourselves as `ipe run`).
+    // Locate this binary (we re-invoke ourselves as `ipe dev run`).
     let ipe_bin = std::env::current_exe()
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
     let mut cmd = Command::new(&ipe_bin);
     cmd.args(crate::verb::Verb::DEV_RUN.argv())
         .arg(snippet_path);
-    // Forward the warm shared target into the `ipe run` child's CARGO_TARGET_DIR.
+    // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
-    // `ipe run` never reads; without this translation the child cold-builds the
+    // `ipe dev run` never reads; without this translation the child cold-builds the
     // whole runtime tree per example. Absent it (a bare local run) the child
     // inherits the ambient env unchanged.
     if let Some(target) = child_shared_target_dir() {
@@ -3263,11 +3263,13 @@ fn run_example_and_check(
     }
     let out = cmd
         .output()
-        .map_err(|e| format!("{label}: ipe run failed to spawn: {e}"))?;
+        .map_err(|e| format!("{label}: ipe dev run failed to spawn: {e}"))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{label}: ipe run exited non-zero\n       {stderr}"));
+        return Err(format!(
+            "{label}: ipe dev run exited non-zero\n       {stderr}"
+        ));
     }
 
     let actual = String::from_utf8_lossy(&out.stdout);

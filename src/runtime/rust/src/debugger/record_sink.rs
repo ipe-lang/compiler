@@ -3,7 +3,7 @@
 //!
 //! Beside a file destination it also writes the session's typed log (same
 //! stem, extension [`crate::TYPED_LOG_EXTENSION`]) through the program's
-//! [`SessionCodec`] — the replayable form `ipe run --replay` reads. A program
+//! [`SessionCodec`] — the replayable form `ipe dev run --replay` reads. A program
 //! with no typed log (see [`crate::debugger::session_log`]) gets the trace
 //! only, and any stale typed log from an earlier build is removed.
 //!

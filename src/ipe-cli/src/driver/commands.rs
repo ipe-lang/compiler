@@ -110,7 +110,7 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     }
 
     // `<cmd> --help [--json]`: a top-level command's own page. A legacy verb
-    // name is no command, so `ipe build --help` falls through to its refusal.
+    // name is no command, so a bare `build --help` falls through to its refusal.
     if let Some((cmd, rest)) = args.split_first()
         && help::is_command(cmd)
         && rest.iter().any(|a| is_help_flag(a))
@@ -191,7 +191,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     }
     // An umbrella group (`ipe dev <verb> …`) resolves its member to a typed
     // `Verb`, and `dispatch` runs it with the umbrella's posture. A bare group
-    // refuses; a `release` followed by a non-member token (`ipe release web`)
+    // refuses; a `release` followed by a non-member token (`release web`)
     // refuses with the `release build` form carrying that tail; a `dev`
     // followed by a non-member token is an unknown verb of the group.
     if let Some(umbrella) = Umbrella::from_name(cmd) {
@@ -319,7 +319,7 @@ pub fn default_entry() -> Result<String, CliError> {
     Err(CliError::Usage(text::msg::no_entry()))
 }
 
-/// `ipe watch [<path>]` — rebuild and re-run on every source change
+/// `ipe dev watch [<path>]` — rebuild and re-run on every source change
 /// (`crate::watch`). Never returns
 /// `Err` for a build failure (INV-3: a red build is logged, not fatal);
 /// only misuse / setup failures propagate.
@@ -331,7 +331,7 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     };
 
     // Validate the delivery grammar against the shape `main` pins: the `[shape]`
-    // cross-check and the `[runtime] [host]` tail. `ipe watch` is a dev
+    // cross-check and the `[runtime] [host]` tail. `ipe dev watch` is a dev
     // build-run-reload loop that serves the served runtime; it takes no `--static`.
     // A grammar refusal (e.g. `web solo ios`, which cannot be watched — see the
     // spec's mobile-watch note) is caught here before the loop starts.
@@ -343,19 +343,19 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     )?;
 
     // A Tui app with no interactive terminal is refused right here — before
-    // any compile or cargo work — same as `ipe run`.
+    // any compile or cargo work — same as `ipe dev run`.
     gate_terminal(Verb::DEV_WATCH.name(), delivery.shape())?;
     // Watch is always a native dependency-model dev build (it never vendors the
-    // runtime tree, nor targets wasm), so — like `ipe build` on its default path
+    // runtime tree, nor targets wasm), so — like `ipe dev build` on its default path
     // — it must NOT require the vendored runtime source subtree. It resolves the
     // dependency crate root itself via `runtime_embed::resolve` once the loop
     // starts (see `watch::run`); the vendored tree is honoured only when passed
     // explicitly with `--runtime`. Requiring `resolve_runtime` up front made
-    // `ipe watch` fail to locate the runtime in an installed checkout where the
+    // `ipe dev watch` fail to locate the runtime in an installed checkout where the
     // vendored subtree is absent but the dependency crate root resolves fine.
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), false)?;
 
-    // Fail closed before the watch loop starts: `ipe watch` rebuilds with cargo
+    // Fail closed before the watch loop starts: `ipe dev watch` rebuilds with cargo
     // on every change, so a missing toolchain is reported once, up front, with
     // its root cause — not as a per-rebuild opaque spawn error.
     let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Watch)?;
@@ -608,11 +608,11 @@ pub fn resolve_compile_target(
     CompileTarget::Native
 }
 
-/// `ipe build [<path>]` — compile a program to a native or WebAssembly artifact.
+/// `ipe dev build [<path>]` — compile a program to a native or WebAssembly artifact.
 // A linear pipeline (parse → discover manifest → acknowledge unsafe → resolve
 // target → emit → cargo build); the steps share enough locals that splitting
 // reads worse than the whole.
-/// The outcome of a successful `ipe build`, carrying the facts needed to render
+/// The outcome of a successful `ipe dev build`, carrying the facts needed to render
 /// either a human progress line or a JSON success object.
 pub struct BuildSuccess {
     /// The entry source file that was compiled.
@@ -810,7 +810,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let runtime_dep = runtime_dep_from_env();
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
 
-    // Fail closed before emitting: `ipe build` compiles the emitted project so a
+    // Fail closed before emitting: `ipe dev build` compiles the emitted project so a
     // reported success means the crate actually built. A missing toolchain is a
     // clear root-cause error now, not an opaque OS spawn error after the
     // (wasted) emit. The wasm branch delegates to `bundle_wasm`, which resolves
@@ -836,10 +836,10 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // A `dev build` is a development artifact — Debug.* is permitted.
         intent: Verb::DEV_BUILD.intent(),
         runtime_dep,
-        // `ipe build` never tree-shakes the vendored tree — a dep-model build
+        // `ipe dev build` never tree-shakes the vendored tree — a dep-model build
         // carries no vendored source, and a vendored (`IPE_RUNTIME_VENDORED`)
         // build keeps the full tree so rustc, not the driver, drops the unreached
-        // files. Only `ipe eject` sets this.
+        // files. Only `ipe release eject` sets this.
         tree_shake_vendored: false,
         // Manifest projects overwrite this from `package.ipe` in
         // build_project_with_options; a single-file (no-manifest) build keeps
@@ -847,8 +847,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // names a unique per-build crate (the shared-target coverage harness).
         cargo_name: single_file_cargo_name_from_env(),
         debugger: args.debugger,
-        // `ipe build` never emits appearance hot-swap scaffolding — that is a
-        // `ipe watch`-only dev affordance. A release artifact stays clean.
+        // `ipe dev build` never emits appearance hot-swap scaffolding — that is a
+        // `ipe dev watch`-only dev affordance. A release artifact stays clean.
         hot_appearance: false,
         // A webview-native `web desktop` delivery links the system webview and
         // selects the webview executor; every other delivery does not.
@@ -952,7 +952,7 @@ pub struct NativeBuild {
 /// actually built, so a non-zero cargo exit surfaces as a typed
 /// [`CliError::EmittedBuildFailed`] rather than a silent exit-0 that would mask a
 /// miscompile. It also produces the `target/debug/ipe-app` binary that
-/// `ipe exec` later runs. CWD = the emitted crate dir so the generated
+/// `ipe release run` later runs. CWD = the emitted crate dir so the generated
 /// `.cargo/config.toml` is discovered; a static plan additionally selects the
 /// target triple explicitly.
 ///
@@ -1208,7 +1208,7 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The emit options `ipe eject` builds with.
+/// The emit options `ipe release eject` builds with.
 ///
 /// Eject hands over a shipped project, so it is a release build. It forces the
 /// vendored, tree-shaken shape: a self-contained project names no runtime path
@@ -1224,7 +1224,7 @@ pub(super) fn eject_options() -> BuildOptions {
     }
 }
 
-/// `ipe release [<path>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
+/// `ipe release build [<path>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
 /// build the production artifact for every app kind.
 ///
 /// The artifact kind is determined by the app and the `--target` flag:
@@ -2313,11 +2313,11 @@ fn set_session_env(cmd: &mut std::process::Command, session: &SessionEnv) {
     }
 }
 
-/// The plain trace an `ipe run --record` session writes in the output root.
+/// The plain trace an `ipe dev run --record` session writes in the output root.
 pub const RECORD_LOG_FILE: &str = "session.ipelog";
 
-/// The typed log an `ipe run --record` session writes beside the trace — the
-/// log `ipe run --replay` reads by default.
+/// The typed log an `ipe dev run --record` session writes beside the trace — the
+/// log `ipe dev run --replay` reads by default.
 ///
 /// Derived from the runtime's [`ipe_runtime_rust::TYPED_LOG_EXTENSION`], the
 /// same rule the recorder applies, so the two can never name different files.
@@ -2326,7 +2326,7 @@ pub fn typed_log_file() -> PathBuf {
     Path::new(RECORD_LOG_FILE).with_extension(ipe_runtime_rust::TYPED_LOG_EXTENSION)
 }
 
-/// Refuse `ipe run --record` / `--replay` for a program whose shape or target
+/// Refuse `ipe dev run --record` / `--replay` for a program whose shape or target
 /// has no recordable session.
 ///
 /// A record request never silently yields no log, and a replay request never
@@ -2363,7 +2363,7 @@ pub fn gate_session(
     Ok(())
 }
 
-/// Refuse `ipe run --record` / `--replay` for a native-bearing program.
+/// Refuse `ipe dev run --record` / `--replay` for a native-bearing program.
 ///
 /// A native-bearing program runs inside the jail, where the session log is not
 /// reachable. Judges the capabilities the run's consent gates already resolved,
@@ -2387,7 +2387,7 @@ pub fn gate_session_capabilities(
 ///
 /// Shares its one typed decision — and its one refusal text — with the
 /// runtime's own `TuiGuard` guard, via `ipe_runtime_rust::terminal_access`:
-/// a piped `ipe run`/`ipe watch` is turned away the same way whether the
+/// a piped `ipe dev run`/`ipe dev watch` is turned away the same way whether the
 /// check runs here (before the build) or inside the built binary.
 ///
 /// # Errors
@@ -2558,7 +2558,7 @@ pub fn show_session_trace(path: &Path) -> Result<(), CliError> {
         })
 }
 
-/// `ipe run [<path>]` — compile a program and run the resulting binary.
+/// `ipe dev run [<path>]` — compile a program and run the resulting binary.
 ///
 /// One-shot build + run: compiles the entry to `out_dir` (same routing as
 /// [`run_build`]), then invokes `cargo build` on the emitted project and
@@ -2568,7 +2568,7 @@ pub fn show_session_trace(path: &Path) -> Result<(), CliError> {
 /// Build failures (ipe compile step or cargo build step) surface as
 /// [`CliError`] and print to stderr via the normal error path. The binary
 /// exec step replaces the current process (Unix) or propagates the child's
-/// exit code (all platforms) so the caller sees it as `ipe run`'s own exit.
+/// exit code (all platforms) so the caller sees it as `ipe dev run`'s own exit.
 pub fn run_run(rest: &[String]) -> Result<(), CliError> {
     // First, infallible format pass before the body's fallible parse, so a parse
     // error honours the requested machine surface (see [`run_build`]).
@@ -2590,7 +2590,7 @@ pub fn run_run_body(rest: &[String]) -> Result<(), CliError> {
     run_run_with_args(args)
 }
 
-/// Execute a fully-parsed `ipe run`: compile → cargo build → jailed exec.
+/// Execute a fully-parsed `ipe dev run`: compile → cargo build → jailed exec.
 ///
 /// With `--record`, `IPE_DEBUGGER_RECORD` is injected into the executed child
 /// so the runtime dumps the session's trace and typed log into the output root
@@ -2642,7 +2642,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let static_plan = resolve_static_plan(cli_layer, manifest.as_deref(), output_format)?;
 
     // Resolve the delivery grammar (shape cross-check, runtime/host, `--static`
-    // gate) against the shape `main` pins — same as `ipe build`. A webview-native
+    // gate) against the shape `main` pins — same as `ipe dev build`. A webview-native
     // `web desktop` drives `webview_host` below. Runs after the static-plan check
     // so a flag contradiction fires before the entry file is read.
     let delivery = resolve_delivery(
@@ -2661,7 +2661,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // otherwise silent, so the banner and the running step come first. On a
     // terminal only (piped / CI output stays clean); to stderr, so stdout carries
     // only the program's own output. The cargo build that follows streams its own
-    // progress; the exec that ends `ipe run` leaves no room for a settled "done"
+    // progress; the exec that ends `ipe dev run` leaves no room for a settled "done"
     // line, so the run just starts producing the program's output. Suppressed
     // when `--quiet` is set.
     let show_progress = !args.quiet && {
@@ -2681,9 +2681,9 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     }
 
     // When the project declares [wasm].mode != "off", or IPE_TARGET=wasm is
-    // set, treat `ipe run` as a browser wasm build-and-bundle (no native binary
+    // set, treat `ipe dev run` as a browser wasm build-and-bundle (no native binary
     // to exec). `--target wasi` selects the co-located WASI module, which `ipe
-    // run` EXECUTES under embedded wasmtime. A plain `ipe run` in a non-wasm
+    // dev run` EXECUTES under embedded wasmtime. A plain `ipe dev run` in a non-wasm
     // project stays native. (`--target wasm` was refused at parse: the browser
     // bundle has no executable form.)
     let compile_target = resolve_compile_target(cli_wasm, manifest_wasm.as_ref());
@@ -2695,7 +2695,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         gate_session(flag, delivery.shape(), compile_target)?;
     }
 
-    // The same trust-boundary consent gates as `ipe build`, over ONE capability
+    // The same trust-boundary consent gates as `ipe dev build`, over ONE capability
     // resolution, BEFORE the (costly) emit + cargo build: a disclosed `.Unsafe`
     // import needs consent (a non-interactive run without it fails closed rather
     // than blocking on a prompt), and a disclosed `js-port:<axis>` / `native-ffi`
@@ -2717,7 +2717,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         .admit_triple(engine, triple)
         .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_RUN, &e)))?;
 
-    // `ipe run --target wasi` EXECUTES the emitted module under embedded
+    // `ipe dev run --target wasi` EXECUTES the emitted module under embedded
     // wasmtime; fail closed BEFORE any emit or build when no engine is linked
     // (the `wasi_run` feature is off), so a `wasi_run`-less `ipe` returns a typed
     // refusal naming the feature with NO wasted work — never a panic, never a
@@ -2746,7 +2746,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let runtime_dep = runtime_dep_from_env();
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
 
-    // Fail closed before emitting: `ipe run` shells out to cargo to build the
+    // Fail closed before emitting: `ipe dev run` shells out to cargo to build the
     // emitted project, so a missing toolchain is a clear root-cause error now,
     // not an opaque OS spawn error after the (wasted) compile. The wasm branch
     // delegates to `bundle_wasm`, which resolves cargo itself, so only the
@@ -2759,7 +2759,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     let rust_area = output.area(&[OutputArea::Rust]);
 
-    // `ipe run` is a DEVELOPMENT execution, so `Debug.*` is allowed
+    // `ipe dev run` is a DEVELOPMENT execution, so `Debug.*` is allowed
     // (production = false).
     let options = BuildOptions {
         static_plan,
@@ -2768,8 +2768,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         wasm_hydrate_mode: false,
         intent: Verb::DEV_RUN.intent(),
         runtime_dep,
-        // `ipe run` builds and executes; it never tree-shakes the vendored tree
-        // (only `ipe eject` does).
+        // `ipe dev run` builds and executes; it never tree-shakes the vendored tree
+        // (only `ipe release eject` does).
         tree_shake_vendored: false,
         // Manifest projects overwrite this from `package.ipe` in
         // build_project_with_options; a single-file (no-manifest) run keeps this
@@ -2777,8 +2777,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // unique per-build crate (the shared-target coverage harness).
         cargo_name: single_file_cargo_name_from_env(),
         debugger,
-        // `ipe run` never emits appearance hot-swap scaffolding — that is a
-        // `ipe watch`-only dev affordance.
+        // `ipe dev run` never emits appearance hot-swap scaffolding — that is a
+        // `ipe dev watch`-only dev affordance.
         hot_appearance: false,
         // A webview-native `web desktop` delivery links the system webview and
         // selects the webview executor; every other delivery does not.
@@ -2800,10 +2800,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     )?;
 
     // Post-emit routing per compile target:
-    //   * WasmClient — a browser bundle has no executable form under `ipe run`;
-    //     produce the bundle (same step as `ipe build --target wasm`) and stop.
+    //   * WasmClient — a browser bundle has no executable form under `ipe dev run`;
+    //     produce the bundle (same step as `ipe dev build --target wasm`) and stop.
     //   * WasmWasi — build the `wasm32-wasip1` module (THE SEAL, via the SAME
-    //     `bundle_wasi` build path `ipe build --target wasi` uses) and then
+    //     `bundle_wasi` build path `ipe dev build --target wasi` uses) and then
     //     EXECUTE it under embedded wasmtime, confined by a WASI context derived
     //     from the SAME declared capability floor the native run jail reads.
     //   * Native — fall through to the cargo build + jailed exec below.
@@ -3113,7 +3113,7 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
 }
 
 /// Read the emitted crate IDENTITY from an emitted project's `Cargo.toml`
-/// `[package] name` so `ipe run` / `ipe exec` / `ipe test` locate the correct
+/// `[package] name` so `ipe dev run` / `ipe release run` / `ipe test` locate the correct
 /// built binary — cargo names the binary artifact after the crate, so this is
 /// the per-project path-uniquified identity (`<friendly>_<hash>`), NOT the
 /// user-facing friendly name. Falls back to `"ipe-app"` when the manifest is
@@ -3394,8 +3394,8 @@ pub fn program_constructs_a_widget(
 /// the salsa `lower_program` query rather than a bare single-module
 /// parse→canon→infer→lower. Without injection an entry importing a
 /// compiled-source stdlib module (e.g. `Ipe.Test`) fails name resolution with
-/// IPE-N0004 even though a real `ipe build` of the same program succeeds — the
-/// analysis surfaces (`ipe capabilities`, `ipe build --emit-ir`) must resolve
+/// IPE-N0004 even though a real `ipe dev build` of the same program succeeds — the
+/// analysis surfaces (`ipe capabilities`, `ipe dev build --emit-ir`) must resolve
 /// such a module identically to the build.
 ///
 /// # Errors
@@ -3434,7 +3434,7 @@ impl SourceGraph {
     /// attribution the build path uses (`attribute_canon_errors` +
     /// `attribute_post_link_error`), so `ipe type-check` and every other analysis
     /// surface frame a given diagnostic against the identical source as
-    /// `ipe build`.
+    /// `ipe dev build`.
     ///
     /// A canon error (e.g. IPE-N0020) surfaces from the blame loop already
     /// framed against its own module; only a post-link error reaches the
@@ -3523,7 +3523,7 @@ pub fn build_source_graph(entry: &Path) -> Result<SourceGraph, CliError> {
 
 /// Build the whole-program source graph for a manifest-governed file analysed
 /// by itself, over the src-rooted module set [`collect_manifest_rooted_entry`]
-/// discovers (the same set `ipe build` compiles) — so a nested file importing
+/// discovers (the same set `ipe dev build` compiles) — so a nested file importing
 /// by its full module path (`Api.Handlers` importing `Api.Types`) resolves.
 ///
 /// # Errors
@@ -3668,7 +3668,7 @@ impl ConsentedCapabilities {
 }
 
 /// Resolve the program's capabilities once and pass them through every
-/// trust-boundary consent gate, shared by `ipe build`, `ipe run`, and
+/// trust-boundary consent gate, shared by `ipe dev build`, `ipe dev run`, and
 /// `ipe release`: the `.Unsafe` acknowledgment, then the app-boundary web
 /// consent, then the app-boundary native-crossing consent. All three judge the
 /// SAME resolved value, and the value is released only once all three admit it.
@@ -3905,7 +3905,7 @@ fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliErro
         // decoder-direction gate; then run the SAME IPE-N0040 gate the build
         // path runs (`gate_decoder_pipelines`) over the linked module, so
         // `ipe type-check` rejects the hand-nested decoder footgun for the
-        // earliest possible feedback rather than deferring it to `ipe build`.
+        // earliest possible feedback rather than deferring it to `ipe dev build`.
         let linked = ipe_db::linked_program(db, root, file)
             .clone()
             .map_err(|d| ipe_db::PipelineError::Lower(d, Vec::new()))?;
@@ -3920,7 +3920,7 @@ fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliErro
 ///
 /// The entry's source graph is built as [`build_source_graph`] builds it, then
 /// run through [`compile_prepared`], the same canonicalise, link, target-gate,
-/// type-check, decoder-direction-gate, lower and emit pipeline `ipe build`
+/// type-check, decoder-direction-gate, lower and emit pipeline `ipe dev build`
 /// runs, under a native development configuration. A refusal from any stage,
 /// lowering and emit included, surfaces as the first diagnostic, so a caller
 /// comparing its code sees the stage that actually refused the program. No
@@ -4008,7 +4008,7 @@ pub fn source_graph_for_target(
 }
 
 /// [`emit_ir_text`] over an [`AnalysisTarget`] rather than a bare entry path,
-/// so `ipe build --emit-ir <file>` never substitutes the project's default
+/// so `ipe dev build --emit-ir <file>` never substitutes the project's default
 /// entry for a named file.
 ///
 /// # Errors

@@ -48,7 +48,7 @@ pub const FFI_CACHE_READ_CAP: u64 = 4 * 1024 * 1024;
 pub const BUILD_CACHE_ENTRY_CAP: u64 = 64 * 1024 * 1024;
 
 /// Maximum bytes for a recorded session trace (`session.ipelog`) shown by
-/// `ipe run --replay`.
+/// `ipe dev run --replay`.
 ///
 /// 16 MiB holds a full recorder ring of large-model steps while refusing a
 /// planted multi-GiB file before it is buffered.

@@ -331,9 +331,9 @@ fn home_dir_from_var(raw: Result<String, std::env::VarError>) -> Option<std::pat
 /// downstream `contains(...)` matchers see the bare line. The `is_terminal`
 /// decision is a parameter so the indent rule is testable without a pty.
 ///
-/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe watch`, these
+/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe dev watch`, these
 /// lines are the spawned app's own output, printed one level deeper than the
-/// `[ipe watch] ...` status lines that frame it (which themselves render at
+/// `[ipe dev watch] ...` status lines that frame it (which themselves render at
 /// two gutter-widths) — so this nests under them rather than under the
 /// top-level banner.
 ///
@@ -621,13 +621,13 @@ impl ResolvedPort {
         match self.origin {
             PortOrigin::Relocated => format!(
                 "port {port} is already in use — another application is bound to it.\n\
-                 The port was chosen by the supervisor (`ipe watch` or the dev console); \
+                 The port was chosen by the supervisor (`ipe dev watch` or the dev console); \
                  restart it to pick a free port."
             ),
             PortOrigin::Operator | PortOrigin::Source => format!(
                 "port {port} is already in use — another application is bound to it.\n\
                  Set a different port with the {var} environment variable, e.g.:\n\
-                 {var}=8123 ipe run"
+                 {var}=8123 ipe dev run"
             ),
         }
     }
@@ -978,7 +978,7 @@ fn apply_env_directives(
     builder.env_remove(crate::LISTEN_PORT_RELOCATION_ENV);
 }
 
-/// Env var a supervisor (`ipe watch`, the dev console proxy) sets on the child
+/// Env var a supervisor (`ipe dev watch`, the dev console proxy) sets on the child
 /// it spawns to place that child's HTTP listener on a port the supervisor chose.
 ///
 /// Internal plumbing, never operator configuration: it outranks the operator
@@ -3116,7 +3116,7 @@ mod gutter_line_tests {
     #[test]
     fn indents_only_under_a_terminal() {
         // Terminal stderr → 4-space gutter for the human dev loop (nests under
-        // the CLI's own `[ipe watch] ...` status lines).
+        // the CLI's own `[ipe dev watch] ...` status lines).
         assert_eq!(
             gutter_line("[ipe.http.server] listening on http://127.0.0.1:8000", true),
             "    [ipe.http.server] listening on http://127.0.0.1:8000"
@@ -3917,7 +3917,7 @@ mod listen_port_tests {
             for r in [resolve(None, var, Some("9200")), resolve(None, var, None)] {
                 let msg = r.addr_in_use_message();
                 assert!(
-                    msg.contains(&format!("{var}=8123 ipe run")),
+                    msg.contains(&format!("{var}=8123 ipe dev run")),
                     "the advice must name {var}: {msg}"
                 );
                 assert!(

@@ -277,7 +277,7 @@ fn home_for_span(linked: &ipe_canon::ast::Module, span: Span) -> Option<Vec<Symb
 ///
 /// `text` is the owning module's source. The message is the compiler's own
 /// snippet-free rendering ([`ipe_diagnostics::plain_message`]) — the wording
-/// cannot drift from `ipe build`'s.
+/// cannot drift from `ipe dev build`'s.
 #[must_use]
 pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_types::Diagnostic {
     let span = diag.primary_span();

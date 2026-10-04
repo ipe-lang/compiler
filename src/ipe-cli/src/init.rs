@@ -193,7 +193,7 @@ impl InitShape {
                     "Then open http://localhost:8000 and click the counter buttons."
                 }
                 InitRuntime::Solo => {
-                    "This is a `solo` app: `ipe run` serves the wasm bundle at \
+                    "This is a `solo` app: `ipe dev run` serves the wasm bundle at \
                      http://localhost:8000; open it and click the counter buttons."
                 }
             },
@@ -1081,9 +1081,9 @@ fn print_next_steps(
     runtime: InitRuntime,
 ) {
     let run_cmd = if target_arg == "." {
-        "    ipe run".to_owned()
+        "    ipe dev run".to_owned()
     } else {
-        format!("    cd {target_arg} && ipe run")
+        format!("    cd {target_arg} && ipe dev run")
     };
     let health_tip = if interactive {
         String::new()
@@ -1108,9 +1108,9 @@ fn print_next_steps(
 /// Print the next-steps message for a freshly scaffolded library.
 fn print_next_steps_lib(target_arg: &str, project_name: &str) {
     let build_cmd = if target_arg == "." {
-        "    ipe build".to_owned()
+        "    ipe dev build".to_owned()
     } else {
-        format!("    cd {target_arg} && ipe build")
+        format!("    cd {target_arg} && ipe dev build")
     };
     let body = format!(
         "Created Ipê library `{project_name}`.\n\

@@ -496,18 +496,15 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, &identity, accepts, &bundle, icon)?;
+        let layout = pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = if os.build_runs_on_linux() {
-            "note: an Android shell project is written here; run `./gradlew assembleDebug` \
-             inside it with the Android SDK to produce an APK."
+            crate::text::mobile_android_note()
         } else {
-            "note: the iOS shell project layout is written here, but a signed, runnable \
-             .ipa must be produced on a macOS runner with Xcode + a signing identity \
-             (out of scope)."
+            crate::text::mobile_ios_note()
         };
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -609,8 +606,8 @@ pub fn pack_mobile(
 
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -1109,7 +1106,7 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
 }
 
 /// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe build`:
+/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
 ///
 /// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
 /// 2. a `.ipe` file → itself.
@@ -1285,7 +1282,7 @@ fn classify_under_manifest(
 }
 
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe build` uses, but demands only the
+/// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
 /// 0 with a friendly framed success line when the program type-checks, or
 /// non-zero carrying the first rendered diagnostic when it does not.
@@ -1385,7 +1382,7 @@ pub fn verify_check(path: Option<&str>) -> Result<(), CliError> {
     run_type_check(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
 
-/// Stage 3: the build — the same compilation as `ipe build`.
+/// Stage 3: the build — the same compilation as `ipe dev build`.
 pub fn verify_build(path: Option<&str>) -> Result<(), CliError> {
     run_build(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
@@ -2505,7 +2502,7 @@ pub fn verify_capabilities(
 /// is refused and nothing is disclosed, because a union over only the entries
 /// that lowered would silently drop the failing entry's capabilities from the
 /// consumer's consent surface. Every entry links the WHOLE package source tree,
-/// exactly as `ipe build` does, so a module that does not compile at all (a
+/// exactly as `ipe dev build` does, so a module that does not compile at all (a
 /// name or type error, imported or not) fails every entry and is refused the
 /// same way.
 ///
@@ -2839,7 +2836,7 @@ fn aggregate_entry_inferences(
 /// The build's own attribution: a canon error is blamed on its own module's
 /// file via [`attribute_canon_errors`] (the root holds every package module, so
 /// an unimported sibling that fails to canonicalize fails every entry, exactly
-/// as `ipe build` refuses it); a post-link error goes through
+/// as `ipe dev build` refuses it); a post-link error goes through
 /// [`attribute_post_link_error`]. Demanded after `lower_program`, so every
 /// query here is a memo hit.
 fn attribute_entry_lowering_error(

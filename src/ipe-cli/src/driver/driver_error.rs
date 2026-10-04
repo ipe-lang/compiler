@@ -350,7 +350,7 @@ pub enum CliError {
     /// exits non-zero after the report and never shows the `lint` command's
     /// `--help` page. Carries nothing: the printed findings are the message.
     LintGateFailed,
-    /// `ipe eject` was asked to eject a program it cannot make self-contained.
+    /// `ipe release eject` was asked to eject a program it cannot make self-contained.
     /// Eject vendors ONLY the embedded runtime source; a program that binds a
     /// foreign Rust crate (FFI) would need those external crates pulled from a
     /// registry, which the self-contained, source-only eject contract forbids.
@@ -491,7 +491,7 @@ pub enum CliError {
         /// What was wrong with the file.
         detail: String,
     },
-    /// `ipe run --target wasi` was invoked on an `ipe` binary built WITHOUT the
+    /// `ipe dev run --target wasi` was invoked on an `ipe` binary built WITHOUT the
     /// `wasi_run` feature, so no embedded wasmtime engine is linked to execute
     /// the emitted `wasm32-wasip1` module. A typed refusal naming the feature —
     /// never a panic, never a silent fall-through to a native run — so the
@@ -508,7 +508,7 @@ pub enum CliError {
     },
     /// The emitted `wasm32-wasip1` module ran to completion under embedded
     /// wasmtime and returned a non-zero WASI exit code. Propagated as `ipe
-    /// run`'s own non-zero exit, mirroring how the native run surfaces a child's
+    /// dev run`'s own non-zero exit, mirroring how the native run surfaces a child's
     /// non-zero status — the guest's own outcome, not a driver fault.
     WasiRunExited {
         /// The module's WASI exit code (non-zero).
@@ -1102,7 +1102,7 @@ impl std::fmt::Display for CliError {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_failed(detail))
             }
             // The guest ran to completion and returned a non-zero WASI exit; this
-            // one-line verdict pairs with `ipe run`'s own non-zero exit, mirroring
+            // one-line verdict pairs with `ipe dev run`'s own non-zero exit, mirroring
             // the native run's child-exit surfacing.
             Self::WasiRunExited { code } => {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_exited(code))

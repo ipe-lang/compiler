@@ -442,7 +442,7 @@ fn web_client_config_js() -> String {
     // dev-watch blue-green proxy, so a reconnect is an expected rebuild cutover,
     // not an outage. The client then greets a reconnect with a brief positive
     // "updated ✓" toast instead of the amber "Reconnecting…" banner. Only the
-    // `ipe watch` blue-green path sets this; a release/`ipe run` server never
+    // `ipe dev watch` blue-green path sets this; a release/`ipe dev run` server never
     // does, so the flag defaults off there.
     let swap_toast = matches!(
         crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
@@ -646,7 +646,7 @@ struct PatchEnvelope<'a> {
 
 /// Body for the dev-only `POST /_ipe/watch/status` endpoint.
 ///
-/// Sent by `ipe watch` to push build state to connected browsers.
+/// Sent by `ipe dev watch` to push build state to connected browsers.
 /// Only mounted when the dev banner is active (non-production, root-mounted,
 /// and `IPE_WEB_BANNER` not explicitly disabled).
 #[derive(serde::Deserialize)]
@@ -662,7 +662,7 @@ struct WatchStatusBody {
     phase: Option<String>,
 }
 
-/// Latest build status from `ipe watch`, held in the server's shared state.
+/// Latest build status from `ipe dev watch`, held in the server's shared state.
 ///
 /// `None` = no status yet (initial state or production). Set by the
 /// `/_ipe/watch/status` endpoint and replayed to new SSE connections so a
@@ -1005,7 +1005,7 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// an unbounded number of sessions. Decremented ONLY via `SessionSlot::drop`,
     /// so the leak fix (mortal driver) and this cap share one mechanism.
     session_count: Arc<AtomicUsize>,
-    /// Latest build status from `ipe watch`. `None` until the first status
+    /// Latest build status from `ipe dev watch`. `None` until the first status
     /// POST arrives. Replayed to new SSE connections so a browser refresh
     /// during a failed build immediately shows the sticky error banner.
     /// Populated only when the dev watch/status endpoint is mounted;
@@ -1823,7 +1823,7 @@ fn parse_duration_secs(raw: &str) -> Option<u64> {
 /// When `true`, the web request handler skips the session-checkpoint lookup
 /// (`get_reconstructing`) and forces every returning session to a fresh `init`,
 /// bypassing the additive-splice algorithm entirely. This is the escape hatch
-/// for `ipe watch --reset-state`: the watch process sets the flag in the child's
+/// for `ipe dev watch --reset-state`: the watch process sets the flag in the child's
 /// env for the lifetime of that binary. Dev-only; a release binary is never
 /// launched with this flag by the CLI.
 ///
@@ -2995,7 +2995,7 @@ mod handlers {
             let (m, _cmd) = (st.init)(req);
             m
         };
-        // `IPE_WEB_RESET_STATE=1` (set by `ipe watch --reset-state` in the child
+        // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
         // evaluated once per request (cheap env read, cached by the OS) and is
@@ -3308,7 +3308,7 @@ mod handlers {
         // SSE open with a lightweight `swapped` frame. The client shows the
         // brief positive "updated ✓" toast only when it is a RECONNECT (it
         // already saw a prior `hello` this page-life), so a first page load is
-        // silent. A release / `ipe run` server never sets the env, so this
+        // silent. A release / `ipe dev run` server never sets the env, so this
         // frame is never emitted there.
         if crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
             .ok()
@@ -3320,7 +3320,7 @@ mod handlers {
 
         // Reconnect-resync.
         // A session restored from the store on a cold hit — or any process
-        // restart / `ipe watch` rebuild / redeploy paired with a persistent
+        // restart / `ipe dev watch` rebuild / redeploy paired with a persistent
         // store — has no live subscriptions from the previous process, so
         // nothing pushes until the next user Msg. Render the current view once
         // and ship it as a full-body `event: patch` frame; the client consumes
@@ -3342,7 +3342,7 @@ mod handlers {
 
         // Replay the latest build-status so a browser refresh during a failed
         // build immediately shows the sticky error banner without waiting for
-        // the next `ipe watch` status POST. A `None` status (no build has run
+        // the next `ipe dev watch` status POST. A `None` status (no build has run
         // yet, or production) sends nothing. Best-effort: a full channel is
         // fine — the next reload or real status event will catch up.
         {
@@ -3546,7 +3546,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-appearance (dev-only) ──────────────────────────
     // The running server's inbound leg of the appearance-hot-swap live socket.
-    // The `ipe watch` process (a SEPARATE process from the running app) computes
+    // The `ipe dev watch` process (a SEPARATE process from the running app) computes
     // an appearance-only table patch for an edited `view` and POSTs it here; the
     // handler registers it and re-renders every live session's `view(currentModel)`,
     // pushing the resulting VDOM diff over the existing SSE `patches` channel —
@@ -3612,7 +3612,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-transition (dev-only) ──────────────────────────
     // The running server's inbound leg of the `update`-arm transition-hot-swap
-    // live socket. The `ipe watch` process computes a transition patch for an
+    // live socket. The `ipe dev watch` process computes a transition patch for an
     // edited data-describable arm and POSTs it here; the handler registers the
     // replacement `Transition` under the arm's baked-datum signature, so the next
     // dispatch of that arm applies the edited transition through the SAME compiled
@@ -3690,7 +3690,7 @@ mod handlers {
     // ── POST /_ipe/hot-msg (dev-only) ─────────────────────────────────
     // The running server's inbound leg of the additive-`Msg`-variant hot-swap
     // live socket. When a source edit adds a `Msg` variant (plus its arm and a
-    // button firing it), `ipe watch` computes the edited program's `MsgSet`
+    // button firing it), `ipe dev watch` computes the edited program's `MsgSet`
     // descriptor and POSTs it here alongside the live baked descriptor. The
     // handler accepts it ONLY when it is a proven additive superset of the live
     // set (every live variant present, unchanged), so a returning session's live
@@ -3777,7 +3777,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-subs (dev-only) ────────────────────────────────
     // The running server's inbound leg of the `subscriptions`-entry hot-swap live
-    // socket. The `ipe watch` process computes a sub patch for an edited
+    // socket. The `ipe dev watch` process computes a sub patch for an edited
     // data-describable subscription (an interval or tick-message change) and POSTs
     // it here; the handler registers the replacement `SubDescription` under the
     // entry's baked-datum signature, so the next re-subscribe of that entry builds
@@ -3857,7 +3857,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-init (dev-only) ────────────────────────────────
     // The running server's inbound leg of the session-`init` hot-swap live
-    // socket. The `ipe watch` process computes an init patch for an edited
+    // socket. The `ipe dev watch` process computes an init patch for an edited
     // data-describable `init` and POSTs it here; the handler registers the
     // replacement `InitDatum` under the app's baked-datum signature, so the NEXT
     // NEW session decodes the edited init through the SAME compiled
@@ -3935,7 +3935,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-wiring (dev-only) ──────────────────────────────
     // The running server's inbound leg of the `update`-arm Cmd-WIRING hot-swap
-    // live socket. The `ipe watch` process computes a wiring patch for an edited
+    // live socket. The `ipe dev watch` process computes a wiring patch for an edited
     // arm (which compiled effect it fires) and POSTs it here; the handler
     // registers the replacement `CmdWiring` under the arm's baked-datum signature,
     // so the next dispatch of that arm fires the edited (already-compiled) effect
@@ -4013,12 +4013,12 @@ mod handlers {
     }
 
     // ── POST /_ipe/watch/status (dev-only) ───────────────────────────
-    // Inbound build-status notification from `ipe watch`. Guarded two ways
+    // Inbound build-status notification from `ipe dev watch`. Guarded two ways
     // so it is inert in production:
     //   1. The route is MOUNTED only when the dev banner is active (non-
     //      production + `IPE_WEB_BANNER` not disabled + root-mounted).
     //   2. The `X-Ipe-Hot-Token` header MUST match the per-process token
-    //      set by `ipe watch` (the same mechanism as `/_ipe/hot-appearance`).
+    //      set by `ipe dev watch` (the same mechanism as `/_ipe/hot-appearance`).
     //      A web page cannot obtain this token, so the token alone is the
     //      trust boundary (same model as `/_ipe/hot-appearance`).
     //
@@ -8751,7 +8751,7 @@ mod bind_error_tests {
         };
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
             let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe run"), "{msg}");
+            assert!(msg.contains("IPE_WEB_PORT=8123 ipe dev run"), "{msg}");
         }
         let relocated = resolve(Some("9100"), Some("9200"));
         assert_eq!(relocated.port, 9100);

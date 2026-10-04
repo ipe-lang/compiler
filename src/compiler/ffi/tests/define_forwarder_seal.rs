@@ -9,7 +9,7 @@
 //! backend assembles — resolves the define type at its crate-absolute path
 //! `crate::ffi::<slug>::<T>` and CALLS every forwarder.
 //!
-//! The keystone invariant is `ipe build ⇒ cargo build`. The interface-admission
+//! The keystone invariant is `ipe dev build ⇒ cargo build`. The interface-admission
 //! assertions run in the DEFAULT gate; the cargo build+run proof of the
 //! assembled module tree is `IPE_E2E`-gated (it shells out to `cargo`), matching
 //! the repo's other SEAL fixtures.

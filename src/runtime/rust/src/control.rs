@@ -1,11 +1,11 @@
 //! Shape-agnostic dev-loop control wire — the single parent→child transport
-//! definition shared by hot-swap (`ipe watch` appearance edits) and the
+//! definition shared by hot-swap (`ipe dev watch` appearance edits) and the
 //! time-travel debugger across the tui/cli/worker/web shapes.
 //!
 //! ## Why one wire
 //!
 //! Both features are the same structural problem: a dev-loop capability that
-//! `ipe watch` (the parent) must deliver into the spawned child. Rather than two
+//! `ipe dev watch` (the parent) must deliver into the spawned child. Rather than two
 //! ad-hoc message formats — the web hot-appearance JSON body and a separate
 //! debugger command channel — every message rides ONE [`ControlFrame`] so the
 //! wire is defined exactly once. The per-shape transport (loopback HTTP for web,
@@ -15,7 +15,7 @@
 //!
 //! Compiled only when a dev-loop surface is present: the `web` feature (the
 //! existing hot-appearance endpoints), the `debugger` feature (the recorder), or
-//! `control-wire` (the parent-side `ipe watch` sender, which links the codec +
+//! `control-wire` (the parent-side `ipe dev watch` sender, which links the codec +
 //! `transport` primitives ALONE — no `server` accept-loop). Each implies
 //! `serde` + `crypto-core`, so the frame's derives and the constant-time token
 //! check are unconditional here. A pure `ipe release` artifact carries none of
@@ -70,7 +70,7 @@ pub struct AppearancePatch {
     pub patch: Vec<(usize, String)>,
 }
 
-/// A time-travel debugger command from `ipe watch` (parent) to the child.
+/// A time-travel debugger command from `ipe dev watch` (parent) to the child.
 ///
 /// Each variant maps to an operation the recorder already supports on its
 /// bounded message ring (`debugger::{History, RecordBuffer}`): stepping the
@@ -235,23 +235,23 @@ pub fn decode_frame_body(body: &[u8]) -> Result<ControlFrame, FrameError> {
 ///   ask it to bind a routable interface, so a LAN peer can never reach the
 ///   channel.
 /// - **Token-gated, fail-closed.** [`is_authorized`] returns `true` only when a
-///   token was both minted (by `ipe watch`) and presented, and the two match in
+///   token was both minted (by `ipe dev watch`) and presented, and the two match in
 ///   constant time. An absent expected token, an absent presented token, or a
 ///   mismatch all yield `false` — the child then runs with no control surface
-///   and `ipe watch` falls back to a full rebuild, never a degraded path.
+///   and `ipe dev watch` falls back to a full rebuild, never a degraded path.
 /// - **Release-absent.** The whole `control` module is gated on a dev-loop
 ///   feature, so this transport cannot be compiled into an `ipe release`
 ///   artifact.
 pub mod transport {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    /// The env var carrying the loopback control-socket port `ipe watch`
+    /// The env var carrying the loopback control-socket port `ipe dev watch`
     /// allocated for the child, beside the listener relocation var
     /// [`crate::LISTEN_PORT_RELOCATION_ENV`].
     pub const CONTROL_PORT_ENV: &str = "IPE_CONTROL_PORT";
 
     /// The env var carrying the per-session control token. Reuses the same
-    /// secret `ipe watch` already mints for the web hot-appearance endpoint, so
+    /// secret `ipe dev watch` already mints for the web hot-appearance endpoint, so
     /// one token authenticates every shape's control surface.
     pub const CONTROL_TOKEN_ENV: &str = "IPE_WATCH_HOT_TOKEN";
 
@@ -349,14 +349,14 @@ pub mod transport {
 /// same `web`/`debugger` gate as the wire itself, so a pure `ipe release` build —
 /// which selects none of those features — carries no accept-loop at all. Where
 /// the code is present it is inert unless launched with both a control port and a
-/// token, so a child with no `ipe watch` parent opens no socket. Every guarantee
+/// token, so a child with no `ipe dev watch` parent opens no socket. Every guarantee
 /// is fail-closed:
 ///
 /// - **Bind is loopback-only** — the listener address comes from
 ///   [`transport::control_bind_addr`], which admits no routable interface.
 /// - **No surface without a session** — [`serve_control`] returns cleanly (binds
 ///   nothing) unless BOTH the port and the token env vars are present, so a child
-///   with no `ipe watch` parent runs with no control socket at all.
+///   with no `ipe dev watch` parent runs with no control socket at all.
 /// - **Every frame is token-checked** — a connection presents its token as a
 ///   length-delimited record ahead of the frame; a frame whose token is absent,
 ///   empty, or mismatched is dropped before the handler ever sees it.
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn appearance_patch_matches_the_classifiers_wire_shape() {
-        // `ipe watch` (`push_appearance_patches`) POSTs an appearance edit as
+        // `ipe dev watch` (`push_appearance_patches`) POSTs an appearance edit as
         // `{"defaults":[...],"patch":[[i,"v"],...]}` — the classifier's
         // `ViewPatch` shape. `AppearancePatch` is the single runtime-owned
         // definition of that wire; pin that the exact bytes the sender emits

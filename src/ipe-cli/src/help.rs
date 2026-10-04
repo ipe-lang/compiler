@@ -1205,7 +1205,7 @@ mod tests {
         }
     }
 
-    /// `ipe build --help` (and every other legacy name with a help flag) is
+    /// A bare `build --help` (and every other legacy name with a help flag) is
     /// refused with [`CliError::GroupRequired`] naming the grouped forms — it
     /// never renders a page.
     #[test]

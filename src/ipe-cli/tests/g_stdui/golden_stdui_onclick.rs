@@ -52,7 +52,7 @@ fn build_run_onclick() -> (PathBuf, crate::support::RunOutcome) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for stdui_onclick: {:?}",
+        "ipe dev build must succeed for stdui_onclick: {:?}",
         built.err()
     );
 

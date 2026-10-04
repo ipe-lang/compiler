@@ -45,19 +45,19 @@ pub mod static_build;
 // The `update`-arm → transition-datum classifier: the compile-time half of the
 // dev-loop's logic hot-swap (the counterpart of `emit_template`'s static
 // partition). Public API — consumed by the `hot_appearance` update emitter and
-// the `ipe watch` transition classifier; its dev == prod conformance to the
+// the `ipe dev watch` transition classifier; its dev == prod conformance to the
 // runtime `apply_transition` is pinned in-module.
 pub mod transition_classify;
 // The `Msg`-enum → schema-tagged set-descriptor classifier: the compile-time
 // half of the additive-`Msg`-variant hot-swap. Public API — consumed by the
-// `ipe watch` loop to bake and diff the program's `Msg` variant surface; its
+// `ipe dev watch` loop to bake and diff the program's `Msg` variant surface; its
 // dev == prod conformance to the runtime `web::msg_set` proof is pinned
 // in-module.
 pub mod msg_set_classify;
 
 // The `subscriptions`-entry sub-description partition: reduces a data-describable
 // tick subscription (`Time.every 1000 Tick`) to an inert `CompileSubDescription`
-// consumed by the emit hook and mirrored by the `ipe watch` subs classifier; its
+// consumed by the emit hook and mirrored by the `ipe dev watch` subs classifier; its
 // dev == prod conformance to the runtime `sub_every_hot` is pinned in-module.
 pub mod sub_classify;
 
@@ -78,8 +78,8 @@ pub use preamble::{epilogue, preamble};
 
 /// Which `ipe` verb family an emit serves.
 ///
-/// The verb, never the cargo profile, decides it. `Development` (`ipe build`,
-/// `ipe run`, `ipe test`, `ipe watch`) turns on the runtime `dev-posture`
+/// The verb, never the cargo profile, decides it. `Development` (`ipe dev build`,
+/// `ipe dev run`, `ipe test`, `ipe dev watch`) turns on the runtime `dev-posture`
 /// feature, the one input that lets the operator console default open, and only
 /// on a loopback bind. `Release` is the default, so an emit whose caller states
 /// no intent is a release emit: the console stays closed until
@@ -88,7 +88,7 @@ pub use preamble::{epilogue, preamble};
 pub enum BuildIntent {
     /// A dev-loop verb: the runtime carries the `dev-posture` feature.
     Development,
-    /// A shipped artifact (`ipe release`, `ipe eject`, the desktop bundle).
+    /// A shipped artifact (`ipe release`, `ipe release eject`, the desktop bundle).
     #[default]
     Release,
 }
@@ -101,7 +101,7 @@ pub enum BuildIntent {
 /// the `ipe_runtime/config.rs` template and `Cargo.toml` sqlx feature
 /// [`crate::project::emit_program`] selects. `Sqlite` is the default: a
 /// program with no database setting, or one built via the single-file
-/// `ipe build` path (no manifest at all), emits byte-identical output to
+/// `ipe dev build` path (no manifest at all), emits byte-identical output to
 /// pre-driver-selection backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DbDriver {
@@ -239,7 +239,7 @@ pub struct RustBackend<'a> {
     wasm_public_env: Vec<String>,
     wasm_hydrate_mode: bool,
     runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe build --debugger` / `ipe run --debugger` was passed. Adds
+    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed. Adds
     /// the runtime `debugger` feature to the emitted project's dependency feature
     /// list so the TEA driver instantiates the recorder. Never set for
     /// `ipe release` (the release command does not expose the flag), so no
@@ -607,7 +607,7 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Select the compilation target the emitted project is built for
-    /// (`Native` by default; `WasmClient` under `ipe build --target wasm`).
+    /// (`Native` by default; `WasmClient` under `ipe dev build --target wasm`).
     #[must_use]
     pub const fn with_target(mut self, target: ipe_ir::Target) -> Self {
         self.target = target;
@@ -1475,7 +1475,7 @@ pub(crate) struct EmitCtx<'a> {
     /// source; `None` (the default) emits the byte-identical vendored project.
     /// Ignored on the wasm target (which keeps its closed vendoring template).
     pub(crate) runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe build/run --debugger` selected the development-only
+    /// `true` when `ipe dev build/run --debugger` selected the development-only
     /// time-travelling debugger. When set, [`crate::runtime_features`] adds the
     /// `debugger` feature to the emitted runtime dependency's feature list on
     /// both targets, so the TEA driver records each `(msg, model)` step. Never
@@ -2476,7 +2476,7 @@ impl<'a> EmitCtx<'a> {
             // `IPE_DEBUGGER_RECORD` dump at loop exit, not the control socket. A
             // pure webview shape (`uses_webview && !uses_web`) is likewise gated
             // off: it ships `web-core` (so the table would build) but runs no
-            // control port to push to. With the flag off (`ipe build`/`ipe
+            // control port to push to. With the flag off (`ipe dev build`/`ipe
             // release`) the whole hoist is inert and the emit is byte-identical to
             // the direct-literal form — so a release artifact never references the
             // dev-loop table. `tui_shape_hoists`, `pure_webview_shape_does_not_hoist`,
@@ -3015,7 +3015,7 @@ impl<'a> EmitCtx<'a> {
     /// Both browser shapes route seal types through serde (the Web session
     /// store, the `CustomElement` down/up seam), and a `--debugger` build encodes
     /// a cli/worker session's `Msg` (and, when legal, `Model`) into the typed
-    /// session log `ipe run --replay` reads. The derive only ever lands on a
+    /// session log `ipe dev run --replay` reads. The derive only ever lands on a
     /// type the serde fixpoint proved derivable, so widening this gate is
     /// cargo-buildable by construction. The ONE predicate every serde derive
     /// site and the app-crate `serde` dependency read, so they cannot drift.

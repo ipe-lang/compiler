@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! End-to-end proof for the DEV-ONLY blue-green front proxy in `ipe watch`
+//! End-to-end proof for the DEV-ONLY blue-green front proxy in `ipe dev watch`
 //! (`crate::watch` with `WatchOptions::bluegreen`).
 //!
 //! The load-bearing property: a rebuild behind the proxy does NOT drop the
@@ -845,7 +845,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
     stop_and_join(&handle, join)
 }
 
-/// The flag-OFF control: with `bluegreen` disabled, `ipe watch` keeps its
+/// The flag-OFF control: with `bluegreen` disabled, `ipe dev watch` keeps its
 /// direct-bind behaviour — a rebuild still swaps the served binary (proving
 /// the default path is unchanged). It does NOT assert socket survival (the
 /// direct path drops connections on restart by design).

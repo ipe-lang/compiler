@@ -83,17 +83,17 @@ fn registry_unreachable_matches_network_signals_only() {
 
 #[test]
 fn vendored_runtime_dir_is_required_only_when_vendoring() {
-    // The dependency-model path (default `ipe build`/`run`, and `ipe watch`)
+    // The dependency-model path (default `ipe dev build`/`run`, and `ipe dev watch`)
     // never vendors the runtime source tree — it reaches the runtime as a
     // crate dependency — so it must resolve to an empty sentinel WITHOUT
     // demanding a runtime dir. Requiring the vendored tree here is what made
-    // `ipe watch` fail to locate the runtime in an installed checkout.
+    // `ipe dev watch` fail to locate the runtime in an installed checkout.
     assert_eq!(
         resolve_vendored_runtime_dir(None, false).ok(),
         Some(PathBuf::new()),
     );
     // An explicit `--runtime` is honoured verbatim, vendoring or not — so the
-    // vendoring path (e.g. `ipe eject`) resolves a runtime dir even when the
+    // vendoring path (e.g. `ipe release eject`) resolves a runtime dir even when the
     // ambient vendored tree is absent.
     assert_eq!(
         resolve_vendored_runtime_dir(Some("/opt/ipe-runtime".to_owned()), false).ok(),
@@ -241,7 +241,7 @@ fn emitted_build_failure_reports_missing_feature() {
     assert!(rendered.contains("/tmp/rt"), "{rendered}");
     assert!(rendered.contains("out of date"), "{rendered}");
     assert!(
-        !rendered.contains("ipe run [<path>]"),
+        !rendered.contains("ipe dev run [<path>]"),
         "the build failure must not print the run help page: {rendered}"
     );
 }
@@ -268,7 +268,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
     assert!(rendered.contains("cannot find value"), "{rendered}");
     assert!(rendered.contains("E0425"), "{rendered}");
     // Neither a help page nor the old plain-header user-error framing.
-    assert!(!rendered.contains("ipe run [<path>]"), "{rendered}");
+    assert!(!rendered.contains("ipe dev run [<path>]"), "{rendered}");
     assert!(
         !rendered.contains("building the emitted program failed (cargo exited"),
         "{rendered}"
@@ -400,8 +400,8 @@ fn emit_ir_prints_a_tree_for_the_golden() {
 
 /// A program importing a compiled-source stdlib module that defines its own
 /// types (`Ipe.Test`) must resolve its qualified members through the CLI
-/// analysis path (`ipe build --emit-ir` / `ipe capabilities`), exactly as it
-/// does through a real `ipe build`. Both share the injection-aware
+/// analysis path (`ipe dev build --emit-ir` / `ipe capabilities`), exactly as it
+/// does through a real `ipe dev build`. Both share the injection-aware
 /// source-graph pipeline: the analysis path once ran a bare single-module
 /// lower that never injected the closure, so `Test.runMain` / `Test.equal`
 /// failed with IPE-N0004 "unknown module `Test`" here while the build
@@ -582,7 +582,7 @@ fn generic_record_program_builds_and_prints_forty_two() {
 
     let out = dir.join("out");
     let built = build(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {built:?}");
+    assert!(built.is_ok(), "ipe dev build must succeed: {built:?}");
 
     let status = std::process::Command::new("cargo")
         .arg("build")
@@ -1115,7 +1115,7 @@ Io.println \"hello from main task\"
 /// is honoured. Exercises the logic without mutating process env.
 #[test]
 fn hot_appearance_defaults_on_and_honours_overrides() {
-    // Neither var set ⇒ on (the new default for `ipe watch`).
+    // Neither var set ⇒ on (the new default for `ipe dev watch`).
     assert!(hot_appearance_from_env(None, None), "unset ⇒ default on");
     // Opt-out set ⇒ off, regardless of the explicit var.
     assert!(
@@ -1235,8 +1235,8 @@ fn emit_web_app_source(hot_appearance: bool, tag: &str) -> String {
     sources
 }
 
-/// PROD-CLEAN: a build-mode emit (`hot_appearance = false`, what `ipe build`
-/// / `ipe run` / `ipe release` thread) carries NO hot-swap scaffolding — no
+/// PROD-CLEAN: a build-mode emit (`hot_appearance = false`, what `ipe dev build`
+/// / `ipe dev run` / `ipe release` thread) carries NO hot-swap scaffolding — no
 /// `LiteralTable` and no `/_ipe/hot-appearance` endpoint.
 #[test]
 fn build_mode_emit_carries_no_hot_swap_scaffolding() {
@@ -2122,7 +2122,7 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-/// Shipped artifacts build with the release intent: `ipe eject` and the
+/// Shipped artifacts build with the release intent: `ipe release eject` and the
 /// `ipe release` bundle never carry the development console default.
 #[test]
 fn shipped_artifact_builds_are_release() {
@@ -3267,7 +3267,7 @@ fn nested_test_file_importing_a_test_sibling_type_checks_green() {
     );
 }
 
-/// `ipe build --emit-ir` and `ipe capabilities` analyse a NAMED non-default
+/// `ipe dev build --emit-ir` and `ipe capabilities` analyse a NAMED non-default
 /// `src/` file, blamed on it, never the project's default entry.
 #[test]
 fn emit_ir_and_capabilities_over_a_non_default_src_file_analyse_it_not_main() {
@@ -4158,7 +4158,7 @@ fn artifact_size_bytes_surfaces_a_missing_artifact_as_a_typed_error() {
     );
 }
 
-// ── `ipe run --record` / `--replay` — refusals ─────────────────────────────
+// ── `ipe dev run --record` / `--replay` — refusals ─────────────────────────────
 
 // Recording and replay are refused, before any build, for every shape without
 // a cli/worker update loop — never a run that silently writes no log, nor a
@@ -4517,7 +4517,7 @@ fn user_project(tag: &str) -> PathBuf {
 
 /// Emitting into a directory that holds the user's files is refused untouched.
 ///
-/// This is `ipe build --out .`: nothing is written or pruned, and the user's
+/// This is `ipe dev build --out .`: nothing is written or pruned, and the user's
 /// `src/` and `Cargo.toml` survive byte-for-byte.
 #[test]
 fn emitting_into_a_user_directory_is_refused_untouched() {

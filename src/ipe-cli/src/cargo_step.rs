@@ -306,7 +306,7 @@ pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, C
         .ok_or_else(|| CliError::Usage(text::msg::cargo_metadata_no_target_dir()))
 }
 
-/// One `ipe watch` rebuild: [`WatchBuild::spawn`] starts it and returns at
+/// One `ipe dev watch` rebuild: [`WatchBuild::spawn`] starts it and returns at
 /// once, so the watch loop can kill a superseded build.
 ///
 /// A watch rebuild passes no `--locked`: the emitted crate's dependencies

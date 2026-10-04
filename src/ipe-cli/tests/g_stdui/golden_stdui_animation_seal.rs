@@ -88,7 +88,7 @@ fn animation_module_resolves_and_emits_kernel() {
     let (emit, res) = build_animation_project("emit");
     assert!(
         res.is_ok(),
-        "ipe build with `import Ipe.Ui.Animation` must succeed \
+        "ipe dev build with `import Ipe.Ui.Animation` must succeed \
          (native animate + compiled module): {:?}",
         res.err()
     );

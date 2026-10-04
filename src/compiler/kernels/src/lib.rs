@@ -16010,7 +16010,7 @@ pub enum Target {
     /// The native host binary (server / CLI / TUI / desktop).
     #[default]
     Native,
-    /// A browser WASM bundle (`ipe build --target wasm`) — fully public,
+    /// A browser WASM bundle (`ipe dev build --target wasm`) — fully public,
     /// `wasm2wat`-inspectable; no server effect or secret may compile in.
     WasmClient,
     /// A co-located portable WASI bundle (`wasm32-wasip1`) — a `Direct`/`Script`

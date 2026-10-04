@@ -1,4 +1,4 @@
-//! CLI-level proof that `ipe run` and `ipe watch` refuse a `Tui`-shape entry
+//! CLI-level proof that `ipe dev run` and `ipe dev watch` refuse a `Tui`-shape entry
 //! BEFORE any compile or build when the process has no interactive terminal —
 //! wired end-to-end through `ipe::run_cli`, exactly the boundary a real
 //! invocation crosses.
@@ -43,7 +43,7 @@ fn write_entry(dir_name: &str, src: &str) -> std::path::PathBuf {
     entry
 }
 
-/// `ipe run <tui-entry>` under the test runner's non-interactive stdio must
+/// `ipe dev run <tui-entry>` under the test runner's non-interactive stdio must
 /// refuse before any build: a `run` command-usage error whose reason names
 /// the missing interactive terminal.
 #[test]
@@ -65,7 +65,7 @@ fn run_refuses_a_tui_entry_without_an_interactive_terminal() {
     );
 }
 
-/// `ipe watch <tui-entry>` must refuse the same way, before the watch loop
+/// `ipe dev watch <tui-entry>` must refuse the same way, before the watch loop
 /// itself ever starts — so this call returns promptly instead of looping.
 #[test]
 fn watch_refuses_a_tui_entry_without_an_interactive_terminal() {

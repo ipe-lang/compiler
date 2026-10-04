@@ -38,7 +38,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// `ipe build` (multi-module, sibling discovery) must succeed — the derive in
+/// `ipe dev build` (multi-module, sibling discovery) must succeed — the derive in
 /// the dependency module resolves its constructors without an `exposing (..)`
 /// clause. Checked unconditionally (no `cargo`), since IPE-N0041 fired here
 /// before the fix.
@@ -53,7 +53,7 @@ fn assert_ipe_derive_succeeds(name: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name} (Codec.auto in a dependency module, \
+        "ipe dev build must succeed for {name} (Codec.auto in a dependency module, \
          no `exposing (Codec(..), Shape(..), ColType(..))`); got: {:?}",
         built.err()
     );

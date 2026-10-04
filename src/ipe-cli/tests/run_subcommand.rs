@@ -1,4 +1,4 @@
-//! Integration tests for `ipe run` — gated on `IPE_E2E=1` so the default
+//! Integration tests for `ipe dev run` — gated on `IPE_E2E=1` so the default
 //! `cargo nextest` stays fast and offline (no cargo invocation required).
 //!
 //! The non-E2E tests still exercise the CLI parsing surface (usage errors) and
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 // CLI-parsing tests (unconditional — no network, no build)
 // ---------------------------------------------------------------------------
 
-/// `ipe run` (no arguments, nothing to build here) must return a command-usage
+/// `ipe dev run` (no arguments, nothing to build here) must return a command-usage
 /// error naming `run` — so the caller shows `run`'s help page — not panic.
 #[test]
 fn run_no_args_returns_usage_error() {
@@ -26,11 +26,11 @@ fn run_no_args_returns_usage_error() {
             &result,
             Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
         ),
-        "expected a `run` command-usage error for bare `ipe run`, got: {result:?}"
+        "expected a `run` command-usage error for bare `ipe dev run`, got: {result:?}"
     );
 }
 
-/// `ipe run <entry> --bogus` (unrecognised flag after the entry) must return a
+/// `ipe dev run <entry> --bogus` (unrecognised flag after the entry) must return a
 /// command-usage error for `run` — carrying a reason naming the offending flag,
 /// so the caller shows `run`'s help page — not panic.
 #[test]
@@ -56,7 +56,7 @@ fn run_unknown_flag_returns_usage_error() {
 // E2E test — only active when IPE_E2E=1 (requires cargo + runtime)
 // ---------------------------------------------------------------------------
 
-/// `ipe run <entry.ipe>` must:
+/// `ipe dev run <entry.ipe>` must:
 ///   1. Compile the Ipê program (exit 0 from ipe pipeline).
 ///   2. Invoke `cargo build` on the emitted project (SEAL check).
 ///   3. Exec the resulting binary; its stdout must equal `"hello from run\n"`.
@@ -92,7 +92,7 @@ fn run_subcommand_builds_and_executes_hello_program() {
         // child process to check stdout.  This exercises the same code paths as
         // run_run without sacrificing the test runner.
         let built = ipe::build(&entry, &out_dir, &runtime_dir);
-        assert!(built.is_ok(), "ipe build step must succeed: {built:?}");
+        assert!(built.is_ok(), "ipe dev build step must succeed: {built:?}");
 
         // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
         // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
@@ -130,12 +130,12 @@ fn run_subcommand_builds_and_executes_hello_program() {
     }
 }
 
-/// After `ipe build` on a single-file program (no manifest) the emitted
+/// After `ipe dev build` on a single-file program (no manifest) the emitted
 /// `Cargo.toml` must carry `name = "ipe-app"`, and after `ipe build_project`
 /// on a manifest whose `name` field sanitizes to a different slug the emitted
 /// `Cargo.toml` must carry that slug — not `"ipe-app"`.
 ///
-/// This is the structural guarantee that `ipe run` relies on: it reads the
+/// This is the structural guarantee that `ipe dev run` relies on: it reads the
 /// binary name from the emitted `Cargo.toml` (the same file cargo just built
 /// from) rather than re-deriving it from the manifest, so both sides can never
 /// disagree.
@@ -169,7 +169,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
         // crate-identity hash suffix. The manifest name "Crc32 Checksum" sanitizes to
         // "crc32-checksum"; the emitted crate identity is "crc32-checksum_<hash>" so
         // two same-named projects at different paths own separate shared-target slots.
-        // The `ipe run` binary lookup reads THIS emitted name (SSOT), so it locates
+        // The `ipe dev run` binary lookup reads THIS emitted name (SSOT), so it locates
         // the hashed binary cargo produces — never "ipe-app".
         let pkg_dir = dir.join("pkg");
         let src_dir = pkg_dir.join("src");
@@ -258,7 +258,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
 // Toolchain-absence tests (unconditional — the whole point is NO cargo)
 // ---------------------------------------------------------------------------
 
-/// `ipe run <entry.ipe>` under a `PATH` with no `cargo`, and with `CARGO_HOME`
+/// `ipe dev run <entry.ipe>` under a `PATH` with no `cargo`, and with `CARGO_HOME`
 /// and `HOME` pointed at empty directories so no install location is found,
 /// must fail with the friendly root-cause message — naming Rust/Cargo, why Ipê
 /// needs it, and the rustup fix — rather than the opaque OS spawn error.
@@ -287,7 +287,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     // any executable, so cargo is unresolvable on the PATH.
     let cargoless_path = "/nonexistent-ipe-cargo-probe";
     let out = std::process::Command::new(ipe_bin)
-        .args(["run", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "run", &entry.to_string_lossy(), "--out"])
         .arg(dir.join("out"))
         .env("PATH", cargoless_path)
         .env("HOME", &empty_home)
@@ -301,7 +301,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
 
     assert!(
         !out.status.success(),
-        "ipe run with no cargo must exit non-zero"
+        "ipe dev run with no cargo must exit non-zero"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Which disposition fires depends on the host: a machine with no Rust at
@@ -313,7 +313,7 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     );
     assert!(
         stderr.contains("compile and run this program"),
-        "the message must name what `ipe run` was doing, got:\n{stderr}"
+        "the message must name what `ipe dev run` was doing, got:\n{stderr}"
     );
     // Both dispositions end with an actionable fix: install via rustup, or add
     // the existing Cargo to PATH.

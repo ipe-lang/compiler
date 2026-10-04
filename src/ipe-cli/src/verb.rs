@@ -20,7 +20,7 @@ use crate::text;
 pub enum Umbrella {
     /// `ipe dev …` — the development inner loop.
     Dev,
-    /// `ipe release …` — the production artifact.
+    /// `ipe release build|run|eject` — the production artifact.
     Release,
 }
 

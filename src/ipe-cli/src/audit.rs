@@ -671,7 +671,7 @@ fn prepare(path: &Path) -> Result<Prepared, CliError> {
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
     let emitted_dir = audit_scratch_dir(&manifest.name)?;
-    // Resolve the runtime exactly as `ipe build` does — one resolver for every
+    // Resolve the runtime exactly as `ipe dev build` does — one resolver for every
     // command. Under the default dependency model the emitted project names the
     // runtime as a path dependency, which the build materializes from the
     // embedded source under `IPE_HOME`; no vendored module tree is needed, so an
@@ -2951,7 +2951,7 @@ mod tests {
 
     // ── Runtime resolution ───────────────────────────────────────────────────
 
-    /// `prepare` resolves the runtime through the SAME path `ipe build` uses — the
+    /// `prepare` resolves the runtime through the SAME path `ipe dev build` uses — the
     /// materialize-capable resolver — never a separate walk-up that cannot
     /// materialize. Under the default dependency model no vendored module tree is
     /// needed, so with `IPE_RUNTIME_DIR` unset the resolution succeeds with an

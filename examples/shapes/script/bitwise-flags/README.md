@@ -5,6 +5,6 @@ low bits of one `Int`, combined with OR, tested with AND, and cleared with the
 complement. The worked example for the [Bitwise guide](../../../../docs/guide/bitwise.md).
 
 ```
-ipe build package.ipe
+ipe dev build package.ipe
 cargo run --manifest-path out/rust/Cargo.toml
 ```

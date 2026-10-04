@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe build --target wasm` to produce a browser bundle
+ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build --target wasm` to produce a browser bundle
 
 ## run-wasi-native-flags
 
@@ -78,7 +78,7 @@ ipe run builds and executes a native binary; --target wasm has no native artifac
 
 ## eject-out-required
 
-ipe eject: --out <dir> is required (the directory to write the standalone project to)
+ipe release eject: --out <dir> is required (the directory to write the standalone project to)
 
 ## release-no-wasi
 
@@ -218,7 +218,7 @@ refusing to use the project manifest `{path}` found above the entry file: it is 
 
 ## manifest-unverifiable
 
-refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe build path/to/project`), whose `package.ipe` is then used as named
+refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe dev build path/to/project`), whose `package.ipe` is then used as named
 
 ## no-entry
 
@@ -724,12 +724,12 @@ advisory file {path} is malformed — refusing to treat the dep as safe:
 
 ## cli-wasi-run-feature-disabled
 
-ipe run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
-  = help: build the module with `ipe build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
+ipe dev run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
+  = help: build the module with `ipe dev build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
 
 ## cli-wasi-run-failed
 
-ipe run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
+ipe dev run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
 
 ## cli-wasi-run-exited
 
@@ -793,7 +793,7 @@ WASI wall-clock deadline
 
 ## watch-thread-refused
 
-[ipe watch] warning: {detail}; the dependency-resolve retry is skipped
+[ipe dev watch] warning: {detail}; the dependency-resolve retry is skipped
 
 # Publish refusals
 
@@ -1869,7 +1869,7 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+ipe dev build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
 
 ## run-profile-unparsable
 
@@ -1885,11 +1885,11 @@ program entry module `{module}` is not yet buildable — a declared `programs` e
 
 ## pack-retired
 
-ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe build web desktop` / `ipe build web ios` / `ipe build web android` for a fast dev bundle, or `ipe release web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe build --emit-permissions <ios|macos|android>`.
+ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe dev build web desktop` / `ipe dev build web ios` / `ipe dev build web android` for a fast dev bundle, or `ipe release build web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe release build --emit-permissions <ios|macos|android>`.
 
 ## build-binary-missing
 
-ipe build: expected binary at {path} — cargo build succeeded but the binary is missing
+ipe dev build: expected binary at {path} — cargo build succeeded but the binary is missing
 
 ## release-binary-missing
 
@@ -1961,27 +1961,27 @@ the wasm32-wasip1 build reported no `.wasm` artifact for {dir} — cargo's JSON 
 
 ## session-no-recordable
 
-ipe run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
+ipe dev run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
 
 ## session-native-only
 
-ipe run {flag}: works on a native run only — drop `--target wasi`
+ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
 ## session-jailed
 
-ipe run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
 
 ## session-flags-exclusive
 
-ipe run: {first} and {second} cannot be combined — record a session, then replay it
+ipe dev run: {first} and {second} cannot be combined — record a session, then replay it
 
 ## replay-no-default-log
 
-ipe run --replay: no session log at {typed} or trace at {trace} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {typed} or trace at {trace} — record one with `ipe dev run --record`
 
 ## replay-log-missing
 
-ipe run --replay: no session log at {path} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {path} — record one with `ipe dev run --record`
 
 ## program-exited
 
@@ -2083,6 +2083,14 @@ released → {path} (single self-jailing binary; run `--capabilities` to audit)
 ## release-bundled
 
 released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app can be run directly, bypassing the sandbox — prefer embed mode for production)
+
+## mobile-android-note
+
+note: an unsigned Android Gradle project is written here. `./gradlew assembleDebug` (with the Android SDK) builds an APK signed with the SDK's debug key, for local install only; a store build needs your own keystore — add a `signingConfig` for it to `app/build.gradle`, then run `./gradlew assembleRelease`.
+
+## mobile-ios-note
+
+note: the iOS shell project layout is written here, but a signed, runnable .ipa must be produced on a macOS runner with Xcode + a signing identity (out of scope).
 
 # Consent refusals
 

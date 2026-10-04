@@ -188,7 +188,7 @@ fn caf_body_renders_once() {
     assert_eq!(renders, 1, "the CAF body must render once, got {names:?}");
 }
 
-/// The stack `ipe watch` compiles on: a spawned thread's default.
+/// The stack `ipe dev watch` compiles on: a spawned thread's default.
 const WATCH_WORKER_STACK: usize = 2 << 20;
 
 /// A `main` whose body chains `n` `Task.andThen` continuations.

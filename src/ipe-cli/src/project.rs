@@ -124,7 +124,7 @@ pub struct ProjectManifest {
 /// Per-host delivery configuration, parsed from the `delivery = { … }` field.
 ///
 /// All three sections are present and live: every project's manifest carries
-/// defaults for all hosts, and `ipe build` reads only the one matching the
+/// defaults for all hosts, and `ipe dev build` reads only the one matching the
 /// resolved target. There is no `active` selector — that is the CLI.
 #[derive(Clone, Debug, Default)]
 pub struct DeliveryConfig {
@@ -414,7 +414,7 @@ pub struct WasmConfig {
     /// `"solo"` / `"hydrate"` / `"off"` (default when the key or section is
     /// absent — `--target wasm` still works without a `[wasm]` section; this
     /// field is metadata for the eventual SSR+hydration/SPA-shell split, not
-    /// a gate on `ipe build --target wasm` itself).
+    /// a gate on `ipe dev build --target wasm` itself).
     pub mode: Option<String>,
     /// The client entry module's file, relative to the project root
     /// (defaults to the build's own entry file when absent — see M6).
@@ -716,7 +716,7 @@ pub const MAX_DISCOVERY_DEPTH: usize = 64;
 
 /// The most `.ipe` modules the module-discovery walk collects.
 ///
-/// The same bound `ipe watch` holds its watched source files to, so the one
+/// The same bound `ipe dev watch` holds its watched source files to, so the one
 /// walk that feeds both a build and a watch session refuses a pathological
 /// tree once, with one limit.
 pub const MAX_DISCOVERED_MODULES: usize = ipe_watch::MAX_WATCHED_FILES;

@@ -3250,7 +3250,7 @@ fn release_rejects_debug_wildcard_pattern() {
 /// A bare `_ ->`-only catch-all over a closed union is rejected in BOTH build
 /// postures (it is IPE-T0018, an ordinary type error, not a build-posture
 /// gate). Pinning it at the CLI level proves the error is not swallowed by the
-/// warning channel — a developer sees the failure at `ipe build` / `type-check`.
+/// warning channel — a developer sees the failure at `ipe dev build` / `type-check`.
 #[test]
 fn bare_wildcard_over_closed_union_is_rejected_at_cli() {
     let src = format!(

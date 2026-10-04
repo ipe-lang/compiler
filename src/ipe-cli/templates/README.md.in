@@ -5,7 +5,7 @@ An Ipê application scaffolded by `ipe init`. `src/Main.ipe` is {description}
 Run it:
 
 ```sh
-ipe run
+ipe dev run
 ```
 
 {run_hint}

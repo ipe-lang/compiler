@@ -636,7 +636,7 @@ fn end_to_end_static_binary_is_static_and_runs() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "Hello, Ipê!\n");
 }
 
-/// `ipe run --static` end to end: the driver emits, cargo-builds for the
+/// `ipe dev run --static` end to end: the driver emits, cargo-builds for the
 /// musl triple, resolves the relocated target dir, and execs a genuinely
 /// static binary. Gated: `IPE_E2E_STATIC=1`.
 #[test]
@@ -662,16 +662,16 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
         .map_or_else(|| out.join("target"), PathBuf::from);
 
     let run = std::process::Command::new(support::ipe_bin())
-        .args(["run"])
+        .args(["dev", "run"])
         .arg(&entry)
         .args(["--static", "--out"])
         .arg(&out)
         .env("CARGO_TARGET_DIR", &target_dir)
         .output()
-        .expect("spawn ipe run --static");
+        .expect("spawn ipe dev run --static");
     assert!(
         run.status.success(),
-        "ipe run --static failed\nstdout: {}\nstderr: {}",
+        "ipe dev run --static failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
@@ -698,6 +698,6 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
     );
     assert!(
         ldd_text.contains("statically linked") || ldd_text.contains("not a dynamic executable"),
-        "ipe run --static executed a non-static binary: {ldd_text}"
+        "ipe dev run --static executed a non-static binary: {ldd_text}"
     );
 }

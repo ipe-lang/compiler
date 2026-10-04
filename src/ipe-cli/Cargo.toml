@@ -31,13 +31,13 @@ path = "src/bin/gen_cli_docs.rs"
 # default so an ordinary `ipe` build stays lean.
 signing = ["dep:sigstore", "dep:sigstore_protobuf_specs", "dep:pki_types"]
 
-# `ipe run --target wasi` executes the emitted `wasm32-wasip1` module in an
+# `ipe dev run --target wasi` executes the emitted `wasm32-wasip1` module in an
 # EMBEDDED wasmtime engine (never an external `wasmtime` binary), so the WASI
 # context is built by us from the program's declared capability floor — the
 # SAME deny-by-default model as the native run jail. wasmtime is a large
 # dependency (a full wasm engine + the preview1 WASI shim), so it sits behind
 # this feature, OFF by default so an ordinary dev/test `ipe` build stays lean
-# and ON for release packaging. With the feature off `ipe run --target wasi`
+# and ON for release packaging. With the feature off `ipe dev run --target wasi`
 # returns a typed refusal naming the feature — never a panic, never a silent
 # fallback.
 wasi_run = ["dep:wasmtime", "dep:wasmtime-wasi"]
@@ -76,7 +76,7 @@ ipe_watch = { path = "../compiler/watch" }
 # `widget-assets` feature (sha2 + base64 + the shared wire constants) — NOT the
 # heavy `web`/server surface, and never linked into an emitted program.
 # `control-wire`: the dev-loop control-channel CODEC (`ControlFrame` +
-# `encode_frame`/`decode_frame`), so `ipe watch`'s `send_control_frame` builds
+# `encode_frame`/`decode_frame`), so `ipe dev watch`'s `send_control_frame` builds
 # and parses frames from the ONE wire definition (SSOT) over its own std sockets
 # — no tokio server pulled into the CLI.
 ipe-runtime-rust = { path = "../runtime/rust", default-features = false, features = ["widget-assets", "control-wire"] }
@@ -162,12 +162,12 @@ sigstore_protobuf_specs = { version = "0.5", default-features = false, optional 
 # the DER bytes in `trusted_root.json`.
 pki_types = { package = "rustls-pki-types", version = "1", optional = true }
 
-# The embedded wasm engine + the WASI preview1 shim for `ipe run --target wasi`,
+# The embedded wasm engine + the WASI preview1 shim for `ipe dev run --target wasi`,
 # behind the optional `wasi_run` feature. `wasmtime` runs the emitted
 # `wasm32-wasip1` module in-process; `wasmtime-wasi`'s `p1` module supplies the
 # preview1 `WasiCtxBuilder` we drive from the declared capability floor
 # (preopened dirs, env allowlist, args) with NO ambient authority. The Cranelift
-# JIT default backend is kept (the module is executed once per `ipe run`, not a
+# JIT default backend is kept (the module is executed once per `ipe dev run`, not a
 # cold-start-sensitive path). Optional so the default build never links the
 # engine's graph.
 wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }

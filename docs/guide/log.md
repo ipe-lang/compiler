@@ -46,7 +46,7 @@ main =
         Io.println "done — four log records emitted above"
 ```
 
-Running it (`ipe run`) writes each record as a timestamped, level-tagged line —
+Running it (`ipe dev run`) writes each record as a timestamped, level-tagged line —
 the plain shape is `<timestamp> <LEVEL> <message>`:
 
 ```

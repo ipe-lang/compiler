@@ -4,11 +4,11 @@
 //! `ipe_lsp_features`; this module supplies the one driver-side ingredient
 //! the server cannot own — project resolution. [`DriverLoader`] first
 //! classifies the opened document as a [`ProjectRoot`]. A package routes
-//! through the SAME manifest-discovery/stdlib-injection code path `ipe build`
-//! and `ipe watch` use, so the module set the editor analyzes can never
+//! through the SAME manifest-discovery/stdlib-injection code path `ipe dev build`
+//! and `ipe dev watch` use, so the module set the editor analyzes can never
 //! diverge from the one the batch build compiles. A loose file (no
 //! `package.ipe` above it) resolves through [`crate::loose_file`], the same
-//! resolver `ipe build` and `ipe watch` use for it.
+//! resolver `ipe dev build` and `ipe dev watch` use for it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -152,7 +152,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
 /// A refusal caused by project source (a module path, a `Rust.Ffi.call` site)
 /// degrades the load, since an edit can lift it. A conflict inside the
 /// installed catalog refuses it: no buffer edit fixes it, and degrading would
-/// serve analysis over a program `ipe build` rejects. The match names every
+/// serve analysis over a program `ipe dev build` rejects. The match names every
 /// variant with no fallback arm, so a new refusal cannot reach the editor
 /// until its disposition is decided.
 const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadError {
@@ -189,7 +189,7 @@ impl ProjectLoader for DriverLoader {
             .map_err(|e| load_error(&e, user_sources_limit(&root)))?;
         let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
         // Load the FFI catalog and inject installed-crate interface modules so
-        // the LSP sees `Rust.<Crate>` bindings exactly as `ipe build` does. A
+        // the LSP sees `Rust.<Crate>` bindings exactly as `ipe dev build` does. A
         // missing/empty catalog is fine (no crates installed); a tampered
         // cache is surfaced as a `LoadError`.
         let ffi_injected = crate::ffi::prepare_ffi(&mut sources, &blame_path)

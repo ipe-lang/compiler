@@ -85,8 +85,8 @@ pub fn gutter(text: &str) -> String {
 /// Cargo's own progress bar and diagnostics already carry their own internal
 /// alignment; this is not a full [`GUTTER`] (that would fight cargo's column
 /// math) but one shared space so the relay sits off the terminal edge instead
-/// of flush against it. One space, defined once, so `ipe build`'s and `ipe
-/// watch`'s cargo relays can never drift apart — the exact bug this constant
+/// of flush against it. One space, defined once, so `ipe dev build`'s and `ipe
+/// dev watch`'s cargo relays can never drift apart — the exact bug this constant
 /// closes: two independent call sites hand-rolling the same "no indent at
 /// all" default.
 pub const RELAY_INDENT: &str = " ";

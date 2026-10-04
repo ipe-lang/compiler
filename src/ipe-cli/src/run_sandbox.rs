@@ -1,6 +1,6 @@
-//! Wiring the runtime capability sandbox around `ipe run`'s final exec.
+//! Wiring the runtime capability sandbox around `ipe dev run`'s final exec.
 //!
-//! `ipe run` compiles, `cargo build`s, and then runs the emitted `ipe-app`
+//! `ipe dev run` compiles, `cargo build`s, and then runs the emitted `ipe-app`
 //! binary. This module inserts the jail between the build and the run for
 //! programs that reach opaque native code: it resolves the program's capability
 //! set (`inferred ∪ declared`), lowers it to a [`SandboxProfile`], establishes
@@ -77,7 +77,7 @@ impl ResolvedCapabilities {
 /// Lower a database driver to the concrete axis the profile needs.
 ///
 /// Every project has a resolved driver (it defaults to `SQLite`), so this is
-/// total — there is no "unknown driver" path at `ipe run` (the fail-closed
+/// total — there is no "unknown driver" path at `ipe dev run` (the fail-closed
 /// [`DatabaseAxis::NotApplicable`] path exists for callers that genuinely cannot
 /// resolve one).
 #[must_use]
@@ -312,7 +312,7 @@ pub fn profile_axes(profile: &SandboxProfile) -> BTreeSet<Capability> {
 /// The Rust source of a `#[used]` static that embeds the capability floor into
 /// the emitted binary's `.rodata`.
 ///
-/// `ipe exec` scans this *passively off disk* (never by executing the binary) as
+/// `ipe release run` scans this *passively off disk* (never by executing the binary) as
 /// the authoritative floor a tampered `ipe.profile` cannot go below —
 /// [`ipe_sandbox::run_jail::scan_capfloor`] finds it by its
 /// [`ipe_sandbox::run_jail::CAPFLOOR_MARKER`] prefix. The floor lands in
@@ -343,13 +343,13 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
     // named section: an allocated section survives `strip` (the deploy artifact
     // builds release with `strip = true`), whereas a non-alloc custom section is
     // stripped away. `#[used]` + `#[no_mangle]` keep the linker from
-    // garbage-collecting the never-read static. `ipe exec` finds the floor by
+    // garbage-collecting the never-read static. `ipe release run` finds the floor by
     // scanning the binary for the unique `ipe-capfloor` marker — see
     // `ipe_sandbox::run_jail::scan_capfloor`.
     format!(
         "\n// The runtime capability FLOOR, embedded read-only in `.rodata` so a\n\
          // tampered ipe.profile cannot request less isolation than this binary was\n\
-         // built for. `ipe exec` scans this out of the binary WITHOUT running it.\n\
+         // built for. `ipe release run` scans this out of the binary WITHOUT running it.\n\
          // `.rodata` survives `strip`; a custom link-section would not.\n\
          #[used]\n\
          #[unsafe(no_mangle)]\n\
@@ -364,7 +364,7 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
 /// capability-floor static appended to the emitted `src/main.rs` (embedded in
 /// the binary). The profile is a *convenience mirror* the launcher parses; the
 /// authoritative floor is the embedded static. A profile weaker than the floor
-/// is refused at launch (`ipe exec`), so tampering the mirror alone cannot
+/// is refused at launch (`ipe release run`), so tampering the mirror alone cannot
 /// under-isolate.
 ///
 /// # Errors
@@ -385,7 +385,7 @@ pub fn write_build_artifacts(
     //    so the linker genuinely retains the bytes (a mere `#[used]` is
     //    garbage-collected by an aggressive linker like `mold`, and `strip`
     //    removes the unreferenced data). The read keeps the bytes in `.rodata`,
-    //    where `strip` cannot touch them; `ipe exec` scans them out passively.
+    //    where `strip` cannot touch them; `ipe release run` scans them out passively.
     //    Idempotent: a re-build replaces any prior floor block + reference.
     let main_rs = crate_dir.path_to(Path::new("src").join("main.rs"))?;
     let existing = crate::io_bounded::read_to_string_capped(

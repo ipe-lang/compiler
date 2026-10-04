@@ -1,6 +1,6 @@
 //! A reused-by-value generic param clone gap (SEAL).
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build` with
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build` with
 //! E0382 (`use of moved value: x`) in the body of a function whose only generic
 //! is used MORE THAN ONCE in a by-value consuming position:
 //! `dup x = """{{x}}{{x}}"""` emits `interpolate_to_string(x)` TWICE with no
@@ -66,7 +66,7 @@ fn i189_ipec_accepts_and_clones_reused_generic() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for reused_generic_clone: {:?}",
+        "ipe dev build must succeed for reused_generic_clone: {:?}",
         built.err()
     );
 
@@ -99,7 +99,7 @@ fn i189_ipec_accepts_and_clones_reused_generic() {
 /// cargo-0 ∧ run-0 ∧ golden-verified: the emitted project actually compiles with
 /// `rustc` (no E0382), prints the two instantiations, and its stdout matches the
 /// cached golden oracle. Gated on `IPE_E2E=1` — a real `cargo build`, the only check
-/// that would have caught the original SEAL violation (E0382, `ipe build`
+/// that would have caught the original SEAL violation (E0382, `ipe dev build`
 /// clean).
 #[test]
 fn i189_cargo_builds_and_runs() {
@@ -118,7 +118,7 @@ fn i189_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for reused_generic_clone: {:?}",
+        "ipe dev build must succeed for reused_generic_clone: {:?}",
         built.err()
     );
 

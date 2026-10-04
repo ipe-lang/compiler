@@ -97,7 +97,7 @@ searchQuery =
         ]
 ```
 
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 parse + narrow (checkScheme):

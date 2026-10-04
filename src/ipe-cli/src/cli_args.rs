@@ -41,7 +41,7 @@ pub struct DeliveryPositionals {
 ///
 /// A leading token that is a shape word (`web`/`tui`/`cli`/`worker`/`script`) is
 /// the cross-check shape; any other leading token belongs to the tail (a
-/// runtime/host/target), so a bare `ipe build solo` and a bare `ipe build web`
+/// runtime/host/target), so a bare `ipe dev build solo` and a bare `ipe dev build web`
 /// both parse. `server` is NOT a shape word — a server is a `script` — so a
 /// leading `server` reads as an entry path, never a shape. The tail is parsed
 /// by [`DeliveryTokens::parse`].
@@ -330,7 +330,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str, command: &str) -> Res
     Ok(())
 }
 
-/// Select `ipe run`'s session mode, refusing a second `--record` / `--replay`.
+/// Select `ipe dev run`'s session mode, refusing a second `--record` / `--replay`.
 fn set_session(slot: &mut SessionMode, mode: SessionMode) -> Result<(), CliError> {
     const LABEL: &str = Verb::DEV_RUN.name();
     if let Some(first) = slot.flag() {
@@ -361,7 +361,7 @@ fn take_value(
 }
 
 /// Take the leading positional entry, if any: the first token, but ONLY when it
-/// is not a flag. A leading `--flag` (e.g. `ipe build --emit-ir`) leaves the
+/// is not a flag. A leading `--flag` (e.g. `ipe dev build --emit-ir`) leaves the
 /// entry unset — so the flag is parsed as a flag rather than silently swallowed
 /// as a bogus entry path — and the caller falls back to its project-aware
 /// default. Advances `it` past the entry only when one is taken.
@@ -377,7 +377,7 @@ fn take_leading_entry(
 /// `true` when `token` is a delivery word — a shape (`web`/`tui`/…), the `solo`
 /// runtime, the never-written `served`, or a host (`desktop`/`ios`/`android`).
 /// Used to tell a leading entry-path positional from a leading delivery word so
-/// `ipe build web` (a delivery) and `ipe build src/Main.ipe` (an entry) both
+/// `ipe dev build web` (a delivery) and `ipe dev build src/Main.ipe` (an entry) both
 /// parse. A target triple is deliberately excluded: a leading bare triple with
 /// no preceding shape word is meaningless, so it stays an entry-path candidate
 /// and the delivery parse rejects it in tail position if it slips through.
@@ -401,8 +401,8 @@ fn shadowing_note(word: &str, exists: impl FnOnce(&str) -> bool) -> Option<Strin
 }
 
 /// Take the leading positional entry only when it is a genuine entry path — not
-/// a delivery word. `ipe build web desktop` leaves the entry unset (the project
-/// default) and hands `web desktop` to the delivery parse; `ipe build
+/// a delivery word. `ipe dev build web desktop` leaves the entry unset (the project
+/// default) and hands `web desktop` to the delivery parse; `ipe dev build
 /// src/Main.ipe web` consumes the path, then hands `web` to delivery.
 ///
 /// When a skipped leading delivery word also names a path on disk it prints a
@@ -577,7 +577,7 @@ impl WasmKind {
     }
 }
 
-/// The compilation surface `ipe build` produces — dump the lowered IR, or emit
+/// The compilation surface `ipe dev build` produces — dump the lowered IR, or emit
 /// a native/wasm project.
 ///
 /// Making this an enum is what forbids `--emit-ir --out X` / `--emit-ir
@@ -605,7 +605,7 @@ pub enum BuildMode {
     },
 }
 
-/// Fully-parsed `ipe build` arguments.
+/// Fully-parsed `ipe dev build` arguments.
 // Four independent one-of-two CLI switches (`fix`, `accept_risks`, `debugger`,
 // `quiet`) each maps naturally to a bool; a two-variant enum or state machine
 // would obscure their independence rather than clarify it.
@@ -640,7 +640,7 @@ pub struct BuildArgs {
     pub quiet: bool,
 }
 
-/// Parse `ipe build`'s argument tail.
+/// Parse `ipe dev build`'s argument tail.
 ///
 /// Rejects, at this single boundary: `--emit-ir` combined with any
 /// emit-affecting flag (`--out` / `--static` / `--target` / `--allocator` /
@@ -758,7 +758,7 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
     })
 }
 
-/// What `ipe run` does with a cli/worker app's TEA session.
+/// What `ipe dev run` does with a cli/worker app's TEA session.
 ///
 /// One value, so a run that both records and replays is unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -794,7 +794,7 @@ impl SessionMode {
     }
 }
 
-/// Fully-parsed `ipe run` arguments.
+/// Fully-parsed `ipe dev run` arguments.
 pub struct RunArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -808,13 +808,13 @@ pub struct RunArgs {
     /// The native static-request layer.
     pub static_layer: StaticRequestLayer,
     /// The WASM compilation target selected on the CLI. `Client` (`--target
-    /// wasm`, the browser bundle) has no executable form under `ipe run` and is
-    /// refused at parse; `Wasi` (`--target wasi`) routes `ipe run` to the
+    /// wasm`, the browser bundle) has no executable form under `ipe dev run` and is
+    /// refused at parse; `Wasi` (`--target wasi`) routes `ipe dev run` to the
     /// embedded-wasmtime execution path; `None` is the ordinary native run.
     pub wasm: WasmKind,
     /// `--accept-risks` — take responsibility for every disclosed `.Unsafe`
     /// escape-hatch import and proceed without the acknowledgment prompt. Same
-    /// one-off consent as `ipe build --accept-risks`.
+    /// one-off consent as `ipe dev build --accept-risks`.
     pub accept_risks: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the emitted runtime loop. Absent from `ipe release` so the debugger can
@@ -838,10 +838,10 @@ pub struct RunArgs {
     pub quiet: bool,
 }
 
-/// Parse `ipe run`'s argument tail.
+/// Parse `ipe dev run`'s argument tail.
 ///
 /// Splits on the first `--`: everything before is `ipe`-owned, everything after
-/// is forwarded to the emitted binary untouched. `ipe run` builds and executes a
+/// is forwarded to the emitted binary untouched. `ipe dev run` builds and executes a
 /// process: a native binary, or — under `--target wasi` — the emitted
 /// `wasm32-wasip1` module in an embedded wasmtime engine. `--target wasm` (the
 /// browser bundle, which has no executable form) is rejected here rather than
@@ -915,7 +915,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     // static-link triple; classify it before `static_flags.layer()` consumes
     // the flags. `--target wasi` runs the emitted module under embedded
     // wasmtime, so it composes with none of the native static-link flags — the
-    // same non-composition `ipe build` enforces (they lower to a native triple
+    // same non-composition `ipe dev build` enforces (they lower to a native triple
     // that a wasm target has no use for).
     let wasm = wasm_kind_of(static_flags.target);
     match wasm {
@@ -957,7 +957,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     })
 }
 
-/// Fully-parsed `ipe eject` arguments.
+/// Fully-parsed `ipe release eject` arguments.
 pub struct EjectArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -968,10 +968,10 @@ pub struct EjectArgs {
     pub runtime: Option<String>,
 }
 
-/// Parse `ipe eject`'s argument tail.
+/// Parse `ipe release eject`'s argument tail.
 ///
 /// `--out <dir>` is required: eject writes a whole standalone project, so there
-/// is no sensible in-place default the way a throwaway `ipe build` artifact has —
+/// is no sensible in-place default the way a throwaway `ipe dev build` artifact has —
 /// the destination must be named. Each value flag is rejected on a second
 /// occurrence.
 ///
@@ -1336,7 +1336,7 @@ pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
     })
 }
 
-/// Fully-parsed `ipe watch` arguments.
+/// Fully-parsed `ipe dev watch` arguments.
 pub struct WatchArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -1357,12 +1357,12 @@ pub struct WatchArgs {
     pub reset_state: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the rebuilt runtime loop, exposing the in-app debugger overlay. Off by
-    /// default (the recorder adds runtime weight); the same opt-in `ipe run` and
-    /// `ipe build` offer.
+    /// default (the recorder adds runtime weight); the same opt-in `ipe dev run` and
+    /// `ipe dev build` offer.
     pub debugger: bool,
 }
 
-/// Parse `ipe watch`'s argument tail. `--port` is parsed into a `u16` at this
+/// Parse `ipe dev watch`'s argument tail. `--port` is parsed into a `u16` at this
 /// boundary, and each value flag is rejected on a second occurrence.
 ///
 /// # Errors
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[test]
     fn build_leading_shape_word_is_delivery_not_entry() {
-        // `ipe build web` is a delivery shape cross-check, not an entry file.
+        // `ipe dev build web` is a delivery shape cross-check, not an entry file.
         let a = parse_build(&s(&["web"])).expect("web");
         assert!(a.entry.is_none());
         assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[test]
     fn run_wasi_target_is_accepted_and_captured() {
-        // `ipe run --target wasi` now EXECUTES the emitted `wasm32-wasip1` module
+        // `ipe dev run --target wasi` now EXECUTES the emitted `wasm32-wasip1` module
         // under embedded wasmtime, so the flag is accepted at parse and captured
         // as the WASI compilation target (routed to the wasmtime path downstream).
         let a = parse_run(&s(&["--target", "wasi"])).expect("wasi accepted");
@@ -1966,7 +1966,7 @@ mod tests {
     #[test]
     fn run_wasi_does_not_compose_with_static_flags() {
         // `--target wasi` is a wasm axis; the native static-link flags do not
-        // apply to it — the same non-composition `ipe build --target wasi` enforces.
+        // apply to it — the same non-composition `ipe dev build --target wasi` enforces.
         assert!(parse_run(&s(&["--target", "wasi", "--static"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--allocator", "dlmalloc"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--cfree"])).is_err());

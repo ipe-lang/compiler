@@ -317,7 +317,7 @@ pub fn emit_expr_at(
                         // `materialize_template_str` read, so a structural edit
                         // (add/remove/reorder a static element, static attribute, static
                         // text) becomes a zero-compile data patch. Off (release / `ipe
-                        // build`) it never fires — the subtree falls through to the inline
+                        // dev build`) it never fires — the subtree falls through to the inline
                         // emit below and the output is byte-identical. `None` for any
                         // non-static subtree → keep it compiled.
                         if let Some(result) = emit_html_template(ctx, expr) {
@@ -327,7 +327,7 @@ pub fn emit_expr_at(
                         // provably-static `Ipe.Ui` element subtree is hoisted whole as ONE
                         // serialized template and emitted as a `materialize_str`
                         // read (returning an `Element`), so a structural edit becomes a
-                        // zero-compile data patch. Off (release / `ipe build`) it never
+                        // zero-compile data patch. Off (release / `ipe dev build`) it never
                         // fires — the subtree falls through to the inline emit below and the
                         // output is byte-identical. `None` for any non-static subtree.
                         if let Some(result) = emit_ui_template(ctx, expr, indent, child, generics)?

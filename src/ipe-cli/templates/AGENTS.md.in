@@ -130,8 +130,8 @@ Ask one focused question per ambiguity; no guess heroically.
 |------------------------------------------|--------------------|------------------------------------|-------|
 | Web app (forms, real-time, UI state)     | **Ipe.Tea.Web**        | `Web.tea cfg`                      | HTTP-first; SSE patches; sessions + cookies + routing built in. |
 | Multi-tenant SaaS / dashboard            | **Ipe.Tea.Web + auth-app gate** | `Web.tea { consoleAuth = … }` | Tenant scope enforced at SQL layer. |
-| Desktop app                              | **Ipe.Tea.Web** (host=desktop) | `Web.tea cfg` + `ipe build web desktop` | Same `web` shape; desktop is a delivery host. |
-| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (solo runtime) | `Web.tea cfg` + `ipe release web solo ios\|android` | `wasm = On { mode = Solo }` in `package.ipe`. |
+| Desktop app                              | **Ipe.Tea.Web** (host=desktop) | `Web.tea cfg` + `ipe dev build web desktop` | Same `web` shape; desktop is a delivery host. |
+| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (solo runtime) | `Web.tea cfg` + `ipe release build web solo ios\|android` | `wasm = On { mode = Solo }` in `package.ipe`. |
 | View-less background TEA worker          | **Ipe.Tea.Worker**     | `Worker.tea cfg`                   | Managed `init`/`update`/`subscriptions` loop, no view sink. |
 | Line-oriented interactive tool           | **Ipe.Tea.Cli**        | `Cli.tea cfg`                      | Managed stdin-driven TEA loop (init/update/view/subscriptions); lines via `Sub.onLine`. |
 | Terminal UI (TUI)                        | **Ipe.Tea.Tui**        | `Tui.tea cfg`                      | `Screen` view (`Ipe.Ui.Tui`), a terminal-only view type; keys via `Sub.onKey`. |
@@ -406,7 +406,7 @@ app code.
 | `Db.Store` | `Ipe.Db.Store` | Typed, injection-safe table over `Ipe.Db`, derived from ONE `Codec`. `fromCodec` → `Draft` (schema known, deny-by-default: NO read/write). Classify to query: `public` (world-open `Store`, uses `all`/`get`/`insert`/`upsert`/…; `upsert`'s conflict target is the declared key — primary key, else the one `unique` column — never an argument, and a store without one is a typed `Err`) or `secured policy` → `Secured` (read/written ONLY via the authenticated `allAs`/`getAs`/`insertAs`/`updateAs`/`deleteAs`, each taking an `Auth.Principal`). **`Policy` builders**: `ownerColumn .col` (scope all ops to `col = $subject` + force owner on insert; never rewritten), `readOnly p` (reads `p`, every write `never`), `publicRead`/`unrestricted`, `immutable .col` (drop from update SET), `mask .col pred` (project value only when `pred`, else NULL), `alsoInsert`/`alsoUpdate`/`alsoDelete` (open a write path; a secured write the policy refuses returns `0` and writes nothing), `andPolicy` (AND-compose). **Predicate leaves** (`Pred row`): `always`/`never`/`allOf`/`anyOf`/`notPred`/`matchWhere` (lift a `Cond`), the FAIL-CLOSED caller-side `role`/`memberOf`/`claimEquals` (absent role/group/claim DENIES), and `existsIn`/`correlate` (correlated-subquery sharing). `explain policy` → the per-op WHERE as text. Owner filter compiles to bound-param `Sql.column`/`Sql.param`, never interpolation. Guide: `docs/guide/db-store.md` + `db-store-rls-composition.md`. |
 | `Auth` | `Ipe.Auth` | register, login, setRole (Task) + hashPassword, hashPasswordCost, verifyPassword, passwordStrength, signToken, verifyToken (Result); signTokenWithClaims/verifyTokenWithAlgorithm — typed-builder aliases over `Ipe.Jwt` for fine-grained algorithm+claims control |
 | `Log` | `Ipe.Log` | debug, info, warn, error, debugWith, infoWith, warnWith, errorWith — observability only (levelled, timestamped, telemetry-mirrored). For a bare line use `Io.println` / `Io.eprintln`. |
-| `Debug` | `Ipe.Debug` | log : String -> a -> a — DEV-ONLY escape hatch (Elm-style). Prints `"label: value"` to stderr, returns the value unchanged. `ipe release` REJECTS any `Debug.*` use (IPE-L0140); use `ipe build` / `ipe run` during development. |
+| `Debug` | `Ipe.Debug` | log : String -> a -> a — DEV-ONLY escape hatch (Elm-style). Prints `"label: value"` to stderr, returns the value unchanged. `ipe release` REJECTS any `Debug.*` use (IPE-L0140); use `ipe dev build` / `ipe dev run` during development. |
 | `Trace` | `Ipe.Trace` | span, event, attr — opt-in app-level tracing spans. Tier-1 spans (HTTP/session/Msg/DB/Auth/Http/File) automatic. |
 | `Server` | `Ipe.Http.Server` | param, queryParam, header, getCookie, static (Layer 3 surface); higher-level `get/post/listen/text/json/html` are kernel-only |
 | `Stream` | `Ipe.Http.Server.Stream` | stream, emit, finish, withContentType — server-side streaming HTTP responses (SSE/LLM token forwarding/chunked downloads). Mirror of `Ipe.Core.Http.Stream`. Sync bridge: `Ipe.Core.Http.Stream.forEachChunk hdl body` drains an upstream stream from inside a plain Ipe.Http.Server handler (relay shape). |
@@ -1048,7 +1048,7 @@ through the `Ui.html : Html msg -> Element msg` node.
 
 ## Browser-WASM target (`--target wasm`)
 
-`ipe build --target wasm` compiles single-page `Web.tea` program to
+`ipe dev build --target wasm` compiles single-page `Web.tea` program to
 browser bundle: emitted project = `cdylib` crate (wasm-bindgen glue, no
 tokio/axum/sqlx) plus static `www/` shell (CSP `script-src 'self'
 'wasm-unsafe-eval'` — no JS eval). Bundle w/
@@ -1110,7 +1110,7 @@ package =
 ```
 
 When `wasm = On { mode = Solo }` (or `Hydrate`), the compiler infers the wasm
-target: `ipe build` is equivalent to `ipe build --target wasm` without an
+target: `ipe dev build` is equivalent to `ipe dev build --target wasm` without an
 explicit flag. Precedence (highest first): `--target wasm` CLI flag >
 `IPE_TARGET=wasm` env > the manifest's `wasm` mode > default native. An
 absent `wasm` field (or `wasm = Off`) keeps the native default.
@@ -1176,19 +1176,20 @@ Deliberate omissions, not gaps to close.
 ```bash
 ipe init [name]                    # new project
 # The dev inner loop lives under `ipe dev {build,run,watch}` (dev posture:
-# Debug.* on, unsigned, hot-reload). `build`/`run`/`watch` also work bare as
-# shortcuts for the same dev posture. `ipe release` is the distinct shipping
-# posture (optimised, Debug.* rejected, native code jailed) — there is no
-# `watch` under release, so hot-reloading a shipping build is not expressible.
-ipe dev build src/Main.ipe         # compile → out/app  (bare `ipe build` too)
+# Debug.* on, unsigned, hot-reload). `ipe release build|run|eject` is the
+# distinct shipping posture (optimised, Debug.* rejected, native code jailed)
+# — there is no `watch` under release, so hot-reloading a shipping build is
+# not expressible. A `build` / `run` with no group in front is refused: the
+# group names the posture.
+ipe dev build src/Main.ipe         # compile → out/app
 ipe dev build src/Main.ipe --target wasm   # browser-WASM project (cdylib + www/ shell)
-ipe dev run src/Main.ipe           # build + run        (bare `ipe run` too)
-ipe release src/Main.ipe           # PRODUCTION build; rejects any Debug.* use
+ipe dev run src/Main.ipe           # build + run
+ipe release build src/Main.ipe     # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
 ipe dev build|run … --static       # fully-static musl single binary (dlmalloc
                                    #  default; --target <triple> --allocator
                                    #  <auto|system|dlmalloc|talc|mimalloc>)
-ipe dev watch src/Main.ipe         # file-watch rebuild + restart (bare `ipe watch` too)
+ipe dev watch src/Main.ipe         # file-watch rebuild + restart
 ipe type-check src/Main.ipe        # type-check only — no build, no run, no emit
 ipe fmt src/Main.ipe               # opinionated formatter (run after editing .ipe/.ipei)
                                    # test runner: place tests/Main.ipe in the
@@ -1218,10 +1219,10 @@ directories it created (marked by an `.ipe-output` file) and refuses an `--out`
 that is the project, encloses it, sits inside `src/`, or already holds your files:
 
 ```bash
-cd my-app && ipe build            # → out/rust/, out/bin/my-app
+cd my-app && ipe dev build        # → out/rust/, out/bin/my-app
 ```
 
-`ipe type-check` runs the same pipeline as `ipe build` up through type-checking,
+`ipe type-check` runs the same pipeline as `ipe dev build` up through type-checking,
 then stops — it emits no Rust and runs no `cargo`, so it is the fastest way to
 ask "does this program type-check?". Run `ipe fmt` after editing
 `.ipe`/`.ipei` files (formatter idempotent).

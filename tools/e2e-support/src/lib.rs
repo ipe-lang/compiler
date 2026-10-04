@@ -318,7 +318,7 @@ fn resolve_emitted_target(shared: Option<&str>) -> Option<String> {
 /// The `CARGO_TARGET_DIR` a child `ipe`/`cargo` process should inherit so its
 /// emitted build links against the warm shared dependency target.
 ///
-/// A test spawning the `ipe` subprocess (`ipe run|build|watch`) forwards this on
+/// A test spawning the `ipe` subprocess (`ipe dev run|build|watch`) forwards this on
 /// the child's environment. The resolution order:
 ///   * `IPE_ORACLE_SHARED_TARGET`, when it is an absolute path — CI's e2e/seal
 ///     jobs export ONLY this variable, and production `ipe` never reads it, so

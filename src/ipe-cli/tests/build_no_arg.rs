@@ -1,4 +1,4 @@
-//! Tests for `ipe build` / `ipe run` / `ipe watch` with no positional entry.
+//! Tests for `ipe dev build` / `ipe dev run` / `ipe dev watch` with no positional entry.
 //!
 //! The CLI-parsing tests run unconditionally (no cargo, no network).
 //! The E2E test that exercises the full compile → cargo-build pipeline is
@@ -50,7 +50,7 @@ macro_rules! in_dir {
 // CLI-parsing: no-project directory → usage error (no package.ipe, no src/Main.ipe)
 // ---------------------------------------------------------------------------
 
-/// `ipe build` with no argument in an empty temp directory returns a usage
+/// `ipe dev build` with no argument in an empty temp directory returns a usage
 /// error, not a panic.
 #[test]
 fn build_no_arg_empty_dir_returns_usage_error() {
@@ -66,11 +66,11 @@ fn build_no_arg_empty_dir_returns_usage_error() {
             &result,
             Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev build"
         ),
-        "bare `ipe build` in an empty dir must yield a build command-usage error, got: {result:?}"
+        "bare `ipe dev build` in an empty dir must yield a build command-usage error, got: {result:?}"
     );
 }
 
-/// `ipe run` with no argument in an empty temp directory returns a usage
+/// `ipe dev run` with no argument in an empty temp directory returns a usage
 /// error, not a panic.
 #[test]
 fn run_no_arg_empty_dir_returns_usage_error() {
@@ -86,15 +86,15 @@ fn run_no_arg_empty_dir_returns_usage_error() {
             &result,
             Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
         ),
-        "bare `ipe run` in an empty dir must yield a run command-usage error, got: {result:?}"
+        "bare `ipe dev run` in an empty dir must yield a run command-usage error, got: {result:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// E2E: `ipe init <dir>` then `ipe build` with no positional entry
+// E2E: `ipe init <dir>` then `ipe dev build` with no positional entry
 // ---------------------------------------------------------------------------
 
-/// `ipe build` (no positional) inside a scaffolded project directory must
+/// `ipe dev build` (no positional) inside a scaffolded project directory must
 /// compile and emit a Rust project that `cargo build` accepts (THE SEAL).
 ///
 /// Gated on `IPE_E2E=1` — requires a working cargo and `IPE_RUNTIME_DIR`.
@@ -113,7 +113,7 @@ fn build_no_arg_in_project_dir_succeeds() {
     let init = ipe::run_cli(&["init".to_owned(), project.to_string_lossy().into_owned()]);
     assert!(init.is_ok(), "ipe init must succeed: {init:?}");
 
-    // Switch into the project directory and call `ipe build` with no entry.
+    // Switch into the project directory and call `ipe dev build` with no entry.
     let out_dir = project.join("out").join("rust");
     let build_result = in_dir!(
         &project,
@@ -122,7 +122,7 @@ fn build_no_arg_in_project_dir_succeeds() {
 
     assert!(
         build_result.is_ok(),
-        "`ipe build` (no positional) in project dir must succeed: {build_result:?}"
+        "`ipe dev build` (no positional) in project dir must succeed: {build_result:?}"
     );
 
     // THE SEAL: emitted Rust must compile with cargo.
@@ -141,7 +141,7 @@ fn build_no_arg_in_project_dir_succeeds() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `ipe build --out /tmp/o` (flag-first, no positional entry) in a scaffolded
+/// `ipe dev build --out /tmp/o` (flag-first, no positional entry) in a scaffolded
 /// project directory must still resolve the default entry and succeed.
 ///
 /// Gated on `IPE_E2E=1`.
@@ -172,7 +172,7 @@ fn build_flag_first_no_entry_resolves_default() {
 
     assert!(
         build_result.is_ok(),
-        "`ipe build --out <dir>` (no positional) must succeed: {build_result:?}"
+        "`ipe dev build --out <dir>` (no positional) must succeed: {build_result:?}"
     );
 
     // THE SEAL. `--out` names the output root; the emitted crate is its
