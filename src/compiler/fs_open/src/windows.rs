@@ -184,6 +184,13 @@ fn id_of(file: &File) -> Result<FileId, OpenRefusal> {
     })
 }
 
+/// How many directory entries name the object `file` holds.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    winapi_util::file::information(file)
+        .map(|info| info.number_of_links())
+        .map_err(|e| refusal_of(&e))
+}
+
 /// The identity of the object looking `path` up now reaches, following links.
 pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -271,6 +278,23 @@ impl Dir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(refusal_of(&e)),
         }
+    }
+
+    /// The target the reparse point `name` stores.
+    ///
+    /// Read through the held directory's proven real path, then the held
+    /// handle is re-proven, as for a listing. An entry that is not a reparse
+    /// point is classified by an attribute-only open of `name` first.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        match self.kind_of(name)? {
+            None => return Err(OpenRefusal::Absent),
+            Some(FileKind::Symlink) => {}
+            Some(kind) => return Err(OpenRefusal::NotRegular(kind)),
+        }
+        let target =
+            std::fs::read_link(self.real.join(name.as_os_str())).map_err(|e| refusal_of(&e))?;
+        self.reprove()?;
+        Ok(target)
     }
 
     /// The names of this directory's entries with the hint their find data carries; never opens an entry.

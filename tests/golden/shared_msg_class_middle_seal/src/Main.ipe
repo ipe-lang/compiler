@@ -1,0 +1,22 @@
+module Main exposing (main)
+
+-- `Lib.nav` <- `Lib.wrap` <- `Mid.mid` <- `Main.view`: the concrete `Msg`
+-- reaches `Lib`'s shared message slot only through `Mid`. ipe MUST exit 0 AND
+-- the emitted project MUST cargo-build (THE SEAL).
+
+import Ipe.Html as Html exposing (Html)
+import Ipe.Io as Io
+import Mid exposing (mid)
+
+
+type Msg
+    = Click
+
+
+view : Html Msg
+view =
+    Html.div [] [ mid ]
+
+
+main =
+    Io.println (Html.render view)

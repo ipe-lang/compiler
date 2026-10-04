@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "g_issues/golden_cross_module_chained_msg_slot_seal.rs"]
+mod golden_cross_module_chained_msg_slot_seal;
 #[path = "g_issues/golden_embed_fn_param_capture_seal.rs"]
 mod golden_embed_fn_param_capture_seal;
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
@@ -124,6 +126,8 @@ mod golden_l0135_consume_then_borrow_seal;
 mod golden_l0135_effect_field_move_seal;
 #[path = "g_issues/golden_l0135_union_task_reuse_seal.rs"]
 mod golden_l0135_union_task_reuse_seal;
+#[path = "g_issues/golden_shared_msg_class_seal.rs"]
+mod golden_shared_msg_class_seal;
 #[path = "g_issues/golden_stream_handler_capture_seal.rs"]
 mod golden_stream_handler_capture_seal;
 #[path = "g_issues/golden_swapped_container_capture_seal.rs"]

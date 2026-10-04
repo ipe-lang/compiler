@@ -398,6 +398,41 @@ fn env_block_from_pairs(pairs: &[(OsString, OsString)]) -> Vec<u16> {
     block
 }
 
+/// The access mask the container SID is granted on the scratch and a granted
+/// working tree: `FILE_GENERIC_READ | FILE_GENERIC_WRITE`.
+///
+/// It carries neither `DELETE` nor `FILE_DELETE_CHILD`, so the child cannot
+/// unlink or rename an entry the grant did not give it; it can still create and
+/// write entries, which is why a tree holding version-control metadata is
+/// refused ([`windows_working_tree_plan`]).
+#[cfg(any(windows, test))]
+pub const WORKING_TREE_GRANT_MASK: u32 = 0x0012_019F;
+
+/// The path the Windows jail grants read-write for `tree`, which it grants only
+/// when the tree holds no version-control metadata.
+///
+/// The grant is an inheritable allow ACE over the whole tree, and a carve needs
+/// a deny ACE written over each carved path; until the arm writes one, a tree
+/// holding metadata is refused.
+///
+/// # Errors
+/// [`crate::JailPathError::VcsMetadataUncarvable`] naming the first carved path
+/// when the carve is not empty.
+#[cfg(any(windows, test))]
+pub fn windows_working_tree_plan(
+    tree: &crate::WritableTree,
+) -> Result<&crate::CanonicalPath, crate::JailPathError> {
+    tree.carve().paths().next().map_or_else(
+        || Ok(tree.tree()),
+        |first| {
+            Err(crate::JailPathError::VcsMetadataUncarvable {
+                arm: crate::JailArm::Windows,
+                path: first.as_path().to_path_buf(),
+            })
+        },
+    )
+}
+
 /// The Windows run-jail launcher: assembles the Job Object + AppContainer token +
 /// scrubbed environment and launches the app confined, fail-closed at every step.
 ///
@@ -466,7 +501,12 @@ mod windows_jail {
     };
 
     /// Access rights ACLed onto a granted path for the container SID (read+write).
-    const FILE_RW: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    const FILE_RW: u32 = super::WORKING_TREE_GRANT_MASK;
+
+    /// Keep the pure [`super::WORKING_TREE_GRANT_MASK`] (whose missing delete
+    /// rights a host-independent test pins) equal to the Win32 read+write rights.
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); it fails the build if the cross-platform mask drifts from the Win32 constants [ledger #boundary]
+    const _: () = assert!(FILE_RW == FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
     /// Inheritance of the read+write grants: every file and subdirectory below a
     /// granted root, present and future, carries the grant.
@@ -572,6 +612,16 @@ mod windows_jail {
         app: &Path,
         app_args: &[OsString],
     ) -> Result<u32, RunJailDefect> {
+        // 0. A writable working tree holding version-control metadata is refused
+        //    before any container exists: the grant cannot keep it read-only.
+        if profile.filesystem == FilesystemScope::WorkingTreeReadWrite {
+            let tree = crate::CanonicalPath::resolve(working_tree).map_err(RunJailDefect::Path)?;
+            let tmp = crate::CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
+            let writable =
+                crate::WritableTree::parse(tree, &[&tmp]).map_err(RunJailDefect::Path)?;
+            super::windows_working_tree_plan(&writable).map_err(RunJailDefect::Path)?;
+        }
+
         // 1. Derive a per-run AppContainer SID from a unique per-run name. The
         //    profile is created (idempotently) so the SID is registerable, then
         //    deleted after the SID is derived — the SID outlives the profile.
@@ -2011,5 +2061,46 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), total, "two base names collide: {keys:?}");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // test fixtures: the scratch dirs must exist
+    fn windows_refuses_a_tree_with_vcs_metadata() {
+        let base_dir = crate::test_dir::TestDir::new("windows-vcs").expect("test dir");
+        let base = base_dir.path();
+        let tree = base.join("tree");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(tree.join(".hg")).expect("hg dir");
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let resolve = |path: &Path| crate::CanonicalPath::resolve(path).expect("canonical");
+        let scratch = resolve(&tmp);
+        let writable =
+            crate::WritableTree::parse(resolve(&tree), &[&scratch]).expect("the tree parses");
+        let planned = windows_working_tree_plan(&writable);
+        assert!(
+            matches!(
+                &planned,
+                Err(crate::JailPathError::VcsMetadataUncarvable {
+                    arm: crate::JailArm::Windows,
+                    path,
+                }) if *path == tree.join(".hg")
+            ),
+            "{planned:?}"
+        );
+        std::fs::remove_dir(tree.join(".hg")).expect("remove hg dir");
+        let plain =
+            crate::WritableTree::parse(resolve(&tree), &[&scratch]).expect("the tree parses");
+        assert!(
+            matches!(windows_working_tree_plan(&plain), Ok(path) if *path == resolve(&tree)),
+            "a tree without metadata is granted"
+        );
+    }
+
+    #[test]
+    fn the_working_tree_grant_never_carries_delete_child() {
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+        assert_eq!(WORKING_TREE_GRANT_MASK & DELETE, 0);
+        assert_eq!(WORKING_TREE_GRANT_MASK & FILE_DELETE_CHILD, 0);
     }
 }
