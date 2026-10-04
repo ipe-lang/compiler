@@ -187,7 +187,6 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
-| `IPE_ALLOW_UNSANDBOXED` | unset (false) | When `bwrap` confinement is unavailable, set to `1` to allow `ipe dev run` to proceed unconfined instead of refusing. Widens the trust boundary. Never set in CI or production. | `SecurityTunable` |
 | `IPE_HOME` | unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe) | Root directory for materialised runtime source, config, and cached binaries. Overrides the XDG / home-directory fallback. Must be an absolute path. | `Tunable` |
 | `IPE_RUNTIME_DIR` | unset (embedded / in-repo) | Explicit path to the runtime crate source directory. Overrides the embedded fallback. Used in tests and in-repo development. | `Tunable` |
 | `IPE_RUNTIME_VENDORED` | unset (false) | Set to `1` to declare that the runtime is vendored (already present on disk) and skip materialization. Used during packaging. | `Tunable` |
