@@ -1,5 +1,6 @@
 use super::{
     Arm, DResult, Diagnostic, Expr, GenericScope, Match, ModPath, Pat, Symbol, emit_expr_at,
+    int_pattern,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
@@ -612,12 +613,13 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
     match pat {
         Pat::Var(sym) => ctx.emit_ident(*sym),
         Pat::Wildcard => Ok("_".to_owned()),
-        // Literal leaves render as Rust literals. Int reuses the same spelling as
-        // the `Expr::Int` emitter; Bool maps to the Rust keyword constant; Char
-        // and Str escape via the `{:?}` Debug form, which produces a valid Rust
-        // literal (quotes, backslashes and control chars escaped) and is
-        // deterministic.
-        Pat::Int(n) => Ok(n.to_string()),
+        // Literal leaves render as Rust literals. Int renders through
+        // `int_pattern` (unsuffixed, unparenthesised: a pattern is never a
+        // receiver, and the type comes from the `i64` scrutinee); Bool maps to
+        // the Rust keyword constant; Char and Str escape via the `{:?}` Debug
+        // form, which produces a valid Rust literal (quotes, backslashes and
+        // control chars escaped) and is deterministic.
+        Pat::Int(n) => Ok(int_pattern(*n)),
         Pat::Bool(b) => Ok(if *b { "true" } else { "false" }.to_owned()),
         // A well-formed Char pattern carries exactly one character → Rust char
         // literal. A non-single-scalar value fails closed as a `CompilerBug`:

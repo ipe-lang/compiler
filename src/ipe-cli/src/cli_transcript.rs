@@ -138,11 +138,13 @@ pub const UNCLASSIFIED_SENTINEL: &str = "UNCLASSIFIED";
 
 /// One absolute path prefix to redact to `<TMP>`.
 ///
-/// The OS temp root stays behind its redaction-only wrapper: this list never
-/// holds it as text a caller could turn back into a path.
+/// The OS temp root and the home value stay behind their redaction-only
+/// wrappers: this list never holds either as text a caller could turn back
+/// into a path.
 enum VolatilePrefix {
     Text(String),
     TempRoot(ipe_sandbox::scratch::TempRootRedactor),
+    Home(ipe_sandbox::home::HomeRedactor),
 }
 
 impl VolatilePrefix {
@@ -150,6 +152,7 @@ impl VolatilePrefix {
         match self {
             Self::Text(text) => text.len(),
             Self::TempRoot(root) => root.byte_len(),
+            Self::Home(home) => home.byte_len(),
         }
     }
 
@@ -158,6 +161,7 @@ impl VolatilePrefix {
             Self::Text(text) if text.is_empty() => input.to_owned(),
             Self::Text(text) => input.replace(text.as_str(), "<TMP>"),
             Self::TempRoot(root) => root.redact(input, "<TMP>"),
+            Self::Home(home) => home.redact(input, "<TMP>"),
         }
     }
 }
@@ -178,8 +182,10 @@ fn volatile_path_prefixes(repo_root: &Path) -> Vec<VolatilePrefix> {
     if let Some(temp_root) = ipe_sandbox::scratch::TempRootRedactor::current() {
         prefixes.push(VolatilePrefix::TempRoot(temp_root));
     }
-    if let Some(home) = crate::env_dir::home() {
-        prefixes.push(VolatilePrefix::Text(home.to_string_lossy().into_owned()));
+    // A refused home is redacted too: the transcript carries the raw value
+    // whether or not the parser trusts it as a directory.
+    if let Some(home) = ipe_sandbox::home::HomeRedactor::current() {
+        prefixes.push(VolatilePrefix::Home(home));
     }
     prefixes.sort_by_key(|p| std::cmp::Reverse(p.byte_len()));
     prefixes

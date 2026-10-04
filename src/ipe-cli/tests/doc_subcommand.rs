@@ -400,7 +400,7 @@ fn every_listed_module_is_queryable() -> io::Result<()> {
         .min(names.len().max(1));
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
+            std::thread::Builder::new().spawn_scoped(scope, || {
                 loop {
                     let i = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some(name) = names.get(i) else { break };
@@ -414,7 +414,7 @@ fn every_listed_module_is_queryable() -> io::Result<()> {
                             ));
                     }
                 }
-            });
+            }).expect("spawn test thread");
         }
     });
     let failures = failures

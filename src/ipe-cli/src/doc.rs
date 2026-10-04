@@ -7260,12 +7260,14 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let mut site: BTreeMap<String, String> = BTreeMap::new();
-            site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-            let (mut conn, _) = listener.accept().expect("accept");
-            serve_one(&mut conn, &site);
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let mut site: BTreeMap<String, String> = BTreeMap::new();
+                site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
+                let (mut conn, _) = listener.accept().expect("accept");
+                serve_one(&mut conn, &site);
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         client
@@ -7292,13 +7294,15 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let site: BTreeMap<String, String> = BTreeMap::new();
-            let (mut conn, _) = listener.accept().expect("accept");
-            let started = Instant::now();
-            serve_one(&mut conn, &site);
-            started.elapsed()
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let site: BTreeMap<String, String> = BTreeMap::new();
+                let (mut conn, _) = listener.accept().expect("accept");
+                let started = Instant::now();
+                serve_one(&mut conn, &site);
+                started.elapsed()
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         // Send well past the request-line cap with no newline. Ignore write
@@ -7333,12 +7337,14 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let mut site: BTreeMap<String, String> = BTreeMap::new();
-            site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-            let (mut conn, _) = listener.accept().expect("accept");
-            serve_one(&mut conn, &site);
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let mut site: BTreeMap<String, String> = BTreeMap::new();
+                site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
+                let (mut conn, _) = listener.accept().expect("accept");
+                serve_one(&mut conn, &site);
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         // Exactly the cap in bytes, no newline: the server's capped read consumes

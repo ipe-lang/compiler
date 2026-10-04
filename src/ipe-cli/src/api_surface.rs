@@ -520,42 +520,51 @@ fn extract_from_db(
         if !user_modules.contains(path) {
             continue;
         }
-        match ipe_db::typed_interface(db, source_root, *file) {
-            Some(interface) => {
-                // Scope the interner lock to the projection only — it must not
-                // outlive this arm, and the mutex is not reentrant.
-                let module_api = {
-                    let interner = db.interner().lock();
-                    project_interface(interface, &interner, path)?
-                };
-                modules.insert(path.clone(), module_api);
-            }
-            None => {
-                // `None` is either an open interface or a red program. Demand the
-                // scoped types to tell them apart: a red module yields a typed
-                // diagnostic (fail closed on a package that does not typecheck);
-                // a green-but-open module reports the open-interface refusal.
-                match ipe_db::typecheck_module(db, source_root, *file, *file) {
-                    Ok(_) => {
-                        return Err(DiffError::OpenInterface {
-                            module: path.clone(),
-                        });
-                    }
-                    Err((diag, _home)) => {
-                        return Err(DiffError::Typecheck {
-                            module: path.clone(),
-                            diag: Box::new(diag.clone()),
-                        });
-                    }
-                }
-            }
-        }
+        let Some(interface) = ipe_db::typed_interface(db, source_root, *file) else {
+            return Err(closed_interface_refusal(db, source_root, *file, path));
+        };
+        // Scope the interner lock to the projection only — it must not outlive
+        // this statement, and the mutex is not reentrant.
+        let module_api = {
+            let interner = db.interner().lock();
+            project_interface(interface, &interner, path)?
+        };
+        modules.insert(path.clone(), module_api);
     }
 
     if modules.is_empty() {
         return Err(DiffError::OpenInterface { module: Vec::new() });
     }
     Ok(PublicApi { modules })
+}
+
+/// Why a module has no typed interface: a red program or an open one.
+///
+/// `linked_program` is demanded first so a parse or resolve error anywhere in
+/// the program refuses the package even when this module's own scoped solve
+/// stands. A red module yields its typed diagnostic (fail closed on a package that does
+/// not typecheck); a green-but-open module reports the open-interface refusal.
+fn closed_interface_refusal(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+    path: &[String],
+) -> DiffError {
+    if let Err(diag) = ipe_db::linked_program(db, source_root, file) {
+        return DiffError::Typecheck {
+            module: path.to_vec(),
+            diag: Box::new(diag.clone()),
+        };
+    }
+    match ipe_db::typecheck_module(db, source_root, file, file) {
+        Ok(_) => DiffError::OpenInterface {
+            module: path.to_vec(),
+        },
+        Err(err) => DiffError::Typecheck {
+            module: path.to_vec(),
+            diag: Box::new(err.diagnostic().clone()),
+        },
+    }
 }
 
 #[cfg(test)]

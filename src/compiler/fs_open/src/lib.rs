@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 mod name;
 pub mod win32_name;
 
-pub use name::EntryName;
+pub use name::{EntryName, is_one_spelled_name};
 
 #[cfg(unix)]
 mod unix;

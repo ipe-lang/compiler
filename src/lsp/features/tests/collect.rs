@@ -95,6 +95,32 @@ fn type_error_is_attributed_to_the_entry_module() {
     assert!(lsp.message.contains("type mismatch"), "{}", lsp.message);
 }
 
+/// A dependency whose field access disagrees with its annotation: the failing
+/// `rec.present` sits at a byte offset `Main`'s longer body also covers.
+const DEP_FIELD_MISMATCH: &str = "module Dep exposing (bad)\n\nbad : Int\nbad =\n    let\n        pad0 = 0\n        pad1 = 0\n        pad2 = 0\n        pad3 = 0\n        pad4 = 0\n        pad5 = 0\n        rec = { present = \"a\" }\n    in\n    rec.present\n";
+const ENTRY_OVER_DEP: &str = "module Main exposing (main)\n\nimport Dep exposing (bad)\n\nmain : Int\nmain =\n    bad + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0\n";
+
+/// A field-type mismatch is attributed to the module owning the access, never
+/// to the module whose def happens to enclose the same byte offsets.
+#[test]
+fn field_mismatch_attributes_to_owning_module() {
+    let db = IpeDatabase::new();
+    let dep = file(&db, &["Dep"], DEP_FIELD_MISMATCH);
+    let entry = file(&db, &["Main"], ENTRY_OVER_DEP);
+    let root = root_of(&db, &[(&["Dep"], dep), (&["Main"], entry)]);
+
+    let all = collect(&db, root, entry);
+    let dep_diags = &diags_for(&all, &["Dep"]).diagnostics;
+    assert!(
+        dep_diags.iter().any(|d| d.code().as_str() == "IPE-T0001"),
+        "the T0001 must be attributed to Dep, got {all:?}"
+    );
+    assert!(
+        diags_for(&all, &["Main"]).diagnostics.is_empty(),
+        "Main must not carry Dep's mismatch, got {all:?}"
+    );
+}
+
 #[test]
 fn dep_parse_error_is_blamed_on_the_dep_not_the_importer() {
     let db = IpeDatabase::new();

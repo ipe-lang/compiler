@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::home::RelativeToolHome;
+use crate::home::{HomeDir, HomeRefusal, RelativeToolHome, ToolHome};
 use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WritableTree};
 
 /// Directories masked in every jail, whoever the invoker is.
@@ -36,8 +36,9 @@ pub enum JailPathError {
         /// Why resolution failed.
         kind: std::io::ErrorKind,
     },
-    /// The invoker's home is unset or relative, so it cannot be masked.
-    UserHomeUnresolved,
+    /// The invoker's home is not a [`HomeDir`], so which directory to mask is
+    /// unknown; the refusal says why.
+    UserHomeUnresolved(HomeRefusal),
     /// A tool-home variable is set to a relative path.
     ToolHomeRelative(RelativeToolHome),
     /// A path resolved earlier no longer resolves to itself: a component was
@@ -96,9 +97,9 @@ impl fmt::Display for JailPathError {
                 "the jail path {} does not resolve ({kind}); refusing to build the jail",
                 path.display()
             ),
-            Self::UserHomeUnresolved => f.write_str(
-                "the invoker's home is unset or not absolute, so it cannot be masked; \
-                 refusing to build the jail",
+            Self::UserHomeUnresolved(refusal) => write!(
+                f,
+                "the invoker's home cannot be masked: {refusal}; refusing to build the jail"
             ),
             Self::ToolHomeRelative(relative) => {
                 write!(f, "{relative}; refusing to build the jail")
@@ -264,27 +265,21 @@ impl HomeMasks {
     /// A home that resolves to no directory gets no mask: nothing is there to
     /// hide.
     ///
+    /// Both homes arrive proven absolute ([`HomeDir`], [`ToolHome`]), so no
+    /// judgement on their spelling is made here.
+    ///
     /// # Errors
-    /// - [`JailPathError::UserHomeUnresolved`] when `user_home` is absent or
-    ///   relative: which directory to hide is unknown.
-    /// - [`JailPathError::ToolHomeRelative`] when `cargo_home` is relative.
+    /// [`JailPathError::UserHomeUnresolved`] carrying the refusal when
+    /// `user_home` is not a [`HomeDir`]: which directory to hide is unknown.
     pub fn resolve(
-        user_home: Option<&Path>,
-        cargo_home: Option<&Path>,
+        user_home: Result<&HomeDir, HomeRefusal>,
+        cargo_home: Option<&ToolHome>,
     ) -> Result<Self, JailPathError> {
-        let user_home = user_home
-            .filter(|home| home.is_absolute())
-            .ok_or(JailPathError::UserHomeUnresolved)?;
-        let cargo_home = match cargo_home {
-            Some(dir) if !dir.is_absolute() => {
-                return Err(JailPathError::ToolHomeRelative(RelativeToolHome {
-                    var: "CARGO_HOME",
-                }));
-            }
-            Some(dir) => MaskedDir::resolve(dir),
-            None => None,
-        };
-        Ok(Self::new(MaskedDir::resolve(user_home), cargo_home))
+        let user_home = user_home.map_err(JailPathError::UserHomeUnresolved)?;
+        Ok(Self::new(
+            MaskedDir::resolve(user_home.as_path()),
+            cargo_home.and_then(|dir| MaskedDir::resolve(dir.as_path())),
+        ))
     }
 
     /// The homes of the invoking process: `HOME` and the cargo home
@@ -294,9 +289,13 @@ impl HomeMasks {
     /// As [`Self::resolve`]; [`JailPathError::ToolHomeRelative`] also when
     /// `CARGO_HOME` is set to a relative path.
     pub fn of_invoker() -> Result<Self, JailPathError> {
-        let cargo_home = crate::home::tool_home("CARGO_HOME", ".cargo")
+        let home = crate::home::home_dir();
+        let cargo_home = crate::home::tool_home("CARGO_HOME", home.as_ref().ok(), ".cargo")
             .map_err(JailPathError::ToolHomeRelative)?;
-        Self::resolve(crate::home::home_dir().as_deref(), cargo_home.as_deref())
+        Self::resolve(
+            home.as_ref().map_err(|refusal| *refusal),
+            cargo_home.as_ref(),
+        )
     }
 
     /// Test-only: no home masks, for pure argv tests.
@@ -709,32 +708,50 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_or_relative_user_home_refuses_the_jail() {
-        for home in [None, Some(Path::new("home/u")), Some(Path::new(""))] {
+    fn an_unset_user_home_refuses_the_jail() {
+        for refusal in [
+            HomeRefusal::Unset,
+            HomeRefusal::NotUtf8,
+            HomeRefusal::ContainsNul,
+            HomeRefusal::NotAbsolute,
+            HomeRefusal::ParentComponent,
+            HomeRefusal::WindowsDeviceOrVerbatim,
+            HomeRefusal::WindowsUnc,
+        ] {
+            let refused = HomeMasks::resolve(Err(refusal), None);
             assert_eq!(
-                HomeMasks::resolve(home, None),
-                Err(JailPathError::UserHomeUnresolved),
-                "{home:?}"
+                refused,
+                Err(JailPathError::UserHomeUnresolved(refusal)),
+                "{refusal:?}"
             );
+            let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(message.contains(&refusal.to_string()), "{message:?}");
         }
     }
 
     #[test]
-    fn a_relative_cargo_home_refuses_the_jail() {
-        let user_home_dir = temp_dir("relative-cargo");
-        let user_home = user_home_dir.path();
+    fn a_parsed_cargo_home_is_masked() {
+        let user_home_dir = temp_dir("parsed-user");
+        let cargo_home_dir = temp_dir("parsed-cargo");
+        let user = crate::home::test_home(user_home_dir.path());
+        let cargo = crate::home::test_tool_home(cargo_home_dir.path());
+        let homes = HomeMasks::resolve(Ok(&user), Some(&cargo)).expect("parsed homes");
         assert_eq!(
-            HomeMasks::resolve(Some(user_home), Some(Path::new("cargo"))),
-            Err(JailPathError::ToolHomeRelative(RelativeToolHome {
-                var: "CARGO_HOME"
-            }))
+            homes,
+            HomeMasks::new(
+                MaskedDir::resolve(user_home_dir.path()),
+                MaskedDir::resolve(cargo_home_dir.path()),
+            )
         );
+        assert_eq!(homes.dirs().count(), 2);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn an_absolute_user_home_that_does_not_exist_gets_no_mask() {
+        let missing = crate::home::test_home(Path::new("/nonexistent/ipe-sandbox-home"));
         assert_eq!(
-            HomeMasks::resolve(Some(Path::new("/nonexistent/ipe-sandbox-home")), None),
+            HomeMasks::resolve(Ok(&missing), None),
             Ok(HomeMasks::unmasked())
         );
     }

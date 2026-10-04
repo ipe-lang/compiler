@@ -3041,6 +3041,7 @@ dependencies = [
  "ipe_watch",
  "notify",
  "panic-scan",
+ "proc-macro2",
  "rustix 0.38.44",
  "rustls-pki-types",
  "salsa",
@@ -3050,6 +3051,7 @@ dependencies = [
  "signal-hook",
  "sigstore",
  "sigstore_protobuf_specs",
+ "syn 3.0.6",
  "toml",
  "toml_edit 0.25.15+spec-1.1.0",
  "ureq",
@@ -5511,6 +5513,7 @@ name = "regen-cli-transcripts"
 version = "0.4.0"
 dependencies = [
  "ipe",
+ "ipe_docs",
  "serde_json",
 ]
 
@@ -5520,6 +5523,7 @@ version = "0.4.0"
 dependencies = [
  "e2e-support",
  "ipe",
+ "ipe_docs",
 ]
 
 [[package]]

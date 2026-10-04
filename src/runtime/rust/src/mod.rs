@@ -193,6 +193,10 @@ pub mod system;
 // runtime guard (`TuiGuard::enter*`) and by `ipe-cli`'s pre-build gate over
 // `Shape::Tui`. Neither depends on the `tui` feature's crossterm/tokio stack.
 pub mod terminal_access;
+// `threads` is always compiled (std-only; its tokio offload is gated inside): it
+// is the one start point for OS threads and blocking-pool work, refusing with a
+// typed error where the std and tokio starts panic.
+pub mod threads;
 // wasm32: the pure future-combinator half of `Task.*` (`map`/`andThen`/
 // `mapError`/`succeed`/`fail`/`fromResult`/`andThenResult`/`onError`/`lazy`/
 // `sequence`) compiles + runs unchanged — no tokio dependency. The
@@ -558,6 +562,12 @@ pub use ws_client::*;
 // so it must exist in a headless server that never vendors `html`. Reached by
 // qualified path (`crate::escape::…`); not glob-re-exported.
 pub mod escape;
+
+// `Redacted<T>`: the field carrier whose `Debug` never prints the value, worn by
+// every secret-role field of a runtime type (server, principal, js_port). Std-only
+// and declared in every module set (the emitted floor and the wasm set too).
+// Reached by qualified path (`crate::redact::…`); not glob-re-exported.
+pub mod redact;
 
 // Ipe.Html / Ipe.Ui render surface — the Html/Attribute/Event ADTs + renderer +
 // htmlXxx kernel wrappers. Pure (std only), so always available; a non-Web

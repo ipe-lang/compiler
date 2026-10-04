@@ -32,7 +32,7 @@ Modes:
   --lint     fail unless nightly-green.yml runs `--verdict` unconditionally,
              the manifest declares `nightly-green` a gate, and `PRODUCERS`
              equals what the manifest and each producer's triggers derive.
-             manifest-guard runs it.
+             artifact-guard runs it.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ class Producer:
         return f"{WORKFLOWS_DIR}/{self.workflow}"
 
 
-# Asserted equal to the manifest + trigger derivation by `--lint` (manifest-guard);
+# Asserted equal to the manifest + trigger derivation by `--lint` (artifact-guard);
 # held here because the verdict runs from a sparse checkout of this file alone.
 PRODUCERS: tuple[Producer, ...] = (
     Producer(

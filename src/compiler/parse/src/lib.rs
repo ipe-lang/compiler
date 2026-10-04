@@ -1093,7 +1093,8 @@ mod tests {
 
     #[test]
     fn float_literals_lex_to_float_tokens() {
-        use lexer::{Tok, lex};
+        use lexer::{IntMagnitude, Tok, lex};
+        let int = |digits: &str| Tok::Int(IntMagnitude::from_digits(digits).unwrap());
         let kinds = |src: &str| -> Vec<Tok> {
             lex(src).map_or_else(
                 |_| Vec::new(),
@@ -1107,9 +1108,9 @@ mod tests {
         assert_eq!(kinds("2e-2"), vec![Tok::Float(0.02)]);
         assert_eq!(kinds("6E2"), vec![Tok::Float(600.0)]);
         // An integer with no fraction / exponent stays an `Int`.
-        assert_eq!(kinds("42"), vec![Tok::Int(42)]);
+        assert_eq!(kinds("42"), vec![int("42")]);
         // `1..5` is a range, not a float: the `..` is not consumed as a point.
-        assert_eq!(kinds("1..5"), vec![Tok::Int(1), Tok::DotDot, Tok::Int(5)]);
+        assert_eq!(kinds("1..5"), vec![int("1"), Tok::DotDot, int("5")]);
     }
 
     #[test]
@@ -3470,23 +3471,146 @@ mod tests {
         );
     }
 
+    /// The span and code of the diagnostic `src` produces, or `None` when it
+    /// (unexpectedly) parses.
+    fn parse_refusal(src: &str) -> Option<(String, Span)> {
+        let mut i = Interner::new();
+        parse_module(src, &mut i)
+            .err()
+            .map(|d| (d.code().as_str().to_owned(), d.primary_span()))
+    }
+
+    /// An expression-position body and a `case`-pattern-position body that
+    /// both carry `lit`, so each refusal is pinned in both grammars.
+    fn in_both_positions(lit: &str) -> [String; 2] {
+        [
+            format!("{HDR}v =\n    {lit}\n"),
+            format!("{HDR}v : Int\nv =\n    case n of\n        {lit} -> 1\n        _ -> 0\n"),
+        ]
+    }
+
+    /// `9223372036854775808` (`2^63`) without a unary minus is no `i64`: it is
+    /// refused in both positions, at the digits' span.
     #[test]
-    fn neg_int_min_magnitude_is_lex_error() {
-        // `9223372036854775808` (i64::MIN's absolute value) overflows `i64` at
-        // lex time (IPE-P0013), so the parser's `checked_neg` path is never
-        // reached — in both expression and pattern position.
+    fn int_literal_two_pow_63_unnegated_refused() {
+        let lit = "9223372036854775808";
+        for src in in_both_positions(lit) {
+            let refusal = parse_refusal(&src);
+            assert_eq!(
+                refusal.as_ref().map(|(code, _)| code.as_str()),
+                Some("IPE-P0013"),
+                "unnegated 2^63 must be IPE-P0013:\n{src}"
+            );
+            let lo = u32::try_from(src.find(lit).unwrap()).unwrap();
+            let hi = lo + u32::try_from(lit.len()).unwrap();
+            assert_eq!(
+                refusal.map(|(_, span)| span),
+                Some(Span::new(lo, hi)),
+                "the refusal points at the digits only:\n{src}"
+            );
+        }
+    }
+
+    /// One past `i64::MIN` is refused in both positions.
+    #[test]
+    fn int_literal_below_min_refused() {
+        for src in in_both_positions("-9223372036854775809") {
+            assert_eq!(err_code(&src), "IPE-P0013", "below i64::MIN:\n{src}");
+        }
+    }
+
+    /// A magnitude past `u64` is the same typed refusal, never a compiler bug.
+    #[test]
+    fn int_literal_past_u64_refused() {
+        for lit in ["-18446744073709551616", "99999999999999999999999"] {
+            for src in in_both_positions(lit) {
+                assert_eq!(err_code(&src), "IPE-P0013", "past u64:\n{src}");
+            }
+        }
+    }
+
+    /// A binary minus leaves the literal unnegated, spaced or not, so `2^63`
+    /// after it is refused: the sign comes from unary position, never from a
+    /// preceding `-` token.
+    #[test]
+    fn int_literal_binary_minus_magnitude_refused() {
+        for body in ["a - 9223372036854775808", "a -9223372036854775808"] {
+            let src = format!("{HDR}v a =\n    {body}\n");
+            assert_eq!(err_code(&src), "IPE-P0013", "binary minus `{body}`");
+        }
+        // The same operands one step inside the range are accepted, so the
+        // refusal above is the range check and not some other parse error.
+        for body in ["a - 9223372036854775807", "a -9223372036854775807"] {
+            let src = format!("{HDR}v a =\n    {body}\n");
+            assert_eq!(err_code(&src), "OK", "binary minus `{body}` in range");
+        }
+    }
+
+    /// A minus that is not folded into the literal (a parenthesised operand,
+    /// or a space before the digits) never admits `2^63`.
+    #[test]
+    fn int_literal_paren_negate_refused() {
         assert_eq!(
-            err_code(&format!("{HDR}v =\n    -9223372036854775808\n")),
+            err_code(&format!("{HDR}v =\n    -(9223372036854775808)\n")),
             "IPE-P0013",
-            "magnitude overflowing i64 must lex as IPE-P0013 in expression"
+            "`-(2^63)` negates an out-of-range Int"
         );
-        assert_eq!(
-            err_code(&format!(
-                "{HDR}v : Int\nv =\n    case n of\n        -9223372036854775808 -> 1\n        _ -> 0\n"
-            )),
-            "IPE-P0013",
-            "magnitude overflowing i64 must lex as IPE-P0013 in pattern"
+        assert_ne!(
+            err_code(&format!("{HDR}v =\n    - 9223372036854775808\n")),
+            "OK",
+            "`- 2^63` (spaced) must be refused"
         );
+    }
+
+    /// Every `i64` is spellable: `i64::MIN` under an adjacent minus in both
+    /// positions, `-0` as zero, and `i64::MAX` unsigned.
+    #[test]
+    fn int_literal_min_accepted() {
+        let body = |src: &str| -> Option<Expr_> {
+            let mut i = Interner::new();
+            let m = parse_module(src, &mut i).ok()?;
+            find_value(&m, &i, "v").map(|v| v.body.value.clone())
+        };
+        let [expr_src, pat_src] = in_both_positions("-9223372036854775808");
+        assert!(
+            matches!(body(&expr_src), Some(Expr_::Int(i64::MIN))),
+            "`-9223372036854775808` is Int(i64::MIN)"
+        );
+        let pat = body(&pat_src);
+        assert!(
+            matches!(&pat, Some(Expr_::Case(_, arms))
+                if arms.first().is_some_and(|(p, _)| matches!(p.value, Pattern_::PInt(i64::MIN)))),
+            "`-9223372036854775808` pattern is PInt(i64::MIN): {pat:?}"
+        );
+        assert!(
+            matches!(body(&format!("{HDR}v =\n    -0\n")), Some(Expr_::Int(0))),
+            "`-0` is Int(0)"
+        );
+        assert!(
+            matches!(
+                body(&format!("{HDR}v =\n    9223372036854775807\n")),
+                Some(Expr_::Int(i64::MAX))
+            ),
+            "`9223372036854775807` is Int(i64::MAX)"
+        );
+    }
+
+    /// `IntMagnitude` admits exactly `0 ..= 2^63`, and only `2^63` lacks an
+    /// unsigned reading.
+    #[test]
+    fn int_magnitude_bounds() {
+        use lexer::IntMagnitude;
+        let two_pow_63 = IntMagnitude::from_digits("9223372036854775808");
+        assert_eq!(two_pow_63.map(IntMagnitude::positive), Some(None));
+        assert_eq!(two_pow_63.map(IntMagnitude::negated), Some(i64::MIN));
+        assert_eq!(IntMagnitude::from_digits("9223372036854775809"), None);
+        assert_eq!(IntMagnitude::from_digits("18446744073709551616"), None);
+        let zero = IntMagnitude::from_digits("0");
+        assert_eq!(zero.map(IntMagnitude::negated), Some(0));
+        assert_eq!(zero.map(IntMagnitude::positive), Some(Some(0)));
+        let max = IntMagnitude::from_digits("9223372036854775807");
+        assert_eq!(max.map(IntMagnitude::positive), Some(Some(i64::MAX)));
+        assert_eq!(max.map(IntMagnitude::negated), Some(i64::MIN + 1));
     }
 
     // ---- doc-string tests --------------------------------------------------

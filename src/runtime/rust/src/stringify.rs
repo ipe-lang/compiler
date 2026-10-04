@@ -542,4 +542,52 @@ mod tests {
         // String field unquoted; Debug-only field via fallback — never E0599.
         assert_eq!(g.ipe_show(), "{alice OnlyDebug { x: 7 }}");
     }
+
+    // (d) A generated-style record holding secret-bearing runtime values: the
+    // Debug fallback renders them, and none of their secrets reach the output.
+    #[cfg(feature = "server")]
+    struct GenAuthed {
+        req: crate::server::ServerRequest,
+        cookie: crate::server::ServerCookie,
+        who: crate::principal::Principal,
+    }
+    #[cfg(feature = "server")]
+    impl IpeStringify for GenAuthed {
+        fn ipe_show(&self) -> String {
+            format!(
+                "{{{} {} {}}}",
+                (&Wrap(&self.req)).dispatch(),
+                (&Wrap(&self.cookie)).dispatch(),
+                (&Wrap(&self.who)).dispatch()
+            )
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn debug_fallback_renders_no_secret_of_a_runtime_value() {
+        use std::collections::{BTreeMap, HashMap};
+        let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
+        let g = GenAuthed {
+            req: crate::server::ServerRequest {
+                method: "GET".to_owned(),
+                path: "/me".to_owned(),
+                body: String::new(),
+                headers: pair("Authorization", "Bearer S3CR3T"),
+                params: HashMap::new(),
+                query: HashMap::new(),
+                cookies: pair("sid", "T0K3N"),
+                remoteAddr: String::new(),
+            },
+            cookie: crate::server::server_cookie("sid".to_owned(), "T0K3N".to_owned()),
+            who: crate::principal::principal_mint_with_claims(
+                "user-S3CR3T".to_owned(),
+                BTreeMap::from([("email".to_owned(), "T0K3N@example.com".to_owned())]),
+            ),
+        };
+        let shown = g.ipe_show();
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("T0K3N"), "{shown}");
+        assert!(shown.contains("\"GET\""), "{shown}");
+    }
 }

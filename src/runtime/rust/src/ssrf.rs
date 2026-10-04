@@ -12,13 +12,17 @@
 //!
 //! Blocks requests whose resolved host is loopback, RFC-1918 private,
 //! link-local, unique-local (ULA), unspecified, or v4-mapped-private.
-//! The guard is **default-ON in production, default-OFF in dev**:
+//! The guard is **default-ON**; only a dev-intent binary with no exposed
+//! listener defaults it OFF:
 //!
-//! * `IPE_HTTP_DENY_PRIVATE` set to a truthy value (`1`/`on`/`true`) → ON.
-//! * `IPE_HTTP_DENY_PRIVATE` set to anything else → OFF (explicit opt-out).
-//! * `IPE_HTTP_DENY_PRIVATE` unset → follows the production gate
-//!   (`production_from_env`): ON in production, OFF in dev so localhost
-//!   development keeps working.
+//! * `IPE_HTTP_DENY_PRIVATE` set to `1`/`on`/`true` → ON.
+//! * `IPE_HTTP_DENY_PRIVATE` set to `0`/`off`/`false` → OFF (explicit opt-out).
+//! * `IPE_HTTP_DENY_PRIVATE` set to anything else, a non-UTF-8 value included
+//!   → ON, with one warning naming the variable.
+//! * `IPE_HTTP_DENY_PRIVATE` unset → ON, unless the binary holds a
+//!   [`DevIntent`](crate::telemetry::DevIntent) and no app listener of the
+//!   process is exposed, so a dev CLI or loopback dev server still reaches
+//!   localhost. A release build is always ON.
 //!
 //! ## Pinning
 //!
@@ -40,26 +44,81 @@ use url::Url;
 
 pub use crate::url::SchemeShown;
 
+/// An explicit `IPE_HTTP_DENY_PRIVATE` setting, parsed once from its raw read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenyPrivateSetting {
+    /// `1`/`on`/`true`, or any value not recognised as an opt-out.
+    On,
+    /// `0`/`off`/`false`: the explicit opt-out.
+    Off,
+    /// The variable is not set.
+    Unset,
+}
+
+impl DenyPrivateSetting {
+    /// Parse a raw read; `recognised` is false for a value that fails closed.
+    fn parse(raw: crate::telemetry::RawEnv<'_>) -> (Self, bool) {
+        use crate::telemetry::RawEnv;
+        match raw {
+            RawEnv::Absent => (Self::Unset, true),
+            RawEnv::NotUnicode => (Self::On, false),
+            RawEnv::Value(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" => (Self::On, true),
+                "0" | "off" | "false" => (Self::Off, true),
+                _ => (Self::On, false),
+            },
+        }
+    }
+}
+
+/// The deny-private default for an unset `IPE_HTTP_DENY_PRIVATE`.
+///
+/// OFF only for a dev-intent binary none of whose app listeners is exposed;
+/// ON everywhere else, every release build included.
+const fn deny_private_default(
+    dev: Option<&crate::telemetry::DevIntent>,
+    scope: crate::telemetry::ProcessScope,
+) -> bool {
+    use crate::telemetry::ProcessScope;
+    match (dev, scope) {
+        (Some(_), ProcessScope::Unbound | ProcessScope::Loopback) => false,
+        (Some(_), ProcessScope::Exposed) | (None, _) => true,
+    }
+}
+
 /// Returns `true` when the SSRF deny-private guard is active.
 ///
-/// Default-ON in production (PRINCIPLES #1: the safe outcome must be the default
-/// for untrusted input). The decision:
-///   * `IPE_HTTP_DENY_PRIVATE` set to a truthy value (`1`/`on`/`true`) → ON.
-///   * `IPE_HTTP_DENY_PRIVATE` set to anything else (`0`/`off`/`false`/…) → OFF
-///     (explicit opt-out, so a production deploy that genuinely needs to reach a
-///     private host can disable it deliberately).
-///   * `IPE_HTTP_DENY_PRIVATE` UNSET → tied to the production gate
-///     (`production_from_env`): ON in production (`ENV`/`IPE_ENV` not in
-///     {unset, dev, development, local}), OFF in dev so localhost development
-///     keeps working unchanged.
-///
-/// Env is read only through the crate's locked accessors (`read_env_var` +
-/// `production_from_env`), never raw `std::env`.
+/// Default-ON (PRINCIPLES #1: the safe outcome must be the default for
+/// untrusted input); see the module docs for the decision table. An
+/// unrecognised value fails closed and is reported once. Env is read only
+/// through the crate's locked accessor, never raw `std::env`.
 pub(crate) fn ssrf_deny_private_enabled() -> bool {
-    match crate::system::read_env_var("IPE_HTTP_DENY_PRIVATE") {
-        Ok(v) => matches!(v.to_ascii_lowercase().trim(), "1" | "on" | "true"),
-        Err(_) => crate::telemetry::production_from_env(),
+    let read = crate::system::read_env_var("IPE_HTTP_DENY_PRIVATE");
+    let (setting, recognised) =
+        DenyPrivateSetting::parse(crate::telemetry::RawEnv::from_read(&read));
+    if !recognised {
+        static UNRECOGNISED_NOTICE: std::sync::Once = std::sync::Once::new();
+        UNRECOGNISED_NOTICE.call_once(|| {
+            crate::system::emit_runtime_log("ssrf", &unrecognised_notice(&read));
+        });
     }
+    match setting {
+        DenyPrivateSetting::On => true,
+        DenyPrivateSetting::Off => false,
+        DenyPrivateSetting::Unset => deny_private_default(
+            crate::telemetry::dev_intent_from_env().as_ref(),
+            crate::telemetry::ProcessScope::current(),
+        ),
+    }
+}
+
+/// The one-line warning for an unrecognised `IPE_HTTP_DENY_PRIVATE`, value escaped.
+fn unrecognised_notice(read: &Result<String, std::env::VarError>) -> String {
+    let shown = match read {
+        Ok(value) => format!("{:?}", value.chars().take(64).collect::<String>()),
+        Err(_) => "a non-UTF-8 value".to_owned(),
+    };
+    format!("IPE_HTTP_DENY_PRIVATE={shown} is not 0/off/false or 1/on/true; deny-private stays ON")
 }
 
 /// The deny-private policy a dial runs under.
@@ -72,7 +131,7 @@ pub enum DialPolicy {
 }
 
 impl DialPolicy {
-    /// The policy `IPE_HTTP_DENY_PRIVATE` and the production gate select.
+    /// The policy `IPE_HTTP_DENY_PRIVATE` and the dev-intent default select.
     #[must_use]
     pub fn from_env() -> Self {
         if ssrf_deny_private_enabled() {
@@ -1788,6 +1847,76 @@ mod tests {
     /// `host` as a configuration field names it.
     fn configured(host: &str) -> ConfiguredHost {
         ConfiguredHost::from_config(host.to_owned())
+    }
+
+    // A release binary under `ENV=dev`, with a loopback listener recorded,
+    // keeps an unset `IPE_HTTP_DENY_PRIVATE` ON; so does every exposed
+    // dev-intent process, and only a dev intent with no exposed listener
+    // defaults it OFF.
+    #[test]
+    fn deny_private_default_on_release_under_env_dev() {
+        use crate::telemetry::{ProcessScope, test_dev_intent};
+        for scope in [
+            ProcessScope::Unbound,
+            ProcessScope::Loopback,
+            ProcessScope::Exposed,
+        ] {
+            assert!(deny_private_default(None, scope), "{scope:?}");
+        }
+        let dev = test_dev_intent();
+        assert!(!deny_private_default(Some(&dev), ProcessScope::Unbound));
+        assert!(!deny_private_default(Some(&dev), ProcessScope::Loopback));
+        assert!(deny_private_default(Some(&dev), ProcessScope::Exposed));
+        if !cfg!(feature = "dev-posture") {
+            crate::system::locked_set_var("ENV", "dev");
+            crate::system::locked_remove_var("IPE_HTTP_DENY_PRIVATE");
+            crate::telemetry::record_bind("127.0.0.1");
+            assert!(ssrf_deny_private_enabled());
+            assert_eq!(DialPolicy::from_env(), DialPolicy::DenyPrivate);
+            crate::system::locked_remove_var("ENV");
+        }
+    }
+
+    // A value that is neither a recognised opt-in nor an opt-out keeps the
+    // guard ON: a typo never disables it.
+    #[test]
+    fn deny_private_unrecognised_value_is_on() {
+        use crate::telemetry::RawEnv;
+        for value in ["yes", "enable", "", " ", "no", "disabled", "0x0", "offf"] {
+            assert_eq!(
+                DenyPrivateSetting::parse(RawEnv::Value(value)),
+                (DenyPrivateSetting::On, false),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            DenyPrivateSetting::parse(RawEnv::NotUnicode),
+            (DenyPrivateSetting::On, false)
+        );
+        for value in ["1", "on", "TRUE", " true "] {
+            assert_eq!(
+                DenyPrivateSetting::parse(RawEnv::Value(value)),
+                (DenyPrivateSetting::On, true)
+            );
+        }
+        for value in ["0", "off", "False", " OFF "] {
+            assert_eq!(
+                DenyPrivateSetting::parse(RawEnv::Value(value)),
+                (DenyPrivateSetting::Off, true)
+            );
+        }
+        assert_eq!(
+            DenyPrivateSetting::parse(RawEnv::Absent),
+            (DenyPrivateSetting::Unset, true)
+        );
+        for value in ["yes", "enable"] {
+            crate::system::locked_set_var("IPE_HTTP_DENY_PRIVATE", value);
+            assert!(ssrf_deny_private_enabled(), "{value:?}");
+        }
+        crate::system::locked_remove_var("IPE_HTTP_DENY_PRIVATE");
+        let notice = unrecognised_notice(&Ok("y\nes".to_owned()));
+        assert!(!notice.contains('\n'), "{notice}");
+        assert!(notice.contains("IPE_HTTP_DENY_PRIVATE"));
     }
 
     /// A URL whose userinfo may run past its authority is never an

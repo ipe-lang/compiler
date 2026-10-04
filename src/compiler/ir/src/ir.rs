@@ -3401,11 +3401,11 @@ pub enum BinOp {
     /// panics on `b == 0` (divide by zero) **and** on `i64::MIN / -1`
     /// (signed overflow); `//` is a Rust line comment, so it cannot be
     /// emitted literally. The backend routes this variant through the total
-    /// helper `ipe_runtime::math::ipe_int_div(l, r)`, never via `op_str`.
+    /// helper `ipe_runtime::math::ipe_int_div(l, r)`, never as a raw infix token.
     IntDiv,
     /// String append `++`. Unlike the infix arithmetic/comparison operators,
     /// this has no single Rust infix form for two `String`s, so the backend
-    /// emits it as a `format!` concatenation rather than via `op_str`.
+    /// emits it as a `format!` concatenation rather than as an infix token.
     Append,
 }
 

@@ -1,0 +1,387 @@
+module SafeTextTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Set as Set
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+
+import TestSupport exposing
+    ( tableExists
+    , countReviewRows
+    , expectErr
+    , refuse
+    , seedIndex
+    , writeFileText
+    , fixtureLibRs
+    , fixtureMainIpe
+    , viewA
+    , viewB
+    , viewTag
+    , shownTextOf
+    , unitViewTag
+    , execIndex
+    , execIndexUnchecked
+    , Scratch
+    , freshScratch
+    , freshDir
+    , check
+    , indexSchemaStatements
+    , execIndexSchema
+    , seedIndexDb
+    , insertUnitRows
+    , setIndexEnv
+    , loadFirstPage
+    , PageEntry
+    , checkUnits
+    , listSecond
+    , isUnitA
+    , isUnitB
+    , cleanupIndex
+    , removeFileIfAny
+    , codeText
+    , noHazard
+    , rendered
+    , renderedForeign
+    , describeText
+    , refusedFor
+    , openReadOnlyAt
+    , vectorsPath
+    , ipeIndexTestFile
+    , repoFile
+    , probeMessage
+    , probeNames
+    , maybeContains
+    )
+
+
+
+
+-- Every member of the runtime's `is_log_hazard` set as it stood before the
+-- review-display superset: `Cc` 0x00-0x1F and 0x7F-0x9F, U+061C,
+-- U+200E-U+200F, U+2028-U+202E (the separators and U+202A-U+202E),
+-- U+2066-U+2069. Each stays a display hazard.
+hazardMembers : List Int
+hazardMembers =
+    List.range 0 31
+        ++ List.range 127 159
+        ++ [ 1564 ]
+        ++ List.range 8206 8207
+        ++ List.range 8232 8238
+        ++ List.range 8294 8297
+
+
+
+-- The code point one step outside each range edge of
+-- `display_hazard_vectors.json`: printable, so shown verbatim.
+hazardNeighbours : List Int
+hazardNeighbours =
+    [ 32, 126, 161, 172, 174, 846, 848, 1535, 1542, 1563, 1565, 1756, 1758, 1806, 1808, 2191, 2194, 2273, 2275, 4446, 4449, 5759, 5761, 6067, 6070, 6154, 6160, 8191, 8208, 8231, 8240, 8286, 8304, 10239, 10241, 12287, 12289, 12643, 12645, 65023, 65040, 65278, 65280, 65439, 65441, 65519, 65532, 69820, 69822, 69836, 69838, 78895, 78912, 113823, 113828, 119154, 119163, 917503, 921600 ]
+
+
+
+-- `render` escapes exactly the hazard set, in `scrub_log_controls`'s spelling,
+-- and passes every neighbour through unchanged.
+safeTextHazardTable : Bool
+safeTextHazardTable =
+    List.all
+        (\code ->
+            SafeText.isHazard (Char.fromCode code)
+                && rendered (codeText code) /= codeText code
+                && noHazard (rendered (codeText code))
+                && noHazard (renderedForeign (codeText code))
+        )
+        hazardMembers
+        && List.all
+            (\code ->
+                not (SafeText.isHazard (Char.fromCode code))
+                    && rendered (codeText code) == codeText code
+                    && renderedForeign (codeText code) == codeText code
+            )
+            hazardNeighbours
+        && List.all identity
+            [ rendered "\n" == "\\n"
+            , rendered "\r" == "\\r"
+            , rendered "\t" == "\\t"
+            , rendered (codeText 0) == "\\u{0}"
+            , rendered (codeText 27) == "\\u{1b}"
+            , rendered (codeText 127) == "\\u{7f}"
+            , rendered (codeText 159) == "\\u{9f}"
+            , rendered (codeText 1564) == "\\u{61c}"
+            , rendered (codeText 8238) == "\\u{202e}"
+            , rendered (codeText 8297) == "\\u{2069}"
+            , rendered "src/plain.ipe" == "src/plain.ipe"
+            , SafeText.toString (SafeText.quoted ("a" ++ codeText 27)) == "\"a\\u{1b}\""
+            ]
+
+
+
+-- `SafeText.isHazard` holds on exactly the code points of the shared
+-- `display_hazard_vectors.json`, swept over every scalar value in 4096-wide
+-- blocks (surrogates have no `Char`). Red if the file is absent, holds fewer
+-- than 20 ranges, or the two sets differ at any scalar.
+hazardSetMatchesVectors : Task.Task Error Bool
+hazardSetMatchesVectors =
+    do
+        cwd <- System.cwd ()
+        ranges <- readCodeRanges (ipeIndexTestFile cwd "display_hazard_vectors.json")
+        Task.succeed (List.length ranges >= 20 && List.all (hazardBlockMatches ranges) (List.range 0 271))
+
+
+
+hazardBlockMatches : List ( Int, Int ) -> Int -> Bool
+hazardBlockMatches ranges block =
+    List.all
+        (\code -> (code >= 55296 && code <= 57343) || SafeText.isHazard (Char.fromCode code) == inCodeRanges ranges code)
+        (List.range (block * 4096) (block * 4096 + 4095))
+
+
+
+-- Every endpoint and midpoint of every range of the runtime's
+-- `log_hazard_ranges.json` is a display hazard. Red if the tool's set falls
+-- below the runtime's log scrub, or if the file is absent or short.
+logHazardsAreDisplayHazards : Task.Task Error Bool
+logHazardsAreDisplayHazards =
+    do
+        cwd <- System.cwd ()
+        ranges <- readCodeRanges (repoFile cwd "src/runtime/rust/tests/log_hazard_ranges.json")
+        Task.succeed
+            (List.length ranges >= 20
+                && List.all
+                    (\( lo, hi ) -> List.all (\code -> SafeText.isHazard (Char.fromCode code)) [ lo, (lo + hi) // 2, hi ])
+                    ranges
+            )
+
+
+
+readCodeRanges : String -> Task.Task Error (List ( Int, Int ))
+readCodeRanges file =
+    do
+        path <- Task.fromResult (Path.fromString file)
+        text <- File.readFileLimit path (ByteSize.kib 64)
+        Task.fromResult (Decode.decodeString (Decode.list codeRangeDecoder) text)
+
+
+
+codeRangeDecoder : Decode.Decoder ( Int, Int )
+codeRangeDecoder =
+    Decode.map2 (\lo hi -> ( lo, hi ))
+        (Decode.field "lo" Decode.int)
+        (Decode.field "hi" Decode.int)
+
+
+
+inCodeRanges : List ( Int, Int ) -> Int -> Bool
+inCodeRanges ranges code =
+    List.any (\( lo, hi ) -> code >= lo && code <= hi) ranges
+
+
+
+-- One code point per class the review-display set adds beyond the log set
+-- renders as `\u{hex}` through `render`, `renderForeign` and
+-- `Highlight.tokenText`; a hidden zero-width space makes `admin` look
+-- different; U+0020, `é` and `✓` stay verbatim.
+invisibleCodepointsRendered : Bool
+invisibleCodepointsRendered =
+    let
+        escaped ( code, spelled ) =
+            rendered (codeText code)
+                == spelled
+                && renderedForeign (codeText code)
+                == spelled
+                && SafeText.toString (Highlight.tokenText (Plain (codeText code)))
+                == spelled
+    in
+    List.all escaped
+        [ ( 173, "\\u{ad}" )
+        , ( 847, "\\u{34f}" )
+        , ( 4447, "\\u{115f}" )
+        , ( 6068, "\\u{17b4}" )
+        , ( 6155, "\\u{180b}" )
+        , ( 8203, "\\u{200b}" )
+        , ( 8205, "\\u{200d}" )
+        , ( 8288, "\\u{2060}" )
+        , ( 10240, "\\u{2800}" )
+        , ( 12644, "\\u{3164}" )
+        , ( 65039, "\\u{fe0f}" )
+        , ( 65279, "\\u{feff}" )
+        , ( 65440, "\\u{ffa0}" )
+        , ( 917569, "\\u{e0041}" )
+        , ( 917760, "\\u{e0100}" )
+        , ( 160, "\\u{a0}" )
+        , ( 12288, "\\u{3000}" )
+        ]
+        && rendered "admin"
+        /= rendered ("admin" ++ codeText 8203)
+        && List.all (\code -> rendered (codeText code) == codeText code && SafeText.toString (Highlight.tokenText (Plain (codeText code))) == codeText code) [ 32, 233, 10003 ]
+
+
+
+-- Every displayed source token draws its characters in byte order.
+sourceTokensDisplayInByteOrder : Bool
+sourceTokensDisplayInByteOrder =
+    List.member ( "unicode-bidi", "bidi-override" ) Highlight.sourceTokenStyle
+        && List.member ( "direction", "ltr" ) Highlight.sourceTokenStyle
+
+
+
+-- `render` escapes a literal `\`, so text spelling an escape cannot pass for
+-- the character it names; `renderForeign` leaves `\` alone.
+backslashCannotForge : Bool
+backslashCannotForge =
+    List.all identity
+        [ rendered "\\u{1b}" /= rendered (codeText 27)
+        , rendered "\\u{1b}" == "\\\\u{1b}"
+        , rendered "a\\nb" /= rendered "a\nb"
+        , renderedForeign "a\\b" == "a\\b"
+        , renderedForeign ("a\\" ++ codeText 27) == "a\\\\u{1b}"
+        ]
+
+
+
+-- `render` escapes `"`, so a quoted foreign value cannot close its own quotes
+-- and fake a boundary in the diagnostic around it.
+quoteCannotForgeBoundary : Bool
+quoteCannotForgeBoundary =
+    List.all identity
+        [ rendered "a\"b" == "a\\\"b"
+        , SafeText.toString (SafeText.quoted "x\" ok \"y") == "\"x\\\" ok \\\"y\""
+        , String.contains "\"ipe:a\\\" has\"" (describeText (MissingTag "ipe:a\" has"))
+        , rendered "\\\"" /= rendered "\""
+        ]
+
+
+
+-- The sink renders that live in `Lib`: the queue's failure line escapes a
+-- hazard-bearing error.
+sinkRendersEscape : Bool
+sinkRendersEscape =
+    case Queue.queueStatusText (Failed (Error.unexpected (codeText 27 ++ "[2J" ++ codeText 8238))) of
+        Just text ->
+            noHazard text && String.contains "\\u{1b}[2J\\u{202e}" text
+
+        Nothing ->
+            False
+
+
+
+-- ── text from the index never reaches a page raw ─────────────────────────
+--
+-- Every displayed index column is `SafeText` from the decode point on, and
+-- every source token is rendered by `Highlight.tokenText`. Red if
+-- `withView` stops rendering a column (the hazard survives) or `tokenText`
+-- returns the raw token.
+rlo : String
+rlo =
+    codeText 8238
+
+
+
+indexTextRendered : Task.Task Error Bool
+indexTextRendered =
+    do
+        at <- freshScratch "ipe-index-safe-text"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb
+            "UPDATE units SET name = ?, qualified = ?, kind = ?, facing = ?, purpose = ? WHERE uid = ?"
+            [ SqlString ("an" ++ rlo ++ "swer")
+            , SqlString ("Lib." ++ rlo ++ "answer")
+            , SqlString ("fn" ++ codeText 27)
+            , SqlString ("internal" ++ codeText 8294)
+            , SqlString ("purpose" ++ codeText 8207 ++ "A")
+            , SqlString "u-a"
+            ]
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case List.find (\e -> e.uid == "u-a") r.units of
+                Just entry ->
+                    indexUnitRendered entry.unit
+
+                Nothing ->
+                    False
+            )
+
+
+
+indexUnitRendered : Index.Unit -> Bool
+indexUnitRendered u =
+    List.all safeShown [ u.name, u.qualified, u.kind, u.facing ]
+        && (Maybe.map safeShown u.purpose == Just True)
+        && SafeText.toString u.qualified
+        == "Lib.\\u{202e}answer"
+
+
+
+-- Rendered text holds no hazard and spells at least one as an escape.
+safeShown : SafeText.SafeText -> Bool
+safeShown text =
+    let
+        shown =
+            SafeText.toString text
+    in
+    noHazard shown && String.contains "\\u{" shown
+
+
+
+-- A source line with bidi overrides, in every highlighter language, and a
+-- link label built from such a token, show each override as an escape.
+sourceTokensRendered : Bool
+sourceTokensRendered =
+    let
+        line =
+            "let ok = \"admin" ++ rlo ++ " " ++ codeText 8294 ++ "\"; // check" ++ codeText 8297 ++ " done"
+
+        shownIn lang =
+            String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
+
+        label =
+            [ Links.internal ("Lib." ++ rlo ++ "x") "u-x" ]
+                |> List.map (\l -> SafeText.toString (Links.label l))
+    in
+    List.all (\lang -> noHazard (shownIn lang) && String.contains "\\u{202e}" (shownIn lang) && String.contains "\\u{2066}" (shownIn lang))
+        [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
+        && label
+        == [ "→ Lib.\\u{202e}x" ]
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ Task.succeed ( "safe text escapes the log set and passes each display-set neighbour", safeTextHazardTable )
+        , Task.succeed ( "every invisible code point class renders as an escape", invisibleCodepointsRendered )
+        , Task.succeed ( "source tokens display in byte order", sourceTokensDisplayInByteOrder )
+        , Task.succeed ( "a literal backslash cannot forge an escape", backslashCannotForge )
+        , Task.succeed ( "a quote cannot forge a quoted boundary", quoteCannotForgeBoundary )
+        , Task.succeed ( "queue failure line escapes its error", sinkRendersEscape )
+        , check "index text is rendered at the decode point" indexTextRendered
+        , Task.succeed ( "source tokens and link labels render bidi visibly", sourceTokensRendered )
+        , check "the hazard set equals the shared display-hazard vectors" hazardSetMatchesVectors
+        , check "every runtime log hazard is a display hazard" logHazardsAreDisplayHazards
+        ]

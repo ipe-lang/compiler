@@ -79,6 +79,25 @@ const RUNTIME_MOD_RS: &str = include_str!("../templates/ipe_runtime/mod.rs");
 /// The generated `ipe_runtime/config.rs` (DB/config bindings — empty by default).
 const RUNTIME_CONFIG_RS: &str = include_str!("../templates/ipe_runtime/config.rs");
 
+/// The runtime crate's own `clippy.toml`, vendored next to the emitted `Cargo.toml`.
+///
+/// A vendored runtime compiles inside the app crate, so clippy reads the app
+/// crate's config: without the runtime's `disallowed-methods`/`disallowed-types`
+/// bans, every runtime `#[expect(clippy::disallowed_*)]` would be an unfulfilled
+/// expectation in the emitted project. Embedded from the runtime file itself, so
+/// the two cannot drift.
+const RUNTIME_CLIPPY_TOML: &str = include_str!("../../../../../src/runtime/rust/clippy.toml");
+
+/// Insert [`RUNTIME_CLIPPY_TOML`] at the project root of a vendored-runtime emit.
+///
+/// # Errors
+///
+/// Propagates a [`Diagnostic`] from building the fixed relative path.
+fn insert_vendored_runtime_clippy_config(files: &mut BTreeMap<RelPath, String>) -> DResult<()> {
+    files.insert(RelPath::new("clippy.toml")?, RUNTIME_CLIPPY_TOML.to_owned());
+    Ok(())
+}
+
 // ── Browser-WASM manifest + runtime module set ─────────────────────────────
 
 /// The `--target wasm` project manifest. A fourth template beside
@@ -247,6 +266,7 @@ pub mod ct_eq;
 pub mod crypto_core;
 pub mod decimal;
 pub mod task;
+pub mod threads;
 pub mod dict;
 pub mod encoding;
 pub mod error;
@@ -268,6 +288,7 @@ pub mod scratch_host;
 pub mod path_core;
 pub mod path;
 pub mod random;
+pub mod redact;
 pub mod regex_kernel;
 pub mod secret;
 pub mod app_config;
@@ -2766,6 +2787,7 @@ fn assemble_project_files(
             WASM_RUNTIME_MOD_RS.to_owned()
         };
         files.insert(RelPath::new("src/ipe_runtime/mod.rs")?, wasm_mod_rs);
+        insert_vendored_runtime_clippy_config(&mut files)?;
         files.insert(
             RelPath::new("src/ipe_runtime/config.rs")?,
             RUNTIME_CONFIG_RS.to_owned(),
@@ -3155,6 +3177,7 @@ fn assemble_project_files(
         files.insert(path, text);
     }
     files.insert(RelPath::new("src/ipe_runtime/mod.rs")?, runtime_mod_rs);
+    insert_vendored_runtime_clippy_config(&mut files)?;
     files.insert(
         RelPath::new("src/ipe_runtime/config.rs")?,
         runtime_config_rs,

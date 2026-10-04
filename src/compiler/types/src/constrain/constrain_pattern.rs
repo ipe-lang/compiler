@@ -21,7 +21,7 @@ impl Builder<'_> {
             // nothing — the pattern-position counterpart of the unit expression.
             canon::Pattern_::PUnit => {
                 let unit = self.structure(FlatType::Unit)?;
-                self.eq(pat.span, unit, scrut_var);
+                self.eq(pat.span, unit, scrut_var)?;
                 Ok(())
             }
             canon::Pattern_::PVar(s) => {
@@ -59,7 +59,7 @@ impl Builder<'_> {
                     // sub-pattern's typing too; the lowerer is what restricts
                     // payloads to variables / wildcards.
                     let (arg_vars, result_var) = self.instantiate_ctor(&scheme)?;
-                    self.eq(pat.span, result_var, scrut_var);
+                    self.eq(pat.span, result_var, scrut_var)?;
                     for (sub, av) in args.iter().zip(arg_vars) {
                         self.constrain_pattern(local, sub, av)?;
                         // Record this sub-pattern's own instantiated field type so
@@ -70,7 +70,7 @@ impl Builder<'_> {
                         // Class 4 item C —
                         // docs/adr/0002-codegen-soundness-and-the-seal.md.
                         self.regions
-                            .insert((self.current_home.clone(), sub.span), av);
+                            .insert((self.home()?.into_path(), sub.span), av);
                     }
                 } else {
                     // A constructor with no registered scheme (imported, outside the
@@ -82,7 +82,7 @@ impl Builder<'_> {
                     // map and fires the "unbound local" ICE.  Use a fresh flex
                     // variable per arg since the field types are unknown.
                     let ctor = self.con_var(home.clone(), *type_name, Vec::new())?;
-                    self.eq(pat.span, ctor, scrut_var);
+                    self.eq(pat.span, ctor, scrut_var)?;
                     for sub in args {
                         let av = self.flex()?;
                         self.constrain_pattern(local, sub, av)?;
@@ -101,14 +101,14 @@ impl Builder<'_> {
                     elem_vars.push(self.flex()?);
                 }
                 let tuple = self.structure(FlatType::Tuple(elem_vars.clone()))?;
-                self.eq(pat.span, tuple, scrut_var);
+                self.eq(pat.span, tuple, scrut_var)?;
                 for (sub, ev) in elems.iter().zip(elem_vars) {
                     self.constrain_pattern(local, sub, ev)?;
                     // Same region-threading as the `PCtor` arm above so a record
                     // (or list) nested inside a TUPLE element (`(Ok {name}, y)`)
                     // recovers its complete shape in the lowerer. Class 4 item C.
                     self.regions
-                        .insert((self.current_home.clone(), sub.span), ev);
+                        .insert((self.home()?.into_path(), sub.span), ev);
                 }
                 Ok(())
             }
@@ -128,7 +128,7 @@ impl Builder<'_> {
                         field: f.value,
                         result,
                         span: f.span,
-                        home: self.current_home.clone(),
+                        home: self.home()?,
                     });
                     local.insert(f.value, result);
                 }
@@ -139,22 +139,22 @@ impl Builder<'_> {
             // surfaces as the ordinary IPE-T0001 type mismatch.
             canon::Pattern_::PInt(_) => {
                 let lit = self.int_var()?;
-                self.eq(pat.span, lit, scrut_var);
+                self.eq(pat.span, lit, scrut_var)?;
                 Ok(())
             }
             canon::Pattern_::PBool(_) => {
                 let lit = self.bool_var()?;
-                self.eq(pat.span, lit, scrut_var);
+                self.eq(pat.span, lit, scrut_var)?;
                 Ok(())
             }
             canon::Pattern_::PChar(_) => {
                 let lit = self.char_var()?;
-                self.eq(pat.span, lit, scrut_var);
+                self.eq(pat.span, lit, scrut_var)?;
                 Ok(())
             }
             canon::Pattern_::PStr(_) => {
                 let lit = self.string_var()?;
-                self.eq(pat.span, lit, scrut_var);
+                self.eq(pat.span, lit, scrut_var)?;
                 Ok(())
             }
             // An alias `inner as name` binds `name` to the whole scrutinee and
@@ -169,7 +169,7 @@ impl Builder<'_> {
             canon::Pattern_::PList(elems) => {
                 let elem = self.flex()?;
                 let list = self.list_var(elem)?;
-                self.eq(pat.span, list, scrut_var);
+                self.eq(pat.span, list, scrut_var)?;
                 for sub in elems {
                     self.constrain_pattern(local, sub, elem)?;
                 }
@@ -180,7 +180,7 @@ impl Builder<'_> {
             canon::Pattern_::PCons(head, tail) => {
                 let elem = self.flex()?;
                 let list = self.list_var(elem)?;
-                self.eq(pat.span, list, scrut_var);
+                self.eq(pat.span, list, scrut_var)?;
                 self.constrain_pattern(local, head, elem)?;
                 self.constrain_pattern(local, tail, list)
             }
@@ -210,7 +210,7 @@ impl Builder<'_> {
                     // binder of the same name established by the first alternative.
                     for (name, var) in alt_local {
                         if let Some(reference) = local.get(&name).copied() {
-                            self.eq(alt.span, reference, var);
+                            self.eq(alt.span, reference, var)?;
                         } else {
                             // Unreachable: canon proved every alternative binds
                             // the same names. Adopt the binder rather than drop it.

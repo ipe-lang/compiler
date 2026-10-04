@@ -1225,8 +1225,8 @@ pub fn cmd_rename_symbol(
             // then read the file relative to the repo root. A single repo is
             // indexed today, so the root is the current directory.
             let (_tag, rel) = crate::model::split_tag(&path);
-            let full_path = std::path::Path::new(rel);
-            let content = std::fs::read_to_string(full_path).unwrap_or_default();
+            let content =
+                crate::walk::read_indexed(std::path::Path::new("."), rel).unwrap_or_default();
             let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
             line_cache.insert(path.clone(), lines);
         }

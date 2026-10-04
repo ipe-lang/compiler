@@ -33,6 +33,8 @@ main =
 `|>` `<|` pipelines | `::` cons | `\x -> x + 1` lambdas | `let…in`
 | `case…of` (exhaustiveness checked) | `{ record | field = value }`
 update | `module M exposing (..)` | `import M as Alias exposing (func)`.
+An open import's (`exposing (..)`) clash with another name is reported only
+where the name is used bare, never at the import itself.
 
 **Multiline strings** — triple-quoted, `{{expr}}` interpolation:
 

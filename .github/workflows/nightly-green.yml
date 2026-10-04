@@ -12,7 +12,7 @@ name: nightly-green
 # re-run this check; ruleset-admin-read.yml runs on main only, see
 # `.github/ci/RECONCILIATION.md`). Absence is not a pass. The rule and its
 # producer table live in `.github/ci/nightly_green.py`, the one file the sparse
-# checkout below materialises; its `--lint` (manifest-guard) pins this wiring
+# checkout below materialises; its `--lint` (artifact-guard) pins this wiring
 # and asserts the table equal to what the manifest and each producer's
 # triggers derive.
 on:
