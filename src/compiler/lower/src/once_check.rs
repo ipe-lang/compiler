@@ -1,8 +1,10 @@
 //! The once check: refuse every [`Expr::OnceLambda`] whose parent may call it
 //! more than once.
 //!
-//! An eta-built closure that moves a non-`Clone` capture is `FnOnce` only, so
-//! the lowerer builds it as an [`Expr::OnceLambda`]. This walk visits every
+//! A closure that moves a non-`Clone` capture is `FnOnce` only, so the lowerer
+//! builds it as an [`Expr::OnceLambda`], a source lambda and an eta-built
+//! closure alike. Building an inner closure that captures the value moves it
+//! too, so the parent of such a closure is once-only as well. This walk visits every
 //! child position of a lowered body, names the position as a [`ClosureSite`],
 //! and asks [`admits_once`] — the single verdict the backend reads too. An
 //! unadmitted once closure is refused with IPE-L0126 at the moved capture's
@@ -228,6 +230,51 @@ mod tests {
             body: Box::new(once(&mut i)?),
         };
         assert!(refused_at(&check_once_closures(&nested), 7, 8));
+        Ok(())
+    }
+
+    /// `Task.andThen (\t -> Task.andThen <once> t)`: a once closure in a once closure.
+    #[test]
+    fn a_once_closure_inside_an_admitted_once_closure_passes() -> DResult<()> {
+        let mut i = Interner::new();
+        let t = i.intern("t")?;
+        let h = i.intern("h")?;
+        let outer = Expr::OnceLambda {
+            params: vec![(t, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(kernel_call(
+                KernelFn::TaskAndThen,
+                vec![once(&mut i)?, Expr::Var(t)],
+            )),
+            capture: MovedCapture {
+                name: h,
+                lo: 3,
+                hi: 4,
+            },
+        };
+        let admitted = kernel_call(KernelFn::TaskAndThen, vec![outer.clone(), Expr::Unit]);
+        assert!(check_once_closures(&admitted).is_ok());
+        let mapped = kernel_call(KernelFn::ListMap, vec![outer, Expr::Unit]);
+        assert!(
+            refused_at(&check_once_closures(&mapped), 3, 4),
+            "the outer closure moves the capture its inner one takes, so a recalling slot refuses it"
+        );
+        Ok(())
+    }
+
+    /// `Task.andThen { let m = m.clone(); <once> }`: the backend boxes a wrapped
+    /// closure as `dyn Fn`, so the wrap must not hide a once closure from the check.
+    #[test]
+    fn a_pre_cloned_once_closure_in_an_admitted_slot_refuses() -> DResult<()> {
+        let mut i = Interner::new();
+        let m = i.intern("m")?;
+        let wrapped = Expr::Let {
+            name: m,
+            value: Box::new(Expr::CloneVar(m)),
+            body: Box::new(once(&mut i)?),
+        };
+        let and_then = kernel_call(KernelFn::TaskAndThen, vec![wrapped, Expr::Unit]);
+        assert!(refused_at(&check_once_closures(&and_then), 7, 8));
         Ok(())
     }
 }
