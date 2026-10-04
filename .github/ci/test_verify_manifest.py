@@ -6405,6 +6405,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           targets: ${{ matrix.target }}
@@ -6418,6 +6419,7 @@ jobs:
   release-targets-freebsd:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
           usesh: true
@@ -6428,7 +6430,12 @@ jobs:
 _RT_RELEASE = """\
 on: workflow_dispatch
 jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "tag=v1.0.0" >> "$GITHUB_OUTPUT"
   build:
+    needs: resolve-tag
     strategy:
       fail-fast: false
       matrix:
@@ -6443,6 +6450,9 @@ jobs:
             ext: ''
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           targets: ${{ matrix.target }}
@@ -6458,8 +6468,12 @@ jobs:
           mkdir -p dist
           cp "target/$TARGET/release/ipe$EXT" dist/
   build-freebsd:
+    needs: resolve-tag
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
           usesh: true
@@ -6645,24 +6659,21 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_extra_ci_step_refused(self) -> None:
         fake = "      - run: echo /tmp/fake-cargo >> \"$GITHUB_PATH\"\n"
         ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", fake + "      - name: Install musl toolchain (linux)\n")
-        self.assertRefused("must run exactly release.yml's 3 steps", ci)
+        self.assertRefused("must run exactly release.yml's 4 steps", ci)
         vm = "      - run: echo '[build]' > .cargo/config.toml\n      - uses: vmactions/freebsd-vm@"
         ci = self.swap(_RT_CI, "      - uses: vmactions/freebsd-vm@", vm)
-        self.assertRefused("must run exactly release.yml's 1 steps", ci)
+        self.assertRefused("must run exactly release.yml's 2 steps", ci)
 
     def test_ci_step_differing_from_release_refused(self) -> None:
         ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", "      - name: Install musl toolchain (linux)\n        continue-on-error: true\n")
-        self.assertRefused("native step 2", ci)
+        self.assertRefused("native step 3", ci)
         ci = self.swap(_RT_CI, "      - uses: ./.github/actions/rust-toolchain-pinned\n", "      - uses: ./.github/actions/rust-toolchain-pinned\n        if: false\n")
-        self.assertRefused("native step 1", ci)
+        self.assertRefused("native step 2", ci)
 
     def test_checkout_of_another_commit_refused(self) -> None:
         checkout = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
-        ci = _RT_CI.replace("    steps:\n", "    steps:\n" + checkout)
-        release = _RT_RELEASE.replace("    steps:\n", "    steps:\n" + checkout + "        with:\n          ref: v1\n", 2)
-        self.assertEqual(self.errors(ci, release), [])
         pinned = checkout + "        with:\n          ref: 0123abc\n"
-        self.assertRefused("native step 1", _RT_CI.replace("    steps:\n", "    steps:\n" + pinned), release)
+        self.assertRefused("native step 1", _RT_CI.replace(checkout, pinned, 1))
 
     def test_cargo_step_extra_line_refused(self) -> None:
         native = self.swap(
@@ -6670,12 +6681,16 @@ class TestReleaseTargetParity(unittest.TestCase):
             "        run: cargo check --release",
             "        run: |\n          cargo() { :; }\n          cargo check --release",
         )
-        self.assertRefused("native cargo step must run only", native)
+        self.assertRefused("job 'release-targets-run' runs cargo 2 time(s)", native)
         bsd = self.swap(
             _RT_CI,
             "          run: |\n            cargo check",
             "          run: |\n            alias cargo=true\n            cargo check",
         )
+        self.assertRefused("job 'release-targets-freebsd' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", bsd)
+        native = self.swap(_RT_CI, "        run: cargo check --release", "        run: |\n          export RUSTFLAGS=-Cx\n          cargo check --release")
+        self.assertRefused("native cargo step must run only", native)
+        bsd = self.swap(_RT_CI, "          run: |\n            cargo check", "          run: |\n            export RUSTFLAGS=-Cx\n            cargo check")
         self.assertRefused("FreeBSD cargo step must run only", bsd)
 
     def test_cargo_step_env_beyond_release_refused(self) -> None:
@@ -6684,7 +6699,7 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_vm_input_drift_refused(self) -> None:
         ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n          run: |\n            cargo check", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n          run: |\n            cargo check")
-        self.assertRefused("FreeBSD step 1 `with`", ci)
+        self.assertRefused("FreeBSD step 2 `with`", ci)
 
     def test_job_key_drift_refused(self) -> None:
         for key in ("services:\n      cache:\n        image: x", "permissions:\n      contents: write", "defaults:\n      run:\n        shell: sh"):
@@ -6852,12 +6867,107 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("reads the `steps` context", action=spliced)
 
     def test_freebsd_strategy_refused(self) -> None:
-        strategy = "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - flags: x\n    steps:\n      - uses: vmactions"
-        ci = _RT_CI.replace("    runs-on: ubuntu-latest\n    steps:\n      - uses: vmactions", strategy, 1)
-        release = _RT_RELEASE.replace("    runs-on: ubuntu-latest\n    steps:\n      - uses: vmactions", strategy, 1)
+        strategy = "    strategy:\n      matrix:\n        include:\n          - flags: x\n"
+        ci = _RT_CI.replace("  release-targets-freebsd:\n", "  release-targets-freebsd:\n" + strategy, 1)
+        release = _RT_RELEASE.replace("  build-freebsd:\n", "  build-freebsd:\n" + strategy, 1)
         self.assertNotEqual(ci, _RT_CI)
         self.assertNotEqual(release, _RT_RELEASE)
         self.assertRefused("FreeBSD job has a `strategy`", ci, release)
+
+    # GitHub reads each scalar as YAML 1.2 does and hands a step its own text
+    # of it; the checker compares the loaded value, so the type is part of it.
+
+    _CARGO_ENV = "        env:\n          TARGET: ${{ matrix.target }}\n"
+
+    def with_cargo_env(self, ci_line: str, release_line: str) -> tuple[str, str]:
+        return (
+            self.swap(_RT_CI, self._CARGO_ENV, self._CARGO_ENV + f"          {ci_line}\n"),
+            self.swap(_RT_RELEASE, self._CARGO_ENV, self._CARGO_ENV + f"          {release_line}\n"),
+        )
+
+    def test_env_values_equal_only_as_typed_text(self) -> None:
+        for ci_line, release_line, needle in (
+            ("RUSTFLAGS: 1", "RUSTFLAGS: true", "sets ['RUSTFLAGS'] to a non-string"),
+            ("RUSTFLAGS: '1'", "RUSTFLAGS: 'true'", "`RUSTFLAGS` = '1' in ci.yml"),
+            ("RUSTFLAGS: 0x2", "RUSTFLAGS: 2", "spell it as YAML 1.2 does"),
+            ("RUSTFLAGS: yes", "RUSTFLAGS: true", "spell it as YAML 1.2 does"),
+            ("RUSTFLAGS: 2", "RUSTFLAGS: 2", "sets ['RUSTFLAGS'] to a non-string"),
+        ):
+            with self.subTest(ci=ci_line, release=release_line):
+                self.assertRefused(needle, *self.with_cargo_env(ci_line, release_line))
+        self.assertEqual(self.errors(*self.with_cargo_env("RUSTFLAGS: '2'", "RUSTFLAGS: '2'")), [])
+
+    def test_matrix_values_equal_only_as_typed_text(self) -> None:
+        env_write = '        run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV" && sudo apt-get update'
+        ci, release = self.both(self._APT, env_write)
+        for ci_line, release_line, needle in (
+            ("flags: 1", "flags: true", "is a non-string scalar"),
+            ("flags: '1'", "flags: 'true'", "matrix `flags` for target 'x86_64-unknown-linux-musl'"),
+            ("flags: 0x2", "flags: 2", "spell it as YAML 1.2 does"),
+        ):
+            with self.subTest(ci=ci_line, release=release_line):
+                c = self.swap(ci, self._MUSL_LEG, self._MUSL_LEG + f"            {ci_line}\n")
+                r = self.swap(release, self._MUSL_LEG, self._MUSL_LEG + f"            {release_line}\n")
+                self.assertRefused(needle, c, r)
+
+    def test_line_continuation_joins_a_runner_name(self) -> None:
+        for text, needle in (
+            ('$GITHUB\\\n_REF_NAME', "`GITHUB_REF_NAME`"),
+            ('$GIT\\\nHUB_REF', "`GITHUB_REF`"),
+            ('$GITHUB`\n_REF_NAME', "`GITHUB_REF_NAME`"),
+        ):
+            with self.subTest(text=text):
+                guard = '        run: |\n          echo "RUSTFLAGS=--cfg ' + text.replace("\n", "\n          ").replace("\r\n          ", "\r\n") + '" >> "$GITHUB_ENV"\n          sudo apt-get update'
+                self.assertRefused(needle, *self.both(self._APT, guard))
+        # A double-quoted scalar keeps a carriage return the shell also joins over.
+        crlf = '        run: "echo \\"RUSTFLAGS=--cfg $GITHUB\\\\\\r\\n_REF_NAME\\" >> \\"$GITHUB_ENV\\" && sudo apt-get update && sudo apt-get install -y musl-tools"'
+        self.assertRefused("`GITHUB_REF_NAME`", *self.both(self._APT + " && sudo apt-get install -y musl-tools", crlf))
+
+    def test_runner_variable_refused(self) -> None:
+        guard = '        run: echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV" && sudo apt-get update'
+        self.assertRefused("names the runner variable `RUNNER_DEBUG`", *self.both(self._APT, guard))
+
+    _TAG_REF = "          ref: ${{ needs.resolve-tag.outputs.tag }}\n"
+
+    def test_release_checkout_ref_is_the_tag_only(self) -> None:
+        for ref in ("main", "${{ github.event.inputs.ref }}", "${{ needs.resolve-tag.outputs.tag }}x"):
+            with self.subTest(ref=ref):
+                release = self.swap(_RT_RELEASE, self._TAG_REF, f"          ref: {ref}\n")
+                self.assertRefused("first step must check out `ref: ${{ needs.resolve-tag.outputs.tag }}`", release=release)
+        release = self.swap(_RT_RELEASE, "    needs: resolve-tag\n", "")
+        self.assertRefused("job 'build' must need `resolve-tag`", release=release)
+        second = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: main\n"
+        anchor = "      - name: Install musl toolchain (linux)\n"
+        ci = self.swap(_RT_CI, anchor, "      - uses: actions/checkout@0000000000000000000000000000000000000000\n" + anchor)
+        release = self.swap(_RT_RELEASE, anchor, second + anchor)
+        self.assertRefused("job 'build' step 3 checks out `ref: 'main'` after the tag's checkout", ci, release)
+
+    def test_quoted_and_unquoted_cargo_arguments_differ(self) -> None:
+        self.assertRefused("native cargo command", self.swap(_RT_CI, '--target "$TARGET"', "--target $TARGET"))
+
+    def test_second_cargo_invocation_refused(self) -> None:
+        upload = "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+        for line in (
+            "RUSTFLAGS=--cfg=evil cargo build --release -p ipe",
+            "command cargo build --release -p ipe",
+            "exec cargo build --release -p ipe",
+            "env RUSTFLAGS=x cargo build --release -p ipe",
+            "time cargo build --release -p ipe",
+            "echo -p | xargs cargo build",
+            "sh -c 'cargo build --release -p ipe'",
+            "c=cargo; $c build",
+        ):
+            with self.subTest(line=line):
+                release = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", f"            cp target/release/ipe dist/ipe\n            {line}\n")
+                self.assertRefused("job 'build-freebsd' runs cargo", release=release)
+                later = f"      - shell: bash\n        run: {line}\n"
+                release = self.swap(_RT_RELEASE, upload, later + upload)
+                self.assertRefused("job 'build-freebsd' runs cargo", release=release)
+        native = self.swap(_RT_RELEASE, '\n          mkdir -p dist\n          cp "', '\n          mkdir -p dist\n          cargo build --release -p ipe\n          cp "')
+        self.assertRefused("job 'build' must have exactly one cargo command, has 2", release=native)
+        # The shell joins `CAR\` + newline + `GO`; a case-insensitive file system runs it as cargo.
+        split = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", "            cp target/release/ipe dist/ipe\n            CAR\\\n            GO build\n")
+        self.assertRefused("job 'build-freebsd' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", release=split)
 
 
 class TestModuleConstantsDefinedOnce(unittest.TestCase):

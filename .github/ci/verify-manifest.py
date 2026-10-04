@@ -381,15 +381,26 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       VM action, `usesh`, `prepare`, `strategy` and cargo command, the verb
       aside (`build` there, `check` here).  Each ci.yml job runs release.yml's
       steps up to and including the cargo step, one for one and nothing
-      else, each pair equal but for its `name` and release.yml's checkout
-      `with.ref`.  The whole static scope that can reach the cargo command
+      else, each pair equal but for its `name` and the `with.ref` of
+      release.yml's first step, which must be a checkout of exactly
+      `${{ needs.resolve-tag.outputs.tag }}` in a job that needs
+      `resolve-tag`; any later checkout with a `ref` is refused.  Values are
+      compared typed (`1` is not `true`, nor `'1'`), and an `env` or read
+      matrix value that is not a string is refused, since GitHub hands the
+      step its own text of it; the shared loader refuses a plain scalar YAML
+      1.1 and 1.2 read differently (`yes`, `0x2`, `010`).  The whole static scope that can reach the cargo command
       is compared both ways: the workflow keys but `name`, `run-name`, `on`,
       `permissions`, `concurrency` and `jobs` (`defaults` among them); the
       job keys but `name`, `needs`, `if`, `timeout-minutes`, `strategy` and
       `steps`; the cargo command's environment, workflow, job and step
       `env` merged; and the cargo step's text, which is exactly its one
-      cargo line on ci.yml's side and opens with it on release.yml's (lines
-      after it, the packaging, cannot reach it).  The environments are equal
+      cargo line on ci.yml's side and opens with it on release.yml's.  The
+      line after `cargo <verb>` is compared as text, quoting included.  Each
+      job runs cargo exactly once, in the cargo step: every invocation the
+      shell reader finds (behind an env prefix, `env`, `command`, `exec`,
+      `time`, `sh -c`) in any step or local action is counted, a `cargo`
+      word it cannot read as one (`xargs cargo`, `c=cargo; $c`) is refused,
+      so release.yml's packaging steps cannot rebuild what it ships.  The environments are equal
       but for the closed, value-pinned `ALLOWED_ENV_DIFFERENCES`, each entry
       named with its why; an entry no longer used is refused, and so is any
       read of an allowed name where it is visible (the whole region for a
@@ -399,8 +410,10 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `steps` inside a local action (never `steps` inside its `run:`); the
       matrix values and an action's input defaults read no context; every
       matrix key read is a scalar equal for each target on both sides; and a
-      literal `GITHUB_*` or `ACTIONS_*` name other than the command files is
-      refused, in the text and in the matrix values alike, so no event, ref,
+      literal `GITHUB_*`, `ACTIONS_*` or `RUNNER_*` name other than the
+      command files is refused, in the text, in the text with its line
+      continuations (backslash or backtick, then LF or CRLF) joined, and in
+      the matrix values alike, so no event, ref,
       variable or secret can make the two runs differ.  A `${{ }}` whose value
       lands in text may not touch a name character or another expression, nor
       call `format`, `join` or `fromJSON`, so no name is assembled out of the
@@ -5743,20 +5756,67 @@ def _cargo_lines(text: object) -> list[str]:
     return [ln for ln in lines if ln.startswith("cargo ")]
 
 
+# The word `cargo` (or `cargo.exe`) anywhere in a step's strings, as a
+# second, spelling-level count beside `cargo_invocation.in_shell`'s: a path
+# component (`~/.cargo/bin`) or a variable name (`CARGO_HOME`) is not one.
+_CARGO_WORD_RE = re.compile(r"(?<![A-Za-z0-9_.-])cargo(?:\.exe)?(?![A-Za-z0-9_-])", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class _CargoStep:
-    """A job's one cargo-carrying step, that command's line, its tokens with
-    the verb word replaced by a placeholder, and the step text's other
-    non-empty lines before and after the cargo line."""
+    """A job's one cargo-carrying step, that command's line, its tokens, the
+    line's text after `cargo <verb>` exactly as written (quotes kept: bash
+    splits and globs `$TARGET` but not `"$TARGET"`), and the step text's
+    other non-empty lines before and after the cargo line."""
 
     step: dict
     line: str
     tokens: list[str]
+    args: str
     before: tuple[str, ...]
     after: tuple[str, ...]
 
 
-def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: bool = False) -> _CargoStep | None:
+def _job_cargo_runs(job: dict, where: str, repo: str, errors: list[str]) -> list[dict] | None:
+    """The steps of `job` that run cargo, each once per invocation: every
+    invocation `cargo_invocation.in_shell` reads in a step's `run` or
+    `with.run` (an env-assignment prefix, `command`, `exec`, `env`, `time`,
+    `timeout`, `sh -c`, `eval` peeled; `xargs cargo` and the like are read as
+    an unreadable invocation, still counted), and separately every `cargo`
+    word in any of its strings, line continuations joined (`CAR\\` + newline
+    + `GO` runs cargo on a case-insensitive file system), a local action's
+    steps included. A job that runs cargo more often than its
+    one mirrored line, by either count, can rebuild what it ships; None when
+    the counts disagree, so the caller refuses."""
+    by_shell: list[dict] = []
+    by_word: list[dict] = []
+    for step in _steps_of(job):
+        with_ = step.get("with")
+        for text in (step.get("run"), with_.get("run") if isinstance(with_, dict) else None):
+            if isinstance(text, str):
+                by_shell.extend(step for _ in cargo_invocation.in_shell(text))
+        body = {k: v for k, v in step.items() if k != "name"}
+        for _w, text, _b in _region_strings(body, where, False, errors):
+            by_word.extend(step for _ in _CARGO_WORD_RE.finditer(_scanned_texts(text)[-1]))
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("./"):
+            for item in _local_action_strings(uses, repo, where, 0, errors):
+                if item.where.endswith(".run"):
+                    by_shell.extend(step for _ in cargo_invocation.in_shell(item.text))
+                by_word.extend(step for _ in _CARGO_WORD_RE.finditer(_scanned_texts(item.text)[-1]))
+    if len(by_shell) != len(by_word) or any(a is not b for a, b in zip(by_shell, by_word)):
+        errors.append(
+            f"check 23: {where} runs cargo {len(by_shell)} time(s) as the shell reads it but names `cargo` "
+            f"{len(by_word)} time(s): a cargo command this check cannot read (a built name, a wrapper, an "
+            "action input) can rebuild what the job ships; refused"
+        )
+        return None
+    return by_shell
+
+
+def _cargo_step(
+    job: dict, where: str, verb: str, repo: str, errors: list[str], vm_run: bool = False
+) -> _CargoStep | None:
     """`job`'s one cargo command (a FreeBSD VM job keeps its commands under the
     VM step's `with.run`) and the step carrying it. The step must run whenever
     its job does: an `if:` or a `continue-on-error` there lets the job succeed
@@ -5773,6 +5833,15 @@ def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: boo
     if not isinstance(one, tuple):
         return None
     step, line = one
+    runs = _job_cargo_runs(job, where, repo, errors)
+    if runs is None:
+        return None
+    if len(runs) != 1 or runs[0] is not step:
+        errors.append(
+            f"check 23: {where} runs cargo {len(runs)} time(s) where `{line}` must be its one cargo command: "
+            "another invocation, before or after it, can rebuild what the job ships; refused"
+        )
+        return None
     if "if" in step or "continue-on-error" in step:
         errors.append(
             f"check 23: {where}: the step running `{line}` has an `if:` or `continue-on-error`, so the job "
@@ -5784,14 +5853,15 @@ def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: boo
     except ValueError as e:
         errors.append(f"check 23: {where}: `{line}` is not readable ({e})")
         return None
-    if len(tokens) < 2 or tokens[1] != verb:
+    head = f"cargo {verb}"
+    if not (line == head or line.startswith(head + " ")):
         errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
         return None
     holder = step.get("with") if vm_run else step
     text = holder.get("run") if isinstance(holder, dict) else None
     lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
     at = lines.index(str(line))
-    return _CargoStep(step, str(line), [tokens[0], "<verb>", *tokens[2:]], tuple(lines[:at]), tuple(lines[at + 1 :]))
+    return _CargoStep(step, str(line), tokens, line[len(head) :], tuple(lines[:at]), tuple(lines[at + 1 :]))
 
 
 def _job_unmasked(job: dict, where: str, errors: list[str]) -> None:
@@ -5840,8 +5910,24 @@ def _matrix_legs(job: dict, where: str, errors: list[str]) -> dict[str, dict] | 
     return legs
 
 
+def _same_value(a: object, b: object) -> bool:
+    """`a` and `b` are one value as GitHub reads it: the same type at every
+    level, then equal. Python's `==` holds `1 == True` and `1 == 1.0`, which
+    GitHub stringifies apart (`1`, `true`, `1.0`)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        b_keys = {(type(k), k): v for k, v in b.items()}
+        return len(a) == len(b) and all(
+            (type(k), k) in b_keys and _same_value(v, b_keys[(type(k), k)]) for k, v in a.items()
+        )
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def _compare(what: str, ci_value: object, release_value: object, errors: list[str]) -> None:
-    if ci_value != release_value:
+    if not _same_value(ci_value, release_value):
         errors.append(
             f"check 23: ci.yml's {what} is {ci_value!r} but release.yml's is {release_value!r}; "
             "they must be equal"
@@ -5857,6 +5943,54 @@ def _step_with_run(job: dict, needle: str) -> dict | None:
 # timeout, its display name, and the matrix and steps compared on their own.
 _PARITY_FREE_JOB_KEYS = frozenset({"name", "needs", "if", "timeout-minutes", "strategy", "steps"})
 _CHECKOUT_ACTION = "actions/checkout@"
+# The job that parses the release tag, and the one `ref` a release build
+# checks out: the tag it parsed. ci.yml checks the tree under test instead.
+RELEASE_TAG_JOB = "resolve-tag"
+RELEASE_CHECKOUT_REF = "${{ needs.resolve-tag.outputs.tag }}"
+
+
+def _is_checkout(step: dict) -> bool:
+    return str(step.get("uses", "")).startswith(_CHECKOUT_ACTION)
+
+
+def _tag_ref_set_aside(steps: list[dict], step: dict) -> bool:
+    """`step` is the release job's first step, a checkout of exactly
+    `RELEASE_CHECKOUT_REF`: the one `with.ref` the comparisons set aside."""
+    with_ = step.get("with")
+    return (
+        bool(steps)
+        and steps[0] is step
+        and _is_checkout(step)
+        and isinstance(with_, dict)
+        and _same_value(with_.get("ref"), RELEASE_CHECKOUT_REF)
+    )
+
+
+def _check_release_checkout(job: dict, where: str, errors: list[str]) -> None:
+    """A release build checks out the parsed tag and nothing else: its first
+    step is a checkout whose `ref` is exactly `RELEASE_CHECKOUT_REF`, the
+    job needs `RELEASE_TAG_JOB` (else the expression reads empty and the
+    checkout falls back to the event's ref, a branch on a dispatch), and no
+    later checkout carries a `ref`. Any other `ref` — a branch, a `github.*`
+    value, a second checkout over the first — builds a tree other than the
+    tag's, which ci.yml never checked."""
+    steps = _steps_of(job)
+    needs = job.get("needs")
+    if not (needs == RELEASE_TAG_JOB or (isinstance(needs, list) and RELEASE_TAG_JOB in needs)):
+        errors.append(f"check 23: {where} must need `{RELEASE_TAG_JOB}`, whose tag its checkout builds; refused")
+    if not steps or not _tag_ref_set_aside(steps, steps[0]):
+        first = steps[0] if steps else None
+        errors.append(
+            f"check 23: {where}'s first step must check out `ref: {RELEASE_CHECKOUT_REF}`, and is {first!r}: "
+            "any other ref builds a tree other than the release tag's; refused"
+        )
+    for n, step in enumerate(steps[1:], start=2):
+        with_ = step.get("with")
+        if _is_checkout(step) and isinstance(with_, dict) and "ref" in with_:
+            errors.append(
+                f"check 23: {where} step {n} checks out `ref: {with_['ref']!r}` after the tag's checkout: it can "
+                "replace the tree the job builds; refused"
+            )
 
 
 def _compare_job_keys(label: str, ci_job: dict, rel_job: dict, errors: list[str]) -> None:
@@ -5880,7 +6014,8 @@ def _check_mirrored_steps(
     `$GITHUB_PATH` or `$GITHUB_ENV` write, a `.cargo/config.toml`, a shell
     function named `cargo`, a checkout of another commit — while the cargo
     line itself still matches. Each pair is equal but for its `name`; the
-    checkout but for release.yml's `with.ref` (the tag; ci.yml checks the tree
+    first step but for release.yml's `with.ref` when it is exactly
+    `RELEASE_CHECKOUT_REF` (`_check_release_checkout`; ci.yml checks the tree
     under test); the cargo step but for its text, which on ci.yml's side is
     exactly its one cargo line and on release.yml's side opens with it, and
     its `env`, which `_check_cargo_scope` compares merged with the enclosing
@@ -5924,7 +6059,7 @@ def _check_mirrored_steps(
                 _compare(what, _mirrored(ci_s, ("run", "env")), _mirrored(rel_s, ("run", "env")), errors)
             continue
         want = _mirrored(rel_s, ())
-        if str(rel_s.get("uses", "")).startswith(_CHECKOUT_ACTION) and isinstance(want.get("with"), dict):
+        if _tag_ref_set_aside(rel_steps, rel_s) and isinstance(want.get("with"), dict):
             with_ = {k: v for k, v in want["with"].items() if k != "ref"}
             if with_:
                 want["with"] = with_
@@ -6004,10 +6139,23 @@ _STRING_BUILDING_FUNCTIONS = frozenset({"format", "join", "fromjson"})
 # point at the same kind of file on both sides. Every other `GITHUB_*` name
 # carries the run's event, ref, commit or workflow, and an `ACTIONS_*` name the
 # run's token grants (`ACTIONS_ID_TOKEN_REQUEST_URL` follows the parity-free
-# `permissions`), which differ.
+# `permissions`), and a `RUNNER_*` name the run's attempt (`RUNNER_DEBUG` is
+# set on a debug re-run only), which differ.
 _COMMAND_FILE_VARS = frozenset({"GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE"})
-_GITHUB_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:GITHUB|ACTIONS)_[A-Za-z0-9_]*", re.IGNORECASE)
+_GITHUB_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:GITHUB|ACTIONS|RUNNER)_[A-Za-z0-9_]*", re.IGNORECASE)
 _NAME_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
+# A line continuation the shell removes before it reads a name: bash's
+# backslash-newline, pwsh's backtick-newline, either with a CR before the
+# newline. `$GITHUB\` + newline + `_REF` is `$GITHUB_REF` to bash.
+_LINE_CONTINUATION_RE = re.compile(r"[\\`]\r?\n")
+
+
+def _scanned_texts(text: str) -> tuple[str, ...]:
+    """`text` as the name scans read it: as written and, when it differs,
+    with every line continuation removed. Removing one where the shell would
+    not (inside single quotes) only adds a text to scan, never drops one."""
+    joined = _LINE_CONTINUATION_RE.sub("", text)
+    return (text,) if joined == text else (text, joined)
 # The contexts a string of the region may read: a workflow's own strings the
 # matrix leg (compared key by key), a local action's its inputs (the compared
 # `with:`) and its own steps' outputs — the latter never inside a `run:`, where
@@ -6047,6 +6195,13 @@ def _effective_env(wf_doc: dict, job: dict, step: dict, where: str, errors: list
                 "expression can set any variable; refused"
             )
             return None
+        typed = sorted(k for k, v in env.items() if not isinstance(v, str))
+        if typed:
+            errors.append(
+                f"check 23: {where}: the {level.value} `env` sets {typed!r} to a non-string; GitHub hands the "
+                "process its own text of the value (`1`, `true`), which a typed compare cannot see; quote it"
+            )
+            return None
         merged.update((k, _EnvSetting(v, level)) for k, v in env.items())
     return merged
 
@@ -6059,7 +6214,7 @@ def _env_differences(
     used: set[AllowedEnvDifference] = set()
     for key in sorted(set(ci_env) | set(rel_env)):
         c, r = ci_env.get(key), rel_env.get(key)
-        if c is not None and r is not None and c.value == r.value:
+        if c is not None and r is not None and _same_value(c.value, r.value):
             continue
         only = (_Side.CI, c) if r is None else (_Side.RELEASE, r) if c is None else None
         allowed = None
@@ -6069,7 +6224,7 @@ def _env_differences(
                 (
                     a
                     for a in ALLOWED_ENV_DIFFERENCES
-                    if a.side is side and a.level is setting.level and a.key == key and a.value == setting.value
+                    if a.side is side and a.level is setting.level and a.key == key and _same_value(a.value, setting.value)
                 ),
                 None,
             )
@@ -6164,8 +6319,8 @@ def _cargo_region(
     """Every string that can reach `side`'s cargo command: the workflow and
     job keys check 23 compares, each step up to the cargo step, the cargo
     step but for its text after the cargo line, and the steps of the local
-    actions these use. Left out: the parity-free keys, release.yml's checkout
-    `with.ref`, the values of the allowed env differences `unread`, and a
+    actions these use. Left out: the parity-free keys, release.yml's first-step
+    checkout `with.ref` of exactly `RELEASE_CHECKOUT_REF`, the values of the allowed env differences `unread`, and a
     `Swatinem/rust-cache` `with.save-if` of exactly `RUST_CACHE_SAVE_IF` —
     it gates saving the cache, never what is restored or compiled."""
     where = f"{side.value} {label} job"
@@ -6198,7 +6353,7 @@ def _cargo_region(
         uses = str(body.get("uses", ""))
         if isinstance(body.get("with"), dict):
             with_ = dict(body["with"])
-            if side is _Side.RELEASE and uses.startswith(_CHECKOUT_ACTION):
+            if side is _Side.RELEASE and _tag_ref_set_aside(steps, st):
                 with_.pop("ref", None)
             if uses.casefold().startswith(RUST_CACHE_REPO.casefold() + "@") and with_.get("save-if") == RUST_CACHE_SAVE_IF:
                 del with_["save-if"]
@@ -6271,6 +6426,15 @@ def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
             continue
         if not item.bare:
             _refuse_spliced_names(item, parsed, errors)
+            for joined in _scanned_texts(item.text)[1:]:
+                parsed_joined = gha_expr.parse_template(joined)
+                if isinstance(parsed_joined, gha_expr.Refusal):
+                    errors.append(
+                        f"check 23: {item.where}: {item.text!r} with its line continuations removed is not a "
+                        f"readable expression ({parsed_joined.why}); refused"
+                    )
+                else:
+                    _refuse_spliced_names(replace(item, text=joined), parsed_joined, errors)
         for e in parsed.exprs:
             why = _parity_context_refusal(e, item.contexts)
             if why is not None:
@@ -6286,7 +6450,7 @@ def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
                 and n.path
                 and isinstance(n.path[0], gha_expr.Prop)
             )
-        for m in _GITHUB_VAR_RE.finditer(item.text):
+        for m in (m for text in _scanned_texts(item.text) for m in _GITHUB_VAR_RE.finditer(text)):
             if m.group(0).upper() not in _COMMAND_FILE_VARS:
                 errors.append(
                     f"check 23: {item.where}: {item.text!r} names the runner variable `{m.group(0)}`, which can "
@@ -6304,7 +6468,8 @@ def _refuse_allowed_names_read(
     for a in sorted(used, key=lambda a: a.key):
         name = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(a.key)}(?![A-Za-z0-9_])", re.IGNORECASE)
         for item in region:
-            if (a.level is not _EnvLevel.CARGO_STEP or item.in_cargo_step) and name.search(item.text):
+            visible = a.level is not _EnvLevel.CARGO_STEP or item.in_cargo_step
+            if visible and any(name.search(text) for text in _scanned_texts(item.text)):
                 errors.append(
                     f"check 23: {item.where}: {item.text!r} names `{a.key}`, which only "
                     f"{a.side.value}'s {label} cargo command sees (ALLOWED_ENV_DIFFERENCES: {a.why}); refused"
@@ -6384,6 +6549,12 @@ def _compare_matrix_reads(
                     f"check 23: matrix `{key}` for target {target!r} is a mapping or list, whose keys no name "
                     "scan reads; a matrix value read by a step that reaches the cargo command must be a scalar"
                 )
+            elif any(key in leg and not isinstance(leg[key], str) for leg in (ci_leg, rel_leg)):
+                errors.append(
+                    f"check 23: matrix `{key}` for target {target!r} is a non-string scalar; GitHub splices its "
+                    "own text of it (`1`, `true`), so a value read by a step that reaches the cargo command must "
+                    "be a string; quote it"
+                )
             _compare(
                 f"matrix `{key}` for target {target!r} (read by a step that reaches the cargo command)",
                 ci_leg.get(key),
@@ -6443,14 +6614,16 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
             errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
 
     _job_unmasked(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", errors)
+    _check_release_checkout(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
+    _check_release_checkout(rel[RELEASE_FREEBSD_JOB], f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors)
     _job_unmasked(ci[CI_RELEASE_FREEBSD_JOB], f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", errors)
     # The same `os` per target means the same runner only when both jobs run on
     # `matrix.os`; the job's environment must agree too.
     _compare_job_keys("native", ci_native, rel_native, errors)
-    ci_cargo = _cargo_step(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", errors)
-    rel_cargo = _cargo_step(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
+    ci_cargo = _cargo_step(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", repo, errors)
+    rel_cargo = _cargo_step(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", repo, errors)
     if ci_cargo is not None and rel_cargo is not None:
-        _compare("native cargo command (verb aside)", ci_cargo.tokens, rel_cargo.tokens, errors)
+        _compare("native cargo command (verb aside)", ci_cargo.args, rel_cargo.args, errors)
         _check_mirrored_steps(ci_native, rel_native, ci_cargo, rel_cargo, "native", False, errors)
         for key in ("shell", "working-directory"):
             _compare(f"native cargo step `{key}`", ci_cargo.step.get(key), rel_cargo.step.get(key), errors)
@@ -6483,12 +6656,12 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         for key in ("usesh", "prepare"):
             _compare(f"FreeBSD VM `{key}`", ci_with.get(key), rel_with.get(key), errors)
     _compare_job_keys("FreeBSD", ci_bsd, rel_bsd, errors)
-    ci_bsd_cargo = _cargo_step(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", errors, vm_run=True)
+    ci_bsd_cargo = _cargo_step(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", repo, errors, vm_run=True)
     rel_bsd_cargo = _cargo_step(
-        rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "build", errors, vm_run=True
+        rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "build", repo, errors, vm_run=True
     )
     if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
-        _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.tokens, rel_bsd_cargo.tokens, errors)
+        _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.args, rel_bsd_cargo.args, errors)
         _check_mirrored_steps(ci_bsd, rel_bsd, ci_bsd_cargo, rel_bsd_cargo, "FreeBSD", True, errors)
         # No matrix on either side, so `${{ matrix.k }}` reads one empty leg.
         for side, bsd in ((_Side.CI, ci_bsd), (_Side.RELEASE, rel_bsd)):
