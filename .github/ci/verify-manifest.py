@@ -378,29 +378,42 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       equal (a target missing from either side, or on another `os`, is
       refused); each native job's one cargo command, its pinned-toolchain
       step and its musl-install step are equal, as are the FreeBSD jobs'
-      VM action, `usesh`, `prepare` and cargo command, the verb aside
-      (`build` there, `check` here).  Every job key but `name`, `needs`,
-      `if`, `timeout-minutes`, `strategy` and `steps` is equal (`runs-on`,
-      `env`, `defaults`, `container`, `services`, `permissions`, ..), as are
-      the native cargo step's `shell`, `working-directory` and `env.TARGET`
-      and the VM step's `env`.  Each ci.yml job runs release.yml's steps up
-      to and including the cargo step, one for one and nothing else: each
-      pair equal but for its `name`, the checkout but for release.yml's
-      `with.ref`, and the cargo step but for its text — on ci.yml's side
-      exactly its one cargo line — and its `env`, on ci.yml's side a subset
-      of release.yml's; so no other step or line (a `$GITHUB_PATH` or
-      `$GITHUB_ENV` write, a `.cargo/config.toml`, a `cargo` shell function,
-      a checkout of another commit) can change what the cargo line runs.
-      A cargo-carrying step with an `if:` or a `continue-on-error`, or a
-      ci.yml job with a `continue-on-error`, is refused, since either lets
-      the job succeed without the cargo command; and release.yml's completeness
-      `expected` list is exactly the artifacts its jobs publish.  A job,
-      matrix, cargo line or VM step that is absent or not one literal
-      is refused.  Both release builds carry `--features ipe/wasi_run`, so
-      the shipped `ipe` has the embedded WASI run its refusal text promises.
+      VM action, `usesh`, `prepare`, `strategy` and cargo command, the verb
+      aside (`build` there, `check` here).  Each ci.yml job runs release.yml's
+      steps up to and including the cargo step, one for one and nothing
+      else, each pair equal but for its `name` and release.yml's checkout
+      `with.ref`.  The whole static scope that can reach the cargo command
+      is compared both ways: the workflow keys but `name`, `run-name`, `on`,
+      `permissions`, `concurrency` and `jobs` (`defaults` among them); the
+      job keys but `name`, `needs`, `if`, `timeout-minutes`, `strategy` and
+      `steps`; the cargo command's environment, workflow, job and step
+      `env` merged; and the cargo step's text, which is exactly its one
+      cargo line on ci.yml's side and opens with it on release.yml's (lines
+      after it, the packaging, cannot reach it).  The environments are equal
+      but for the closed, value-pinned `ALLOWED_ENV_DIFFERENCES`, each entry
+      named with its why; an entry no longer used is refused, and so is any
+      read of an allowed name where it is visible (the whole region for a
+      workflow entry, the cargo step for a step entry).  Every expression in
+      that region (the steps, the job keys, the local actions they use) may
+      read only `matrix.<key>` and the pure functions, plus `inputs` and
+      `steps` inside a local action; every matrix key read is equal for each
+      target on both sides, and a literal `GITHUB_*` name other than the
+      command files is refused, so no event, ref, variable or secret can make
+      the two runs differ.  A cargo-carrying step with an `if:` or a
+      `continue-on-error`, or a ci.yml job with a `continue-on-error`, is
+      refused, since either lets the job succeed without the cargo command;
+      and release.yml's completeness `expected` list is exactly the
+      artifacts its jobs publish.  A job, matrix, `env`, cargo line or VM
+      step that is absent or not one literal is refused.  Both release
+      builds carry `--features ipe/wasi_run`, so the shipped `ipe` has the
+      embedded WASI run its refusal text promises.
       LIMIT: `cargo check` does not link, so a link-time
       failure of a target is not seen; the FreeBSD toolchain is the VM's
-      unpinned `pkg install rust`.
+      unpinned `pkg install rust`.  LIMIT: a runner variable read
+      dynamically (`${!x}`, `printenv`, `env`, `eval`), the internals of the
+      third-party actions (checkout, rust-cache, the toolchain and VM
+      actions), and a build script or proc-macro reading an allowed name are
+      not proven absent.
   LIMIT (checks 15, 16, 20, 22, 23): a cargo line is read as run, not
   proven to reach its step's exit status — `cargo .. || true`, an `exit 0`
   before it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail`
@@ -5292,6 +5305,10 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
         template engine): legitimate tools take author-written `-c` text,
         so the verifier cannot tell the two apart; and interpreter
         variables (`PYTHON*`) that steer the canonical pip install;
+      - a `run:` that reads a runner variable (`$GITHUB_EVENT_NAME`,
+        `$GITHUB_REF`, ..) in the shell rather than through `${{ }}`: the
+        text scan here does not model it (check 23 refuses the literal names
+        in its region only);
       - shadowing a checked command by means other than a shell function or
         alias written in the same `run:` (a `PATH` entry, `BASH_ENV`, a
         sourced file);
@@ -5725,12 +5742,15 @@ def _cargo_lines(text: object) -> list[str]:
 
 @dataclass(frozen=True)
 class _CargoStep:
-    """A job's one cargo-carrying step, that command's line, and its tokens
-    with the verb word replaced by a placeholder."""
+    """A job's one cargo-carrying step, that command's line, its tokens with
+    the verb word replaced by a placeholder, and the step text's other
+    non-empty lines before and after the cargo line."""
 
     step: dict
     line: str
     tokens: list[str]
+    before: tuple[str, ...]
+    after: tuple[str, ...]
 
 
 def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: bool = False) -> _CargoStep | None:
@@ -5764,7 +5784,11 @@ def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: boo
     if len(tokens) < 2 or tokens[1] != verb:
         errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
         return None
-    return _CargoStep(step, str(line), [tokens[0], "<verb>", *tokens[2:]])
+    holder = step.get("with") if vm_run else step
+    text = holder.get("run") if isinstance(holder, dict) else None
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    at = lines.index(str(line))
+    return _CargoStep(step, str(line), [tokens[0], "<verb>", *tokens[2:]], tuple(lines[:at]), tuple(lines[at + 1 :]))
 
 
 def _job_unmasked(job: dict, where: str, errors: list[str]) -> None:
@@ -5855,8 +5879,9 @@ def _check_mirrored_steps(
     line itself still matches. Each pair is equal but for its `name`; the
     checkout but for release.yml's `with.ref` (the tag; ci.yml checks the tree
     under test); the cargo step but for its text, which on ci.yml's side is
-    exactly its one cargo line, and its `env`, which on ci.yml's side is a
-    subset of release.yml's."""
+    exactly its one cargo line and on release.yml's side opens with it, and
+    its `env`, which `_check_cargo_scope` compares merged with the enclosing
+    scopes."""
     ci_steps, rel_steps = _steps_of(ci_job), _steps_of(rel_job)
     cut = next((i for i, s in enumerate(rel_steps) if s is rel_cargo.step), None)
     if cut is None:
@@ -5875,21 +5900,17 @@ def _check_mirrored_steps(
             if ci_s is not ci_cargo.step:
                 errors.append(f"check 23: ci.yml's {label} cargo command must sit in step {n}, as in release.yml; refused")
                 continue
-            holder_ci = ci_s.get("with") if vm_run else ci_s
-            text = holder_ci.get("run") if isinstance(holder_ci, dict) else None
-            lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
-            if lines != [ci_cargo.line]:
+            if ci_cargo.before or ci_cargo.after:
+                lines = [*ci_cargo.before, ci_cargo.line, *ci_cargo.after]
                 errors.append(
                     f"check 23: ci.yml's {label} cargo step must run only `{ci_cargo.line}`, and runs {lines!r}: "
                     "another line can redefine or skip it; refused"
                 )
-            ci_env, rel_env = ci_s.get("env"), rel_s.get("env")
-            ci_env = ci_env if isinstance(ci_env, dict) else ({} if ci_env is None else {"": ci_env})
-            rel_env = rel_env if isinstance(rel_env, dict) else {}
-            extra = sorted(k for k, v in ci_env.items() if k not in rel_env or rel_env[k] != v)
-            if extra:
+            if rel_cargo.before:
                 errors.append(
-                    f"check 23: ci.yml's {label} cargo step sets `env` {extra!r} that release.yml's does not; refused"
+                    f"check 23: {RELEASE_WORKFLOW}'s {label} cargo step runs {list(rel_cargo.before)!r} before "
+                    f"`{rel_cargo.line}`: a line there (a `cd`, an `export`) changes what the cargo line runs, "
+                    "so the cargo line must open the step; refused"
                 )
             if vm_run:
                 ci_with = {k: v for k, v in (ci_s.get("with") or {}).items() if k != "run"}
@@ -5907,6 +5928,411 @@ def _check_mirrored_steps(
             else:
                 del want["with"]
         _compare(what, _mirrored(ci_s, ()), want, errors)
+
+
+class _Side(enum.Enum):
+    """The workflow a value of a release-target pair comes from."""
+
+    CI = "ci.yml"
+    RELEASE = RELEASE_WORKFLOW
+
+
+class _EnvLevel(enum.Enum):
+    """Where a variable of the cargo command's environment is set."""
+
+    WORKFLOW = "workflow"
+    JOB = "job"
+    CARGO_STEP = "cargo step"
+
+
+@dataclass(frozen=True)
+class _EnvSetting:
+    value: object
+    level: _EnvLevel
+
+
+@dataclass(frozen=True)
+class AllowedEnvDifference:
+    """A variable only one side's cargo command sees, at one level and with
+    one value, and why it cannot change what compiles. Its name may not be
+    read anywhere it is visible in the compared region."""
+
+    side: _Side
+    level: _EnvLevel
+    key: str
+    value: object
+    why: str
+
+
+# The closed list of environment differences between a ci.yml release-target
+# job and its release.yml job. Every entry must still be in use; a new one
+# must say why it cannot change what the cargo command compiles.
+ALLOWED_ENV_DIFFERENCES: tuple[AllowedEnvDifference, ...] = (
+    AllowedEnvDifference(
+        _Side.CI, _EnvLevel.WORKFLOW, "CARGO_TERM_COLOR", "always",
+        "colours cargo's terminal output; it selects no code and no profile",
+    ),
+    AllowedEnvDifference(
+        _Side.CI, _EnvLevel.WORKFLOW, "CARGO_INCREMENTAL", "0",
+        "turns off the incremental cache, which `--release` already leaves off; it changes the build "
+        "cache, never which code compiles or whether it does",
+    ),
+    AllowedEnvDifference(
+        _Side.RELEASE, _EnvLevel.CARGO_STEP, "EXT", "${{ matrix.ext }}",
+        "the binary suffix the copy lines after the cargo line read; the cargo line may not name it",
+    ),
+)
+
+# Workflow keys that cannot reach a job's cargo command: the trigger (its
+# evaluation context is held apart by the expression rule below), the token
+# scope and run grouping, the display names, and the jobs compared one by one.
+# `env` is compared merged with the job and step levels; every other key
+# (`defaults`, ..) is compared as written.
+_PARITY_FREE_WORKFLOW_KEYS = frozenset({"name", "run-name", "on", True, "permissions", "concurrency", "jobs", "env"})
+# Expression functions whose value depends on their arguments alone; a status
+# function (`success()`, `always()`), `hashFiles` and anything else is refused.
+_PURE_EXPRESSION_FUNCTIONS = frozenset({"contains", "startswith", "endswith", "format", "join", "tojson", "fromjson"})
+# Runner variables naming a per-step command file: read in equal text, they
+# point at the same kind of file on both sides. Every other `GITHUB_*` name
+# carries the run's event, ref, commit or workflow, which differ.
+_COMMAND_FILE_VARS = frozenset({"GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE"})
+_GITHUB_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])GITHUB_[A-Za-z0-9_]*", re.IGNORECASE)
+# The contexts a string of the region may read: a workflow's own strings the
+# matrix leg (compared key by key), a local action's its inputs (the compared
+# `with:`) and its own steps' outputs.
+_STEP_CONTEXTS = frozenset({"matrix"})
+_ACTION_CONTEXTS = frozenset({"inputs", "steps"})
+
+
+@dataclass(frozen=True)
+class _RegionText:
+    """One string of the region that can reach the cargo command: `bare`
+    marks a step `if:` (an expression without `${{ }}`), `contexts` the
+    contexts it may read, `in_cargo_step` the cargo step's own strings."""
+
+    where: str
+    text: str
+    bare: bool
+    contexts: frozenset[str]
+    in_cargo_step: bool
+
+
+def _effective_env(wf_doc: dict, job: dict, step: dict, where: str, errors: list[str]) -> dict[str, _EnvSetting] | None:
+    """The cargo step's environment: workflow `env`, then job `env`, then
+    step `env`, each later level overriding. A level whose `env` is not a
+    literal mapping (an expression can set any variable) is refused."""
+    merged: dict[str, _EnvSetting] = {}
+    for level, holder in ((_EnvLevel.WORKFLOW, wf_doc), (_EnvLevel.JOB, job), (_EnvLevel.CARGO_STEP, step)):
+        env = holder.get("env")
+        if env is None:
+            continue
+        if not isinstance(env, dict) or not all(isinstance(k, str) for k in env):
+            errors.append(
+                f"check 23: {where}: the {level.value} `env` must be a literal mapping, and is {env!r}: an "
+                "expression can set any variable; refused"
+            )
+            return None
+        merged.update((k, _EnvSetting(v, level)) for k, v in env.items())
+    return merged
+
+
+def _env_differences(
+    label: str, ci_env: dict[str, _EnvSetting], rel_env: dict[str, _EnvSetting], errors: list[str]
+) -> set[AllowedEnvDifference]:
+    """Both environments are equal, key for key both ways, but for entries of
+    `ALLOWED_ENV_DIFFERENCES`; the entries used."""
+    used: set[AllowedEnvDifference] = set()
+    for key in sorted(set(ci_env) | set(rel_env)):
+        c, r = ci_env.get(key), rel_env.get(key)
+        if c is not None and r is not None and c.value == r.value:
+            continue
+        only = (_Side.CI, c) if r is None else (_Side.RELEASE, r) if c is None else None
+        allowed = None
+        if only is not None:
+            side, setting = only
+            allowed = next(
+                (
+                    a
+                    for a in ALLOWED_ENV_DIFFERENCES
+                    if a.side is side and a.level is setting.level and a.key == key and a.value == setting.value
+                ),
+                None,
+            )
+        if allowed is None:
+            errors.append(
+                f"check 23: the {label} cargo command's environment (workflow, job and step `env` merged) has "
+                f"`{key}` = {c.value if c else None!r} in ci.yml ({c.level.value if c else 'unset'}) but "
+                f"{r.value if r else None!r} in {RELEASE_WORKFLOW} ({r.level.value if r else 'unset'}); they "
+                "must be equal, or the difference a named entry of ALLOWED_ENV_DIFFERENCES"
+            )
+            continue
+        used.add(allowed)
+    return used
+
+
+def _region_strings(node: object, where: str, step_level: bool, errors: list[str]) -> list[tuple[str, str, bool]]:
+    """Every string value under `node` as (where, text, bare); `bare` marks a
+    step's own `if:`. Nesting past `STRING_SCALAR_DEPTH_LIMIT` is refused."""
+    out: list[tuple[str, str, bool]] = []
+    stack: list[tuple[str, object, int, bool]] = [(where, node, 0, False)]
+    while stack:
+        path, value, depth, bare = stack.pop()
+        if isinstance(value, str):
+            out.append((path, value, bare))
+        elif isinstance(value, (dict, list)):
+            if depth >= STRING_SCALAR_DEPTH_LIMIT:
+                errors.append(f"check 23: {path} nests deeper than {STRING_SCALAR_DEPTH_LIMIT}; refused")
+                continue
+            items = value.items() if isinstance(value, dict) else enumerate(value)
+            for k, v in items:
+                stack.append((f"{path}.{k}", v, depth + 1, step_level and depth == 0 and k == "if"))
+    return out
+
+
+def _local_action_strings(uses: str, repo: str, where: str, depth: int, errors: list[str]) -> list[_RegionText]:
+    """The step strings of the local composite action `uses` names and of
+    every local action it uses in turn (to `LOCAL_ACTION_DEPTH_LIMIT`
+    levels): an action runs in the workflow's evaluation context too. An
+    action that cannot be read as a composite is refused."""
+    rel = posixpath.normpath(uses.split("@", 1)[0][2:])
+    found = [os.path.join(repo, rel, n) for n in ("action.yml", "action.yaml") if os.path.isfile(os.path.join(repo, rel, n))]
+    if depth >= LOCAL_ACTION_DEPTH_LIMIT or len(found) != 1:
+        why = "nests local actions too deep" if found else "has no single action.yml/action.yaml"
+        errors.append(f"check 23: {where}: local action {uses!r} {why}, so what it reads cannot be compared; refused")
+        return []
+    try:
+        with open(found[0]) as f:
+            doc = strict_yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        errors.append(f"check 23: {where}: local action {uses!r} is unreadable ({e}); refused")
+        return []
+    runs = doc.get("runs") if isinstance(doc, dict) else None
+    steps = runs.get("steps") if isinstance(runs, dict) and runs.get("using") == "composite" else None
+    if not isinstance(steps, list) or not all(isinstance(st, dict) for st in steps):
+        errors.append(f"check 23: {where}: local action {uses!r} is not a composite of step mappings; refused")
+        return []
+    out: list[_RegionText] = []
+    for n, st in enumerate(steps, start=1):
+        swhere = f"{where} -> {uses} step {n}"
+        body = {k: v for k, v in st.items() if k != "name"}
+        out.extend(_RegionText(w, t, b, _ACTION_CONTEXTS, False) for w, t, b in _region_strings(body, swhere, True, errors))
+        inner = st.get("uses")
+        if isinstance(inner, str) and inner.startswith("./"):
+            out.extend(_local_action_strings(inner, repo, swhere, depth + 1, errors))
+    return out
+
+
+def _cargo_region(
+    side: _Side,
+    wf_doc: dict,
+    job: dict,
+    cargo: _CargoStep,
+    vm_run: bool,
+    unread: set[AllowedEnvDifference],
+    label: str,
+    repo: str,
+    errors: list[str],
+) -> list[_RegionText]:
+    """Every string that can reach `side`'s cargo command: the workflow and
+    job keys check 23 compares, each step up to the cargo step, the cargo
+    step but for its text after the cargo line, and the steps of the local
+    actions these use. Left out: the parity-free keys, release.yml's checkout
+    `with.ref`, the values of the allowed env differences `unread`, and a
+    `Swatinem/rust-cache` `with.save-if` of exactly `RUST_CACHE_SAVE_IF` —
+    it gates saving the cache, never what is restored or compiled."""
+    where = f"{side.value} {label} job"
+    skip = {(a.level, a.key) for a in unread if a.side is side}
+
+    def env_without(env: object, level: _EnvLevel) -> object:
+        return {k: v for k, v in env.items() if (level, k) not in skip} if isinstance(env, dict) else env
+
+    texts: list[tuple[str, str, bool, bool]] = []
+    wf_part = {k: v for k, v in wf_doc.items() if k not in _PARITY_FREE_WORKFLOW_KEYS or k == "env"}
+    if "env" in wf_part:
+        wf_part["env"] = env_without(wf_part["env"], _EnvLevel.WORKFLOW)
+    texts.extend((w, t, b, False) for w, t, b in _region_strings(wf_part, f"{side.value} workflow", False, errors))
+    job_part = {k: v for k, v in job.items() if k not in _PARITY_FREE_JOB_KEYS}
+    if "env" in job_part:
+        job_part["env"] = env_without(job_part["env"], _EnvLevel.JOB)
+    texts.extend((w, t, b, False) for w, t, b in _region_strings(job_part, where, False, errors))
+    steps = _steps_of(job)
+    cut = next((i for i, s in enumerate(steps) if s is cargo.step), len(steps) - 1)
+    out: list[_RegionText] = []
+    for n, st in enumerate(steps[: cut + 1], start=1):
+        is_cargo = st is cargo.step
+        body = {k: v for k, v in st.items() if k != "name"}
+        uses = str(body.get("uses", ""))
+        if isinstance(body.get("with"), dict):
+            with_ = dict(body["with"])
+            if side is _Side.RELEASE and uses.startswith(_CHECKOUT_ACTION):
+                with_.pop("ref", None)
+            if uses.casefold().startswith(RUST_CACHE_REPO.casefold() + "@") and with_.get("save-if") == RUST_CACHE_SAVE_IF:
+                del with_["save-if"]
+            if is_cargo and vm_run:
+                with_.pop("run", None)
+            body["with"] = with_
+        if is_cargo:
+            if not vm_run:
+                body.pop("run", None)
+            if "env" in body:
+                body["env"] = env_without(body["env"], _EnvLevel.CARGO_STEP)
+            swhere = f"{where} cargo step"
+            texts.extend((f"{swhere} line", ln, False, True) for ln in (*cargo.before, cargo.line))
+        else:
+            swhere = f"{where} step {n}"
+        texts.extend((w, t, b, is_cargo) for w, t, b in _region_strings(body, swhere, True, errors))
+        if uses.startswith("./"):
+            out.extend(_local_action_strings(uses, repo, swhere, 0, errors))
+    return [_RegionText(w, t, b, _STEP_CONTEXTS, c) for w, t, b, c in texts] + out
+
+
+def _parity_context_refusal(e: gha_expr.Expr, contexts: frozenset[str]) -> str | None:
+    """Why `e` can evaluate differently in the two workflows, or None: a
+    context outside `contexts`, a context read whole or by a computed name,
+    or a function outside `_PURE_EXPRESSION_FUNCTIONS`."""
+    for node in gha_expr.walk(e):
+        if isinstance(node, gha_expr.Call) and node.name.casefold() not in _PURE_EXPRESSION_FUNCTIONS:
+            return f"`{node.name}()`"
+        if isinstance(node, gha_expr.ContextRef):
+            if node.ctx.casefold() not in contexts:
+                return f"the `{node.ctx}` context"
+            if not node.path or not isinstance(node.path[0], gha_expr.Prop):
+                return f"`{node.ctx}` read whole or by a computed name"
+    return None
+
+
+def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
+    """Refuse every string of `region` that can evaluate differently in the
+    two workflows; the matrix keys it reads (case-folded)."""
+    reads: set[str] = set()
+    for item in region:
+        parsed = gha_expr.parse_condition(item.text) if item.bare else gha_expr.parse_template(item.text)
+        if isinstance(parsed, gha_expr.Refusal):
+            errors.append(f"check 23: {item.where}: {item.text!r} is not a readable expression ({parsed.why}); refused")
+            continue
+        for e in parsed.exprs:
+            why = _parity_context_refusal(e, item.contexts)
+            if why is not None:
+                errors.append(
+                    f"check 23: {item.where}: {item.text!r} reads {why}, which can differ between ci.yml and "
+                    f"{RELEASE_WORKFLOW} in a step that reaches the cargo command; refused"
+                )
+            reads.update(
+                n.path[0].name.casefold()
+                for n in gha_expr.walk(e)
+                if isinstance(n, gha_expr.ContextRef)
+                and n.ctx.casefold() == "matrix"
+                and n.path
+                and isinstance(n.path[0], gha_expr.Prop)
+            )
+        for m in _GITHUB_VAR_RE.finditer(item.text):
+            if m.group(0).upper() not in _COMMAND_FILE_VARS:
+                errors.append(
+                    f"check 23: {item.where}: {item.text!r} names the runner variable `{m.group(0)}`, which can "
+                    f"differ between ci.yml and {RELEASE_WORKFLOW} in a step that reaches the cargo command; refused"
+                )
+    return reads
+
+
+def _refuse_allowed_names_read(
+    region: list[_RegionText], used: set[AllowedEnvDifference], label: str, errors: list[str]
+) -> None:
+    """An allowed env difference's name is read nowhere it is visible: a
+    workflow- or job-level variable in any string of the region, a cargo-step
+    variable in the cargo step's own strings."""
+    for a in sorted(used, key=lambda a: a.key):
+        name = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(a.key)}(?![A-Za-z0-9_])", re.IGNORECASE)
+        for item in region:
+            if (a.level is not _EnvLevel.CARGO_STEP or item.in_cargo_step) and name.search(item.text):
+                errors.append(
+                    f"check 23: {item.where}: {item.text!r} names `{a.key}`, which only "
+                    f"{a.side.value}'s {label} cargo command sees (ALLOWED_ENV_DIFFERENCES: {a.why}); refused"
+                )
+
+
+def _matrix_by_key(leg: dict, where: str, errors: list[str]) -> dict[str, object] | None:
+    """`leg` keyed case-folded, as an expression reads it; two keys that fold
+    alike are refused."""
+    out: dict[str, object] = {}
+    for k, v in leg.items():
+        folded = str(k).casefold()
+        if folded in out:
+            errors.append(f"check 23: {where}: matrix keys fold to the same name {folded!r}; refused")
+            return None
+        out[folded] = v
+    return out
+
+
+@dataclass(frozen=True)
+class _CargoScope:
+    """One side's cargo command in its whole static context: the merged
+    environment and every string that can reach the command."""
+
+    env: dict[str, _EnvSetting]
+    region: list[_RegionText]
+
+
+def _check_cargo_scope(
+    label: str,
+    docs: tuple[dict, dict],
+    jobs: tuple[dict, dict],
+    cargos: tuple[_CargoStep, _CargoStep],
+    vm_run: bool,
+    repo: str,
+    errors: list[str],
+) -> tuple[set[AllowedEnvDifference], set[str]] | None:
+    """Compare the cargo command's whole static context on both sides,
+    symmetrically: the merged environment (`_env_differences`), the
+    workflow keys outside `_PARITY_FREE_WORKFLOW_KEYS`, and the region's
+    expressions and runner-variable reads (`_region_reads`). The allowed
+    env differences used and the matrix keys either region reads, or None
+    when an environment cannot be read."""
+    (ci_doc, rel_doc), (ci_job, rel_job), (ci_cargo, rel_cargo) = docs, jobs, cargos
+    for key in sorted({*ci_doc, *rel_doc} - _PARITY_FREE_WORKFLOW_KEYS, key=str):
+        _compare(f"workflow `{key}`", ci_doc.get(key), rel_doc.get(key), errors)
+    ci_env = _effective_env(ci_doc, ci_job, ci_cargo.step, f"ci.yml {label} cargo step", errors)
+    rel_env = _effective_env(rel_doc, rel_job, rel_cargo.step, f"{RELEASE_WORKFLOW} {label} cargo step", errors)
+    if ci_env is None or rel_env is None:
+        return None
+    used = _env_differences(label, ci_env, rel_env, errors)
+    scopes = (
+        _CargoScope(ci_env, _cargo_region(_Side.CI, ci_doc, ci_job, ci_cargo, vm_run, used, label, repo, errors)),
+        _CargoScope(rel_env, _cargo_region(_Side.RELEASE, rel_doc, rel_job, rel_cargo, vm_run, used, label, repo, errors)),
+    )
+    reads: set[str] = set()
+    for scope in scopes:
+        reads |= _region_reads(scope.region, errors)
+        _refuse_allowed_names_read(scope.region, used, label, errors)
+    return used, reads
+
+
+def _compare_matrix_reads(
+    reads: set[str], ci_legs: dict[str, dict], rel_legs: dict[str, dict], errors: list[str]
+) -> None:
+    """Every matrix key the native region reads has, for every target, one
+    value on both sides: an equal text over `${{ matrix.k }}` takes each
+    workflow's own leg value."""
+    for target in sorted(set(ci_legs).intersection(rel_legs)):
+        ci_leg = _matrix_by_key(ci_legs[target], f"ci.yml leg {target!r}", errors)
+        rel_leg = _matrix_by_key(rel_legs[target], f"{RELEASE_WORKFLOW} leg {target!r}", errors)
+        if ci_leg is None or rel_leg is None:
+            continue
+        for key in sorted(reads):
+            _compare(
+                f"matrix `{key}` for target {target!r} (read by a step that reaches the cargo command)",
+                ci_leg.get(key),
+                rel_leg.get(key),
+                errors,
+            )
+
+
+def _refuse_stale_allowed(used: set[AllowedEnvDifference], errors: list[str]) -> None:
+    for a in ALLOWED_ENV_DIFFERENCES:
+        if a not in used:
+            errors.append(
+                f"check 23: ALLOWED_ENV_DIFFERENCES names {a.side.value}'s {a.level.value} `{a.key}` = {a.value!r}, "
+                "which no release-target job sets that way any more; drop it"
+            )
 
 
 def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> None:
@@ -5929,6 +6355,9 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
                 return
         jobs[fname] = {job_id: have[job_id] for job_id in wanted}
     ci, rel = jobs["ci.yml"], jobs[RELEASE_WORKFLOW]
+    docs = (by_file["ci.yml"].doc, by_file[RELEASE_WORKFLOW].doc)
+    used: set[AllowedEnvDifference] = set()
+    scoped = 0
 
     ci_native, rel_native = ci[CI_RELEASE_NATIVE_JOB], rel[RELEASE_NATIVE_JOB]
     ci_legs = _matrix_legs(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", errors)
@@ -5959,13 +6388,14 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         _check_mirrored_steps(ci_native, rel_native, ci_cargo, rel_cargo, "native", False, errors)
         for key in ("shell", "working-directory"):
             _compare(f"native cargo step `{key}`", ci_cargo.step.get(key), rel_cargo.step.get(key), errors)
-        ci_env, rel_env = ci_cargo.step.get("env"), rel_cargo.step.get("env")
-        _compare(
-            "native cargo step `env.TARGET`",
-            ci_env.get("TARGET") if isinstance(ci_env, dict) else None,
-            rel_env.get("TARGET") if isinstance(rel_env, dict) else None,
-            errors,
+        scope = _check_cargo_scope(
+            "native", docs, (ci_native, rel_native), (ci_cargo, rel_cargo), False, repo, errors
         )
+        if scope is not None:
+            used |= scope[0]
+            scoped += 1
+            if ci_legs is not None and rel_legs is not None:
+                _compare_matrix_reads(scope[1], ci_legs, rel_legs, errors)
     _require_feature(rel_cargo.tokens if rel_cargo else None, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
     ci_tc = [s.get("with") for s in _steps_of(ci_native) if s.get("uses") == _TOOLCHAIN_ACTION]
     rel_tc = [s.get("with") for s in _steps_of(rel_native) if s.get("uses") == _TOOLCHAIN_ACTION]
@@ -5993,8 +6423,17 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     )
     if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
         _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.tokens, rel_bsd_cargo.tokens, errors)
-        _compare("FreeBSD VM step `env`", ci_bsd_cargo.step.get("env"), rel_bsd_cargo.step.get("env"), errors)
         _check_mirrored_steps(ci_bsd, rel_bsd, ci_bsd_cargo, rel_bsd_cargo, "FreeBSD", True, errors)
+        # No matrix on either side, so `${{ matrix.k }}` reads one empty leg.
+        _compare("FreeBSD job `strategy`", ci_bsd.get("strategy"), rel_bsd.get("strategy"), errors)
+        scope = _check_cargo_scope(
+            "FreeBSD", docs, (ci_bsd, rel_bsd), (ci_bsd_cargo, rel_bsd_cargo), True, repo, errors
+        )
+        if scope is not None:
+            used |= scope[0]
+            scoped += 1
+    if scoped == 2:
+        _refuse_stale_allowed(used, errors)
     _require_feature(
         rel_bsd_cargo.tokens if rel_bsd_cargo else None, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors
     )

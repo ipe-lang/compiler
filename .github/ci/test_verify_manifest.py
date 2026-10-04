@@ -6390,6 +6390,9 @@ class TestFeatureCoverage(unittest.TestCase):
 
 _RT_CI = """\
 on: pull_request
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
 jobs:
   release-targets-run:
     strategy:
@@ -6433,9 +6436,11 @@ jobs:
           - os: ubuntu-latest
             artifact: ipe-linux-x64
             target: x86_64-unknown-linux-musl
+            ext: ''
           - os: macos-latest
             artifact: ipe-darwin-arm64
             target: aarch64-apple-darwin
+            ext: ''
     runs-on: ${{ matrix.os }}
     steps:
       - uses: ./.github/actions/rust-toolchain-pinned
@@ -6447,9 +6452,11 @@ jobs:
       - shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
         run: |
           cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
           mkdir -p dist
+          cp "target/$TARGET/release/ipe$EXT" dist/
   build-freebsd:
     runs-on: ubuntu-latest
     steps:
@@ -6460,6 +6467,7 @@ jobs:
           run: |
             cargo build --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
             mkdir -p dist
+            cp target/release/ipe dist/ipe
       - uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
           name: ipe-freebsd-x64
@@ -6472,22 +6480,38 @@ jobs:
           expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"
           echo done
 """
+_RT_ACTION = """\
+name: pinned
+runs:
+  using: composite
+  steps:
+    - id: channel
+      shell: bash
+      run: echo "channel=1.0" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+      with:
+        toolchain: ${{ steps.channel.outputs.channel }}
+        targets: ${{ inputs.targets }}
+"""
 
 
 class TestReleaseTargetParity(unittest.TestCase):
     """Check 23: ci.yml checks exactly the targets release.yml builds."""
 
-    def errors(self, ci: str = _RT_CI, release: str = _RT_RELEASE) -> list[str]:
+    def errors(self, ci: str = _RT_CI, release: str = _RT_RELEASE, action: str = _RT_ACTION) -> list[str]:
         with tempfile.TemporaryDirectory() as repo:
             root = os.path.join(repo, ".github")
             _write(os.path.join(root, "workflows", "ci.yml"), ci)
             _write(os.path.join(root, "workflows", "release.yml"), release)
+            _write(os.path.join(root, "actions", "rust-toolchain-pinned", "action.yml"), action)
             errors: list[str] = []
             check_release_target_parity(errors, root=root)
             return errors
 
-    def assertRefused(self, needle: str, ci: str = _RT_CI, release: str = _RT_RELEASE) -> None:
-        errors = self.errors(ci, release)
+    def assertRefused(
+        self, needle: str, ci: str = _RT_CI, release: str = _RT_RELEASE, action: str = _RT_ACTION
+    ) -> None:
+        errors = self.errors(ci, release, action)
         self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
 
     @staticmethod
@@ -6512,7 +6536,8 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_target_only_in_ci_refused(self) -> None:
         release = self.swap(
             _RT_RELEASE,
-            "          - os: macos-latest\n            artifact: ipe-darwin-arm64\n            target: aarch64-apple-darwin\n",
+            "          - os: macos-latest\n            artifact: ipe-darwin-arm64\n            target: aarch64-apple-darwin\n"
+            "            ext: ''\n",
             "",
         )
         self.assertRefused("which release.yml does not build", release=release)
@@ -6609,7 +6634,7 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_cargo_step_shell_or_target_drift_refused(self) -> None:
         self.assertRefused("native cargo step `shell`", self.swap(_RT_CI, "      - shell: bash\n", "      - shell: pwsh\n"))
         self.assertRefused(
-            "native cargo step `env.TARGET`",
+            "`TARGET` = 'x86_64-unknown-linux-musl' in ci.yml (cargo step)",
             self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n", "          TARGET: x86_64-unknown-linux-musl\n"),
         )
         self.assertRefused(
@@ -6655,7 +6680,7 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_cargo_step_env_beyond_release_refused(self) -> None:
         ci = self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n        run: cargo", "          TARGET: ${{ matrix.target }}\n          RUSTC_WRAPPER: /tmp/w\n        run: cargo")
-        self.assertRefused("sets `env` ['RUSTC_WRAPPER']", ci)
+        self.assertRefused("`RUSTC_WRAPPER` = '/tmp/w' in ci.yml (cargo step) but None in release.yml (unset)", ci)
 
     def test_vm_input_drift_refused(self) -> None:
         ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n          run: |\n            cargo check", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n          run: |\n            cargo check")
@@ -6670,6 +6695,110 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_non_literal_matrix_refused(self) -> None:
         ci = self.swap(_RT_CI, "        include:\n", "        extra: [1]\n        include:\n")
         self.assertRefused("must be a matrix of only an `include` list", ci)
+
+    # The cargo command's whole static context: every scope that can reach it
+    # is compared both ways, with only `ALLOWED_ENV_DIFFERENCES` apart.
+
+    def test_release_line_before_cargo_line_refused(self) -> None:
+        for before in ("cd sub", "export RUSTFLAGS='--cfg broken'"):
+            with self.subTest(job="native", line=before):
+                release = self.swap(
+                    _RT_RELEASE, "        run: |\n          cargo build", f"        run: |\n          {before}\n          cargo build"
+                )
+                self.assertRefused(f"release.yml's native cargo step runs [{before!r}] before", release=release)
+            with self.subTest(job="freebsd", line=before):
+                release = self.swap(
+                    _RT_RELEASE, "          run: |\n            cargo build", f"          run: |\n            {before}\n            cargo build"
+                )
+                self.assertRefused(f"release.yml's FreeBSD cargo step runs [{before!r}] before", release=release)
+
+    def test_release_only_cargo_step_env_refused(self) -> None:
+        for key in ("RUSTFLAGS: --cfg broken", "CARGO_BUILD_TARGET_DIR: /tmp/t", "RUSTC_BOOTSTRAP: '1'"):
+            with self.subTest(key=key):
+                release = self.swap(_RT_RELEASE, "          EXT: ${{ matrix.ext }}\n", f"          EXT: ${{{{ matrix.ext }}}}\n          {key}\n")
+                self.assertRefused(f"has `{key.split(':')[0]}` = ", release=release)
+                self.assertRefused("None in ci.yml (unset)", release=release)
+        release = self.swap(
+            _RT_RELEASE,
+            "        env:\n          TARGET: ${{ matrix.target }}\n          EXT: ${{ matrix.ext }}\n",
+            "        env: ${{ fromJSON(vars.BUILD_ENV) }}\n",
+        )
+        self.assertRefused("the cargo step `env` must be a literal mapping", release=release)
+
+    def test_workflow_env_and_defaults_compared(self) -> None:
+        release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  RUSTFLAGS: --cfg broken\n")
+        self.assertRefused("`RUSTFLAGS` = None in ci.yml (unset) but '--cfg broken' in release.yml (workflow)", release=release)
+        ci = self.swap(_RT_CI, "  CARGO_INCREMENTAL: '0'\n", "  CARGO_INCREMENTAL: '0'\n  RUSTFLAGS: --cfg broken\n")
+        self.assertRefused("`RUSTFLAGS` = '--cfg broken' in ci.yml (workflow)", ci)
+        release = self.swap(
+            _RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\ndefaults:\n  run:\n    working-directory: sub\n"
+        )
+        self.assertRefused("ci.yml's workflow `defaults` is None", release=release)
+        release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv: ${{ vars.E }}\n")
+        self.assertRefused("the workflow `env` must be a literal mapping", release=release)
+
+    def test_allowed_env_differences_are_closed(self) -> None:
+        allowed = {(a.side.value, a.level.value, a.key, a.value) for a in verify_manifest.ALLOWED_ENV_DIFFERENCES}
+        self.assertEqual(
+            allowed,
+            {
+                ("ci.yml", "workflow", "CARGO_TERM_COLOR", "always"),
+                ("ci.yml", "workflow", "CARGO_INCREMENTAL", "0"),
+                ("release.yml", "cargo step", "EXT", "${{ matrix.ext }}"),
+            },
+        )
+        # An allowed key at another value, at another level, or on the other side.
+        self.assertRefused("`CARGO_INCREMENTAL` = '1' in ci.yml", self.swap(_RT_CI, "CARGO_INCREMENTAL: '0'", "CARGO_INCREMENTAL: '1'"))
+        ci = self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", "")
+        ci = self.swap(ci, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    env:\n      CARGO_TERM_COLOR: always\n")
+        self.assertRefused("`CARGO_TERM_COLOR` = 'always' in ci.yml (job)", ci)
+        release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  CARGO_INCREMENTAL: '0'\n")
+        self.assertRefused("names ci.yml's workflow `CARGO_INCREMENTAL` = '0', which no", release=release)
+        # A stale entry is refused.
+        self.assertRefused("names ci.yml's workflow `CARGO_TERM_COLOR` = 'always', which no", self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", ""))
+        # The name of an allowed difference is read nowhere it is visible.
+        both = ("        run: sudo apt-get update", "        run: test -z \"$CARGO_INCREMENTAL\" || sudo apt-get update")
+        self.assertRefused("names `CARGO_INCREMENTAL`", self.swap(_RT_CI, *both), self.swap(_RT_RELEASE, *both))
+        ci = self.swap(_RT_CI, '--target "$TARGET"', '--target "$TARGET$EXT"')
+        release = self.swap(_RT_RELEASE, '--target "$TARGET"', '--target "$TARGET$EXT"')
+        self.assertRefused("names `EXT`, which only release.yml's native cargo command sees", ci, release)
+
+    def test_matrix_value_read_by_mirrored_step_refused(self) -> None:
+        env_write = '      - run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV"\n      - name: Install musl toolchain (linux)\n'
+        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", env_write)
+        release = self.swap(_RT_RELEASE, "      - name: Install musl toolchain (linux)\n", env_write)
+        release = self.swap(release, "            target: x86_64-unknown-linux-musl\n            ext: ''\n", "            target: x86_64-unknown-linux-musl\n            ext: ''\n            flags: --cfg broken\n")
+        self.assertRefused("matrix `flags` for target 'x86_64-unknown-linux-musl'", ci, release)
+        whole = ("        if: contains(matrix.target, 'musl')\n", "        if: contains(toJSON(matrix), 'musl')\n")
+        self.assertRefused("`matrix` read whole or by a computed name", self.swap(_RT_CI, *whole), self.swap(_RT_RELEASE, *whole))
+        computed = ("        if: contains(matrix.target, 'musl')\n", "        if: contains(matrix['target'], 'musl')\n")
+        self.assertRefused("`matrix` read whole or by a computed name", self.swap(_RT_CI, *computed), self.swap(_RT_RELEASE, *computed))
+
+    def test_context_expression_in_mirrored_region_refused(self) -> None:
+        cond = "contains(matrix.target, 'musl')"
+        for new, needle in (
+            (f"{cond} && github.event_name == 'workflow_dispatch'", "the `github` context"),
+            (f"{cond} && always()", "`always()`"),
+            (f"{cond} && runner.os == 'Linux'", "the `runner` context"),
+            (f"{cond} && hashFiles('x') != ''", "`hashFiles()`"),
+        ):
+            with self.subTest(expr=new):
+                self.assertRefused(needle, self.swap(_RT_CI, cond, new), self.swap(_RT_RELEASE, cond, new))
+        ref = ("targets: ${{ matrix.target }}", "targets: ${{ github.ref_name }}")
+        self.assertRefused("the `github` context", self.swap(_RT_CI, *ref), self.swap(_RT_RELEASE, *ref))
+        shell = ("        run: sudo apt-get update", "        run: test \"$GITHUB_EVENT_NAME\" = x || sudo apt-get update")
+        self.assertRefused("names the runner variable `GITHUB_EVENT_NAME`", self.swap(_RT_CI, *shell), self.swap(_RT_RELEASE, *shell))
+
+    def test_local_action_context_read_refused(self) -> None:
+        action = self.swap(_RT_ACTION, "targets: ${{ inputs.targets }}", "targets: ${{ github.event_name == 'release' && 'x' || inputs.targets }}")
+        self.assertRefused("rust-toolchain-pinned step 2.with.targets", action=action)
+        with tempfile.TemporaryDirectory() as repo:
+            root = os.path.join(repo, ".github")
+            _write(os.path.join(root, "workflows", "ci.yml"), _RT_CI)
+            _write(os.path.join(root, "workflows", "release.yml"), _RT_RELEASE)
+            errors: list[str] = []
+            check_release_target_parity(errors, root=root)
+        self.assertTrue(any("has no single action.yml" in e for e in errors), errors)
 
 
 if __name__ == "__main__":
