@@ -1204,7 +1204,7 @@ mod real_jail {
         args: &[std::ffi::OsString],
         tmpdir: Option<&std::path::Path>,
     ) -> (bool, String, String) {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ipe"));
+        let mut cmd = std::process::Command::new(super::support::ipe_bin());
         cmd.arg("release").arg("run").args(args).current_dir(cwd);
         if let Some(tmpdir) = tmpdir {
             cmd.env("TMPDIR", tmpdir);

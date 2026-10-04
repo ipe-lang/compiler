@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn machine_json_escapes_the_sanitised_message_exactly_once() {
         let err = CliError::Usage(crate::text::msg::command_refusal(
-            &"build",
+            &crate::verb::Verb::DEV_BUILD,
             &format!("bad value `a\"b\\c` {HOSTILE}"),
         ));
         let line = crate::machine_output::machine_error(
