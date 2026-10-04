@@ -419,13 +419,6 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
-impl Command {
-    /// The command's parsed help page.
-    fn text(&self) -> CommandText {
-        help_page::parse_command_page(self.name, self.page).0
-    }
-}
-
 impl Group {
     /// The group word (`dev`, `release`).
     const fn name(&self) -> &'static str {
