@@ -643,8 +643,8 @@ diagnosticsNeverRaw =
         cwd <- System.cwd ()
         cwdRoot <- RepoPath.parseRoot cwd
         roots <- mapOf [ ( "ipe", cwdRoot ) ]
-        nested <- freshNested
-        nestedRoots <- mapOf [ ( "out", nested.outer ), ( "in", nested.inner ) ]
+        tree <- freshNested
+        nestedRoots <- mapOf [ ( "out", tree.outer ), ( "in", tree.inner ) ]
         Task.succeed
             (List.length allPathErrors == 9
                 && List.all (\err -> clean (withForeign hazards nested err)) allPathErrors
@@ -791,6 +791,47 @@ siblingPrefixNotClaimed =
                 , resolvesBelow n.outer "/innerx" (RepoPath.resolve roots "out:innerx")
                 , claimed (RepoPath.resolve roots "out:inner2/../inner/x")
                 ]
+            )
+
+
+
+-- A claim is judged on one key for every spelling of a path: a case
+-- variant or a `\` separator, which a case-insensitive or `\`-separated
+-- filesystem reads as the deeper root's file, is claimed like the canonical
+-- spelling. Red while the claim compares raw `/`-split components.
+caseAndSeparatorVariantsClaimed : Task.Task Error Bool
+caseAndSeparatorVariantsClaimed =
+    do
+        n <- freshNested
+        roots <- mapOf [ ( "out", n.outer ), ( "in", n.inner ) ]
+        Task.succeed
+            (List.all identity
+                [ claimed (RepoPath.resolve roots "out:INNER/x")
+                , claimed (RepoPath.resolve roots "out:Inner/sub/x")
+                , claimed (RepoPath.resolve roots "out:INNER")
+                , claimed (RepoPath.resolve roots "out:inner\\x")
+                , claimed (RepoPath.resolve roots "out:INNER\\sub\\x")
+                , resolvesBelow n.outer "/innerx" (RepoPath.resolve roots "out:innerx")
+                , resolvesBelow n.inner "/x" (RepoPath.resolve roots "in:x")
+                ]
+            )
+
+
+
+-- Two tags on directories whose names differ only in case are refused as
+-- one directory: on a case-insensitive filesystem they are. Red while
+-- duplicate roots compare raw components.
+caseVariantRootsRefused : Task.Task Error Bool
+caseVariantRootsRefused =
+    do
+        base <- freshRootBase
+        makeDir (base ++ "/A")
+        lower <- RepoPath.parseRoot (base ++ "/a")
+        upper <- RepoPath.parseRoot (base ++ "/A")
+        other <- RepoPath.parseRoot (base ++ "/b")
+        Task.succeed
+            (mapRefusedAs "duplicate-root" (mapResult [ ( "lo", lower ), ( "up", upper ) ])
+                && not (mapRefused (mapResult [ ( "lo", lower ), ( "b", other ) ]))
             )
 
 
@@ -971,4 +1012,6 @@ checks =
         , check "nested roots resolve under the deepest owner" grandchildOwnedByDeepest
         , check "dotdot out of an inner root stays refused" dotdotFromInnerStillRefused
         , check "root ceiling matches the shared ipe-index vector" tooManyRootsRefused
+        , check "case and separator variants of a deeper root are claimed" caseAndSeparatorVariantsClaimed
+        , check "roots differing only in case refused as one directory" caseVariantRootsRefused
         ]

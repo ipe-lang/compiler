@@ -104,7 +104,8 @@ tagName tag =
 -- A root map from its bindings. Refused: no binding (`NoRoots`), more than
 -- `maxRoots` (`TooManyRoots`), a tag bound twice (`DuplicateTag`), which
 -- would make the lookup order decide the root, or two tags on one cleaned
--- directory (`DuplicateRoot`), which would give one file two owners. A root
+-- directory (`DuplicateRoot`, compared case- and separator-folded as
+-- `segmentsOf` keys it), which would give one file two owners. A root
 -- below another is allowed: the deeper root owns the paths under it.
 rootMap : List ( Tag, Root ) -> Result PathError RootMap
 rootMap bindings =
@@ -155,12 +156,21 @@ bindingOf entries entry =
     }
 
 
--- The components of a cleaned absolute path. Ownership is judged over whole
+-- The ownership key of a cleaned absolute path: its components, split on
+-- both `/` and `\` and lowercased. Ownership is judged over whole
 -- components, never over a string prefix: `/r/inner2` is not below
--- `/r/inner`.
+-- `/r/inner`. One key serves the claim check and the duplicate-root check, so
+-- neither can be passed by a spelling the other folds: a path reached
+-- through `INNER` or `inner\x` on a case-insensitive or `\`-separated
+-- filesystem is claimed as under `inner`. Folding can only add claims and
+-- duplicates, never remove one: two roots that differ only in case are
+-- refused even where the filesystem tells them apart.
 segmentsOf : String -> List String
 segmentsOf path =
-    List.filter (\segment -> segment /= "") (String.split "/" path)
+    String.split "/" path
+        |> List.concatMap (String.split "\\")
+        |> List.filter (\segment -> segment /= "")
+        |> List.map String.toLower
 
 
 -- `prefix` is the leading components of `whole`, or all of it.
