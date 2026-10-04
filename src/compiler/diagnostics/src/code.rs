@@ -458,6 +458,9 @@ code! {
     IPE_N0051 = "IPE-N0051", "an app entry is built with a Model or Msg that is still a type variable", "IPE-N0051";
     /// terminal input passed as an app config field instead of a subscription
     IPE_N0052 = "IPE-N0052", "terminal input is a subscription, not an app config field", "IPE-N0052";
+    /// a row-parameter argument of a type alias is not a record, or repeats
+    /// one of the alias's own record labels
+    IPE_N0053 = "IPE-N0053", "a type alias row argument cannot extend its record", "IPE-N0053";
 
     // -----------------------------------------------------------------------
     // Type (IPE-T####)

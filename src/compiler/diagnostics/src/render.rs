@@ -605,6 +605,16 @@ fn name_prose(msg: &NameError) -> String {
             "`{field}` is not a `{entry}` config field — terminal input arrives through \
              `subscriptions`, like every other event."
         ),
+        NameError::AliasRowArgument { alias, fault } => match fault {
+            crate::diagnostic::AliasRowFault::NotARecord { found } => format!(
+                "`{alias}` extends its row argument with its own fields, but {found} is not a \
+                 record."
+            ),
+            crate::diagnostic::AliasRowFault::FieldClash { field } => format!(
+                "`{alias}` already has a `{field}` field, so its row argument cannot add \
+                 another one."
+            ),
+        },
         NameError::Unknown => "Something is off with a name in this code.".to_string(),
     }
 }
@@ -1700,6 +1710,15 @@ fn name_label(msg: &NameError) -> Option<String> {
             "remove `{field}` from the config and subscribe instead: \
              `import {sub_module} as Sub`, then `subscriptions _ = Sub.{field} {field}`"
         )),
+        NameError::AliasRowArgument { alias, fault } => Some(match fault {
+            crate::diagnostic::AliasRowFault::NotARecord { .. } => format!(
+                "pass `{alias}` a record (`{alias} {{ age : Int }}`) or a type variable \
+                 (`{alias} r`)"
+            ),
+            crate::diagnostic::AliasRowFault::FieldClash { field } => {
+                format!("remove `{field}` from the argument; `{alias}` already supplies it")
+            }
+        }),
         NameError::RustNameFold { .. } | NameError::Unknown => None,
     }
 }

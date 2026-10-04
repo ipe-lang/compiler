@@ -789,6 +789,52 @@ fn canon_type_alias_expansion_depth_limit() {
     assert_rejected("canon_alias_depth_limit", &src, "IPE-N0032");
 }
 
+/// A row alias applied to `{ age : Int }`, with its own fields.
+const NAMED_AGE: &str = "type alias Named r = { r | name : String }\n\
+                         f : Named { age : Int } -> Int\n\
+                         f p =\n    p.age\n";
+
+/// A record missing the alias's own `name` field is not a `Named { age : Int }`.
+#[test]
+fn alias_row_arg_missing_base_field() {
+    let src = format!("{HEAD}{NAMED_AGE}main =\n    f {{ age = 1 }}\n");
+    assert_rejected("alias_row_arg_missing_base_field", &src, "IPE-T0001");
+}
+
+/// A record missing the row argument's `age` field is not a `Named { age : Int }`.
+#[test]
+fn alias_row_arg_missing_extension_field() {
+    let src = format!("{HEAD}{NAMED_AGE}main =\n    f {{ name = \"x\", other = True }}\n");
+    assert_rejected("alias_row_arg_missing_extension_field", &src, "IPE-T0001");
+}
+
+/// A row alias argument that is not a record has no fields to extend.
+#[test]
+fn alias_row_arg_not_record() {
+    let src = format!(
+        "{HEAD}type alias Named r = {{ r | name : String }}\n\
+         f : Named Int -> Int\nf p =\n    1\nmain =\n    1\n"
+    );
+    assert_rejected("alias_row_arg_not_record", &src, "IPE-N0053");
+}
+
+/// A row alias argument repeating one of the alias's own labels.
+#[test]
+fn alias_row_arg_label_clash() {
+    let src = format!(
+        "{HEAD}type alias Named r = {{ r | name : String }}\n\
+         f : Named {{ name : Int }} -> Int\nf p =\n    1\nmain =\n    1\n"
+    );
+    assert_rejected("alias_row_arg_label_clash", &src, "IPE-N0053");
+}
+
+/// A record type naming the same label twice.
+#[test]
+fn record_type_duplicate_label() {
+    let src = format!("{HEAD}f : {{ a : Int, a : String }} -> Int\nf p =\n    1\nmain =\n    1\n");
+    assert_rejected("record_type_duplicate_label", &src, "IPE-N0010");
+}
+
 /// A user type that reuses a built-in type name (`Int`).
 #[test]
 fn canon_reserved_builtin_type_name() {

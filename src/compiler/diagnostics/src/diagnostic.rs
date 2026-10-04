@@ -25,13 +25,13 @@ use crate::code::{
     IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
     IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
     IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
-    IPE_N0051, IPE_N0052, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012,
-    IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021,
-    IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062,
-    IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070,
-    IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012,
-    IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020,
-    IPE_T0021, Severity,
+    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
+    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
+    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
+    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
+    IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011,
+    IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019,
+    IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
 use crate::terminal::TerminalSafe;
@@ -808,6 +808,24 @@ pub enum NameError {
         field: Box<str>,
         sub_module: Box<str>,
     },
+    /// A row-parameter argument of a type alias cannot extend the alias's record.
+    ///
+    /// `alias` is the alias applied (`Named` for `type alias Named r = { r |
+    /// name : String }`) and `fault` says why its row argument is refused.
+    /// [IPE-N0053]
+    AliasRowArgument {
+        alias: Box<str>,
+        fault: AliasRowFault,
+    },
+}
+
+/// Why a [`NameError::AliasRowArgument`] refuses a row-parameter argument.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AliasRowFault {
+    /// The argument is not a record or a type variable; `found` names it.
+    NotARecord { found: Box<str> },
+    /// The argument's record already has the alias's own label `field`.
+    FieldClash { field: Box<str> },
 }
 
 /// How a [`NameError::GenericAppEntry`] refusal relates the entry to its
@@ -2508,6 +2526,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::ScriptImportsShapeView { .. } => IPE_N0050,
         NameError::GenericAppEntry { .. } | NameError::UnpinnedAppEntry { .. } => IPE_N0051,
         NameError::InputFieldIsSubscription { .. } => IPE_N0052,
+        NameError::AliasRowArgument { .. } => IPE_N0053,
     })
 }
 
@@ -2739,6 +2758,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         | NameError::GenericAppEntry { .. }
         | NameError::UnpinnedAppEntry { .. }
         | NameError::InputFieldIsSubscription { .. }
+        | NameError::AliasRowArgument { .. }
         | NameError::WebInitPolyArg => Vec::new(), // no span-based help
     }
 }
