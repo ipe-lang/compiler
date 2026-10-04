@@ -2806,4 +2806,120 @@ mod tests {
              wrong-type value into `Nothing`, the fail-open boundary of #2692",
         );
     }
+
+    /// Canonicalise `src` as the project module `Main` over `catalog`.
+    fn canon_main(
+        src: &str,
+        catalog: &ipe_canon::ModuleCatalog,
+    ) -> Result<(), ipe_diagnostics::Diagnostic> {
+        let mut interner = Interner::new();
+        let parsed = ipe_parse::parse_module(src, &mut interner)?;
+        let expected = parsed.name.value.clone();
+        ipe_canon::canonicalise_module_in_project(
+            &parsed,
+            &expected,
+            &std::collections::BTreeMap::new(),
+            catalog,
+            ipe_canon::ModuleOrigin::User,
+            &mut interner,
+        )
+        .map(drop)
+    }
+
+    /// The candidate modules of an IPE-N0034, or `None` for any other outcome.
+    fn import_candidates(result: &Result<(), ipe_diagnostics::Diagnostic>) -> Option<Vec<&str>> {
+        match result {
+            Err(ipe_diagnostics::Diagnostic::Name {
+                msg: ipe_diagnostics::NameError::ImportRequired { candidates, .. },
+                ..
+            }) => Some(candidates.iter().map(|m| &**m).collect()),
+            _ => None,
+        }
+    }
+
+    /// Every qualifier a catalog module's bare import binds, used unimported,
+    /// is the must-import diagnostic listing EXACTLY the catalog modules whose
+    /// bare import binds it — over a catalog built the way the build driver
+    /// builds it (kernel paths + compiled-source modules + the project).
+    ///
+    /// Iterates the whole catalog, so a module added later that shares a
+    /// qualifier with another (the kernel `Ipe.Tea.Tui` and the compiled
+    /// `Ipe.Ui.Tui` both bind `Tui`) is checked by construction: a candidate
+    /// set built from one table, a first match, or a last-segment-keyed map
+    /// drops one and goes red here.
+    #[test]
+    fn compiled_std_modules_are_in_the_catalog() {
+        let catalog = ipe_canon::ModuleCatalog::new(
+            std::iter::once(Box::<str>::from("Main")).chain(
+                COMPILED_STD_MODULES
+                    .iter()
+                    .map(|module| Box::<str>::from(module.dotted)),
+            ),
+        );
+        let qualifiers: std::collections::BTreeSet<&str> = catalog
+            .paths()
+            .flat_map(|module| {
+                let segments: Vec<&str> = module.split('.').collect();
+                let canonical = ipe_canon::stdlib_canonical_qualifier(&segments);
+                module.rsplit('.').next().into_iter().chain(canonical)
+            })
+            .filter(|qualifier| *qualifier != "Main")
+            .collect();
+        let mut shared = 0usize;
+        for qualifier in qualifiers {
+            let expected: Vec<&str> = catalog
+                .paths()
+                .filter(|module| *module != "Main")
+                .filter(|module| ipe_canon::bare_import_binds(module, qualifier))
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+            let src = format!("module Main exposing (main)\n\nmain =\n    {qualifier}.x\n");
+            let result = canon_main(&src, &catalog);
+            // An ambient qualifier (`Cmd`) resolves with no import, so it never
+            // raises IPE-N0034 and builds no candidate list.
+            if matches!(
+                &result,
+                Ok(())
+                    | Err(ipe_diagnostics::Diagnostic::Name {
+                        msg: ipe_diagnostics::NameError::NoSuchMember { .. },
+                        ..
+                    })
+            ) {
+                continue;
+            }
+            if expected.len() > 1 {
+                shared += 1;
+            }
+            assert_eq!(
+                import_candidates(&result).as_deref(),
+                Some(&expected[..]),
+                "{qualifier}.x unimported must be IPE-N0034 naming every binding \
+                 module, sorted: {result:?}"
+            );
+        }
+        assert!(
+            shared > 0,
+            "the catalog has a qualifier two modules bind (`Tui`); the check above \
+             must exercise it"
+        );
+        let tui = canon_main(
+            "module Main exposing (main)\n\nmain =\n    Tui.x\n",
+            &catalog,
+        );
+        assert_eq!(
+            import_candidates(&tui).as_deref(),
+            Some(&["Ipe.Tea.Tui", "Ipe.Ui.Tui"][..]),
+            "{tui:?}"
+        );
+        for module in COMPILED_STD_MODULES {
+            let qualifier = module.dotted.rsplit('.').next().unwrap_or(module.dotted);
+            assert!(
+                ipe_canon::bare_import_binds(module.dotted, qualifier),
+                "a compiled-source module binds its last segment: {}",
+                module.dotted
+            );
+        }
+    }
 }

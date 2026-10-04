@@ -323,7 +323,7 @@ fn error_block_failing_with_other_code_is_a_mismatch() {
 
 #[test]
 fn error_block_refused_with_its_own_code_meets_its_verdict() {
-    let text = "```ipe ipe:error\nmain : Task ()\nmain =\n    Io.println \"hi\"\n```\n";
+    let text = "```ipe ipe:error\nmain : Task ()\nmain =\n    Iox.println \"hi\"\n```\n";
     let found = judge_synthetic(
         "error_block_refused_with_its_own_code_meets_its_verdict",
         text,
