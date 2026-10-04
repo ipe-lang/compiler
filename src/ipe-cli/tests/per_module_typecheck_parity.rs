@@ -3,7 +3,7 @@
 //!
 //! Wherever the per-module scoped solve engages
 //! ([`ipe_db::ScopedModuleTypes::PerModule`]), its result MUST equal the
-//! normalized whole-program projection of that module — for EVERY module of
+//! canonical whole-program slice of that module — for EVERY module of
 //! EVERY golden fixture, and at every state of the adversarial multi-module
 //! edit sequence. A scoped result that diverges from the joint solve is a
 //! correctness violation (the LSP would show a type the build disagrees
@@ -88,7 +88,7 @@ fn assert_state_parity(
     let mut engaged = 0usize;
     for (path, file) in &files {
         match ipe_db::infer_module_scoped(db, root, *file) {
-            ipe_db::ScopedModuleTypes::PerModule { types, .. } => {
+            ipe_db::ScopedModuleTypes::PerModule { solved: scoped, .. } => {
                 engaged += 1;
                 // On a red program there is no joint slice to compare
                 // against — the scoped result standing on closed
@@ -105,17 +105,16 @@ fn assert_state_parity(
                     let Some(home) = home else {
                         return (engaged, files.len());
                     };
-                    let projected =
-                        ipe_db::normalize_module_types(ipe_db::project_module_types(solved, &home));
+                    let projected = ipe_db::canonical_module_types(solved, &home).ok();
                     assert_eq!(
-                        **types,
+                        Some(ipe_db::project_module_types(scoped, &home)),
                         projected,
                         "[{label}] scoped result for {} diverges from the joint slice",
                         path.join(".")
                     );
                 }
             }
-            ipe_db::ScopedModuleTypes::WholeProgram => {}
+            ipe_db::ScopedModuleTypes::WholeProgram(_) => {}
         }
     }
     (engaged, files.len())
@@ -411,7 +410,7 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() {
             assert!(
                 matches!(
                     ipe_db::infer_module_scoped(&db, root, module),
-                    ipe_db::ScopedModuleTypes::WholeProgram
+                    ipe_db::ScopedModuleTypes::WholeProgram(_)
                 ),
                 "[{label}] {who} must fall back to the whole-program solve"
             );
