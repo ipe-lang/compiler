@@ -13,6 +13,7 @@ const UTIL: &str = "module Lib.Util exposing (..)\n\nf : Int -> Int\nf n =\n    
 /// Canonicalise `sources` in order against `catalog`, each seeing the exports
 /// of every module before it; the last module's error. A source set that
 /// canonicalises cleanly fails the calling test.
+#[allow(clippy::expect_used)] // a source set that canonicalises cleanly IS the failure
 fn last_error(sources: &[&str], catalog: &[&str]) -> Diagnostic {
     let catalog = ModuleCatalog::new(catalog.iter().map(|m| Box::<str>::from(*m)));
     let mut interner = Interner::new();
@@ -43,7 +44,7 @@ fn last_error(sources: &[&str], catalog: &[&str]) -> Diagnostic {
             }
         }
     }
-    last.unwrap_or_else(|| panic!("expected a canonicalisation error, got none"))
+    last.expect("expected a canonicalisation error, got none")
 }
 
 /// The candidates of an IPE-N0034 diagnostic, or `None` for any other.
@@ -115,8 +116,7 @@ fn gated_unimported_qualifier_never_suggested() {
     for (expr, absent) in [("Hosts.name", "Host"), ("Lsit.map identity [ 1 ]", "List")] {
         let src = format!("module Main exposing (main)\n\nmain =\n    {expr}\n");
         let diag = last_error(&[src.as_str()], &["Main", "Ipe.List"]);
-        let names = unknown_module_suggestions(&diag)
-            .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
+        let names = unknown_module_suggestions(&diag).expect("expected IPE-N0004");
         assert!(!names.contains(&absent), "{expr}: {names:?}");
         assert!(!names.contains(&"Host"), "{expr}: {names:?}");
     }
@@ -129,8 +129,7 @@ fn imported_qualifier_still_suggested() {
     let src =
         "module Main exposing (main)\n\nimport Lib.Util\n\nmain : Int\nmain =\n    Utli.f 1\n";
     let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
-    let names = unknown_module_suggestions(&diag)
-        .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
+    let names = unknown_module_suggestions(&diag).expect("expected IPE-N0004");
     assert!(names.contains(&"Util"), "{names:?}");
 }
 
@@ -153,8 +152,8 @@ fn aliased_module_spelled_by_name_points_at_the_alias() {
         "module Main exposing (main)\n\nimport Lib.Util as U\n\nmain : Int\nmain =\n    Util.f 1\n";
     let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
     assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
-    let candidates = unknown_module_candidates(&diag)
-        .unwrap_or_else(|| panic!("expected an unknown-module diagnostic, got {diag:?}"));
+    let candidates =
+        unknown_module_candidates(&diag).expect("expected an unknown-module diagnostic");
     assert_eq!(&*candidates.names, &[Box::<str>::from("U")], "{diag:?}");
     let lo = u32::try_from(src.find("Util.f").unwrap_or(0)).unwrap_or(0);
     let token = ipe_diagnostics::Span::new(lo, lo.saturating_add(6));
@@ -185,7 +184,6 @@ fn aliased_kernel_module_spelled_by_name_points_at_the_alias() {
 fn gated_unimported_kernel_qualifier_never_suggested() {
     let src = "module Main exposing (main)\n\nmain =\n    Crpyto.sha256 \"x\"\n";
     let diag = last_error(&[src], &["Main"]);
-    let names = unknown_module_suggestions(&diag)
-        .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
+    let names = unknown_module_suggestions(&diag).expect("expected IPE-N0004");
     assert!(!names.contains(&"Crypto"), "{names:?}");
 }
