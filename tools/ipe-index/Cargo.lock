@@ -360,6 +360,7 @@ dependencies = [
  "blake3",
  "clap",
  "icu_properties",
+ "ipe-test-temp",
  "regex",
  "rusqlite",
  "serde_json",
@@ -369,6 +370,10 @@ dependencies = [
  "tree-sitter-typescript",
  "unicode-general-category",
 ]
+
+[[package]]
+name = "ipe-test-temp"
+version = "0.4.0"
 
 [[package]]
 name = "is_terminal_polyfill"
