@@ -90,21 +90,28 @@ pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, C
         manifest_path,
         crate::io_bounded::MANIFEST_READ_CAP,
     )?;
-    parse_package_manifest_source(&text, manifest_path)
+    parse_package_manifest_source(&text, manifest_path).map(|(manifest, _)| manifest)
 }
 
-/// Parse the text of the `package.ipe` at `manifest_path`, already read.
+/// The source root of a manifest that names none.
+const DEFAULT_SOURCE_ROOT: &str = "src";
+
+/// Parse the text of the `package.ipe` at `manifest_path`, already read, beside
+/// the source root exactly as the manifest spells it.
 ///
 /// The project root is the parent of `manifest_path`. This is
 /// [`parse_package_manifest`] minus the file read, so a caller that holds the
-/// manifest's bytes judges them rather than a second read of the path.
+/// manifest's bytes judges them rather than a second read of the path. The
+/// spelling is the root-relative path before any filesystem lookup: a caller
+/// holding a captured tree locates the source root in that tree by it, never
+/// by a live resolution of the path.
 ///
 /// # Errors
 /// As [`parse_package_manifest`], minus the file-read error.
 pub fn parse_package_manifest_source(
     text: &str,
     manifest_path: &Path,
-) -> Result<ProjectManifest, CliError> {
+) -> Result<(ProjectManifest, String), CliError> {
     // A bare `package.ipe` has an EMPTY parent (`Some("")`), not `None`; both an
     // empty and an absent parent mean the current directory. An empty root never
     // canonicalises, so normalise it to `.` before path containment.
@@ -112,7 +119,13 @@ pub fn parse_package_manifest_source(
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    read_package_manifest(text, &root, manifest_path)
+    let fields = read_manifest_fields(text, manifest_path)?;
+    let spelled = fields
+        .src_rel
+        .as_deref()
+        .unwrap_or(DEFAULT_SOURCE_ROOT)
+        .to_owned();
+    Ok((fields.into_manifest(&root)?, spelled))
 }
 
 /// The total core: `&str -> Result<ProjectManifest, CliError>`, given the
@@ -128,6 +141,14 @@ pub fn read_package_manifest(
     root: &Path,
     manifest_path: &Path,
 ) -> Result<ProjectManifest, CliError> {
+    read_manifest_fields(src, manifest_path)?.into_manifest(root)
+}
+
+/// Parse `src` and read the record of its sole `package` binding into fields.
+///
+/// # Errors
+/// As [`read_package_manifest`], minus the whole-manifest validations.
+fn read_manifest_fields(src: &str, manifest_path: &Path) -> Result<ManifestFields, CliError> {
     let mut interner = Interner::new();
     let module =
         ipe_parse::parse_module(src, &mut interner).map_err(|diag| CliError::Pipeline {
@@ -141,8 +162,7 @@ pub fn read_package_manifest(
         src,
         manifest_path,
     };
-    let fields = reader.read_module(&module)?;
-    fields.into_manifest(root)
+    reader.read_module(&module)
 }
 
 /// Borrowed context every walk step shares: the interner to resolve [`Symbol`]s
@@ -189,7 +209,7 @@ impl ManifestFields {
         let name = self
             .name
             .ok_or(CliError::Usage(text::msg::package_manifest_name_required()))?;
-        let src_rel_raw = self.src_rel.as_deref().unwrap_or("src");
+        let src_rel_raw = self.src_rel.as_deref().unwrap_or(DEFAULT_SOURCE_ROOT);
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
                 raw: src_rel_raw.to_owned(),
@@ -1346,7 +1366,7 @@ pub fn render_manifest_record(manifest: &ProjectManifest) -> String {
         fields.push(format!("version = {}", quote(&version.to_string())));
     }
     if let Some(src_rel) = manifest_src_rel(manifest)
-        && src_rel != "src"
+        && src_rel != DEFAULT_SOURCE_ROOT
     {
         fields.push(format!("sourceRoot = {}", quote(&src_rel)));
     }
@@ -3010,9 +3030,13 @@ mod tests {
         let path = root.join(PACKAGE_IPE);
         std::fs::write(&path, text).expect("write package.ipe");
         let from_path = parse_package_manifest(&path).expect("path reader");
-        let from_text = parse_package_manifest_source(text, &path).expect("text reader");
+        let (from_text, spelled) = parse_package_manifest_source(text, &path).expect("text reader");
         let refused = parse_package_manifest_source("package = 1 +", &path);
         let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            spelled, DEFAULT_SOURCE_ROOT,
+            "no sourceRoot spells the default"
+        );
         assert_eq!(from_path.name, from_text.name);
         assert_eq!(from_path.root, from_text.root);
         assert_eq!(from_path.src_root, from_text.src_root);

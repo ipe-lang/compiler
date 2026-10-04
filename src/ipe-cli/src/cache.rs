@@ -386,6 +386,11 @@ impl TreeCapture {
         self.dirs.contains(rel)
     }
 
+    /// Take what the walk kept of the file at this tree-relative path.
+    pub fn take(&mut self, rel: &str) -> Option<KeptFile> {
+        self.kept.remove(rel)
+    }
+
     /// The [`hash_tree`] digest of the walked tree and the kept files.
     ///
     /// The files are keyed by forward-slash path relative to the tree root.
