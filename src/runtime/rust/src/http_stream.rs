@@ -23,12 +23,25 @@
 //! exact 32-char lowercase-hex wire form once, and `Debug` never renders the
 //! key. The one registry refuses every handle it does not hold with a typed
 //! `InvalidInput`, so no party reaches a stream it did not open.
+//!
+//! Every live upstream connection is owned by one value that also holds one of
+//! `CLIENT_STREAMS_MAX` connection permits, and every wait for upstream bytes
+//! (the response headers, then each chunk) ends within the idle ceiling. A
+//! drain holds its connection only while its registry slot holds the drain's
+//! cancel half, so a `close` stops it at once, even while it waits on the
+//! upstream.
 
 use super::*;
-use futures_util::StreamExt;
+use crate::http_client::VettingResolver;
+use crate::ssrf::DialPolicy;
+use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
-use std::num::NonZeroU128;
-use std::sync::{Mutex, OnceLock};
+use std::convert::Infallible;
+use std::num::{NonZeroU64, NonZeroU128};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 /// Opaque handle for an in-flight HTTP streaming response.
 ///
@@ -165,18 +178,131 @@ pub enum ChunkEvent<E> {
     Errored(E),
 }
 
-// Hard cap on registry entries (parked, draining, and ended tombstones). A
-// full registry evicts the oldest ended tombstone, else the oldest parked
-// stream (its response/connection drops at once); a draining stream is never
-// evicted, so a registry full of draining streams refuses `open`.
+/// Live upstream connections allowed at once: the registry's entry cap and the
+/// connection-permit count.
 const CLIENT_STREAMS_MAX: usize = 1024;
+
+// The permit semaphore must be constructible at the cap: a cap above
+// `Semaphore::MAX_PERMITS` underflows this item and breaks the build.
+const _: usize = Semaphore::MAX_PERMITS - CLIENT_STREAMS_MAX;
+
+/// The longest wait for upstream progress: the response headers, then each chunk.
+///
+/// Held as a nonzero millisecond count, so a zero ceiling is unrepresentable.
+#[derive(Clone, Copy, Debug)]
+struct IdleCeiling {
+    millis: NonZeroU64,
+}
+
+impl IdleCeiling {
+    const fn from_millis(millis: NonZeroU64) -> Self {
+        Self { millis }
+    }
+
+    const fn as_duration(self) -> Duration {
+        Duration::from_millis(self.millis.get())
+    }
+}
+
+/// 300 s: an upstream silent for longer ends the open or the drain with a `Timeout`.
+const STREAM_IDLE_CEILING: IdleCeiling =
+    IdleCeiling::from_millis(NonZeroU64::MIN.saturating_add(299_999));
+
+/// The fixed text of the idle-ceiling `Timeout`; it never carries the URL.
+const STREAM_IDLE_TIMED_OUT: &str = "http stream: no data within the idle ceiling";
+
+fn idle_timeout() -> IpeError {
+    IpeError::timeout().with_message(STREAM_IDLE_TIMED_OUT.to_owned())
+}
+
+/// The registry's half of a drain's cancel signal.
+///
+/// Dropping it cancels the drain, and nothing can be sent on it, so every way
+/// out of `Draining` (a close, an eviction, the registry itself going away)
+/// cancels.
+struct CancelHalf {
+    _revoke: oneshot::Sender<Infallible>,
+}
+
+/// The drain's half of its cancel signal: resolves once the slot's `CancelHalf` drops.
+struct DrainCancel {
+    revoked: oneshot::Receiver<Infallible>,
+}
+
+impl DrainCancel {
+    /// Completes when the registry gives the drain up; never polled again after that.
+    async fn revoked(&mut self) {
+        let _ = (&mut self.revoked).await;
+    }
+}
+
+fn cancel_pair() -> (CancelHalf, DrainCancel) {
+    let (revoke, revoked) = oneshot::channel();
+    (CancelHalf { _revoke: revoke }, DrainCancel { revoked })
+}
+
+/// One of `CLIENT_STREAMS_MAX` connection permits.
+///
+/// It lives in the value that owns the connection, so the connection count is
+/// the permit count whatever the registry holds.
+struct ConnPermit {
+    _held: OwnedSemaphorePermit,
+}
+
+/// A stream a drain can read: its chunk source and the permit it holds.
+trait LiveStream: Send + 'static {
+    /// The foreign read error of the chunk source.
+    type Fault: Send + 'static;
+    /// The chunk source, as UTF-8 text per chunk.
+    type Body: Stream<Item = Result<String, Self::Fault>> + Unpin + Send + 'static;
+
+    /// Splits the stream into its chunk source and its permit.
+    fn into_parts(self) -> (Self::Body, ConnPermit);
+
+    /// The typed error a read fault becomes; a foreign error is redacted here.
+    fn fault<E: From<String>>(fault: Self::Fault) -> E;
+}
+
+/// A response that holds its connection permit; the only constructor takes one.
+struct LiveResponse {
+    resp: reqwest::Response,
+    permit: ConnPermit,
+}
+
+type ResponseBody = Pin<Box<dyn Stream<Item = Result<String, reqwest::Error>> + Send>>;
+
+#[allow(clippy::disallowed_methods)] // a streamed chunk reaches Ipê as `String` text
+fn chunk_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+impl LiveStream for LiveResponse {
+    type Fault = reqwest::Error;
+    type Body = ResponseBody;
+
+    fn into_parts(self) -> (ResponseBody, ConnPermit) {
+        let body: ResponseBody = Box::pin(
+            self.resp
+                .bytes_stream()
+                .map(|read| read.map(|bytes| chunk_text(&bytes))),
+        );
+        (body, self.permit)
+    }
+
+    // [B8] The reqwest error `Debug`/`Display` can echo the target URL, request
+    // headers, or a bearer / API key; `redacted_transport_error` logs the raw
+    // detail under a ref id and returns a fixed generic message.
+    fn fault<E: From<String>>(fault: reqwest::Error) -> E {
+        crate::http_client::redacted_transport_error(fault)
+    }
+}
 
 /// Where a registered stream is in its life.
 enum Slot<V> {
     /// Opened, its response parked until a drain or a close.
     Parked(V),
-    /// One drain owns the response; a close ends it at the next chunk.
-    Draining,
+    /// One drain owns the response; dropping the half cancels it.
+    Draining(CancelHalf),
     /// Drained or closed; kept as a tombstone so a re-subscribe stays quiet.
     Ended,
 }
@@ -187,10 +313,48 @@ struct Entry<V> {
     slot: Slot<V>,
 }
 
+/// A parked response handed to its one drain.
+struct Claimed<V> {
+    value: V,
+    cancel: DrainCancel,
+    /// The entry's `seq`: the drain's lease ends only an entry carrying it.
+    seq: u64,
+}
+
+/// Why a slot cannot be claimed for a drain.
+enum Unclaimed {
+    /// Another drain owns it.
+    Busy,
+    /// It already ended.
+    Ended,
+}
+
+/// Moves a parked entry to `Draining`, or reports why it cannot.
+fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Unclaimed> {
+    let (half, cancel) = cancel_pair();
+    match std::mem::replace(&mut entry.slot, Slot::Draining(half)) {
+        Slot::Parked(value) => Ok(Claimed {
+            value,
+            cancel,
+            seq: entry.seq,
+        }),
+        // Put the previous slot back: the half just installed drops, and a
+        // running drain's half (inside `previous`) is never dropped.
+        previous => {
+            let refusal = match previous {
+                Slot::Draining(_) => Unclaimed::Busy,
+                Slot::Parked(_) | Slot::Ended => Unclaimed::Ended,
+            };
+            entry.slot = previous;
+            Err(refusal)
+        }
+    }
+}
+
 /// What a `chunks` subscribe must do.
 enum Subscription<V> {
     /// First subscribe of a parked stream: drain this response.
-    Drain(V),
+    Drain(Claimed<V>),
     /// The stream is draining or ended: nothing to start.
     Active,
     /// The handle names no stream: emit one `Errored`; a tombstone now dedups it.
@@ -202,7 +366,7 @@ enum Subscription<V> {
 
 /// What `close` does to an entry.
 enum CloseAct {
-    /// A drain owns the response: mark it ended so the drain stops.
+    /// A drain owns the response: end the entry, which cancels the drain.
     EndInPlace,
     /// A parked response nothing reads: drop it and its entry.
     Remove,
@@ -214,6 +378,7 @@ enum CloseAct {
 struct StreamRegistry<V> {
     map: HashMap<StreamKey, Entry<V>>,
     next_seq: u64,
+    conns: Arc<Semaphore>,
 }
 
 impl<V> StreamRegistry<V> {
@@ -221,7 +386,17 @@ impl<V> StreamRegistry<V> {
         Self {
             map: HashMap::new(),
             next_seq: 0,
+            conns: Arc::new(Semaphore::new(CLIENT_STREAMS_MAX)),
         }
+    }
+
+    /// The oldest entry whose slot satisfies `pick`.
+    fn oldest_where(&self, pick: impl Fn(&Slot<V>) -> bool) -> Option<StreamKey> {
+        self.map
+            .iter()
+            .filter(|(_, e)| pick(&e.slot))
+            .min_by_key(|(_, e)| e.seq)
+            .map(|(k, _)| *k)
     }
 
     /// The entry a full registry gives up for one more, or `None` when there is room.
@@ -229,19 +404,8 @@ impl<V> StreamRegistry<V> {
         if self.map.len() < CLIENT_STREAMS_MAX {
             return Ok(None);
         }
-        let oldest = |want_ended: bool| {
-            self.map
-                .iter()
-                .filter(|(_, e)| match e.slot {
-                    Slot::Ended => want_ended,
-                    Slot::Parked(_) => !want_ended,
-                    Slot::Draining => false,
-                })
-                .min_by_key(|(_, e)| e.seq)
-                .map(|(k, _)| *k)
-        };
-        oldest(true)
-            .or_else(|| oldest(false))
+        self.oldest_where(|s| matches!(s, Slot::Ended))
+            .or_else(|| self.oldest_where(|s| matches!(s, Slot::Parked(_))))
             .map(Some)
             .ok_or_else(|| IpeError::unavailable(TOO_MANY_STREAMS.to_owned()))
     }
@@ -252,6 +416,31 @@ impl<V> StreamRegistry<V> {
             .checked_add(1)
             .ok_or_else(|| IpeError::unavailable(SEQUENCE_EXHAUSTED.to_owned()))?;
         Ok(seq)
+    }
+
+    fn try_permit(&self) -> Option<ConnPermit> {
+        Arc::clone(&self.conns)
+            .try_acquire_owned()
+            .ok()
+            .map(|held| ConnPermit { _held: held })
+    }
+
+    /// Claims one connection permit for a request about to go out.
+    ///
+    /// A full registry gives up its oldest parked stream (its response drops at
+    /// once and returns its permit); with nothing parked it refuses. The claim
+    /// and the eviction share the registry lock, so no other claimant can take
+    /// the freed permit in between.
+    fn reserve(&mut self) -> Result<ConnPermit, IpeError> {
+        let refused = || IpeError::unavailable(TOO_MANY_STREAMS.to_owned());
+        if let Some(permit) = self.try_permit() {
+            return Ok(permit);
+        }
+        let parked = self
+            .oldest_where(|s| matches!(s, Slot::Parked(_)))
+            .ok_or_else(refused)?;
+        self.map.remove(&parked);
+        self.try_permit().ok_or_else(refused)
     }
 
     /// Makes room, then records `slot` under `key`.
@@ -278,18 +467,14 @@ impl<V> StreamRegistry<V> {
     }
 
     /// Hands a parked response to one drain; any other state is a typed refusal.
-    fn take_for_drain(&mut self, key: StreamKey) -> Result<V, IpeError> {
+    fn take_for_drain(&mut self, key: StreamKey) -> Result<Claimed<V>, IpeError> {
         let Some(entry) = self.map.get_mut(&key) else {
             return Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned()));
         };
-        match std::mem::replace(&mut entry.slot, Slot::Draining) {
-            Slot::Parked(value) => Ok(value),
-            Slot::Draining => Err(IpeError::conflict(STREAM_BUSY.to_owned())),
-            Slot::Ended => {
-                entry.slot = Slot::Ended;
-                Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned()))
-            }
-        }
+        claim(entry).map_err(|why| match why {
+            Unclaimed::Busy => IpeError::conflict(STREAM_BUSY.to_owned()),
+            Unclaimed::Ended => IpeError::invalid_input(UNKNOWN_STREAM.to_owned()),
+        })
     }
 
     /// Releases a live stream. A handle naming no live stream (never opened,
@@ -300,7 +485,7 @@ impl<V> StreamRegistry<V> {
             return Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned()));
         };
         let act = match entry.slot {
-            Slot::Draining => CloseAct::EndInPlace,
+            Slot::Draining(_) => CloseAct::EndInPlace,
             Slot::Parked(_) => CloseAct::Remove,
             Slot::Ended => CloseAct::Refuse,
         };
@@ -317,13 +502,9 @@ impl<V> StreamRegistry<V> {
     /// Decides one `chunks` subscribe.
     fn subscribe(&mut self, key: StreamKey) -> Subscription<V> {
         if let Some(entry) = self.map.get_mut(&key) {
-            return match std::mem::replace(&mut entry.slot, Slot::Draining) {
-                Slot::Parked(value) => Subscription::Drain(value),
-                Slot::Draining => Subscription::Active,
-                Slot::Ended => {
-                    entry.slot = Slot::Ended;
-                    Subscription::Active
-                }
+            return match claim(entry) {
+                Ok(claimed) => Subscription::Drain(claimed),
+                Err(Unclaimed::Busy | Unclaimed::Ended) => Subscription::Active,
             };
         }
         match self.insert(key, Slot::Ended) {
@@ -332,16 +513,13 @@ impl<V> StreamRegistry<V> {
         }
     }
 
-    fn is_draining(&self, key: StreamKey) -> bool {
-        self.map
-            .get(&key)
-            .is_some_and(|e| matches!(e.slot, Slot::Draining))
-    }
-
-    /// Ends a drain: a still-draining entry becomes a tombstone.
-    fn finish_drain(&mut self, key: StreamKey) {
+    /// Ends a drain: the entry the drain owns (`seq`) becomes a tombstone.
+    ///
+    /// An entry the drain does not own (another `seq`, or not draining) is left alone.
+    fn finish_drain(&mut self, key: StreamKey, seq: u64) {
         if let Some(entry) = self.map.get_mut(&key)
-            && matches!(entry.slot, Slot::Draining)
+            && entry.seq == seq
+            && matches!(entry.slot, Slot::Draining(_))
         {
             entry.slot = Slot::Ended;
         }
@@ -349,37 +527,315 @@ impl<V> StreamRegistry<V> {
 }
 
 // Contract: every `open` should be paired with a `forEachChunk`/`chunks` drain
-// or a `close` — each releases the parked response + its connection. The 30s
-// connect timeout bounds only the header stage; `CLIENT_STREAMS_MAX` bounds the
-// registry under abandoned-stream workloads.
-fn registry() -> &'static Mutex<StreamRegistry<reqwest::Response>> {
-    static R: OnceLock<Mutex<StreamRegistry<reqwest::Response>>> = OnceLock::new();
+// or a `close` — each releases the parked response and its permit. The idle
+// ceiling bounds the header wait and every chunk wait; `CLIENT_STREAMS_MAX`
+// bounds live connections under abandoned-stream workloads.
+fn registry() -> &'static Mutex<StreamRegistry<LiveResponse>> {
+    static R: OnceLock<Mutex<StreamRegistry<LiveResponse>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(StreamRegistry::new()))
 }
 
-/// Runs `f` under the registry lock.
+/// Runs `f` under `reg`'s lock.
 ///
 /// A poisoned lock is recovered: no method leaves a cross-entry invariant
 /// half-written.
-fn with_registry<T>(f: impl FnOnce(&mut StreamRegistry<reqwest::Response>) -> T) -> T {
-    let mut guard = registry().lock().unwrap_or_else(|e| e.into_inner());
+fn with_registry<V, T>(
+    reg: &Mutex<StreamRegistry<V>>,
+    f: impl FnOnce(&mut StreamRegistry<V>) -> T,
+) -> T {
+    let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
 /// Ends a drain when dropped, so a cancelled drain never pins its slot as draining.
-struct DrainLease {
+struct DrainLease<V: 'static> {
+    reg: &'static Mutex<StreamRegistry<V>>,
     key: StreamKey,
+    seq: u64,
 }
 
-impl DrainLease {
-    fn still_owned(&self) -> bool {
-        with_registry(|r| r.is_draining(self.key))
+impl<V: 'static> Drop for DrainLease<V> {
+    fn drop(&mut self) {
+        with_registry(self.reg, |r| r.finish_drain(self.key, self.seq));
     }
 }
 
-impl Drop for DrainLease {
-    fn drop(&mut self) {
-        with_registry(|r| r.finish_drain(self.key));
+/// What ended a drain.
+enum DrainEnd<X, E> {
+    /// The upstream finished cleanly.
+    Eof,
+    /// The registry gave the drain up (a close, an eviction, the registry dropped).
+    Cancelled,
+    /// No bytes arrived within the idle ceiling.
+    Idle,
+    /// The upstream read failed.
+    ReadFault(X),
+    /// The per-chunk step failed.
+    BodyFailed(E),
+}
+
+/// A drain's resources: the chunk source, its permit, its cancel signal and its ceiling.
+struct Pump<S> {
+    stream: S,
+    permit: ConnPermit,
+    cancel: DrainCancel,
+    idle: IdleCeiling,
+}
+
+impl<S, X> Pump<S>
+where
+    S: Stream<Item = Result<String, X>> + Unpin + Send,
+    X: Send,
+{
+    /// Reads chunks until the upstream ends, the registry cancels, or the idle ceiling passes.
+    ///
+    /// Every wait is a biased `select!` with the cancel signal first, so a
+    /// cancelled drain neither reads nor starts another chunk. A cancel during a
+    /// step drops the stream and the permit at once, then lets the step finish:
+    /// the connection is released, the caller's effect is never torn. Every arm
+    /// is irrefutable and unconditional, so no `select!` can find all arms disabled.
+    async fn run<E, F, Fut>(self, mut on_chunk: F) -> DrainEnd<X, E>
+    where
+        E: Send,
+        F: FnMut(String) -> Fut + Send,
+        Fut: Future<Output = Result<(), E>> + Send,
+    {
+        let Self {
+            mut stream,
+            permit,
+            mut cancel,
+            idle,
+        } = self;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = cancel.revoked() => return DrainEnd::Cancelled,
+                next = tokio::time::timeout(idle.as_duration(), stream.next()) => next,
+            };
+            let chunk = match next {
+                Err(_elapsed) => return DrainEnd::Idle,
+                Ok(None) => return DrainEnd::Eof,
+                Ok(Some(Err(fault))) => return DrainEnd::ReadFault(fault),
+                Ok(Some(Ok(chunk))) => chunk,
+            };
+            let step = on_chunk(chunk);
+            tokio::pin!(step);
+            tokio::select! {
+                biased;
+                () = cancel.revoked() => {
+                    drop(stream);
+                    drop(permit);
+                    return match step.await {
+                        Ok(()) => DrainEnd::Cancelled,
+                        Err(e) => DrainEnd::BodyFailed(e),
+                    };
+                }
+                done = &mut step => {
+                    if let Err(e) = done {
+                        return DrainEnd::BodyFailed(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `forEachChunk` over `reg`: drains `key` through `body`, bounded by `idle`.
+async fn for_each_chunk_in<V, E, F>(
+    reg: &'static Mutex<StreamRegistry<V>>,
+    key: StreamKey,
+    idle: IdleCeiling,
+    body: F,
+) -> IpeResult<E, ()>
+where
+    V: LiveStream,
+    E: From<String> + From<IpeError> + Send + 'static,
+    F: Fn(String) -> IpeTask<E, ()> + Send + 'static,
+{
+    let claimed = match with_registry(reg, |r| r.take_for_drain(key)) {
+        Ok(claimed) => claimed,
+        Err(e) => return IpeResult::Err(E::from(e)),
+    };
+    let _lease = DrainLease {
+        reg,
+        key,
+        seq: claimed.seq,
+    };
+    let (stream, permit) = claimed.value.into_parts();
+    let pump = Pump {
+        stream,
+        permit,
+        cancel: claimed.cancel,
+        idle,
+    };
+    let end = pump
+        .run(move |chunk| {
+            let step = body(chunk);
+            async move {
+                match step.await {
+                    IpeResult::Ok(()) => Ok(()),
+                    IpeResult::Err(e) => Err(e),
+                }
+            }
+        })
+        .await;
+    match end {
+        DrainEnd::Eof | DrainEnd::Cancelled => IpeResult::Ok(()),
+        DrainEnd::Idle => IpeResult::Err(E::from(idle_timeout())),
+        DrainEnd::ReadFault(fault) => IpeResult::Err(V::fault::<E>(fault)),
+        DrainEnd::BodyFailed(e) => IpeResult::Err(e),
+    }
+}
+
+/// Hands each `ChunkEvent` to the subscription loop as its `Msg`.
+struct ChunkRelay<M, F> {
+    to_msg: F,
+    emit: Arc<dyn Fn(M) + Send + Sync>,
+}
+
+impl<M, F> ChunkRelay<M, F> {
+    fn send<E>(&mut self, event: ChunkEvent<E>)
+    where
+        F: Fn(ChunkEvent<E>) -> M,
+    {
+        (self.emit)((self.to_msg)(event));
+    }
+}
+
+/// `chunks` over `reg`: a subscription source draining `key` into `to_msg` Msgs.
+fn subscribe_in<V, E, M, F>(
+    reg: &'static Mutex<StreamRegistry<V>>,
+    key: StreamKey,
+    idle: IdleCeiling,
+    to_msg: F,
+) -> IpeSub<M>
+where
+    V: LiveStream,
+    E: From<String> + From<IpeError> + Send + 'static,
+    M: Send + 'static,
+    F: Fn(ChunkEvent<E>) -> M + Send + 'static,
+{
+    IpeSub::Source(Box::new(move |emit| {
+        let mut relay = ChunkRelay { to_msg, emit };
+        match with_registry(reg, |r| r.subscribe(key)) {
+            Subscription::Drain(claimed) => {
+                // The lease moves into the task, so a task dropped before its
+                // first poll still ends the slot.
+                let lease = DrainLease {
+                    reg,
+                    key,
+                    seq: claimed.seq,
+                };
+                tokio::spawn(async move {
+                    let (stream, permit) = claimed.value.into_parts();
+                    let pump = Pump {
+                        stream,
+                        permit,
+                        cancel: claimed.cancel,
+                        idle,
+                    };
+                    let end = pump
+                        .run(|chunk| {
+                            relay.send::<E>(ChunkEvent::Chunk(chunk));
+                            std::future::ready(Ok::<(), Infallible>(()))
+                        })
+                        .await;
+                    // The slot ends before the final event, so a re-subscribe
+                    // the event provokes finds the tombstone.
+                    drop(lease);
+                    match end {
+                        DrainEnd::Eof => relay.send::<E>(ChunkEvent::Done),
+                        DrainEnd::Idle => {
+                            relay.send::<E>(ChunkEvent::Errored(E::from(idle_timeout())));
+                        }
+                        DrainEnd::ReadFault(fault) => {
+                            relay.send::<E>(ChunkEvent::Errored(V::fault::<E>(fault)));
+                        }
+                        DrainEnd::Cancelled => {}
+                        DrainEnd::BodyFailed(never) => match never {},
+                    }
+                });
+            }
+            Subscription::Refused => {
+                relay.send::<E>(ChunkEvent::Errored(E::from(IpeError::invalid_input(
+                    UNKNOWN_STREAM.to_owned(),
+                ))));
+            }
+            Subscription::Active | Subscription::Unrecorded => {}
+        }
+        tokio::spawn(async {}) // dummy handle for `SubRuntime` to abort harmlessly
+    }))
+}
+
+/// `open` over `reg`: fires `req` under `policy`, bounded by `idle`, parks the response.
+async fn open_in<E>(
+    reg: &'static Mutex<StreamRegistry<LiveResponse>>,
+    req: HttpRequest,
+    policy: DialPolicy,
+    idle: IdleCeiling,
+) -> IpeResult<E, IpeStreamId>
+where
+    E: From<String> + From<IpeError> + Send + 'static,
+{
+    // SSRF guard: resolve + validate + pin, and the per-redirect re-check,
+    // through the shared helper, identical to Http.get/post.
+    let builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+    let builder = match crate::http_client::ssrf_apply_with(
+        builder,
+        &req.url,
+        req.redirects,
+        policy,
+        VettingResolver::system(),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(refusal) => {
+            return IpeResult::Err(E::from(IpeError::invalid_input(format!("http: {refusal}"))));
+        }
+    };
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            return IpeResult::Err(E::from(IpeError::unavailable(format!(
+                "http.stream.open: client: {e}"
+            ))));
+        }
+    };
+    // The permit is claimed before the request goes out, so a header wait in
+    // flight counts against the cap; every early return gives it back.
+    let permit = match with_registry(reg, StreamRegistry::reserve) {
+        Ok(permit) => permit,
+        Err(e) => return IpeResult::Err(E::from(e)),
+    };
+    // `HttpMethod` is an ADT — every variant maps to a known reqwest
+    // constant (no runtime failure possible here).
+    let method = crate::http_client::method_to_reqwest(req.method);
+    let mut rb = client.request(method, &req.url);
+    for (k, v) in &req.headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    if !req.body.is_empty() {
+        rb = rb.body(req.body.clone());
+    }
+    // No whole-request timeout — streams may run for minutes (LLM completions).
+    // The idle ceiling bounds the wait for the headers; the 30 s connect
+    // timeout above bounds only the connect phase of it.
+    let resp = match tokio::time::timeout(idle.as_duration(), rb.send()).await {
+        Err(_elapsed) => return IpeResult::Err(E::from(idle_timeout())),
+        Ok(Ok(r)) => r,
+        // [B8] The reqwest error `Debug`/`Display` (and `req.url`) can echo the
+        // target URL / request headers / bearer / API key. Route through the
+        // correlation-id redaction helper: raw detail → server log under a ref
+        // id; Ipê sees only a fixed generic message.
+        Ok(Err(e)) => return IpeResult::Err(crate::http_client::redacted_transport_error(e)),
+    };
+    // HTTP error statuses (4xx/5xx) still surface as a stream — the body may
+    // carry the error payload the caller wants to read. Mirrors Http.get
+    // returning Ok with a 4xx status.
+    match with_registry(reg, |r| r.open(LiveResponse { resp, permit }, os_entropy)) {
+        Ok(sid) => IpeResult::Ok(sid),
+        Err(e) => IpeResult::Err(E::from(e)),
     }
 }
 
@@ -387,58 +843,16 @@ impl Drop for DrainLease {
 ///
 /// Returns a freshly minted `IpeStreamId` handle for the parked response.
 ///
-/// No whole-request timeout — streams may run for minutes (LLM completions);
-/// a 30s connect timeout bounds the header stage only.
+/// No whole-request timeout — streams may run for minutes (LLM completions).
+/// The response headers must arrive within the idle ceiling (300 s), else
+/// `Err Timeout`. The request holds one connection permit from before it goes
+/// out; a registry at the cap with nothing parked refuses with `Err Unavailable`.
 pub fn http_stream_open<E: From<String> + From<IpeError> + Send + 'static>(
     req: HttpRequest,
 ) -> IpeTask<E, IpeStreamId> {
-    Box::pin(async move {
-        // SSRF guard: resolve + validate + pin, and the per-redirect re-check,
-        // through the shared helper, identical to Http.get/post.
-        let builder =
-            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(30));
-        let builder = match crate::http_client::ssrf_apply(builder, &req.url, req.redirects).await {
-            Ok(b) => b,
-            Err(refusal) => {
-                return IpeResult::Err(E::from(IpeError::invalid_input(format!(
-                    "http: {refusal}"
-                ))));
-            }
-        };
-        let client = match builder.build() {
-            Ok(c) => c,
-            Err(e) => {
-                return IpeResult::Err(E::from(IpeError::unavailable(format!(
-                    "http.stream.open: client: {e}"
-                ))));
-            }
-        };
-        // `HttpMethod` is an ADT — every variant maps to a known reqwest
-        // constant (no runtime failure possible here).
-        let method = crate::http_client::method_to_reqwest(req.method);
-        let mut rb = client.request(method, &req.url);
-        for (k, v) in &req.headers {
-            rb = rb.header(k.as_str(), v.as_str());
-        }
-        if !req.body.is_empty() {
-            rb = rb.body(req.body.clone());
-        }
-        let resp = match rb.send().await {
-            Ok(r) => r,
-            // [B8] The reqwest error `Debug`/`Display` (and `req.url`) can echo the
-            // target URL / request headers / bearer / API key. Route through the
-            // correlation-id redaction helper: raw detail → server log under a ref
-            // id; Ipê sees only a fixed generic message.
-            Err(e) => return IpeResult::Err(crate::http_client::redacted_transport_error(e)),
-        };
-        // HTTP error statuses (4xx/5xx) still surface as a stream — the body may
-        // carry the error payload the caller wants to read. Mirrors Http.get
-        // returning Ok with a 4xx status.
-        match with_registry(|r| r.open(resp, os_entropy)) {
-            Ok(sid) => IpeResult::Ok(sid),
-            Err(e) => IpeResult::Err(E::from(e)),
-        }
-    })
+    Box::pin(
+        async move { open_in(registry(), req, DialPolicy::from_env(), STREAM_IDLE_CEILING).await },
+    )
 }
 
 /// `Ipe.Http.Stream.forEachChunk : StreamId -> (String -> Task Error ()) -> Task Error ()`
@@ -450,67 +864,45 @@ pub fn http_stream_open<E: From<String> + From<IpeError> + Send + 'static>(
 /// Semantics:
 ///   * clean EOF                     → Ok ()
 ///   * upstream read error           → Err e
+///   * no bytes within the idle ceiling (300 s, per read) → Err `Timeout`
 ///   * `body chunk` returns Err      → abort, close, Err e (fail-fast)
-///   * `close` during the drain      → stop at the next chunk boundary, Ok ()
+///   * `close` during the drain      → stops at once, even blocked on the
+///     upstream, releases the connection, Ok ()
 ///   * a handle no open stream holds → Err `InvalidInput`
 ///   * a stream another drain owns   → Err `Conflict`
 ///   * the connection is always released on exit.
 ///
 /// Backpressure: `body` runs synchronously per chunk; if it blocks on a slow
 /// downstream (`Server.Stream.emit` to a bounded channel) the upstream read
-/// naturally throttles.
+/// naturally throttles. Time spent in `body` is not upstream idleness, so the
+/// ceiling does not count it.
 pub fn http_stream_for_each_chunk<E, F>(sid: IpeStreamId, body: F) -> IpeTask<E, ()>
 where
     E: From<String> + From<IpeError> + Send + 'static,
     F: Fn(String) -> IpeTask<E, ()> + Send + 'static,
 {
-    let key = sid.key;
-    Box::pin(async move {
-        let resp = match with_registry(|r| r.take_for_drain(key)) {
-            Ok(r) => r,
-            Err(e) => return IpeResult::Err(E::from(e)),
-        };
-        let lease = DrainLease { key };
-        let mut stream = resp.bytes_stream();
-        loop {
-            if !lease.still_owned() {
-                break IpeResult::Ok(());
-            }
-            match stream.next().await {
-                Some(Ok(bytes)) => {
-                    #[allow(clippy::disallowed_methods)]
-                    // a streamed chunk reaches Ipê as `String` text
-                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
-                    match body(chunk).await {
-                        IpeResult::Ok(()) => {}
-                        IpeResult::Err(e) => break IpeResult::Err(e),
-                    }
-                }
-                // [B8] redact the foreign reqwest read error (see open above).
-                Some(Err(e)) => {
-                    break IpeResult::Err(crate::http_client::redacted_transport_error(e));
-                }
-                None => break IpeResult::Ok(()),
-            }
-        }
-        // `stream` (the response) and `lease` drop here: the connection is
-        // released and the slot ends.
-    })
+    Box::pin(for_each_chunk_in(
+        registry(),
+        sid.key,
+        STREAM_IDLE_CEILING,
+        body,
+    ))
 }
 
 /// `Ipe.Http.Stream.close : StreamId -> Task Error ()`
 ///
 /// Releases a live stream: a parked response drops at once, a stream being
-/// drained ends at its next chunk boundary. A handle naming no live stream
-/// (never opened, already closed, ended by its drain, or evicted) is
-/// `Err InvalidInput`, so a double close or a forged handle never passes for a
-/// release. A caller wanting idempotence opts in with `Task.onError`.
+/// drained stops at once and releases its connection, even while blocked
+/// waiting on the upstream. A handle naming no live stream (never opened,
+/// already closed, ended by its drain, or evicted) is `Err InvalidInput`, so a
+/// double close or a forged handle never passes for a release. A caller
+/// wanting idempotence opts in with `Task.onError`.
 pub fn http_stream_close<E: From<String> + From<IpeError> + Send + 'static>(
     sid: IpeStreamId,
 ) -> IpeTask<E, ()> {
     let key = sid.key;
     Box::pin(async move {
-        match with_registry(|r| r.close(key)) {
+        match with_registry(registry(), |r| r.close(key)) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => IpeResult::Err(E::from(e)),
         }
@@ -524,13 +916,15 @@ pub fn http_stream_close<E: From<String> + From<IpeError> + Send + 'static>(
 /// Returns a `IpeSub::Source` that, on first subscribe for a parked stream,
 /// spawns a detached task draining the response and dispatching a `ChunkEvent`
 /// Msg per chunk: `Chunk s` per UTF-8 byte chunk, `Done` on clean EOF,
-/// `Errored e` on a read fault; a `close` during the drain stops it with no
-/// further event. `subscriptions` is re-evaluated on every TEA `update`, so a
-/// re-subscribe to a draining or ended stream starts nothing — the registry
-/// decides that under its one lock. A handle no open stream holds gets exactly
-/// one `Errored InvalidInput` (its tombstone dedups every re-subscribe). The
-/// drain is DETACHED — `SubRuntime`'s abort-on-respawn only ever hits the dummy
-/// handle, never the drain. `E` is pinned to `IpeError` at the call site.
+/// `Errored e` on a read fault or when no bytes arrive within the idle ceiling
+/// (300 s, per read, a `Timeout`); a `close` during the drain stops it at once,
+/// even blocked on the upstream, with no further event. `subscriptions` is
+/// re-evaluated on every TEA `update`, so a re-subscribe to a draining or
+/// ended stream starts nothing — the registry decides that under its one lock.
+/// A handle no open stream holds gets exactly one `Errored InvalidInput` (its
+/// tombstone dedups every re-subscribe). The drain is DETACHED —
+/// `SubRuntime`'s abort-on-respawn only ever hits the dummy handle, never the
+/// drain. `E` is pinned to `IpeError` at the call site.
 /// `to_msg` is moved exclusively into the ONE detached `tokio::spawn` task
 /// below (never behind a shared `Arc`, never read from two threads at once) --
 /// the same shape as the sibling `sub_subscribe_topic` (`pubsub.rs`), whose
@@ -554,55 +948,21 @@ where
     M: Send + 'static,
     F: Fn(ChunkEvent<E>) -> M + Send + 'static,
 {
-    let key = sid.key;
-    IpeSub::Source(Box::new(move |emit| {
-        match with_registry(|r| r.subscribe(key)) {
-            Subscription::Drain(resp) => {
-                // The lease moves into the task, so a task dropped before its
-                // first poll still ends the slot.
-                let lease = DrainLease { key };
-                tokio::spawn(async move {
-                    let mut stream = resp.bytes_stream();
-                    loop {
-                        if !lease.still_owned() {
-                            break;
-                        }
-                        match stream.next().await {
-                            Some(Ok(bytes)) => {
-                                #[allow(clippy::disallowed_methods)]
-                                // a streamed chunk reaches Ipê as `String` text
-                                let chunk = String::from_utf8_lossy(&bytes).into_owned();
-                                emit(to_msg(ChunkEvent::Chunk(chunk)));
-                            }
-                            Some(Err(e)) => {
-                                // [B8] redact the foreign reqwest read error (see open above).
-                                emit(to_msg(ChunkEvent::Errored(
-                                    crate::http_client::redacted_transport_error(e),
-                                )));
-                                break;
-                            }
-                            None => {
-                                emit(to_msg(ChunkEvent::Done));
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-            Subscription::Refused => {
-                emit(to_msg(ChunkEvent::Errored(E::from(
-                    IpeError::invalid_input(UNKNOWN_STREAM.to_owned()),
-                ))));
-            }
-            Subscription::Active | Subscription::Unrecorded => {}
-        }
-        tokio::spawn(async {}) // dummy handle for `SubRuntime` to abort harmlessly
-    }))
+    subscribe_in(registry(), sid.key, STREAM_IDLE_CEILING, to_msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{FutureExt, stream};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+    use tokio::time::Instant;
 
     /// A deterministic key source: the n-th draw is the key `n`.
     fn counting_source() -> impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error> {
@@ -631,6 +991,643 @@ mod tests {
     fn slot_of(reg: &StreamRegistry<()>, k: StreamKey) -> Option<&Slot<()>> {
         reg.map.get(&k).map(|e| &e.slot)
     }
+
+    fn is_draining<V>(reg: &StreamRegistry<V>, k: StreamKey) -> bool {
+        matches!(reg.map.get(&k).map(|e| &e.slot), Some(Slot::Draining(_)))
+    }
+
+    fn is_ended<V>(reg: &StreamRegistry<V>, k: StreamKey) -> bool {
+        matches!(reg.map.get(&k).map(|e| &e.slot), Some(Slot::Ended))
+    }
+
+    fn draining_in<V>(reg: &Mutex<StreamRegistry<V>>, k: StreamKey) -> bool {
+        with_registry(reg, |r| is_draining(r, k))
+    }
+
+    fn ended_in<V>(reg: &Mutex<StreamRegistry<V>>, k: StreamKey) -> bool {
+        with_registry(reg, |r| is_ended(r, k))
+    }
+
+    fn free_permits<V>(reg: &Mutex<StreamRegistry<V>>) -> usize {
+        with_registry(reg, |r| r.conns.available_permits())
+    }
+
+    fn ms(n: u64) -> IdleCeiling {
+        IdleCeiling::from_millis(NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN))
+    }
+
+    fn into_err<A>(result: IpeResult<IpeError, A>) -> Option<IpeError> {
+        match result {
+            IpeResult::Err(e) => Some(e),
+            IpeResult::Ok(_) => None,
+        }
+    }
+
+    fn into_ok<A>(result: IpeResult<IpeError, A>) -> Option<A> {
+        match result {
+            IpeResult::Ok(a) => Some(a),
+            IpeResult::Err(_) => None,
+        }
+    }
+
+    // ─── Fake upstream ──────────────────────────────────────────────────────
+
+    type FakeBody = Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>;
+
+    /// A scripted connection: its body, and the permit it holds.
+    struct FakeConn {
+        body: FakeBody,
+        permit: ConnPermit,
+    }
+
+    impl LiveStream for FakeConn {
+        type Fault = String;
+        type Body = FakeBody;
+
+        fn into_parts(self) -> (FakeBody, ConnPermit) {
+            (self.body, self.permit)
+        }
+
+        fn fault<E: From<String>>(fault: String) -> E {
+            E::from(fault)
+        }
+    }
+
+    /// One step of a scripted upstream.
+    enum Beat {
+        /// Wait this many milliseconds, then yield the text.
+        Chunk(u64, &'static str),
+        /// Never yield again.
+        Stall,
+    }
+
+    /// The beats in order, then EOF.
+    fn scripted(beats: Vec<Beat>) -> FakeBody {
+        Box::pin(stream::unfold(
+            VecDeque::from(beats),
+            |mut beats| async move {
+                match beats.pop_front()? {
+                    Beat::Chunk(wait, text) => {
+                        if wait > 0 {
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                        }
+                        Some((Ok::<String, String>(text.to_owned()), beats))
+                    }
+                    Beat::Stall => std::future::pending().await,
+                }
+            },
+        ))
+    }
+
+    /// A chunk every millisecond, forever.
+    fn ticking() -> FakeBody {
+        Box::pin(stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Some((Ok::<String, String>("x".to_owned()), ()))
+        }))
+    }
+
+    /// Sets its flag when dropped.
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A body that reports its own drop.
+    struct Watched {
+        inner: FakeBody,
+        _signal: DropSignal,
+    }
+
+    impl Stream for Watched {
+        type Item = Result<String, String>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.inner.as_mut().poll_next(cx)
+        }
+    }
+
+    fn new_reg<V: Send + 'static>() -> &'static Mutex<StreamRegistry<V>> {
+        Box::leak(Box::new(Mutex::new(StreamRegistry::new())))
+    }
+
+    /// Parks `body` under a fresh handle; the flag is set when the body drops.
+    fn park(
+        reg: &'static Mutex<StreamRegistry<FakeConn>>,
+        body: FakeBody,
+    ) -> (IpeStreamId, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body: FakeBody = Box::pin(Watched {
+            inner: body,
+            _signal: DropSignal(Arc::clone(&dropped)),
+        });
+        let sid = with_registry(reg, |r| {
+            let permit = r.reserve().unwrap();
+            r.open(FakeConn { body, permit }, os_entropy)
+        })
+        .unwrap();
+        (sid, dropped)
+    }
+
+    /// Parks an empty stream in a local registry.
+    fn park_local(
+        reg: &mut StreamRegistry<FakeConn>,
+        source: &mut impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+    ) -> IpeStreamId {
+        let permit = reg.reserve().unwrap();
+        let body = scripted(Vec::new());
+        reg.open(FakeConn { body, permit }, &mut *source).unwrap()
+    }
+
+    fn counting_body(
+        calls: &Arc<AtomicUsize>,
+    ) -> impl Fn(String) -> IpeTask<IpeError, ()> + Send + 'static {
+        let calls = Arc::clone(calls);
+        move |_chunk: String| -> IpeTask<IpeError, ()> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(IpeResult::Ok(())))
+        }
+    }
+
+    type Events = Arc<Mutex<Vec<ChunkEvent<IpeError>>>>;
+
+    /// Subscribes to `key` and runs the source on the current runtime.
+    fn start_subscription(
+        reg: &'static Mutex<StreamRegistry<FakeConn>>,
+        key: StreamKey,
+        idle: IdleCeiling,
+    ) -> Events {
+        let events: Events = Arc::default();
+        let sink = Arc::clone(&events);
+        let sub =
+            subscribe_in::<FakeConn, IpeError, ChunkEvent<IpeError>, _>(reg, key, idle, |event| {
+                event
+            });
+        if let IpeSub::Source(spawn) = sub {
+            let emit: Arc<dyn Fn(ChunkEvent<IpeError>) + Send + Sync> =
+                Arc::new(move |event: ChunkEvent<IpeError>| sink.lock().unwrap().push(event));
+            drop(spawn(emit));
+        }
+        events
+    }
+
+    fn labels(events: &Events) -> Vec<String> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| match event {
+                ChunkEvent::Chunk(text) => text.clone(),
+                ChunkEvent::Done => "<done>".to_owned(),
+                ChunkEvent::Errored(_) => "<errored>".to_owned(),
+            })
+            .collect()
+    }
+
+    fn errored_kinds(events: &Events) -> Vec<IpeErrorKind> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ChunkEvent::Errored(e) => Some(kind(e)),
+                ChunkEvent::Chunk(_) | ChunkEvent::Done => None,
+            })
+            .collect()
+    }
+
+    // ─── Cancel: a close stops a drain wherever it waits ────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn close_stops_a_drain_blocked_on_the_upstream() {
+        let reg = new_reg::<FakeConn>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
+        let drain = tokio::spawn(for_each_chunk_in(
+            reg,
+            sid.key,
+            ms(7_200_000),
+            counting_body(&calls),
+        ));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(draining_in(reg, sid.key));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX - 1);
+        let started = Instant::now();
+        assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
+        let outcome = tokio::time::timeout(Duration::from_secs(3_600), drain).await;
+        assert!(matches!(outcome, Ok(Ok(IpeResult::Ok(())))));
+        assert!(started.elapsed() < Duration::from_secs(3_600));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_during_a_body_step_releases_the_connection_at_once() {
+        let reg = new_reg::<FakeConn>();
+        let (sid, dropped) = park(reg, scripted(vec![Beat::Chunk(0, "a"), Beat::Stall]));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let body = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |_chunk: String| -> IpeTask<IpeError, ()> {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    IpeResult::Ok(())
+                })
+            }
+        };
+        let drain = tokio::spawn(for_each_chunk_in(reg, sid.key, ms(7_200_000), body));
+        entered.notified().await;
+        assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The connection is gone while the body step is still pending.
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+        assert!(!drain.is_finished());
+        release.notify_one();
+        assert!(matches!(drain.await, Ok(IpeResult::Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_inside_the_body_reads_no_further_chunk() {
+        let reg = new_reg::<FakeConn>();
+        let (sid, dropped) = park(reg, ticking());
+        let key = sid.key;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let body = {
+            let calls = Arc::clone(&calls);
+            move |_chunk: String| -> IpeTask<IpeError, ()> {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let closed = with_registry(reg, |r| r.close(key));
+                Box::pin(std::future::ready(match closed {
+                    Ok(()) => IpeResult::Ok(()),
+                    Err(e) => IpeResult::Err(e),
+                }))
+            }
+        };
+        let drained = tokio::time::timeout(
+            Duration::from_secs(60),
+            for_each_chunk_in(reg, key, ms(7_200_000), body),
+        )
+        .await;
+        assert!(matches!(drained, Ok(IpeResult::Ok(()))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_relays_every_chunk_then_ends_the_slot() {
+        let reg = new_reg::<FakeConn>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let beats = vec![Beat::Chunk(0, "a"), Beat::Chunk(1, "b")];
+        let (sid, dropped) = park(reg, scripted(beats));
+        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        assert!(matches!(drained, IpeResult::Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(ended_in(reg, sid.key));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    // ─── Idle ceiling ───────────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_upstream_ends_the_drain_at_the_idle_ceiling() {
+        let reg = new_reg::<FakeConn>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
+        let started = Instant::now();
+        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        let waited = started.elapsed();
+        let refused = into_err(drained);
+        assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
+        assert!(matches!(&refused, Some(e) if message(e) == STREAM_IDLE_TIMED_OUT));
+        assert!(waited >= Duration::from_secs(5));
+        assert!(waited < Duration::from_millis(5_050));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+        assert!(ended_in(reg, sid.key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunk_inside_the_ceiling_is_not_idle() {
+        let reg = new_reg::<FakeConn>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (sid, _dropped) = park(reg, scripted(vec![Beat::Chunk(4_000, "a")]));
+        let started = Instant::now();
+        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        assert!(matches!(drained, IpeResult::Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ceiling_is_per_read_not_per_drain() {
+        let reg = new_reg::<FakeConn>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let beats = vec![
+            Beat::Chunk(4_000, "a"),
+            Beat::Chunk(4_000, "b"),
+            Beat::Stall,
+        ];
+        let (sid, _dropped) = park(reg, scripted(beats));
+        let started = Instant::now();
+        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        let waited = started.elapsed();
+        let refused = into_err(drained);
+        assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Two reads of 4 s each stay under the ceiling; the stall then costs one ceiling.
+        assert!(waited >= Duration::from_secs(13));
+        assert!(waited < Duration::from_millis(13_050));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_upstream_errors_a_subscription_once() {
+        let reg = new_reg::<FakeConn>();
+        let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
+        let events = start_subscription(reg, sid.key, ms(5_000));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(errored_kinds(&events) == [IpeErrorKind::Timeout]);
+        assert_eq!(labels(&events).len(), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+        // A re-subscribe finds the tombstone and starts nothing.
+        let again = start_subscription(reg, sid.key, ms(5_000));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(labels(&again).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_relays_chunks_then_done() {
+        let reg = new_reg::<FakeConn>();
+        let beats = vec![Beat::Chunk(0, "a"), Beat::Chunk(0, "b")];
+        let (sid, _dropped) = park(reg, scripted(beats));
+        let events = start_subscription(reg, sid.key, ms(5_000));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(labels(&events) == ["a", "b", "<done>"]);
+        assert!(ended_in(reg, sid.key));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_stops_a_subscription_without_an_event() {
+        let reg = new_reg::<FakeConn>();
+        let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
+        let events = start_subscription(reg, sid.key, ms(7_200_000));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(draining_in(reg, sid.key));
+        assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(labels(&events).is_empty());
+        assert!(ended_in(reg, sid.key));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    // ─── Real sockets: the headers wait and the connection itself ───────────
+
+    fn loopback_request(port: u16) -> HttpRequest {
+        HttpRequest {
+            body: String::new(),
+            headers: Vec::new(),
+            method: HttpMethod::Get,
+            redirects: RedirectPolicy::NoRedirects,
+            timeout: 0,
+            url: format!("http://127.0.0.1:{port}/"),
+        }
+    }
+
+    /// Accepts one connection, writes `reply`, then holds the socket.
+    async fn serve_once(reply: &'static [u8]) -> (u16, JoinHandle<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if !reply.is_empty() {
+                socket.write_all(reply).await.unwrap();
+            }
+            socket
+        });
+        (port, held)
+    }
+
+    #[tokio::test]
+    async fn open_times_out_when_the_headers_never_arrive() {
+        let reg = new_reg::<LiveResponse>();
+        let (port, _server) = serve_once(b"").await;
+        let started = Instant::now();
+        let opened = tokio::time::timeout(
+            Duration::from_secs(30),
+            open_in::<IpeError>(reg, loopback_request(port), DialPolicy::AllowAll, ms(300)),
+        )
+        .await;
+        let waited = started.elapsed();
+        let refused = opened.ok().and_then(into_err);
+        assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
+        assert!(matches!(&refused, Some(e) if message(e) == STREAM_IDLE_TIMED_OUT));
+        assert!(waited >= Duration::from_millis(300));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    #[tokio::test]
+    async fn open_inside_the_ceiling_parks_a_response_holding_a_permit() {
+        let reg = new_reg::<LiveResponse>();
+        let reply = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let (port, _server) = serve_once(reply).await;
+        let opened = tokio::time::timeout(
+            Duration::from_secs(30),
+            open_in::<IpeError>(
+                reg,
+                loopback_request(port),
+                DialPolicy::AllowAll,
+                ms(30_000),
+            ),
+        )
+        .await;
+        let sid = opened.ok().and_then(into_ok);
+        assert!(sid.is_some());
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX - 1);
+        let Some(sid) = sid else { return };
+        assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    #[tokio::test]
+    async fn close_shuts_the_socket_of_a_drain_blocked_on_a_silent_peer() {
+        let reg = new_reg::<LiveResponse>();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Chunked headers, no chunks; then read until the client closes.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+            socket.write_all(head).await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let opened = tokio::time::timeout(
+            Duration::from_secs(30),
+            open_in::<IpeError>(
+                reg,
+                loopback_request(port),
+                DialPolicy::AllowAll,
+                ms(60_000),
+            ),
+        )
+        .await;
+        let Some(sid) = opened.ok().and_then(into_ok) else {
+            return;
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drain = tokio::spawn(for_each_chunk_in(
+            reg,
+            sid.key,
+            ms(60_000),
+            counting_body(&calls),
+        ));
+        for _ in 0..500 {
+            if draining_in(reg, sid.key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(draining_in(reg, sid.key));
+        // Let the drain reach its blocked read.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
+        let drained = tokio::time::timeout(Duration::from_secs(10), drain).await;
+        assert!(matches!(drained, Ok(Ok(IpeResult::Ok(())))));
+        let peer = tokio::time::timeout(Duration::from_secs(10), server).await;
+        assert!(matches!(peer, Ok(Ok(()))));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ─── Permits ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_ended_stream_keeps_its_permit_while_its_value_lives() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
+        let mut source = counting_source();
+        let mut held = Vec::new();
+        for _ in 0..CLIENT_STREAMS_MAX {
+            let sid = park_local(&mut reg, &mut source);
+            let claimed = reg.take_for_drain(sid.key).unwrap();
+            reg.finish_drain(sid.key, claimed.seq);
+            held.push(claimed);
+        }
+        assert_eq!(reg.conns.available_permits(), 0);
+        let refused = reg.reserve();
+        assert!(matches!(&refused, Err(e) if kind(e) == IpeErrorKind::Unavailable));
+        assert!(matches!(&refused, Err(e) if message(e) == TOO_MANY_STREAMS));
+        // Happy twin: one connection ending frees exactly one permit.
+        drop(held.pop());
+        assert!(reg.reserve().is_ok());
+    }
+
+    #[test]
+    fn a_full_parked_registry_gives_up_its_oldest_for_a_permit() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
+        let mut source = counting_source();
+        for _ in 0..CLIENT_STREAMS_MAX {
+            park_local(&mut reg, &mut source);
+        }
+        assert_eq!(reg.conns.available_permits(), 0);
+        let permit = reg.reserve();
+        assert!(permit.is_ok());
+        let evicted = reg.take_for_drain(key(1));
+        assert!(matches!(&evicted, Err(e) if kind(e) == IpeErrorKind::InvalidInput));
+        // The next-oldest is still held.
+        assert!(reg.take_for_drain(key(2)).is_ok());
+    }
+
+    #[test]
+    fn a_stale_lease_does_not_end_a_newer_drain() {
+        let mut reg = StreamRegistry::<()>::new();
+        let sid = reg.open((), counting_source()).unwrap();
+        let claimed = reg.take_for_drain(sid.key).unwrap();
+        reg.finish_drain(sid.key, claimed.seq + 1);
+        assert!(is_draining(&reg, sid.key));
+        reg.finish_drain(sid.key, claimed.seq);
+        assert!(is_ended(&reg, sid.key));
+    }
+
+    #[test]
+    fn a_refused_second_claim_leaves_the_first_drain_running() {
+        let mut reg = StreamRegistry::<()>::new();
+        let sid = reg.open((), counting_source()).unwrap();
+        let mut claimed = reg.take_for_drain(sid.key).unwrap();
+        let second = reg.take_for_drain(sid.key);
+        assert!(matches!(&second, Err(e) if kind(e) == IpeErrorKind::Conflict));
+        assert!(is_draining(&reg, sid.key));
+        assert!(claimed.cancel.revoked().now_or_never().is_none());
+        // Closing is what cancels it.
+        assert!(reg.close(sid.key).is_ok());
+        assert!(claimed.cancel.revoked().now_or_never().is_some());
+    }
+
+    /// Spawns a pump over a stalled stream claimed from `reg`.
+    fn start_pump(
+        reg: &mut StreamRegistry<FakeConn>,
+        idle: IdleCeiling,
+    ) -> (StreamKey, u64, JoinHandle<DrainEnd<String, String>>) {
+        let permit = reg.reserve().unwrap();
+        let body = scripted(vec![Beat::Stall]);
+        let sid = reg.open(FakeConn { body, permit }, os_entropy).unwrap();
+        let claimed = reg.take_for_drain(sid.key).unwrap();
+        let (stream, permit) = claimed.value.into_parts();
+        let pump = Pump {
+            stream,
+            permit,
+            cancel: claimed.cancel,
+            idle,
+        };
+        let task = tokio::spawn(pump.run(|_chunk| std::future::ready(Ok::<(), String>(()))));
+        (sid.key, claimed.seq, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_registry_cancels_a_running_drain() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
+        let (_key, _seq, task) = start_pump(&mut reg, ms(7_200_000));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(reg);
+        let end = tokio::time::timeout(Duration::from_secs(3_600), task).await;
+        assert!(matches!(end, Ok(Ok(DrainEnd::Cancelled))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overwriting_a_draining_entry_cancels_its_drain() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
+        let (key, seq, task) = start_pump(&mut reg, ms(7_200_000));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        reg.map.insert(
+            key,
+            Entry {
+                seq,
+                slot: Slot::Ended,
+            },
+        );
+        let end = tokio::time::timeout(Duration::from_secs(3_600), task).await;
+        assert!(matches!(end, Ok(Ok(DrainEnd::Cancelled))));
+    }
+
+    // ─── Registry state machine ─────────────────────────────────────────────
 
     #[test]
     fn for_each_chunk_unknown_key_is_invalid_input() {
@@ -683,8 +1680,8 @@ mod tests {
     fn close_after_drain_end_refused() {
         let mut reg = StreamRegistry::<()>::new();
         let sid = reg.open((), counting_source()).unwrap();
-        assert!(reg.take_for_drain(sid.key).is_ok());
-        reg.finish_drain(sid.key);
+        let claimed = reg.take_for_drain(sid.key).unwrap();
+        reg.finish_drain(sid.key, claimed.seq);
         assert_unknown(&reg.close(sid.key));
         assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
     }
@@ -706,15 +1703,15 @@ mod tests {
         assert!(reg.take_for_drain(sid.key).is_ok());
         let second = reg.take_for_drain(sid.key);
         assert!(matches!(&second, Err(e) if kind(e) == IpeErrorKind::Conflict));
-        assert!(reg.is_draining(sid.key));
+        assert!(is_draining(&reg, sid.key));
     }
 
     #[test]
     fn for_each_chunk_after_end_is_invalid_input() {
         let mut reg = StreamRegistry::<()>::new();
         let sid = reg.open((), counting_source()).unwrap();
-        assert!(reg.take_for_drain(sid.key).is_ok());
-        reg.finish_drain(sid.key);
+        let claimed = reg.take_for_drain(sid.key).unwrap();
+        reg.finish_drain(sid.key, claimed.seq);
         let again = reg.take_for_drain(sid.key);
         assert!(matches!(&again, Err(e) if kind(e) == IpeErrorKind::InvalidInput));
         assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
@@ -724,11 +1721,13 @@ mod tests {
     fn close_during_drain_ends_the_drain() {
         let mut reg = StreamRegistry::<()>::new();
         let sid = reg.open((), counting_source()).unwrap();
-        assert!(reg.take_for_drain(sid.key).is_ok());
-        assert!(reg.is_draining(sid.key));
+        let claimed = reg.take_for_drain(sid.key).unwrap();
+        assert!(is_draining(&reg, sid.key));
         assert!(reg.close(sid.key).is_ok());
-        assert!(!reg.is_draining(sid.key));
-        reg.finish_drain(sid.key);
+        assert!(!is_draining(&reg, sid.key));
+        assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
+        // The drain's own lease then ends nothing further.
+        reg.finish_drain(sid.key, claimed.seq);
         assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
     }
 
@@ -740,7 +1739,7 @@ mod tests {
         assert!(matches!(reg.subscribe(key(5)), Subscription::Active));
         // Happy twin: a parked stream drains once, then dedups.
         let sid = reg.open((), counting_source()).unwrap();
-        assert!(matches!(reg.subscribe(sid.key), Subscription::Drain(())));
+        assert!(matches!(reg.subscribe(sid.key), Subscription::Drain(_)));
         assert!(matches!(reg.subscribe(sid.key), Subscription::Active));
     }
 
@@ -890,8 +1889,8 @@ mod tests {
         fill(&mut reg, &mut source);
         // A later stream ends; the oldest (key 1) stays parked.
         let ended = key(500);
-        assert!(reg.take_for_drain(ended).is_ok());
-        reg.finish_drain(ended);
+        let claimed = reg.take_for_drain(ended).unwrap();
+        reg.finish_drain(ended, claimed.seq);
         assert!(reg.open((), &mut source).is_ok());
         assert_eq!(reg.map.len(), CLIENT_STREAMS_MAX);
         assert!(slot_of(&reg, ended).is_none());
