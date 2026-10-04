@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 CREATE TABLE IF NOT EXISTS reviewed_stamp (
   one  INTEGER PRIMARY KEY CHECK (one = 1),
-  head TEXT NOT NULL
+  head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
 );
 ";
 
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(head, "genesis:abc");
     }
 
-    // One stamp row, never empty text for a head.
+    // One stamp row, its head non-empty text.
     #[test]
     fn reviewed_stamp_holds_one_row_with_a_head() {
         let s = Store::open(":memory:").unwrap();
@@ -1044,6 +1044,52 @@ mod tests {
             )
             .unwrap_err();
         assert!(headless.to_string().contains("NOT NULL"), "got: {headless}");
+        for head in ["''", "x''", "x'6869'"] {
+            let refused = s
+                .conn
+                .execute(
+                    &format!("INSERT INTO reviewed_stamp (one, head) VALUES (1, {head})"),
+                    [],
+                )
+                .unwrap_err();
+            assert!(refused.to_string().contains("CHECK"), "{head}: {refused}");
+        }
+        let rows: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM reviewed_stamp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    // Removes an on-disk test database and its WAL side files.
+    struct DbFile(std::path::PathBuf);
+    impl Drop for DbFile {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut path = self.0.clone().into_os_string();
+                path.push(suffix);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    // Opening a current index writes nothing, so a query command opens beside
+    // a rebuild that holds the write lock. A rewrite of the view on every open
+    // would wait out the busy timeout and fail here.
+    #[test]
+    fn open_beside_a_held_write_lock_rewrites_nothing() {
+        let file = DbFile(std::env::temp_dir().join(format!(
+            "ipe-index-open-beside-write-lock-{}.db",
+            std::process::id()
+        )));
+        drop(DbFile(file.0.clone()));
+        let path = file.0.to_str().unwrap();
+        let writer = Store::open(path).unwrap();
+        let uid = unit_with_hash(&writer, "foo", "sha256:aa");
+        writer.begin().unwrap();
+        let reader = Store::open(path).unwrap();
+        assert_eq!(open_uids(&reader), vec![uid]);
+        writer.rollback().unwrap();
     }
 
     // A root row with an outer tag but no prefix (or the reverse) cannot be
