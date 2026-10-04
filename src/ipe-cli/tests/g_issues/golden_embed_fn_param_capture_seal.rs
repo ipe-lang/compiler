@@ -141,6 +141,86 @@ main =
     Server.listen 8000 [ Server.mountApp "/" (mk step) ]
 "#;
 
+/// A routed `Web.embed` with `onNavigate` whose `update` closes over a
+/// non-`Copy` record: the runtime entry and the generated `set_page` both
+/// dispatch through `update`, so it must be evaluated once and shared.
+const EMBED_ROUTED_ON_NAVIGATE_CAPTURED_UPDATE: &str = r#"module Main exposing (main)
+
+import Ipe.Server.Http as Server
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type Page
+    = HomePage
+    | AboutPage
+
+
+type alias Settings =
+    { greeting : String }
+
+
+type alias Model =
+    { page : Page
+    , count : Int
+    }
+
+
+type Msg
+    = Increment
+    | Navigate Page
+
+
+step : Settings -> Msg -> Model -> ( Model, Cmd.Cmd Msg )
+step settings msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + String.length settings.greeting }, Cmd.none )
+
+        Navigate page ->
+            ( { model | page = page }, Cmd.none )
+
+
+mk : Settings -> Web.WebApp
+mk settings =
+    Web.embed
+        { init = \_ -> ( { page = HomePage, count = 0 }, Cmd.none )
+        , update = step settings
+        , view =
+            \model ->
+                case model.page of
+                    HomePage ->
+                        Ui.text (String.fromInt model.count)
+
+                    AboutPage ->
+                        Ui.text "about"
+        , subscriptions = \_ -> Sub.none
+        , routes =
+            [ Web.route "/" HomePage
+            , Web.route "/about" AboutPage
+            ]
+        , notFound = HomePage
+        , onNavigate = Navigate
+        }
+
+
+main : Task Error ()
+main =
+    Server.listen 8000 [ Server.mountApp "/" (mk { greeting = "hello" }) ]
+"#;
+
+#[test]
+fn embed_routed_on_navigate_captured_update_builds() {
+    assert_accepted_and_builds(
+        "embed_routed_on_navigate_captured_update",
+        EMBED_ROUTED_ON_NAVIGATE_CAPTURED_UPDATE,
+    );
+}
+
 #[test]
 fn embed_fn_param_update_builds() {
     assert_accepted_and_builds("embed_fn_param_update", EMBED_FN_PARAM_UPDATE);
