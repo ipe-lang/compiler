@@ -560,7 +560,10 @@ mod tests {
         // A suffix of the slots rebuilds the rest after the matched prefix.
         let ([first, s1, s2], tail) = ipe_list_view_owned::<_, 3>(once_list(5));
         assert_eq!(first.map(|f| f()), Some(0));
-        assert_eq!(run_all(ipe_list_view_rest([s1, s2], tail)), vec![1, 2, 3, 4]);
+        assert_eq!(
+            run_all(ipe_list_view_rest([s1, s2], tail)),
+            vec![1, 2, 3, 4]
+        );
     }
 
     // Every HOF kernel in this file must accept the EXACT shape

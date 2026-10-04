@@ -7984,7 +7984,7 @@ impl FlatNestedList {
 /// The nested-list desugaring copies each head out by index and takes the tail
 /// by `List.drop` of the copied binder; neither exists for an
 /// [`SliceOwnership::OwnedMove`] element.
-fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()> {
+const fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()> {
     match own {
         SliceOwnership::BorrowClone => Ok(()),
         SliceOwnership::OwnedMove => Err(unsupported(span, Feature::NestedCtorDiscrimination)),
@@ -32793,13 +32793,16 @@ mod tests {
         assert!(carrier_is_clone(&named(shared_fn, Vec::new()), &payloads));
         assert!(carrier_is_clone(&named(wrap, vec![IrType::Int]), &payloads));
         assert!(!carrier_is_clone(&named(boxed_fn, Vec::new()), &payloads));
-        assert!(!carrier_is_clone(&named(wrap, vec![fun.clone()]), &payloads));
+        assert!(!carrier_is_clone(
+            &named(wrap, vec![fun.clone()]),
+            &payloads
+        ));
 
         // The list-`case` ownership decision and the emitter's generic-aware
         // authority agree: a slice element copies out exactly when its carrier
         // is `Clone` under the emitted bound.
         let generic = IrType::Generic(Symbol::from_raw(8));
-        let mut owned_samples = samples.clone();
+        let mut owned_samples = samples;
         owned_samples.push(generic.clone());
         for ty in &owned_samples {
             assert_eq!(
@@ -37322,10 +37325,7 @@ mod tests {
         };
         let binding = [
             slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
-            slice(
-                SliceOwnership::OwnedMove,
-                vec![Pat::Wildcard, Pat::Var(x)],
-            ),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
         ];
         assert_eq!(
             owned_or_refusal(&binding, span),
