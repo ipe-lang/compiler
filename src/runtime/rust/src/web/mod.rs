@@ -1634,7 +1634,10 @@ fn page_response(
     // Max-Age: persist the cookie for the store TTL so a
     // tab-close doesn't drop a still-live server session. Without it the cookie is
     // session-scoped and the user loses state on tab close.
-    let max_age = web_ttl().as_secs();
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let max_age = ttl.as_secs();
     let session_cookie = format!(
         "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
         session_cookie_name(),
@@ -1689,7 +1692,10 @@ fn page_response_with_overlay(
     } else {
         "Lax"
     };
-    let max_age = web_ttl().as_secs();
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let max_age = ttl.as_secs();
     let session_cookie = format!(
         "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
         session_cookie_name(),
@@ -1755,62 +1761,44 @@ mod web_max_body_bytes_tests {
     }
 }
 
+/// The session idle-TTL the environment may set: `IPE_WEB_TTL`, whole seconds
+/// or `h` / `m` / `s` segments (`30m`, `1h30m`), at most 400 days.
+#[cfg(feature = "server")]
+const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
+    "IPE_WEB_TTL",
+    1800,
+    "duration (whole seconds, or h/m/s segments such as 30m or 1h30m)",
+)
+.at_most(400 * 24 * 60 * 60);
+
 /// Session idle-TTL under the one config precedence `env > setting-in-code >
 /// fallback`: `IPE_WEB_TTL` wins, else an installed `Web.sessionTtl` setting,
 /// else the default 1800 (30 min).
+///
+/// # Errors
+///
+/// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
+/// duration within the bound; a present value is never replaced by a default.
 #[cfg(feature = "server")]
-fn web_ttl() -> std::time::Duration {
-    let secs = crate::system::read_env_var("IPE_WEB_TTL")
-        .ok()
-        .and_then(|s| parse_duration_secs(&s))
-        .or_else(crate::app_config::resolve_session_ttl_override)
-        .unwrap_or(1800u64);
-    std::time::Duration::from_secs(secs)
+fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
+    let raw = crate::system::read_env_var(WEB_TTL.name());
+    if matches!(raw, Err(std::env::VarError::NotPresent))
+        && let Some(secs) = crate::app_config::resolve_session_ttl_override()
+    {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    WEB_TTL.parse(raw).map(std::time::Duration::from_secs)
 }
 
-/// Parse a duration string: a bare integer is seconds (legacy), otherwise one
-/// or more `<number><unit>` segments with units `h` / `m` / `s`
-/// (e.g. `30m`, `1h`, `24h`, `90s`, `1h30m`). Total: any malformed input
-/// returns `None` (caller falls back to the default) — never panics.
+/// The `503` a request answers when the session TTL cannot be resolved.
 #[cfg(feature = "server")]
-fn parse_duration_secs(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Bare integer → seconds (legacy form).
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
-    }
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    let mut saw_unit = false;
-    let mut saw_digit = false;
-    for ch in s.chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.checked_mul(10)?.checked_add(d as u64)?;
-            saw_digit = true;
-        } else {
-            let unit_secs = match ch {
-                'h' => 3600,
-                'm' => 60,
-                's' => 1,
-                _ => return None, // unknown unit / stray char → malformed
-            };
-            if !saw_digit {
-                return None; // a unit with no preceding number
-            }
-            total = total.checked_add(num.checked_mul(unit_secs)?)?;
-            num = 0;
-            saw_digit = false;
-            saw_unit = true;
-        }
-    }
-    // A trailing number with no unit (e.g. `1h30`) is malformed.
-    if saw_digit || !saw_unit {
-        return None;
-    }
-    Some(total)
+fn ttl_unavailable_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        FAIL_CLOSED_BODY,
+    )
+        .into_response()
 }
 
 /// Graceful-drain grace window: how long the pure axum graceful drain is allowed
@@ -2189,10 +2177,16 @@ where
         // A fail-closed store config (e.g. prod `IPE_WEB_STORE=sqlite` in a
         // build with no `db` feature) surfaces as a task error → stderr + exit
         // 1, never a silent downgrade to a different backend.
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -2287,17 +2281,17 @@ where
             // router that answers every path with the fixed 503 body (the
             // operator detail goes to the runtime log) — never a silent downgrade to a different backend and never a mount
             // that quietly serves real sessions on the wrong store.
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2390,17 +2384,17 @@ where
                 routed_resolvers(routes, not_found, set_page, render);
             // A mount has no task-error channel, so an unhonourable store config
             // fails closed as a 503-everywhere router (see `web_embed_router`).
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2715,10 +2709,16 @@ where
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -4941,6 +4941,7 @@ where
     let body_limit: usize = WEB_MAX_BODY_CEILING
         .read()
         .map_err(StartupRefusal::Ceiling)?;
+    let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
     if let Err(refusal) = client_tuning_js() {
@@ -5209,7 +5210,7 @@ where
         }
     };
     if !proxy_active && console::gate_allows() {
-        store::emit_memory_store_log(web_ttl());
+        store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
             &format!(
@@ -5652,28 +5653,70 @@ mod dev_banner_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod duration_parse_tests {
-    use super::parse_duration_secs;
+    use super::{WEB_TTL, web_ttl};
+    use crate::system::{locked_remove_var, locked_set_var};
+    use std::time::Duration;
 
-    #[test]
-    fn duration_formats_and_bare_seconds() {
-        assert_eq!(parse_duration_secs("1800"), Some(1800)); // bare seconds (legacy)
-        assert_eq!(parse_duration_secs("30m"), Some(1800));
-        assert_eq!(parse_duration_secs("1h"), Some(3600));
-        assert_eq!(parse_duration_secs("24h"), Some(86400));
-        assert_eq!(parse_duration_secs("90s"), Some(90));
-        assert_eq!(parse_duration_secs("1h30m"), Some(5400));
-        assert_eq!(parse_duration_secs("45m"), Some(2700)); // the e2e check (IPE_WEB_TTL=45m)
-        assert_eq!(parse_duration_secs("  1h  "), Some(3600));
+    fn ttl_with(raw: &str) -> Result<Duration, crate::system::EnvCeilingRefusal> {
+        locked_set_var("IPE_WEB_TTL", raw);
+        let resolved = web_ttl();
+        locked_remove_var("IPE_WEB_TTL");
+        resolved
     }
 
     #[test]
-    fn malformed_is_none_never_panics() {
-        assert_eq!(parse_duration_secs(""), None);
-        assert_eq!(parse_duration_secs("abc"), None);
-        assert_eq!(parse_duration_secs("1d"), None); // unsupported unit
-        assert_eq!(parse_duration_secs("1h30"), None); // trailing unit-less number
-        assert_eq!(parse_duration_secs("m"), None); // unit with no number
-        assert_eq!(parse_duration_secs("-5m"), None);
+    fn the_web_ttl_honours_the_duration_contract() {
+        crate::system::assert_env_duration_contract(WEB_TTL);
+    }
+
+    #[test]
+    fn duration_formats_and_bare_seconds() {
+        for (raw, secs) in [
+            ("1800", 1800),
+            ("30m", 1800),
+            ("1h", 3600),
+            ("24h", 86_400),
+            ("90s", 90),
+            ("1h30m", 5400),
+            ("45m", 2700),
+            ("34560000", 34_560_000),
+            ("9600h", 34_560_000),
+        ] {
+            assert_eq!(ttl_with(raw), Ok(Duration::from_secs(secs)), "{raw:?}");
+        }
+        assert_eq!(
+            web_ttl(),
+            Ok(Duration::from_secs(1800)),
+            "absent is the default"
+        );
+    }
+
+    #[test]
+    fn a_malformed_ttl_is_refused_never_defaulted() {
+        for raw in [
+            "",
+            "abc",
+            "1d",
+            "1h30",
+            "m",
+            "-5m",
+            "0",
+            "0s",
+            "0h0m",
+            " 1h",
+            "1h ",
+            "30m1h",
+            "1m1m",
+            "34560001",
+            "9601h",
+            "99999999999999999999",
+        ] {
+            let outcome = ttl_with(raw);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == "IPE_WEB_TTL"),
+                "{raw:?} must be refused naming IPE_WEB_TTL, got {outcome:?}"
+            );
+        }
     }
 }
 

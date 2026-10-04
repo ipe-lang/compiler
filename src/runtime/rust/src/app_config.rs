@@ -495,101 +495,91 @@ fn session_ttl_from(env_present: bool, setting: Option<i64>) -> Option<u64> {
     }
 }
 
+/// The longest an auth lifetime or window may be set to, in seconds (one year).
+const AUTH_SECONDS_BOUND: u64 = 365 * 24 * 60 * 60;
+
+/// The absolute-lifetime cap of a signed session token, from `IPE_AUTH_MAX_LIFETIME`.
+const AUTH_MAX_LIFETIME_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_AUTH_MAX_LIFETIME",
+    8 * 60 * 60,
+    crate::system::ZeroCeiling::Refused,
+    "decimal second count",
+)
+.at_most(AUTH_SECONDS_BOUND);
+
+/// The rolling re-issue window of a signed session token, from `IPE_AUTH_SLIDE_WINDOW`.
+const AUTH_SLIDE_WINDOW_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_AUTH_SLIDE_WINDOW",
+    30 * 60,
+    crate::system::ZeroCeiling::Refused,
+    "decimal second count",
+)
+.at_most(AUTH_SECONDS_BOUND);
+
+/// The value `ceiling`'s variable sets, or `None` while the variable is absent.
+fn env_override(
+    ceiling: crate::system::EnvCeiling,
+) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
+    match crate::system::read_env_var(ceiling.name()) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        raw => ceiling.parse(raw).map(Some),
+    }
+}
+
 /// The absolute-lifetime cap for a signed session token, in seconds. Applies the
 /// one precedence: `IPE_AUTH_MAX_LIFETIME` (env) > `Web.authMaxLifetime`
-/// (setting-in-code) > 8 h fallback. A non-positive value in either the env or the
-/// in-code setting is dropped fail-closed to the fallback. The fallback of 8 h
-/// (28 800 s) bounds the value of a stolen, still-unrevoked token.
+/// (setting-in-code) > 8 h fallback. A non-positive in-code setting is dropped
+/// fail-closed to the fallback. The fallback of 8 h (28 800 s) bounds the value
+/// of a stolen, still-unrevoked token.
 ///
 /// This is the single call site for the resolved cap — all callers (sign + verify)
 /// use this so the precedence is never duplicated.
-#[must_use]
-pub fn resolve_auth_max_lifetime() -> u64 {
-    /// 8 hours in seconds.
-    const DEFAULT_SECS: u64 = 8 * 60 * 60;
-    // Env wins: parse a positive integer from `IPE_AUTH_MAX_LIFETIME`.
-    if let Ok(raw) = crate::system::read_env_var("IPE_AUTH_MAX_LIFETIME") {
-        if let Ok(secs) = raw.trim().parse::<i64>()
-            && let Some(v) = auth_max_lifetime_from(true, Some(secs))
-        {
-            return v;
-        }
-        // Env var present but not parseable or non-positive → fall closed to default.
-        return DEFAULT_SECS;
-    }
-    auth_max_lifetime_from(
-        false,
-        INSTALLED.get().and_then(|c| c.auth_max_lifetime_secs),
-    )
-    .unwrap_or(DEFAULT_SECS)
+///
+/// # Errors
+///
+/// A refusal naming `IPE_AUTH_MAX_LIFETIME` when it is set to anything but a
+/// positive decimal second count within one year.
+pub fn resolve_auth_max_lifetime() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    let installed = INSTALLED.get().and_then(|c| c.auth_max_lifetime_secs);
+    Ok(env_override(AUTH_MAX_LIFETIME_CEILING)?.unwrap_or_else(|| {
+        positive_setting(installed).unwrap_or_else(|| AUTH_MAX_LIFETIME_CEILING.default_value())
+    }))
 }
 
-/// Pure auth-max-lifetime resolution: the installed setting applies only when no
-/// env override is present, and a non-positive value is dropped (fail-closed to the
-/// caller's default). Split out for unit testing without process-wide state.
-fn auth_max_lifetime_from(env_present: bool, setting: Option<i64>) -> Option<u64> {
-    if env_present {
-        return match setting {
-            Some(secs) if secs > 0 => u64::try_from(secs).ok(),
-            _ => None,
-        };
-    }
-    match setting {
-        Some(secs) if secs > 0 => u64::try_from(secs).ok(),
-        _ => None,
-    }
+/// An installed setting as seconds: a non-positive value is dropped (fail-closed
+/// to the caller's default). Split out for unit testing without process-wide state.
+fn positive_setting(setting: Option<i64>) -> Option<u64> {
+    setting
+        .filter(|secs| *secs > 0)
+        .and_then(|secs| u64::try_from(secs).ok())
 }
 
 /// The rolling re-issue window for a signed session token, in seconds. Applies the
 /// one precedence: `IPE_AUTH_SLIDE_WINDOW` (env) > `Web.authSlideWindow`
-/// (setting-in-code) > 30 m fallback. A non-positive value in either tier is
-/// dropped fail-closed to the fallback. Clamped so `slide_window < max_lifetime`
+/// (setting-in-code) > 30 m fallback. A non-positive in-code setting is dropped
+/// fail-closed to the fallback. Clamped so `slide_window < max_lifetime`
 /// — a slide window equal to or larger than the max lifetime would allow a
 /// single re-issue to extend a session to its full cap in one step.
 ///
 /// This is the single call site for the resolved slide window.
-#[must_use]
-pub fn resolve_auth_slide_window() -> u64 {
-    /// 30 minutes in seconds.
-    const DEFAULT_SECS: u64 = 30 * 60;
-    let max_lifetime = resolve_auth_max_lifetime();
-    let raw = if let Ok(raw) = crate::system::read_env_var("IPE_AUTH_SLIDE_WINDOW") {
-        if let Ok(secs) = raw.trim().parse::<i64>()
-            && let Some(v) = auth_slide_window_from(true, Some(secs))
-        {
-            v
-        } else {
-            DEFAULT_SECS
-        }
-    } else {
-        auth_slide_window_from(
-            false,
-            INSTALLED.get().and_then(|c| c.auth_slide_window_secs),
-        )
-        .unwrap_or(DEFAULT_SECS)
-    };
+///
+/// # Errors
+///
+/// A refusal naming `IPE_AUTH_SLIDE_WINDOW` (or `IPE_AUTH_MAX_LIFETIME`, which
+/// the clamp reads) when it is set to anything but a positive decimal second
+/// count within one year.
+pub fn resolve_auth_slide_window() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    let max_lifetime = resolve_auth_max_lifetime()?;
+    let installed = INSTALLED.get().and_then(|c| c.auth_slide_window_secs);
+    let window = env_override(AUTH_SLIDE_WINDOW_CEILING)?.unwrap_or_else(|| {
+        positive_setting(installed).unwrap_or_else(|| AUTH_SLIDE_WINDOW_CEILING.default_value())
+    });
     // Clamp: slide_window must be strictly less than max_lifetime.
-    if raw >= max_lifetime {
+    Ok(if window >= max_lifetime {
         max_lifetime.saturating_sub(1)
     } else {
-        raw
-    }
-}
-
-/// Pure slide-window resolution: the installed setting applies only when no env
-/// override is present, and a non-positive value is dropped (fail-closed to the
-/// caller's default). Split out for unit testing without process-wide state.
-fn auth_slide_window_from(env_present: bool, setting: Option<i64>) -> Option<u64> {
-    if env_present {
-        return match setting {
-            Some(secs) if secs > 0 => u64::try_from(secs).ok(),
-            _ => None,
-        };
-    }
-    match setting {
-        Some(secs) if secs > 0 => u64::try_from(secs).ok(),
-        _ => None,
-    }
+        window
+    })
 }
 
 /// The resolved revocation mode, applying the one precedence:
@@ -627,19 +617,26 @@ pub fn resolve_auth_revocation_mode() -> RevocationMode {
 /// limit should use signing-key rotation instead of per-session revocation.
 pub const REVOCATION_STORE_CAPACITY: usize = 1 << 20; // 1,048,576
 
+/// The per-map entry ceiling of the revocation store, from `IPE_REVOCATION_CAPACITY`.
+///
+/// The bound is 2^24 entries, about 1 GiB per map at the per-entry cost above.
+const REVOCATION_CAPACITY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_REVOCATION_CAPACITY",
+    REVOCATION_STORE_CAPACITY as u64,
+    crate::system::ZeroCeiling::Refused,
+    "decimal entry count",
+)
+.at_most(1 << 24);
+
 /// The resolved revocation store capacity, applying the one precedence:
-/// `IPE_REVOCATION_CAPACITY` (env) > [`REVOCATION_STORE_CAPACITY`] default. A
-/// non-positive or non-parseable env value falls back to the default.
-#[must_use]
-pub fn resolve_revocation_capacity() -> usize {
-    if let Ok(raw) = crate::system::read_env_var("IPE_REVOCATION_CAPACITY")
-        && let Ok(n) = raw.trim().parse::<usize>()
-        && n > 0
-    {
-        return n;
-    }
-    // Non-positive, unparseable, or env var absent → fall closed to default.
-    REVOCATION_STORE_CAPACITY
+/// `IPE_REVOCATION_CAPACITY` (env) > [`REVOCATION_STORE_CAPACITY`] default.
+///
+/// # Errors
+///
+/// A refusal naming `IPE_REVOCATION_CAPACITY` when it is set to anything but a
+/// positive decimal entry count of at most 2^24.
+pub fn resolve_revocation_capacity() -> Result<usize, crate::system::EnvCeilingRefusal> {
+    REVOCATION_CAPACITY_CEILING.read()
 }
 
 /// The resolved database URL from the installed `Db.url` setting, if one was set
@@ -816,58 +813,106 @@ mod tests {
         assert_eq!(session_ttl_from(false, None), None);
     }
 
-    // ── AuthMaxLifetime: env > setting > 8h default, non-positive dropped ──
+    // ── Auth lifetimes and revocation capacity: env > setting > default ─────
 
     #[test]
-    fn auth_max_lifetime_setting_applies_when_no_env() {
-        assert_eq!(auth_max_lifetime_from(false, Some(3600)), Some(3600));
+    fn a_non_positive_setting_is_dropped() {
+        assert_eq!(positive_setting(Some(3600)), Some(3600));
+        assert_eq!(positive_setting(Some(0)), None);
+        assert_eq!(positive_setting(Some(-1)), None);
+        assert_eq!(positive_setting(None), None);
     }
 
     #[test]
-    fn auth_max_lifetime_env_overrides_setting() {
-        // env_present → the setting value becomes the env-branch result.
-        assert_eq!(auth_max_lifetime_from(true, Some(7200)), Some(7200));
+    fn the_auth_and_revocation_ceilings_honour_the_env_contract() {
+        for ceiling in [
+            AUTH_MAX_LIFETIME_CEILING,
+            AUTH_SLIDE_WINDOW_CEILING,
+            REVOCATION_CAPACITY_CEILING,
+        ] {
+            crate::system::assert_env_ceiling_contract(ceiling);
+        }
+    }
+
+    /// `resolve` under `name` set to `raw`, the variable removed afterwards.
+    fn resolve_with<T>(
+        name: &str,
+        raw: &str,
+        resolve: fn() -> Result<T, crate::system::EnvCeilingRefusal>,
+    ) -> Result<T, crate::system::EnvCeilingRefusal> {
+        crate::system::locked_set_var(name, raw);
+        let resolved = resolve();
+        crate::system::locked_remove_var(name);
+        resolved
     }
 
     #[test]
-    fn auth_max_lifetime_non_positive_falls_closed_to_none() {
-        // A zero or negative value is dropped in both branches.
-        assert_eq!(auth_max_lifetime_from(false, Some(0)), None);
-        assert_eq!(auth_max_lifetime_from(false, Some(-1)), None);
-        assert_eq!(auth_max_lifetime_from(true, Some(0)), None);
-        assert_eq!(auth_max_lifetime_from(true, Some(-100)), None);
+    fn a_malformed_auth_max_lifetime_is_refused_never_defaulted() {
+        let name = "IPE_AUTH_MAX_LIFETIME";
+        for refused in ["", "0", "-1", " 3600", "3600 ", "8h", "31536001"] {
+            let outcome = resolve_with(name, refused, resolve_auth_max_lifetime);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == name),
+                "{refused:?} must be refused naming {name}, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            resolve_with(name, "31536000", resolve_auth_max_lifetime),
+            Ok(31_536_000)
+        );
+        assert_eq!(
+            resolve_with(name, "7200", resolve_auth_max_lifetime),
+            Ok(7200)
+        );
+        assert_eq!(resolve_auth_max_lifetime(), Ok(8 * 60 * 60));
     }
 
     #[test]
-    fn auth_max_lifetime_absent_setting_falls_through() {
-        assert_eq!(auth_max_lifetime_from(false, None), None);
-        assert_eq!(auth_max_lifetime_from(true, None), None);
-    }
-
-    // ── AuthSlideWindow: env > setting > 30m default, non-positive dropped ──
-
-    #[test]
-    fn auth_slide_window_setting_applies_when_no_env() {
-        assert_eq!(auth_slide_window_from(false, Some(900)), Some(900));
-    }
-
-    #[test]
-    fn auth_slide_window_env_overrides_setting() {
-        assert_eq!(auth_slide_window_from(true, Some(900)), Some(900));
-    }
-
-    #[test]
-    fn auth_slide_window_non_positive_falls_closed_to_none() {
-        assert_eq!(auth_slide_window_from(false, Some(0)), None);
-        assert_eq!(auth_slide_window_from(false, Some(-1)), None);
-        assert_eq!(auth_slide_window_from(true, Some(0)), None);
-        assert_eq!(auth_slide_window_from(true, Some(-60)), None);
+    fn a_malformed_auth_slide_window_is_refused_never_defaulted() {
+        let name = "IPE_AUTH_SLIDE_WINDOW";
+        for refused in ["", "0", "-60", " 900", "900 ", "15m", "31536001"] {
+            let outcome = resolve_with(name, refused, resolve_auth_slide_window);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == name),
+                "{refused:?} must be refused naming {name}, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            resolve_with(name, "900", resolve_auth_slide_window),
+            Ok(900)
+        );
+        assert_eq!(resolve_auth_slide_window(), Ok(30 * 60));
     }
 
     #[test]
-    fn auth_slide_window_absent_setting_falls_through() {
-        assert_eq!(auth_slide_window_from(false, None), None);
-        assert_eq!(auth_slide_window_from(true, None), None);
+    fn the_slide_window_clamp_and_its_lifetime_refusal_hold() {
+        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "1800");
+        let clamped = resolve_with("IPE_AUTH_SLIDE_WINDOW", "3600", resolve_auth_slide_window);
+        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "8h");
+        let refused = resolve_auth_slide_window();
+        crate::system::locked_remove_var("IPE_AUTH_MAX_LIFETIME");
+        assert_eq!(clamped, Ok(1799));
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_AUTH_MAX_LIFETIME"),
+            "the clamp reads the lifetime, so its refusal reaches the window"
+        );
+    }
+
+    #[test]
+    fn a_malformed_revocation_capacity_is_refused_never_defaulted() {
+        let name = "IPE_REVOCATION_CAPACITY";
+        for refused in ["", "0", "-1", " 1024", "1024 ", "1k", "16777217"] {
+            let outcome = resolve_with(name, refused, resolve_revocation_capacity);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == name),
+                "{refused:?} must be refused naming {name}, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            resolve_with(name, "16777216", resolve_revocation_capacity),
+            Ok(1 << 24)
+        );
+        assert_eq!(resolve_revocation_capacity(), Ok(REVOCATION_STORE_CAPACITY));
     }
 
     // ── RevocationMode setting constructor ──────────────────────────────────

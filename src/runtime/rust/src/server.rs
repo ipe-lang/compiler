@@ -584,7 +584,13 @@ where
             // credentials; the client manages re-issue itself via re-auth).
             let reissue_cookie: Option<String> = if let TokenSource::Cookie(ref name) = cfg.source {
                 if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                    let slide_window_secs = crate::app_config::resolve_auth_slide_window();
+                    // A malformed window refuses the request rather than
+                    // re-issuing under an unknown bound; the detail stays out of
+                    // the response.
+                    let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                    else {
+                        return ok_res(plain_resp(503, "service unavailable", &[]));
+                    };
                     let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
                     let now = crate::jwt::now_unix_seconds();
                     // Throttle: re-issue only once past exp - slide_window/2.
@@ -884,6 +890,11 @@ struct ListenCeilings {
 fn listen_ceilings() -> Result<ListenCeilings, crate::system::EnvCeilingRefusal> {
     max_body()?;
     ws_ceilings()?;
+    #[cfg(feature = "jwt")]
+    {
+        crate::app_config::resolve_auth_slide_window()?;
+        crate::app_config::resolve_revocation_capacity()?;
+    }
     Ok(ListenCeilings {
         request_timeout_secs: REQUEST_TIMEOUT_CEILING.read()?,
         max_inflight: MAX_INFLIGHT_CEILING.read()?,
@@ -3949,6 +3960,24 @@ mod tests {
         );
         assert!(zero_timeout.is_err_and(|r| r.name() == "IPE_HTTP_REQUEST_TIMEOUT"));
         assert!(zero_inflight.is_err_and(|r| r.name() == "IPE_HTTP_MAX_INFLIGHT"));
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn a_malformed_auth_ceiling_refuses_listen() {
+        for (name, raw) in [
+            ("IPE_AUTH_MAX_LIFETIME", "8h"),
+            ("IPE_AUTH_SLIDE_WINDOW", "0"),
+            ("IPE_REVOCATION_CAPACITY", " 1024"),
+        ] {
+            crate::system::locked_set_var(name, raw);
+            let refused = listen_ceilings();
+            crate::system::locked_remove_var(name);
+            assert!(
+                refused.is_err_and(|r| r.name() == name),
+                "{name}={raw:?} must refuse Server.listen"
+            );
+        }
     }
 
     #[tokio::test]

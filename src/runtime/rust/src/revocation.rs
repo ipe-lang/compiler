@@ -165,18 +165,32 @@ enum MapSelector {
     Sessions,
 }
 
-fn store() -> &'static Mutex<RevocationStore> {
-    static STORE: OnceLock<Mutex<RevocationStore>> = OnceLock::new();
-    STORE.get_or_init(|| {
-        let capacity = crate::app_config::resolve_revocation_capacity();
-        Mutex::new(RevocationStore::new(capacity))
-    })
+/// The process store, or `None` when the operator's capacity setting is refused.
+fn store() -> Option<&'static Mutex<RevocationStore>> {
+    static STORE: OnceLock<Option<Mutex<RevocationStore>>> = OnceLock::new();
+    STORE
+        .get_or_init(|| store_with(crate::app_config::resolve_revocation_capacity()))
+        .as_ref()
 }
 
-/// Acquire the store lock. Returns `None` on lock poison (fail-closed: the
-/// caller treats `None` as [`Verdict::Unknown`] and denies the request).
+/// A store of the resolved capacity; a refused capacity yields no store at all.
+///
+/// The store never runs under a capacity the operator did not set. The refusal
+/// itself is raised at `Server.listen`; here its only effect is that every
+/// verdict is [`Verdict::Unknown`] and every write is [`RevocationError::Unavailable`].
+fn store_with(
+    capacity: Result<usize, crate::system::EnvCeilingRefusal>,
+) -> Option<Mutex<RevocationStore>> {
+    capacity
+        .ok()
+        .map(|capacity| Mutex::new(RevocationStore::new(capacity)))
+}
+
+/// Acquire the store lock. Returns `None` on lock poison or a refused capacity
+/// (fail-closed: the caller treats `None` as [`Verdict::Unknown`] and denies the
+/// request).
 fn lock() -> Option<MutexGuard<'static, RevocationStore>> {
-    store().lock().ok()
+    store()?.lock().ok()
 }
 
 /// Query whether `subject` or `jti` is revoked.
@@ -211,8 +225,11 @@ pub fn revoke_subject(subject: String) -> Result<(), RevocationError> {
         return Err(RevocationError::Unavailable);
     };
     let now = crate::jwt::now_unix_seconds();
-    let max_lifetime =
-        i64::try_from(crate::app_config::resolve_auth_max_lifetime()).unwrap_or(i64::MAX);
+    // A refused lifetime setting writes no entry: its expiry would be unknown.
+    let Ok(max_lifetime_secs) = crate::app_config::resolve_auth_max_lifetime() else {
+        return Err(RevocationError::Unavailable);
+    };
+    let max_lifetime = i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX);
     // Expiry anchored to the *current* AuthMaxLifetime (ML): any token minted
     // right now could live at most `now + ML`, so this entry stays in the store
     // until all currently mintable tokens have expired.
@@ -357,6 +374,32 @@ mod tests {
     // capacity bound operate on a local RevocationStore directly.
 
     const FAR_FUTURE: i64 = i64::MAX / 2;
+
+    #[test]
+    fn a_refused_capacity_builds_no_store() {
+        crate::system::locked_set_var("IPE_REVOCATION_CAPACITY", "1k");
+        let refused = store_with(crate::app_config::resolve_revocation_capacity());
+        crate::system::locked_set_var("IPE_REVOCATION_CAPACITY", "16");
+        let accepted = store_with(crate::app_config::resolve_revocation_capacity());
+        crate::system::locked_remove_var("IPE_REVOCATION_CAPACITY");
+        assert!(refused.is_none(), "a malformed capacity builds no store");
+        assert!(accepted.is_some(), "a well-formed capacity builds a store");
+    }
+
+    #[test]
+    fn a_refused_lifetime_writes_no_subject_entry() {
+        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "8h");
+        let outcome = revoke_subject("refused-lifetime-subject-001".to_string());
+        crate::system::locked_remove_var("IPE_AUTH_MAX_LIFETIME");
+        assert_eq!(outcome, Err(RevocationError::Unavailable));
+        assert!(
+            matches!(
+                is_revoked("refused-lifetime-subject-001", "any-jti"),
+                Verdict::Active
+            ),
+            "a refused write leaves no entry behind"
+        );
+    }
 
     // ─── Existing behaviour tests (updated for new signatures) ────────────────
 
@@ -657,8 +700,10 @@ mod tests {
     fn subject_expiry_covers_live_sessions() {
         let mut s = local_store(8);
         let now = now_approx();
-        let max_lifetime =
-            i64::try_from(crate::app_config::resolve_auth_max_lifetime()).unwrap_or(i64::MAX);
+        let max_lifetime = i64::try_from(
+            crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
+        )
+        .unwrap_or(i64::MAX);
         let subject_expiry = now.saturating_add(max_lifetime);
 
         s.insert_bounded(

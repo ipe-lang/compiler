@@ -356,6 +356,9 @@ pub enum SsrfRefusal {
         /// The deadline that expired.
         after: Duration,
     },
+    /// The operator's resolution deadline is not a usable setting, so no name
+    /// is resolved under an unknown bound.
+    Deadline(crate::system::EnvCeilingRefusal),
     /// The target is a local Unix-domain socket, which reaches the local server
     /// exactly as loopback TCP does.
     LocalSocket,
@@ -398,6 +401,7 @@ impl std::fmt::Display for SsrfRefusal {
                 "blocked: resolving {host} timed out after {} ms",
                 after.as_millis()
             )?,
+            Self::Deadline(refusal) => return write!(f, "blocked: {refusal}"),
             Self::LocalSocket => f.write_str("blocked: local socket dial target")?,
             Self::UnprovenTarget => f.write_str(
                 "blocked: connection URL names no host, so the dial target is unproven",
@@ -436,23 +440,35 @@ impl HostResolver for SystemResolver {
     }
 }
 
-/// Default deadline for one SSRF-gate name resolution.
-const DNS_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+/// The deadline for one SSRF-gate name resolution, from `IPE_HTTP_DNS_TIMEOUT_MS`.
+const DNS_TIMEOUT_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_HTTP_DNS_TIMEOUT_MS",
+    5_000,
+    crate::system::ZeroCeiling::Refused,
+    "decimal millisecond count",
+)
+.at_most(60_000);
 
 /// The deadline for one SSRF-gate name resolution.
 ///
 /// A stalling resolver must not hold a task indefinitely: a remote party that
 /// controls the target name's authoritative server could otherwise pile up
 /// pending dials. Overridable via `IPE_HTTP_DNS_TIMEOUT_MS` (a positive
-/// integer); anything else falls back to the default.
-#[must_use]
-pub fn dns_timeout() -> Duration {
-    let ms = crate::system::read_env_var("IPE_HTTP_DNS_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DNS_TIMEOUT_MS_DEFAULT);
-    Duration::from_millis(ms)
+/// decimal millisecond count of at most one minute).
+///
+/// # Errors
+///
+/// [`SsrfRefusal::Deadline`] when the variable is set to anything else.
+pub fn dns_timeout() -> Result<Duration, SsrfRefusal> {
+    dns_deadline(crate::system::read_env_var(DNS_TIMEOUT_CEILING.name()))
+}
+
+/// [`dns_timeout`] over a raw lookup of its variable.
+fn dns_deadline(raw: Result<String, std::env::VarError>) -> Result<Duration, SsrfRefusal> {
+    DNS_TIMEOUT_CEILING
+        .parse(raw)
+        .map(Duration::from_millis)
+        .map_err(SsrfRefusal::Deadline)
 }
 
 /// Strip a single surrounding `[`…`]` from an IPv6-literal host as it appears in
@@ -807,7 +823,7 @@ impl VettedDial {
                 host.as_str(),
                 HostDisclosure::Named,
                 port,
-                dns_timeout(),
+                dns_timeout()?,
             )
             .await
             .map(|addr| Self::Pinned(VettedAddr(addr))),
@@ -822,7 +838,8 @@ impl VettedDial {
     // from under a generated WebSocket caller.
     #[cfg_attr(not(feature = "websocket_client"), allow(dead_code))]
     pub(crate) async fn for_url(url: &str) -> Result<Self, UrlRefusal> {
-        vet_url_with(DialPolicy::from_env(), &SystemResolver, url, dns_timeout()).await
+        let deadline = dns_timeout().map_err(UrlRefusal::Host)?;
+        vet_url_with(DialPolicy::from_env(), &SystemResolver, url, deadline).await
     }
 
     /// The host string to hand a dialler: the vetted IP when pinned, else `host`.
@@ -3175,5 +3192,74 @@ mod tests {
                 "{refused:?}"
             );
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_dns_deadline_ceiling_honours_the_env_contract() {
+        crate::system::assert_env_ceiling_contract(DNS_TIMEOUT_CEILING);
+    }
+
+    /// An absent deadline is the default; every other setting is parsed or refused.
+    #[test]
+    fn a_malformed_dns_deadline_is_refused_never_defaulted() {
+        use std::env::VarError;
+        assert_eq!(
+            dns_deadline(Err(VarError::NotPresent)),
+            Ok(Duration::from_millis(5_000))
+        );
+        assert_eq!(
+            dns_deadline(Ok("60000".to_owned())),
+            Ok(Duration::from_secs(60))
+        );
+        for refused in [
+            "",
+            "0",
+            "-1",
+            " 5000",
+            "5000 ",
+            "5s",
+            "60001",
+            "18446744073709551616",
+        ] {
+            let outcome = dns_deadline(Ok(refused.to_owned()));
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(SsrfRefusal::Deadline(r)) if r.name() == "IPE_HTTP_DNS_TIMEOUT_MS"
+                ),
+                "{refused:?} must be refused, got {outcome:?}"
+            );
+        }
+    }
+
+    /// The refusal names the variable and does not blame the deny-private switch.
+    #[test]
+    fn the_dns_deadline_refusal_names_its_variable_only() {
+        let shown = dns_deadline(Ok("5s".to_owned()))
+            .map_err(|refusal| refusal.to_string())
+            .expect_err("a suffixed deadline is refused");
+        assert!(shown.contains("IPE_HTTP_DNS_TIMEOUT_MS"), "{shown}");
+        assert!(!shown.contains("IPE_HTTP_DENY_PRIVATE"), "{shown}");
+    }
+
+    /// A refused deadline stops a vet before any name is resolved.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_malformed_dns_deadline_refuses_every_vet() {
+        crate::system::locked_set_var("IPE_HTTP_DENY_PRIVATE", "1");
+        crate::system::locked_set_var("IPE_HTTP_DNS_TIMEOUT_MS", "5s");
+        let by_url = VettedDial::for_url("http://example.com/").await;
+        let by_host = VettedDial::for_configured_host(&configured("db.example"), 5432).await;
+        crate::system::locked_remove_var("IPE_HTTP_DNS_TIMEOUT_MS");
+        crate::system::locked_remove_var("IPE_HTTP_DENY_PRIVATE");
+        assert!(
+            matches!(by_url, Err(UrlRefusal::Host(SsrfRefusal::Deadline(_)))),
+            "a URL vet must refuse on a malformed deadline"
+        );
+        assert!(
+            matches!(by_host, Err(SsrfRefusal::Deadline(_))),
+            "a configured-host vet must refuse on a malformed deadline"
+        );
     }
 }

@@ -166,7 +166,11 @@ pub fn auth_sign_token<E: From<String>>(
     // only a fresh token (no `cap` in the supplied claims) gets the cap stamped.
     // This guarantees cap is immutable across re-issues: the re-issuer supplies
     // the original cap back in the claims map and this block leaves it alone.
-    let max_lifetime_secs = crate::app_config::resolve_auth_max_lifetime();
+    let max_lifetime_secs = match crate::app_config::resolve_auth_max_lifetime() {
+        Ok(secs) => secs,
+        // A malformed lifetime mints no token: the cap would be an unknown bound.
+        Err(refusal) => return IpeResult::Err(format!("auth.signToken: {refusal}").into()),
+    };
     let cap_from_claims = claims.get("cap").and_then(|s| s.parse::<i64>().ok());
     let cap: i64 = match cap_from_claims {
         Some(existing) => existing,
