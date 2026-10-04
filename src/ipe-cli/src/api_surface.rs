@@ -615,7 +615,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).expect("mk src");
         std::fs::write(
             root.join("src").join("Main.ipe"),
-            "module Main exposing (answer)\n\nanswer = 42\n",
+            "module Main exposing (answer)\n\nanswer : Int\nanswer =\n    42\n",
         )
         .expect("write Main");
         let tree = read_tree(&root).expect("read tree");
