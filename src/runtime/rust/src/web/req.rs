@@ -84,7 +84,7 @@ mod tests {
         );
         assert_eq!(req.cookies.get("ipe_sid").map(String::as_str), Some("abc"));
         assert!(
-            req.cookies.get("x").is_none(),
+            !req.cookies.contains_key("x"),
             "the non-ASCII pair is skipped"
         );
     }

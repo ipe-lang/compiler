@@ -794,6 +794,9 @@ fn parse_response_header(
     if name == axum::http::header::CONTENT_LENGTH || name == axum::http::header::TRANSFER_ENCODING {
         return Err(HeaderRefusal::Framing);
     }
+    if !value.is_ascii() {
+        return Err(HeaderRefusal::Value);
+    }
     let value = axum::http::HeaderValue::from_str(value).map_err(|_| HeaderRefusal::Value)?;
     Ok((name, value))
 }
