@@ -25,7 +25,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod name;
 pub mod win32_name;
@@ -291,6 +291,15 @@ impl HeldDir {
         self.dir.kind_of(name)
     }
 
+    /// The target the link `name` stores, read relative to this handle; never followed.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::Absent`]; [`OpenRefusal::NotRegular`] for an entry that
+    /// is not a link; another refusal on another failure.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        self.dir.read_link(name)
+    }
+
     /// Every entry of this directory and its kind, `.` and `..` excluded.
     ///
     /// An entry that vanishes between the listing and its classification is
@@ -390,6 +399,14 @@ impl RegularFile {
             (FileKind::Symlink, _) => Err(OpenRefusal::Link),
             (kind, _) => Err(OpenRefusal::NotRegular(kind)),
         }
+    }
+
+    /// How many directory entries name this file now; more than one is a hard link.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn link_count(&self) -> Result<u64, OpenRefusal> {
+        sys::link_count(&self.file)
     }
 
     /// The length the proof saw; the file may have changed since.

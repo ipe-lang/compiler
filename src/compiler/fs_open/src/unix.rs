@@ -1,11 +1,11 @@
 //! Unix primitives: every entry open is an `openat` on a held descriptor, never following a final link.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -111,6 +111,13 @@ pub fn kind_and_len(file: &File) -> Result<(FileKind, u64), OpenRefusal> {
     Ok((kind_of_type(meta.file_type()), meta.len()))
 }
 
+/// How many directory entries name the object `file` holds.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    file.metadata()
+        .map(|meta| meta.nlink())
+        .map_err(|e| refusal_of(&e))
+}
+
 /// The identity of the object looking `path` up now reaches, following links.
 pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
     std::fs::metadata(path)
@@ -173,6 +180,21 @@ impl Dir {
                 stat.st_mode,
             )))),
             Err(errno) if errno == Errno::NOENT => Ok(None),
+            Err(errno) => Err(refusal(errno)),
+        }
+    }
+
+    /// The target the link `name` stores, read on the held handle.
+    ///
+    /// An entry that is not a link answers `EINVAL`; it is classified by a
+    /// no-follow stat of `name`.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        match rustix::fs::readlinkat(&self.0, name.as_os_str(), Vec::new()) {
+            Ok(target) => Ok(PathBuf::from(OsString::from_vec(target.into_bytes()))),
+            Err(errno) if errno == Errno::INVAL => Err(match self.kind_of(name)? {
+                None => OpenRefusal::Absent,
+                Some(kind) => OpenRefusal::NotRegular(kind),
+            }),
             Err(errno) => Err(refusal(errno)),
         }
     }
