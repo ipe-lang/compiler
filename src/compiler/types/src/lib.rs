@@ -310,56 +310,52 @@ impl Renumbering {
         Ok(self.var(home, var)?.raw())
     }
 
-    fn ty(&mut self, home: u32, ty: &Ty) -> Result<Ty, CanonicalizeError> {
-        Ok(match ty {
-            Ty::Var(raw) => Ty::Var(self.raw(home, *raw)?),
-            Ty::Unit => Ty::Unit,
-            Ty::Fun(arg, result) => Ty::Fun(
-                Box::new(self.ty(home, arg)?),
-                Box::new(self.ty(home, result)?),
-            ),
-            Ty::Tuple(elems) => Ty::Tuple(
-                elems
-                    .iter()
-                    .map(|elem| self.ty(home, elem))
-                    .collect::<Result<_, _>>()?,
-            ),
-            Ty::Record(fields, tail) => {
-                let fields = fields
-                    .iter()
-                    .map(|(name, field)| -> Result<_, CanonicalizeError> {
-                        Ok((*name, self.ty(home, field)?))
-                    })
-                    .collect::<Result<_, _>>()?;
-                let tail = match tail {
-                    RowTail::Closed => RowTail::Closed,
-                    RowTail::Open(raw) => RowTail::Open(self.raw(home, *raw)?),
-                };
-                Ty::Record(fields, tail)
+    /// Renumber every solver variable of `ty` in place, in pre-order.
+    fn ty(&mut self, home: u32, ty: &mut Ty) -> Result<(), CanonicalizeError> {
+        match ty {
+            Ty::Var(raw) => *raw = self.raw(home, *raw)?,
+            Ty::Unit => {}
+            Ty::Fun(arg, result) => {
+                self.ty(home, arg)?;
+                self.ty(home, result)?;
             }
-            Ty::Con { module, name, args } => Ty::Con {
-                module: module.clone(),
-                name: *name,
-                args: args
-                    .iter()
-                    .map(|arg| self.ty(home, arg))
-                    .collect::<Result<_, _>>()?,
-            },
-        })
+            Ty::Tuple(elems) => {
+                for elem in elems {
+                    self.ty(home, elem)?;
+                }
+            }
+            Ty::Record(fields, tail) => {
+                for field in fields.values_mut() {
+                    self.ty(home, field)?;
+                }
+                match tail {
+                    RowTail::Closed => {}
+                    RowTail::Open(raw) => *raw = self.raw(home, *raw)?,
+                }
+            }
+            Ty::Con {
+                module: _,
+                name: _,
+                args,
+            } => {
+                for arg in args {
+                    self.ty(home, arg)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Renumber every `Ty` value of a map whose key names its owning module.
-    fn ty_map<K: Clone + Ord>(
+    /// Renumber in place every `Ty` value of a map keyed by `(home, _)`.
+    fn ty_map<K>(
         &mut self,
-        map: &BTreeMap<K, Ty>,
-        home_of: impl Fn(&K) -> &[Symbol],
-    ) -> Result<BTreeMap<K, Ty>, CanonicalizeError> {
-        map.iter()
-            .map(|(key, ty)| -> Result<_, CanonicalizeError> {
-                let home = self.home(home_of(key))?;
-                Ok((key.clone(), self.ty(home, ty)?))
-            })
-            .collect()
+        map: &mut BTreeMap<(Vec<Symbol>, K), Ty>,
+    ) -> Result<(), CanonicalizeError> {
+        for ((home, _), ty) in map {
+            let home = self.home(home)?;
+            self.ty(home, ty)?;
+        }
+        Ok(())
     }
 }
 
@@ -402,53 +398,40 @@ pub fn canonicalize(
     ceiling: VarCeiling,
 ) -> Result<CanonicalTypes, CanonicalizeError> {
     let SolvedTypes {
-        env,
-        regions,
-        expected,
+        mut env,
+        mut regions,
+        mut expected,
         bounds,
         warnings,
-        poly_var_map,
+        mut poly_var_map,
         untyped_type_params,
         msg_defaulted_vars,
-        signature_wildcards,
+        mut signature_wildcards,
     } = types;
     let mut table = Renumbering::new(scope, ceiling);
-    let env = table.ty_map(&env, |key| key.0.as_slice())?;
-    let regions = table.ty_map(&regions, |key| key.0.as_slice())?;
-    let expected = table.ty_map(&expected, |key| key.0.as_slice())?;
-    let signature_wildcards = signature_wildcards
-        .iter()
-        .map(|(key, wildcards)| -> Result<_, CanonicalizeError> {
-            let SignatureWildcards { param_counts, pins } = wildcards;
-            let home = table.home(key.0.as_slice())?;
-            let pins = pins
-                .iter()
-                .map(|(index, pin)| -> Result<_, CanonicalizeError> {
-                    Ok((*index, table.ty(home, pin)?))
-                })
-                .collect::<Result<_, _>>()?;
-            Ok((
-                key.clone(),
-                SignatureWildcards {
-                    param_counts: param_counts.clone(),
-                    pins,
-                },
-            ))
-        })
-        .collect::<Result<_, CanonicalizeError>>()?;
-    let poly_var_map = poly_var_map
-        .iter()
-        .map(|(key, vars)| -> Result<_, CanonicalizeError> {
-            let home = table.home(key.0.as_slice())?;
-            let vars = vars
-                .iter()
-                .map(|(var, name)| -> Result<_, CanonicalizeError> {
-                    Ok((table.var(home, *var)?, *name))
-                })
-                .collect::<Result<_, _>>()?;
-            Ok((key.clone(), vars))
-        })
-        .collect::<Result<_, CanonicalizeError>>()?;
+    table.ty_map(&mut env)?;
+    table.ty_map(&mut regions)?;
+    table.ty_map(&mut expected)?;
+    for ((home, _), wildcards) in &mut signature_wildcards {
+        let SignatureWildcards {
+            param_counts: _,
+            pins,
+        } = wildcards;
+        let home = table.home(home)?;
+        for pin in pins.values_mut() {
+            table.ty(home, pin)?;
+        }
+    }
+    for ((home, _), vars) in &mut poly_var_map {
+        let home = table.home(home)?;
+        // Injective per home, so no two keys collapse into one entry.
+        *vars = std::mem::take(vars)
+            .into_iter()
+            .map(|(var, name)| -> Result<_, CanonicalizeError> {
+                Ok((table.var(home, var)?, name))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+    }
     Ok(CanonicalTypes(SolvedTypes {
         env,
         regions,
@@ -7589,7 +7572,7 @@ mod canonicalize_tests {
             .map_err(|_| "symbol count drifted".to_owned())
     }
 
-    fn empty() -> SolvedTypes {
+    const fn empty() -> SolvedTypes {
         SolvedTypes {
             env: BTreeMap::new(),
             regions: BTreeMap::new(),
@@ -7604,7 +7587,7 @@ mod canonicalize_tests {
     }
 
     /// The `Ty::Var` of solver variable `id`.
-    fn tv(id: u32) -> Ty {
+    const fn tv(id: u32) -> Ty {
         Ty::Var(SolverVar::from_var(id).raw())
     }
 
@@ -7803,6 +7786,58 @@ mod canonicalize_tests {
         Ok(())
     }
 
+    /// Every var-bearing position is renumbered through the one table, in the documented traversal order.
+    ///
+    /// `env`, `regions`, `expected`, the `signature_wildcards` pins and the
+    /// `poly_var_map` keys each hold one distinct variable, numbered so the
+    /// traversal meets them in reverse raw order: a skipped position keeps
+    /// its raw and a reordered traversal assigns a different dense id.
+    #[test]
+    fn every_var_position_is_renumbered_in_traversal_order() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let mut types = empty();
+        types.env.insert((vec![a], f), tv(50));
+        types.regions.insert((vec![a], at(0)), tv(40));
+        types.expected.insert((vec![a], at(0)), tv(30));
+        types.signature_wildcards.insert(
+            (vec![a], f),
+            SignatureWildcards {
+                param_counts: vec![1],
+                pins: BTreeMap::from([(0, tv(20))]),
+            },
+        );
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(10), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            canonical.env.values().cloned().collect::<Vec<_>>(),
+            vec![tv(0)]
+        );
+        assert_eq!(region_values(&canonical), vec![tv(1)]);
+        assert_eq!(
+            canonical.expected.values().cloned().collect::<Vec<_>>(),
+            vec![tv(2)]
+        );
+        assert_eq!(
+            canonical
+                .signature_wildcards
+                .get(&(vec![a], f))
+                .map(|wildcards| wildcards.pins.values().cloned().collect::<Vec<_>>()),
+            Some(vec![tv(3)])
+        );
+        assert_eq!(
+            canonical
+                .poly_var_map
+                .get(&(vec![a], f))
+                .map(|vars| vars.keys().copied().collect::<Vec<_>>()),
+            Some(vec![SolverVar::from_var(4)])
+        );
+        Ok(())
+    }
+
     fn warning(diagnostic: Diagnostic, home: Symbol) -> Result<HomedWarning, String> {
         HomedWarning::new(diagnostic, &[home]).map_err(|e| format!("{e:?}"))
     }
@@ -7860,11 +7895,13 @@ mod canonicalize_tests {
 
     /// Reads every field of each warning-severity variant with its concrete type.
     ///
-    /// A warning is compared and sorted by `(home, span, code)` alone because
-    /// no warning payload can hold a solver variable: the diagnostics crate
-    /// cannot name [`Ty`]. Adding a field to one of these variants breaks this
+    /// `canonicalize` carries warnings through without renumbering, so no
+    /// payload may depend on solver-variable ids: the diagnostics crate cannot
+    /// name [`Ty`], and a rendered type names its variables in first-seen order
+    /// ([`VarNamer`]). Adding a field to one of these variants breaks this
     /// destructure (it names every field, with no `..`), so the new field has
-    /// to be classified here before it can ship.
+    /// to be classified here before it can ship. A new warning variant is
+    /// classified by [`Diagnostic::severity`], not here.
     fn warning_payload_is_ty_free(diagnostic: &Diagnostic) -> bool {
         match diagnostic {
             Diagnostic::Parse {
@@ -7912,7 +7949,7 @@ mod canonicalize_tests {
         }
     }
 
-    /// The five warning-severity variants are exactly the ones whose payload is `Ty`-free.
+    /// Each of the five warning-severity variants is accepted as a warning and has a `Ty`-free payload.
     #[test]
     fn no_warning_variant_embeds_a_ty() -> Result<(), String> {
         let [home] = syms(["A"])?;

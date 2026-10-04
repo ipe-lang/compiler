@@ -706,24 +706,22 @@ mod var_ceiling_tests {
 
     /// A ceiling above the solver tag would let a dense id carry the tag bit, so it clamps to the tag.
     #[test]
-    fn ceiling_never_exceeds_the_solver_tag() {
+    fn ceiling_never_exceeds_the_solver_tag() -> Result<(), String> {
         for n in [SOLVER_VAR_TAG + 1, u32::MAX] {
-            let Some(n) = NonZeroU32::new(n) else {
-                return;
-            };
+            let n = NonZeroU32::new(n).ok_or_else(|| format!("zero ceiling {n}"))?;
             assert_eq!(VarCeiling::at_most(n), VarCeiling::SOLVER);
         }
         assert_eq!(VarCeiling::SOLVER.get(), SOLVER_VAR_TAG);
+        Ok(())
     }
 
     /// A ceiling at or below the tag is kept exactly.
     #[test]
-    fn ceiling_below_the_tag_is_kept() {
+    fn ceiling_below_the_tag_is_kept() -> Result<(), String> {
         for n in [1, 2, 1_000, SOLVER_VAR_TAG] {
-            let Some(nz) = NonZeroU32::new(n) else {
-                return;
-            };
+            let nz = NonZeroU32::new(n).ok_or_else(|| format!("zero ceiling {n}"))?;
             assert_eq!(VarCeiling::at_most(nz).get(), n);
         }
+        Ok(())
     }
 }
