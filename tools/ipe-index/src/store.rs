@@ -322,8 +322,13 @@ impl Store {
     /// The root set this index was built under, re-proved against the tree.
     ///
     /// Every reader resolves a stored path through this set, never through
-    /// the working directory.
+    /// the working directory. An index of another schema version is refused
+    /// before its `repos` table is read: that table may lack the columns this
+    /// version records.
     pub fn repo_set(&self) -> Result<RepoSet> {
+        if !self.schema_is_current()? {
+            bail!("ipe-index: the index was built by another version; re-run `index`");
+        }
         let rows = self.recorded_repos()?;
         if rows.is_empty() {
             bail!("ipe-index: the index records no root set; run `index` first");
@@ -714,6 +719,25 @@ mod tests {
         assert_eq!(s.recorded_repos().unwrap(), want);
         s.reset_index().unwrap();
         assert_eq!(s.recorded_repos().unwrap(), Vec::new());
+    }
+
+    // A previous-version index, whose `repos` table holds no root column, is
+    // refused by name before that table is read.
+    #[test]
+    fn repo_set_of_an_older_schema_names_index() {
+        let uri = "file:repo_set_older_schema?mode=memory&cache=shared";
+        let older = Connection::open(uri).unwrap();
+        older
+            .execute_batch(
+                "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO meta VALUES ('schema_version', '7');
+                 CREATE TABLE repos (tag TEXT PRIMARY KEY, outer TEXT, prefix TEXT);
+                 INSERT INTO repos VALUES ('ipe', NULL, NULL);",
+            )
+            .unwrap();
+        let s = Store::open(uri).unwrap();
+        let err = s.repo_set().unwrap_err().to_string();
+        assert!(err.contains("re-run `index`"), "{err}");
     }
 
     #[test]
