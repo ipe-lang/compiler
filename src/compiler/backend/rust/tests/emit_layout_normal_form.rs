@@ -142,16 +142,17 @@ fn emitted_golden_files() -> Vec<PathBuf> {
 fn every_emitted_golden_file_is_in_layout_normal_form() {
     let files = emitted_golden_files();
     assert!(!files.is_empty(), "no emitted golden files found");
-    let mut report = String::new();
+    let mut report: Vec<String> = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(file).expect("golden is readable");
         for v in layout_violations(&text) {
-            report.push_str(&format!("{}:{}: {}\n", file.display(), v.line, v.rule));
+            report.push(format!("{}:{}: {}", file.display(), v.line, v.rule));
         }
     }
     assert!(
         report.is_empty(),
-        "emitted Rust breaks the layout normal form:\n{report}"
+        "emitted Rust breaks the layout normal form:\n{}",
+        report.join("\n")
     );
 }
 
