@@ -6326,6 +6326,41 @@ class TestFeatureCoverage(unittest.TestCase):
         dead_job = _FC_CI.replace("  wasi-run:\n", "  wasi-run:\n    if: false\n")
         self.assertRefused(dead_job, "'signing'")
 
+    def test_conditional_step_covers_nothing(self) -> None:
+        conditional = _FC_CI.replace(
+            "      - run: cargo clippy -p ipe --features",
+            "      - if: github.event_name == 'workflow_dispatch'\n        run: cargo clippy -p ipe --features",
+        )
+        errors = self.errors(conditional)
+        self.assertTrue(
+            any("feature 'signing'" in e and "enabled by no command" in e for e in errors), errors
+        )
+
+    def test_conditional_step_inside_a_local_action_covers_nothing(self) -> None:
+        action = (
+            "runs:\n  using: composite\n  steps:\n"
+            "    - IF\n      shell: bash\n      run: cargo clippy -p ipe --features wasi_run,signing\n"
+        )
+        ci = _FC_CI.replace(
+            "      - run: cargo clippy -p ipe --features wasi_run,signing --all-targets",
+            "      - uses: ./.github/actions/feat",
+        )
+        self.files[".github/actions/feat/action.yml"] = action.replace("IF\n      ", "")
+        self.assertEqual(self.errors(ci), [])
+        self.files[".github/actions/feat/action.yml"] = action.replace("IF", "if: inputs.full == 'true'")
+        self.assertRefused(ci, "'signing'")
+
+    def test_weak_dependency_feature_covers_nothing(self) -> None:
+        self.files["src/ipe-cli/Cargo.toml"] = self.files["src/ipe-cli/Cargo.toml"].replace(
+            "signing = []\n", 'signing = ["ipe_ffi?/extra"]\n'
+        )
+        self.files["src/compiler/ffi/Cargo.toml"] += "extra = []\n"
+        self.assertRefused(_FC_CI, "'extra'")
+        self.files["src/ipe-cli/Cargo.toml"] = self.files["src/ipe-cli/Cargo.toml"].replace(
+            "ipe_ffi?/extra", "ipe_ffi/extra"
+        )
+        self.assertEqual(self.errors(), [])
+
     def test_workspace_exclude_is_not_counted(self) -> None:
         self.assertRefused(
             self.with_wasi_run("cargo clippy --workspace --exclude ipe-runtime-rust --all-features"), "'signing'"
@@ -6546,6 +6581,41 @@ class TestReleaseTargetParity(unittest.TestCase):
             with self.subTest(change=new):
                 ci = _RT_CI.rsplit(old, 1)
                 self.assertRefused("FreeBSD cargo command", new.join(ci))
+
+    def test_conditional_ci_cargo_step_refused(self) -> None:
+        masks = ("if: github.event_name == 'workflow_dispatch'", "continue-on-error: true")
+        for mask in masks:
+            with self.subTest(job="native", mask=mask):
+                ci = self.swap(_RT_CI, "      - shell: bash\n", f"      - {mask}\n        shell: bash\n")
+                self.assertRefused("has an `if:` or `continue-on-error`", ci)
+            with self.subTest(job="freebsd", mask=mask):
+                ci = self.swap(
+                    _RT_CI, "      - uses: vmactions/freebsd-vm@", f"      - {mask}\n        uses: vmactions/freebsd-vm@"
+                )
+                self.assertRefused("has an `if:` or `continue-on-error`", ci)
+        for job in ("release-targets-run", "release-targets-freebsd"):
+            with self.subTest(job=job, mask="job continue-on-error"):
+                ci = self.swap(_RT_CI, f"  {job}:\n", f"  {job}:\n    continue-on-error: true\n")
+                self.assertRefused(f"job '{job}' has a `continue-on-error`", ci)
+
+    def test_runs_on_drift_refused(self) -> None:
+        ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ubuntu-latest\n")
+        self.assertRefused("native job `runs-on`", ci)
+        ci = self.swap(_RT_CI, "  release-targets-freebsd:\n    runs-on: ubuntu-latest\n", "  release-targets-freebsd:\n    runs-on: ubuntu-22.04\n")
+        self.assertRefused("FreeBSD job `runs-on`", ci)
+        ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    env:\n      RUSTFLAGS: -Copt-level=0\n")
+        self.assertRefused("native job `env`", ci)
+
+    def test_cargo_step_shell_or_target_drift_refused(self) -> None:
+        self.assertRefused("native cargo step `shell`", self.swap(_RT_CI, "      - shell: bash\n", "      - shell: pwsh\n"))
+        self.assertRefused(
+            "native cargo step `env.TARGET`",
+            self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n", "          TARGET: x86_64-unknown-linux-musl\n"),
+        )
+        self.assertRefused(
+            "native cargo step `working-directory`",
+            self.swap(_RT_CI, "      - shell: bash\n", "      - shell: bash\n        working-directory: src\n"),
+        )
 
     def test_non_literal_matrix_refused(self) -> None:
         ci = self.swap(_RT_CI, "        include:\n", "        extra: [1]\n        include:\n")

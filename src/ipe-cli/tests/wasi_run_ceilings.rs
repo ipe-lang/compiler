@@ -6,8 +6,10 @@
 //!   [`CliError::WasiRunFailed`] once `wall_secs` elapses; a guest that returns
 //!   at once runs to `Ok`.
 //! * **Linear memory** — a guest whose `memory.grow` would pass `as_bytes` is
-//!   turned back with [`CliError::WasiRunFailed`]; a guest that grows within the
-//!   ceiling runs to `Ok`.
+//!   turned back with [`CliError::WasiRunFailed`] for a trap while it runs; a
+//!   guest that grows within the ceiling runs to `Ok`, and the very module
+//!   refused under the ceiling runs to `Ok` under the default ceiling, so the
+//!   refusal is the ceiling's and not a module that fails to load.
 //!
 //! The modules are hand-assembled bytes (no wasm toolchain, no new dependency).
 //! Every refusal test goes red when its ceiling is not honoured: without the
@@ -110,13 +112,19 @@ fn a_guest_that_never_returns_is_turned_back_at_the_wall_ceiling() {
 fn a_guest_that_returns_at_once_runs_to_ok_under_the_wall_ceiling() {
     let (file, tree) = module_file("wasi_ceiling_return", &RETURN_AT_ONCE);
     let profile = profile(RunResourceLimits {
-        wall_secs: Some(1),
+        wall_secs: Some(60),
         ..RunResourceLimits::default()
     });
+    let started = Instant::now();
     let outcome = run(&file, &tree, &profile);
+    let took = started.elapsed();
     assert!(
         matches!(outcome, Ok(())),
         "a guest inside its ceiling must run to completion, got {outcome:?}"
+    );
+    assert!(
+        took < Duration::from_secs(30),
+        "a guest that returns at once took {took:?}"
     );
 }
 
@@ -129,8 +137,27 @@ fn a_guest_that_grows_memory_past_the_ceiling_is_turned_back() {
     });
     let outcome = run(&file, &tree, &profile);
     assert!(
-        matches!(outcome, Err(CliError::WasiRunFailed { .. })),
-        "a grow past the memory ceiling must be refused, got {outcome:?}"
+        matches!(
+            &outcome,
+            Err(CliError::WasiRunFailed { detail })
+                if detail.as_str().starts_with("the module trapped during execution")
+        ),
+        "a grow past the memory ceiling must trap while the guest runs, got {outcome:?}"
+    );
+}
+
+#[test]
+fn the_over_ceiling_grow_runs_to_ok_once_the_ceiling_is_lifted() {
+    let (file, tree) = module_file("wasi_ceiling_grow_lifted", &GROW_TWO_HUNDRED_PAGES);
+    let defaults = RunResourceLimits::default();
+    assert!(
+        defaults.as_bytes > 201 * 65_536,
+        "the default ceiling must fit the 200-page grow for this control to mean anything"
+    );
+    let outcome = run(&file, &tree, &profile(defaults));
+    assert!(
+        matches!(outcome, Ok(())),
+        "the module refused under the memory ceiling must load and run under the default one, got {outcome:?}"
     );
 }
 

@@ -356,7 +356,11 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
   22. Every cargo feature is compiled by a required job: each `[features]`
       key of every workspace member is switched on by a cargo command of a
       required `ci.yml` job (one a `gate` entry produced by it names or
-      aggregates; not behind a literal-false `if:` or `continue-on-error`) —
+      aggregates; not behind a literal-false job `if:` or a job
+      `continue-on-error`) in a step with no `if:` and no
+      `continue-on-error`, at every local-action depth: check 11 governs job
+      conditions only, and a step `if:` can skip the step while the job
+      succeeds —
       through `--features`/`-F` (plain or `pkg/feat`), `--all-features`, a
       default feature, a feature another feature lists, or a
       `features = [..]` edge from a compiled member (a dev-dependency edge
@@ -375,7 +379,12 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       refused); each native job's one cargo command, its pinned-toolchain
       step and its musl-install step are equal, as are the FreeBSD jobs'
       VM action, `usesh`, `prepare` and cargo command, the verb aside
-      (`build` there, `check` here); and release.yml's completeness
+      (`build` there, `check` here).  Each job's `runs-on`, `env`,
+      `defaults` and `container` are equal, as are the native cargo step's
+      `shell`, `working-directory` and `env.TARGET` and the VM step's `env`;
+      a cargo-carrying step with an `if:` or a `continue-on-error`, or a
+      ci.yml job with a `continue-on-error`, is refused, since either lets
+      the job succeed without the cargo command; and release.yml's completeness
       `expected` list is exactly the artifacts its jobs publish.  A job,
       matrix, cargo line or VM step that is absent or not one literal
       is refused.  Both release builds carry `--features ipe/wasi_run`, so
@@ -383,6 +392,10 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       LIMIT: `cargo check` does not link, so a link-time
       failure of a target is not seen; the FreeBSD toolchain is the VM's
       unpinned `pkg install rust`.
+  LIMIT (checks 15, 16, 20, 22, 23): a cargo line is read as run, not
+  proven to reach its step's exit status — `cargo .. || true`, an `exit 0`
+  before it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail`
+  are not modelled.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -2897,14 +2910,19 @@ def _default_wd(container: dict) -> str | None:
 
 
 def _steps_cargo(
-    steps: object, repo: str, wd: str | None, depth: int = 0
+    steps: object, repo: str, wd: str | None, depth: int = 0, unconditional: bool = False
 ) -> list[cargo_invocation.Found]:
     """Every cargo invocation `steps` run, each with its directory: every
     `run:` (here-document bodies included) from its `working-directory` (else
-    `wd`), and the steps of each local composite action a step `uses`."""
+    `wd`), and the steps of each local composite action a step `uses`. With
+    `unconditional`, a step (at any action depth) that has an `if:` or a
+    masking `continue-on-error` is left out: it can be skipped or fail while
+    its job succeeds."""
     out: list[cargo_invocation.Found] = []
     for st in steps if isinstance(steps, list) else []:
         if not isinstance(st, dict):
+            continue
+        if unconditional and not _unconditional_step(st):
             continue
         uses = st.get("uses")
         if isinstance(uses, str) and uses.startswith("./"):
@@ -2923,7 +2941,7 @@ def _steps_cargo(
                 continue
             runs = action.get("runs") if isinstance(action, dict) else None
             if isinstance(runs, dict) and runs.get("using") == "composite":
-                out.extend(_steps_cargo(runs.get("steps"), repo, None, depth + 1))
+                out.extend(_steps_cargo(runs.get("steps"), repo, None, depth + 1, unconditional))
             continue
         run = st.get("run")
         if not isinstance(run, str):
@@ -2936,14 +2954,14 @@ def _steps_cargo(
     return out
 
 
-def _job_cargo(job: dict, repo: str, doc: object) -> list[cargo_invocation.Found]:
+def _job_cargo(job: dict, repo: str, doc: object, unconditional: bool = False) -> list[cargo_invocation.Found]:
     """Every cargo invocation of `job` (see `_steps_cargo`); its default
     directory is the job's `defaults.run.working-directory`, else the
     workflow's."""
     wd = _default_wd(job)
     if wd is None and isinstance(doc, dict):
         wd = _default_wd(doc)
-    return _steps_cargo(job.get("steps"), repo, wd)
+    return _steps_cargo(job.get("steps"), repo, wd, unconditional=unconditional)
 
 
 def _workspace_layout(repo: str, tracked: list[str] | None) -> cargo_invocation.Layout | str:
@@ -5495,7 +5513,8 @@ def _feature_closure(
     `seeds` switched on: the seeds, the `features = [..]` that the
     (non-optional) edges of each compiled member name, all closed over the
     members' feature tables. A root's dev-dependency edges count when `tests`
-    compiles its test targets; an optional edge is never counted."""
+    compiles its test targets; an optional edge, and a weak `x?/f` entry, is
+    never counted."""
     by_name = {m.name: d for d, m in members.items()}
     compiled: set[str] = set(roots)
     active: set[tuple[str, str]] = set()
@@ -5516,11 +5535,14 @@ def _feature_closure(
                 continue
             active.add((d, f))
             for entry in members[d].features[f]:
-                if entry.startswith("dep:"):
+                # `dep:x` names no feature; `x?/f` switches `f` on only when
+                # the optional dependency `x` is already on, which an optional
+                # edge never is here.
+                if entry.startswith("dep:") or "?/" in entry:
                     continue
                 if "/" in entry:
                     pkg, feat = entry.split("/", 1)
-                    target = by_name.get(pkg.rstrip("?"))
+                    target = by_name.get(pkg)
                     if target is not None:
                         wanted.add((target, feat))
                 else:
@@ -5547,13 +5569,21 @@ def _required_ci_jobs(entries: list[dict], wf: Workflow) -> list[dict]:
 
 
 def _always_runs(node: object) -> bool:
-    """Whether a job or step runs unconditionally: no `if:` and no
-    `continue-on-error` that could mask it."""
+    """Whether a job or step is neither dead nor masked: no literal-false
+    `if:` and no `continue-on-error` that could mask it."""
     if not isinstance(node, dict):
         return False
     if "continue-on-error" in node and node["continue-on-error"] is not False:
         return False
     return str(node.get("if", "true")).strip().lower() not in ("false", "${{ false }}")
+
+
+def _unconditional_step(step: object) -> bool:
+    """Whether a step runs whenever its job does: no `if:` at all and no
+    masking `continue-on-error`. Check 11 governs job conditions only; a step
+    `if:` can skip the step while the job, and the phase verdict reading it,
+    succeeds — so a step with any `if:` proves nothing ran."""
+    return _always_runs(step) and isinstance(step, dict) and "if" not in step
 
 
 def _invocation_roots(
@@ -5613,8 +5643,7 @@ def check_feature_coverage(
         for job in _required_ci_jobs(entries, wf):
             if not _always_runs(job):
                 continue
-            steps = [s for s in job.get("steps") or [] if _always_runs(s)]
-            for found in _job_cargo({**job, "steps": steps}, repo, wf.doc):
+            for found in _job_cargo(job, repo, wf.doc, unconditional=True):
                 inv = found.invocation
                 if isinstance(inv, str):
                     if _FEATURE_FLAG_TEXT.search(found.line):
@@ -5682,20 +5711,37 @@ def _cargo_lines(text: object) -> list[str]:
     return [ln for ln in lines if ln.startswith("cargo ")]
 
 
-def _cargo_tokens(job: dict, where: str, verb: str, errors: list[str], vm_run: bool = False) -> list[str] | None:
-    """The tokens of `job`'s one cargo command, its `verb` word replaced by a
-    placeholder (a FreeBSD VM job keeps its commands under the VM step's
-    `with.run`)."""
-    texts = []
+@dataclass(frozen=True)
+class _CargoStep:
+    """A job's one cargo-carrying step and that command's tokens, its verb
+    word replaced by a placeholder."""
+
+    step: dict
+    tokens: list[str]
+
+
+def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: bool = False) -> _CargoStep | None:
+    """`job`'s one cargo command (a FreeBSD VM job keeps its commands under the
+    VM step's `with.run`) and the step carrying it. The step must run whenever
+    its job does: an `if:` or a `continue-on-error` there lets the job succeed
+    with the cargo command skipped or failed, so either is refused."""
+    found: list[tuple[dict, str]] = []
     for step in _steps_of(job):
         if vm_run:
             with_ = step.get("with")
-            texts.append(with_.get("run") if isinstance(with_, dict) else None)
+            text = with_.get("run") if isinstance(with_, dict) else None
         else:
-            texts.append(step.get("run"))
-    lines = [ln for t in texts for ln in _cargo_lines(t)]
-    line = _only(lines, where, "cargo command", errors)
-    if line is None:
+            text = step.get("run")
+        found.extend((step, ln) for ln in _cargo_lines(text))
+    one = _only(found, where, "cargo command", errors)
+    if not isinstance(one, tuple):
+        return None
+    step, line = one
+    if "if" in step or "continue-on-error" in step:
+        errors.append(
+            f"check 23: {where}: the step running `{line}` has an `if:` or `continue-on-error`, so the job "
+            "can succeed without it; refused"
+        )
         return None
     try:
         tokens = shlex.split(str(line))
@@ -5705,7 +5751,13 @@ def _cargo_tokens(job: dict, where: str, verb: str, errors: list[str], vm_run: b
     if len(tokens) < 2 or tokens[1] != verb:
         errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
         return None
-    return [tokens[0], "<verb>", *tokens[2:]]
+    return _CargoStep(step, [tokens[0], "<verb>", *tokens[2:]])
+
+
+def _job_unmasked(job: dict, where: str, errors: list[str]) -> None:
+    """A job whose result is a parity witness may not mask its own failure."""
+    if "continue-on-error" in job:
+        errors.append(f"check 23: {where} has a `continue-on-error`, so it can succeed with its cargo command failed; refused")
 
 
 def _require_feature(tokens: list[str] | None, where: str, errors: list[str]) -> None:
@@ -5798,11 +5850,26 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         for target in sorted(set(ci_legs) - set(rel_legs)):
             errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
 
-    ci_cargo = _cargo_tokens(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", errors)
-    rel_cargo = _cargo_tokens(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
+    _job_unmasked(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", errors)
+    _job_unmasked(ci[CI_RELEASE_FREEBSD_JOB], f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", errors)
+    # The same `os` per target means the same runner only when both jobs run on
+    # `matrix.os`; the job's environment must agree too.
+    for key in ("runs-on", "env", "defaults", "container"):
+        _compare(f"native job `{key}`", ci_native.get(key), rel_native.get(key), errors)
+    ci_cargo = _cargo_step(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", errors)
+    rel_cargo = _cargo_step(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
     if ci_cargo is not None and rel_cargo is not None:
-        _compare("native cargo command (verb aside)", ci_cargo, rel_cargo, errors)
-    _require_feature(rel_cargo, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
+        _compare("native cargo command (verb aside)", ci_cargo.tokens, rel_cargo.tokens, errors)
+        for key in ("shell", "working-directory"):
+            _compare(f"native cargo step `{key}`", ci_cargo.step.get(key), rel_cargo.step.get(key), errors)
+        ci_env, rel_env = ci_cargo.step.get("env"), rel_cargo.step.get("env")
+        _compare(
+            "native cargo step `env.TARGET`",
+            ci_env.get("TARGET") if isinstance(ci_env, dict) else None,
+            rel_env.get("TARGET") if isinstance(rel_env, dict) else None,
+            errors,
+        )
+    _require_feature(rel_cargo.tokens if rel_cargo else None, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
     ci_tc = [s.get("with") for s in _steps_of(ci_native) if s.get("uses") == _TOOLCHAIN_ACTION]
     rel_tc = [s.get("with") for s in _steps_of(rel_native) if s.get("uses") == _TOOLCHAIN_ACTION]
     _compare("native toolchain step", ci_tc, rel_tc, errors)
@@ -5822,13 +5889,18 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         rel_with = rel_step.get("with") if isinstance(rel_step.get("with"), dict) else {}
         for key in ("usesh", "prepare"):
             _compare(f"FreeBSD VM `{key}`", ci_with.get(key), rel_with.get(key), errors)
-    ci_bsd_cargo = _cargo_tokens(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", errors, vm_run=True)
-    rel_bsd_cargo = _cargo_tokens(
+    for key in ("runs-on", "env", "defaults", "container"):
+        _compare(f"FreeBSD job `{key}`", ci_bsd.get(key), rel_bsd.get(key), errors)
+    ci_bsd_cargo = _cargo_step(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", errors, vm_run=True)
+    rel_bsd_cargo = _cargo_step(
         rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "build", errors, vm_run=True
     )
     if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
-        _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo, rel_bsd_cargo, errors)
-    _require_feature(rel_bsd_cargo, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors)
+        _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.tokens, rel_bsd_cargo.tokens, errors)
+        _compare("FreeBSD VM step `env`", ci_bsd_cargo.step.get("env"), rel_bsd_cargo.step.get("env"), errors)
+    _require_feature(
+        rel_bsd_cargo.tokens if rel_bsd_cargo else None, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors
+    )
 
     if rel_legs is None:
         return

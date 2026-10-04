@@ -473,6 +473,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
@@ -496,6 +497,7 @@ jobs:
     needs: [changes, quick-check]
     if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check in FreeBSD VM
@@ -803,6 +805,7 @@ jobs:
   # workspace member to a command that enables it.
   wasi-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [changes, quick-check]
     if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
     env:
