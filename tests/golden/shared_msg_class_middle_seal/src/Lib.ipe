@@ -1,0 +1,12 @@
+module Lib exposing (wrap)
+
+import Ipe.Html as Html exposing (Html)
+
+
+-- Private and message-free: shares `wrap`'s message slot.
+nav =
+    Html.div [] [ Html.text "nav" ]
+
+
+wrap =
+    Html.div [] [ nav ]

@@ -1,0 +1,15 @@
+module Main exposing (main)
+
+-- `Mid.w` wraps `Lib.nav` and is only rendered: no use fixes its message
+-- type. ipe MUST exit 0 AND the emitted project MUST cargo-build (THE SEAL).
+
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Lib exposing (Wrap(..))
+import Mid exposing (w)
+
+
+main =
+    case w of
+        Wrap h ->
+            Io.println (Html.render h)
