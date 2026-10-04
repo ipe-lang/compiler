@@ -1,10 +1,10 @@
 use super::{
     BinOp, Callee, DResult, Diagnostic, Expr, GenericScope, IrType, KernelClass, KernelFn,
     LowerError, MAX_EMIT_DEPTH, Match, ModPath, Span, Symbol, callee_name, clone_targets_in_expr,
-    combine_guards, emit_apply, emit_arm_head, emit_binding_stmts, emit_config_ctor_call,
-    emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value, emit_html_template,
-    emit_http_builder_call, emit_http_call, emit_json_decoder_call, emit_lambda,
-    emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
+    combine_guards, elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts,
+    emit_config_ctor_call, emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value,
+    emit_html_template, emit_http_builder_call, emit_http_call, emit_json_decoder_call,
+    emit_lambda, emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_loop_call, emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template,
     emit_update, float_literal, free_vars, indent_of, infix, inlined_let_body, int_literal,
@@ -632,11 +632,15 @@ pub fn emit_expr_at(
             let t = emit_expr_at(ctx, tail, indent, child, generics)?;
             Ok(format!("ipe_runtime::list::ipe_list_cons({h}, {t})"))
         }
-        Expr::ListIndexClone { list, index } => {
+        Expr::ListIndexClone { list, index, elem } => {
             // Clone the element at a constant index — the arm guard already
             // proved `list.len() > index`, so the Rust index is in
             // bounds by construction. `.clone()` keeps the list intact for the
-            // sibling tail binder.
+            // sibling tail binder; the lowerer builds this node only over a
+            // `Clone` element and refuses a nested cons over any other
+            // (IPE-L0116), and `elem_clone_proof` re-checks the element
+            // against the emitted `Clone` facts before any text is written.
+            elem_clone_proof(ctx, elem)?;
             let l = emit_expr_at(ctx, list, indent, child, generics)?;
             Ok(format!("({l})[{index}].clone()"))
         }

@@ -108,7 +108,7 @@ pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_target(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_target(p, target)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_target(p, target)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_target(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_target(p, target))
         }
@@ -362,9 +362,10 @@ pub fn substitute_var(expr: Expr, target: Symbol, replacement: &Expr) -> Expr {
             head: Box::new(substitute_var(*head, target, replacement)),
             tail: Box::new(substitute_var(*tail, target, replacement)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(substitute_var(*list, target, replacement)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(substitute_var(*list, target, replacement)),
