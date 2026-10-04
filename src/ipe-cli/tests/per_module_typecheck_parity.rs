@@ -662,3 +662,108 @@ fn field_accessor_export_parity() -> Result<(), String> {
     assert_eq!(swept, engaged, "parity sweep and engaged set disagree");
     Ok(())
 }
+
+/// A Lib whose private message-free helper `private` shares its message slot
+/// with the exported `wrap` (a same-module reference is one shared variable),
+/// declared in either order.
+fn shared_class_lib(private: &str, private_first: bool) -> String {
+    let private_decl = format!("{private} =\n    Html.div [] [ Html.text \"nav\" ]\n");
+    let wrap_decl = format!("wrap =\n    Html.div [] [ {private} ]\n");
+    let (first, second) = if private_first {
+        (private_decl, wrap_decl)
+    } else {
+        (wrap_decl, private_decl)
+    };
+    format!(
+        "module Lib exposing (wrap)\n\n\
+         import Ipe.Html as Html exposing (Html)\n\n\
+         {first}\n\n{second}"
+    )
+}
+
+const SHARED_CLASS_MAIN: &str = "module Main exposing (main)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\
+     import Ipe.Io as Io\n\
+     import Lib exposing (wrap)\n\n\
+     type Msg\n    = Click\n\n\
+     view : Html Msg\n\
+     view =\n    Html.div [] [ wrap ]\n\n\
+     main =\n    Io.println (Html.render view)\n";
+
+/// The scoped verdict of a module whose exported helper shares a message slot
+/// with a private one is decided per slot, never per binding: whichever of the
+/// two the solve visits first, Lib serves its interface only, its own scoped
+/// facts (the slot pinned to `Unit`) disagree with the joint solve (the slot
+/// kept generic for `Main`), and every engaged module agrees with the joint
+/// solve. `nav` is a stdlib name interned before `wrap`, `qqPanel` after it.
+#[test]
+fn shared_msg_class_verdict_is_order_independent() -> Result<(), String> {
+    use ipe_db::Db as _;
+    for private in ["nav", "qqPanel"] {
+        for private_first in [true, false] {
+            let label = format!("{private}, private first: {private_first}");
+            let lib_src = shared_class_lib(private, private_first);
+            let (db, root, seen) = checked(&sources_of(&[
+                (&["Main"], SHARED_CLASS_MAIN),
+                (&["Lib"], &lib_src),
+            ]))?;
+            assert_eq!(
+                (seen.get("Lib"), seen.get("Main")),
+                (Some(&"InterfaceOnly"), Some(&"PerModule")),
+                "[{label}] the shared slot's exporter serves its interface only"
+            );
+            let engaged = seen.values().filter(|v| **v == "PerModule").count();
+            let (swept, _) = assert_state_parity(&label, &db, root);
+            assert_eq!(
+                swept, engaged,
+                "[{label}] parity sweep and engaged set disagree"
+            );
+            let file_at = |path: &[&str]| {
+                root.files(&db)
+                    .iter()
+                    .find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied()))
+                    .map(|(_, f)| *f)
+            };
+            let main_file =
+                file_at(&["Main"]).ok_or_else(|| format!("[{label}] fixture must carry Main"))?;
+            let lib_file =
+                file_at(&["Lib"]).ok_or_else(|| format!("[{label}] fixture must carry Lib"))?;
+            let joint = ipe_db::typecheck(&db, root, main_file)
+                .clone()
+                .map_err(|e| format!("[{label}] program must type-check: {e:?}"))?;
+            let (lib_home, wrap) = {
+                let mut interner = db.interner().lock();
+                let lib = interner
+                    .intern("Lib")
+                    .map_err(|e| format!("[{label}] interner append failed: {e:?}"))?;
+                let wrap = interner
+                    .intern("wrap")
+                    .map_err(|e| format!("[{label}] interner append failed: {e:?}"))?;
+                drop(interner);
+                (vec![lib], wrap)
+            };
+            let lib_joint =
+                ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home));
+            let lib_served = ipe_db::typecheck_module(&db, root, main_file, lib_file)
+                .clone()
+                .map_err(|e| format!("[{label}] Lib's types must be served: {e:?}"))?;
+            assert_eq!(
+                *lib_served, lib_joint,
+                "[{label}] Lib's served types must be the joint slice"
+            );
+            let lib_own = scoped_own_types(&db, root, lib_file, &lib_home)?;
+            let own_entry = lib_own.env.get(&wrap);
+            let joint_entry = lib_joint.env.get(&wrap);
+            assert!(
+                own_entry.is_some() && joint_entry.is_some(),
+                "[{label}] both solves must type `wrap`"
+            );
+            assert_ne!(
+                own_entry, joint_entry,
+                "[{label}] Lib's own scoped `wrap` must differ from the joint one, so the \
+                 refusal is load-bearing"
+            );
+        }
+    }
+    Ok(())
+}

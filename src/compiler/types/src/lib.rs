@@ -1041,9 +1041,9 @@ fn infer_core(
     // msg, or an untyped helper's quantified root that itself stays generic --
     // keeps it generic too (`Lib.nav` inside `Mid.wrap`, which `Main.view :
     // Html Msg` pins), as the typed path counts a `Rigid` instantiation pinned.
-    // `generic_msg_roots` holds every quantified untyped root that stays
+    // `msg_classes.generic` holds every quantified untyped root that stays
     // generic, so a typed use threaded into one counts as pinned below.
-    let (discharge_outcomes, generic_msg_roots) = lift!(msg_discharge_outcomes(
+    let msg_classes = lift!(msg_slot_classes(
         &mut uf,
         budget,
         &generated.pending_instantiations,
@@ -1119,7 +1119,7 @@ fn infer_core(
                         match lift!(uf.content(root)) {
                             Content::Structure(FlatType::Unit) => {}
                             Content::Flex => {
-                                if generic_msg_roots.contains(&root) {
+                                if msg_classes.generic.contains(&root) {
                                     pinned = true;
                                     break;
                                 }
@@ -1302,46 +1302,22 @@ fn infer_core(
     // coarse boolean: default the slot to `Unit` exactly when no cross-module
     // use pins it to a concrete `Msg`, and keep it generic when ≥1 use does.
     //
-    // The outcomes are read before the typed defaulting above, as
-    // `discharge_outcomes` / `generic_msg_roots`.
-    for (key, scheme) in &untyped_schemes {
-        if scheme.quantified.is_empty() {
-            continue;
+    // The decision is taken per union-find CLASS, not per binding: a
+    // same-module reference is the one shared variable, so `nav` and `wrap =
+    // Html.div [] [ nav ]` own the same slot, and pinning it for `nav` would
+    // pin `wrap` too. `msg_classes` was settled before the typed defaulting
+    // above, from the pre-pin classification: a class is pinned to `Unit`
+    // only when it is message-only for every owner and no owner stays
+    // generic.
+    for (&rep, owners) in &msg_classes.defaulted {
+        // A cross-module use may keep this slot generic in the joint solve, so
+        // a defaulted class an exported binding owns makes this module's own
+        // solved facts importer-dependent. Its exported scheme was reified
+        // before this pin.
+        if owners.iter().any(|owner| exported_by_scoped_module(owner)) {
+            own_facts_importer_dependent = true;
         }
-        // A cross-module reference keeps the binding generic only when a use
-        // discharges its ui-msg slot to a concrete `Msg`; an unpinned outcome
-        // falls through to the same `Unit`-defaulting the same-module path uses.
-        if let Some(outcome) = discharge_outcomes.get(key)
-            && !outcome.should_default()
-        {
-            continue;
-        }
-        let scheme_ty = lift!(zonk(&mut uf, budget, scheme.root));
-        let mut ui_msg_vars = BTreeSet::new();
-        let mut other_vars = BTreeSet::new();
-        collect_ui_msg_and_other_vars(
-            &scheme_ty,
-            &ui_msg_cons,
-            false,
-            &mut ui_msg_vars,
-            &mut other_vars,
-        );
-        for &root in scheme.quantified.keys() {
-            // A zonked unresolved var reads back as `Ty::Var(tag_solver_var(root))`.
-            let tagged_sym = Symbol::from_raw(tag_solver_var(root));
-            let msg_only = ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym);
-            if msg_only {
-                // A cross-module use may pin this slot in the joint solve, so an
-                // exported msg-only root makes this module's own solved facts
-                // importer-dependent. Its exported scheme was reified before
-                // this pin.
-                if exported_by_scoped_module(key) {
-                    own_facts_importer_dependent = true;
-                }
-                let rep = lift!(uf.find(root));
-                lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
-            }
-        }
+        lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
     }
 
     let mut untyped_type_params: BTreeMap<(Vec<Symbol>, Symbol), Vec<Symbol>> = BTreeMap::new();
@@ -1722,8 +1698,24 @@ fn quantified_msg_roots<'a>(
     })
 }
 
-/// Every untyped binding's cross-module [`MsgDischargeOutcome`], and the
-/// representatives of the quantified untyped roots that stay generic.
+/// The untyped msg defaulting's decision over the union-find classes of the
+/// quantified untyped roots, taken once per class before any slot is pinned.
+///
+/// A same-module reference to an untyped binding is the one shared variable,
+/// so a single class can be the quantified root of several bindings (`nav` and
+/// `wrap = Html.div [] [ nav ]`). Pinning the class for one owner pins it for
+/// every owner, so the decision belongs to the class: it stays generic when it
+/// is not message-only for some owner, or when any owner's
+/// [`MsgDischargeOutcome`] keeps that owner generic.
+struct MsgSlotClasses<'a> {
+    /// Every class that stays generic.
+    generic: BTreeSet<VarId>,
+    /// Every message-only class pinned to `Unit`, with the bindings owning it.
+    defaulted: BTreeMap<VarId, Vec<&'a BindingKey>>,
+}
+
+/// Settle every untyped binding's cross-module [`MsgDischargeOutcome`], then
+/// decide each class (see [`MsgSlotClasses`]).
 ///
 /// A use threads the slot into an enclosing generic when a discharged msg
 /// slot holds a `Rigid` / `Super` (a typed helper's own message variable), a
@@ -1732,13 +1724,13 @@ fn quantified_msg_roots<'a>(
 /// dependency between bindings, settled by a worklist: each binding turns
 /// `Threaded` at most once, so the pass ends after at most one visit per
 /// binding.
-fn msg_discharge_outcomes(
+fn msg_slot_classes<'a>(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     pending: &[constrain::PendingInstantiation],
-    untyped_schemes: &constrain::UntypedSchemes,
+    untyped_schemes: &'a constrain::UntypedSchemes,
     ui_msg_cons: &BTreeSet<Symbol>,
-) -> DResult<(BTreeMap<BindingKey, MsgDischargeOutcome>, BTreeSet<VarId>)> {
+) -> DResult<MsgSlotClasses<'a>> {
     let mut placeholders: BTreeMap<&BindingKey, Vec<VarId>> = BTreeMap::new();
     for pi in pending {
         placeholders
@@ -1811,16 +1803,20 @@ fn msg_discharge_outcomes(
             }
         }
     }
-    let mut generic_roots = always_generic;
-    for (rep, owners) in &msg_only_owners {
-        if owners
-            .iter()
-            .any(|owner| outcomes.get(*owner).is_some_and(|o| !o.should_default()))
-        {
-            generic_roots.insert(*rep);
+    let mut generic = always_generic;
+    let mut defaulted: BTreeMap<VarId, Vec<&BindingKey>> = BTreeMap::new();
+    for (rep, owners) in msg_only_owners {
+        let kept = generic.contains(&rep)
+            || owners
+                .iter()
+                .any(|owner| outcomes.get(*owner).is_some_and(|o| !o.should_default()));
+        if kept {
+            generic.insert(rep);
+        } else {
+            defaulted.insert(rep, owners);
         }
     }
-    Ok((outcomes, generic_roots))
+    Ok(MsgSlotClasses { generic, defaulted })
 }
 
 /// Collect the concrete `Msg` identities occupying a ui-msg slot of `ty` — the
