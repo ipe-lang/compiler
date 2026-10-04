@@ -819,20 +819,23 @@ where
     // SSRF guard: resolve + validate + pin, and the per-redirect re-check,
     // through the shared helper, identical to Http.get/post.
     let builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
-    let builder = match crate::http_client::ssrf_apply_with(
-        builder,
-        &req.url,
-        req.redirects,
-        policy,
-        VettingResolver::system(),
-    )
-    .await
-    {
-        Ok(b) => b,
+    let gate = match VettingResolver::system() {
+        Ok(gate) => gate,
         Err(refusal) => {
             return IpeResult::Err(E::from(IpeError::invalid_input(format!("http: {refusal}"))));
         }
     };
+    let builder =
+        match crate::http_client::ssrf_apply_with(builder, &req.url, req.redirects, policy, gate)
+            .await
+        {
+            Ok(b) => b,
+            Err(refusal) => {
+                return IpeResult::Err(E::from(IpeError::invalid_input(format!(
+                    "http: {refusal}"
+                ))));
+            }
+        };
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
@@ -1560,6 +1563,18 @@ mod tests {
         assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
         assert!(matches!(&refused, Some(e) if message(e) == STREAM_IDLE_TIMED_OUT));
         assert!(waited >= Duration::from_millis(300));
+        assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    #[tokio::test]
+    async fn open_refuses_a_malformed_dns_deadline_and_holds_no_permit() {
+        let reg = new_reg::<LiveResponse>();
+        crate::system::locked_set_var("IPE_HTTP_DNS_TIMEOUT_MS", "5s");
+        let opened =
+            open_in::<IpeError>(reg, loopback_request(9), DialPolicy::AllowAll, ms(30_000)).await;
+        crate::system::locked_remove_var("IPE_HTTP_DNS_TIMEOUT_MS");
+        let refused = into_err(opened);
+        assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::InvalidInput));
         assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
     }
 
