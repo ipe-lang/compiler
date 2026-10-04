@@ -1781,7 +1781,7 @@ const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
 /// duration within the bound; a present value is never replaced by a default.
 #[cfg(feature = "server")]
 fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
-    let raw = crate::system::read_env_var(WEB_TTL.name());
+    let raw = WEB_TTL.lookup();
     if matches!(raw, Err(std::env::VarError::NotPresent))
         && let Some(secs) = crate::app_config::resolve_session_ttl_override()
     {

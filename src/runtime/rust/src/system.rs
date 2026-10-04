@@ -187,13 +187,23 @@ impl EnvCeiling {
         T::try_from(n).map_err(|_| self.refusal(n.to_string(), CeilingDefect::TooLarge))
     }
 
+    /// The raw lookup of this ceiling's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// [`std::env::VarError::NotPresent`] while the variable is unset, or
+    /// `NotUnicode` for a non-UTF-8 value; [`Self::parse`] judges either.
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        read_env_var(self.name)
+    }
+
     /// Reads and parses this ceiling from the live environment (overlay first).
     ///
     /// # Errors
     ///
     /// Returns the [`Self::parse_as`] refusal for a present, malformed value.
     pub fn read<T: TryFrom<u64>>(self) -> Result<T, EnvCeilingRefusal> {
-        self.parse_as(read_env_var(self.name))
+        self.parse_as(self.lookup())
     }
 
     /// A parsed value under this ceiling's zero rule and bound.

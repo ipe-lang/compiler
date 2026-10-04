@@ -520,7 +520,7 @@ const AUTH_SLIDE_WINDOW_CEILING: crate::system::EnvCeiling = crate::system::EnvC
 fn env_override(
     ceiling: crate::system::EnvCeiling,
 ) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
-    match crate::system::read_env_var(ceiling.name()) {
+    match ceiling.lookup() {
         Err(std::env::VarError::NotPresent) => Ok(None),
         raw => ceiling.parse(raw).map(Some),
     }

@@ -460,7 +460,7 @@ const DNS_TIMEOUT_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling
 ///
 /// [`SsrfRefusal::Deadline`] when the variable is set to anything else.
 pub fn dns_timeout() -> Result<Duration, SsrfRefusal> {
-    dns_deadline(crate::system::read_env_var(DNS_TIMEOUT_CEILING.name()))
+    dns_deadline(DNS_TIMEOUT_CEILING.lookup())
 }
 
 /// [`dns_timeout`] over a raw lookup of its variable.
