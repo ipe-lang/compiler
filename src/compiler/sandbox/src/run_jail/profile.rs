@@ -62,7 +62,12 @@ pub enum FilesystemScope {
     /// writable tempdir. The maximally-isolated filesystem view.
     Isolated,
     /// `filesystem` granted: the working tree is bound read-write (still coarse
-    /// — any path under it — per the first-cut map).
+    /// — any path under it — per the first-cut map), except its version-control
+    /// metadata ([`crate::VcsKind::ALL`]), which stays read-only: the host runs
+    /// code that metadata names. An arm that cannot keep it read-only refuses
+    /// a tree holding it. Metadata the program creates after the jail starts is
+    /// not carved on every arm, so a tree is trusted only as far as the next
+    /// tool the developer runs over it.
     WorkingTreeReadWrite,
 }
 

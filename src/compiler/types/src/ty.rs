@@ -26,6 +26,7 @@
 //! without forcing every app to enumerate empty optionals.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use ipe_canon::ast as canon;
 use ipe_intern::Symbol;
@@ -58,10 +59,10 @@ pub enum Ty {
     ///
     /// A `Ty` containing a tagged (solver-space) `Var` must never be fed to
     /// `instantiate_in`/`instantiate_tracked`/`instantiate_logging_wildcards` — those
-    /// only handle annotation-space ids. No current consumer needs to
-    /// recover the underlying [`crate::unionfind::VarId`] from a tagged raw
-    /// (`crate::doc::ty_to_doc`'s `VarNamer` treats it as an opaque key);
-    /// mask off [`SOLVER_VAR_TAG`] if one ever does.
+    /// only handle annotation-space ids. A tagged raw is an opaque key
+    /// (`crate::doc::ty_to_doc`'s `VarNamer`, `SolvedTypes::poly_var_map`):
+    /// readers compare it whole and never recover the bare
+    /// [`crate::unionfind::VarId`].
     Var(u32),
     /// A function `arg -> result`.
     Fun(Box<Self>, Box<Self>),
@@ -96,6 +97,11 @@ pub enum Ty {
 /// bit can never collide with a genuine id from either space.
 const SOLVER_VAR_TAG: u32 = 1 << 31;
 
+// The tag is a single non-zero bit, so every id below it is untagged and
+// `VarCeiling::SOLVER` is exactly the count of distinct tagged ids.
+// IPE-RUST-AUDIT:ACCEPTED — compile-time `const` assertion (not a runtime panic); it fails the build if the tag stops being a single non-zero bit
+const _: () = assert!(SOLVER_VAR_TAG.is_power_of_two() && SOLVER_VAR_TAG > 0);
+
 /// Tag a solver [`VarId`] for storage in a [`Ty::Var`].
 ///
 /// Marks it as solver-representative space (from [`crate::constrain::zonk`])
@@ -106,38 +112,89 @@ pub const fn tag_solver_var(id: VarId) -> u32 {
     id | SOLVER_VAR_TAG
 }
 
-/// Strip [`SOLVER_VAR_TAG`] from a [`Ty::Var`] raw, recovering the bare
-/// union-find [`VarId`]. A no-op on a raw that was never tagged.
-///
-/// SEAL fix: `SolvedTypes::poly_var_map`'s "typed-rigids" entries
-/// (`ipe_types::lib.rs` around line 347) are keyed by the BARE union-find
-/// representative — a typed binding's own `params`/`ret` are read straight
-/// from its annotation, never zonked, so they were never tagged in the first
-/// place. But a `Ty::Var` read back from a ZONKED region (`SolvedTypes::regions`,
-/// e.g. a nested lambda's return-type slot inside that same typed binding's
-/// body) IS tagged, because `zonk` always tags an unresolved representative
-/// before storing it. Consumers in `ipe_lower` that probe `current_poly_tvars`
-/// with a region-sourced raw MUST strip the tag first (or try both forms) or
-/// the lookup silently misses for every typed (not boundary-scheme-promoted)
-/// enclosing binding — the exact gap that let `withErrorReporting : String ->
-/// Task Error a -> Task Error a`'s internal closures fall back to
-/// `IrType::Json` instead of `IrType::Generic(a)`, an E0308 exit-0-then-
-/// cargo-fail (examples/18-job-queue).
-#[must_use]
-pub const fn untag_solver_var(raw: u32) -> u32 {
-    raw & !SOLVER_VAR_TAG
-}
-
 /// True iff a [`Ty::Var`] raw is solver-representative space.
 ///
 /// I.e. tagged by [`tag_solver_var`] rather than an annotation-symbol raw.
 /// Callers that resolve a `Ty::Var` raw through the interner (e.g. the
 /// wildcard-`"any"` check) MUST skip that resolution when this returns
 /// true — a tagged raw is structurally guaranteed to never be a real
-/// interned symbol.
+/// interned symbol. Every table keyed by solver variables
+/// (`SolvedTypes::poly_var_map`) stores the tagged form only, so a reader
+/// answers for a tagged raw by exact lookup and for an untagged raw (an
+/// annotation symbol) not at all; probing both forms would match a symbol
+/// against a variable key.
 #[must_use]
 pub const fn is_solver_var(raw: u32) -> bool {
     raw & SOLVER_VAR_TAG != 0
+}
+
+/// A solver variable as a table key: always the tagged raw `zonk` writes into a [`Ty::Var`].
+///
+/// The field is private, so a key is built only from a [`VarId`] (tagging
+/// it) or from a raw that already carries the tag; an annotation-symbol raw
+/// has no `SolverVar`. A table keyed by solver variables
+/// (`SolvedTypes::poly_var_map`) therefore cannot hold, or be probed with,
+/// an untagged raw.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SolverVar(u32);
+
+impl SolverVar {
+    /// The key of a union-find variable.
+    #[must_use]
+    pub const fn from_var(id: VarId) -> Self {
+        Self(tag_solver_var(id))
+    }
+
+    /// The key a [`Ty::Var`] raw names, or `None` for an annotation-symbol raw.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if is_solver_var(raw) {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    /// The tagged [`Ty::Var`] raw.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// The union-find variable this key names.
+    #[must_use]
+    pub const fn var(self) -> VarId {
+        self.0 & !SOLVER_VAR_TAG
+    }
+}
+
+/// The exclusive upper bound on the dense ids a renumbering may mint.
+///
+/// Held in `1..=SOLVER_VAR_TAG`: an id below the bound never carries the tag
+/// bit, so tagging it can neither alias another id nor read back as an
+/// annotation symbol. Built only through [`Self::SOLVER`] or [`Self::at_most`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct VarCeiling(u32);
+
+impl VarCeiling {
+    /// The full solver-variable space: ids `0..2^31`.
+    pub const SOLVER: Self = Self(SOLVER_VAR_TAG);
+
+    /// A ceiling of `n` ids, clamped to the solver-variable space.
+    #[must_use]
+    pub const fn at_most(n: NonZeroU32) -> Self {
+        if n.get() > SOLVER_VAR_TAG {
+            Self::SOLVER
+        } else {
+            Self(n.get())
+        }
+    }
+
+    /// The exclusive upper bound.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// The tail of a record type's row variable — whether the record is closed
@@ -601,7 +658,25 @@ pub fn from_canon(t: &canon::Type) -> Ty {
 
 #[cfg(test)]
 mod aud13_tag_tests {
-    use super::{is_solver_var, tag_solver_var};
+    use super::{SolverVar, is_solver_var, tag_solver_var};
+
+    /// An annotation-symbol raw has no solver-variable key; a tagged raw is the key of its variable.
+    #[test]
+    fn solver_var_key_refuses_an_untagged_raw() {
+        for id in [0u32, 7, 1_000_000, u32::MAX >> 1] {
+            assert_eq!(
+                SolverVar::from_raw(id),
+                None,
+                "untagged raw {id} is a symbol"
+            );
+            assert_eq!(
+                SolverVar::from_raw(tag_solver_var(id)),
+                Some(SolverVar::from_var(id)),
+                "tagged raw names the key of variable {id}"
+            );
+            assert_eq!(SolverVar::from_var(id).raw(), tag_solver_var(id));
+        }
+    }
 
     #[test]
     fn tag_is_detectable_and_preserves_the_id_bits() {
@@ -627,5 +702,32 @@ mod aud13_tag_tests {
                 "a plain annotation-symbol raw must never look tagged"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod var_ceiling_tests {
+    use super::{SOLVER_VAR_TAG, VarCeiling};
+    use std::num::NonZeroU32;
+
+    /// A ceiling above the solver tag would let a dense id carry the tag bit, so it clamps to the tag.
+    #[test]
+    fn ceiling_never_exceeds_the_solver_tag() -> Result<(), String> {
+        for n in [SOLVER_VAR_TAG + 1, u32::MAX] {
+            let n = NonZeroU32::new(n).ok_or_else(|| format!("zero ceiling {n}"))?;
+            assert_eq!(VarCeiling::at_most(n), VarCeiling::SOLVER);
+        }
+        assert_eq!(VarCeiling::SOLVER.get(), SOLVER_VAR_TAG);
+        Ok(())
+    }
+
+    /// A ceiling at or below the tag is kept exactly.
+    #[test]
+    fn ceiling_below_the_tag_is_kept() -> Result<(), String> {
+        for n in [1, 2, 1_000, SOLVER_VAR_TAG] {
+            let nz = NonZeroU32::new(n).ok_or_else(|| format!("zero ceiling {n}"))?;
+            assert_eq!(VarCeiling::at_most(nz).get(), n);
+        }
+        Ok(())
     }
 }

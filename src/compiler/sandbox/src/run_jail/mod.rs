@@ -2052,4 +2052,59 @@ mod tests {
             "{joined}"
         );
     }
+
+    #[test]
+    fn the_run_jail_binds_a_trees_git_dir_read_only_over_its_write_grant() {
+        let base_dir = crate::test_dir::TestDir::new("run-jail-vcs").expect("test dir");
+        let base = base_dir.path();
+        let tree = base.join("tree");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(tree.join(".git").join("hooks")).expect("git dir");
+        std::fs::create_dir_all(&tmp).expect("scratch");
+        let mounts = mounts_of(
+            CanonicalPath::resolve(&tmp).expect("resolve scratch"),
+            CanonicalPath::resolve(&tree).expect("resolve tree"),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let argv_for = |filesystem: FilesystemScope| -> Vec<String> {
+            let profile = SandboxProfile {
+                filesystem,
+                ..SandboxProfile::maximally_isolated()
+            };
+            let no_env = |_: &str| None;
+            run_jail_argv(
+                &tools(),
+                &profile,
+                &mounts,
+                None,
+                &no_env,
+                &[OsString::from("app")],
+            )
+            .args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let tree = tree.to_string_lossy().into_owned();
+        let git = format!("{tree}/.git");
+        let granted = argv_for(FilesystemScope::WorkingTreeReadWrite);
+        let at = |argv: &[String], window: &[&str]| {
+            argv.windows(window.len())
+                .position(|w| w.iter().zip(window).all(|(a, b)| a == b))
+        };
+        let found = (
+            at(&granted, &["--bind", &tree, &tree]),
+            at(&granted, &["--ro-bind", &git, &git]),
+        );
+        assert!(
+            matches!(found, (Some(bind), Some(carve)) if bind < carve),
+            "the git dir is bound read-only after the tree's write bind: {granted:?}"
+        );
+        let isolated = argv_for(FilesystemScope::Isolated);
+        assert!(
+            !isolated.contains(&git),
+            "an ungranted tree renders no carve: {isolated:?}"
+        );
+    }
 }

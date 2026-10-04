@@ -457,3 +457,42 @@ fn a_file_held_open_elsewhere_is_in_use() {
     );
     drop(other);
 }
+
+/// A link's stored target is read through the handle, never followed; a non-link is refused as what it is.
+#[cfg(unix)]
+#[test]
+fn read_link_reads_the_stored_target_and_refuses_a_non_link() {
+    let dir = scratch("read_link");
+    std::fs::write(dir.join("plain.txt"), "plain").unwrap();
+    std::os::unix::fs::symlink("../elsewhere/run", dir.join("link")).unwrap();
+    let held = held(&dir);
+    let target = held.read_link(&name("link"));
+    assert_eq!(
+        target.ok(),
+        Some(PathBuf::from("../elsewhere/run")),
+        "the stored target is returned verbatim, dangling or not"
+    );
+    let plain = held.read_link(&name("plain.txt"));
+    assert!(
+        matches!(plain, Err(OpenRefusal::NotRegular(FileKind::Regular))),
+        "a regular file is not a link, got {plain:?}"
+    );
+    let absent = held.read_link(&name("absent"));
+    assert!(
+        matches!(absent, Err(OpenRefusal::Absent)),
+        "an absent entry is absent, got {absent:?}"
+    );
+}
+
+/// A second directory entry for a file shows in its link count.
+#[test]
+fn link_count_counts_a_hard_link() {
+    let dir = scratch("link_count");
+    std::fs::write(dir.join("one.txt"), "one").unwrap();
+    let held = held(&dir);
+    let alone = held.open_regular(&name("one.txt")).unwrap().link_count();
+    assert_eq!(alone.ok(), Some(1), "a file with one name counts one");
+    std::fs::hard_link(dir.join("one.txt"), dir.join("two.txt")).unwrap();
+    let linked = held.open_regular(&name("one.txt")).unwrap().link_count();
+    assert_eq!(linked.ok(), Some(2), "a hard link counts as a second name");
+}
