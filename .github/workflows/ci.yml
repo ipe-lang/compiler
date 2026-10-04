@@ -15,7 +15,7 @@ name: Build & test
 #     feature job wasi-run), the 14-shard e2e
 #     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
-#     Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
+#     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
 #     the queue is about to land.
 #   • POST-MERGE (`post_merge`: push to main, dispatch) — the ASAN/TSAN
 #     sanitizers and the arm64 Tier-2 proof.
@@ -444,6 +444,86 @@ jobs:
           results: >-
             changes=${{ needs.changes.result }}
             registry-admission-run=${{ needs.registry-admission-run.result }}
+          phase: tests
+          tier: ${{ needs.changes.outputs.tests }}
+          scope: ${{ needs.changes.outputs.code }}
+
+  # The release workflow's targets, type-checked before a release is cut: each
+  # release leg's `cargo build` is a `cargo check` here, on the same runner, target
+  # and pinned toolchain, so a target that cannot compile surfaces in the merge
+  # queue, not on the release tag. `ring` needs a native C toolchain, so each leg
+  # runs natively. The matrix, argv and FreeBSD prelude are held equal to
+  # release.yml's by ci/verify-manifest.py check 23. `cargo check` does not link.
+  release-targets-run:
+    needs: [changes, quick-check]
+    # Tests phase: five native runners, so merge queue and dispatch only.
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install musl toolchain (linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+
+  # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
+  # that leg's check, with release.yml's `uses`, prelude and cargo line.
+  release-targets-freebsd:
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check in FreeBSD VM
+        uses: vmactions/freebsd-vm@4469451fe39bee80be4066836c5170362e9349f3 # v1.5.7
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: |
+            cargo check --release --locked -p ipe -p ipe-ffi-inspector
+
+  # Required context for the release-target jobs: the phase verdict (see the header).
+  release-targets:
+    name: release-targets
+    runs-on: ubuntu-latest
+    needs: [changes, release-targets-run, release-targets-freebsd]
+    if: always()
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/phase-verdict
+      - name: Judge the aggregated jobs
+        uses: ./.github/actions/phase-verdict
+        with:
+          results: >-
+            changes=${{ needs.changes.result }}
+            release-targets-run=${{ needs.release-targets-run.result }}
+            release-targets-freebsd=${{ needs.release-targets-freebsd.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}

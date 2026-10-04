@@ -304,6 +304,18 @@ checks:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
     aggregates: [registry-admission-run]
+  - context: release-targets
+    disposition: gate
+    producer: ci.yml
+    local:
+      ci-only: platform
+    guards: >-
+      Every target release.yml builds type-checks on its own runner under the
+      pinned toolchain and the lockfile before merge, so a release target that
+      cannot compile surfaces in the merge queue, not on the release tag;
+      check 23 holds the matrix, cargo line and FreeBSD prelude equal to
+      release.yml's.
+    aggregates: [release-targets-run, release-targets-freebsd]
 
   # ── Cancel-on-cheap-red watcher — informational (never a merge gate) ──────
   # Normally SKIPPED (its `needs:` all succeed and `failure()` is false), so it

@@ -368,6 +368,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `runtime-feature-combos`), with a refusal for a stale entry.  LIMIT: a
       `--workspace --exclude` run is not counted; `cfg(all(feature=a,
       not(feature=b)))` combinations are not enumerated.
+  23. Release-target parity: ci.yml's `release-targets-run` and
+      `release-targets-freebsd` check exactly what release.yml's `build` and
+      `build-freebsd` build.  The `(os, target)` pairs of the two matrices are
+      equal (a target missing from either side, or on another `os`, is
+      refused); each native job's one cargo command, its pinned-toolchain
+      step and its musl-install step are equal, as are the FreeBSD jobs'
+      VM action, `usesh`, `prepare` and cargo command, the verb aside
+      (`build` there, `check` here); and release.yml's completeness
+      `expected` list is exactly the artifacts its jobs publish.  A job,
+      matrix, cargo line or VM step that is absent or not one literal
+      is refused.  LIMIT: `cargo check` does not link, so a link-time
+      failure of a target is not seen; the FreeBSD toolchain is the VM's
+      unpinned `pkg install rust`.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -383,6 +396,7 @@ import os
 import enum
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -5633,6 +5647,188 @@ def check_feature_coverage(
             )
 
 
+# Check 23: the release workflow's jobs and the ci.yml jobs that check them.
+RELEASE_WORKFLOW = "release.yml"
+RELEASE_NATIVE_JOB = "build"
+RELEASE_FREEBSD_JOB = "build-freebsd"
+RELEASE_PUBLISH_JOB = "release"
+CI_RELEASE_NATIVE_JOB = "release-targets-run"
+CI_RELEASE_FREEBSD_JOB = "release-targets-freebsd"
+_TOOLCHAIN_ACTION = "./.github/actions/rust-toolchain-pinned"
+_RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
+
+
+def _steps_of(job: dict) -> list[dict]:
+    steps = job.get("steps")
+    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+
+
+def _only(items: list, where: str, what: str, errors: list[str]) -> object | None:
+    """The one of `items`, else a refusal naming `what`."""
+    if len(items) != 1:
+        errors.append(f"check 23: {where} must have exactly one {what}, has {len(items)}")
+        return None
+    return items[0]
+
+
+def _cargo_lines(text: object) -> list[str]:
+    """The lines of a `run:` text that start a cargo command."""
+    lines = (ln.strip() for ln in text.splitlines()) if isinstance(text, str) else ()
+    return [ln for ln in lines if ln.startswith("cargo ")]
+
+
+def _cargo_tokens(job: dict, where: str, verb: str, errors: list[str], vm_run: bool = False) -> list[str] | None:
+    """The tokens of `job`'s one cargo command, its `verb` word replaced by a
+    placeholder (a FreeBSD VM job keeps its commands under the VM step's
+    `with.run`)."""
+    texts = []
+    for step in _steps_of(job):
+        if vm_run:
+            with_ = step.get("with")
+            texts.append(with_.get("run") if isinstance(with_, dict) else None)
+        else:
+            texts.append(step.get("run"))
+    lines = [ln for t in texts for ln in _cargo_lines(t)]
+    line = _only(lines, where, "cargo command", errors)
+    if line is None:
+        return None
+    try:
+        tokens = shlex.split(str(line))
+    except ValueError as e:
+        errors.append(f"check 23: {where}: `{line}` is not readable ({e})")
+        return None
+    if len(tokens) < 2 or tokens[1] != verb:
+        errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
+        return None
+    return [tokens[0], "<verb>", *tokens[2:]]
+
+
+def _matrix_legs(job: dict, where: str, errors: list[str]) -> dict[str, dict] | None:
+    """`job`'s `strategy.matrix.include` legs keyed by target."""
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    include = matrix.get("include") if isinstance(matrix, dict) else None
+    if (
+        not isinstance(matrix, dict)
+        or set(matrix) != {"include"}
+        or not isinstance(include, list)
+        or not all(isinstance(leg, dict) for leg in include)
+    ):
+        errors.append(f"check 23: {where} must be a matrix of only an `include` list of mappings")
+        return None
+    legs: dict[str, dict] = {}
+    for leg in include:
+        target, os_name = leg.get("target"), leg.get("os")
+        if not isinstance(target, str) or not isinstance(os_name, str):
+            errors.append(f"check 23: {where}: a matrix leg needs a literal `os` and `target`: {leg!r}")
+            return None
+        if target in legs:
+            errors.append(f"check 23: {where}: target {target!r} appears in more than one leg")
+            return None
+        legs[target] = leg
+    return legs
+
+
+def _compare(what: str, ci_value: object, release_value: object, errors: list[str]) -> None:
+    if ci_value != release_value:
+        errors.append(
+            f"check 23: ci.yml's {what} is {ci_value!r} but release.yml's is {release_value!r}; "
+            "they must be equal"
+        )
+
+
+def _step_with_run(job: dict, needle: str) -> dict | None:
+    return next((s for s in _steps_of(job) if needle in str(s.get("run", ""))), None)
+
+
+def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 23 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    by_file = {wf.fname: wf for wf in _load_workflows(root, errors)}
+    jobs: dict[str, dict[str, dict]] = {}
+    for fname, wanted in (
+        ("ci.yml", (CI_RELEASE_NATIVE_JOB, CI_RELEASE_FREEBSD_JOB)),
+        (RELEASE_WORKFLOW, (RELEASE_NATIVE_JOB, RELEASE_FREEBSD_JOB, RELEASE_PUBLISH_JOB)),
+    ):
+        wf = by_file.get(fname)
+        if wf is None:
+            errors.append(f"check 23: .github/workflows/{fname} is missing; refused")
+            return
+        have = {wj.job_id: wj.raw for wj in wf.jobs}
+        for job_id in wanted:
+            if job_id not in have:
+                errors.append(f"check 23: {fname} has no job {job_id!r}, which the release-target parity needs")
+                return
+        jobs[fname] = {job_id: have[job_id] for job_id in wanted}
+    ci, rel = jobs["ci.yml"], jobs[RELEASE_WORKFLOW]
+
+    ci_native, rel_native = ci[CI_RELEASE_NATIVE_JOB], rel[RELEASE_NATIVE_JOB]
+    ci_legs = _matrix_legs(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", errors)
+    rel_legs = _matrix_legs(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
+    if ci_legs is not None and rel_legs is not None:
+        for target, leg in sorted(rel_legs.items()):
+            if target not in ci_legs:
+                errors.append(
+                    f"check 23: {RELEASE_WORKFLOW} builds {target!r} but ci.yml's {CI_RELEASE_NATIVE_JOB} never checks it"
+                )
+            elif ci_legs[target]["os"] != leg["os"]:
+                errors.append(
+                    f"check 23: target {target!r} runs on {ci_legs[target]['os']!r} in ci.yml but "
+                    f"{leg['os']!r} in {RELEASE_WORKFLOW}; they must be equal"
+                )
+        for target in sorted(set(ci_legs) - set(rel_legs)):
+            errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
+
+    ci_cargo = _cargo_tokens(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", errors)
+    rel_cargo = _cargo_tokens(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
+    if ci_cargo is not None and rel_cargo is not None:
+        _compare("native cargo command (verb aside)", ci_cargo, rel_cargo, errors)
+    ci_tc = [s.get("with") for s in _steps_of(ci_native) if s.get("uses") == _TOOLCHAIN_ACTION]
+    rel_tc = [s.get("with") for s in _steps_of(rel_native) if s.get("uses") == _TOOLCHAIN_ACTION]
+    _compare("native toolchain step", ci_tc, rel_tc, errors)
+    for label, key in (("musl install run", "run"), ("musl install condition", "if")):
+        ci_musl = _step_with_run(ci_native, "musl-tools")
+        rel_musl = _step_with_run(rel_native, "musl-tools")
+        _compare(label, ci_musl.get(key) if ci_musl else None, rel_musl.get(key) if rel_musl else None, errors)
+
+    ci_bsd, rel_bsd = ci[CI_RELEASE_FREEBSD_JOB], rel[RELEASE_FREEBSD_JOB]
+    ci_vm = [s for s in _steps_of(ci_bsd) if str(s.get("uses", "")).startswith("vmactions/freebsd-vm@")]
+    rel_vm = [s for s in _steps_of(rel_bsd) if str(s.get("uses", "")).startswith("vmactions/freebsd-vm@")]
+    ci_step = _only(ci_vm, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "FreeBSD VM step", errors)
+    rel_step = _only(rel_vm, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "FreeBSD VM step", errors)
+    if isinstance(ci_step, dict) and isinstance(rel_step, dict):
+        _compare("FreeBSD VM action", ci_step.get("uses"), rel_step.get("uses"), errors)
+        ci_with = ci_step.get("with") if isinstance(ci_step.get("with"), dict) else {}
+        rel_with = rel_step.get("with") if isinstance(rel_step.get("with"), dict) else {}
+        for key in ("usesh", "prepare"):
+            _compare(f"FreeBSD VM `{key}`", ci_with.get(key), rel_with.get(key), errors)
+    ci_bsd_cargo = _cargo_tokens(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", errors, vm_run=True)
+    rel_bsd_cargo = _cargo_tokens(
+        rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "build", errors, vm_run=True
+    )
+    if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
+        _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo, rel_bsd_cargo, errors)
+
+    if rel_legs is None:
+        return
+    published = {leg.get("artifact") for leg in rel_legs.values()}
+    for step in _steps_of(rel_bsd):
+        with_ = step.get("with")
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@") and isinstance(with_, dict):
+            published.add(with_.get("name"))
+    expected_sets = [
+        set(m.group(1).split())
+        for step in _steps_of(rel[RELEASE_PUBLISH_JOB])
+        for m in _RELEASE_EXPECTED.finditer(str(step.get("run", "")))
+    ]
+    expected = _only(expected_sets, f"{RELEASE_WORKFLOW} job {RELEASE_PUBLISH_JOB!r}", "`expected=\"..\"` list", errors)
+    if isinstance(expected, set):
+        for name in sorted(str(n) for n in published - expected):
+            errors.append(f"check 23: {RELEASE_WORKFLOW} publishes {name!r} but its completeness gate does not expect it")
+        for name in sorted(expected - published):
+            errors.append(f"check 23: {RELEASE_WORKFLOW}'s completeness gate expects {name!r}, which no job publishes")
+
+
 def load_manifest() -> dict:
     doc = strict_yaml.safe_load(open(MANIFEST))
     if not isinstance(doc, dict) or "checks" not in doc:
@@ -5785,6 +5981,9 @@ def main() -> int:
 
     # ---- 22. Every cargo feature is compiled by a required job ----
     check_feature_coverage(entries, errors)
+
+    # ---- 23. ci.yml checks exactly the targets release.yml builds ----
+    check_release_target_parity(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

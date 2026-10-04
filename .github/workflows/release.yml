@@ -97,7 +97,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
         run: |
-          cargo build --release --target "$TARGET" -p ipe -p ipe-ffi-inspector
+          cargo build --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
           mkdir -p dist
           BIN="target/$TARGET/release"
           cp "$BIN/ipe$EXT"               "dist/ipe$EXT"
@@ -143,7 +143,7 @@ jobs:
           usesh: true
           prepare: pkg install -y rust
           run: |
-            cargo build --release -p ipe -p ipe-ffi-inspector
+            cargo build --release --locked -p ipe -p ipe-ffi-inspector
             ./target/release/ipe version
             mkdir -p dist
             cp target/release/ipe dist/ipe

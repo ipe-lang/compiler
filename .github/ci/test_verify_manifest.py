@@ -58,6 +58,7 @@ check_workspace_inheritance = verify_manifest.check_workspace_inheritance
 check_test_claims = verify_manifest.check_test_claims
 check_ci_suites_required = verify_manifest.check_ci_suites_required
 check_feature_coverage = verify_manifest.check_feature_coverage
+check_release_target_parity = verify_manifest.check_release_target_parity
 
 with open(os.path.join(HERE, "github-env-allowlist.txt")) as _f:
     VALID_ENV_ALLOWLIST = _f.read()
@@ -6351,6 +6352,192 @@ class TestFeatureCoverage(unittest.TestCase):
             self.assertRefused(_FC_CI, "names 'src/nowhere'")
         self.files["src/runtime/rust/Cargo.toml"] = '[package]\nname = "ipe-runtime-rust"\n'
         self.assertRefused(_FC_CI, "names 'src/runtime/rust'")
+
+_RT_CI = """\
+on: pull_request
+jobs:
+  release-targets-run:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain (linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+  release-targets-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: |
+            cargo check --release --locked -p ipe -p ipe-ffi-inspector
+"""
+_RT_RELEASE = """\
+on: workflow_dispatch
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: ipe-linux-x64
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            artifact: ipe-darwin-arm64
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain (linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+          mkdir -p dist
+  build-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: |
+            cargo build --release --locked -p ipe -p ipe-ffi-inspector
+            mkdir -p dist
+      - uses: actions/upload-artifact@0000000000000000000000000000000000000000
+        with:
+          name: ipe-freebsd-x64
+          path: dist/ipe-freebsd-x64.tar.gz
+  release:
+    needs: [build, build-freebsd]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"
+          echo done
+"""
+
+
+class TestReleaseTargetParity(unittest.TestCase):
+    """Check 23: ci.yml checks exactly the targets release.yml builds."""
+
+    def errors(self, ci: str = _RT_CI, release: str = _RT_RELEASE) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            root = os.path.join(repo, ".github")
+            _write(os.path.join(root, "workflows", "ci.yml"), ci)
+            _write(os.path.join(root, "workflows", "release.yml"), release)
+            errors: list[str] = []
+            check_release_target_parity(errors, root=root)
+            return errors
+
+    def assertRefused(self, needle: str, ci: str = _RT_CI, release: str = _RT_RELEASE) -> None:
+        errors = self.errors(ci, release)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    @staticmethod
+    def swap(text: str, old: str, new: str) -> str:
+        assert text.count(old) >= 1, old
+        return text.replace(old, new)
+
+    def test_matching_workflows_pass(self) -> None:
+        self.assertEqual(self.errors(), [])
+
+    def test_repo_workflows_pass(self) -> None:
+        errors: list[str] = []
+        check_release_target_parity(errors)
+        self.assertEqual(errors, [])
+
+    def test_target_missing_from_ci_refused(self) -> None:
+        ci = self.swap(
+            _RT_CI, "          - os: macos-latest\n            target: aarch64-apple-darwin\n", ""
+        )
+        self.assertRefused("aarch64-apple-darwin' but ci.yml's release-targets-run never checks it", ci)
+
+    def test_target_only_in_ci_refused(self) -> None:
+        release = self.swap(
+            _RT_RELEASE,
+            "          - os: macos-latest\n            artifact: ipe-darwin-arm64\n            target: aarch64-apple-darwin\n",
+            "",
+        )
+        self.assertRefused("which release.yml does not build", release=release)
+
+    def test_different_os_for_the_same_target_refused(self) -> None:
+        ci = self.swap(_RT_CI, "os: macos-latest", "os: macos-15-intel")
+        self.assertRefused("runs on 'macos-15-intel' in ci.yml but 'macos-latest' in release.yml", ci)
+
+    def test_cargo_line_drift_refused(self) -> None:
+        for old, new in (
+            ("--release --locked", "--locked"),
+            ("--release --locked", "--release"),
+            ("--release --locked", "--release --locked --features wasi_run"),
+            (" -p ipe -p ipe-ffi-inspector", " -p ipe"),
+            ("--release --locked --target", "--release --locked --offline --target"),
+        ):
+            with self.subTest(change=new):
+                self.assertRefused("native cargo command", self.swap(_RT_CI, old, new))
+
+    def test_release_dropping_locked_is_refused(self) -> None:
+        release = self.swap(_RT_RELEASE, "cargo build --release --locked --target", "cargo build --release --target")
+        self.assertRefused("native cargo command", release=release)
+
+    def test_ci_must_check_not_build(self) -> None:
+        self.assertRefused("must run `cargo check`", self.swap(_RT_CI, "cargo check --release --locked --target", "cargo build --release --locked --target"))
+
+    def test_toolchain_or_musl_drift_refused(self) -> None:
+        self.assertRefused("native toolchain step", self.swap(_RT_CI, "targets: ${{ matrix.target }}", "targets: x86_64-unknown-linux-musl"))
+        self.assertRefused("musl install run", self.swap(_RT_CI, "install -y musl-tools", "install -y musl-dev"))
+        self.assertRefused("musl install condition", self.swap(_RT_CI, "contains(matrix.target, 'musl')", "true"))
+
+    def test_expected_artifact_missing_refused(self) -> None:
+        release = self.swap(_RT_RELEASE, 'expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"', 'expected="ipe-linux-x64 ipe-freebsd-x64"')
+        self.assertRefused("publishes 'ipe-darwin-arm64' but its completeness gate does not expect it", release=release)
+
+    def test_expected_artifact_nobody_publishes_refused(self) -> None:
+        release = self.swap(_RT_RELEASE, 'ipe-freebsd-x64"\n', 'ipe-freebsd-x64 ipe-haiku-x64"\n')
+        self.assertRefused("expects 'ipe-haiku-x64', which no job publishes", release=release)
+
+    def test_missing_freebsd_leg_refused(self) -> None:
+        head, _, _ = _RT_CI.partition("  release-targets-freebsd:\n")
+        self.assertRefused("has no job 'release-targets-freebsd'", head)
+
+    def test_freebsd_prelude_drift_refused(self) -> None:
+        self.assertRefused("FreeBSD VM `prepare`", self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"))
+        self.assertRefused("FreeBSD VM `usesh`", self.swap(_RT_CI, "usesh: true", "usesh: false"))
+        self.assertRefused(
+            "FreeBSD VM action",
+            self.swap(_RT_CI, "freebsd-vm@0000000000000000000000000000000000000000", "freebsd-vm@1111111111111111111111111111111111111111"),
+        )
+
+    def test_freebsd_cargo_drift_refused(self) -> None:
+        for old, new in (("--release --locked -p", "--release -p"), (" -p ipe-ffi-inspector\n", "\n")):
+            with self.subTest(change=new):
+                ci = _RT_CI.rsplit(old, 1)
+                self.assertRefused("FreeBSD cargo command", new.join(ci))
+
+    def test_non_literal_matrix_refused(self) -> None:
+        ci = self.swap(_RT_CI, "        include:\n", "        extra: [1]\n        include:\n")
+        self.assertRefused("must be a matrix of only an `include` list", ci)
 
 
 if __name__ == "__main__":
