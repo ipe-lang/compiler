@@ -1078,8 +1078,8 @@ const RUNTIME_MOD_RS_LOCALE_APPEND: &str = "pub mod locale;\npub use locale::*;\
 /// Unlike `ws_client`/`email`, `env_public.rs` is NOT vendored from the
 /// source tree — it is generated per-project by [`render_env_public_rs`]
 /// (its content is project-specific: the `package.ipe` `[wasm] publicEnv`
-/// allowlist). No extra Cargo dependency or feature flag: `option_env!`/
-/// `std::env::var` are both `std`-only.
+/// allowlist). No extra Cargo dependency or feature flag: `option_env!` is
+/// `std`-only and the native read is the runtime's own `system::read_env_var`.
 const RUNTIME_MOD_RS_ENV_PUBLIC_APPEND: &str = "pub mod env_public;\npub use env_public::*;\n";
 
 /// Render the per-project `ipe_runtime/env_public.rs`: `Env.public`'s runtime
@@ -1090,7 +1090,9 @@ const RUNTIME_MOD_RS_ENV_PUBLIC_APPEND: &str = "pub mod env_public;\npub use env
 /// One `env_public` fn per target, `#[cfg]`-split: wasm32 embeds each
 /// allowlisted key's value at BUILD time via `option_env!` (a browser has no
 /// live process environment to read at runtime); native reads the SAME
-/// allowlisted key from the live environment via `std::env::var`, so a
+/// allowlisted key from the live environment through the runtime accessor
+/// `system::read_env_var` (the env overlay first, a temp-root name always
+/// unset — the same semantics as `System.getenv`), so a
 /// module shared between a native SSR path and the wasm client behaves
 /// identically against both — same allowlist, same set of readable keys,
 /// only the READ MECHANISM differs. A key absent from `allowlist` has no
@@ -1098,15 +1100,46 @@ const RUNTIME_MOD_RS_ENV_PUBLIC_APPEND: &str = "pub mod env_public;\npub use env
 /// no code path from an arbitrary runtime string back to the raw host/process
 /// environment, on either target.
 ///
+/// A temp-root name (`scratch_core::TEMP_ROOT_NAMES`) allowlisted in
+/// `publicEnv` is the one divergence: native reads it as `Nothing` (the
+/// accessor's rule) while wasm32 embeds the build host's value.
+///
 /// Each key is emitted via `{key:?}` (Rust's `Debug` string-literal escaping)
-/// on BOTH the match-arm pattern and the `option_env!`/`std::env::var`
+/// on BOTH the match-arm pattern and the `option_env!`/`read_env_var`
 /// argument, so a key containing a quote or backslash (an unusual but
 /// syntactically legal env-var name) round-trips through the generated
 /// source safely rather than corrupting it.
 #[must_use]
 fn render_env_public_rs(allowlist: &[String]) -> String {
+    render_env_public(allowlist, EnvPublicRuntimeRoot::Vendored)
+}
+
+/// Where an emitted `env_public` module reaches the runtime from.
+#[derive(Clone, Copy)]
+enum EnvPublicRuntimeRoot {
+    /// A submodule of the vendored `ipe_runtime` (`super::…`).
+    Vendored,
+    /// A user-crate module reaching the `ipe_runtime` extern crate.
+    Extern,
+}
+
+impl EnvPublicRuntimeRoot {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Vendored => "super",
+            Self::Extern => "ipe_runtime",
+        }
+    }
+}
+
+/// The one body of the `env_public` module, spelled from `runtime`'s root.
+///
+/// Both emit models render through here, so the two never differ except in
+/// the path prefix.
+fn render_env_public(allowlist: &[String], runtime: EnvPublicRuntimeRoot) -> String {
     use std::fmt::Write as _;
 
+    let root = runtime.path();
     let mut wasm_arms = String::new();
     let mut native_arms = String::new();
     for key in allowlist {
@@ -1123,7 +1156,8 @@ fn render_env_public_rs(allowlist: &[String]) -> String {
         );
         let _ = writeln!(
             native_arms,
-            "        {lit} => std::env::var({lit}).map_or(IpeMaybe::Nothing, IpeMaybe::Just),"
+            "        {lit} => {root}::system::read_env_var({lit})\
+             .map_or(IpeMaybe::Nothing, IpeMaybe::Just),"
         );
     }
     format!(
@@ -1133,8 +1167,9 @@ fn render_env_public_rs(allowlist: &[String]) -> String {
          // `package.ipe` `[wasm] publicEnv` allowlist; every other key returns\n\
          // `Nothing` by construction (no match arm reaches it). wasm32 embeds\n\
          // each value at BUILD time (`option_env!`); native reads the SAME\n\
-         // allowlisted key from the live environment (`std::env::var`).\n\
-         use super::core::IpeMaybe;\n\
+         // allowlisted key from the live environment (`read_env_var`: the env\n\
+         // overlay first, a temp-root name always unset).\n\
+         use {root}::core::IpeMaybe;\n\
          \n\
          #[cfg(target_arch = \"wasm32\")]\n\
          pub fn env_public(key: String) -> IpeMaybe<String> {{\n\
@@ -2241,16 +2276,12 @@ fn insert_app_serde_json_dependency(manifest: &str) -> DResult<String> {
 
 /// Render the per-project `env_public` module for the dependency model as a
 /// USER-crate module (`src/ipe_env_public.rs`), declared + re-exported from
-/// `main.rs`. Byte-identical to [`render_env_public_rs`] except the one runtime
-/// import: `use super::core::IpeMaybe` (a submodule of the vendored
-/// `ipe_runtime`) becomes `use ipe_runtime::core::IpeMaybe` (the extern crate),
-/// since the module no longer lives inside the runtime tree.
+/// `main.rs`. Identical to [`render_env_public_rs`] except every runtime path
+/// starts at the `ipe_runtime` extern crate rather than `super` (a submodule of
+/// the vendored `ipe_runtime`), since the module no longer lives inside the
+/// runtime tree.
 fn render_env_public_user_rs(allowlist: &[String]) -> String {
-    render_env_public_rs(allowlist).replacen(
-        "use super::core::IpeMaybe;",
-        "use ipe_runtime::core::IpeMaybe;",
-        1,
-    )
+    render_env_public(allowlist, EnvPublicRuntimeRoot::Extern)
 }
 
 /// Rewrite the one emitted `crate::ipe_runtime::…` reference (the `IpeStringify`
@@ -6836,5 +6867,72 @@ mod non_serde_tests {
             &IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
             &table
         ));
+    }
+}
+
+#[cfg(test)]
+mod env_public_tests {
+    use super::{render_env_public_rs, render_env_public_user_rs};
+
+    /// Plain, temp-root and quote/backslash names, so escaping is exercised too.
+    const KEYS: [&str; 3] = ["API_BASE_URL", "TMPDIR", "ODD\"NAME\\X"];
+
+    fn allowlist() -> Vec<String> {
+        KEYS.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    /// Every native arm reads through the runtime accessor spelled from `root`.
+    fn assert_native_arms_use_the_accessor(src: &str, root: &str) {
+        assert!(
+            !src.contains("std::env::"),
+            "an emitted `Env.public` read bypasses the runtime env accessor:\n{src}"
+        );
+        let native = src.rsplit_once("#[cfg(not(target_arch = \"wasm32\"))]");
+        assert!(native.is_some(), "no native arm section in:\n{src}");
+        let Some((_, native)) = native else { return };
+        for key in KEYS {
+            let arm = format!(
+                "{key:?} => {root}::system::read_env_var({key:?})\
+                 .map_or(IpeMaybe::Nothing, IpeMaybe::Just),"
+            );
+            assert!(
+                native.contains(&arm),
+                "missing native arm `{arm}` in:\n{src}"
+            );
+        }
+        assert_eq!(
+            src.matches("read_env_var(").count(),
+            KEYS.len(),
+            "exactly one accessor call per key, none on the wasm32 arm:\n{src}"
+        );
+    }
+
+    #[test]
+    fn vendored_native_arms_read_through_the_runtime_accessor() {
+        let src = render_env_public_rs(&allowlist());
+        assert_native_arms_use_the_accessor(&src, "super");
+        assert!(
+            !src.contains("ipe_runtime::"),
+            "the vendored module reaches the runtime through `super`:\n{src}"
+        );
+    }
+
+    #[test]
+    fn dependency_native_arms_read_through_the_runtime_accessor() {
+        let src = render_env_public_user_rs(&allowlist());
+        assert_native_arms_use_the_accessor(&src, "ipe_runtime");
+        assert!(
+            !src.contains("super::"),
+            "the user-crate module reaches the runtime through the extern crate:\n{src}"
+        );
+        assert!(src.contains("use ipe_runtime::core::IpeMaybe;"), "{src}");
+    }
+
+    #[test]
+    fn an_empty_allowlist_reads_nothing() {
+        for src in [render_env_public_rs(&[]), render_env_public_user_rs(&[])] {
+            assert!(!src.contains("read_env_var("), "{src}");
+            assert!(!src.contains("std::env::"), "{src}");
+        }
     }
 }

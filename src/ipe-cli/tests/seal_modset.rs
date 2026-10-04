@@ -69,6 +69,22 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
 /// items, causing E0425/E0412 at `cargo build` despite `ipe` exit 0 — a SEAL
 /// breach that the default dep-model tests cannot catch.
 fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError> {
+    // Force the vendored emit model so `#[cfg(feature = "...")]` coverage in
+    // the vendored runtime source is verified — the dep-model never exercises it.
+    let options = ipe::BuildOptions {
+        runtime_dep: false,
+        ..ipe::BuildOptions::default()
+    };
+    emit_and_build_with(name, ipe_source, options)
+}
+
+/// Like `emit_and_build` with explicit [`ipe::BuildOptions`]: the caller names
+/// the emit model (`runtime_dep`) and any project-level input (`wasm_public_env`).
+fn emit_and_build_with(
+    name: &str,
+    ipe_source: &str,
+    options: ipe::BuildOptions,
+) -> Result<(), BoxError> {
     let src_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("seal_modset_{name}_ipe"));
     let _ = std::fs::remove_dir_all(&src_dir);
@@ -85,14 +101,8 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    // Force the vendored emit model so `#[cfg(feature = "...")]` coverage in
-    // the vendored runtime source is verified — the dep-model never exercises it.
-    let options = ipe::BuildOptions {
-        runtime_dep: false,
-        ..ipe::BuildOptions::default()
-    };
     ipe::build_with_options(&entry, &out_dir, &runtime, options)
-        .map_err(|e| -> BoxError { format!("{name}: ipe build (vendored) failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{name}: ipe build failed: {e}").into() })?;
 
     e2e_support::build_rust_binary(name, &out_dir)
         .map(|_| ())
@@ -519,6 +529,51 @@ fn tui_app_vendored_builds() {
     emit_and_build_vendored("tui_app_vendored", TUI_APP).expect(
         "Tui.tea must cargo-build under the vendored emit model \
          (seal_codec must be declared in ipe_runtime/mod.rs — was E0432)",
+    );
+}
+
+/// Minimal native program reading `Env.public`: it appends the generated
+/// `env_public` module, whose native arm reads through the runtime accessor
+/// `system::read_env_var`.
+const ENV_PUBLIC: &str = "module Main exposing (main)\n\
+    import Ipe.Env as Env\n\
+    import Ipe.Io as Io\n\
+    import Ipe.Maybe as Maybe\n\
+    main = Io.println (Maybe.withDefault \"(none)\" (Env.public \"APP_MODE\"))\n";
+
+/// Emit options for [`ENV_PUBLIC`] under `runtime_dep`, allowlisting `APP_MODE`.
+fn env_public_options(runtime_dep: bool) -> ipe::BuildOptions {
+    ipe::BuildOptions {
+        runtime_dep,
+        wasm_public_env: vec!["APP_MODE".to_owned()],
+        ..ipe::BuildOptions::default()
+    }
+}
+
+/// Vendored model: `ipe_runtime/env_public.rs` reaches `system::read_env_var`
+/// as `super::system::read_env_var`, so the accessor must be `pub` and in scope.
+#[test]
+fn env_public_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_with("env_public_vendored", ENV_PUBLIC, env_public_options(false)).expect(
+        "Env.public must cargo-build under the vendored emit model \
+         (`super::system::read_env_var` must resolve from `ipe_runtime/env_public.rs`)",
+    );
+}
+
+/// Dependency model: the relocated user-crate `src/ipe_env_public.rs` reaches
+/// the accessor as `ipe_runtime::system::read_env_var` across the crate boundary,
+/// so it must be `pub` (a `pub(crate)` accessor is E0603 here).
+#[test]
+fn env_public_dep_model_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_with("env_public_dep_model", ENV_PUBLIC, env_public_options(true)).expect(
+        "Env.public must cargo-build under the dependency model \
+         (`ipe_runtime::system::read_env_var` must be public)",
     );
 }
 

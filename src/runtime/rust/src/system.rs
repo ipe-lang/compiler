@@ -39,9 +39,10 @@ pub(crate) fn env_entry_is_valid(key: &str, val: &str) -> bool {
 
 /// Read an environment variable: the overlay wins over the real environ, so a
 /// value Ipê set/removed via `System.setenv`/`unsetenv`/`loadEnv` is observed
-/// consistently. `pub(crate)` so every non-test process-env read in the crate
-/// routes through this one accessor — that is what makes the overlay authoritative
-/// for Ipê by construction. The runtime's own settings follow the overlay too:
+/// consistently. `pub` so every non-test process-env read — the runtime's own and
+/// emitted code's (`Env.public`) — routes through this one accessor, which is what
+/// makes the overlay authoritative for Ipê by construction. The runtime's own
+/// settings follow the overlay too:
 /// `NO_COLOR`, `IPE_EXPLAIN_VERBOSE`, and the debugger's `IPE_DEBUGGER_RECORD` /
 /// `IPE_DEBUGGER_REPLAY` observe a value the program wrote, not only the
 /// environment the process started with.
@@ -51,7 +52,13 @@ pub(crate) fn env_entry_is_valid(key: &str, val: &str) -> bool {
 /// by the scratch primitive behind its ownership checks, so no Ipê program or
 /// runtime path builds a temporary name from it. `System.getenv "TMPDIR"` is
 /// therefore `Err` and `getenvOr` yields its default, whatever the environ holds.
-pub(crate) fn read_env_var(key: &str) -> Result<String, std::env::VarError> {
+///
+/// # Errors
+///
+/// [`std::env::VarError::NotPresent`] when the variable is unset, tombstoned in
+/// the overlay, or a temp-root key; [`std::env::VarError::NotUnicode`] when the
+/// real value is not valid Unicode.
+pub fn read_env_var(key: &str) -> Result<String, std::env::VarError> {
     if super::scratch_core::is_temp_root_key(key) {
         return Err(std::env::VarError::NotPresent);
     }
