@@ -10,11 +10,11 @@ use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
 use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, ir_type_is_derivable};
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use ipe_ir::Program;
 
 use crate::doc::Doc;
+use crate::items::{Items, braced};
 use crate::naming::{
     field_witness_assoc_type_name, field_witness_getter_name, field_witness_trait_name,
     mangle_reserved,
@@ -729,6 +729,7 @@ fn render_fn_once_chain(
 ///     Increment,
 ///     Decrement,
 /// }
+///
 /// impl IpeStringify for MainMsg {
 ///     fn ipe_show(&self) -> String {
 ///         match self {
@@ -749,6 +750,7 @@ fn render_fn_once_chain(
 ///     Just(T1),
 ///     Nothing,
 /// }
+///
 /// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainMaybe<T1> {
 ///     fn ipe_show(&self) -> String {
 ///         match self {
@@ -881,19 +883,22 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
         String::new()
     };
     let ipe_impl_head = impl_header(&impl_bounds, "IpeStringify", &format!("{name}{use_clause}"));
-    Ok(format!(
-        "{derive_prefix}pub enum {name}{decl_clause} {{
-{variants}
-}}
-{clone_impl}{ipe_impl_head}
+    let mut items = Items::new();
+    items.push(&braced(
+        &format!("{derive_prefix}pub enum {name}{decl_clause}"),
+        &variants,
+    ));
+    items.push(&clone_impl);
+    items.push(&format!(
+        "{ipe_impl_head}
     fn ipe_show(&self) -> String {{
         match self {{
 {arms}
         }}
     }}
-}}
-"
-    ))
+}}"
+    ));
+    Ok(items.render())
 }
 
 /// Emit an enum's variant declaration lines and its `ipe_show` match arms.
@@ -1080,6 +1085,7 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 ///     x: i64,
 ///     y: i64,
 /// }
+///
 /// impl IpeStringify for RecXY {
 ///     fn ipe_show(&self) -> String {
 ///         format!("{{{} {}}}", (&ipe_runtime::stringify::Wrap(&self.x)).dispatch(), (&ipe_runtime::stringify::Wrap(&self.y)).dispatch())
@@ -1100,6 +1106,7 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 /// pub struct RecValue<T1> {
 ///     value: T1,
 /// }
+///
 /// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecValue<T1> {
 ///     ...
 /// }
@@ -1265,17 +1272,20 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
         String::new()
     };
     let ipe_impl_head = impl_header(&impl_bounds, "IpeStringify", &format!("{name}{use_clause}"));
-    Ok(format!(
-        "{derive_prefix}pub struct {name}{decl_clause} {{
-{fields_block}
-}}
-{clone_impl}{ipe_impl_head}
+    let mut items = Items::new();
+    items.push(&braced(
+        &format!("{derive_prefix}pub struct {name}{decl_clause}"),
+        &fields_block,
+    ));
+    items.push(&clone_impl);
+    items.push(&format!(
+        "{ipe_impl_head}
     fn ipe_show(&self) -> String {{
         {body}
     }}
-}}
-"
-    ))
+}}"
+    ));
+    Ok(items.render())
 }
 
 /// Every distinct field name required by any row-polymorphic function's
@@ -1341,7 +1351,7 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         return Ok(String::new());
     }
     let updated_field_names = row_updated_field_names(program);
-    let mut out = String::new();
+    let mut items = Items::new();
     for field_sym in &field_names {
         let field_name = ctx.resolve_ident(*field_sym)?.to_owned();
         let trait_name = field_witness_trait_name(&field_name);
@@ -1351,10 +1361,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         // borrowing getter. The associated type keeps the trait type-agnostic
         // so a single trait serves the field at every type it occurs at across
         // structs.
-        let _ = write!(
-            out,
-            "pub trait {trait_name} {{\n    type {assoc};\n    fn {getter}(&self) -> &Self::{assoc};\n}}\n"
-        );
+        items.push(&format!(
+            "pub trait {trait_name} {{\n    type {assoc};\n    fn {getter}(&self) -> &Self::{assoc};\n}}"
+        ));
         // Setter trait for fields that are updated in some row-poly body (G2).
         // Supertraits the getter: `IpeWithF: IpeHasF`. The setter consumes
         // `self` and returns `Self` so the `..self` rebuild in each struct impl
@@ -1364,10 +1373,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         if needs_setter {
             let setter_trait = crate::naming::field_setter_witness_trait_name(&field_name);
             let setter_method = crate::naming::field_setter_witness_method_name(&field_name);
-            let _ = write!(
-                out,
-                "pub trait {setter_trait}: {trait_name} {{\n    fn {setter_method}(self, v: Self::{assoc}) -> Self;\n}}\n"
-            );
+            items.push(&format!(
+                "pub trait {setter_trait}: {trait_name} {{\n    fn {setter_method}(self, v: Self::{assoc}) -> Self;\n}}"
+            ));
         }
         // One getter impl per registry struct carrying this field — total over
         // the struct namespace, no reachability analysis (correctness needs
@@ -1396,10 +1404,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
             };
             let struct_ty = format!("{}{use_clause}", rec.name);
             let head = impl_header(&decl_clause, &trait_name, &struct_ty);
-            let _ = write!(
-                out,
-                "{head}\n    type {assoc} = {assoc_ty};\n    fn {getter}(&self) -> &{assoc_ty} {{ &self.{ident} }}\n}}\n"
-            );
+            items.push(&format!(
+                "{head}\n    type {assoc} = {assoc_ty};\n    fn {getter}(&self) -> &{assoc_ty} {{ &self.{ident} }}\n}}"
+            ));
             // Setter impl for this (field, struct) pair when needed.
             if needs_setter {
                 let setter_trait = crate::naming::field_setter_witness_trait_name(&field_name);
@@ -1413,12 +1420,11 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
                 // struct name — it is the entire point of the impl
                 // separation.
                 let struct_name = &rec.name;
-                let _ = write!(
-                    out,
-                    "{setter_head}\n    fn {setter_method}(self, v: {assoc_ty}) -> Self {{ {struct_name}{use_clause} {{ {ident}: v, ..self }} }}\n}}\n"
-                );
+                items.push(&format!(
+                    "{setter_head}\n    fn {setter_method}(self, v: {assoc_ty}) -> Self {{ {struct_name}{use_clause} {{ {ident}: v, ..self }} }}\n}}"
+                ));
             }
         }
     }
-    Ok(out)
+    Ok(items.render())
 }
