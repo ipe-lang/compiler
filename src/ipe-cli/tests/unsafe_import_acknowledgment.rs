@@ -178,3 +178,75 @@ fn safe_program_is_unaffected() -> Result<(), Box<dyn Error>> {
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// The ceilings a spawned `ipe` build runs under: a wedged or flooding child
+/// is killed rather than hanging the suite.
+const BUILD_BOUNDS: e2e_support::BoundedRun = e2e_support::BoundedRun {
+    max_total: std::time::Duration::from_mins(20),
+    idle_window: std::time::Duration::from_mins(10),
+    out_cap: 64 * 1024 * 1024,
+};
+
+/// Run `ipe <mode> build <project>/package.ipe --out <project>/out` with stdin
+/// closed (never a terminal), returning (success, stderr).
+fn spawn_build(mode: &str, dir: &std::path::Path) -> Result<(bool, String), Box<dyn Error>> {
+    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    cmd.args([mode, "build"])
+        .arg(dir.join("package.ipe"))
+        .arg("--out")
+        .arg(dir.join("out"))
+        .current_dir(dir)
+        .env(
+            "IPE_RUNTIME_DIR",
+            e2e_support::require_runtime().into_path_buf(),
+        )
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null());
+    let out = e2e_support::run_bounded(cmd, BUILD_BOUNDS)?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// `ipe dev build` checks no capability: an unsafe-importing program builds
+/// with stdin closed and no manifest acceptance, and no consent refusal is
+/// printed.
+#[test]
+fn dev_build_asks_no_consent() -> Result<(), Box<dyn Error>> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    let dir = scratch_project("devnoconsent", UNSAFE_MAIN)?;
+    let (ok, stderr) = spawn_build("dev", &dir)?;
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "a dev build of an unsafe-importing program succeeds:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("S0001"),
+        "a dev build asks no consent:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe release build` still gates the same program: with stdin closed and no
+/// manifest acceptance it fails closed with the consent refusal, before any
+/// cargo build.
+#[test]
+fn release_build_still_asks_consent() -> Result<(), Box<dyn Error>> {
+    let dir = scratch_project("releaseconsent", UNSAFE_MAIN)?;
+    let (ok, stderr) = spawn_build("release", &dir)?;
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !ok,
+        "a headless release build without consent fails:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S0001") && stderr.contains("Ipe.Html.Unsafe"),
+        "the release refusal is the consent gate naming the module:\n{stderr}"
+    );
+    Ok(())
+}

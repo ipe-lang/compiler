@@ -240,23 +240,63 @@ pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> 
 /// # Errors
 ///
 /// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim or
-/// holds a symlink on the way; [`CliError::Io`] on any filesystem failure.
+/// holds a symlink on the way; [`CliError::Io`] on any filesystem failure;
+/// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
 pub fn write_build_artifacts(
     crate_dir: &crate::output_dir::OwnedDir,
     profile: &SandboxProfile,
 ) -> Result<(), CliError> {
-    // 1. The ipe.profile mirror.
     crate_dir
         .path_to("ipe.profile")?
         .write(profile.to_profile_string().as_bytes())?;
+    embed_floor(
+        crate_dir,
+        &capfloor_static_source(profile, FloorIntent::Release),
+    )
+}
 
-    // 2. Embed the capfloor into the emitted main.rs: a `#[used]` static holding
-    //    the floor bytes, PLUS a `black_box` read of it at the top of `fn main`
-    //    so the linker genuinely retains the bytes (a mere `#[used]` is
-    //    garbage-collected by an aggressive linker like `mold`, and `strip`
-    //    removes the unreferenced data). The read keeps the bytes in `.rodata`,
-    //    where `strip` cannot touch them; `ipe release run` scans them out passively.
-    //    Idempotent: a re-build replaces any prior floor block + reference.
+/// Embed the development marker into an emitted `ipe dev` crate: a constant,
+/// maximally isolated floor whose intent is [`FloorIntent::Development`].
+///
+/// A dev build infers no capabilities and writes no `ipe.profile`. The marker
+/// makes a release reader refuse the binary as a development build
+/// ([`FloorRefusal::NotRelease`], which names the remedy). It also closes the
+/// self-attested grant: [`run_jail::scan_capfloor`] reads a binary as a
+/// release build only when every floor line in it names release, so a
+/// release-shaped line the program carries in its own data never stands alone.
+///
+/// # Errors
+///
+/// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim or
+/// holds a symlink on the way; [`CliError::Io`] on any filesystem failure;
+/// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
+pub fn write_dev_floor_marker(crate_dir: &crate::output_dir::OwnedDir) -> Result<(), CliError> {
+    embed_floor(
+        crate_dir,
+        &capfloor_static_source(
+            &SandboxProfile::maximally_isolated(),
+            FloorIntent::Development,
+        ),
+    )
+}
+
+/// Append `floor_static` to the emitted `src/main.rs`, with a `black_box` read
+/// of it at the top of `fn main`.
+///
+/// A mere `#[used]` static is garbage-collected by an aggressive linker like
+/// `mold`, and `strip` removes unreferenced data; the read keeps the bytes in
+/// `.rodata`, where `strip` cannot touch them and `ipe release run` scans them
+/// out passively. Idempotent: any prior floor block and reference are replaced.
+///
+/// # Errors
+///
+/// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim or
+/// holds a symlink on the way; [`CliError::Io`] on any filesystem failure;
+/// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
+fn embed_floor(
+    crate_dir: &crate::output_dir::OwnedDir,
+    floor_static: &str,
+) -> Result<(), CliError> {
     let main_rs = crate_dir.path_to(Path::new("src").join("main.rs"))?;
     let existing = crate::io_bounded::read_to_string_capped(
         &main_rs.path(),
@@ -264,10 +304,7 @@ pub fn write_build_artifacts(
     )?;
     let base = strip_capfloor_block(&existing);
     let referenced = inject_floor_reference(&base)?;
-    let with_floor = format!(
-        "{referenced}{}",
-        capfloor_static_source(profile, FloorIntent::Release)
-    );
+    let with_floor = format!("{referenced}{floor_static}");
     main_rs.write(with_floor.as_bytes())
 }
 

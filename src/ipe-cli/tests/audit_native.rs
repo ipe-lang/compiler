@@ -1512,4 +1512,105 @@ mod real_jail {
             "the refusal names the remedy:\nstderr:\n{stderr}"
         );
     }
+
+    /// Build `main_src` with the real `ipe dev build` and lay its binary out as
+    /// a bundle's `ipe-app`, beside a maximally isolated `ipe.profile` (a
+    /// profile every floor admits) and the stub wrapper.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn dev_built_bundle(base: &std::path::Path, main_src: &str) -> PathBuf {
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let entry = project.join("Main.ipe");
+        std::fs::write(&entry, main_src).expect("Main.ipe");
+        let out = base.join("out");
+        let mut cmd = std::process::Command::new(super::support::ipe_bin());
+        cmd.args(["dev", "build"])
+            .arg(&entry)
+            .arg("--out")
+            .arg(&out)
+            .current_dir(&project)
+            .env(
+                "IPE_RUNTIME_DIR",
+                e2e_support::require_runtime().into_path_buf(),
+            )
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        let built = super::run_child(cmd).expect("run ipe dev build");
+        assert!(
+            built.status.success(),
+            "the dev build succeeds:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let (dir, _) = floor_bundle(base, &[]);
+        std::fs::copy(out.join("bin").join("ipe-app"), dir.join("ipe-app"))
+            .expect("the dev build's binary becomes the bundle's app");
+        std::fs::write(
+            dir.join("ipe.profile"),
+            SandboxProfile::maximally_isolated().to_profile_string(),
+        )
+        .expect("profile");
+        dir
+    }
+
+    /// `ipe release run` refuses a real `ipe dev build` artifact as a
+    /// development build: the linked binary keeps the development marker.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_real_dev_build() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-real-dev-build");
+        let dir = dev_built_bundle(
+            &base,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"started\"\n",
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("started"),
+            "a dev build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("built by `ipe dev build`") && stderr.contains("ipe release build"),
+            "the refusal names the development build and the remedy:\nstderr:\n{stderr}"
+        );
+    }
+
+    /// A dev build whose program data holds a release-shaped floor line is
+    /// still refused: the embedded development marker outvotes the forged
+    /// line, so a string literal cannot pass a dev build off as a release one.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_dev_binary_with_forged_release_literal() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-forged-dev-build");
+        let dir = dev_built_bundle(
+            &base,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    \
+             Io.println \"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\\n\"\n",
+        );
+        let app = std::fs::read(dir.join("ipe-app")).expect("read the app");
+        assert!(
+            app.windows(b"intent=release".len())
+                .any(|w| w == b"intent=release"),
+            "the forged release line is in the linked binary (control)"
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("ipe-capfloor"),
+            "a forged release literal never runs a dev build:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("built by `ipe dev build`"),
+            "the refusal names the development build:\nstderr:\n{stderr}"
+        );
+    }
 }

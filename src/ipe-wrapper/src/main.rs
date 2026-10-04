@@ -530,8 +530,7 @@ mod tests {
         assert_eq!(verify_release_floor(&profile, &release), Ok(()));
     }
 
-    /// The release wrapper refuses an app that embeds no floor, which every
-    /// `ipe dev` build is.
+    /// The release wrapper refuses an app that embeds no floor marker.
     #[test]
     fn verify_release_floor_refuses_a_floorless_binary() {
         let profile = net_profile();

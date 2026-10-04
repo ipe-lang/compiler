@@ -1869,7 +1869,7 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe dev build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+the emitted `fn main` anchor is absent, so the embedded capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
 
 ## run-profile-unparsable
 
@@ -1877,7 +1877,7 @@ ipe dev build: the emitted `fn main` anchor is absent, so the capability floor c
 
 ## run-floor-unreadable
 
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
+{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified: rebuild it with `ipe release build`
 
 ## run-floor-not-release
 

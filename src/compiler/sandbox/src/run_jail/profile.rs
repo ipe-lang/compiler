@@ -337,7 +337,8 @@ impl std::fmt::Display for FloorRefusal {
             Self::Unreadable => write!(
                 f,
                 "{}: the binary embeds no readable capability floor — refusing to run an \
-                 artifact whose confinement cannot be verified",
+                 artifact whose confinement cannot be verified: rebuild it with \
+                 `ipe release build`",
                 code.as_str()
             ),
             Self::NotRelease => write!(

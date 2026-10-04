@@ -32,9 +32,10 @@ path = "src/bin/gen_cli_docs.rs"
 signing = ["dep:sigstore", "dep:sigstore_protobuf_specs", "dep:pki_types"]
 
 # `ipe dev run --target wasi` executes the emitted `wasm32-wasip1` module in an
-# EMBEDDED wasmtime engine (never an external `wasmtime` binary), so the WASI
-# context is built by us from the program's declared capability floor — the
-# SAME deny-by-default model as the native run jail. wasmtime is a large
+# EMBEDDED wasmtime engine (never an external `wasmtime` binary). A dev run
+# checks no capabilities: the WASI context grants ambient authority (the
+# inherited environment, the network, the working directory read-write) and
+# keeps only the memory and epoch ceilings. wasmtime is a large
 # dependency (a full wasm engine + the preview1 WASI shim), so it sits behind
 # this feature, OFF by default so an ordinary dev/test `ipe` build stays lean
 # and ON for release packaging. With the feature off `ipe dev run --target wasi`

@@ -929,11 +929,12 @@ pub struct NativeBuild {
 
 /// The posture a native crate is finished in.
 ///
-/// A development build carries no capability floor and no profile. A release
-/// build lowers its consented capabilities to the floor it embeds, so a floor
-/// exists only behind a [`ConsentedCapabilities`] witness.
+/// A development build embeds only the constant development marker and writes
+/// no profile, so every release reader refuses it. A release build lowers its
+/// consented capabilities to the floor it embeds, so a release floor exists
+/// only behind a [`ConsentedCapabilities`] witness.
 enum NativeFinish<'a> {
-    /// `ipe dev`: no floor, no profile, a debug build.
+    /// `ipe dev`: the development marker, no profile, a debug build.
     Dev,
     /// `ipe release`: the consented capabilities' profile and release floor are
     /// written before an optimised build.
@@ -953,8 +954,8 @@ struct FlooredBuild<'a> {
     /// The emitted crate, both floored and built.
     crate_dir: &'a OwnedDir,
     /// The posture: it decides the floor and picks the cargo profile, so a
-    /// release floor is never built as a debug binary and a dev build never
-    /// carries one.
+    /// release floor is never built as a debug binary and a dev build carries
+    /// only the development marker.
     finish: NativeFinish<'a>,
     /// The compile target.
     target: CargoTarget,
@@ -970,14 +971,19 @@ impl FlooredBuild<'_> {
     /// Run cargo in the build's posture. A release build first writes the
     /// `ipe.profile` mirror and the embedded floor, so the binary cargo
     /// produces carries exactly this build's floor — never none and never a
-    /// stale one left by an earlier build.
+    /// stale one left by an earlier build. A dev build first embeds the
+    /// constant development marker, with no capability inference.
     ///
     /// # Errors
     /// The errors of [`run_sandbox::build_profile`],
-    /// [`run_sandbox::write_build_artifacts`] and [`CargoBuild::run`].
+    /// [`run_sandbox::write_build_artifacts`],
+    /// [`run_sandbox::write_dev_floor_marker`] and [`CargoBuild::run`].
     fn run(self) -> Result<String, CliError> {
         let profile = match self.finish {
-            NativeFinish::Dev => CargoProfile::Dev,
+            NativeFinish::Dev => {
+                run_sandbox::write_dev_floor_marker(self.crate_dir)?;
+                CargoProfile::Dev
+            }
             NativeFinish::Release { consented, driver } => {
                 let floor = run_sandbox::build_profile(consented.resolved(), driver)?;
                 run_sandbox::write_build_artifacts(self.crate_dir, &floor)?;
@@ -1008,8 +1014,8 @@ impl FlooredBuild<'_> {
 /// `.cargo/config.toml` is discovered; a static plan additionally selects the
 /// target triple explicitly.
 ///
-/// A dev artifact carries no capability floor and no profile, so a release
-/// run refuses it.
+/// A dev artifact carries only the development marker and no profile, so a
+/// release run refuses it as a development build.
 ///
 /// Returns the path the built binary was copied to under the project
 /// (`<project>/out/bin/<name>`), so the artifact is findable regardless of a
@@ -2401,9 +2407,9 @@ pub fn gate_session(
 /// FFI: foreign code's effects are not proven to replay deterministically.
 ///
 /// # Errors
-/// [`CliError::Usage`] when `ffi` is [`ffi::FfiPresence::Present`].
-pub fn gate_session_ffi(flag: &str, ffi: ffi::FfiPresence) -> Result<(), CliError> {
-    match ffi {
+/// [`CliError::Usage`] when `presence` is [`ffi::FfiPresence::Present`].
+pub fn gate_session_ffi(flag: &str, presence: ffi::FfiPresence) -> Result<(), CliError> {
+    match presence {
         ffi::FfiPresence::Absent => Ok(()),
         ffi::FfiPresence::Present => Err(CliError::Usage(text::msg::session_ffi_unproven(&flag))),
     }
@@ -4352,16 +4358,22 @@ mod held_crate_tests {
         }
     }
 
-    /// A dev build writes no floor and no profile: cargo is handed the emitted
-    /// `main.rs` untouched, so the artifact carries nothing a release run could
-    /// mistake for a release floor.
+    /// A dev build embeds the constant development marker and no release floor,
+    /// and writes no profile: cargo is handed a `main.rs` whose only floor line
+    /// names development, so a release reader refuses the artifact as a
+    /// development build even when the program's own data holds a
+    /// release-shaped line.
     /// Runs in the Linux `test` CI job.
     #[test]
-    fn the_dev_build_embeds_no_floor() {
+    fn the_dev_build_embeds_a_development_marker_and_no_release_floor() {
         use super::{NativeBuild, compile_and_finalize_native_build};
         use crate::output_dir::{OutputRoot, ProjectPaths};
+        use crate::run_sandbox;
+        use ipe_sandbox::run_jail::{
+            FloorIntent, FloorRefusal, SandboxProfile, scan_capfloor, verify_release_floor,
+        };
 
-        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("dev-no-floor");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("dev-marker");
         let project = base.join("project");
         std::fs::create_dir_all(&project).expect("project dir");
         let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
@@ -4379,13 +4391,43 @@ mod held_crate_tests {
         );
         assert!(built.is_err(), "the stub fails the build: {built:?}");
         let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        let isolated = SandboxProfile::maximally_isolated();
+        let marker = run_sandbox::capfloor_static_source(&isolated, FloorIntent::Development);
         assert!(
-            !handed.contains("IPE_CAPABILITY_FLOOR") && !handed.contains("ipe-capfloor"),
-            "a dev build carries no capability floor:\n{handed}"
+            handed.contains(&marker)
+                && handed.contains("std::hint::black_box(&IPE_CAPABILITY_FLOOR)"),
+            "a dev build embeds the retained development marker:\n{handed}"
+        );
+        assert_eq!(
+            handed.matches("IPE_CAPABILITY_FLOOR:").count(),
+            1,
+            "a dev build embeds exactly one floor static:\n{handed}"
+        );
+        assert!(
+            !handed.contains(&run_sandbox::capfloor_static_source(
+                &isolated,
+                FloorIntent::Release
+            )),
+            "a dev build never carries a release floor:\n{handed}"
         );
         assert!(
             !crate_dir.path().join("ipe.profile").exists(),
             "a dev build writes no profile"
+        );
+        // The marker's bytes, beside a forged release line the program could
+        // carry as a string literal, still read as a development build.
+        let mut binary = isolated
+            .to_capfloor_line(FloorIntent::Development)
+            .into_bytes();
+        binary.push(b'\n');
+        binary.extend_from_slice(b"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\n");
+        assert_eq!(
+            scan_capfloor(&binary).map(|floor| floor.intent),
+            Some(FloorIntent::Development)
+        );
+        assert_eq!(
+            verify_release_floor(&isolated, &binary),
+            Err(FloorRefusal::NotRelease)
         );
         let args = std::fs::read_to_string(&seen_args).expect("cargo arguments");
         assert!(

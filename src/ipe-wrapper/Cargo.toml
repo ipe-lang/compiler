@@ -18,6 +18,8 @@ ipe_env = { path = "../compiler/env" }
 
 [dev-dependencies]
 ipe_kernels = { path = "../compiler/kernels" }
+# The run-time `CARGO_BIN_EXE_ipe-wrapper` the bundle refusal test resolves.
+ipe_env = { path = "../compiler/env" }
 
 [lints]
 workspace = true

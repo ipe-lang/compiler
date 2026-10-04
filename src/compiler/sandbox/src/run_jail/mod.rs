@@ -1902,8 +1902,9 @@ mod tests {
         );
     }
 
-    /// An `ipe dev` build embeds no floor: the release reader refuses it as
-    /// unreadable, whatever profile it is offered.
+    /// A binary with no floor marker (a foreign or hand-built app) is refused
+    /// as unreadable, whatever profile it is offered, and the refusal names
+    /// the remedy.
     #[test]
     fn verify_release_floor_refuses_a_floorless_binary() {
         let floorless: &[u8] = b"\x7fELF\x02\x01\x01\0fn main() {}\0";
@@ -1928,6 +1929,12 @@ mod tests {
                 .to_string()
                 .contains("embeds no readable capability floor"),
             "the refusal names why"
+        );
+        assert!(
+            FloorRefusal::Unreadable
+                .to_string()
+                .ends_with("rebuild it with `ipe release build`"),
+            "the refusal names the remedy"
         );
     }
 
