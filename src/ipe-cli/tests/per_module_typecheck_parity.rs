@@ -377,7 +377,7 @@ const MSG_LIB_TYPED: &str = "module Lib exposing (sharedRow)\n\n\
 /// An exported message-only UI slot refuses the scoped path for its module
 /// and every importer, and the fallback still agrees with the joint solve.
 #[test]
-fn importer_pinnable_msg_slot_refuses_scoped_path() {
+fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
     let lib: &[&str] = &["Lib"];
     let main: &[&str] = &["Main"];
     for (label, lib_src) in [("untyped", MSG_LIB_UNTYPED), ("typed", MSG_LIB_TYPED)] {
@@ -391,14 +391,9 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() {
                 .find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied()))
                 .map(|(_, f)| *f)
         };
-        let (lib_file, main_file) = (file_at(lib), file_at(main));
-        assert!(
-            lib_file.is_some() && main_file.is_some(),
-            "[{label}] fixture must carry Lib and Main"
-        );
-        let (Some(lib_file), Some(main_file)) = (lib_file, main_file) else {
-            return;
-        };
+        let lib_file = file_at(lib).ok_or_else(|| format!("[{label}] fixture must carry Lib"))?;
+        let main_file =
+            file_at(main).ok_or_else(|| format!("[{label}] fixture must carry Main"))?;
         assert!(
             ipe_db::typecheck(&db, root, main_file).is_ok(),
             "[{label}] program must type-check"
@@ -441,4 +436,5 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() {
             "[{label}] parity sweep and engaged set disagree"
         );
     }
+    Ok(())
 }

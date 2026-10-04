@@ -8145,37 +8145,38 @@ mod canonicalize_tests {
         let [a, b] = syms(["A", "B"])?;
         assert!(a < b, "the ordering below relies on interning order");
         let mut types = empty();
+        let doc_warning = Diagnostic::Parse {
+            span: Span { lo: 0, hi: 2 },
+            msg: ParseError::DocOnUnexported { name: "f".into() },
+        };
+        let doc_code = doc_warning.code();
+        let redundant_code = redundant(0, 1).code();
+        assert_ne!(doc_code, redundant_code, "the tie-break needs two codes");
         types.warnings = vec![
             warning(redundant(0, 1), b)?,
             warning(redundant(5, 6), a)?,
             warning(redundant(0, 9), a)?,
             warning(redundant(0, 2), a)?,
-            warning(
-                Diagnostic::Parse {
-                    span: Span { lo: 0, hi: 2 },
-                    msg: ParseError::DocOnUnexported { name: "f".into() },
-                },
-                a,
-            )?,
+            warning(doc_warning, a)?,
         ];
         let canonical = run(types, VarScope::Program, VarCeiling::SOLVER)?;
-        let order: Vec<(Symbol, u32, u32, &str)> = canonical
+        let order: Vec<_> = canonical
             .warnings
             .iter()
             .map(|w| {
                 let span = w.diagnostic().primary_span();
                 let home = w.home().first().copied().unwrap_or(a);
-                (home, span.lo, span.hi, w.diagnostic().code().as_str())
+                (home, span.lo, span.hi, w.diagnostic().code())
             })
             .collect();
         assert_eq!(
             order,
             vec![
-                (a, 0, 2, "IPE-P0066"),
-                (a, 0, 2, "IPE-T0011"),
-                (a, 0, 9, "IPE-T0011"),
-                (a, 5, 6, "IPE-T0011"),
-                (b, 0, 1, "IPE-T0011"),
+                (a, 0, 2, doc_code),
+                (a, 0, 2, redundant_code),
+                (a, 0, 9, redundant_code),
+                (a, 5, 6, redundant_code),
+                (b, 0, 1, redundant_code),
             ]
         );
         Ok(())
