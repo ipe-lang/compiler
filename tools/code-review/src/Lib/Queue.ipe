@@ -17,7 +17,7 @@ import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings exposing (IndexSettings)
+import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
 
 
 -- A pending unit plus its resurfacing state. `changed` is Just the previous
@@ -302,12 +302,12 @@ historyStatusText state =
 -- One History page from `cursor`, newest first, each row with the unit's
 -- qualified name resolved from the index db named by `settings`. At most
 -- `LibDb.historyPageSize` rows are read, and one name lookup runs per row.
-loadHistoryPage : IndexSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
+loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
 loadHistoryPage settings cursor =
     do
-        db <- LibDb.open
+        db <- LibDb.openAt settings.review
         page <- LibDb.historyPage db LibDb.historyPageSize cursor
-        conn <- Index.readConnection settings
+        conn <- Index.readConnection settings.index
         rows <- Task.sequence (List.map (historyRow conn) page.rows)
         Task.succeed { rows = rows, at = cursor, next = page.next }
 
@@ -696,14 +696,14 @@ pageHeaderText page =
 -- The page also carries the whole-queue count, the database size and the
 -- review progress. Progress is read first, so a rebuild of the `reviewed`
 -- copy that drains an undrained decided pair is already reflected in the
--- page's rows and count. The index settings are the value resolved at startup
--- and every index read runs on the one read connection opened from them.
-loadPage : IndexSettings -> Index.Cursor -> Task.Task Error QueuePage
+-- page's rows and count. The settings are the value resolved at startup and
+-- every index read runs on the one read connection opened from them.
+loadPage : AppSettings -> Index.Cursor -> Task.Task Error QueuePage
 loadPage settings cursor =
     do
-        conn <- Index.readConnection settings
-        db <- LibDb.open
-        progress <- currentProgress settings conn db
+        conn <- Index.readConnection settings.index
+        db <- LibDb.openAt settings.review
+        progress <- currentProgress settings.index conn db
         rows <- Index.loadPendingPage conn cursor
         total <- Index.countPending conn
         bytes <- Index.dbBytes conn
@@ -711,7 +711,7 @@ loadPage settings cursor =
         Task.succeed
             { units = units
             , total = total
-            , dbName = SafeText.renderForeign (Settings.dbFileName settings.db)
+            , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
             , dbBytes = bytes
             , next = nextCursor rows
             , progress = progress
@@ -721,9 +721,9 @@ loadPage settings cursor =
 -- A decided unit drained from the index queue, then the queue page at
 -- `cursor` reloaded. The drain writes the index alone: the review database
 -- already holds the decision, so nothing is written to it here.
-drainThenLoad : IndexSettings -> Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
+drainThenLoad : AppSettings -> Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
 drainThenLoad settings attested cursor =
-    Index.drainUnit settings attested |> Task.andThen (\_ -> loadPage settings cursor)
+    Index.drainUnit settings.index attested |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.

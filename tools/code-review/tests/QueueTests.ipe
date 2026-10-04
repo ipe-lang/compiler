@@ -60,6 +60,8 @@ import TestSupport exposing
     , loadUnitNow
     , decideNow
     , envSettings
+    , envReview
+    , envAppSettings
     , loadPageNow
     , drainThenLoadNow
     , loadUnitViewNow
@@ -1223,18 +1225,25 @@ pageReadsStartupSettings =
         seedIndex at.indexDb at.repo
         System.setenv "IPE_REVIEW_DB" at.reviewDb
         migratedReviewAt at.reviewDb
-        startup <- envSettings
+        startup <- envAppSettings
         before <- Queue.loadPage startup Index.Start
         removeFileIfAny (at.repo ++ "/src/Lib.rs")
         removeFileIfAny (at.repo ++ "/src/Main.ipe")
         setIndexEnv (at.indexDb ++ ".gone") (at.repo ++ "/gone")
+        System.setenv "IPE_REVIEW_DB" "sqlite:review.db"
         reparsedRefused <- envSettings |> Task.map (\_ -> False) |> Task.onError (\_ -> Task.succeed True)
+        reviewRefused <- envReview |> Task.map (\_ -> False) |> Task.onError (\_ -> Task.succeed True)
         after <- Queue.loadPage startup Index.Start
+        history <- Queue.loadHistoryPage startup LibDb.HistoryStart
         setIndexEnv at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed
             (reparsedRefused
+                && reviewRefused
+                && List.length history.rows
+                == 0
                 && List.length after.units
                 == List.length before.units
                 && after.total
