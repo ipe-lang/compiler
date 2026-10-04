@@ -2260,3 +2260,37 @@ mod listen_scope_tests {
         }
     }
 }
+
+/// Runs one ignored test of this test binary as a child process holding a
+/// given `IPE_WEB_FRAME_ANCESTORS`, so the process-wide parse is made under
+/// that value and no other test of the parent can have made it first.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod frame_ancestors_child {
+    /// Printed by a child test once it has observed the startup refusal.
+    pub(crate) const REFUSED: &str = "frame-ancestors startup refusal observed";
+
+    /// Run the ignored test `name` of `module` (a `module_path!()`) with
+    /// `IPE_WEB_FRAME_ANCESTORS` set to `raw`. `true` when the child exited 0
+    /// having printed [`REFUSED`]; the child's stdout comes back for the report.
+    #[allow(clippy::expect_used)] // test helper: a test binary that cannot re-run itself is an environment issue
+    pub(crate) fn refused(module: &str, name: &str, raw: &str) -> (bool, String) {
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::{name}");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(super::FRAME_ANCESTORS_ENV, raw)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let ran = out.status.success();
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        (ran && stdout.contains(REFUSED), stdout)
+    }
+}

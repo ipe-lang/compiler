@@ -1703,8 +1703,19 @@ fn with_page_headers(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
 ) -> axum::response::Response {
+    with_page_headers_checked(resp, cookies, csrf::security_headers())
+}
+
+/// [`with_page_headers`] over the outcome of reading the security headers: a
+/// refused framing policy answers `500` with no cookie and no header set.
+#[cfg(feature = "server")]
+fn with_page_headers_checked(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Ok(security) = csrf::security_headers() else {
+    let Ok(security) = security else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     with_page_headers_from(resp, cookies, security)
@@ -1738,7 +1749,7 @@ fn with_page_headers_from(
 #[cfg(test)]
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 mod page_headers_tests {
-    use super::with_page_headers_from;
+    use super::{with_page_headers_checked, with_page_headers_from};
     use crate::server::SetCookie;
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
@@ -1787,6 +1798,23 @@ mod page_headers_tests {
         let resp = with_page_headers_from(ok(), &[&session], csp);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(resp.headers().get("content-security-policy").is_none());
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: the page ships neither
+    /// its cookies nor a header set missing the framing policy.
+    #[test]
+    fn page_headers_refuse_a_refused_framing_policy() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let resp = with_page_headers_checked(
+            ok(),
+            &[&session],
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-frame-options").is_none());
+        let framed = with_page_headers_checked(ok(), &[&session], Ok(framing()));
+        assert_eq!(framed.status(), StatusCode::OK);
     }
 }
 
@@ -9299,6 +9327,53 @@ mod emitted_router_behavior_tests {
                 "{name}={raw:?} must refuse the router, got {refused:?}"
             );
         }
+    }
+
+    /// The router refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation at startup. The value is read once per
+    /// process, so the check runs in a child holding it.
+    #[test]
+    fn an_unrepresentable_frame_ancestors_refuses_the_router() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "router_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `an_unrepresentable_frame_ancestors_refuses_the_router`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by an_unrepresentable_frame_ancestors_refuses_the_router"]
+    async fn router_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        let refused = build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err();
+        assert!(
+            matches!(
+                refused,
+                Some(StartupRefusal::FrameAncestors(
+                    crate::telemetry::FrameAncestorsRefusal::DirectiveSeparator
+                ))
+            ),
+            "a `;` must refuse the router, got {refused:?}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
     }
 
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────

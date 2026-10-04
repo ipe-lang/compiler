@@ -498,8 +498,8 @@ fn reissue_set_cookie_with(
     slide_window_secs: u64,
     secure: bool,
 ) -> SetCookie {
-    // Frame-ancestors (CSP embedding) is a web-surface concept; a server-only
-    // program cannot be framed, so `SameSite=Lax` is the fail-closed default.
+    // A server-only program has no double-submit CSRF check, so its session
+    // cookie stays `SameSite=Lax` even when `frame-ancestors` admits embedding.
     #[cfg(feature = "web")]
     let embeddable = crate::web::csrf::frame_ancestors().is_some();
     #[cfg(not(feature = "web"))]
@@ -1369,6 +1369,7 @@ fn strict_serve_dir_with(
 }
 
 /// Add the decoded cookies of one request's jar to `out`; the first value of a name wins.
+#[cfg(test)]
 fn parse_cookies<'a, I>(jar: I, out: &mut HashMap<String, String>)
 where
     I: IntoIterator<Item = &'a [u8]>,
@@ -1419,14 +1420,11 @@ async fn build_request(
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
     // Read from the raw bytes of every `Cookie` header, outside the text gate
-    // below, so one pair with a non-ASCII byte drops only itself.
-    parse_cookies(
-        req.headers()
-            .get_all(axum::http::header::COOKIE)
-            .iter()
-            .map(axum::http::HeaderValue::as_bytes),
-        &mut cookies,
-    );
+    // below, so one pair with a non-ASCII byte drops only itself. The first
+    // value of a name wins.
+    for (name, value) in request_cookie_jar(req.headers()) {
+        cookies.entry(name).or_insert(value);
+    }
     for (k, v) in req.headers() {
         if let Ok(s) = v.to_str() {
             // Store under  canonical MIME casing (`content-type` ->
@@ -1526,6 +1524,14 @@ async fn build_request(
 }
 
 fn to_axum_response(r: ServerResponse) -> axum::response::Response {
+    to_axum_response_with(r, crate::telemetry::security_headers())
+}
+
+/// [`to_axum_response`] over the outcome of reading the security headers.
+fn to_axum_response_with(
+    r: ServerResponse,
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     // Ipe.Http.Server.Stream: a streaming response carries a sentinel body the
     // handler stashed via ServerStream.stream. Detect it + serve the chunked
@@ -1578,7 +1584,7 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     // env/static (no request-derived strings → no header-injection surface).
     // A refused framing policy answers 500: `Server.listen` refuses to start on
     // it, and this second check keeps a response from ever shipping without it.
-    let Ok(security) = crate::telemetry::security_headers() else {
+    let Ok(security) = security else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     for (name, value) in security {
@@ -3414,6 +3420,47 @@ mod tests {
         );
     }
 
+    /// The listener refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation before it binds. The value is read
+    /// once per process, so the check runs in a child holding it.
+    #[test]
+    fn listen_refuses_an_unrepresentable_frame_ancestors() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "listen_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `listen_refuses_an_unrepresentable_frame_ancestors`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by listen_refuses_an_unrepresentable_frame_ancestors"]
+    async fn listen_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        // A listener that got past the refusal would bind and serve forever;
+        // the timeout turns that regression into a failure instead of a hang.
+        let listened: IpeResult<String, ()> = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server_listen(0, Vec::new()),
+        )
+        .await
+        .expect("a refused framing policy must return before binding, not serve");
+        let IpeResult::Err(msg) = listened else {
+            panic!("a `;` in IPE_WEB_FRAME_ANCESTORS must refuse the listener");
+        };
+        assert!(
+            msg.starts_with("Server.listen: IPE_WEB_FRAME_ANCESTORS holds `;`"),
+            "{msg}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
+    }
+
     #[test]
     fn server_header_is_case_insensitive_go_parity() {
         let mut headers = HashMap::new();
@@ -4782,6 +4829,49 @@ mod tests {
             Some("a;b".to_owned())
         );
         assert_eq!(request_cookie(&headers, &parsed_name("ipe%5Fsid")), None);
+    }
+
+    /// A lookup reads the session cookie beside a pair with a non-ASCII byte.
+    #[test]
+    fn request_cookie_reads_beside_a_non_ascii_pair() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"x=\x80; ipe_sid=real")
+                .expect("obs-text is a valid header value"),
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("ipe_sid")),
+            Some("real".to_owned())
+        );
+        assert_eq!(request_cookie(&headers, &parsed_name("x")), None);
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: no response ships with
+    /// a header set missing its framing policy.
+    #[test]
+    fn response_refuses_a_refused_framing_policy() {
+        let refused = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(refused.headers().get("x-frame-options").is_none());
+        let framed = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Ok(vec![("x-frame-options", "SAMEORIGIN".to_owned())]),
+        );
+        assert_eq!(framed.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            framed
+                .headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("SAMEORIGIN")
+        );
     }
 
     /// The `InvalidInput` message of a refused `Server.withHeader`, or `None`
