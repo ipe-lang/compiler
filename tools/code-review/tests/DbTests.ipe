@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
@@ -29,59 +29,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , onFreshReview
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , migratedReviewAt
-    , tableNames
-    , attestedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -92,7 +40,6 @@ removeReviewFiles dbPath =
         removeFileIfAny (dbPath ++ "-shm")
 
 
-
 -- After `probe` the review database holds the review table and the
 -- migrations table, nothing else: no write-only table outlives its last
 -- reader. A second `probe` on the same file is a no-op. Red while the
@@ -100,7 +47,6 @@ removeReviewFiles dbPath =
 drainCursorGoneAfterMigrate : Task.Task Error Bool
 drainCursorGoneAfterMigrate =
     freshDir "ipe-review-table-set" |> Task.andThen drainCursorGoneAfterMigrateIn
-
 
 
 drainCursorGoneAfterMigrateIn : String -> Task.Task Error Bool
@@ -119,7 +65,6 @@ drainCursorGoneAfterMigrateIn base =
         Task.succeed (tables == [ "_ipe_migrations", "review" ])
 
 
-
 -- `LibDb.openAt` never migrates: on a review file that `probe` never ran on,
 -- the next read is a typed error and no table is created. A review file
 -- deleted under a running server is therefore never silently re-created
@@ -127,7 +72,6 @@ drainCursorGoneAfterMigrateIn base =
 openDoesNotMigrate : Task.Task Error Bool
 openDoesNotMigrate =
     freshDir "ipe-review-open-no-migrate" |> Task.andThen openDoesNotMigrateIn
-
 
 
 openDoesNotMigrateIn : String -> Task.Task Error Bool
@@ -138,14 +82,12 @@ openDoesNotMigrateIn base =
     in
     do
         db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
-        readFailed <-
-            LibDb.findDecision db "u-a" "h"
-                |> Task.map (\_ -> False)
-                |> Task.onError (\_ -> Task.succeed True)
+        readFailed <- LibDb.findDecision db "u-a" "h"
+            |> Task.map (\_ -> False)
+            |> Task.onError (\_ -> Task.succeed True)
         created <- tableExists db "review"
         removeReviewFiles dbPath
         Task.succeed (readFailed && not created)
-
 
 
 -- A second decision on the same attested pair is a no-op: one row, the
@@ -165,7 +107,6 @@ duplicateInsertIsNoop =
         )
 
 
-
 -- Re-reviewing the same pair must succeed (any Err here fails
 -- the check loudly) and must keep the first decision.
 isApproved : Maybe LibDb.ReviewRow -> Bool
@@ -183,17 +124,14 @@ isApproved m =
                     False
 
 
-
 shortHashShown : String -> String
 shortHashShown stored =
     SafeText.toString (Index.shortHash stored)
 
 
-
 reasonShown : LibDb.Reason -> String
 reasonShown reason =
     SafeText.toString (LibDb.reasonText reason)
-
 
 
 -- `parseReason` is the only way to a refusal: blank and over-long reasons
@@ -223,21 +161,19 @@ reasonBounded db =
                 && rejected (atBound ++ "x")
                 && rejected (atBound ++ atBound)
                 && (case LibDb.parseReason atBound of
-                        Ok r ->
-                            String.length (reasonShown r) == LibDb.reasonMaxChars
+                    Ok r ->
+                        String.length (reasonShown r) == LibDb.reasonMaxChars
 
-                        Err _ ->
-                            False
-                   )
+                    Err _ ->
+                        False
+                )
                 && storedRefused
             )
-
 
 
 checkPair : Maybe LibDb.ReviewRow -> Maybe LibDb.ReviewRow -> Bool
 checkPair approved refused =
     isApproved approved && storedReasonShown "too big" refused
-
 
 
 -- True when the row is a refusal whose reason shows exactly as `expected`.
@@ -256,7 +192,6 @@ storedReasonShown expected found =
                     row.decision == "refuse" && SafeText.toString (LibDb.storedReasonText r) == expected
 
 
-
 decisionRoundtrip : Task.Task Error Bool
 decisionRoundtrip =
     onFreshReview "ipe-review-roundtrip"
@@ -267,7 +202,6 @@ decisionRoundtrip =
                     (LibDb.findDecision db "u-a" (Index.attest viewA))
                     (LibDb.findDecision db "u-b" (Index.attest viewB))
         )
-
 
 
 -- ── stored rows ─────────────────────────────────────────────────────────
@@ -290,7 +224,6 @@ storedOverlongReasonDecodes db =
         Task.succeed (storedReasonShown expected byPair && storedReasonShown expected byUid)
 
 
-
 -- A stored reason the table's check accepts but that is blank to the tool
 -- (SQLite's `trim` strips only spaces) decodes as blank, not as a `Reason`.
 storedBlankReasonDecodes : Db -> Task.Task Error Bool
@@ -300,7 +233,6 @@ storedBlankReasonDecodes db =
         found <- LibDb.findDecision db "blank-uid" "hB"
         Db.exec db "DELETE FROM review WHERE uid = ?" [ SqlString "blank-uid" ]
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
-
 
 
 -- History pages walked two rows at a time from the start return every row
@@ -336,7 +268,6 @@ historyWalkMatchesOrder db =
             )
 
 
-
 -- The state one History walk step carries: where the next page starts, the
 -- keys read so far, and how many pages were read.
 type alias HistoryWalk =
@@ -344,7 +275,6 @@ type alias HistoryWalk =
     , seen : List ( String, String )
     , pages : Int
     }
-
 
 
 historyWalkStep : Db -> HistoryWalk -> Task.Task Error (Task.Step HistoryWalk HistoryWalk)
@@ -366,7 +296,6 @@ historyWalkStep db state =
                 Task.succeed (Task.Continue { next | cursor = cursor })
 
 
-
 isLastHistoryPage : Maybe LibDb.HistoryCursor -> Bool
 isLastHistoryPage next =
     case next of
@@ -375,7 +304,6 @@ isLastHistoryPage next =
 
         Just _ ->
             False
-
 
 
 -- A History page of no rows, or fewer, is refused as invalid input before
@@ -393,7 +321,6 @@ historyPageSizeRefused db =
         negative <- refused (-1)
         one <- LibDb.historyPage db 1 HistoryStart |> Task.map (\page -> List.length page.rows <= 1)
         Task.succeed (zero && negative && one)
-
 
 
 -- Each History state has its own text: a load in flight or a failed load
@@ -421,7 +348,6 @@ historyStateTextsDistinct =
         ]
 
 
-
 -- Both History page shapes read in the order of the `review_history_order`
 -- index: the first page scans it from the top, a later page seeks into it at
 -- its cursor, and neither sorts the table. Red without the index migration,
@@ -437,7 +363,6 @@ historyPagesUseIndex db =
         first <- LibDb.historyPlan db HistoryStart
         later <- LibDb.historyPlan db (HistoryAfter (Timestamp.fromUnixMillis 5) "u" "h")
         Task.succeed (indexed first && indexed later && List.any (String.startsWith "SEARCH") later)
-
 
 
 -- A slot's load tickets: each load takes a ticket no earlier load holds, and
@@ -458,7 +383,6 @@ loadTicketsSettleLatest =
         && not (Queue.isCurrentLoad second first)
 
 
-
 -- A write that fails for a reason other than the key keeps its own error, and
 -- a failed insert whose pair already has a row is the duplicate no-op. A
 -- read-only connection makes every insert fail without a key conflict, with
@@ -466,7 +390,6 @@ loadTicketsSettleLatest =
 failedWritesKeepTheirError : Task.Task Error Bool
 failedWritesKeepTheirError =
     freshDir "ipe-review-failed-writes" |> Task.andThen failedWritesKeepTheirErrorIn
-
 
 
 failedWritesKeepTheirErrorIn : String -> Task.Task Error Bool
@@ -496,11 +419,9 @@ failedWritesKeepTheirErrorIn base =
         Task.succeed (duplicate == 0 && freshReview && not (hasDecision kept))
 
 
-
 readOnlyWriteError : String
 readOnlyWriteError =
     "db: database error [8]"
-
 
 
 hasDecision : Maybe LibDb.ReviewRow -> Bool
@@ -513,7 +434,6 @@ hasDecision m =
             False
 
 
-
 -- ── review history ──────────────────────────────────────────────────────
 --
 -- Two decisions on a scratch review db must come back on the first History
@@ -521,7 +441,6 @@ hasDecision m =
 historyRoundtrip : Task.Task Error Bool
 historyRoundtrip =
     freshDir "ipe-index-b6-history" |> Task.andThen historyRoundtripIn
-
 
 
 historyRoundtripIn : String -> Task.Task Error Bool
@@ -563,7 +482,6 @@ historyRoundtripIn base =
                     |> Task.andThen (\_ -> removeFileIfAny (reviewDb ++ "-shm"))
                     |> Task.map (\_ -> ok)
             )
-
 
 
 -- Fixture unit u-a approved and u-b refused "too big", each against the

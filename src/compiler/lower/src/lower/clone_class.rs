@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ipe_diagnostics::{DResult, Diagnostic, Feature, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::once_closure::CaptureScope;
-use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath, Pat, enum_payload_holds};
+use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath, Pat, SliceOwnership, enum_payload_holds};
 
 use super::capture_rewrite::force_shared_capture_clones;
 
@@ -456,6 +456,120 @@ fn clone_class_named_composite<'a>(
     }
 }
 
+/// Is a value of `ty` non-`Clone` under the bound every emitted generic carries?
+///
+/// A [`IrType::Generic`] or [`IrType::RowGeneric`] leaf counts as `Clone` at
+/// every depth: the emitter stamps a `Clone` bound on every type parameter and
+/// row witness ([`ipe_ir::carrier_is_clone_bounded`]). An opaque `Rust.*` FFI
+/// handle anywhere in the value counts as non-`Clone`: its `Clone`-ness is the
+/// foreign crate's, and the emitter gives it no `Clone` impl to call.
+pub(super) fn bounded_nonclone(env: CloneEnv<'_>, ty: &IrType) -> bool {
+    !ipe_ir::carrier_is_clone_bounded(ty, env.payloads)
+        || ipe_ir::ir_type_holds(ty, env.payloads, &|t| is_opaque_ffi_handle(env, t))
+}
+
+/// Is `t` itself an opaque `Rust.*` FFI handle?
+fn is_opaque_ffi_handle(env: CloneEnv<'_>, t: &IrType) -> bool {
+    matches!(t, IrType::Enum { home, name, .. } if enum_is_opaque_ffi_handle(env, home, *name))
+}
+
+/// How a list pattern over elements of type `elem` takes its binders.
+///
+/// An element non-`Clone` under the emitted generic bound ([`bounded_nonclone`])
+/// moves out of an owned view; every other element copies out of the borrow.
+pub(super) fn slice_ownership(env: CloneEnv<'_>, elem: &IrType) -> SliceOwnership {
+    if bounded_nonclone(env, elem) {
+        SliceOwnership::OwnedMove
+    } else {
+        SliceOwnership::BorrowClone
+    }
+}
+
+/// Does `pat` bind any name at any depth?
+pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
+    match pat {
+        Pat::Var(_) | Pat::Alias(_, _) => true,
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        Pat::Ctor { args, .. } => args.iter().any(pat_binds_any_name),
+        Pat::Tuple(elems) => elems.iter().any(pat_binds_any_name),
+        Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_any_name(p)),
+        Pat::Slice { prefix, rest, .. } => {
+            prefix.iter().any(pat_binds_any_name) || rest.as_deref().is_some_and(pat_binds_any_name)
+        }
+        Pat::Or(alts) => alts.iter().any(pat_binds_any_name),
+    }
+}
+
+/// Refuse (IPE-L0135) an alias `inner as n` over a non-`Clone` `part` whose `inner` binds a name.
+///
+/// The alias and the inner binders would each own the same part, and a
+/// non-`Clone` part has no copy to give one of them. An inner that binds
+/// nothing takes no part, and a part `Clone` under the emitted generic bound
+/// ([`bounded_nonclone`]) copies, so both are accepted.
+pub(super) fn alias_rebuild_refusal(
+    env: CloneEnv<'_>,
+    inner: &Pat,
+    part: &IrType,
+    span: Span,
+) -> DResult<()> {
+    if pat_binds_any_name(inner) && bounded_nonclone(env, part) {
+        return Err(super::unsupported(span, Feature::NonCloneValueReuse));
+    }
+    Ok(())
+}
+
+/// Refuse (IPE-L0135) an element alias in an owned-move list pattern whose inner binds a name.
+///
+/// Under [`SliceOwnership::OwnedMove`] each element moves into its binder, so
+/// an element `p as n` with a binding `p` would own the element twice.
+pub(super) fn slice_element_alias_refusal(prefix: &[Pat], span: Span) -> DResult<()> {
+    if prefix.iter().any(holds_binding_alias) {
+        return Err(super::unsupported(span, Feature::NonCloneValueReuse));
+    }
+    Ok(())
+}
+
+/// Does `pat` contain an alias whose inner binds a name?
+fn holds_binding_alias(pat: &Pat) -> bool {
+    match pat {
+        Pat::Alias(inner, _) => pat_binds_any_name(inner),
+        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
+            false
+        }
+        Pat::Ctor { args, .. } => args.iter().any(holds_binding_alias),
+        Pat::Tuple(elems) => elems.iter().any(holds_binding_alias),
+        Pat::Record(fields) => fields.iter().any(|(_, p)| holds_binding_alias(p)),
+        Pat::Slice { prefix, rest, .. } => {
+            prefix.iter().any(holds_binding_alias)
+                || rest.as_deref().is_some_and(holds_binding_alias)
+        }
+        Pat::Or(alts) => alts.iter().any(holds_binding_alias),
+    }
+}
+
+/// Does a value of `ty` hold a move-only leaf anywhere?
+///
+/// A move-only leaf has no `Clone` impl and no other reuse gate: an effect
+/// carrier (`Task` / `Cmd` / `Sub`), a consume-once closure chain, or a shape-app
+/// handle. A boxed fn is left to the function-value reuse gate, an opaque FFI
+/// handle to the foreign-handle reuse gate, and a generic carries the emitted
+/// `Clone` bound.
+fn holds_move_only_leaf(ty: &IrType, payloads: &EnumPayloadTable) -> bool {
+    ipe_ir::ir_type_holds(ty, payloads, &|t| {
+        matches!(
+            t,
+            IrType::Task(_)
+                | IrType::Cmd(_)
+                | IrType::Sub(_)
+                | IrType::FnOnceChain(_, _)
+                | IrType::WebApp
+                | IrType::TuiApp
+                | IrType::CliApp
+                | IrType::WorkerApp
+        )
+    })
+}
+
 /// Does `pat` bind ANY symbol in `a` OR `b`? One walk of `pat` tests each bound
 /// name against both sets at once — a bound name is caught iff it is in either
 /// set, so this is the `pat`-binds-any-in-the-union predicate the clone/non-clone
@@ -469,7 +583,7 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_any_in_either(p, a, b)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_any_in_either(p, a, b)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_any_in_either(p, a, b)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_any_in_either(p, a, b))
                 || rest
                     .as_deref()
@@ -948,11 +1062,12 @@ pub(super) fn rewrite_captured_clones(
                 clone_set, noncl_set, walk, *tail, scope,
             )?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(rewrite_captured_clones(
                 clone_set, noncl_set, walk, *list, scope,
             )?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(rewrite_captured_clones(
@@ -1052,7 +1167,12 @@ pub(super) fn rewrite_captured_clones(
     }
 }
 
-/// Refuse (IPE-L0135) a reuse of a non-`Clone` effect-carrier binding `sym`.
+/// Refuse (IPE-L0135) a reuse of a non-`Clone` binding `sym` that holds a move-only leaf.
+///
+/// A move-only leaf is what [`holds_move_only_leaf`] accepts; a binding is
+/// checked only when its [`clone_class`] is also `NonClone`. A list of such
+/// values is moved whole by an owned-move list `case`, so this gate is what
+/// refuses a later use of that list.
 ///
 /// Reached only through the lowerer's single move-ownership entry point, so
 /// every used binder of every form (parameter, arm binder, `let`, destructured
@@ -1066,7 +1186,7 @@ pub(super) fn reject_nonclone_value_reuse(
     body: &Expr,
     span: Span,
 ) -> DResult<()> {
-    if !super::ir_type_has_effect_carrier(ir_ty, env.payloads)
+    if !holds_move_only_leaf(ir_ty, env.payloads)
         || !matches!(clone_class(env, ir_ty), CloneClass::NonClone)
     {
         return Ok(());
@@ -1427,9 +1547,10 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             head: Box::new(rewrite_multiuse_clones(sym, remaining, *head)),
             tail: Box::new(rewrite_multiuse_clones(sym, remaining, *tail)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(rewrite_multiuse_clones(sym, remaining, *list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(rewrite_multiuse_clones(sym, remaining, *list)),

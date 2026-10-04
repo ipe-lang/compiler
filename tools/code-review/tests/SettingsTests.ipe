@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,57 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , envReview
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , envSettings
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
@@ -96,14 +46,13 @@ dbRefusalNamesOnlyVariable =
                 && not (refusedFor "]0;pwn" refusal)
                 && not (refusedFor "postgres://" refusal)
                 && (case refusal of
-                        Just message ->
-                            noHazard message
+                    Just message ->
+                        noHazard message
 
-                        Nothing ->
-                            False
-                   )
+                    Nothing ->
+                        False
+                )
             )
-
 
 
 settingsRefusal : String -> Task.Task Error (Maybe String)
@@ -114,11 +63,9 @@ settingsRefusal indexDb =
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
 
 
-
 settingsRefused : String -> String -> Task.Task Error Bool
 settingsRefused indexDb reason =
     settingsRefusal indexDb |> Task.map (refusedFor reason)
-
 
 
 -- `IPE_INDEX_DB` values that cannot name a SQLite database stop at the parse,
@@ -188,7 +135,6 @@ badIndexDbRefused =
             )
 
 
-
 -- Every open URL carries exactly the app's mode, for a file path and a
 -- `sqlite://` URL alike, and a `sqlite://` URL parses to the same location as
 -- the plain path it names; a `+` in the URL path is a literal `+`, never a
@@ -229,7 +175,6 @@ dbUrlsCarryAppMode =
             )
 
 
-
 -- A working directory can hold `%`, `?` or `#`; each is escaped so the joined
 -- file path survives the URL as the same name, with `%` escaped first so the
 -- other escapes are not re-encoded.
@@ -241,7 +186,6 @@ filePathsEncodeUrlSpecials =
         == "/w/%253F"
         && Settings.encodeFilePath "/w/plain.db"
         == "/w/plain.db"
-
 
 
 -- ── required resources probed before listen ─────────────────────────────
@@ -265,7 +209,6 @@ probesNameTheirVariable =
         Task.succeed (good == Nothing && missing && notIndex && review)
 
 
-
 -- A nonexistent index is refused with the build hint and is not created.
 missingIndexProbed : Scratch -> Task.Task Error Bool
 missingIndexProbed at =
@@ -279,7 +222,6 @@ missingIndexProbed at =
         message <- probeMessage (envSettings |> Task.andThen Index.probe)
         created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
         Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
-
 
 
 -- A SQLite file with none of the index tables is refused.
@@ -298,7 +240,6 @@ foreignDbProbed at =
         Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
 
 
-
 -- A review location under a missing directory is refused with its own fix.
 reviewProbed : Scratch -> Task.Task Error Bool
 reviewProbed at =
@@ -312,7 +253,6 @@ reviewProbed at =
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && not (maybeContains "ipe-index index" message))
 
 
-
 -- Each `IPE_INDEX_DB` refusal states its problem and exactly one fix. Red if
 -- a problem that carries its own fix gets the generic one appended again.
 dbRefusalsStateOneFix : Task.Task Error Bool
@@ -320,20 +260,19 @@ dbRefusalsStateOneFix =
     do
         cwd <- System.cwd ()
         System.setenv "IPE_INDEX_ROOT" cwd
-        refusals <-
-            [ ""
-            , "postgres://localhost/index"
-            , "sqlite:index.db"
-            , "index.db?mode=rwc"
-            , "sqlite:///tmp/index.db?mode=rwc"
-            , "sqlite:///tmp/index%zz.db"
-            , "sqlite://"
-            , "sqlite:///tmp/index%00.db"
-            , "sqlite://rel.db"
-            , "sqlite:///"
-            ]
-                |> List.map settingsRefusal
-                |> Task.sequence
+        refusals <- [ ""
+        , "postgres://localhost/index"
+        , "sqlite:index.db"
+        , "index.db?mode=rwc"
+        , "sqlite:///tmp/index.db?mode=rwc"
+        , "sqlite:///tmp/index%zz.db"
+        , "sqlite://"
+        , "sqlite:///tmp/index%00.db"
+        , "sqlite://rel.db"
+        , "sqlite:///"
+        ]
+            |> List.map settingsRefusal
+            |> Task.sequence
         Task.succeed
             (List.all
                 (\refusal ->
@@ -367,22 +306,21 @@ startupReadsAdmittedOnly =
         cwd <- System.cwd ()
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
-        sources <-
-            Task.sequence
-                (List.map
-                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                    (moduleFiles topNames libNames)
-                )
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
         settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
         mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
         Task.succeed
             (layoutAdmits topNames libNames
-                && List.length sources >= 12
+                && List.length sources
+                >= 12
                 && sitesAdmitted sources
                 && mainAdmits mainSource
                 && settingsExports settings
             )
-
 
 
 readDirAt : String -> Task.Task Error (List String)
@@ -390,13 +328,11 @@ readDirAt dir =
     Task.fromResult (Path.fromString dir) |> Task.andThen File.readDir
 
 
-
 -- Every module of `src` by its path relative to `src`.
 moduleFiles : List String -> List String -> List String
 moduleFiles topNames libNames =
     List.filter (String.endsWith ".ipe") topNames
         ++ List.map (\name -> "Lib/" ++ name) (List.filter (String.endsWith ".ipe") libNames)
-
 
 
 -- `src` holds `.ipe` modules and the `Lib` directory, and `Lib` holds only
@@ -409,12 +345,10 @@ layoutAdmits topNames libNames =
         && List.all (\name -> String.endsWith ".ipe" name || String.startsWith "." name) libNames
 
 
-
 readLibSource : String -> Task.Task Error String
 readLibSource file =
     Task.fromResult (Path.fromString file)
         |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 256))
-
 
 
 -- The source with every whole-line comment dropped, so prose naming a
@@ -424,11 +358,9 @@ withoutCommentLines source =
     String.join "\n" (List.filter (\line -> not (String.startsWith "--" (String.trimStart line))) (String.lines source))
 
 
-
 occurrences : String -> String -> Int
 occurrences needle text =
     List.length (String.split needle text) - 1
-
 
 
 -- Each needle and, for every module admitted to name it, the exact number of
@@ -451,7 +383,6 @@ admittedSites =
     ]
 
 
-
 admittedCount : String -> List ( String, Int ) -> Int
 admittedCount rel admitted =
     case List.find (\( file, _ ) -> file == rel) admitted of
@@ -460,7 +391,6 @@ admittedCount rel admitted =
 
         Nothing ->
             0
-
 
 
 -- Every module names every needle exactly as often as `admittedSites`
@@ -477,7 +407,6 @@ sitesAdmitted sources =
         && List.all (\( _, text ) -> List.all systemImportAdmitted (String.lines text)) sources
 
 
-
 systemImportAdmitted : String -> Bool
 systemImportAdmitted line =
     let
@@ -485,7 +414,6 @@ systemImportAdmitted line =
             String.words line
     in
     List.take 2 parts /= [ "import", "Ipe.System" ] || parts == [ "import", "Ipe.System", "as", "System" ]
-
 
 
 -- The scan refuses each way around it: a reader behind an alias or an
@@ -499,12 +427,11 @@ startupScanRefusesEvasions =
         cwd <- System.cwd ()
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
-        sources <-
-            Task.sequence
-                (List.map
-                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                    (moduleFiles topNames libNames)
-                )
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
         Task.succeed
             (sitesAdmitted sources
                 && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
@@ -522,12 +449,10 @@ startupScanRefusesEvasions =
             )
 
 
-
 -- The scan refuses `sources` once `extra` is appended to module `rel`.
 evaded : List ( String, String ) -> String -> String -> Bool
 evaded sources rel extra =
     not (sitesAdmitted (appendTo rel extra sources))
-
 
 
 -- `sources` with `extra` appended to the code of module `rel`.
@@ -542,7 +467,6 @@ appendTo rel extra sources =
                 ( name, text )
         )
         sources
-
 
 
 mainAdmits : String -> Bool
@@ -568,7 +492,6 @@ mainAdmits text =
         && List.all (\needle -> occurrences needle text == 0) [ "parseDbLocation", "parseRoot", "absolutize", "isDir", "System.cwd" ]
 
 
-
 -- True when the module header exports both parsers and neither the bare
 -- `indexSettings` nor `reviewDb`.
 settingsExports : String -> Bool
@@ -585,7 +508,6 @@ settingsExports source =
 
         Nothing ->
             False
-
 
 
 checks : Task.Task Error (List ( String, Bool ))

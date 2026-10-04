@@ -6,7 +6,7 @@ use crate::{
     ALL_CODES, Applicability, BTreeMap, Diagnostic, Path, PathBuf, Suggestion, cli_args, fs,
     project, style,
 };
-use ipe_diagnostics::{NameError, Span};
+use ipe_diagnostics::{Candidates, EditTarget, NameError, Span};
 
 /// An emit target at `out`, proven disjoint from a project directory beside it.
 fn emit_target(out: &Path) -> EmitTarget {
@@ -483,7 +483,10 @@ fn machine_applicable_suggestion_is_collected_and_applied() {
         span: Span::new(7, 13),
         msg: NameError::ValueNotFound {
             name: "lenght".into(),
-            suggestions: Box::new(["length".into()]),
+            suggestions: Candidates::at(
+                EditTarget::whole(Span::new(7, 13), "lenght"),
+                Box::new(["length".into()]),
+            ),
         },
     };
     let fixes = machine_applicable_suggestions(&diag);
@@ -493,15 +496,54 @@ fn machine_applicable_suggestion_is_collected_and_applied() {
     assert_eq!(patched.as_deref(), Some("main = length"));
 }
 
+/// A suggestion whose span holds other text than it `replaces` is refused
+/// whole, never applied over the wrong bytes.
+#[test]
+fn apply_fixes_refuses_mismatched_replaces() {
+    let s = Suggestion {
+        span: Span::new(7, 15),
+        replaces: "Lsit".into(),
+        replacement: "List".into(),
+        applicability: Applicability::MachineApplicable,
+    };
+    assert_eq!(apply_fixes("main = Lsit.map f", &[s]), None);
+}
+
+/// `ipe fix` on a misspelt qualifier rewrites only the qualifier: the member
+/// after the dot survives.
+#[test]
+fn ipe_fix_never_rewrites_qualified_token_whole() {
+    let src =
+        "module Main exposing (main)\n\nimport Ipe.Crypto\n\nmain =\n    Crpyto.sha256 \"x\"\n";
+    let diag = pipeline_first_diagnostic(src);
+    assert!(
+        diag.is_some(),
+        "a misspelt qualifier must raise a diagnostic"
+    );
+    let Some(diag) = diag else {
+        return;
+    };
+    let fixes = select_non_overlapping(machine_applicable_suggestions(&diag), src.len());
+    assert_eq!(fixes.len(), 1, "one applicable fix, got {diag:?}");
+    assert_eq!(
+        apply_fixes(src, &fixes).as_deref(),
+        Some(
+            "module Main exposing (main)\n\nimport Ipe.Crypto\n\nmain =\n    Crypto.sha256 \"x\"\n"
+        )
+    );
+}
+
 #[test]
 fn overlapping_suggestions_are_filtered_back_to_front() {
     let left = Suggestion {
         span: Span::new(0, 5),
+        replaces: "a".into(),
         replacement: "x".into(),
         applicability: Applicability::MachineApplicable,
     };
     let right = Suggestion {
         span: Span::new(3, 8),
+        replaces: "a".into(),
         replacement: "y".into(),
         applicability: Applicability::MachineApplicable,
     };
@@ -515,6 +557,7 @@ fn overlapping_suggestions_are_filtered_back_to_front() {
 fn apply_fixes_rejects_out_of_bounds_span() {
     let s = Suggestion {
         span: Span::new(0, 999),
+        replaces: "a".into(),
         replacement: "z".into(),
         applicability: Applicability::MachineApplicable,
     };
@@ -526,6 +569,7 @@ fn apply_fixes_rejects_non_char_boundary_span() {
     // "é" is two UTF-8 bytes; a span that splits it is rejected.
     let s = Suggestion {
         span: Span::new(0, 1),
+        replaces: "a".into(),
         replacement: "z".into(),
         applicability: Applicability::MachineApplicable,
     };

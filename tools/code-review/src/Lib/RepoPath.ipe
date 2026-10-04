@@ -143,16 +143,15 @@ bindingOf : List Entry -> Entry -> Binding
 bindingOf entries entry =
     { tag = entry.tag
     , root = entry.root
-    , deeper =
-        List.filterMap
-            (\other ->
-                if strictlyBelow entry.segments other.segments then
-                    Just other.segments
+    , deeper = List.filterMap
+        (\other ->
+            if strictlyBelow entry.segments other.segments then
+                Just other.segments
 
-                else
-                    Nothing
-            )
-            entries
+            else
+                Nothing
+        )
+        entries
     }
 
 
@@ -249,20 +248,19 @@ parseRoot raw =
 
     else
         do
-            path <-
-                absolutize raw
-                    |> Task.mapError
-                        (\e ->
-                            Error.invalidInput
-                                (rootRefusal raw
-                                    (SafeText.concat
-                                        [ SafeText.literal "is not a valid path ("
-                                        , SafeText.render (Error.message e)
-                                        , SafeText.literal ")"
-                                        ]
-                                    )
+            path <- absolutize raw
+                |> Task.mapError
+                    (\e ->
+                        Error.invalidInput
+                            (rootRefusal raw
+                                (SafeText.concat
+                                    [ SafeText.literal "is not a valid path ("
+                                    , SafeText.render (Error.message e)
+                                    , SafeText.literal ")"
+                                    ]
                                 )
-                        )
+                            )
+                    )
             isDir <- File.isDir path |> Task.onError (\_ -> Task.succeed False)
             if isDir then
                 Task.succeed (Root path)

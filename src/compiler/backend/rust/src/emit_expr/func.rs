@@ -8,6 +8,7 @@ use crate::EmitCtx;
 use crate::render::{LayoutSpend, render_seeded_spend};
 use core::cell::RefCell;
 use core::fmt::Write as _;
+use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
 /// Emit an `Expr` in TAIL/STATEMENT context — the interior of a `TailLoop`'s
@@ -1088,7 +1089,7 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
 /// The per-view `LiteralTable` binding for a function whose body hoisted style
 /// literals, or the empty string when none did.
 ///
-/// Each default is rendered with the same `{:?}` Rust-string escaping a direct
+/// Each default is rendered through `rust_str_lit`, the renderer a direct
 /// `Expr::Str` uses, so the baked default is byte-for-byte the source value and
 /// a `__ipe_lit.get(N)` read is indistinguishable from the direct literal. The
 /// binding is emitted immediately after the recursion guard, in scope for every
@@ -1097,7 +1098,11 @@ pub fn literal_table_prologue(defaults: &[String]) -> String {
     if defaults.is_empty() {
         return String::new();
     }
-    let rendered: Vec<String> = defaults.iter().map(|d| format!("{d:?}")).collect();
+    let rendered: Vec<String> = defaults
+        .iter()
+        .map(String::as_str)
+        .map(rust_str_lit)
+        .collect();
     format!(
         "let __ipe_lit = ipe_runtime::literal_table::LiteralTable::from_defaults(&[{}]);\n    ",
         rendered.join(", ")

@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -29,72 +29,7 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , indexConn
-    , loadUnitNow
-    , decideNow
-    , envSettings
-    , envReview
-    , envAppSettings
-    , loadPageNow
-    , drainThenLoadNow
-    , loadUnitViewNow
-    , drainUnitNow
-    , decideShownNow
-    , resyncReviewedNow
-    , resyncReviewedWithinNow
-    , shownOf
-    , PageEntry
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , migratedReviewAt
-    , tableRowCounts
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -122,7 +57,6 @@ decideAfter name prepare mutate decision =
         Task.succeed { conflict = conflict, rows = rows }
 
 
-
 -- True when deciding `found`'s shown source fails with a conflict; False
 -- when it succeeds, fails otherwise, or the unit was not loaded shown.
 decideOutcome : Db -> Maybe PageEntry -> Decision -> Task.Task Error Bool
@@ -137,12 +71,10 @@ decideOutcome db found decision =
             Task.succeed False
 
 
-
 countUidRows : Db -> String -> Task.Task Error Int
 countUidRows db uid =
     Db.findWhere db "review" (Sql.eq (Sql.column "uid") (Sql.string uid))
         |> Task.map List.length
-
 
 
 noChange : Scratch -> Task.Task Error ()
@@ -150,11 +82,9 @@ noChange _ =
     Task.succeed ()
 
 
-
 driftLib : Scratch -> Task.Task Error ()
 driftLib at =
     writeFileText (at.repo ++ "/src/Lib.rs") ("// inserted above\n" ++ fixtureLibRs)
-
 
 
 -- The control: an unchanged shown unit is decided under its attested hash.
@@ -167,19 +97,17 @@ decideRecordsShownHash =
         seedIndex at.indexDb at.repo
         r <- loadFirstPage
         db <- migratedReviewAt at.reviewDb
-        recorded <-
-            case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == "u-a") r.units) of
-                Just shown ->
-                    decideShownNow db shown Approved
-                        |> Task.map (\( a, n ) -> n == 1 && Index.attestedUid a == "u-a" && Index.attestedHash a == Index.attest viewA)
+        recorded <- case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == "u-a") r.units) of
+            Just shown ->
+                decideShownNow db shown Approved
+                    |> Task.map (\( a, n ) -> n == 1 && Index.attestedUid a == "u-a" && Index.attestedHash a == Index.attest viewA)
 
-                Nothing ->
-                    Task.succeed False
+            Nothing ->
+                Task.succeed False
         rows <- countReviewRows db "u-a" (Index.attest viewA)
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed (recorded && rows == 1)
-
 
 
 -- R4: the file drifts after the page showed it. Red if `reverify` is removed
@@ -190,7 +118,6 @@ approveRefusedAfterDrift =
         |> Task.map (\o -> o.conflict && o.rows == 0)
 
 
-
 -- R5: a re-index after the page loaded: the file and the stored hash move
 -- together to new content, so the fresh row verifies on its own. Red if the
 -- fresh hash is not compared with the shown hash.
@@ -198,13 +125,13 @@ approveRefusedAfterReindex : Task.Task Error Bool
 approveRefusedAfterReindex =
     let
         reindex at =
-            Task.map2 (\_ _ -> ())
+            Task.map2
+                (\_ _ -> ())
                 (writeFileText (at.repo ++ "/src/Lib.rs") (String.replace "42" "43" fixtureLibRs))
                 (execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest (String.replace "42" "43" viewA)), SqlString "u-a" ])
     in
     decideAfter "ipe-index-decide-reindex" noChange reindex Approved
         |> Task.map (\o -> o.conflict && o.rows == 0)
-
 
 
 -- R6: the unit's row is gone from the index after the page loaded.
@@ -215,11 +142,9 @@ approveRefusedAfterUnitDeleted =
         |> Task.map (\o -> o.conflict && o.rows == 0)
 
 
-
 deleteUnitA : Scratch -> Task.Task Error ()
 deleteUnitA at =
     execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ SqlString "u-a" ]
-
 
 
 -- R7: a unit loaded stale has no source a decision can be made on, for a
@@ -247,7 +172,6 @@ staleRefuseAlsoRefused =
             )
 
 
-
 -- Only the selected unit's own shown view is decidable: the same verified
 -- view selected under another uid, or still loading, yields no source. Red
 -- if `decidableSource` ignores the uid or the load state.
@@ -272,7 +196,6 @@ onlySelectedShownDecidable =
             )
 
 
-
 isNothing : Maybe a -> Bool
 isNothing m =
     case m of
@@ -281,7 +204,6 @@ isNothing m =
 
         Nothing ->
             True
-
 
 
 -- ── one source read in flight ───────────────────────────────────────────
@@ -312,7 +234,6 @@ selectionsDuringReadCoalesce =
         == Just "c"
         && selectedTag arrived
         == "loading c"
-
 
 
 -- A response for any uid but the in-flight one changes nothing and starts no
@@ -361,7 +282,6 @@ outdatedResponseDropped =
         == Nothing
 
 
-
 -- A read that predates a page reload never settles the view: the in-flight
 -- unit selected again after the reload (directly, or after another unit
 -- was wanted) is read afresh once the outdated read returns, and a read in
@@ -402,7 +322,6 @@ outdatedReadNeverSettles =
         == Nothing
 
 
-
 selectedTag : Queue.SelectedView -> String
 selectedTag state =
     case state of
@@ -427,7 +346,6 @@ selectedTag state =
             "failed " ++ uid
 
 
-
 -- ── bounded queue pages ─────────────────────────────────────────────────
 --
 -- One page holds at most `Index.pageSize` units while `total` counts the
@@ -436,7 +354,6 @@ selectedTag state =
 pagesCoverQueueOnce : Task.Task Error Bool
 pagesCoverQueueOnce =
     freshDir "ipe-index-queue-pages" |> Task.andThen pagesCoverQueueOnceIn
-
 
 
 pagesCoverQueueOnceIn : String -> Task.Task Error Bool
@@ -463,13 +380,12 @@ pagesCoverQueueOnceIn base =
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
         first <- loadPageNow Index.Start
-        second <-
-            case first.next of
-                Just cursor ->
-                    loadPageNow cursor
+        second <- case first.next of
+            Just cursor ->
+                loadPageNow cursor
 
-                Nothing ->
-                    Task.fail (Error.unexpected "a full first page has no next cursor")
+            Nothing ->
+                Task.fail (Error.unexpected "a full first page has no next cursor")
         removePageFixture indexDb reviewDb repo
         Task.succeed
             (List.length first.units
@@ -484,7 +400,6 @@ pagesCoverQueueOnceIn base =
             )
 
 
-
 isLastPage : Maybe Index.Cursor -> Bool
 isLastPage next =
     case next of
@@ -495,7 +410,6 @@ isLastPage next =
             True
 
 
-
 distinctUids : List Queue.QueuedUnit -> Int
 distinctUids units =
     units
@@ -504,12 +418,10 @@ distinctUids units =
         |> Dict.size
 
 
-
 -- A `deleted` change_queue row is neither listed nor counted.
 deletedRowsNotQueued : Task.Task Error Bool
 deletedRowsNotQueued =
     freshDir "ipe-index-queue-deleted" |> Task.andThen deletedRowsNotQueuedIn
-
 
 
 deletedRowsNotQueuedIn : String -> Task.Task Error Bool
@@ -537,13 +449,11 @@ deletedRowsNotQueuedIn base =
         Task.succeed (r.total == 2 && List.map (\u -> u.uid) r.units == [ "u-page-1", "u-page-3" ])
 
 
-
 -- The size of a seeded index database is positive; a queue load against a
 -- missing index database is `Failed`, never an empty `Loaded`.
 dbSizeAndMissingDb : Task.Task Error Bool
 dbSizeAndMissingDb =
     freshDir "ipe-index-queue-size" |> Task.andThen dbSizeAndMissingDbIn
-
 
 
 dbSizeAndMissingDbIn : String -> Task.Task Error Bool
@@ -568,13 +478,11 @@ dbSizeAndMissingDbIn base =
         migratedReviewAt reviewDb
         bytes <- indexConn |> Task.andThen Index.dbBytes
         setIndexEnv (base ++ "/missing.db") repo
-        result <-
-            loadPageNow Index.Start
-                |> Task.map Ok
-                |> Task.onError (\e -> Task.succeed (Err e))
+        result <- loadPageNow Index.Start
+            |> Task.map Ok
+            |> Task.onError (\e -> Task.succeed (Err e))
         removePageFixture indexDb reviewDb repo
         Task.succeed (bytes > 0 && isFailed (Queue.stateFromResult result))
-
 
 
 isFailed : Queue.QueueState -> Bool
@@ -590,7 +498,6 @@ isFailed state =
             False
 
 
-
 removePageFixture : String -> String -> String -> Task.Task Error ()
 removePageFixture indexDb reviewDb repo =
     Task.sequence
@@ -603,7 +510,6 @@ removePageFixture indexDb reviewDb repo =
         , removeFileIfAny (repo ++ "/src/Main.ipe")
         ]
         |> Task.map (\_ -> ())
-
 
 
 -- Seeds `n` queued units, all `new`, all pointing at the same fixture file.
@@ -627,7 +533,6 @@ seedManyUnits indexDb n =
         |> Task.map (\_ -> ())
 
 
-
 tiedEnqueuedAt : Int -> Int
 tiedEnqueuedAt i =
     if i > Index.pageSize - 5 then
@@ -635,7 +540,6 @@ tiedEnqueuedAt i =
 
     else
         i
-
 
 
 seedOneUnit : Db -> Int -> Task.Task Error ()
@@ -673,7 +577,6 @@ seedOneUnit conn i =
         |> Task.map (\_ -> ())
 
 
-
 -- ── decision drain loop ─────────────────────────────────────────────────
 --
 -- A decided unit leaves the index queue: the decision returns the attested
@@ -683,7 +586,6 @@ drainFlow : Task.Task Error Bool
 drainFlow =
     drainAfter "ipe-index-drain" noChange
         |> Task.map (\o -> o.drained == 1 && not o.stillQueued && o.totalAfter == o.totalBefore - 1)
-
 
 
 -- The drain of a decided unit, with the queue page reloaded after it, writes
@@ -701,10 +603,9 @@ drainWritesNothingToReview =
         db <- migratedReviewAt at.reviewDb
         decided <- decideUnit db (List.find (\u -> u.uid == "u-b") r.units)
         before <- tableRowCounts db
-        page <-
-            case decided of
-                ( attested, _ ) ->
-                    drainThenLoadNow attested Index.Start
+        page <- case decided of
+            ( attested, _ ) ->
+                drainThenLoadNow attested Index.Start
         after <- tableRowCounts db
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
@@ -716,7 +617,6 @@ drainWritesNothingToReview =
             )
 
 
-
 -- R11: the unit is re-queued with a new hash between the decision and the
 -- drain. The drain deletes only the row of the attested hash, so the new
 -- change stays queued. Red if `drainUnit` matches on uid alone.
@@ -724,7 +624,6 @@ drainKeepsRequeuedChange : Task.Task Error Bool
 drainKeepsRequeuedChange =
     drainAfter "ipe-index-drain-requeued" requeueB
         |> Task.map (\o -> o.drained == 0 && o.stillQueued && o.totalAfter == o.totalBefore)
-
 
 
 -- R10: an unknown uid is its own unit-page state, and every state that
@@ -752,11 +651,12 @@ unitPageStatesDistinct =
         cleanupIndex at.indexDb at.repo
         Task.succeed
             (isNotFound (Queue.unitPageFromResult (Ok loaded))
-                && List.length pageTexts == 3
-                && List.length sourceTexts == 4
+                && List.length pageTexts
+                == 3
+                && List.length sourceTexts
+                == 4
                 && pairwiseDistinct (pageTexts ++ sourceTexts)
             )
-
 
 
 isNotFound : Queue.UnitPageState -> Bool
@@ -775,7 +675,6 @@ isNotFound state =
             False
 
 
-
 pairwiseDistinct : List String -> Bool
 pairwiseDistinct texts =
     case texts of
@@ -786,11 +685,9 @@ pairwiseDistinct texts =
             not (List.member t rest) && pairwiseDistinct rest
 
 
-
 requeueB : Scratch -> Task.Task Error ()
 requeueB at =
     execIndex at.indexDb "UPDATE change_queue SET new_hash = ? WHERE uid = ?" [ SqlString "sha256:other", SqlString "u-b" ]
-
 
 
 -- Seeds the bridge fixture, decides `u-b`, runs `mutate`, then drains under
@@ -813,7 +710,6 @@ drainAfter name mutate =
         Task.succeed outcome
 
 
-
 decideUnit : Db -> Maybe PageEntry -> Task.Task Error ( Index.Attested, Int )
 decideUnit db found =
     case Maybe.andThen (\entry -> shownOf entry.view) found of
@@ -824,10 +720,8 @@ decideUnit db found =
             Task.fail (Error.conflict "fixture unit not loaded shown")
 
 
-
 type alias DrainOutcome =
     { drained : Int, stillQueued : Bool, totalBefore : Int, totalAfter : Int }
-
 
 
 drainAndCount : Int -> ( Index.Attested, Int ) -> Task.Task Error DrainOutcome
@@ -845,7 +739,6 @@ drainAndCount totalBefore decided =
                     }
 
 
-
 -- ── change re-enqueue ─────────────────────────────────────────────────────
 --
 -- A unit already decided on its current hash stays hidden; a unit decided on an
@@ -858,7 +751,6 @@ drainAndCount totalBefore decided =
 changeReenqueue : Task.Task Error Bool
 changeReenqueue =
     freshDir "ipe-index-b8-reenqueue" |> Task.andThen changeReenqueueIn
-
 
 
 changeReenqueueIn : String -> Task.Task Error Bool
@@ -922,7 +814,6 @@ changeReenqueueIn base =
             )
 
 
-
 changedHead : List Queue.QueuedUnit -> Bool
 changedHead units =
     case List.head units of
@@ -931,7 +822,6 @@ changedHead units =
 
         Nothing ->
             False
-
 
 
 resurfaced : Maybe LibDb.ReviewRow -> Bool
@@ -944,7 +834,6 @@ resurfaced old =
             False
 
 
-
 freshSecond : List Queue.QueuedUnit -> Bool
 freshSecond units =
     case List.head (List.drop 1 units) of
@@ -955,7 +844,6 @@ freshSecond units =
             False
 
 
-
 neverSeen : Maybe LibDb.ReviewRow -> Bool
 neverSeen old =
     case old of
@@ -964,7 +852,6 @@ neverSeen old =
 
         Just _ ->
             False
-
 
 
 seedB8Db : String -> Task.Task Error ()
@@ -978,7 +865,6 @@ seedB8Db indexDb =
                     |> Task.andThen (\_ -> insertB8Units conn)
             )
         |> Task.map (\_ -> ())
-
 
 
 insertB8Units : Db -> Task.Task Error Int
@@ -1051,7 +937,6 @@ insertB8Units conn =
             )
 
 
-
 -- A queue in flight or failed never renders the empty-queue text; only a
 -- loaded queue with total 0 does, and a loaded page with units has no status
 -- line at all.
@@ -1083,27 +968,24 @@ queueStateTextsDistinct =
         ]
 
 
-
 sampleQueuedUnit : Queue.QueuedUnit
 sampleQueuedUnit =
-    { unit =
-        { uid = "u-sample"
-        , path = SafeText.renderForeign "ipe:src/Main.ipe"
-        , kind = SafeText.renderForeign "module"
-        , lang = Highlight.Ipe
-        , name = SafeText.renderForeign "Main"
-        , qualified = SafeText.renderForeign "Main"
-        , lineStart = 1
-        , lineEnd = 1
-        , facing = SafeText.renderForeign "internal"
-        , purpose = Nothing
-        , attested = Index.UnknownScheme "hash-sample"
-        , updatedSha = "sha-sample"
-        }
+    { unit = { uid = "u-sample"
+    , path = SafeText.renderForeign "ipe:src/Main.ipe"
+    , kind = SafeText.renderForeign "module"
+    , lang = Highlight.Ipe
+    , name = SafeText.renderForeign "Main"
+    , qualified = SafeText.renderForeign "Main"
+    , lineStart = 1
+    , lineEnd = 1
+    , facing = SafeText.renderForeign "internal"
+    , purpose = Nothing
+    , attested = Index.UnknownScheme "hash-sample"
+    , updatedSha = "sha-sample"
+    }
     , queued = { change = "new", oldHash = Nothing, newHash = Nothing }
     , changed = Nothing
     }
-
 
 
 -- ── review progress from the databases ──────────────────────────────────
@@ -1113,8 +995,6 @@ sampleQueuedUnit =
 -- decision and its drain raise `reviewed` by one and leave `total` unchanged,
 -- and a fresh load (no session state) reads the same numbers. Red if progress
 -- goes back to a per-session counter or to the shrinking queue count.
-
-
 -- One bare unit row in a scratch index; its source is never shown.
 insertBareUnit : String -> String -> String -> Task.Task Error ()
 insertBareUnit indexDb uid hash =
@@ -1134,7 +1014,6 @@ insertBareUnit indexDb uid hash =
         ]
 
 
-
 queueNew : String -> String -> String -> Int -> Task.Task Error ()
 queueNew indexDb uid hash at =
     execIndex indexDb
@@ -1142,11 +1021,9 @@ queueNew indexDb uid hash at =
         [ SqlString uid, SqlString "new", SqlNull (SqlString ""), SqlString hash, SqlString ("sha-" ++ uid), SqlInt at ]
 
 
-
 mirrorPair : String -> String -> String -> Task.Task Error ()
 mirrorPair indexDb uid hash =
     execIndex indexDb "INSERT INTO reviewed (uid, body_hash) VALUES (?, ?)" [ SqlString uid, SqlString hash ]
-
 
 
 -- A review row written straight into the review table, with no drain.
@@ -1155,7 +1032,6 @@ insertReviewRow db uid hash =
     Db.exec db
         "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
         [ SqlString uid, SqlString hash, SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
-
 
 
 -- The bridge fixture plus an empty review database at `at`, with the
@@ -1170,7 +1046,6 @@ seedProgressScratch at =
         migratedReviewAt at.reviewDb
 
 
-
 cleanupProgressScratch : Scratch -> Task.Task Error ()
 cleanupProgressScratch at =
     do
@@ -1178,7 +1053,6 @@ cleanupProgressScratch at =
         removeFileIfAny at.reviewDb
         removeFileIfAny (at.reviewDb ++ "-wal")
         removeFileIfAny (at.reviewDb ++ "-shm")
-
 
 
 -- Units a(ha, queued), b(hb, queued), c(hc), d(hd), a2(ha), ab(c); the copy
@@ -1208,7 +1082,6 @@ progressCountsDecidedPairs =
         page <- loadPageNow Index.Start
         cleanupProgressScratch at
         Task.succeed (page.progress.reviewed == 2 && page.progress.total == 3)
-
 
 
 -- A request reads the settings resolved at startup, never the environment: with
@@ -1253,7 +1126,6 @@ pageReadsStartupSettings =
             )
 
 
-
 progressStableAcrossDrain : Task.Task Error Bool
 progressStableAcrossDrain =
     do
@@ -1265,15 +1137,14 @@ progressStableAcrossDrain =
         System.setenv "IPE_REVIEW_DB" at.reviewDb
         db <- migratedReviewAt at.reviewDb
         before <- loadPageNow Index.Start
-        decided <-
-            case List.find (\q -> q.unit.uid == "u-a") before.units of
-                Just _ ->
-                    decideNow db "u-a" Approved
-                        |> Task.andThen (\( attested, _ ) -> drainUnitNow attested)
-                        |> Task.map (\_ -> True)
+        decided <- case List.find (\q -> q.unit.uid == "u-a") before.units of
+            Just _ ->
+                decideNow db "u-a" Approved
+                    |> Task.andThen (\( attested, _ ) -> drainUnitNow attested)
+                    |> Task.map (\_ -> True)
 
-                Nothing ->
-                    Task.succeed False
+            Nothing ->
+                Task.succeed False
         after <- loadPageNow Index.Start
         again <- loadPageNow Index.Start
         cleanupIndex at.indexDb at.repo
@@ -1295,12 +1166,10 @@ progressStableAcrossDrain =
             )
 
 
-
 -- Seeds the bridge fixture with u-a queued under its attested hash, then
 -- decides and drains u-a; the progress before and after, and the pair.
 type alias Drained =
     { db : Db, before : Queue.Progress, after : Queue.Progress, attested : Index.Attested }
-
 
 
 decideAndDrainA : Scratch -> Task.Task Error Drained
@@ -1315,7 +1184,6 @@ decideAndDrainA at =
         Task.succeed { db = db, before = before.progress, after = after.progress, attested = attested }
 
 
-
 decideA : Db -> Queue.QueuePage -> Task.Task Error Index.Attested
 decideA db page =
     case List.find (\q -> q.unit.uid == "u-a") page.units of
@@ -1326,11 +1194,9 @@ decideA db page =
             Task.fail (Error.conflict "fixture unit u-a not queued")
 
 
-
 currentProgressOf : Task.Task Error Queue.Progress
 currentProgressOf =
     loadPageNow Index.Start |> Task.map (\page -> page.progress)
-
 
 
 -- A decided unit re-hashed and re-queued as `modified` is no longer reviewed
@@ -1346,11 +1212,15 @@ rehashedUnitLeavesReviewed =
         now <- currentProgressOf
         cleanupProgressScratch at
         Task.succeed
-            (d.after.reviewed == d.before.reviewed + 1
-                && now.reviewed == d.after.reviewed - 1
-                && now.total == d.after.total
+            (d.after.reviewed
+                == d.before.reviewed
+                + 1
+                && now.reviewed
+                == d.after.reviewed
+                - 1
+                && now.total
+                == d.after.total
             )
-
 
 
 -- A decided unit removed from the index leaves both counts, and returns to
@@ -1368,11 +1238,15 @@ removedUnitReturnsReviewed =
         back <- currentProgressOf
         cleanupProgressScratch at
         Task.succeed
-            (gone.reviewed == d.after.reviewed - 1
-                && gone.total == d.after.total - 1
-                && back == d.after
+            (gone.reviewed
+                == d.after.reviewed
+                - 1
+                && gone.total
+                == d.after.total
+                - 1
+                && back
+                == d.after
             )
-
 
 
 -- A decision saved with no drain is counted on the next load, and its queue
@@ -1390,11 +1264,14 @@ undrainedDecisionHealedOnLoad =
         pendingAfter <- indexConn |> Task.andThen Index.countPending
         cleanupProgressScratch at
         Task.succeed
-            (page.progress.reviewed == 1
-                && pendingAfter == pendingBefore - 1
-                && page.total == pendingAfter
+            (page.progress.reviewed
+                == 1
+                && pendingAfter
+                == pendingBefore
+                - 1
+                && page.total
+                == pendingAfter
             )
-
 
 
 -- A refill copies into the index's `reviewed` table exactly the pairs the
@@ -1427,7 +1304,6 @@ refillDrainsOnlyReviewPairs =
         Task.succeed (copied == List.length pairs && mirrored == pairs)
 
 
-
 -- A pair in the copy the review database lacks (a deleted review row) is
 -- dropped by the load's rebuild. Red if the rebuild only inserts.
 foreignMirrorRowDropped : Task.Task Error Bool
@@ -1444,7 +1320,6 @@ foreignMirrorRowDropped =
         Task.succeed (seeded.reviewed == 1 && page.progress.reviewed == 0 && row.mirrored == 0)
 
 
-
 -- Deciding and draining one pair twice keeps one copy row and counts it
 -- once. Red with a plain `INSERT` (the second drain fails on the key).
 secondDecisionOfPairCountsOnce : Task.Task Error Bool
@@ -1459,13 +1334,18 @@ secondDecisionOfPairCountsOnce =
         row <- indexConn |> Task.andThen Index.loadProgress
         cleanupProgressScratch at
         Task.succeed
-            (drainedAgain == 0
-                && redrained == 0
-                && now == d.after
-                && d.after.reviewed == d.before.reviewed + 1
-                && row.mirrored == 1
+            (drainedAgain
+                == 0
+                && redrained
+                == 0
+                && now
+                == d.after
+                && d.after.reviewed
+                == d.before.reviewed
+                + 1
+                && row.mirrored
+                == 1
             )
-
 
 
 -- With the `reviewed` table gone the drain fails and the queue row stays:
@@ -1481,14 +1361,12 @@ drainIsAtomic =
         attested <- decideA db page
         pendingBefore <- indexConn |> Task.andThen Index.countPending
         execIndex at.indexDb "DROP TABLE reviewed" []
-        refusal <-
-            drainUnitNow attested
-                |> Task.map (\_ -> Nothing)
-                |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refusal <- drainUnitNow attested
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         pendingAfter <- indexConn |> Task.andThen Index.countPending
         cleanupProgressScratch at
         Task.succeed (maybeContains "database error" refusal && pendingAfter == pendingBefore)
-
 
 
 -- An index without the `reviewed` table stops startup naming
@@ -1503,7 +1381,6 @@ probeRefusesIndexWithoutReviewed =
         message <- probeMessage (envSettings |> Task.andThen Index.probe)
         cleanupIndex at.indexDb at.repo
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message && maybeContains "ipe-index index" message)
-
 
 
 -- Two pages of decisions against a one-page ceiling refuse the rebuild and
@@ -1523,10 +1400,9 @@ resyncStopsAtCeiling =
             |> List.map (\i -> insertReviewRow db ("p-" ++ String.fromInt i) "hp")
             |> Task.sequence
         mirrorPair at.indexDb "pre" "hp"
-        refusal <-
-            resyncReviewedWithinNow { pageSize = LibDb.pairPageSize, pageCeiling = 1 } db
-                |> Task.map (\_ -> Nothing)
-                |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refusal <- resyncReviewedWithinNow { pageSize = LibDb.pairPageSize, pageCeiling = 1 } db
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- indexConn |> Task.andThen Index.loadProgress
         conn <- Db.open "sqlite" ("sqlite://" ++ at.indexDb ++ "?mode=rw")
         preRows <- Db.findWhere conn "reviewed" (Sql.eq (Sql.column "uid") (Sql.string "pre"))
@@ -1536,13 +1412,16 @@ resyncStopsAtCeiling =
         cleanupProgressScratch at
         Task.succeed
             (maybeContains ("more than " ++ String.fromInt LibDb.pairPageSize ++ " decisions") refusal
-                && kept.mirrored == 1
-                && List.length preRows == 1
-                && copied == decisions
-                && rebuilt.mirrored == decisions
+                && kept.mirrored
+                == 1
+                && List.length preRows
+                == 1
+                && copied
+                == decisions
+                && rebuilt.mirrored
+                == decisions
                 && List.isEmpty preAfter
             )
-
 
 
 -- A rebuild at the production page ceiling, one pair per page, so the walk
@@ -1566,18 +1445,18 @@ resyncAtDeepestCeiling =
         seed 1 Queue.resyncPageCeiling db
         copied <- resyncReviewedWithinNow bound db
         seed (Queue.resyncPageCeiling + 1) (Queue.resyncPageCeiling + 1) db
-        refusal <-
-            resyncReviewedWithinNow bound db
-                |> Task.map (\_ -> Nothing)
-                |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refusal <- resyncReviewedWithinNow bound db
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- indexConn |> Task.andThen Index.loadProgress
         cleanupProgressScratch at
         Task.succeed
-            (copied == Queue.resyncPageCeiling
+            (copied
+                == Queue.resyncPageCeiling
                 && maybeContains (String.fromInt Queue.resyncPageCeiling ++ "-page ceiling") refusal
-                && kept.mirrored == Queue.resyncPageCeiling
+                && kept.mirrored
+                == Queue.resyncPageCeiling
             )
-
 
 
 -- A bound below one pair per page or one page is refused before the copy is
@@ -1602,7 +1481,6 @@ resyncRefusesEmptyBound =
         Task.succeed (zeroSize && zeroPages && kept.mirrored == 1)
 
 
-
 -- A stored refusal whose reason no longer parses still counts as decided,
 -- and the load succeeds. Red if progress reads decisions through the
 -- full-row decode.
@@ -1612,13 +1490,11 @@ progressIgnoresUndecodableReason =
         at <- freshScratch "ipe-index-progress-bad-reason"
         db <- seedProgressScratch at
         Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "u-del", SqlString "hashC", SqlString "refuse", SqlString (String.repeat (LibDb.reasonMaxChars + 1) "x"), SqlInt 0 ]
-        result <-
-            loadPageNow Index.Start
-                |> Task.map (\page -> Just page.progress.reviewed)
-                |> Task.onError (\_ -> Task.succeed Nothing)
+        result <- loadPageNow Index.Start
+            |> Task.map (\page -> Just page.progress.reviewed)
+            |> Task.onError (\_ -> Task.succeed Nothing)
         cleanupProgressScratch at
         Task.succeed (result == Just 1)
-
 
 
 -- A rebuild with a page per pair succeeds at 6,000 pages, driving the loop
@@ -1642,7 +1518,6 @@ resyncSucceedsAtSixThousandPages =
         Task.succeed (copied == 6000 && kept.mirrored == 6000)
 
 
-
 -- One pair past a 6,000-page ceiling refuses the rebuild and leaves the copy
 -- untouched, the same as the production ceiling. Red if the ceiling is off
 -- by one, or if a refused rebuild still commits what it drained.
@@ -1658,14 +1533,12 @@ resyncRefusesSixThousandAndOnePages =
         List.range 1 6001
             |> List.map (\i -> insertReviewRow db ("t-" ++ String.fromInt i) "ht")
             |> Task.sequence
-        refusal <-
-            resyncReviewedWithinNow bound db
-                |> Task.map (\_ -> Nothing)
-                |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refusal <- resyncReviewedWithinNow bound db
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- indexConn |> Task.andThen Index.loadProgress
         cleanupProgressScratch at
         Task.succeed (maybeContains "6000-page ceiling" refusal && kept.mirrored == 0)
-
 
 
 -- Exactly `pageCeiling x pageSize` pairs still succeeds when a page holds
@@ -1692,7 +1565,6 @@ resyncSucceedsAtExactCeilingTimesPageSize =
         Task.succeed (copied == total && kept.mirrored == total)
 
 
-
 -- `pageCeiling = maxInt` wraps `Task.loop`'s own ceiling (`pageCeiling + 1`)
 -- to a negative value, which `Task.loop` refuses fail-closed before reading
 -- any page. Red if `+` is checked instead of wrapping, or if the wrapped
@@ -1706,15 +1578,15 @@ resyncRefusesMaxIntCeiling =
     do
         at <- freshScratch "ipe-index-progress-maxint"
         db <- seedProgressScratch at
-        refusal <-
-            resyncReviewedWithinNow bound db
-                |> Task.map (\_ -> Nothing)
-                |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refusal <- resyncReviewedWithinNow bound db
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- indexConn |> Task.andThen Index.loadProgress
         cleanupProgressScratch at
         Task.succeed
             (maybeContains "Task.loop needs a step ceiling of at least 1" refusal
-                && kept.mirrored == 0
+                && kept.mirrored
+                == 0
             )
 
 

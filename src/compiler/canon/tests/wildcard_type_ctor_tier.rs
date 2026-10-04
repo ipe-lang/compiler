@@ -505,7 +505,7 @@ fn suggestions_offer_open_imported_ctors() {
             Err(Diagnostic::Name {
                 msg: NameError::ConstructorNotFound { suggestions, .. },
                 ..
-            }) if suggestions.iter().any(|s| s.as_ref() == "Continue")
+            }) if suggestions.names.iter().any(|s| s.as_ref() == "Continue")
         ),
         "a misspelt open-imported ctor pattern must suggest it, got {result:?}"
     );
@@ -520,7 +520,7 @@ fn suggestions_offer_open_imported_ctors() {
             Err(Diagnostic::Name {
                 msg: NameError::ValueNotFound { suggestions, .. },
                 ..
-            }) if suggestions.iter().any(|s| s.as_ref() == "Continue")
+            }) if suggestions.names.iter().any(|s| s.as_ref() == "Continue")
         ),
         "a misspelt open-imported ctor value must suggest it, got {result:?}"
     );

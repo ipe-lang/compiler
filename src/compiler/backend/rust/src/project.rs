@@ -1974,23 +1974,41 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
     assemble_project_files(ctx, rust_sources)
 }
 
-/// Assemble the final [`EmittedProject`] from the already-rendered Rust source
-/// files (`src/main.rs` plus, in the real split, each `src/ipe_mods/<ident>.rs`)
-/// — appending the manifest (`Cargo.toml`) and the trimmed runtime module
-/// files (`ipe_runtime/mod.rs` + `config.rs`).
+/// Refuse a project whose emitted Rust holds a character the Rust lexer
+/// refuses raw.
 ///
-/// **Factored out of [`emit_program`] (design doc §4.4).** This block
-/// is file-count-agnostic — it depends ONLY on `ctx`'s used-kernel flags, never
-/// on how many Rust source files `rust_sources` carries — so the salsa
-/// `emit_manifest` query (`ipe_db`) reuses it verbatim after assembling
-/// `rust_sources` from the per-file [`emit_spine`]/[`emit_module_file`] query
-/// outputs, guaranteeing byte-identity with the single-file `emit_program`
-/// path. Kept a shared helper rather than duplicated, exactly as §4.4 requires.
+/// The output-side half of the lexable seal: every text spliced into emitted
+/// Rust goes through an `ipe_intern::rust_literal` renderer, and this total
+/// scan over every emitted `.rs` file turns a site that bypassed them into an
+/// `ipe`-time [`Diagnostic::CompilerBug`], never a `cargo` lexer error. The
+/// detail names the codepoint as `U+XXXX`, never raw.
 ///
 /// # Errors
 ///
-/// Propagates any [`Diagnostic`] from the `Cargo.toml`/runtime-module
-/// construction (e.g. a drifted server/db/tui/webview manifest anchor).
+/// [`Diagnostic::CompilerBug`] at [`ipe_intern::EMIT_LEXABLE`] on the first
+/// hazard found.
+fn refuse_lexer_hazards(project: &EmittedProject) -> DResult<()> {
+    for (path, text) in &project.files {
+        let is_rust = std::path::Path::new(path.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            continue;
+        }
+        if let Some(hazard) = ipe_intern::find_lexer_hazard(text) {
+            return Err(Diagnostic::CompilerBug {
+                where_: ipe_intern::EMIT_LEXABLE,
+                detail: format!(
+                    "emitted {:?} holds {hazard}; every text spliced into emitted Rust must \
+                     go through an `ipe_intern::rust_literal` renderer",
+                    path.as_str()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A string that is safe to use as the body of a TOML basic (double-quoted)
 /// string. The only constructor is [`SafeTomlString::escape`], which runs the
 /// exhaustive escaper over raw input, so no caller can reach a manifest `"..."`
@@ -2717,8 +2735,44 @@ const _: () = assert!(
      and MOD_APPENDS must carry no append text absent from ALL_MOD_APPEND_TEXTS"
 );
 
-#[allow(clippy::too_many_lines)] // one linear manifest/runtime assembly pass
+/// Assemble the final [`EmittedProject`] and refuse it when an emitted `.rs`
+/// text holds a raw lexer hazard.
+///
+/// The one join point of [`emit_program`] and [`assemble_split_manifest`], so
+/// the lexable seal covers the single-file and the split emit alike.
+///
+/// # Errors
+///
+/// Every [`Diagnostic`] of [`assemble_project_text`] and of
+/// [`refuse_lexer_hazards`].
 fn assemble_project_files(
+    ctx: &EmitCtx,
+    rust_sources: Vec<(RelPath, String)>,
+) -> DResult<EmittedProject> {
+    let project = assemble_project_text(ctx, rust_sources)?;
+    refuse_lexer_hazards(&project)?;
+    Ok(project)
+}
+
+/// Assemble the final [`EmittedProject`] from the already-rendered Rust source
+/// files (`src/main.rs` plus, in the real split, each `src/ipe_mods/<ident>.rs`)
+/// — appending the manifest (`Cargo.toml`) and the trimmed runtime module
+/// files (`ipe_runtime/mod.rs` + `config.rs`).
+///
+/// **Shared by [`emit_program`] and [`assemble_split_manifest`].** This block
+/// is file-count-agnostic — it depends ONLY on `ctx`'s used-kernel flags, never
+/// on how many Rust source files `rust_sources` carries — so the salsa
+/// `emit_manifest` query (`ipe_db`) reuses it verbatim after assembling
+/// `rust_sources` from the per-file [`emit_spine`]/[`emit_module_file`] query
+/// outputs, guaranteeing byte-identity with the single-file `emit_program`
+/// path.
+///
+/// # Errors
+///
+/// Propagates any [`Diagnostic`] from the `Cargo.toml`/runtime-module
+/// construction (e.g. a drifted server/db/tui/webview manifest anchor).
+#[allow(clippy::too_many_lines)] // one linear manifest/runtime assembly pass
+fn assemble_project_text(
     ctx: &EmitCtx,
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
@@ -6758,6 +6812,9 @@ mod escape_toml_basic_tests {
 
 #[cfg(test)]
 mod non_serde_tests {
+    use std::collections::BTreeMap;
+
+    use ipe_backend::RelPath;
     use ipe_diagnostics::DResult;
     use ipe_intern::Interner;
     use ipe_ir::{EnumDef, EnumPayloadTable, IrType, ModPath, Variant, enum_payload_table};
@@ -6836,5 +6893,74 @@ mod non_serde_tests {
             &IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
             &table
         ));
+    }
+
+    /// A project of the given `(path, text)` files.
+    fn project_of(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
+        let mut map = BTreeMap::new();
+        for (path, text) in files {
+            let Ok(path) = RelPath::new(*path) else {
+                return ipe_backend::EmittedProject {
+                    files: BTreeMap::new(),
+                    cargo_toml: String::new(),
+                    uses_webview: false,
+                };
+            };
+            map.insert(path, (*text).to_owned());
+        }
+        ipe_backend::EmittedProject {
+            files: map,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        }
+    }
+
+    /// The output-side lexable seal `emit_program` ends with refuses a raw bidi
+    /// control and a bare CR in any emitted `.rs` file, naming the codepoint as
+    /// `U+XXXX` and never raw; a clean project, CRLF and a hazard in a
+    /// non-Rust file are accepted.
+    #[test]
+    fn emit_program_refuses_a_raw_lexer_hazard() {
+        for (path, text, shown) in [
+            (
+                "src/main.rs",
+                "fn main() { let _ = \"a\u{202E}b\"; }\n",
+                "U+202E",
+            ),
+            (
+                "src/ipe_runtime/x.rs",
+                "// line one\rpub fn f() {}\n",
+                "U+000D",
+            ),
+            (
+                "src/ipe_mods/upper.RS",
+                "pub fn g() { let _ = \"\u{2066}\"; }\n",
+                "U+2066",
+            ),
+        ] {
+            let project = project_of(&[("src/lib_ok.rs", "pub fn ok() {}\n"), (path, text)]);
+            assert_eq!(project.files.len(), 2, "{path}");
+            let refused = super::refuse_lexer_hazards(&project);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, detail })
+                        if *where_ == ipe_intern::EMIT_LEXABLE
+                            && detail.contains(shown)
+                            && detail.contains(path)
+                            && ipe_intern::find_lexer_hazard(detail).is_none()
+                ),
+                "{path}: {refused:?}"
+            );
+        }
+        let clean = project_of(&[
+            (
+                "src/main.rs",
+                "fn main() {\r\n    let _ = \"\\u{202e}\";\r\n}\r\n",
+            ),
+            ("assets/notes.txt", "a\u{202E}b\r"),
+        ]);
+        assert_eq!(clean.files.len(), 2);
+        assert!(super::refuse_lexer_hazards(&clean).is_ok());
     }
 }

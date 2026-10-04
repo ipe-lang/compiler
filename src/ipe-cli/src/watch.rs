@@ -559,7 +559,7 @@ pub(crate) fn resolve_project_sources(
             entry_path,
             blame_path: manifest_path,
             db_driver: manifest.driver,
-            wasm_public_env: manifest.wasm.public_env,
+            wasm_public_env: manifest.wasm.public_env.to_names(),
             cargo_name,
             scope: ScopeSpec::Package {
                 root: package_root,
