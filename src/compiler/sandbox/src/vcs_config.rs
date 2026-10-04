@@ -15,7 +15,7 @@
 //! resolved against the configuration file's directory and the working tree,
 //! `~` through the injected [`Home`]; an option's argument is split again; a
 //! program name passes; any other word, a command substitution, an expansion,
-//! a glob, another user's home, an `ext::` transport, or a relative `..` is
+//! a glob or brace expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
 //! grants, and by a walk that opens each component through a held directory
 //! handle, follows each link it meets (at most [`MAX_LINKS`]), and refuses a
@@ -24,7 +24,7 @@
 //! is bounded by [`ConfigLimits`] or a declared constant, and every
 //! unreadable, oversized, or malformed file refuses.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::num::{NonZeroU32, NonZeroU64};
@@ -480,7 +480,7 @@ pub enum Unprovable {
     TooLong,
     /// A word is neither a program name, a path, an option, nor a number.
     BareWord,
-    /// A word holds a glob character (`*`, `?`, `[`).
+    /// A word holds a glob character (`*`, `?`, `[`) or a brace (`{`, `}`), which the shell expands into words.
     Glob,
     /// The value or its subsection names Git's `ext::` transport, which runs a program.
     ExtTransport,
@@ -521,7 +521,8 @@ impl fmt::Display for Unprovable {
                  file relative to the directory the tool runs in",
             ),
             Self::Glob => f.write_str(
-                "it holds a glob pattern, whose matches are unknown until the tool runs",
+                "it holds a glob pattern or a brace expansion, which the shell expands into \
+                 words the scan does not see",
             ),
             Self::ExtTransport => f.write_str("it runs a program through Git's `ext::` transport"),
             Self::HardLinked => f.write_str(
@@ -866,7 +867,7 @@ pub fn scan(
         paths: 0,
         pending: Vec::new(),
         scopes: 0,
-        remotes: BTreeSet::new(),
+        remotes: BTreeMap::new(),
         deferred: Vec::new(),
     };
     run.seed(roots)?;
@@ -888,7 +889,30 @@ enum Syntax {
     /// Darcs's line-per-preference files.
     Darcs,
     /// A Git `remotes/` or `branches/` file naming a remote's URL.
-    GitRemote,
+    GitRemote(RemoteFile),
+}
+
+/// Which of Git's two per-remote file layouts a remote file follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteFile {
+    /// A `remotes/` file: `URL:`, `Push:`, and `Pull:` lines.
+    Remotes,
+    /// A `branches/` file: a URL on its first line, then `#` and a branch.
+    Branches,
+}
+
+/// What the files read so far say of one Git remote's URLs.
+///
+/// Git uses a remote's name as a URL, so as a path relative to the directory
+/// it runs in, when the remote has no URL. An empty `url` value clears the
+/// URLs set before it; the scan does not read files in the tool's order, so a
+/// cleared remote stays undefined whatever is set after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteUrls {
+    /// A non-empty URL is set, and no empty `url` value was seen.
+    Set,
+    /// An empty `url` value was seen.
+    Cleared,
 }
 
 /// The configuration a Git remote name is looked up in.
@@ -1300,8 +1324,8 @@ struct Scan<'s> {
     pending: Vec<Pending>,
     /// Scopes opened so far besides [`Scope::Main`].
     scopes: u32,
-    /// The Git remotes defined with a URL, by the configuration defining them.
-    remotes: BTreeSet<(Scope, String)>,
+    /// The Git remotes given a URL or cleared, by the configuration naming them.
+    remotes: BTreeMap<(Scope, String), RemoteUrls>,
     /// Remote-name values waiting for every remote to be known.
     deferred: Vec<Deferred>,
 }
@@ -1404,7 +1428,7 @@ impl Scan<'_> {
                 }
                 self.seed_worktrees(common, gitdir)?;
                 self.seed_modules(common)?;
-                self.seed_remote_files(common)?;
+                self.seed_remote_files(common, Scope::Main)?;
             }
             ConfigRoots::Mercurial { dot_hg, shared } => {
                 self.require(dot_hg)?;
@@ -1455,16 +1479,22 @@ impl Scan<'_> {
             self.queue_in(gitdir.join("config"), Syntax::Git, scope);
             self.queue_in(gitdir.join("config.worktree"), Syntax::Git, scope);
             self.list_hooks(&gitdir.join("hooks"))?;
+            self.seed_remote_files(&gitdir, scope)?;
         }
         Ok(())
     }
 
-    /// Queue every file of `common/remotes` and `common/branches`, each defining the remote it is named for.
+    /// Queue every file of `common/remotes` and `common/branches` in `scope`, each naming the remote it is named for.
     ///
-    /// A directory there would name a remote holding a `/`, read from a file
+    /// A file defines its remote only once read, when it holds a URL. A
+    /// directory there would name a remote holding a `/`, read from a file
     /// below it; it is refused rather than walked.
-    fn seed_remote_files(&mut self, common: &Path) -> Result<(), ConfigRefusal> {
-        for listed in ["remotes", "branches"] {
+    fn seed_remote_files(&mut self, common: &Path, scope: Scope) -> Result<(), ConfigRefusal> {
+        let layouts = [
+            ("remotes", RemoteFile::Remotes),
+            ("branches", RemoteFile::Branches),
+        ];
+        for (listed, layout) in layouts {
             let Some((dir, real)) = self.open_dir(&common.join(listed))? else {
                 continue;
             };
@@ -1477,10 +1507,7 @@ impl Scan<'_> {
                     let fault = ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Dir));
                     return Err(self.unreadable(&path, fault));
                 }
-                if let Some(remote) = name.as_os_str().to_str() {
-                    self.remotes.insert((Scope::Main, remote.to_owned()));
-                }
-                self.queue(path, Syntax::GitRemote);
+                self.queue_in(path, Syntax::GitRemote(layout), scope);
             }
         }
         Ok(())
@@ -1535,6 +1562,7 @@ impl Scan<'_> {
                 self.queue_in(real.join("config"), Syntax::Git, module);
                 self.queue_in(real.join("config.worktree"), Syntax::Git, module);
                 self.list_hooks(&real.join("hooks"))?;
+                self.seed_remote_files(&real, module)?;
                 self.count_path(&real)?;
                 stack.push((real.join("modules"), below));
             } else {
@@ -1952,7 +1980,13 @@ impl Scan<'_> {
             }
             Syntax::Toml => self.judge_toml(&ctx, &text),
             Syntax::Darcs => self.judge_entries(&ctx, &parse_darcs(&text)),
-            Syntax::GitRemote => self.judge_entries(&ctx, &parse_git_remote(&text)),
+            Syntax::GitRemote(layout) => {
+                let remote = ctx.source.file_name().and_then(OsStr::to_str);
+                if let Some(name) = remote.filter(|_| remote_file_has_url(&text, layout)) {
+                    self.note_urls(ctx.scope, name, RemoteUrls::Set);
+                }
+                self.judge_entries(&ctx, &parse_git_remote(&text))
+            }
         }
     }
 
@@ -1966,12 +2000,12 @@ impl Scan<'_> {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
                         .map_err(&refuse)?;
-                    self.note_remote(ctx.scope, &entry.setting);
+                    self.note_remote(ctx.scope, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
                 Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
-                Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
+                Syntax::GitRemote(_) => Route::Judge(Role::Url { scp: true }),
             };
             match route {
                 Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
@@ -2008,8 +2042,8 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Record the remote a `remote.<name>.url` setting in `scope` defines.
-    fn note_remote(&mut self, scope: Scope, setting: &Setting) {
+    /// Record what a `remote.<name>.url` setting in `scope` says of the remote: an empty value clears its URLs.
+    fn note_remote(&mut self, scope: Scope, setting: &Setting, value: &str) {
         if let Setting::Key {
             section,
             subsection: Some(name),
@@ -2018,20 +2052,41 @@ impl Scan<'_> {
             && &**section == "remote"
             && key.eq_ignore_ascii_case("url")
         {
-            self.remotes.insert((scope, String::from(&**name)));
+            let urls = if value.is_empty() {
+                RemoteUrls::Cleared
+            } else {
+                RemoteUrls::Set
+            };
+            self.note_urls(scope, name, urls);
+        }
+    }
+
+    /// Record `urls` for the remote `name` in `scope`; a cleared remote stays cleared.
+    fn note_urls(&mut self, scope: Scope, name: &str, urls: RemoteUrls) {
+        let slot = self.remotes.entry((scope, name.to_owned())).or_insert(urls);
+        if urls == RemoteUrls::Cleared {
+            *slot = RemoteUrls::Cleared;
         }
     }
 
     /// Judge every remote-name value naming no remote its scope sees as a URL.
+    ///
+    /// A remote is defined when a scope the name is looked up in sets a URL
+    /// for it and none clears its URLs.
     fn judge_deferred(&mut self) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
         for item in std::mem::take(&mut self.deferred) {
             let looked_up = item.ctx.scope;
-            let defined = [Some(looked_up), looked_up.parent()]
-                .into_iter()
-                .flatten()
-                .any(|scope| self.remotes.contains(&(scope, item.value.clone())));
-            if defined {
+            let mut set = false;
+            let mut cleared = false;
+            for scope in [Some(looked_up), looked_up.parent()].into_iter().flatten() {
+                match self.remotes.get(&(scope, item.value.clone())) {
+                    Some(RemoteUrls::Set) => set = true,
+                    Some(RemoteUrls::Cleared) => cleared = true,
+                    None => {}
+                }
+            }
+            if set && !cleared {
                 continue;
             }
             self.judge(&item.ctx, &Role::Url { scp: true }, &item.value)
@@ -2177,13 +2232,17 @@ impl Scan<'_> {
     /// A path-shaped word is resolved; an option's attached argument and a
     /// compound word's pieces are pushed back to be judged in turn; a program
     /// name, a number, and the empty word pass; any other word may name a file
-    /// relative to the directory the tool runs in, so it is unprovable.
+    /// relative to the directory the tool runs in, so it is unprovable. A word
+    /// holding whitespace, which a program may run again as a command line
+    /// (`sh -c '...'`), also has its shell words pushed back as one: each
+    /// re-split drops a quote or a space, so the text shrinks and
+    /// [`MAX_WORDS`] bounds the pushes.
     fn judge_queue(&mut self, ctx: &FileCtx, words: &mut Words) -> Result<(), Stop> {
         while let Some((word, position)) = words.stack.pop() {
             if word.len() > MAX_PATH_BYTES {
                 return Err(unproven(Unprovable::TooLong));
             }
-            if word.contains(['*', '?', '[']) {
+            if word.contains(is_expansion_char) {
                 return Err(unproven(Unprovable::Glob));
             }
             let text = strip_runners(&word);
@@ -2205,6 +2264,11 @@ impl Scan<'_> {
                     .map_err(unproven)?;
                 continue;
             }
+            if text.contains(is_c_space) {
+                words
+                    .push_split(text, Position::Program)
+                    .map_err(unproven)?;
+            }
             let shaped = is_path_shaped(text);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
@@ -2225,13 +2289,18 @@ impl Scan<'_> {
     }
 
     /// Judge `text` as one path whatever its shape; empty text names nothing.
+    ///
+    /// Surrounding whitespace is trimmed, which only moves the path within
+    /// its directory or makes it absolute; text of whitespace alone (a quoted
+    /// `" "`) still names the entry of that name, so it is kept whole.
     fn judge_forced(
         &mut self,
         ctx: &FileCtx,
         text: &str,
         reach: Reach,
     ) -> Result<Vec<(PathBuf, Resolved)>, Stop> {
-        let path = strip_runners(text.trim_matches(is_c_space));
+        let trimmed = text.trim_matches(is_c_space);
+        let path = strip_runners(if trimmed.is_empty() { text } else { trimmed });
         if path.is_empty() {
             return Ok(Vec::new());
         }
@@ -2487,6 +2556,14 @@ fn is_network_url(value: &str, scp: bool) -> bool {
 /// A path separator of the host.
 const fn is_separator(c: char) -> bool {
     c == '/' || (cfg!(windows) && c == '\\')
+}
+
+/// A character the shell expands a word at: a glob character or a brace.
+///
+/// A brace expansion (`{sh,evil}`) turns one word into several, the first a
+/// program, so its pieces have no position the scan can prove.
+const fn is_expansion_char(c: char) -> bool {
+    matches!(c, '*' | '?' | '[' | '{' | '}')
 }
 
 /// A character a shell or tool splits one word into several at.
@@ -3010,6 +3087,27 @@ fn parse_git_remote(text: &str) -> Vec<Entry> {
         });
     }
     entries
+}
+
+/// Whether a remote file in `layout` gives its remote a non-empty URL, read as Git reads it.
+///
+/// Git reads a `remotes/` file's `URL:` lines only, each trimmed at the end
+/// and after the prefix, and a `branches/` file's first line, trimmed, up to
+/// a `#`. A file giving no URL leaves the remote undefined, so Git reads its
+/// name as a URL.
+fn remote_file_has_url(text: &str, layout: RemoteFile) -> bool {
+    match layout {
+        RemoteFile::Remotes => text.lines().any(|line| {
+            line.trim_end_matches(is_c_space)
+                .strip_prefix("URL:")
+                .is_some_and(|url| !url.trim_start_matches(is_c_space).is_empty())
+        }),
+        RemoteFile::Branches => text.lines().next().is_some_and(|line| {
+            let line = line.trim_matches(is_c_space);
+            let url = line.split_once('#').map_or(line, |(url, _)| url);
+            !url.is_empty()
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3679,6 +3777,131 @@ mod tests {
         );
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.other.join("r").as_path()));
+    }
+
+    #[test]
+    fn remote_without_url_judged_by_name() {
+        let f = fixture("remotenourl");
+        let branch = "[branch \"main\"]\n\tremote = evil\n";
+        for remote in [
+            "[remote \"evil\"]\n\turl =\n",
+            "[remote \"evil\"]\n\turl = https://example.com/r\n\turl =\n",
+        ] {
+            git_config(&f, &format!("{remote}{branch}"));
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{remote:?}"
+            );
+        }
+
+        git_config(&f, branch);
+        let remotes = f.tree.join(".git/remotes/evil");
+        for text in ["", "Pull: refs/heads/*:refs/remotes/evil/*\n", "URL:  \n"] {
+            write(&remotes, text);
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}"
+            );
+        }
+        write(&remotes, "URL: https://example.com/r\n");
+        assert_eq!(scan_git(&f), Ok(()));
+        std::fs::remove_file(&remotes).expect("remove fixture file");
+
+        let branches = f.tree.join(".git/branches/evil");
+        write(&branches, "\nhttps://example.com/r\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+        write(&branches, "https://example.com/r#main\n");
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn whitespace_only_url_names_an_entry() {
+        let f = fixture("spaceurl");
+        git_config(&f, "[remote \"origin\"]\n\turl = \" \"\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join(" ").as_path()));
+    }
+
+    #[test]
+    fn module_and_jj_git_remote_files_judged() {
+        let f = fixture("moduleremotes");
+        let tree = f.tree.display();
+        let module = f.tree.join(".git/modules/sub");
+        write(&module.join("config"), "");
+        let remotes = module.join("remotes/origin");
+        write(&remotes, &format!("URL: {tree}/evil\n"));
+        let result = scan_git(&f);
+        assert_eq!(source(&result), Some(remotes.as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+
+        // A module's remote is defined for the module, never for the repository above it.
+        write(&remotes, "URL: https://example.com/r\n");
+        git_config(&f, "[branch \"main\"]\n\tremote = origin\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("origin").as_path()));
+        git_config(&f, "");
+        write(
+            &module.join("config"),
+            "[branch \"main\"]\n\tremote = origin\n",
+        );
+        assert_eq!(scan_git(&f), Ok(()));
+
+        let dot_jj = f.tree.join(".jj");
+        let repo = dot_jj.join("repo");
+        let jj_remotes = repo.join("store/git/remotes/origin");
+        write(&jj_remotes, &format!("URL: {tree}/evil\n"));
+        let roots = ConfigRoots::Jujutsu {
+            dot_jj: &dot_jj,
+            repo: &repo,
+        };
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(source(&result), Some(jj_remotes.as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn brace_expansion_refused() {
+        let f = fixture("brace");
+        for text in [
+            "[alias]\n\tx = !{sh,evil}\n",
+            "[core]\n\tpager = {sh,evil}\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::Glob),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_command_line_words_judged() {
+        let f = fixture("nestedline");
+        let out = f.out.display();
+        let tree = f.tree.display();
+        for key in ["[core]\n\tpager = ", "[alias]\n\tx = !"] {
+            git_config(&f, &format!("{key}sh -c '{out}/run {tree}/evil.sh'\n"));
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil.sh").as_path()),
+                "{key:?}"
+            );
+            git_config(&f, &format!("{key}sh -c '{out}/run evil'\n"));
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::BareWord),
+                "{key:?}"
+            );
+            git_config(&f, &format!("{key}sh -c '{out}/run {out}/x.sh'\n"));
+            assert_eq!(scan_git(&f), Ok(()), "{key:?}");
+        }
     }
 
     #[test]
