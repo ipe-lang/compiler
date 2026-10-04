@@ -945,6 +945,61 @@ pub struct NativeBuild {
     pub quiet: bool,
 }
 
+/// The cargo build of an emitted native crate together with its enforcement
+/// artifacts: the one path every floored dev and release build takes.
+struct FlooredBuild<'a> {
+    /// The resolved `cargo`.
+    cargo: &'a toolchain::CargoBin,
+    /// The emitted crate, both floored and built.
+    crate_dir: &'a OwnedDir,
+    /// The enforcement profile of a native-bearing program; `None` for pure Ipê,
+    /// which is structurally bounded and carries neither profile nor floor.
+    enforcement: Option<&'a ipe_sandbox::run_jail::SandboxProfile>,
+    /// The pipeline building the crate: it names the floor and picks the cargo
+    /// profile, so a release floor is never built as a debug binary.
+    intent: ipe_backend_rust::BuildIntent,
+    /// The compile target.
+    target: CargoTarget,
+    /// Where cargo's output goes.
+    output: CargoOutput,
+    /// What is built, named in the failure diagnostic.
+    what: &'static str,
+    /// The runtime crate the build links against, when resolved.
+    runtime: Option<RuntimeContext>,
+}
+
+impl FlooredBuild<'_> {
+    /// Write the `ipe.profile` mirror and the embedded floor, then run cargo, so
+    /// the binary cargo produces carries exactly this build's floor — never
+    /// none and never a stale one left by an earlier build.
+    ///
+    /// # Errors
+    /// The errors of [`run_sandbox::write_build_artifacts`] and
+    /// [`CargoBuild::run`].
+    fn run(self) -> Result<String, CliError> {
+        if let Some(profile) = self.enforcement {
+            run_sandbox::write_build_artifacts(
+                self.crate_dir,
+                profile,
+                run_sandbox::floor_intent(self.intent),
+            )?;
+        }
+        CargoBuild {
+            cargo: self.cargo,
+            krate: CargoCrate::Emitted(self.crate_dir),
+            profile: match self.intent {
+                ipe_backend_rust::BuildIntent::Development => CargoProfile::Dev,
+                ipe_backend_rust::BuildIntent::Release => CargoProfile::Release,
+            },
+            target: self.target,
+            output: self.output,
+            what: self.what,
+            runtime: self.runtime,
+        }
+        .run()
+    }
+}
+
 /// Compile the just-emitted native crate and write its runtime-enforcement
 /// artifacts. Split out of [`run_build`] so each stays a readable unit.
 ///
@@ -1007,19 +1062,17 @@ pub fn compile_and_finalize_native_build(
         .as_ref()
         .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
     let resolved = consented.resolved();
-    if run_sandbox::is_native_bearing(&resolved.union()) {
-        let profile = run_sandbox::build_profile(resolved, driver)?;
-        run_sandbox::write_build_artifacts(
-            crate_dir,
-            &profile,
-            run_sandbox::floor_intent(Verb::DEV_BUILD.intent()),
-        )?;
-    }
+    let enforcement = if run_sandbox::is_native_bearing(&resolved.union()) {
+        Some(run_sandbox::build_profile(resolved, driver)?)
+    } else {
+        None
+    };
 
-    CargoBuild {
+    FlooredBuild {
         cargo: &cargo_bin,
-        krate: CargoCrate::Emitted(crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir,
+        enforcement: enforcement.as_ref(),
+        intent: Verb::DEV_BUILD.intent(),
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
@@ -1712,19 +1765,12 @@ pub fn release_pipeline(
         options,
     )?;
 
-    // Write the capability enforcement artifacts (ipe.profile + embedded floor)
-    // BEFORE the build, so the binary cargo produces carries exactly this floor.
     let profile = run_sandbox::build_profile(resolved, driver)?;
-    run_sandbox::write_build_artifacts(
-        &app_dir,
-        &profile,
-        run_sandbox::floor_intent(verb.intent()),
-    )?;
-
-    CargoBuild {
+    FlooredBuild {
         cargo: &cargo_bin,
-        krate: CargoCrate::Emitted(&app_dir),
-        profile: CargoProfile::Release,
+        crate_dir: &app_dir,
+        enforcement: Some(&profile),
+        intent: verb.intent(),
         target: CargoTarget::Static(triple),
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the release app",
@@ -4340,44 +4386,57 @@ mod held_crate_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The enforcement artifacts are written before cargo builds the crate, so
-    /// the binary cargo produces embeds this build's floor (a development
-    /// build's), never none and never a stale one from an earlier build.
-    #[test]
-    fn the_dev_build_embeds_its_floor_before_cargo_runs() {
-        use std::collections::BTreeSet;
-
-        use super::{ConsentedCapabilities, NativeBuild, compile_and_finalize_native_build};
-        use crate::output_dir::{OutputRoot, ProjectPaths};
-        use crate::run_sandbox::{self, ResolvedCapabilities};
-        use ipe_ir::Capability;
-        use ipe_sandbox::run_jail::FloorIntent;
-
-        let (base, crate_dir) = scratch("floor-first");
+    /// A claimed crate holding a bare `src/main.rs`, and a stub `cargo` that
+    /// records the `main.rs` and the arguments it was handed, then fails the
+    /// build. Returns `(base, crate, cargo, seen main.rs, seen arguments)`.
+    fn floor_recording_build(tag: &str) -> (PathBuf, OwnedDir, PathBuf, PathBuf, PathBuf) {
+        let (base, crate_dir) = scratch(tag);
         let src = crate_dir.path().join("src");
         std::fs::create_dir_all(&src).expect("src dir");
         std::fs::write(src.join("main.rs"), "fn main() {\n}\n").expect("main.rs");
-        // The stub records the `main.rs` cargo was handed, then fails the build.
         let seen = base.join("seen-main.rs");
+        let seen_args = base.join("seen-args");
         let cargo = stub(
             &base,
             "cargo",
             &format!(
-                "[ \"$1\" = generate-lockfile ] && exit 0\ncat '{}' > '{}'\nexit 1",
+                "[ \"$1\" = generate-lockfile ] && exit 0\ncat '{}' > '{}'\n\
+                 echo \"$@\" > '{}'\nexit 1",
                 src.join("main.rs").display(),
-                seen.display()
+                seen.display(),
+                seen_args.display()
             ),
         );
+        (base, crate_dir, cargo, seen, seen_args)
+    }
+
+    /// The resolved capabilities of a native-bearing program.
+    fn native_bearing() -> crate::run_sandbox::ResolvedCapabilities {
+        let native = std::collections::BTreeSet::from([ipe_ir::Capability::NativeFfi]);
+        crate::run_sandbox::ResolvedCapabilities {
+            inferred: native.clone(),
+            declared: native,
+        }
+    }
+
+    /// The enforcement artifacts are written before cargo builds the crate, so
+    /// the binary cargo produces embeds this build's floor (a development
+    /// build's), never none and never a stale one from an earlier build.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn the_dev_build_embeds_its_floor_before_cargo_runs() {
+        use super::{ConsentedCapabilities, NativeBuild, compile_and_finalize_native_build};
+        use crate::output_dir::{OutputRoot, ProjectPaths};
+        use crate::run_sandbox;
+        use ipe_sandbox::run_jail::FloorIntent;
+
+        let (base, crate_dir, cargo, seen, _) = floor_recording_build("floor-first");
         let project = base.join("project");
         std::fs::create_dir_all(&project).expect("project dir");
         let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
         let output = OutputRoot::at(&base.join("out"), &paths).expect("output root");
-        let native = BTreeSet::from([Capability::NativeFfi]);
         let consented = ConsentedCapabilities {
-            resolved: ResolvedCapabilities {
-                inferred: native.clone(),
-                declared: native,
-            },
+            resolved: native_bearing(),
         };
         let built = compile_and_finalize_native_build(
             &output,
@@ -4402,6 +4461,58 @@ mod held_crate_tests {
                 FloorIntent::Development
             )),
             "cargo must build a main.rs already carrying the development floor:\n{handed}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The release app build takes the same floored path as the dev build: cargo
+    /// is handed a `main.rs` already carrying the release floor, and builds it
+    /// `--release` for the static target.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn the_release_build_embeds_its_floor_before_cargo_runs() {
+        use super::FlooredBuild;
+        use crate::run_sandbox;
+        use crate::verb::Verb;
+        use ipe_backend_rust::static_build::StaticTriple;
+        use ipe_sandbox::run_jail::FloorIntent;
+
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("release-floor");
+        let profile =
+            run_sandbox::build_profile(&native_bearing(), ipe_backend_rust::DbDriver::Sqlite)
+                .expect("profile");
+        let triple = StaticTriple::X8664LinuxMusl;
+        let built = FlooredBuild {
+            cargo: &CargoBin::stub(cargo),
+            crate_dir: &crate_dir,
+            enforcement: Some(&profile),
+            intent: Verb::RELEASE_BUILD.intent(),
+            target: CargoTarget::Static(triple),
+            output: CargoOutput::Human(Verbosity::Quiet),
+            what: "the release app",
+            runtime: None,
+        }
+        .run();
+        assert!(built.is_err(), "the stub fails the build: {built:?}");
+        let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        assert!(
+            handed.contains(&run_sandbox::capfloor_static_source(
+                &profile,
+                FloorIntent::Release
+            )),
+            "cargo must build a main.rs already carrying the release floor:\n{handed}"
+        );
+        assert!(
+            !handed.contains(&run_sandbox::capfloor_static_source(
+                &profile,
+                FloorIntent::Development
+            )),
+            "a release build never carries the development floor:\n{handed}"
+        );
+        let args = std::fs::read_to_string(&seen_args).expect("cargo arguments");
+        assert!(
+            args.contains("--release") && args.contains(&format!("--target {}", triple.as_str())),
+            "a release floor is built --release for its static target: {args}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
