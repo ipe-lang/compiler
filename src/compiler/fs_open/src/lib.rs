@@ -124,6 +124,24 @@ impl fmt::Display for FileKind {
     }
 }
 
+/// What a directory listing says an entry is, taken from the listing itself without a stat.
+///
+/// [`HintedKind::Unknown`] is the listing declining to say; the one way to
+/// settle it is [`HeldDir::kind_of_unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HintedKind {
+    /// A directory.
+    Dir,
+    /// A regular file.
+    Regular,
+    /// A symbolic link (on Windows, any reparse point).
+    Link,
+    /// A FIFO, socket, or device.
+    Other,
+    /// The listing did not carry a type.
+    Unknown,
+}
+
 /// Why an entry was not opened or read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenRefusal {
@@ -315,6 +333,45 @@ impl HeldDir {
             }
         }
         Ok(found)
+    }
+
+    /// Every entry of this directory and its listing type hint, `.` and `..` excluded.
+    ///
+    /// Never stats and never opens a child: the kind is read from the
+    /// directory entry itself (`d_type` on Unix, the find data on Windows).
+    /// The cap is charged as each entry is listed, so a directory holding more
+    /// than `cap` entries is refused before any entry is acted on.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Link`] when
+    /// the held directory turned into a reparse point (Windows);
+    /// [`OpenRefusal::BadName`] for a listed name no handle-relative open can
+    /// take; another refusal on another failure.
+    pub fn entries_hinted(
+        &self,
+        cap: EntryCap,
+    ) -> Result<Vec<(EntryName, HintedKind)>, OpenRefusal> {
+        let mut found = Vec::new();
+        let mut seen: u32 = 0;
+        for listed in self.dir.hinted_names()? {
+            let listed = listed?;
+            seen = seen.saturating_add(1);
+            if seen > cap.get() {
+                return Err(OpenRefusal::TooManyEntries(cap));
+            }
+            found.push(listed);
+        }
+        Ok(found)
+    }
+
+    /// What the entry `name` is, by a no-follow stat; the way to settle a [`HintedKind::Unknown`].
+    ///
+    /// `None` when the entry vanished.
+    ///
+    /// # Errors
+    /// The refusal of a failure other than absence.
+    pub fn kind_of_unknown(&self, name: &EntryName) -> Result<Option<FileKind>, OpenRefusal> {
+        self.dir.kind_of(name)
     }
 
     /// Open the directory above this one through the handle, not a path; `None` at the root.

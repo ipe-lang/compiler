@@ -10,7 +10,7 @@ use std::path::Path;
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::{EntryName, FileId, FileKind, OpenRefusal};
+use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal};
 
 /// A held directory descriptor.
 #[derive(Debug)]
@@ -75,6 +75,19 @@ const fn kind_of_stat_type(file_type: FileType) -> FileKind {
         FileType::Socket => FileKind::Socket,
         FileType::CharacterDevice | FileType::BlockDevice => FileKind::Device,
         FileType::Unknown => FileKind::Other,
+    }
+}
+
+/// The hint a directory entry's `d_type` carries; a filesystem that leaves it unset yields `Unknown`.
+const fn hint_of_dirent_type(file_type: FileType) -> HintedKind {
+    match file_type {
+        FileType::RegularFile => HintedKind::Regular,
+        FileType::Directory => HintedKind::Dir,
+        FileType::Symlink => HintedKind::Link,
+        FileType::Fifo | FileType::Socket | FileType::CharacterDevice | FileType::BlockDevice => {
+            HintedKind::Other
+        }
+        FileType::Unknown => HintedKind::Unknown,
     }
 }
 
@@ -181,11 +194,24 @@ impl Dir {
     pub fn names(
         &self,
     ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
+        Ok(self
+            .hinted_names()?
+            .map(|listed| listed.map(|(name, _)| name)))
+    }
+
+    /// The names of this directory's entries with their `d_type` hint, `.` and `..` excluded; never stats.
+    pub fn hinted_names(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<(EntryName, HintedKind), OpenRefusal>>, OpenRefusal>
+    {
         let entries = rustix::fs::Dir::read_from(&self.0).map_err(refusal)?;
         Ok(entries.filter_map(|entry| match entry {
             Ok(entry) => {
                 let name = OsStr::from_bytes(entry.file_name().to_bytes());
-                (name != "." && name != "..").then(|| EntryName::parse(name))
+                (name != "." && name != "..").then(|| {
+                    EntryName::parse(name)
+                        .map(|name| (name, hint_of_dirent_type(entry.file_type())))
+                })
             }
             Err(errno) => Some(Err(refusal(errno))),
         }))

@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 
-use crate::{EntryName, FileId, FileKind, OpenRefusal};
+use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal};
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -68,6 +68,33 @@ const fn kind_of_attributes(attributes: u32) -> Option<FileKind> {
     } else {
         None
     }
+}
+
+/// The hint find-data `attributes` carry: a reparse point is a link, never a directory.
+///
+/// A directory listing of a volume holds only files, directories and reparse
+/// points, so an entry that is neither of the last two is a regular file.
+pub const fn hint_of_attributes(attributes: u32) -> HintedKind {
+    if attributes & ATTR_REPARSE_POINT != 0 {
+        HintedKind::Link
+    } else if attributes & ATTR_DIRECTORY != 0 {
+        HintedKind::Dir
+    } else {
+        HintedKind::Regular
+    }
+}
+
+/// The name and hint of one listed entry, read from the find data the listing already holds.
+fn hinted_entry(
+    entry: io::Result<std::fs::DirEntry>,
+) -> Result<(EntryName, HintedKind), OpenRefusal> {
+    let entry = entry.map_err(|e| refusal_of(&e))?;
+    let name = EntryName::parse(&entry.file_name())?;
+    let attributes = entry
+        .metadata()
+        .map_err(|e| refusal_of(&e))?
+        .file_attributes();
+    Ok((name, hint_of_attributes(attributes)))
 }
 
 /// The kind and length of the object `file` holds, read from that handle.
@@ -249,13 +276,21 @@ impl Dir {
     pub fn names(
         &self,
     ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
+        Ok(self
+            .hinted_names()?
+            .map(|listed| listed.map(|(name, _)| name)))
+    }
+
+    /// The names of this directory's entries with the hint their find data carries; never opens an entry.
+    ///
+    /// Proven as [`Dir::names`] is, before any entry is read.
+    pub fn hinted_names(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<(EntryName, HintedKind), OpenRefusal>>, OpenRefusal>
+    {
         let entries = std::fs::read_dir(&self.real).map_err(|e| refusal_of(&e))?;
         self.reprove()?;
-        Ok(entries.map(|entry| {
-            entry
-                .map_err(|e| refusal_of(&e))
-                .and_then(|entry| EntryName::parse(&entry.file_name()))
-        }))
+        Ok(entries.map(hinted_entry))
     }
 
     /// Open the directory above this one; `None` at the volume root.
