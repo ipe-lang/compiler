@@ -34,7 +34,7 @@
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4413, SandboxError};
 use ipe_kernels::Capability;
@@ -806,9 +806,9 @@ pub fn probe_run_jail_tools(_wants_wall_clock: bool) -> Result<RunJailTools, Run
 pub fn exec_in_run_jail(
     _tools: &RunJailTools,
     _profile: &SandboxProfile,
-    _scoped_tmp: &Path,
-    _working_tree: &Path,
-    _app: &Path,
+    _scoped_tmp: &std::path::Path,
+    _working_tree: &std::path::Path,
+    _app: &std::path::Path,
     _app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
     Err(RunJailDefect::UnsupportedPlatform {
@@ -884,8 +884,8 @@ pub fn write_sealed_app_memfd(bytes: &[u8]) -> Result<SealedApp, RunJailDefect> 
 pub fn exec_embedded_in_run_jail(
     _tools: &RunJailTools,
     _profile: &SandboxProfile,
-    _scoped_tmp: &Path,
-    _working_tree: &Path,
+    _scoped_tmp: &std::path::Path,
+    _working_tree: &std::path::Path,
     _app: &SealedApp,
     _app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
@@ -898,6 +898,7 @@ pub fn exec_embedded_in_run_jail(
 mod tests {
     use super::*;
     use crate::{CanonicalPath, HomeMasks};
+    use std::path::Path;
 
     /// An absent anchor token attaches nothing and leaves the argv byte-identical.
     #[cfg(unix)]
