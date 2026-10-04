@@ -5,9 +5,13 @@
 //! under `release`; the bare forms are refused at parse time. A doc, script,
 //! template, or comment that still spells a bare form teaches a command that
 //! fails, so this scan walks the tracked tree (`git ls-files`, minus the
-//! history files `CHANGELOG.md` and `docs/adr/`) and fails on each line that
+//! trees that carry a reader-facing spelling) and fails on each line that
 //! names the `ipe` binary followed by a bare `build`, `run`, `exec`, `watch`,
 //! or `eject`, or by `release` and anything but one of its verbs.
+//!
+//! The scan reads only the trees it lists. A tracked tree it neither lists nor
+//! sets aside is refused, so a new tree cannot slip past unscanned; the files
+//! it sets aside are history or licensing text that no build or test reads.
 //!
 //! The binary is every spelling a command line opens with: `ipe`, `ipe.exe`,
 //! a quoted one, and a shell variable naming it (`$IPE`, `"$ipe_bin"`,
@@ -28,11 +32,60 @@ use ipe::io_bounded::{SOURCE_READ_CAP, read_to_string_capped};
 /// Files allowed to spell a refused form: this scan, whose fixtures must.
 const EXEMPT: &[&str] = &["src/ipe-cli/tests/verb_prose_ratchet.rs"];
 
-/// History files that record the forms as they were.
-const HISTORY_FILE: &str = "CHANGELOG.md";
+/// Top-level trees whose every tracked file is scanned.
+const SCANNED_TREES: &[&str] = &[
+    "src", "tests", "examples", "tools", ".github", "editors", "packages", ".config", ".cargo",
+];
 
-/// The directory of decision records, history by design.
-const HISTORY_DIR: &str = "docs/adr/";
+/// Subtrees of the documentation tree that are scanned.
+const SCANNED_DOCS: &[&str] = &["guide", "reference", "idioms", "topics", "constructs"];
+
+/// Subtrees of the documentation tree that are set aside: decision records,
+/// images, and the divergence note.
+const SET_ASIDE_DOCS: &[&str] = &["adr", "assets", "divergences-from-elm.md"];
+
+/// The documentation tree.
+const DOCS_TREE: &str = "docs";
+
+/// Root files that are scanned; every other root file is configuration,
+/// licensing text, or the generated changelog.
+const SCANNED_ROOT_FILES: &[&str] = &["README.md", "AGENTS.md", "PRINCIPLES.md", "install.sh"];
+
+/// What the scan does with one tracked path.
+#[derive(Debug, PartialEq, Eq)]
+enum Scope {
+    Scanned,
+    SetAside,
+    Unclassified,
+}
+
+/// The scan's decision for the workspace-relative `rel`.
+fn scope_of(rel: &str) -> Scope {
+    let mut parts = rel.split('/');
+    let (Some(top), second) = (parts.next(), parts.next()) else {
+        return Scope::Unclassified;
+    };
+    match second {
+        None => {
+            if SCANNED_ROOT_FILES.contains(&top) {
+                Scope::Scanned
+            } else {
+                Scope::SetAside
+            }
+        }
+        Some(sub) if top == DOCS_TREE => {
+            if SCANNED_DOCS.contains(&sub) {
+                Scope::Scanned
+            } else if SET_ASIDE_DOCS.contains(&sub) {
+                Scope::SetAside
+            } else {
+                Scope::Unclassified
+            }
+        }
+        Some(_) if SCANNED_TREES.contains(&top) => Scope::Scanned,
+        Some(_) => Scope::Unclassified,
+    }
+}
 
 /// Verbs refused when they follow `ipe` directly.
 const BARE_VERBS: &[&str] = &["build", "run", "exec", "watch", "eject"];
@@ -199,9 +252,20 @@ fn tracked() -> Vec<String> {
     let Ok(listed) = listed else {
         return Vec::new();
     };
-    let paths: Vec<String> = listed
-        .split('\0')
-        .filter(|rel| !rel.is_empty() && *rel != HISTORY_FILE && !rel.starts_with(HISTORY_DIR))
+    let all: Vec<&str> = listed.split('\0').filter(|rel| !rel.is_empty()).collect();
+    let unclassified: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|rel| scope_of(rel) == Scope::Unclassified)
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "these tracked paths sit in a tree the verb scan neither scans nor sets \
+         aside; classify the tree in `scope_of`'s tables: {unclassified:?}"
+    );
+    let paths: Vec<String> = all
+        .into_iter()
+        .filter(|rel| scope_of(rel) == Scope::Scanned)
         .map(str::to_owned)
         .collect();
     assert!(
@@ -268,6 +332,34 @@ fn every_exempt_file_still_matches() {
             "exempt file {rel} no longer names a refused form; drop its exemption"
         );
     }
+}
+
+#[test]
+fn a_tree_outside_every_table_is_unclassified() {
+    for rel in [
+        "newtree/file.md",
+        "docs/newdocs/page.md",
+        "docs/page.md",
+        ".hidden/x",
+    ] {
+        assert_eq!(scope_of(rel), Scope::Unclassified, "{rel}");
+    }
+}
+
+#[test]
+fn each_table_routes_its_paths() {
+    assert_eq!(scope_of("src/ipe-cli/src/main.rs"), Scope::Scanned);
+    assert_eq!(scope_of("docs/guide/file.md"), Scope::Scanned);
+    assert_eq!(scope_of("README.md"), Scope::Scanned);
+    assert_eq!(
+        scope_of(&format!("{DOCS_TREE}/adr/0007-x.md")),
+        Scope::SetAside
+    );
+    assert_eq!(
+        scope_of(&format!("{DOCS_TREE}/assets/logo.svg")),
+        Scope::SetAside
+    );
+    assert_eq!(scope_of("Cargo.toml"), Scope::SetAside);
 }
 
 #[test]
