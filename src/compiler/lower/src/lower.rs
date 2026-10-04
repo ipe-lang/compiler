@@ -32709,6 +32709,7 @@ mod tests {
     /// prevent (a `.clone()` on a non-`Clone` carrier is cargo E0599 after
     /// ipe exit 0).
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture table drives every agreement assertion
     fn carrier_clone_authority_agrees_with_clone_class() {
         use ipe_intern::Symbol;
         use ipe_ir::{
