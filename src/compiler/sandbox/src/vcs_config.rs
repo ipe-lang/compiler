@@ -62,8 +62,11 @@ const MAX_WALK_STEPS: u32 = 8192;
 /// The most URL rewrites (Git `insteadOf` and `pushInsteadOf`, Mercurial `[schemes]`) one scan reads.
 pub const MAX_URL_REWRITES: usize = 256;
 
-/// The most pairs of a URL rewrite and a URL value one scan composes.
+/// The most pairs of a URL rewrite and a URL form one scan composes, each step of a Mercurial scheme chain included.
 pub const MAX_REWRITE_PAIRS: usize = 16384;
+
+/// The most URL values one scan keeps to judge once every file is read, in each of its lists.
+pub const MAX_URL_VALUES: usize = 16384;
 
 /// `n` as a [`NonZeroU64`], or one for zero.
 const fn nonzero_u64(n: u64) -> NonZeroU64 {
@@ -500,6 +503,10 @@ pub enum Unprovable {
     TooManyWords,
     /// The value holds a carriage return, vertical tab, or form feed, which tools split words at differently.
     OddSpace,
+    /// The value or its setting's name holds a NUL, at which a tool reading it as a C string ends the text.
+    Nul,
+    /// A Mercurial list value holds a quote, which Mercurial's list parser groups and unescapes into items.
+    ListQuote,
     /// The value lets Git hand a URL the scan does not read (one in `.gitmodules`, one typed on a command line) to a remote helper.
     ///
     /// A URL rewrite to a base Git may read as `<helper>::` once a URL's text
@@ -555,6 +562,13 @@ impl fmt::Display for Unprovable {
                 "it holds a carriage return, vertical tab, or form feed, which the shell and the \
                  tool split words at differently",
             ),
+            Self::Nul => f.write_str(
+                "it holds a NUL byte, at which the tool ends the text while the scan reads on",
+            ),
+            Self::ListQuote => f.write_str(
+                "it is a Mercurial list holding a quote, which Mercurial groups into items the \
+                 scan does not model",
+            ),
             Self::RemoteHelper => f.write_str(
                 "it lets Git hand a URL the scan does not read, such as one in `.gitmodules`, to a \
                  remote helper or `ext::`, which runs a program",
@@ -592,8 +606,10 @@ pub enum ConfigFault {
     Bytes,
     /// The scan reached [`ConfigLimits::paths`].
     Paths,
-    /// The scan read more than [`MAX_URL_REWRITES`] URL rewrites, or more than [`MAX_REWRITE_PAIRS`] pairs of a rewrite and a URL.
+    /// The scan read more than [`MAX_URL_REWRITES`] URL rewrites, composed more than [`MAX_REWRITE_PAIRS`] pairs of a rewrite and a URL, or met a Mercurial scheme chain applying one rewrite twice.
     Rewrites,
+    /// The scan read more than [`MAX_URL_VALUES`] URL values.
+    UrlValues,
     /// It is not valid UTF-8.
     NotUtf8,
 }
@@ -611,7 +627,11 @@ impl fmt::Display for ConfigFault {
             Self::Files => f.write_str("the scan reached its limit on configuration files"),
             Self::Bytes => f.write_str("the scan reached its limit on configuration bytes"),
             Self::Paths => f.write_str("the scan reached its limit on resolved paths"),
-            Self::Rewrites => f.write_str("the scan reached its limit on URL rewrites"),
+            Self::Rewrites => f.write_str(
+                "the scan reached its limit on URL rewrites, or a Mercurial scheme chain applies \
+                 one scheme twice",
+            ),
+            Self::UrlValues => f.write_str("the scan reached its limit on URL values"),
             Self::NotUtf8 => f.write_str("it is not valid UTF-8"),
         }
     }
@@ -1045,6 +1065,13 @@ enum Role {
         /// Whether Git's `host:path` form counts as a network URL.
         scp: bool,
     },
+    /// A Mercurial `[paths]` value: the whole value, and each item of it as a list, judged as [`Role::Url`] without the `host:path` form.
+    ///
+    /// Mercurial reads the value as a list of URLs (`parselist`: commas and
+    /// whitespace separate) once `<name>:multi-urls` is set, in this file or
+    /// any other, and as one URL otherwise. Both readings are judged; a quote,
+    /// which the list parser groups and unescapes by, refuses.
+    UrlList,
 }
 
 /// What becomes of a value.
@@ -1120,17 +1147,25 @@ struct Entry {
     value: String,
 }
 
-/// A remote-name value waiting for every remote to be known.
+/// A value kept to be judged once every file is read: a remote name, a URL, a network remote URL.
+///
+/// The file's context is shared, never copied per value, and each list
+/// holding these is bounded by [`MAX_URL_VALUES`] before every push.
 struct Deferred {
     /// The file it came from.
-    ctx: FileCtx,
+    ctx: Rc<FileCtx>,
     /// The setting holding it.
     setting: Setting,
     /// The value.
     value: String,
 }
 
-/// A rewrite a tool applies to a URL before it reads it, once, never to its own result.
+/// A rewrite a tool applies to a URL before it reads it.
+///
+/// Git applies a prefix rewrite once and never to its own result. Mercurial
+/// resolves a scheme's result again through every scheme
+/// (`ShortRepository.instance` looks the rewritten URL's scheme up anew, an
+/// overridden built-in scheme included), so a scheme rewrite [`Rewrite::chains`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Rewrite {
     /// Git's `url.<base>.insteadOf` or `pushInsteadOf`: a URL starting with `prefix` has it replaced by `base`.
@@ -1161,16 +1196,23 @@ impl Rewrite {
         }
     }
 
+    /// Whether the tool applies rewrites again to this rewrite's result: a Mercurial scheme.
+    const fn chains(&self) -> bool {
+        match self {
+            Self::Prefix { .. } => false,
+            Self::Scheme { .. } => true,
+        }
+    }
+
     /// The form `url` takes under this rewrite, or `None` when it does not apply.
     ///
     /// A template holding a brace substitutes parts of the URL through
     /// Mercurial's templater, which the scan does not model, so it is
-    /// unprovable.
+    /// unprovable. A form longer than [`MAX_PATH_BYTES`] is refused before it
+    /// is built, which bounds every form of a scheme chain.
     fn apply(&self, url: &str) -> Option<Result<String, Unprovable>> {
-        match self {
-            Self::Prefix { prefix, base, .. } => url
-                .strip_prefix(prefix.as_str())
-                .map(|rest| Ok(format!("{base}{rest}"))),
+        let (head, rest) = match self {
+            Self::Prefix { prefix, base, .. } => (base, url.strip_prefix(prefix.as_str())?),
             Self::Scheme {
                 scheme, template, ..
             } => {
@@ -1181,9 +1223,13 @@ impl Rewrite {
                 if template.contains(['{', '}']) {
                     return Some(Err(Unprovable::Glob));
                 }
-                Some(Ok(format!("{template}{rest}")))
+                (template, rest)
             }
+        };
+        if head.len().saturating_add(rest.len()) > MAX_PATH_BYTES {
+            return Some(Err(Unprovable::TooLong));
         }
+        Some(Ok(format!("{head}{rest}")))
     }
 }
 
@@ -1448,15 +1494,15 @@ struct Scan<'s> {
     scopes: u32,
     /// The Git remotes given a URL or cleared, by the configuration naming them.
     remotes: BTreeMap<(Scope, String), RemoteUrls>,
-    /// Remote-name values waiting for every remote to be known.
+    /// Remote-name values waiting for every remote to be known, at most [`MAX_URL_VALUES`].
     deferred: Vec<Deferred>,
-    /// Remote URL values admitted as network URLs, judged again as paths when a remote names a helper.
+    /// Remote URL values admitted as network URLs, judged again as paths when a remote names a helper, at most [`MAX_URL_VALUES`].
     network_urls: Vec<Deferred>,
     /// Whether any file read sets `remote.<name>.vcs`, which hands a remote's URL verbatim to `git-remote-<vcs>`.
     helper_remote: bool,
     /// The URL rewrites of every file read, always or conditionally.
     rewrites: Vec<Rewrite>,
-    /// Every URL value as written, judged again in each form a rewrite gives it.
+    /// Every URL value as written, a Mercurial list's items and a scheme template included, judged again in each form a rewrite gives it; at most [`MAX_URL_VALUES`].
     urls: Vec<UrlValue>,
 }
 
@@ -2105,14 +2151,14 @@ impl Scan<'_> {
         if self.bytes > self.limits.total_bytes.get() {
             return Err(self.unreadable(&item.path, ConfigFault::Bytes));
         }
-        let ctx = FileCtx {
+        let ctx = Rc::new(FileCtx {
             source: item.path,
             bases: opened.bases,
             depth: item.depth,
             syntax: item.syntax,
             scope: item.scope,
             reading: item.reading,
-        };
+        });
         let malformed = |line| ConfigFault::Malformed { line };
         match ctx.syntax {
             Syntax::Git => {
@@ -2132,11 +2178,14 @@ impl Scan<'_> {
     }
 
     /// Judge every entry of a parsed file.
-    fn judge_entries(&mut self, ctx: &FileCtx, entries: &[Entry]) -> Result<(), ConfigRefusal> {
+    fn judge_entries(&mut self, ctx: &Rc<FileCtx>, entries: &[Entry]) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
         for entry in entries {
             let refuse =
                 |stop: Stop| stop.into_refusal(kind, &ctx.source, || entry.setting.public());
+            if holds_nul(entry) {
+                return Err(refuse(unproven(Unprovable::Nul)));
+            }
             let route = match ctx.syntax {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
@@ -2155,28 +2204,36 @@ impl Scan<'_> {
                 }
                 self.rewrites.push(rewrite);
             }
-            let url_scp = match &route {
-                Route::Judge(Role::Url { scp })
-                    if !is_rewrite_target(ctx.syntax, &entry.setting) =>
-                {
-                    Some(*scp)
+            match &route {
+                Route::Judge(Role::Url { scp }) => {
+                    self.keep_url(ctx, &entry.setting, &entry.value, *scp)?;
                 }
-                Route::RemoteName => (entry.value != ".").then_some(true),
-                Route::Judge(_) => None,
-            };
-            if let Some(scp) = url_scp {
-                self.urls.push(UrlValue {
-                    item: Deferred {
-                        ctx: ctx.clone(),
-                        setting: entry.setting.clone(),
-                        value: entry.value.clone(),
-                    },
-                    scp,
-                });
+                Route::Judge(Role::UrlList) => {
+                    self.keep_url(ctx, &entry.setting, &entry.value, false)?;
+                    let items = hg_list_items(&entry.value).map_err(|why| refuse(unproven(why)))?;
+                    for item in items.filter(|item| *item != entry.value) {
+                        self.keep_url(ctx, &entry.setting, item, false)?;
+                    }
+                }
+                Route::RemoteName => {
+                    if entry.value != "." {
+                        self.keep_url(ctx, &entry.setting, &entry.value, true)?;
+                    }
+                }
+                Route::Judge(
+                    Role::Exempt
+                    | Role::Words
+                    | Role::Forced(_)
+                    | Role::Include(_)
+                    | Role::HooksPath,
+                ) => {}
             }
             if is_remote_url(ctx.syntax, &entry.setting) && is_network_url(&entry.value, true) {
+                if self.network_urls.len() >= MAX_URL_VALUES {
+                    return Err(self.unreadable(&ctx.source, ConfigFault::UrlValues));
+                }
                 self.network_urls.push(Deferred {
-                    ctx: ctx.clone(),
+                    ctx: Rc::clone(ctx),
                     setting: entry.setting.clone(),
                     value: entry.value.clone(),
                 });
@@ -2185,8 +2242,11 @@ impl Scan<'_> {
                 Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
                 Route::RemoteName => {
                     if entry.value != "." && !is_network_url(&entry.value, true) {
+                        if self.deferred.len() >= MAX_URL_VALUES {
+                            return Err(self.unreadable(&ctx.source, ConfigFault::UrlValues));
+                        }
                         self.deferred.push(Deferred {
-                            ctx: ctx.clone(),
+                            ctx: Rc::clone(ctx),
                             setting: entry.setting.clone(),
                             value: entry.value.clone(),
                         });
@@ -2194,6 +2254,30 @@ impl Scan<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Keep the URL `value` of `setting` in `ctx` to be judged in each form a rewrite gives it.
+    ///
+    /// Refuses once [`MAX_URL_VALUES`] are kept, before the push.
+    fn keep_url(
+        &mut self,
+        ctx: &Rc<FileCtx>,
+        setting: &Setting,
+        value: &str,
+        scp: bool,
+    ) -> Result<(), ConfigRefusal> {
+        if self.urls.len() >= MAX_URL_VALUES {
+            return Err(self.unreadable(&ctx.source, ConfigFault::UrlValues));
+        }
+        self.urls.push(UrlValue {
+            item: Deferred {
+                ctx: Rc::clone(ctx),
+                setting: setting.clone(),
+                value: value.to_owned(),
+            },
+            scp,
+        });
         Ok(())
     }
 
@@ -2304,11 +2388,11 @@ impl Scan<'_> {
     /// The tool rewrites a URL before reading it, so the value as written
     /// proves nothing about what it reads: `[url "ext:"] insteadOf = ab` turns
     /// `ab:/tree/x`, a network URL as written, into `ext::/tree/x`. Git applies
-    /// only the longest matching prefix; every match is judged, the longest
-    /// among them. A rewritten URL that is a network URL is kept to be judged
+    /// only the longest matching prefix, once; every match is judged, the
+    /// longest among them. Mercurial resolves a scheme's result again, so
+    /// every form of a scheme chain is judged ([`Self::judge_forms`]). A rewritten URL that is a network URL is kept to be judged
     /// as a path too once a remote names a helper.
     fn judge_rewritten(&mut self) -> Result<(), ConfigRefusal> {
-        let kind = self.kind;
         if self.rewrites.is_empty() {
             return Ok(());
         }
@@ -2322,28 +2406,82 @@ impl Scan<'_> {
             return Err(self.unreadable(&source, ConfigFault::Rewrites));
         }
         let rewrites = std::mem::take(&mut self.rewrites);
+        let mut attempts: usize = 0;
         for url in std::mem::take(&mut self.urls) {
-            let item = url.item;
-            let refuse =
-                |stop: Stop| stop.into_refusal(kind, &item.ctx.source, || item.setting.public());
-            for rewrite in &rewrites {
-                let Some(rewritten) = rewrite.apply(&item.value) else {
-                    continue;
-                };
-                let rewritten = rewritten.map_err(|reason| refuse(unproven(reason)))?;
-                self.judge(&item.ctx, &Role::Url { scp: url.scp }, &rewritten)
-                    .map_err(refuse)?;
-                if is_network_url(&rewritten, url.scp)
-                    && is_remote_url(item.ctx.syntax, &item.setting)
-                {
-                    self.network_urls.push(Deferred {
-                        ctx: item.ctx.clone(),
-                        setting: item.setting.clone(),
-                        value: rewritten,
-                    });
+            self.judge_forms(&rewrites, &url, &mut attempts)?;
+        }
+        Ok(())
+    }
+
+    /// Judge every form `rewrites` give `url`: one step of each, and every step of a chain of scheme rewrites.
+    ///
+    /// A depth-first walk keeps one frame per form on its chain: the form, the
+    /// rewrite that gave it (`None` for the value as written), and the next
+    /// rewrite to try on it. A prefix rewrite applies only to the value as
+    /// written; a scheme rewrite applies to every form, as Mercurial resolves
+    /// its result again. Each try is charged to `attempts`, refusing past
+    /// [`MAX_REWRITE_PAIRS`]; a chain applying one rewrite twice refuses, as
+    /// Mercurial would resolve it without end or the scan cannot bound it, so
+    /// a chain holds at most one frame per rewrite.
+    fn judge_forms(
+        &mut self,
+        rewrites: &[Rewrite],
+        url: &UrlValue,
+        attempts: &mut usize,
+    ) -> Result<(), ConfigRefusal> {
+        let kind = self.kind;
+        let item = &url.item;
+        let refuse =
+            |stop: Stop| stop.into_refusal(kind, &item.ctx.source, || item.setting.public());
+        let mut chain: Vec<(String, Option<usize>, usize)> = vec![(item.value.clone(), None, 0)];
+        loop {
+            let Some((form, made_by, next)) = chain.last_mut() else {
+                return Ok(());
+            };
+            let index = *next;
+            let Some(rewrite) = rewrites.get(index) else {
+                chain.pop();
+                continue;
+            };
+            *next = index.saturating_add(1);
+            *attempts = attempts.saturating_add(1);
+            if *attempts > MAX_REWRITE_PAIRS {
+                return Err(self.unreadable(rewrite.source(), ConfigFault::Rewrites));
+            }
+            if made_by.is_some() && !rewrite.chains() {
+                continue;
+            }
+            let Some(rewritten) = rewrite.apply(form) else {
+                continue;
+            };
+            let rewritten = rewritten.map_err(|reason| refuse(unproven(reason)))?;
+            self.judge(&item.ctx, &Role::Url { scp: url.scp }, &rewritten)
+                .map_err(&refuse)?;
+            if is_network_url(&rewritten, url.scp) && is_remote_url(item.ctx.syntax, &item.setting)
+            {
+                self.keep_network_url(item, &rewritten)?;
+            }
+            if rewrite.chains() {
+                if chain.iter().any(|(_, made, _)| *made == Some(index)) {
+                    return Err(self.unreadable(rewrite.source(), ConfigFault::Rewrites));
                 }
+                chain.push((rewritten, Some(index), 0));
             }
         }
+    }
+
+    /// Keep `value`, a network URL `item`'s setting reads, to be judged as a path once a remote names a helper.
+    ///
+    /// Refuses once [`MAX_URL_VALUES`] are kept, before the push.
+    fn keep_network_url(&mut self, item: &Deferred, value: &str) -> Result<(), ConfigRefusal> {
+        if self.network_urls.len() >= MAX_URL_VALUES {
+            return Err(self.unreadable(&item.ctx.source, ConfigFault::UrlValues));
+        }
+        self.network_urls.push(Deferred {
+            ctx: Rc::clone(&item.ctx),
+            setting: item.setting.clone(),
+            value: value.to_owned(),
+        });
         Ok(())
     }
 
@@ -2457,6 +2595,16 @@ impl Scan<'_> {
                 }
                 self.judge_words(ctx, value)?;
                 self.judge_forced(ctx, value, Reach::Command).map(drop)
+            }
+            Role::UrlList => {
+                let url = Role::Url { scp: false };
+                self.judge(ctx, &url, value)?;
+                for item in hg_list_items(value).map_err(unproven)? {
+                    if item != value {
+                        self.judge(ctx, &url, item)?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -2826,8 +2974,11 @@ fn has_ext(text: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"ext::"))
 }
 
-/// The checks every judged value passes first: no substitution, expansion, odd space, or `ext::` transport.
+/// The checks every judged value passes first: no NUL, substitution, expansion, odd space, or `ext::` transport.
 fn value_checks(value: &str) -> Result<(), Unprovable> {
+    if value.contains('\0') {
+        return Err(Unprovable::Nul);
+    }
     if value.contains("$(") || value.contains('`') {
         return Err(Unprovable::CommandSubstitution);
     }
@@ -3140,14 +3291,6 @@ fn rewrite_of(ctx: &FileCtx, setting: &Setting, value: &str) -> Option<Rewrite> 
     }
 }
 
-/// Whether `setting` of a file in `syntax` is a rewrite's target, which the tool never rewrites again: a Mercurial `[schemes]` template.
-fn is_rewrite_target(syntax: Syntax, setting: &Setting) -> bool {
-    matches!(
-        (syntax, setting),
-        (Syntax::Hg, Setting::Key { section, .. }) if &**section == "schemes"
-    )
-}
-
 /// Whether `value` is a Git boolean.
 fn is_git_bool(value: &str) -> bool {
     ["", "true", "false", "yes", "no", "on", "off", "1", "0"]
@@ -3220,6 +3363,36 @@ fn is_remote_url(syntax: Syntax, setting: &Setting) -> bool {
     }
 }
 
+/// The items Mercurial's list parser reads from `value`: text between commas and whitespace.
+///
+/// A quote, which `parselist` groups and unescapes by, is unprovable rather
+/// than modelled.
+fn hg_list_items(value: &str) -> Result<impl Iterator<Item = &str>, Unprovable> {
+    if value.contains('"') {
+        return Err(Unprovable::ListQuote);
+    }
+    Ok(value
+        .split(|c: char| c == ',' || is_wide_space(c))
+        .filter(|item| !item.is_empty()))
+}
+
+/// Whether `entry`'s value or the name of its setting holds a NUL.
+fn holds_nul(entry: &Entry) -> bool {
+    let name_holds = match &entry.setting {
+        Setting::Key {
+            section,
+            subsection,
+            key,
+        } => {
+            section.contains('\0')
+                || subsection.as_ref().is_some_and(|sub| sub.contains('\0'))
+                || key.contains('\0')
+        }
+        Setting::Include | Setting::Line(_) => false,
+    };
+    name_holds || entry.value.contains('\0')
+}
+
 /// How Mercurial treats a value of `setting`.
 fn hg_role(setting: &Setting, value: &str) -> Role {
     let (section, key) = match setting {
@@ -3239,10 +3412,11 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
         return Role::Forced(path.to_owned());
     }
     if &**section == "paths" && (!key.contains(':') || key.ends_with(":pushurl")) {
-        return Role::Url { scp: false };
+        return Role::UrlList;
     }
     // A `[schemes]` template or a `[subpaths]` replacement is the URL the
-    // tool reads in place of one it was given, `.hgsub` sources included.
+    // tool reads in place of one it was given, `.hgsub` sources included; a
+    // template is also a URL the scheme chain rewrites again.
     if &**section == "schemes" || &**section == "subpaths" {
         return Role::Url { scp: false };
     }
@@ -3306,8 +3480,8 @@ const fn is_git_key_char(c: char) -> bool {
 /// Parse Git `config` text into its values, or the line of its first syntax error.
 ///
 /// Mirrors Git's own parser: a section header `[name]`, `[name "sub"]`, or the
-/// deprecated `[name.sub]`; a key of alphanumerics and `-` starting with a
-/// letter, optionally `=` and a value; quotes, the escapes `\n \t \b \" \\`, a
+/// deprecated `[name.sub]`, named as Git names them ([`git_header`]); a key of
+/// alphanumerics and `-` starting with a letter, optionally `=` and a value; quotes, the escapes `\n \t \b \" \\`, a
 /// trailing `\` continuing the line, `#` and `;` comments. A key before any
 /// section, an unknown escape, and an unterminated quote are errors.
 fn parse_git(text: &str) -> Result<Vec<Entry>, usize> {
@@ -3332,8 +3506,8 @@ fn parse_git(text: &str) -> Result<Vec<Entry>, usize> {
             continue;
         }
         if c == '[' {
-            let (name, subsection) = git_section(&mut lexer).ok_or(lexer.line)?;
-            section = Some((Rc::from(name), subsection.map(Rc::from)));
+            let name = git_section(&mut lexer).ok_or(lexer.line)?;
+            section = Some(git_header(&name));
             continue;
         }
         let Some((name, subsection)) = section.as_ref().filter(|_| c.is_ascii_alphabetic()) else {
@@ -3351,8 +3525,12 @@ fn parse_git(text: &str) -> Result<Vec<Entry>, usize> {
     }
 }
 
-/// The rest of a section header after `[`: its lowercase name and its subsection.
-fn git_section(lexer: &mut GitLexer<'_>) -> Option<(String, Option<String>)> {
+/// The rest of a section header after `[`: the name Git builds from it, before the key.
+///
+/// Git lowercases the unquoted part and, for `[base "text"]`, appends `.`
+/// and the quoted text verbatim (`get_extended_base_var`), so `[a.B "c"]`
+/// names `a.b.c`; [`git_header`] splits that name as Git does.
+fn git_section(lexer: &mut GitLexer<'_>) -> Option<String> {
     let mut name = String::new();
     loop {
         let c = lexer.next_char();
@@ -3360,22 +3538,35 @@ fn git_section(lexer: &mut GitLexer<'_>) -> Option<(String, Option<String>)> {
             return None;
         }
         if is_c_space(c) {
-            let subsection = git_subsection(lexer)?;
-            return (!name.is_empty()).then_some((name, Some(subsection)));
-        }
-        if c == ']' {
             if name.is_empty() {
                 return None;
             }
-            return Some(match name.split_once('.') {
-                Some((head, tail)) => (head.to_owned(), Some(tail.to_owned())),
-                None => (name, None),
-            });
+            let subsection = git_subsection(lexer)?;
+            name.push('.');
+            name.push_str(&subsection);
+            return Some(name);
+        }
+        if c == ']' {
+            return (!name.is_empty()).then_some(name);
         }
         if !(is_git_key_char(c) || c == '.') {
             return None;
         }
         name.push(c.to_ascii_lowercase());
+    }
+}
+
+/// The section and subsection Git reads from the header name `name`: the section ends at the first `.`.
+///
+/// Git joins the header name and the key with `.` and splits the full name
+/// back (`parse_config_key`): the section up to the first `.`, the key after
+/// the last, the subsection between. The key holds no `.`, so the
+/// subsection is everything after the header name's first `.`, dots
+/// included: `[a.b "c"]` is section `a`, subsection `b.c`.
+fn git_header(name: &str) -> (Rc<str>, Option<Rc<str>>) {
+    match name.split_once('.') {
+        Some((section, subsection)) => (Rc::from(section), Some(Rc::from(subsection))),
+        None => (Rc::from(name), None),
     }
 }
 
@@ -4117,7 +4308,7 @@ mod tests {
     #[test]
     fn git_parser_follows_git_syntax() {
         let text = "\u{feff}# c\n[Core]\n\tBare\n[a \"Sub\\\"x\"] k = \"v ; w\" # tail\n\
-                    [b.Sub]\n\tz = one\\\n two\n\tq = a\\tb\r\n";
+                    [b.Sub]\n\tz = one\\\n two\n\tq = a\\tb\r\n[c.D \"e.F\"]\n\tk = v\n";
         let parsed = parse_git(text).expect("valid git config");
         let shapes: Vec<(String, Option<String>, String, String)> = parsed
             .iter()
@@ -4140,6 +4331,7 @@ mod tests {
             ("a", Some("Sub\"x"), "k", "v ; w"),
             ("b", Some("sub"), "z", "one two"),
             ("b", Some("sub"), "q", "a\tb"),
+            ("c", Some("d.e.F"), "k", "v"),
         ];
         assert_eq!(shapes.len(), expected.len(), "{shapes:?}");
         for (got, want) in shapes.iter().zip(expected) {
@@ -5298,6 +5490,179 @@ mod tests {
                 Some(Unprovable::HardLinked),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn git_header_names_split_as_git_splits_them() {
+        let f = fixture("headername");
+        let tree = f.tree.display();
+        git_config(
+            &f,
+            &format!(
+                "[remote.o \"x\"]\n\tvcs = hg\n[remote \"o.x\"]\n\turl = ab:{tree}/evil\n\
+                 [branch \"main\"]\n\tremote = o.x\n"
+            ),
+        );
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        git_config(&f, "[url.a \"/evil\"]\n\tinsteadOf = gh:\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("a./evil").as_path()));
+        git_config(&f, "[branch.main \"x\"]\n\tremote = evil\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn git_value_composed_by_a_rewrite_judged() {
+        let f = fixture("composed");
+        let root = f.tree.parent().expect("fixture root").display().to_string();
+        let rewrite = format!("[url \"{root}/\"]\n\tinsteadOf = gh:\n");
+        for text in [
+            format!("{rewrite}[remote \"o\"]\n\turl = gh:tree/evil\n"),
+            format!("{rewrite}[branch \"x\"]\n\tremote = gh:tree/evil\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}"
+            );
+        }
+        git_config(&f, &rewrite);
+        write(&f.tree.join(".git/remotes/o"), "URL: gh:tree/evil\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn hg_paths_value_judged_as_a_list() {
+        let f = fixture("hglist");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        let tree = f.tree.display();
+        for text in [
+            format!(
+                "[paths]\ndefault = https://example.com/r,{tree}/evil\ndefault:multi-urls = yes\n"
+            ),
+            format!("[paths]\ndefault = https://example.com/r,{tree}/evil\n"),
+            format!("[paths]\ndefault:pushurl = https://example.com/r,,{tree}/evil\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}"
+            );
+        }
+        // Spaces separate items too; the whole value, holding one, is judged as words.
+        write(
+            &dot_hg.join("hgrc"),
+            &format!("[paths]\ndefault = https://example.com/r {tree}/evil\n"),
+        );
+        assert!(names_code(&scan_with(&f, &roots, ConfigLimits::DEFAULT)));
+        write(&dot_hg.join("hgrc"), "[paths]\ndefault = \"https://a/r\"\n");
+        assert_eq!(
+            unprovable(&scan_with(&f, &roots, ConfigLimits::DEFAULT)),
+            Some(Unprovable::ListQuote)
+        );
+        write(
+            &dot_hg.join("hgrc"),
+            "[paths]\ndefault = https://a/r,https://b/r\n",
+        );
+        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+    }
+
+    #[test]
+    fn hg_scheme_chain_judged_to_its_end() {
+        let f = fixture("hgchain");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        let root = f.tree.parent().expect("fixture root").display().to_string();
+        for text in [
+            format!(
+                "[schemes]\nhttps = ssh://tree/\nssh = {root}/\n[paths]\ndefault = https://x/evil\n"
+            ),
+            // Each template, rewritten once, is a network URL or a path
+            // outside the grants; only the third form reaches the tree.
+            format!(
+                "[schemes]\nhttps = git://ee/\ngit = ssh://tr\nssh = {root}/\n\
+                 [paths]\ndefault = https://x/evil\n"
+            ),
+            // A template is a URL the chain rewrites again.
+            format!("[schemes]\nhttps = ssh://tree/\nssh = {root}/\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        write(&dot_hg.join("hgrc"), "[schemes]\nhttps = https://x/\n");
+        assert_eq!(
+            fault(&scan_with(&f, &roots, ConfigLimits::DEFAULT)),
+            Some(ConfigFault::Rewrites)
+        );
+        write(
+            &dot_hg.join("hgrc"),
+            "[schemes]\ngh = https://example.com/\n[paths]\ndefault = https://example.com/r\n",
+        );
+        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hg_scheme_composing_a_path_judged() {
+        let f = fixture("hgcompose");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        let tree = f.tree.display().to_string();
+        let relative = tree.strip_prefix('/').expect("absolute fixture tree");
+        write(
+            &dot_hg.join("hgrc"),
+            &format!("[schemes]\nhttps = /\n[paths]\ndefault = https://{relative}/evil\n"),
+        );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn url_values_ceiling() {
+        let f = fixture("urlceil");
+        let urls = |n: usize| format!("[remote \"o\"]\n{}", "\turl = ab:c\n".repeat(n));
+        git_config(&f, &urls(MAX_URL_VALUES));
+        assert_eq!(scan_git(&f), Ok(()));
+        git_config(&f, &urls(MAX_URL_VALUES.saturating_add(1)));
+        assert_eq!(fault(&scan_git(&f)), Some(ConfigFault::UrlValues));
+    }
+
+    #[test]
+    fn nul_in_a_value_or_a_name_refused() {
+        let f = fixture("nul");
+        let tree = f.tree.display();
+        for text in [
+            format!("[core]\n\thooksPath = \"{tree}\0x\"\n"),
+            "[remote \"o\0x\"]\n\turl = https://h/r\n[branch \"m\"]\n\tremote = \"o\0x\"\n"
+                .to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::Nul), "{text:?}");
         }
     }
 
