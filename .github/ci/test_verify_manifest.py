@@ -6617,6 +6617,56 @@ class TestReleaseTargetParity(unittest.TestCase):
             self.swap(_RT_CI, "      - shell: bash\n", "      - shell: bash\n        working-directory: src\n"),
         )
 
+    def test_extra_ci_step_refused(self) -> None:
+        fake = "      - run: echo /tmp/fake-cargo >> \"$GITHUB_PATH\"\n"
+        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", fake + "      - name: Install musl toolchain (linux)\n")
+        self.assertRefused("must run exactly release.yml's 3 steps", ci)
+        vm = "      - run: echo '[build]' > .cargo/config.toml\n      - uses: vmactions/freebsd-vm@"
+        ci = self.swap(_RT_CI, "      - uses: vmactions/freebsd-vm@", vm)
+        self.assertRefused("must run exactly release.yml's 1 steps", ci)
+
+    def test_ci_step_differing_from_release_refused(self) -> None:
+        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", "      - name: Install musl toolchain (linux)\n        continue-on-error: true\n")
+        self.assertRefused("native step 2", ci)
+        ci = self.swap(_RT_CI, "      - uses: ./.github/actions/rust-toolchain-pinned\n", "      - uses: ./.github/actions/rust-toolchain-pinned\n        if: false\n")
+        self.assertRefused("native step 1", ci)
+
+    def test_checkout_of_another_commit_refused(self) -> None:
+        checkout = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+        ci = _RT_CI.replace("    steps:\n", "    steps:\n" + checkout)
+        release = _RT_RELEASE.replace("    steps:\n", "    steps:\n" + checkout + "        with:\n          ref: v1\n", 2)
+        self.assertEqual(self.errors(ci, release), [])
+        pinned = checkout + "        with:\n          ref: 0123abc\n"
+        self.assertRefused("native step 1", _RT_CI.replace("    steps:\n", "    steps:\n" + pinned), release)
+
+    def test_cargo_step_extra_line_refused(self) -> None:
+        native = self.swap(
+            _RT_CI,
+            "        run: cargo check --release",
+            "        run: |\n          cargo() { :; }\n          cargo check --release",
+        )
+        self.assertRefused("native cargo step must run only", native)
+        bsd = self.swap(
+            _RT_CI,
+            "          run: |\n            cargo check",
+            "          run: |\n            alias cargo=true\n            cargo check",
+        )
+        self.assertRefused("FreeBSD cargo step must run only", bsd)
+
+    def test_cargo_step_env_beyond_release_refused(self) -> None:
+        ci = self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n        run: cargo", "          TARGET: ${{ matrix.target }}\n          RUSTC_WRAPPER: /tmp/w\n        run: cargo")
+        self.assertRefused("sets `env` ['RUSTC_WRAPPER']", ci)
+
+    def test_vm_input_drift_refused(self) -> None:
+        ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n          run: |\n            cargo check", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n          run: |\n            cargo check")
+        self.assertRefused("FreeBSD step 1 `with`", ci)
+
+    def test_job_key_drift_refused(self) -> None:
+        for key in ("services:\n      cache:\n        image: x", "permissions:\n      contents: write", "defaults:\n      run:\n        shell: sh"):
+            with self.subTest(key=key):
+                ci = self.swap(_RT_CI, "  release-targets-run:\n", f"  release-targets-run:\n    {key}\n")
+                self.assertRefused(f"native job `{key.split(':')[0]}`", ci)
+
     def test_non_literal_matrix_refused(self) -> None:
         ci = self.swap(_RT_CI, "        include:\n", "        extra: [1]\n        include:\n")
         self.assertRefused("must be a matrix of only an `include` list", ci)

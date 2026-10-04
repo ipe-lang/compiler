@@ -379,10 +379,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       refused); each native job's one cargo command, its pinned-toolchain
       step and its musl-install step are equal, as are the FreeBSD jobs'
       VM action, `usesh`, `prepare` and cargo command, the verb aside
-      (`build` there, `check` here).  Each job's `runs-on`, `env`,
-      `defaults` and `container` are equal, as are the native cargo step's
-      `shell`, `working-directory` and `env.TARGET` and the VM step's `env`;
-      a cargo-carrying step with an `if:` or a `continue-on-error`, or a
+      (`build` there, `check` here).  Every job key but `name`, `needs`,
+      `if`, `timeout-minutes`, `strategy` and `steps` is equal (`runs-on`,
+      `env`, `defaults`, `container`, `services`, `permissions`, ..), as are
+      the native cargo step's `shell`, `working-directory` and `env.TARGET`
+      and the VM step's `env`.  Each ci.yml job runs release.yml's steps up
+      to and including the cargo step, one for one and nothing else: each
+      pair equal but for its `name`, the checkout but for release.yml's
+      `with.ref`, and the cargo step but for its text — on ci.yml's side
+      exactly its one cargo line — and its `env`, on ci.yml's side a subset
+      of release.yml's; so no other step or line (a `$GITHUB_PATH` or
+      `$GITHUB_ENV` write, a `.cargo/config.toml`, a `cargo` shell function,
+      a checkout of another commit) can change what the cargo line runs.
+      A cargo-carrying step with an `if:` or a `continue-on-error`, or a
       ci.yml job with a `continue-on-error`, is refused, since either lets
       the job succeed without the cargo command; and release.yml's completeness
       `expected` list is exactly the artifacts its jobs publish.  A job,
@@ -395,7 +404,10 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
   LIMIT (checks 15, 16, 20, 22, 23): a cargo line is read as run, not
   proven to reach its step's exit status — `cargo .. || true`, an `exit 0`
   before it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail`
-  are not modelled.
+  are not modelled.  LIMIT (checks 15, 16, 20, 22): nor is a cargo line
+  proven to run the toolchain's cargo — an earlier step's `$GITHUB_PATH` or
+  `$GITHUB_ENV` write, a `cargo` shell function or alias, or a `shell:`
+  that is not a shell; check 23 holds its jobs to release.yml's steps.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -5713,10 +5725,11 @@ def _cargo_lines(text: object) -> list[str]:
 
 @dataclass(frozen=True)
 class _CargoStep:
-    """A job's one cargo-carrying step and that command's tokens, its verb
-    word replaced by a placeholder."""
+    """A job's one cargo-carrying step, that command's line, and its tokens
+    with the verb word replaced by a placeholder."""
 
     step: dict
+    line: str
     tokens: list[str]
 
 
@@ -5751,7 +5764,7 @@ def _cargo_step(job: dict, where: str, verb: str, errors: list[str], vm_run: boo
     if len(tokens) < 2 or tokens[1] != verb:
         errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
         return None
-    return _CargoStep(step, [tokens[0], "<verb>", *tokens[2:]])
+    return _CargoStep(step, str(line), [tokens[0], "<verb>", *tokens[2:]])
 
 
 def _job_unmasked(job: dict, where: str, errors: list[str]) -> None:
@@ -5812,6 +5825,90 @@ def _step_with_run(job: dict, needle: str) -> dict | None:
     return next((s for s in _steps_of(job) if needle in str(s.get("run", ""))), None)
 
 
+# The keys a ci.yml release-target job may hold apart from its release.yml
+# job: its place in the CI phase graph (check 11 governs `needs` and `if`), its
+# timeout, its display name, and the matrix and steps compared on their own.
+_PARITY_FREE_JOB_KEYS = frozenset({"name", "needs", "if", "timeout-minutes", "strategy", "steps"})
+_CHECKOUT_ACTION = "actions/checkout@"
+
+
+def _compare_job_keys(label: str, ci_job: dict, rel_job: dict, errors: list[str]) -> None:
+    """Every job key outside `_PARITY_FREE_JOB_KEYS` is equal on both sides:
+    the runner, environment, defaults, container, services and permissions a
+    job runs under all change what its cargo command does."""
+    for key in sorted((set(ci_job) | set(rel_job)) - _PARITY_FREE_JOB_KEYS):
+        _compare(f"{label} job `{key}`", ci_job.get(key), rel_job.get(key), errors)
+
+
+def _mirrored(step: dict, drop: tuple[str, ...]) -> dict:
+    return {k: v for k, v in step.items() if k != "name" and k not in drop}
+
+
+def _check_mirrored_steps(
+    ci_job: dict, rel_job: dict, ci_cargo: _CargoStep, rel_cargo: _CargoStep, label: str, vm_run: bool, errors: list[str]
+) -> None:
+    """ci.yml's job runs release.yml's steps up to and including the cargo
+    step, one for one, and nothing else. Any other step (or another line in
+    the cargo step) can change what `cargo` resolves to or what it reads — a
+    `$GITHUB_PATH` or `$GITHUB_ENV` write, a `.cargo/config.toml`, a shell
+    function named `cargo`, a checkout of another commit — while the cargo
+    line itself still matches. Each pair is equal but for its `name`; the
+    checkout but for release.yml's `with.ref` (the tag; ci.yml checks the tree
+    under test); the cargo step but for its text, which on ci.yml's side is
+    exactly its one cargo line, and its `env`, which on ci.yml's side is a
+    subset of release.yml's."""
+    ci_steps, rel_steps = _steps_of(ci_job), _steps_of(rel_job)
+    cut = next((i for i, s in enumerate(rel_steps) if s is rel_cargo.step), None)
+    if cut is None:
+        return
+    wanted = rel_steps[: cut + 1]
+    if len(ci_steps) != len(wanted):
+        errors.append(
+            f"check 23: ci.yml's {label} job must run exactly release.yml's {len(wanted)} steps up to and "
+            f"including its cargo step, and has {len(ci_steps)}: any other step can change what the cargo "
+            "command runs; refused"
+        )
+        return
+    for n, (ci_s, rel_s) in enumerate(zip(ci_steps, wanted), start=1):
+        what = f"{label} step {n}"
+        if rel_s is rel_cargo.step:
+            if ci_s is not ci_cargo.step:
+                errors.append(f"check 23: ci.yml's {label} cargo command must sit in step {n}, as in release.yml; refused")
+                continue
+            holder_ci = ci_s.get("with") if vm_run else ci_s
+            text = holder_ci.get("run") if isinstance(holder_ci, dict) else None
+            lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+            if lines != [ci_cargo.line]:
+                errors.append(
+                    f"check 23: ci.yml's {label} cargo step must run only `{ci_cargo.line}`, and runs {lines!r}: "
+                    "another line can redefine or skip it; refused"
+                )
+            ci_env, rel_env = ci_s.get("env"), rel_s.get("env")
+            ci_env = ci_env if isinstance(ci_env, dict) else ({} if ci_env is None else {"": ci_env})
+            rel_env = rel_env if isinstance(rel_env, dict) else {}
+            extra = sorted(k for k, v in ci_env.items() if k not in rel_env or rel_env[k] != v)
+            if extra:
+                errors.append(
+                    f"check 23: ci.yml's {label} cargo step sets `env` {extra!r} that release.yml's does not; refused"
+                )
+            if vm_run:
+                ci_with = {k: v for k, v in (ci_s.get("with") or {}).items() if k != "run"}
+                rel_with = rel_s.get("with") if isinstance(rel_s.get("with"), dict) else {}
+                _compare(f"{what} `with` (`run` aside)", ci_with, {k: v for k, v in rel_with.items() if k != "run"}, errors)
+                _compare(what, _mirrored(ci_s, ("with", "env")), _mirrored(rel_s, ("with", "env")), errors)
+            else:
+                _compare(what, _mirrored(ci_s, ("run", "env")), _mirrored(rel_s, ("run", "env")), errors)
+            continue
+        want = _mirrored(rel_s, ())
+        if str(rel_s.get("uses", "")).startswith(_CHECKOUT_ACTION) and isinstance(want.get("with"), dict):
+            with_ = {k: v for k, v in want["with"].items() if k != "ref"}
+            if with_:
+                want["with"] = with_
+            else:
+                del want["with"]
+        _compare(what, _mirrored(ci_s, ()), want, errors)
+
+
 def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> None:
     """Check 23 (see the module docstring)."""
     repo = os.path.dirname(root)
@@ -5854,12 +5951,12 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     _job_unmasked(ci[CI_RELEASE_FREEBSD_JOB], f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", errors)
     # The same `os` per target means the same runner only when both jobs run on
     # `matrix.os`; the job's environment must agree too.
-    for key in ("runs-on", "env", "defaults", "container"):
-        _compare(f"native job `{key}`", ci_native.get(key), rel_native.get(key), errors)
+    _compare_job_keys("native", ci_native, rel_native, errors)
     ci_cargo = _cargo_step(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", "check", errors)
     rel_cargo = _cargo_step(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
     if ci_cargo is not None and rel_cargo is not None:
         _compare("native cargo command (verb aside)", ci_cargo.tokens, rel_cargo.tokens, errors)
+        _check_mirrored_steps(ci_native, rel_native, ci_cargo, rel_cargo, "native", False, errors)
         for key in ("shell", "working-directory"):
             _compare(f"native cargo step `{key}`", ci_cargo.step.get(key), rel_cargo.step.get(key), errors)
         ci_env, rel_env = ci_cargo.step.get("env"), rel_cargo.step.get("env")
@@ -5889,8 +5986,7 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         rel_with = rel_step.get("with") if isinstance(rel_step.get("with"), dict) else {}
         for key in ("usesh", "prepare"):
             _compare(f"FreeBSD VM `{key}`", ci_with.get(key), rel_with.get(key), errors)
-    for key in ("runs-on", "env", "defaults", "container"):
-        _compare(f"FreeBSD job `{key}`", ci_bsd.get(key), rel_bsd.get(key), errors)
+    _compare_job_keys("FreeBSD", ci_bsd, rel_bsd, errors)
     ci_bsd_cargo = _cargo_step(ci_bsd, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "check", errors, vm_run=True)
     rel_bsd_cargo = _cargo_step(
         rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "build", errors, vm_run=True
@@ -5898,6 +5994,7 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
         _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.tokens, rel_bsd_cargo.tokens, errors)
         _compare("FreeBSD VM step `env`", ci_bsd_cargo.step.get("env"), rel_bsd_cargo.step.get("env"), errors)
+        _check_mirrored_steps(ci_bsd, rel_bsd, ci_bsd_cargo, rel_bsd_cargo, "FreeBSD", True, errors)
     _require_feature(
         rel_bsd_cargo.tokens if rel_bsd_cargo else None, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors
     )
