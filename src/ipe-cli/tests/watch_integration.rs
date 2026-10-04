@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! End-to-end proofs for `ipe watch` (`crate::watch`). The cancellation proof
+//! End-to-end proofs for `ipe dev watch` (`crate::watch`). The cancellation proof
 //! lives separately in
 //! `watch_cancellation.rs`, deterministically, since racing a real
 //! file-save against warm salsa recompute — which is DELIBERATELY fast —
@@ -27,7 +27,7 @@ use e2e_support::wait_for;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// The supervisor's listener relocation var `ipe watch` places its child with.
+/// The supervisor's listener relocation var `ipe dev watch` places its child with.
 const RELOCATION_ENV: &str = ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV;
 
 /// A minimal `Ipe.Http.Server` fixture, parameterised on the response body
@@ -93,7 +93,7 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
 ///
 /// Every caller's cold-build budget is generous on purpose: `start_watch`'s
 /// `cargo build` is a genuinely isolated build (no shared cargo target — a
-/// real `ipe watch` session must not silently reuse a stale one), competing
+/// real `ipe dev watch` session must not silently reuse a stale one), competing
 /// for CPU with every other test nextest runs in parallel. A tight deadline
 /// here fails on scheduler contention, not on a real regression.
 fn wait_for_body(port: u16, want: &str, timeout: Duration) -> bool {
@@ -157,6 +157,7 @@ impl EventSink {
     }
 }
 
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch(
     entry: &Path,
     out_dir: &Path,
@@ -181,12 +182,13 @@ fn start_watch(
         hard_cap: Duration::from_millis(600),
     };
     opts.on_event = Some(sink.as_callback());
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 /// Same as [`start_watch`] but with the blue-green proxy turned ON, so proxy
 /// ENGAGEMENT (T2) is exercised: the proxy binds `port` IFF the emitted crate
 /// binds a first-party HTTP listener; a non-HTTP shape takes the direct path.
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch_bluegreen(
     entry: &Path,
     out_dir: &Path,
@@ -206,7 +208,7 @@ fn start_watch_bluegreen(
         hard_cap: Duration::from_millis(600),
     };
     opts.on_event = Some(sink.as_callback());
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 /// A view-less worker that ticks forever — a LONG-LIVED non-HTTP shape. It emits
@@ -263,7 +265,7 @@ fn stop_and_join(
 }
 
 /// Find a live process whose `/proc/<pid>/environ` contains the exact
-/// `key=value` pair `ipe watch` injects into its supervised child's
+/// `key=value` pair `ipe dev watch` injects into its supervised child's
 /// environment (`watch::child_env` sets the listener relocation var
 /// `ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV` to the child's port — see
 /// `watch.rs`). Matching on the environment
@@ -593,9 +595,9 @@ fn watch_proxies_a_hardcoded_port_server_on_an_internal_port() -> Result<(), Box
     stop_and_join(&handle, join)
 }
 
-/// E1 (prove the refusal): operator port vars in `ipe watch`'s own environment
+/// E1 (prove the refusal): operator port vars in `ipe dev watch`'s own environment
 /// can neither relocate nor collide with the supervised child. A real
-/// `ipe watch` subprocess (blue-green, the CLI default) runs with
+/// `ipe dev watch` subprocess (blue-green, the CLI default) runs with
 /// `IPE_SERVER_PORT` and `IPE_WEB_PORT` set to `operator`; the fixture even
 /// passes that value as its source port. The proxy on `port` must serve the
 /// body, and nothing may listen on `operator`: the child binds the internal
@@ -613,7 +615,8 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
     let operator: u16 = 19166;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
-    cmd.arg("watch")
+    cmd.arg("dev")
+        .arg("watch")
         .arg(ipe_dir.join("Main.ipe"))
         .arg("--out")
         .arg(&out_dir)
@@ -633,7 +636,7 @@ fn operator_port_vars_never_relocate_a_watched_child() -> Result<(), BoxError> {
     }
     let mut watch = cmd
         .spawn()
-        .map_err(|e| -> BoxError { format!("ipe watch must spawn: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })?;
 
     let served = wait_for_body(port, "OPERATOR-V1", Duration::from_mins(4));
     let operator_refused = TcpStream::connect_timeout(

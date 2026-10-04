@@ -1,12 +1,12 @@
-//! The dev-only blue-green front proxy for `ipe watch`.
+//! The dev-only blue-green front proxy for `ipe dev watch`.
 //!
-//! DEV ONLY. This proxy is owned by the `ipe watch` process and NEVER exists
+//! DEV ONLY. This proxy is owned by the `ipe dev watch` process and NEVER exists
 //! in a release binary or an emitted app — it is watch-loop plumbing, not a
 //! runtime supervisor baked into the product.
 //!
 //! ## Why it exists
 //!
-//! Without a proxy, `ipe watch` binds the user's port directly onto the
+//! Without a proxy, `ipe dev watch` binds the user's port directly onto the
 //! supervised app binary. A rebuild must therefore kill the old binary to
 //! free the port before the new one can bind it — and killing the old binary
 //! drops every browser connection it was holding (the SSE stream in
@@ -56,7 +56,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -81,6 +81,12 @@ const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 /// Copy-loop buffer size for streaming bodies/responses.
 const COPY_BUF_BYTES: usize = 16 * 1024;
 
+/// Upper bound on concurrently live per-client worker threads. Without a
+/// cap, a local peer opening connections faster than they close could start
+/// an unbounded number of OS threads (PRINCIPLES 3, bounded by construction).
+/// A connection past the cap is closed at once rather than queued.
+const MAX_PROXY_CLIENTS: usize = 256;
+
 /// A running dev proxy: the persistent front the browser talks to.
 ///
 /// Holds the user's port for the whole watch session. The current upstream
@@ -100,6 +106,10 @@ pub struct DevProxy {
     stopped: Arc<AtomicBool>,
     /// The accept-loop thread handle, joined on `shutdown`.
     accept_handle: Option<thread::JoinHandle<()>>,
+    /// Test-only introspection of the live per-client worker count, so a test
+    /// can poll the real state instead of guessing a sleep duration.
+    #[cfg(test)]
+    live_clients: Arc<AtomicUsize>,
 }
 
 impl DevProxy {
@@ -118,11 +128,17 @@ impl DevProxy {
         // promptly on shutdown even if no connection arrives to unblock it.
         let upstream = Arc::new(AtomicU16::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
+        let live_clients = Arc::new(AtomicUsize::new(0));
 
+        // Dropping `listener` on a refused spawn releases the port, same as
+        // any other bind failure.
         let accept_handle = {
             let upstream = Arc::clone(&upstream);
             let stopped = Arc::clone(&stopped);
-            thread::spawn(move || accept_loop(&listener, &upstream, &stopped))
+            let live_clients = Arc::clone(&live_clients);
+            thread::Builder::new()
+                .name("ipe-watch-proxy-accept".to_owned())
+                .spawn(move || accept_loop(&listener, &upstream, &stopped, &live_clients))?
         };
 
         Ok(Self {
@@ -130,6 +146,8 @@ impl DevProxy {
             upstream,
             stopped,
             accept_handle: Some(accept_handle),
+            #[cfg(test)]
+            live_clients,
         })
     }
 
@@ -152,6 +170,14 @@ impl DevProxy {
     #[must_use]
     pub fn current_upstream(&self) -> u16 {
         self.upstream.load(Ordering::SeqCst)
+    }
+
+    /// The current count of live per-client worker slots. Test-only: lets a
+    /// test poll the real state of the [`MAX_PROXY_CLIENTS`] cap instead of
+    /// guessing a sleep duration.
+    #[cfg(test)]
+    fn live_client_count(&self) -> usize {
+        self.live_clients.load(Ordering::SeqCst)
     }
 
     /// Stop accepting new connections and join the accept loop. In-flight
@@ -180,8 +206,26 @@ impl Drop for DevProxy {
     }
 }
 
-/// Accept connections until `stopped`, spawning a worker thread per client.
-fn accept_loop(listener: &TcpListener, upstream: &Arc<AtomicU16>, stopped: &Arc<AtomicBool>) {
+/// Releases one reserved live-client slot when a per-client worker ends, on
+/// every exit path: normal return, panic unwind, or the worker thread never
+/// having started at all (a refused spawn drops this still inside the
+/// un-run closure).
+struct LiveClientSlot(Arc<AtomicUsize>);
+
+impl Drop for LiveClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Accept connections until `stopped`, spawning a worker thread per client,
+/// up to [`MAX_PROXY_CLIENTS`] concurrently live.
+fn accept_loop(
+    listener: &TcpListener,
+    upstream: &Arc<AtomicU16>,
+    stopped: &Arc<AtomicBool>,
+    live_clients: &Arc<AtomicUsize>,
+) {
     for stream in listener.incoming() {
         if stopped.load(Ordering::SeqCst) {
             return;
@@ -192,11 +236,26 @@ fn accept_loop(listener: &TcpListener, upstream: &Arc<AtomicU16>, stopped: &Arc<
             // kills the loop; keep serving.
             continue;
         };
+        if live_clients.fetch_add(1, Ordering::SeqCst) >= MAX_PROXY_CLIENTS {
+            // Over the live-client cap: close this connection at once rather
+            // than start another unbounded worker thread.
+            live_clients.fetch_sub(1, Ordering::SeqCst);
+            drop(client);
+            continue;
+        }
         let upstream = Arc::clone(upstream);
-        thread::spawn(move || {
-            // A worker that errors just closes its own connection.
-            let _ = serve_client(client, &upstream);
-        });
+        let slot = LiveClientSlot(Arc::clone(live_clients));
+        // A refused worker thread drops `client` and `slot` right here,
+        // inside the never-run closure: the connection closes and the
+        // reserved slot releases, exactly as a worker that ran and returned
+        // would. Keep accepting either way.
+        let _ = thread::Builder::new()
+            .name("ipe-watch-proxy-client".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                // A worker that errors just closes its own connection.
+                let _ = serve_client(client, &upstream);
+            });
     }
 }
 
@@ -574,7 +633,7 @@ fn read_line_capped(
 }
 
 fn write_502(client: &mut TcpStream, reason: &str) -> std::io::Result<()> {
-    let body = format!("502 Bad Gateway (ipe watch proxy): {reason}\n");
+    let body = format!("502 Bad Gateway (ipe dev watch proxy): {reason}\n");
     let resp = format!(
         "HTTP/1.1 502 Bad Gateway\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
@@ -618,40 +677,47 @@ mod tests {
     fn spawn_fixed_upstream(body: &'static str) -> u16 {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let port = listener.local_addr().unwrap().port();
-        thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(mut conn) = conn else { continue };
-                thread::spawn(move || {
-                    let mut reader = BufReader::new(conn.try_clone().unwrap());
-                    'conn: loop {
-                        // Read one request head (up to the blank line). An EOF on
-                        // the FIRST line is the client closing between requests.
-                        let mut lines = 0usize;
-                        loop {
-                            let mut line = Vec::new();
-                            let n = read_line_capped(&mut reader, &mut line, 64 * 1024).unwrap();
-                            if n == 0 {
-                                if lines == 0 {
+        thread::Builder::new()
+            .spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { continue };
+                    thread::Builder::new()
+                        .spawn(move || {
+                            let mut reader = BufReader::new(conn.try_clone().unwrap());
+                            'conn: loop {
+                                // Read one request head (up to the blank line). An
+                                // EOF on the FIRST line is the client closing
+                                // between requests.
+                                let mut lines = 0usize;
+                                loop {
+                                    let mut line = Vec::new();
+                                    let n =
+                                        read_line_capped(&mut reader, &mut line, 64 * 1024)
+                                            .unwrap();
+                                    if n == 0 {
+                                        if lines == 0 {
+                                            return;
+                                        }
+                                        break 'conn;
+                                    }
+                                    lines += 1;
+                                    if line == b"\r\n" || line == b"\n" {
+                                        break;
+                                    }
+                                }
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                if conn.write_all(resp.as_bytes()).is_err() {
                                     return;
                                 }
-                                break 'conn;
                             }
-                            lines += 1;
-                            if line == b"\r\n" || line == b"\n" {
-                                break;
-                            }
-                        }
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        );
-                        if conn.write_all(resp.as_bytes()).is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
+                        })
+                        .expect("spawn test thread");
+                }
+            })
+            .expect("spawn test thread");
         port
     }
 
@@ -822,5 +888,56 @@ mod tests {
             Some("CLEAN-OK"),
             "the accept loop must still serve a clean request after malformed ones: {served:?}"
         );
+    }
+
+    /// Poll `proxy`'s live-client count until it reaches `expected` or
+    /// `timeout` elapses, returning the last-observed count. A bounded
+    /// deadline-poll, not a flat sleep: the test that calls this needs to
+    /// know the accept loop has actually reserved every slot before it opens
+    /// the over-cap connection, not merely that some arbitrary delay passed.
+    fn wait_until_live_clients(proxy: &DevProxy, expected: usize, timeout: Duration) -> usize {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let count = proxy.live_client_count();
+            if count >= expected || std::time::Instant::now() >= deadline {
+                return count;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The standing pin for [`MAX_PROXY_CLIENTS`]: once that many connections
+    /// are live, the next one is closed at once rather than queued or served
+    /// by an unbounded extra worker thread.
+    #[test]
+    fn a_connection_past_the_live_client_cap_is_closed_at_once() {
+        let proxy = bind_proxy_on_free_port();
+        let proxy_port = proxy.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], proxy_port));
+
+        let mut idle = Vec::with_capacity(MAX_PROXY_CLIENTS);
+        for _ in 0..MAX_PROXY_CLIENTS {
+            idle.push(TcpStream::connect(addr).expect("connect idle client"));
+        }
+        let reached = wait_until_live_clients(&proxy, MAX_PROXY_CLIENTS, Duration::from_secs(5));
+        assert_eq!(
+            reached, MAX_PROXY_CLIENTS,
+            "every idle connection must be reserved a live-client slot before the cap test proceeds"
+        );
+
+        let mut over_cap = TcpStream::connect(addr).expect("connect over-cap client");
+        over_cap
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let n = over_cap
+            .read(&mut buf)
+            .expect("must see EOF, not a timeout");
+        assert_eq!(
+            n, 0,
+            "a connection past MAX_PROXY_CLIENTS must be closed at once"
+        );
+
+        drop(idle);
     }
 }

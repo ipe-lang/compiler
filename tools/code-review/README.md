@@ -9,8 +9,10 @@ the program stands on its own — no wrapper script.
 ## Prerequisites
 
 This app is written in Ipê, so the `ipe` compiler must be installed and on your
-`PATH`. Install it from the repo root with `./install.sh`; confirm with `ipe
-version`.
+`PATH`, at release `ipe-v0.4.0` or later: the queue loader uses `Task.loop`,
+which first ships in that release, so an older compiler refuses to build the
+app. Install it from the repo root with `./install.sh`, which installs the
+latest release; confirm with `ipe version`.
 
 The app reviews an `ipe-index` database, so you also need one. Build it once
 from the repo root:
@@ -60,9 +62,13 @@ first `:` when no `/` precedes it, matching how `ipe-index` reads it back.
 Every stored `tag:relative` path is sealed with `Ipe.Path.fromString` and joined
 with `Ipe.Path.under`, so it must land strictly under its tag's root: an
 empty, absolute, or NUL-bearing stored path, or one whose `..` climbs out of it,
-is refused with an error naming it and the `Ipe.Path` reason. The check is lexical — a symlink inside the repo is
-followed, so it can point a read outside the root. A source file larger than
-16 MiB is refused rather than read.
+is refused with an error naming it and the `Ipe.Path` reason. The check is
+lexical, and the app's source read follows a symbolic link, so a link placed at
+an indexed path after indexing can point a read outside the root. The index
+itself never lists such a path: `ipe-index` leaves out every symbolic link,
+submodule and non-UTF-8 name, reporting each on stderr, and reads names
+NUL-separated so a newline in a file name cannot split one path into two.
+A source file larger than 16 MiB is refused rather than read.
 
 Diagnostics escape control characters: a stored path, an env value, or an error
 shown on stderr or the page has every control, line-separator and bidi
@@ -104,11 +110,14 @@ consumed `change_queue` row is deleted. The app creates and owns the review DB.
 From this directory, against an index built at the repo root:
 
 ```bash
-IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe run
+IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe dev run
 ```
 
-`ipe run` builds and serves on <http://localhost:8000>. `ipe type-check` runs a
-fast check with no runtime, and `ipe build` compiles to a native binary.
+`ipe dev run` builds and serves on <http://localhost:8000>. Set `IPE_SERVER_PORT`
+to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`; a value that is
+not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
+large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
+no runtime, and `ipe dev build` compiles to a native binary.
 
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
 console at `/_ipe/console` is open only while the server binds loopback, and on
@@ -133,5 +142,5 @@ compiler's runtime to avoid it:
 
 ```bash
 ver=$(ipe version | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) print $i}')
-IPE_RUNTIME_DIR="$HOME/.ipe/runtime/$ver/rust" ipe run
+IPE_RUNTIME_DIR="$HOME/.ipe/runtime/$ver/rust" ipe dev run
 ```

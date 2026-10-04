@@ -274,7 +274,7 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
 /// A dependency-light persistent store: a `mem_cache` of live handles (same
 /// process, owns the driver) PLUS a single on-disk JSON map (`sid → framed
 /// checkpoint blob`) so a checkpoint survives a process swap WITHOUT pulling in
-/// sqlx/redis. This is what makes `ipe watch`'s blue-green Model handoff work
+/// sqlx/redis. This is what makes `ipe dev watch`'s blue-green Model handoff work
 /// for a plain `Web.tea` — such an app reaches no DB kernel, so the emitted
 /// crate carries no `db` feature and the sqlite store compiles out; this store
 /// rides the `web` feature every web build already has (`base64` + `bincode` +
@@ -303,6 +303,49 @@ pub struct FileStore<Model, Msg> {
     /// Whether the last map write failed, so a failure streak is logged once.
     persist_failing: std::sync::atomic::AtomicBool,
 }
+
+/// Why a checkpoint-map persist attempt failed, one variant per step.
+///
+/// The wrapped I/O error can carry the on-disk map path in its message (a
+/// [`crate::scratch_core::ScratchError`] displays the path it refused), so
+/// [`PersistError`]'s own `Display` names the step and the I/O error's
+/// [`std::io::ErrorKind`] (a fixed phrase), never that message — the same
+/// credential-free posture [`StoreOpenError`] keeps for a driver error that
+/// could echo the connection URL.
+#[cfg(feature = "web")]
+#[derive(Debug)]
+pub enum PersistError {
+    /// Encoding the in-memory map as JSON failed (not an I/O error).
+    Encode(serde_json::Error),
+    /// Creating the private atomic-replace sibling failed (open or verify).
+    CreateTemp(std::io::Error),
+    /// Writing the encoded map into the sibling failed.
+    WriteTemp(std::io::Error),
+    /// Flushing or renaming the sibling over the map file failed.
+    ///
+    /// [`crate::scratch_core::AtomicSibling::commit`] reports both as one step.
+    Commit(std::io::Error),
+}
+
+#[cfg(feature = "web")]
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (step, io) = match self {
+            Self::Encode(_) => ("encode", None),
+            Self::CreateTemp(e) => ("create temp file", Some(e)),
+            Self::WriteTemp(e) => ("write temp file", Some(e)),
+            Self::Commit(e) => ("commit (flush/rename)", Some(e)),
+        };
+        write!(f, "session store persist failed at step: {step}")?;
+        if let Some(e) = io {
+            write!(f, " ({})", e.kind())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "web")]
+impl std::error::Error for PersistError {}
 
 #[cfg(feature = "web")]
 impl<Model, Msg> FileStore<Model, Msg> {
@@ -345,10 +388,10 @@ impl<Model, Msg> FileStore<Model, Msg> {
     /// not even momentarily. The rename carries the mode to the final path, and
     /// a refused or failed write removes the temp file.
     ///
-    /// The first failure after a success is logged, naming its cause (a refused
-    /// temp file names the refusal); repeats stay silent until a write succeeds
-    /// again, so a persistently failing disk yields one line, not one per
-    /// mutation.
+    /// The first failure after a success is logged, naming the failed step and
+    /// its I/O error kind but never the map path; repeats stay silent until a
+    /// write succeeds again, so a persistently failing disk yields one line,
+    /// not one per mutation.
     fn persist(&self, disk: &HashMap<String, (String, i64)>) {
         let failed = self.write_map(disk).err();
         let was_failing = self
@@ -357,20 +400,20 @@ impl<Model, Msg> FileStore<Model, Msg> {
         if let (Some(err), false) = (failed, was_failing) {
             crate::system::emit_runtime_log(
                 "live",
-                &format!(
-                    "session store: file @ {} not written, sessions kept in memory: {err}",
-                    self.path.path().display()
-                ),
+                &format!("session store: map not written, sessions kept in memory: {err}"),
             );
         }
     }
 
     /// Serialize `disk` and atomically replace the map file with it.
-    fn write_map(&self, disk: &HashMap<String, (String, i64)>) -> std::io::Result<()> {
-        let json = serde_json::to_string(disk)?;
-        let mut sibling = crate::scratch_core::AtomicSibling::create_reclaimed(&self.path)?;
-        sibling.write_all(json.as_bytes())?;
-        sibling.commit()
+    fn write_map(&self, disk: &HashMap<String, (String, i64)>) -> Result<(), PersistError> {
+        let json = serde_json::to_string(disk).map_err(PersistError::Encode)?;
+        let mut sibling = crate::scratch_core::AtomicSibling::create_reclaimed(&self.path)
+            .map_err(PersistError::CreateTemp)?;
+        sibling
+            .write_all(json.as_bytes())
+            .map_err(PersistError::WriteTemp)?;
+        sibling.commit().map_err(PersistError::Commit)
     }
 }
 
@@ -577,6 +620,7 @@ impl StoreOpenError {
                     | SsrfRefusal::Unresolvable { .. }
                     | SsrfRefusal::NoAddresses { .. }
                     | SsrfRefusal::Timeout { .. }
+                    | SsrfRefusal::Deadline(_)
                     | SsrfRefusal::LocalSocket
                     | SsrfRefusal::UnprovenTarget
                     | SsrfRefusal::UnpinnableTlsName { .. } => true,
@@ -1209,7 +1253,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreBackend {
     Memory,
-    /// The sqlx-free on-disk checkpoint map (the `ipe watch` dev-handoff store).
+    /// The sqlx-free on-disk checkpoint map (the `ipe dev watch` dev-handoff store).
     File,
     Sqlite,
     Postgres,
@@ -1237,7 +1281,7 @@ impl StoreBackend {
     /// (or losing state) is the failure mode this closes. An unrecognised value
     /// falls back to `memory` (the historical default for a typo / unset).
     ///
-    /// Dev (`ipe watch`) is unaffected: it sets `IPE_WEB_STORE=file` explicitly,
+    /// Dev (`ipe dev watch`) is unaffected: it sets `IPE_WEB_STORE=file` explicitly,
     /// which every web build honours; it never asks for `sqlite`.
     fn parse(kind: &str) -> Result<StoreBackend, StoreConfigError> {
         match kind {
@@ -1631,6 +1675,16 @@ mod tests {
                 host: HostShown::Named("db.invalid".to_owned()),
                 after: Duration::from_secs(1),
             })),
+            StoreOpenError::Connect(DbConnectError::HostRefused(SsrfRefusal::Deadline(
+                crate::system::EnvCeiling::new(
+                    "IPE_HTTP_DNS_TIMEOUT_MS",
+                    5_000,
+                    crate::system::ZeroCeiling::Refused,
+                    "decimal millisecond count",
+                )
+                .parse(Ok("5s".to_owned()))
+                .expect_err("a suffixed deadline is refused"),
+            ))),
             StoreOpenError::Connect(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget)),
             StoreOpenError::Connect(DbConnectError::HostRefused(
                 SsrfRefusal::UnpinnableTlsName {
@@ -2247,6 +2301,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `write_map` names the step that failed, never a bare `io::Error`: a
+    /// rename blocked by a non-empty directory is `Commit`, a missing parent
+    /// directory for the sibling itself is `CreateTemp`.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn file_store_write_map_names_the_failing_step() {
+        let dir = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_file_persisterr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+
+        let blocked = dir.join("blocked.json");
+        assert!(std::fs::create_dir_all(blocked.join("x")).is_ok(), "block");
+        let Some(bp) = blocked.to_str() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let s: FileStore<i32, ()> = FileStore::new(bp, Duration::from_secs(60), TEST_TAG);
+        let disk = s.disk.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let err = s.write_map(&disk).err();
+        assert!(matches!(err, Some(PersistError::Commit(_))), "{err:?}");
+
+        let missing = dir.join("missing_parent").join("sessions.json");
+        let Some(mp) = missing.to_str() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let s2: FileStore<i32, ()> = FileStore::new(mp, Duration::from_secs(60), TEST_TAG);
+        let disk2 = s2.disk.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let err2 = s2.write_map(&disk2).err();
+        assert!(
+            matches!(err2, Some(PersistError::CreateTemp(_))),
+            "{err2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `PersistError`'s `Display` (the text the persist log line carries) names
+    /// the step and the error kind, never the inner message — a refused
+    /// scratch location displays the path it refused.
+    #[cfg(feature = "web")]
+    #[test]
+    fn persist_error_display_omits_the_inner_message() {
+        let secret_path = "/srv/app/ipe-sessions/private-map.json";
+        let inner = || std::io::Error::other(format!("refusing scratch location {secret_path}"));
+        let shown = [
+            PersistError::CreateTemp(inner()),
+            PersistError::WriteTemp(inner()),
+            PersistError::Commit(inner()),
+        ]
+        .map(|e| e.to_string());
+        for text in &shown {
+            assert!(!text.contains(secret_path), "path leaked: {text}");
+            assert!(!text.contains("refusing"), "inner message leaked: {text}");
+        }
+        assert_eq!(
+            shown,
+            [
+                "session store persist failed at step: create temp file (other error)",
+                "session store persist failed at step: write temp file (other error)",
+                "session store persist failed at step: commit (flush/rename) (other error)",
+            ]
+        );
+    }
+
+    /// A persist failure sets the streak flag once; a later successful
+    /// persist on the same store clears it.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn file_store_persist_failing_clears_on_success() {
+        let dir = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_file_clearflag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+        let map = dir.join("sessions.json");
+        let Some(p) = map.to_str() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        // The map path starts life as a non-empty directory: the first
+        // mutation's rename fails and the streak flag is set.
+        assert!(std::fs::create_dir_all(map.join("x")).is_ok(), "block");
+        let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
+        s.set("s1", handle_i32(1)).await;
+        assert!(
+            s.persist_failing.load(std::sync::atomic::Ordering::Relaxed),
+            "failure recorded"
+        );
+
+        // Unblock: the rename can now land, so the next mutation succeeds.
+        assert!(std::fs::remove_dir_all(&map).is_ok(), "unblock");
+        s.set("s2", handle_i32(2)).await;
+        assert!(
+            !s.persist_failing.load(std::sync::atomic::Ordering::Relaxed),
+            "streak cleared on the next success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// File-store restart survival: a store writes a checkpoint, a FRESH store
     /// over the same file (empty mem-cache) decodes it as a `Cold` model — the
     /// dev-handoff persistence path, with NO sqlx.
@@ -2525,7 +2681,7 @@ mod tests {
         }))
     }
 
-    /// File store (the `ipe watch` dev-handoff path): a checkpoint written by
+    /// File store (the `ipe dev watch` dev-handoff path): a checkpoint written by
     /// the OLD two-field Model is restored under the NEW three-field Model
     /// across a rebuild — old state (count/name) preserved, the new `scroll`
     /// filled from `init`. This is state PRESERVED across an additive Model

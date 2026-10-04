@@ -29,12 +29,14 @@
 // mis-set-up test fail loudly (the correct behavior for a test).
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    FilesystemScope, RunResourceLimits, SandboxProfile, run_windows_jailed_for_test,
+    FilesystemScope, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
+    run_windows_jailed_for_test, windows_scrubbed_env,
 };
 
 /// A per-test scratch under the process temp dir (NTFS on the hosted image, so
@@ -71,10 +73,12 @@ fn powershell() -> PathBuf {
 }
 
 /// Run `command` (a PowerShell one-liner) under the run jail described by
-/// `profile`, returning the exit code, or `None` if the jail refused to establish
-/// (which the caller treats as a skip, since a hosted runner may lack a
-/// primitive — the CI job proves presence separately).
-fn run_jailed(profile: &SandboxProfile, scratch: &Path, command: &str) -> Option<u32> {
+/// `profile`, returning the child's exit code.
+///
+/// A jail that refuses to establish fails the test: a refusal is never a denial
+/// (it would pass every "must deny" assertion vacuously) and never a skip (it
+/// would hide a launcher that cannot start any child).
+fn run_jailed(profile: &SandboxProfile, scratch: &Path, command: &str) -> u32 {
     let app = powershell();
     let args = [
         OsString::from("-NoProfile"),
@@ -82,7 +86,13 @@ fn run_jailed(profile: &SandboxProfile, scratch: &Path, command: &str) -> Option
         OsString::from("-Command"),
         OsString::from(command),
     ];
-    run_windows_jailed_for_test(profile, scratch, scratch, &app, &args).ok()
+    run_windows_jailed_for_test(profile, scratch, scratch, &app, &args)
+        .expect("the run jail refused to launch the probe")
+}
+
+/// A path as a single-quoted PowerShell string body (`'` doubled).
+fn ps_quoted(path: &Path) -> String {
+    path.to_string_lossy().replace('\'', "''")
 }
 
 /// Run the same PowerShell one-liner unjailed — the control half of the duality.
@@ -142,8 +152,8 @@ fn a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under
     let scratch = scratch_dir("sub");
     // Spawn a trivial child and exit 0 iff it started. Under a job capped at one
     // active process, the second process cannot be created.
-    let spawn_child =
-        "$p = Start-Process -FilePath cmd.exe -ArgumentList '/c exit 0' -PassThru -Wait; exit 0";
+    let spawn_child = "try { $p = Start-Process -FilePath cmd.exe -ArgumentList '/c exit 0' \
+                       -PassThru -Wait -ErrorAction Stop; exit 0 } catch { exit 12 }";
     // Control: spawning a child succeeds outside the job.
     let control = run_control(spawn_child);
     if control != Some(0) {
@@ -156,12 +166,14 @@ fn a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under
     // probe (which needs to spawn) fails with a non-zero code.
     let withheld = run_jailed(&subprocess_withheld(), &scratch, spawn_child);
     let _ = std::fs::remove_dir_all(&scratch);
-    if let Some(g) = granted {
-        assert_eq!(g, 0, "subprocess granted must not false-deny a child spawn");
-    }
-    assert_ne!(
-        withheld,
-        Some(0),
+    assert_eq!(
+        granted, 0,
+        "subprocess granted must not false-deny a child spawn"
+    );
+    // The probe's own catch code: any other non-zero exit (the probe failing to
+    // start or erroring for another reason) is not the denial under test.
+    assert_eq!(
+        withheld, 12,
         "a subprocess-withholding job must DENY the child spawn (control succeeded)"
     );
 }
@@ -218,14 +230,99 @@ fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_c
         let allowed_present = run_jailed(&profile, &scratch, &coded("IPE_ALLOWED_E2E"));
         let _ = std::fs::remove_dir_all(&scratch);
         assert_eq!(
-            secret_absent,
-            Some(0),
+            secret_absent, 0,
             "a non-allowlisted var must be scrubbed from the jailed child"
         );
-        if let Some(a) = allowed_present {
-            assert_eq!(a, 42, "an allowlisted var must survive the scrub");
-        }
+        assert_eq!(
+            allowed_present, 42,
+            "an allowlisted var must survive the scrub"
+        );
     }
+}
+
+/// The host values of the names the launcher may forward: the base set plus
+/// `extra`, read through the same allowlisted host-env reader the launcher uses.
+fn host_lookup(extra: &[&str]) -> Vec<(String, OsString)> {
+    let names: Vec<&str> = WindowsBaseEnv::ALL
+        .into_iter()
+        .map(WindowsBaseEnv::name)
+        .chain(extra.iter().copied())
+        .collect();
+    ipe_sandbox::host_env::granted_env(&env_granted(&names))
+}
+
+#[test]
+fn the_jailed_child_sees_exactly_the_declared_env() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let scratch = scratch_dir("env-exact");
+    let names_file = scratch.join("names.txt");
+    let tmp_file = scratch.join("tmp.txt");
+    let temp_file = scratch.join("temp.txt");
+    let probe = format!(
+        "$k = [Environment]::GetEnvironmentVariables('Process').Keys | ForEach-Object {{ [string]$_ }}; \
+         [IO.File]::WriteAllLines('{names}', [string[]]$k); \
+         [IO.File]::WriteAllText('{tmp}', [string]$env:TMP); \
+         [IO.File]::WriteAllText('{temp}', [string]$env:TEMP); exit 0",
+        names = ps_quoted(&names_file),
+        tmp = ps_quoted(&tmp_file),
+        temp = ps_quoted(&temp_file),
+    );
+    let profile = env_granted(&["COMPUTERNAME"]);
+    let code = run_jailed(&profile, &scratch, &probe);
+    let observed_names = std::fs::read_to_string(&names_file);
+    let observed_tmp = std::fs::read_to_string(&tmp_file);
+    let observed_temp = std::fs::read_to_string(&temp_file);
+    let host = host_lookup(&["COMPUTERNAME"]);
+    let declared = windows_scrubbed_env(&profile, &scratch, &|name: &str| {
+        host.iter()
+            .find(|(granted, _)| granted == name)
+            .map(|(_, value)| value.clone())
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_eq!(code, 0, "the env probe must run to completion");
+
+    // Names starting with `=` are the process-internal per-drive current
+    // directories, never block entries; `PSMODULEPATH` is the one variable
+    // PowerShell sets in its own process at startup.
+    let observed: BTreeSet<String> = observed_names
+        .expect("the probe wrote its env names")
+        .lines()
+        .map(|line| line.trim().to_ascii_uppercase())
+        .filter(|name| !name.is_empty() && !name.starts_with('='))
+        .collect();
+    let expected: BTreeSet<String> = declared
+        .iter()
+        .map(|(name, _)| name.to_string_lossy().to_ascii_uppercase())
+        .chain([String::from("PSMODULEPATH")])
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "the jailed child must see exactly the declared env (declared: {declared:?})"
+    );
+
+    let scratch_str = scratch.to_string_lossy().into_owned();
+    let declared_value = |name: &str| {
+        declared
+            .iter()
+            .find(|(n, _)| n.to_string_lossy() == name)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    };
+    let observed_tmp = observed_tmp.expect("the probe wrote TMP");
+    let observed_temp = observed_temp.expect("the probe wrote TEMP");
+    assert_eq!(observed_tmp, scratch_str, "TMP must be the scratch");
+    assert_eq!(observed_temp, scratch_str, "TEMP must be the scratch");
+    assert_eq!(
+        declared_value("TMP"),
+        Some(scratch_str.clone()),
+        "TMP is declared as the scratch"
+    );
+    assert_eq!(
+        declared_value("TEMP"),
+        Some(scratch_str),
+        "TEMP is declared as the scratch"
+    );
 }
 
 // ── filesystem (enforce half) ────────────────────────────────────────────────
@@ -255,9 +352,8 @@ fn an_out_of_scratch_write_is_denied_under_the_appcontainer_but_succeeds_under_c
     let jailed = run_jailed(&isolated(), &scratch, &write);
     let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_dir_all(&scratch);
-    assert_ne!(
-        jailed,
-        Some(0),
+    assert_eq!(
+        jailed, 13,
         "an AppContainer with only the scratch ACLed must DENY the out-of-scratch write"
     );
 }
@@ -277,12 +373,10 @@ fn a_write_into_the_granted_working_tree_succeeds_no_false_deny() {
     // ACLed to the container SID, so a write into it must NOT be false-denied.
     let jailed = run_jailed(&fs_granted(), &scratch, &write);
     let _ = std::fs::remove_dir_all(&scratch);
-    if let Some(code) = jailed {
-        assert_eq!(
-            code, 0,
-            "a write into the granted working tree must succeed"
-        );
-    }
+    assert_eq!(
+        jailed, 0,
+        "a write into the granted working tree must succeed"
+    );
 }
 
 // ── network (enforce half) ───────────────────────────────────────────────────
@@ -308,9 +402,8 @@ fn an_outbound_connect_is_denied_under_a_network_withholding_appcontainer() {
     let net_withheld = subprocess_granted(); // network stays false
     let jailed = run_jailed(&net_withheld, &scratch, connect);
     let _ = std::fs::remove_dir_all(&scratch);
-    assert_ne!(
-        jailed,
-        Some(0),
+    assert_eq!(
+        jailed, 7,
         "a network-withholding AppContainer must DENY the outbound connect (control succeeded)"
     );
 }

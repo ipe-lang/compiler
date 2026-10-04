@@ -24,13 +24,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::redact::{Redacted, redacting_debug};
+
 /// Ipe.Http.Server.Request — opaque parsed request handle.
 // camelCase field names are required because accessor kernels (server_body,
-// server_path, server_method, …) read these fields directly by name. These
-// fields are NOT part of the Ipê API — Ipê code always goes through a kernel.
+// server_path, server_method, …) read these fields directly by name, and Ipê
+// `req.<field>` access lowers to `(req).<field>.clone()` against the field
+// types of `RequestFields` in `ipe_types` — so every field keeps its plain type.
 // `build_request` populates every field exactly once at the axum boundary.
+// Every field but the method is client-supplied data that can carry a credential
+// (an `Authorization` header, a session cookie, a token in the path, query or
+// body), so `Debug` masks it.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerRequest {
     pub method: String,
     pub path: String,
@@ -42,12 +48,46 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
+redacting_debug!(ServerRequest {
+    shown: [method],
+    masked: [path, body, headers, params, query, cookies, remoteAddr],
+});
+
+/// Emitted `req.<field>` reads each field at the plain type `ipe_types`'
+/// `RequestFields` table gives it (`String`, or `Dict String String` =
+/// `HashMap<String, String>`); a field whose type changes breaks this build,
+/// not a downstream cargo build of an emitted program.
+#[allow(clippy::type_complexity)]
+const _: fn(
+    ServerRequest,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) = |r| {
+    (
+        r.method,
+        r.path,
+        r.body,
+        r.remoteAddr,
+        r.headers,
+        r.params,
+        r.query,
+        r.cookies,
+    )
+};
+
 /// Ipe.Http.Server.Response — opaque response handle built by accessor kernels.
 // camelCase field names are required because builder/emit kernels (server_text,
 // server_with_status, to_axum_response, …) write/read these fields directly.
 // These fields are NOT part of the Ipê API — Ipê code always uses builder kernels.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerResponse {
     pub status: i64,
     pub body: String,
@@ -63,11 +103,19 @@ pub struct ServerResponse {
     pub cookies: Vec<SetCookie>,
 }
 
+// The body, headers and `Set-Cookie` values can carry a session id or a token;
+// the emitter builds this struct by field name, so the masking lives in `Debug`.
+redacting_debug!(ServerResponse {
+    shown: [status, contentType],
+    masked: [body, headers, cookies],
+});
+
 /// Ipe.Http.Server.Cookie (opaque) — safe defaults applied at attach time.
+// The value is the cookie's secret half (a session id, a token); the name is not.
 #[derive(Clone, Debug)]
 pub struct ServerCookie {
     pub name: CookieName,
-    pub value: CookieValue,
+    pub value: Redacted<CookieValue>,
 }
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
@@ -428,14 +476,28 @@ fn reissue_set_cookie(
 ) -> SetCookie {
     // The cookie-security signal lives in `web::csrf` for a program that emits the
     // web surface; a server-only program (no `web` module) falls back to the
-    // production-env signal. `feature = "web"` is the exact condition under which
+    // process `Secure` floor. `feature = "web"` is the exact condition under which
     // `crate::web` is present, so the reference is compiled out when it is absent.
     #[cfg(feature = "web")]
     let base_secure = crate::web::csrf::cookies_secure();
     #[cfg(not(feature = "web"))]
-    let base_secure = crate::telemetry::production_from_env();
-    let secure = base_secure || is_https;
+    let base_secure = cookie_secure_floor();
+    reissue_set_cookie_with(
+        cookie_name,
+        token,
+        slide_window_secs,
+        base_secure || is_https,
+    )
+}
 
+#[cfg(feature = "jwt")]
+/// [`reissue_set_cookie`] under an explicit `Secure` decision.
+fn reissue_set_cookie_with(
+    cookie_name: &CookieName,
+    token: &str,
+    slide_window_secs: u64,
+    secure: bool,
+) -> SetCookie {
     // Frame-ancestors (CSP embedding) is a web-surface concept; a server-only
     // program cannot be framed, so `SameSite=Lax` is the fail-closed default.
     #[cfg(feature = "web")]
@@ -538,7 +600,13 @@ where
             let reissue_cookie: Option<SetCookie> =
                 if let TokenSource::Cookie(ref name) = cfg.source {
                     if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                        let slide_window_secs = crate::app_config::resolve_auth_slide_window();
+                        // A malformed window refuses the request rather than
+                        // re-issuing under an unknown bound; the detail stays out of
+                        // the response.
+                        let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                        else {
+                            return ok_res(plain_resp(503, "service unavailable", &[]));
+                        };
                         let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
                         let now = crate::jwt::now_unix_seconds();
                         // Throttle: re-issue only once past exp - slide_window/2.
@@ -916,8 +984,19 @@ mod cookie_octets {
     }
 
     /// One `Set-Cookie` header value built from typed parts.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    ///
+    /// The line carries the cookie's value (a session id, a token), so its
+    /// `Debug` prints [`crate::redact::REDACTED`], never the line.
+    #[derive(Clone, PartialEq, Eq)]
     pub struct SetCookie(String);
+
+    impl std::fmt::Debug for SetCookie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("SetCookie")
+                .field(&crate::redact::Redacted::new(()))
+                .finish()
+        }
+    }
 
     impl SetCookie {
         /// Render `name=value; Path=<path>` and then `attributes` in a fixed order.
@@ -976,7 +1055,7 @@ pub fn server_cookie(name: String, value: String) -> IpeResult<IpeError, ServerC
     match CookieName::parse(&name) {
         Some(name) => IpeResult::Ok(ServerCookie {
             name,
-            value: CookieValue::encode(&value),
+            value: Redacted::new(CookieValue::encode(&value)),
         }),
         None => IpeResult::Err(IpeError::invalid_input(
             "Server.cookie: a cookie name must not be empty".to_owned(),
@@ -999,7 +1078,7 @@ pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerRespo
             path: CookiePath::root(),
             http_only: true,
             same_site: SameSite::Lax,
-            secure: crate::telemetry::production_from_env(),
+            secure: cookie_secure_floor(),
             max_age_secs: None,
         },
     ));
@@ -1008,40 +1087,58 @@ pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerRespo
 
 // ─── listen + axum adapter (step 4) ───────────────────────────────────────
 
-const DEFAULT_MAX_BODY: usize = 32 * 1024 * 1024; // 32 MiB
+/// Request-body cap: `IPE_WEB_MAX_BODY_BYTES`, default 32 MiB.
+const MAX_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WEB_MAX_BODY_BYTES",
+    32 * 1024 * 1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
 
-/// Request-body cap. Overridable via `IPE_WEB_MAX_BODY_BYTES`; falls back to
-/// 32 MiB.
-fn max_body() -> usize {
-    crate::system::read_env_var("IPE_WEB_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_BODY)
+/// Per-request deadline (slowloris ceiling): `IPE_HTTP_REQUEST_TIMEOUT` seconds, default 30.
+const REQUEST_TIMEOUT_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_HTTP_REQUEST_TIMEOUT",
+    30,
+    crate::system::ZeroCeiling::Refused,
+    "decimal second count",
+);
+
+/// Global in-flight request cap: `IPE_HTTP_MAX_INFLIGHT`, default 1024.
+const MAX_INFLIGHT_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_HTTP_MAX_INFLIGHT",
+    1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal request count",
+)
+.at_most(tokio::sync::Semaphore::MAX_PERMITS as u64);
+
+fn max_body() -> Result<usize, crate::system::EnvCeilingRefusal> {
+    MAX_BODY_CEILING.read()
 }
 
-const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
-
-/// Per-request deadline (slowloris ceiling). Overridable via
-/// `IPE_HTTP_REQUEST_TIMEOUT` (seconds); falls back to 30s.
-fn http_request_timeout_secs() -> u64 {
-    crate::system::read_env_var("IPE_HTTP_REQUEST_TIMEOUT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS)
+/// The ceilings `Server.listen` applies to its listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenCeilings {
+    /// The per-request deadline, in seconds.
+    request_timeout_secs: u64,
+    /// The global in-flight request cap.
+    max_inflight: usize,
 }
 
-const DEFAULT_HTTP_MAX_INFLIGHT: usize = 1024;
-
-/// Global in-flight request cap. Overridable via `IPE_HTTP_MAX_INFLIGHT`; falls
-/// back to 1024.
-fn http_max_inflight() -> usize {
-    crate::system::read_env_var("IPE_HTTP_MAX_INFLIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_HTTP_MAX_INFLIGHT)
+/// Resolves every server ceiling once, before the listener binds.
+///
+/// The per-request and per-socket ceilings are re-read where they apply; this
+/// preflight makes a malformed one refuse `Server.listen` instead of every
+/// request.
+fn listen_ceilings() -> Result<ListenCeilings, crate::system::EnvCeilingRefusal> {
+    max_body()?;
+    ws_ceilings()?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings()?;
+    Ok(ListenCeilings {
+        request_timeout_secs: REQUEST_TIMEOUT_CEILING.read()?,
+        max_inflight: MAX_INFLIGHT_CEILING.read()?,
+    })
 }
 
 /// Why a request is turned away before its handler runs.
@@ -1052,6 +1149,8 @@ pub(crate) enum RequestRejection {
     /// The path or query is not a well-formed URL (a malformed escape, decoded
     /// bytes that are not UTF-8, an over-cap component or too many query pairs).
     BadRequest,
+    /// The request-body ceiling's environment value is malformed.
+    Unavailable,
 }
 
 impl RequestRejection {
@@ -1065,6 +1164,10 @@ impl RequestRejection {
                 "Payload Too Large",
             ),
             Self::BadRequest => (axum::http::StatusCode::BAD_REQUEST, "Bad Request"),
+            Self::Unavailable => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+            ),
         }
     }
 }
@@ -1138,10 +1241,67 @@ fn gate_listener(app: axum::Router) -> axum::Router {
     app.layer(axum::middleware::from_fn(refuse_malformed_url))
 }
 
-/// A static file service behind the strict URL gate.
+/// What a static-file mount may serve for one request path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum StaticRequest {
+    /// The mount's own directory (no segment).
+    Root,
+    /// A path beneath the directory whose every segment is a plain name.
+    File(crate::path_core::RelPath),
+}
+
+/// Why a static-file request path may not reach the filesystem.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum StaticRefusal {
+    /// The strict core refused the path text itself.
+    Malformed(crate::encoding::DecodeRefusal),
+    /// A decoded segment is not a plain name under the serving regime.
+    Segment(crate::path_core::RelPathRefusal),
+    /// The served directory is not UTF-8 text, so no join beneath it is judged.
+    RootNotText,
+    /// The checked join of the parsed path beneath the directory refused.
+    Join(crate::path::PathRefusal),
+}
+
+/// Parse a static-file request path under the serving `regime`, or say why it
+/// may not reach the filesystem beneath `root`.
 ///
-/// `ServeDir` percent-decodes the path itself; the gate makes that decode run
-/// only on a path the strict core already accepted.
+/// The path is decoded once by the strict core (`DecodedPath::parse`; a
+/// malformed one was already answered 400 by [`refuse_malformed_url`]), then
+/// parsed into a `RelPath`, so a segment that climbs, re-anchors, names a
+/// device or a stream, or aliases another entry under the regime is refused
+/// before any join. An empty segment (`/a//b`) names no entry and is refused
+/// too. The join itself ([`crate::path::join_rel`]) then re-checks the joined
+/// text independently; its result is discarded here.
+///
+/// # Errors
+///
+/// The [`StaticRefusal`] of the first boundary that refused the path.
+pub(crate) fn static_request(
+    uri_path: &str,
+    root: &std::path::Path,
+    regime: crate::path_core::Regime,
+) -> Result<StaticRequest, StaticRefusal> {
+    let decoded =
+        crate::encoding::DecodedPath::parse(uri_path).map_err(StaticRefusal::Malformed)?;
+    if decoded.is_root() {
+        return Ok(StaticRequest::Root);
+    }
+    let rel = crate::path_core::RelPath::from_segments(
+        decoded.segments().iter().map(String::as_str),
+        regime,
+    )
+    .map_err(StaticRefusal::Segment)?;
+    let root = root.to_str().ok_or(StaticRefusal::RootNotText)?;
+    crate::path::join_rel(root, &rel).map_err(StaticRefusal::Join)?;
+    Ok(StaticRequest::File(rel))
+}
+
+/// A static file service behind the strict URL gate and the static path gate.
+///
+/// `ServeDir` percent-decodes the path itself; the gates make that decode run
+/// only on a path the strict core already accepted and [`static_request`]
+/// admits under the host regime.
 pub(crate) fn strict_serve_dir(
     dir: std::path::PathBuf,
 ) -> impl tower::Service<
@@ -1152,9 +1312,42 @@ pub(crate) fn strict_serve_dir(
 > + Clone
 + Send
 + 'static {
+    strict_serve_dir_with(dir, crate::path_core::HOST)
+}
+
+/// [`strict_serve_dir`] under an explicit `regime`, so any host proves the
+/// Windows refusals.
+///
+/// A request path [`static_request`] refuses is answered a bare 404 that never
+/// echoes the path, whether or not the entry exists.
+fn strict_serve_dir_with(
+    dir: std::path::PathBuf,
+    regime: crate::path_core::Regime,
+) -> impl tower::Service<
+    axum::extract::Request,
+    Response = axum::response::Response,
+    Error = std::convert::Infallible,
+    Future: Send + 'static,
+> + Clone
++ Send
++ 'static {
+    use axum::response::IntoResponse;
+    let root = dir.clone();
+    let static_gate = axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let admitted = static_request(req.uri().path(), &root, regime).is_ok();
+            async move {
+                if admitted {
+                    next.run(req).await
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
+            }
+        },
+    );
     tower::Layer::layer(
         &axum::middleware::from_fn(refuse_malformed_url),
-        tower_http::services::ServeDir::new(dir),
+        tower::Layer::layer(&static_gate, tower_http::services::ServeDir::new(dir)),
     )
 }
 
@@ -1256,7 +1449,10 @@ async fn build_request(
     let upgrader = axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &())
         .await
         .ok();
-    let cap = max_body();
+    // A malformed ceiling refuses the request rather than widening the cap.
+    let Ok(cap) = max_body() else {
+        return Err(RequestRejection::Unavailable);
+    };
     // Reject an oversize body with 413 instead of silently truncating to "".
     // Pre-check Content-Length when declared (deterministic for non-chunked
     // requests); to_bytes still enforces the cap for chunked bodies.
@@ -1561,6 +1757,10 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         if let Some(msg) = endpoint_conflict(&routes) {
             return IpeResult::Err(msg.into());
         }
+        let ceilings = match listen_ceilings() {
+            Ok(ceilings) => ceilings,
+            Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
+        };
         let mut app: axum::Router = axum::Router::new();
         // At most ONE mounted web app per server: the embedded app's cookie /
         // CSRF / asset paths are scoped through the process-wide base path
@@ -1658,12 +1858,12 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         // forever behind the cap.
         let app = app
             .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-                http_max_inflight(),
+                ceilings.max_inflight,
             ))
             .layer(tower_http::timeout::TimeoutLayer::new(
-                std::time::Duration::from_secs(http_request_timeout_secs()),
+                std::time::Duration::from_secs(ceilings.request_timeout_secs),
             ));
-        // Port precedence: the supervisor's relocation var (`ipe watch` placing
+        // Port precedence: the supervisor's relocation var (`ipe dev watch` placing
         // the app behind its proxy) > `IPE_SERVER_PORT` (operator) > the port the
         // program passed to `Server.listen`. A malformed env layer falls through,
         // never to `0`.
@@ -1680,6 +1880,8 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         // (loopback in debug, all interfaces in release). The conservative
         // loopback default keeps a dev console off the LAN by construction.
         let host = crate::app_config::resolve_host_bind();
+        // Recorded before the bind, so no dev surface outlives an exposed listener.
+        crate::telemetry::record_bind(&host);
         let addr = format!("{}:{}", host, port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -1754,38 +1956,51 @@ enum WsOut {
 /// Per-peer outbound queue depth. A slow/idle WebSocket consumer must NOT let the
 /// server buffer unboundedly (OOM) — the channel is bounded and a full queue drops
 /// the message (the send kernel returns Err), giving real backpressure. Override
-/// via IPE_WS_SEND_BUFFER; default 256 frames.
-fn ws_send_buffer() -> usize {
-    crate::system::read_env_var("IPE_WS_SEND_BUFFER")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(256)
-}
-
-const DEFAULT_WS_MAX_CONNECTIONS: usize = 1024;
+/// via `IPE_WS_SEND_BUFFER`; default 256 frames.
+const WS_SEND_BUFFER_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WS_SEND_BUFFER",
+    256,
+    crate::system::ZeroCeiling::Refused,
+    "decimal frame count",
+)
+.at_most(tokio::sync::Semaphore::MAX_PERMITS as u64);
 
 /// Live-peer ceiling. Each accepted upgrade pins a registry slot, an mpsc
 /// channel, and a heartbeat task; without a ceiling a peer can open connections
 /// until FD/memory exhaustion. Override via `IPE_WS_MAX_CONNECTIONS`; default
 /// 1024, mirroring `http_stream`'s `CLIENT_STREAMS_MAX`.
-fn ws_max_connections() -> usize {
-    crate::system::read_env_var("IPE_WS_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_WS_MAX_CONNECTIONS)
+const WS_MAX_CONNECTIONS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WS_MAX_CONNECTIONS",
+    1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal connection count",
+);
+
+/// Heartbeat interval for WebSocket Ping frames: `IPE_WS_HEARTBEAT` seconds, default 30.
+const WS_HEARTBEAT_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WS_HEARTBEAT",
+    30,
+    crate::system::ZeroCeiling::Refused,
+    "decimal second count",
+);
+
+/// The ceilings one WebSocket peer runs under, resolved at its upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WsCeilings {
+    /// The outbound queue depth, in frames.
+    send_buffer: usize,
+    /// The live-peer ceiling.
+    max_connections: usize,
+    /// The Ping interval, in seconds.
+    heartbeat_secs: u64,
 }
 
-/// Heartbeat interval for WebSocket Ping frames.  Mirrors
-/// `wsDefaultPingInterval = 30s` (``).
-/// Override via `IPE_WS_HEARTBEAT` (seconds, must be > 0).
-fn ws_heartbeat_secs() -> u64 {
-    crate::system::read_env_var("IPE_WS_HEARTBEAT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(30)
+fn ws_ceilings() -> Result<WsCeilings, crate::system::EnvCeilingRefusal> {
+    Ok(WsCeilings {
+        send_buffer: WS_SEND_BUFFER_CEILING.read()?,
+        max_connections: WS_MAX_CONNECTIONS_CEILING.read()?,
+        heartbeat_secs: WS_HEARTBEAT_CEILING.read()?,
+    })
 }
 
 fn ws_registry() -> &'static Mutex<HashMap<i64, tokio::sync::mpsc::Sender<WsOut>>> {
@@ -1822,6 +2037,7 @@ async fn ws_loop<E: From<String> + Send + 'static>(
     mut socket: axum::extract::ws::WebSocket,
     cfg: WsServerCfg<E>,
     id: i64,
+    ceilings: WsCeilings,
 ) {
     use axum::extract::ws::Message;
     use std::time::Duration;
@@ -1832,7 +2048,7 @@ async fn ws_loop<E: From<String> + Send + 'static>(
     // rejected by tokio-tungstenite before it reaches this loop. The Text/Binary
     // size checks below are application-layer defense in depth (belt-and-braces
     // against a future axum/tungstenite version silently dropping the cap).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ws_send_buffer());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
     // Live-peer ceiling, application-layer defense in depth: the upgrade gate in
     // `server_web_socket_upgrade` is the primary check, but under high
     // concurrency the check-then-insert is a TOCTOU window. Re-check under the
@@ -1841,7 +2057,7 @@ async fn ws_loop<E: From<String> + Send + 'static>(
     // Close frame instead of registering it (no `onConnect`, no slot held).
     let admitted = {
         let mut reg = ws_registry().lock().unwrap_or_else(|e| e.into_inner());
-        if reg.len() >= ws_max_connections() {
+        if reg.len() >= ceilings.max_connections {
             false
         } else {
             reg.insert(id, tx);
@@ -1854,12 +2070,12 @@ async fn ws_loop<E: From<String> + Send + 'static>(
         return;
     }
     let _ = (cfg.onConnect)(WsHandle::WebSocketServer(id)).await;
-    // Heartbeat: send a Ping every `ws_heartbeat_secs()` seconds to keep the
+    // Heartbeat: send a Ping every `ceilings.heartbeat_secs` seconds to keep the
     // connection alive through proxies and detect silent drops.  Mirrors
     // `wsDefaultPingInterval = 30s` + `wsPingTimeout = 10s` pattern in
     // ``.  axum auto-replies to incoming Pong
     // frames on our behalf, so we only need to send the Ping here.
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(ws_heartbeat_secs()));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(ceilings.heartbeat_secs));
     heartbeat.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
@@ -2009,19 +2225,34 @@ fn ws_cross_origin(req: &ServerRequest) -> bool {
     crate::http_header::origin_host_mismatch(origin, host)
 }
 
+/// The refusal for a WebSocket upgrade with no origin allowlist, if any.
+///
+/// Waived only under a [`DevSurface`](crate::telemetry::DevSurface): a dev
+/// build whose every listener is loopback falls back to the same-origin check.
+const fn ws_origin_decision(
+    patterns_empty: bool,
+    dev: Option<&crate::telemetry::DevSurface>,
+) -> Option<(i64, &'static str)> {
+    if patterns_empty && dev.is_none() {
+        Some((403, "websocket: origin allowlist required in production"))
+    } else {
+        None
+    }
+}
+
 /// ServerWebSocket_upgrade : Request -> WebSocketServerCfg -> Task Error Response
 pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
     req: ServerRequest,
     cfg: WsServerCfg<E>,
 ) -> IpeTask<E, ServerResponse> {
     Box::pin(async move {
-        // Origin allowlist. Production with no patterns → reject ( With
+        // Origin allowlist. No patterns and no dev surface → reject. With
         // patterns set (any mode), the request's Origin must match one of them.
-        if crate::telemetry::production_from_env() && cfg.originPatterns.is_empty() {
-            return ok_res(ws_resp(
-                403,
-                "websocket: origin allowlist required in production",
-            ));
+        if let Some((status, body)) = ws_origin_decision(
+            cfg.originPatterns.is_empty(),
+            crate::telemetry::dev_surface_from_env().as_ref(),
+        ) {
+            return ok_res(ws_resp(status, body));
         }
         if !cfg.originPatterns.is_empty() {
             let origin = req
@@ -2054,12 +2285,16 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
         // id/channel/task is minted — "allocated slot without a capacity check"
         // is unrepresentable. A race between this check and the registry insert
         // is closed by a re-check at the insert site in `ws_loop`.
+        // A malformed ceiling refuses the upgrade rather than widening it.
+        let Ok(ceilings) = ws_ceilings() else {
+            return ok_res(ws_resp(503, "websocket: server ceiling misconfigured"));
+        };
         {
             let live = ws_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .len();
-            if live >= ws_max_connections() {
+            if live >= ceilings.max_connections {
                 return ok_res(ws_resp(503, "websocket: server at connection capacity"));
             }
         }
@@ -2072,7 +2307,7 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
                 // the limit holds even before `ws_loop`'s in-loop check runs.
                 let max_bytes = ws_max_message_bytes(cfg.maxMessageBytes);
                 let up = up.max_message_size(max_bytes).max_frame_size(max_bytes);
-                let resp = up.on_upgrade(move |socket| ws_loop(socket, cfg, id));
+                let resp = up.on_upgrade(move |socket| ws_loop(socket, cfg, id, ceilings));
                 let _ = WS_RESPONSE.try_with(|c| c.set(Some(resp)));
                 // Sentinel — method_router returns WS_RESPONSE instead of this.
                 ok_res(ServerResponse {
@@ -2374,44 +2609,65 @@ mod ws_adapter_tests {
         assert_eq!(id, 99);
     }
 
-    // ── ws_send_buffer env parsing ────────────────────────────────────────────
+    // ── server environment ceilings ───────────────────────────────────────────
 
     #[test]
-    fn ws_send_buffer_default_is_256() {
-        // Without IPE_WS_SEND_BUFFER the default is 256 frames.
-        // This test avoids touching the env so it's safe to run in parallel
-        // with other tests; it just confirms the fallback constant.
-        // (env-mutation tests use std::env::set_var which is not thread-safe
-        // in parallel test harnesses — we test the parsing logic separately.)
-        let parsed = "256"
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(256);
-        assert_eq!(parsed, 256);
+    fn server_ceilings_refuse_every_malformed_value() {
+        for ceiling in [
+            MAX_BODY_CEILING,
+            REQUEST_TIMEOUT_CEILING,
+            MAX_INFLIGHT_CEILING,
+            WS_SEND_BUFFER_CEILING,
+            WS_MAX_CONNECTIONS_CEILING,
+            WS_HEARTBEAT_CEILING,
+        ] {
+            crate::system::assert_env_ceiling_contract(ceiling);
+        }
+        assert_eq!(WS_SEND_BUFFER_CEILING.default_value(), 256);
+        assert_eq!(WS_HEARTBEAT_CEILING.default_value(), 30);
     }
 
-    // ── ws_heartbeat_secs env parsing ──────────────────────────────────
-
-    /// Default heartbeat interval is 30 s .
     #[test]
-    fn ws_heartbeat_default_is_30() {
-        // Simulate what ws_heartbeat_secs() returns when the env var is absent.
-        let result: u64 = None::<String>
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(30);
-        assert_eq!(result, 30);
+    fn a_malformed_ws_ceiling_refuses_the_listen_preflight() {
+        crate::system::locked_set_var("IPE_WS_HEARTBEAT", "30s");
+        let refused = listen_ceilings();
+        crate::system::locked_remove_var("IPE_WS_HEARTBEAT");
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_WS_HEARTBEAT"),
+            "a malformed per-socket ceiling must refuse Server.listen"
+        );
     }
 
-    /// A valid positive integer overrides the default.
     #[test]
-    fn ws_heartbeat_env_override_parses() {
-        let result: u64 = Some("60".to_string())
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(30);
-        assert_eq!(result, 60);
+    fn a_queue_ceiling_past_the_tokio_permit_limit_refuses_the_listen_preflight() {
+        let past = (tokio::sync::Semaphore::MAX_PERMITS as u64 + 1).to_string();
+        let at = tokio::sync::Semaphore::MAX_PERMITS.to_string();
+        for name in ["IPE_HTTP_MAX_INFLIGHT", "IPE_WS_SEND_BUFFER"] {
+            crate::system::locked_set_var(name, &past);
+            let refused = listen_ceilings();
+            crate::system::locked_set_var(name, &at);
+            let accepted = listen_ceilings();
+            crate::system::locked_remove_var(name);
+            assert!(
+                refused
+                    .is_err_and(|r| r.name() == name
+                        && r.defect() == crate::system::CeilingDefect::TooLarge),
+                "{name} past the permit limit must refuse Server.listen"
+            );
+            assert!(accepted.is_ok(), "{name} at the permit limit is accepted");
+        }
+    }
+
+    #[test]
+    fn a_malformed_body_ceiling_refuses_the_request() {
+        crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", " 1024");
+        let refused = max_body();
+        crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
+        assert!(refused.is_err(), "a padded body ceiling must be refused");
+        assert_eq!(
+            RequestRejection::Unavailable.status_and_reason().0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     /// Zero is rejected and the default is used.
@@ -2689,9 +2945,9 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 
 /// `__Host-` prefix requires Secure + Path=/ + no Domain — mirrors
 /// `live/csrf.rs::csrf_cookie_name`'s reasoning, gated on the SAME
-/// process-wide production signal `server_with_cookie` already uses
-/// (`telemetry::production_from_env`), so naming stays internally consistent
-/// with the rest of `server.rs`'s cookie handling.
+/// process-wide [`cookie_secure_floor`] `server_with_cookie` already uses, so
+/// naming stays internally consistent with the rest of `server.rs`'s cookie
+/// handling.
 ///
 /// This stays process-global (NOT request-scoped) deliberately, same
 /// reasoning as the session cookie's `__Host-` name decision
@@ -2701,12 +2957,27 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 /// Only the `Secure` ATTRIBUTE (`csrf_set_cookie_value`) becomes
 /// request-scoped.
 fn csrf_cookie_name() -> CookieName {
-    let base = if crate::telemetry::production_from_env() {
+    csrf_cookie_name_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// [`csrf_cookie_name`] under an explicit dev-intent proof.
+fn csrf_cookie_name_with(dev: Option<&crate::telemetry::DevIntent>) -> CookieName {
+    let base = if cookie_secure_floor_with(dev) {
         RuntimeCookie::HostCsrf
     } else {
         RuntimeCookie::ServerCsrf
     };
     CookieName::runtime(base, "")
+}
+
+/// The process `Secure` floor for an `Ipe.Http.Server` cookie: [`cookie_secure_floor_with`].
+fn cookie_secure_floor() -> bool {
+    cookie_secure_floor_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// `Secure` unless `dev` proves a dev-intent binary in a dev posture.
+const fn cookie_secure_floor_with(dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    dev.is_none()
 }
 
 /// 64 lowercase-hex chars (two concatenated UUIDv4s, ~244 combined random
@@ -2747,8 +3018,8 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// cross-origin page because SOP blocks that page from reading the
 /// victim-origin cookie).
 ///
-/// `Secure` is set when EITHER `production_from_env()` is true (unconditional
-/// floor — a production deploy always gets `Secure`, matching
+/// `Secure` is set when EITHER [`cookie_secure_floor`] holds (unconditional
+/// floor — every release build and production deploy gets `Secure`, matching
 /// `server_with_cookie`'s gate and the session cookie's
 /// `csrf::cookies_secure()` half) OR `request_is_https` is true (THIS
 /// specific request arrived over TLS at a trusted proxy, opt-in via
@@ -2764,14 +3035,24 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// runs (after the handler's `Task` resolves), the request itself is gone;
 /// only the pre-captured bool survives.
 fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> SetCookie {
+    let dev = crate::telemetry::dev_intent_from_env();
+    csrf_set_cookie_value_with(token, request_is_https, dev.as_ref())
+}
+
+/// [`csrf_set_cookie_value`] under an explicit dev-intent proof.
+fn csrf_set_cookie_value_with(
+    token: &str,
+    request_is_https: bool,
+    dev: Option<&crate::telemetry::DevIntent>,
+) -> SetCookie {
     SetCookie::new(
-        &csrf_cookie_name(),
+        &csrf_cookie_name_with(dev),
         &CookieValue::encode(token),
         CookieAttributes {
             path: CookiePath::root(),
             http_only: false,
             same_site: SameSite::Strict,
-            secure: crate::telemetry::production_from_env() || request_is_https,
+            secure: cookie_secure_floor_with(dev) || request_is_https,
             max_age_secs: None,
         },
     )
@@ -2968,7 +3249,7 @@ mod tests {
         assert!(
             resolve(None, None)
                 .addr_in_use_message()
-                .contains("IPE_SERVER_PORT=8123 ipe run")
+                .contains("IPE_SERVER_PORT=8123 ipe dev run")
         );
         assert!(
             !resolve(Some("9100"), None)
@@ -3112,6 +3393,88 @@ mod tests {
         ));
     }
 
+    /// A request carrying a planted credential in every client-supplied field.
+    fn secret_laden_request() -> ServerRequest {
+        let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
+        ServerRequest {
+            method: "POST".to_owned(),
+            path: "/reset/P4THT0K".to_owned(),
+            body: "password=PW0RD".to_owned(),
+            headers: pair("Authorization", "Bearer S3CR3T"),
+            params: pair("id", "P4R4M"),
+            query: pair("token", "QT0K3N"),
+            cookies: pair("sid", "T0K3N"),
+            remoteAddr: "203.0.113.9".to_owned(),
+        }
+    }
+
+    const PLANTED: [&str; 7] = [
+        "S3CR3T",
+        "T0K3N",
+        "PW0RD",
+        "P4R4M",
+        "QT0K3N",
+        "203.0.113.9",
+        "P4THT0K",
+    ];
+
+    #[test]
+    fn request_debug_prints_no_client_supplied_value() {
+        let req = secret_laden_request();
+        for shown in [format!("{req:?}"), format!("{req:#?}")] {
+            for secret in PLANTED {
+                assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+            }
+            assert!(shown.contains("\"POST\""), "{shown}");
+            assert!(shown.contains(crate::redact::REDACTED));
+        }
+        assert!(matches!(
+            server_get_cookie("sid".to_owned(), req),
+            IpeMaybe::Just(ref v) if v == "T0K3N"
+        ));
+    }
+
+    #[test]
+    fn cookie_and_response_debug_print_no_secret() {
+        let cookie = cookie("sid", "T0K3N");
+        let shown = format!("{cookie:?}");
+        assert!(!shown.contains("T0K3N"), "{shown}");
+        assert!(shown.contains("\"sid\""));
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: true,
+                max_age_secs: None,
+            },
+        );
+        let shown = format!("{line:?}");
+        assert_eq!(shown, "SetCookie(<redacted>)");
+
+        let mut resp = server_text("session=T0K3N".to_owned());
+        resp.headers
+            .insert("Authorization".to_owned(), "Bearer S3CR3T".to_owned());
+        resp.cookies.push(SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: false,
+                max_age_secs: None,
+            },
+        ));
+        let shown = format!("{resp:?}");
+        for secret in ["T0K3N", "S3CR3T"] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("status: 200"));
+    }
+
     /// Run `build_request` inside a router matched on `pattern`.
     ///
     /// Returns what `build_request` produced for `wire`, or `None` when the
@@ -3250,18 +3613,27 @@ mod tests {
         }
     }
 
-    /// Serve `uri` through `strict_serve_dir` mounted at `/static` over a
-    /// fresh directory holding `hello.txt`. Returns the status and body.
-    async fn serve_static(uri: &str) -> (axum::http::StatusCode, String) {
-        use tower::ServiceExt;
+    /// A fresh scratch directory for one static-serving test.
+    fn static_fixture_dir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipe-strict-static-{}-{nanos}", std::process::id()));
+            .join(format!("ipe-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp static dir");
-        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
-        let app = axum::Router::new().nest_service("/static", strict_serve_dir(dir.clone()));
+        dir
+    }
+
+    /// Serve `uri` through `strict_serve_dir_with(dir, regime)` mounted at
+    /// `/static`. Returns the status and body.
+    async fn serve_static_dir(
+        dir: &std::path::Path,
+        regime: crate::path_core::Regime,
+        uri: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .nest_service("/static", strict_serve_dir_with(dir.to_path_buf(), regime));
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
@@ -3273,8 +3645,157 @@ mod tests {
         };
         let status = resp.status();
         let body = axum_body_string(resp).await;
-        let _ = std::fs::remove_dir_all(&dir);
         (status, body)
+    }
+
+    /// Serve `uri` through `strict_serve_dir` mounted at `/static` over a
+    /// fresh directory holding `hello.txt`. Returns the status and body.
+    async fn serve_static(uri: &str) -> (axum::http::StatusCode, String) {
+        let dir = static_fixture_dir("strict-static");
+        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
+        let out = serve_static_dir(&dir, crate::path_core::HOST, uri).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn static_request_windows_refuses_escaping_paths() {
+        use crate::path_core::{ElementRefusal, Regime, RelPathRefusal};
+        let root = std::path::Path::new("C:\\site");
+        let element = |why| StaticRefusal::Segment(RelPathRefusal::Element(why));
+        let segment = StaticRefusal::Segment;
+        for (uri, want) in [
+            ("/a%5C..%5Cx", segment(RelPathRefusal::Separator)),
+            ("/C:x", element(ElementRefusal::Colon)),
+            ("/x:stream", element(ElementRefusal::Colon)),
+            ("/CON", element(ElementRefusal::DosDevice)),
+            ("/nul.txt", element(ElementRefusal::DosDevice)),
+            ("/a/COM1", element(ElementRefusal::DosDevice)),
+            ("/a%5CCOM1", segment(RelPathRefusal::Separator)),
+            ("/LPT9.log", element(ElementRefusal::DosDevice)),
+            ("/..%20", element(ElementRefusal::DotSpaceRun)),
+            ("/..", element(ElementRefusal::Parent)),
+            ("/a.", element(ElementRefusal::StrippedTail)),
+            ("/a%2Fb", segment(RelPathRefusal::Separator)),
+            ("/a%00b", segment(RelPathRefusal::Nul)),
+            // An empty inner segment names no entry: `/a//b.css` is refused,
+            // not collapsed to `a/b.css` as `ServeDir` alone would.
+            ("/a//b.css", segment(RelPathRefusal::NotAName)),
+        ] {
+            assert_eq!(
+                static_request(uri, root, Regime::Windows),
+                Err(want),
+                "{uri:?}"
+            );
+        }
+        assert_eq!(
+            static_request("/", root, Regime::Windows),
+            Ok(StaticRequest::Root)
+        );
+        let file = static_request("/a/b.css/", root, Regime::Windows);
+        assert!(
+            matches!(&file, Ok(StaticRequest::File(rel)) if rel.as_str() == "a\\b.css"),
+            "{file:?}"
+        );
+    }
+
+    #[test]
+    fn static_request_unix_accepts_legal_names() {
+        use crate::path_core::{ElementRefusal, Regime, RelPathRefusal};
+        let root = std::path::Path::new("/srv/site");
+        for (uri, want) in [
+            ("/CON", "CON"),
+            ("/nul.txt", "nul.txt"),
+            ("/x:stream", "x:stream"),
+            ("/a.", "a."),
+            ("/a%5Cb", "a\\b"),
+            ("/fav%69con.ico", "favicon.ico"),
+        ] {
+            let got = static_request(uri, root, Regime::Unix);
+            assert!(
+                matches!(&got, Ok(StaticRequest::File(rel)) if rel.as_str() == want),
+                "{uri:?}: {got:?}"
+            );
+        }
+        for (uri, want) in [
+            (
+                "/a%2F..%2Fx",
+                StaticRefusal::Segment(RelPathRefusal::Separator),
+            ),
+            (
+                "/a/../x",
+                StaticRefusal::Segment(RelPathRefusal::Element(ElementRefusal::Parent)),
+            ),
+            (
+                "/a//b.css",
+                StaticRefusal::Segment(RelPathRefusal::NotAName),
+            ),
+            (
+                "/a/./b.css",
+                StaticRefusal::Segment(RelPathRefusal::NotAName),
+            ),
+            ("/a%00b", StaticRefusal::Segment(RelPathRefusal::Nul)),
+        ] {
+            assert_eq!(
+                static_request(uri, root, Regime::Unix),
+                Err(want),
+                "{uri:?}"
+            );
+        }
+        let malformed = static_request("/a%zz", root, Regime::Unix);
+        assert!(
+            matches!(
+                malformed,
+                Err(StaticRefusal::Malformed(
+                    crate::encoding::DecodeRefusal::MalformedEscape { .. }
+                ))
+            ),
+            "{malformed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_request_refuses_a_non_text_root() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/srv/\xff"));
+        assert_eq!(
+            static_request("/a.css", root, crate::path_core::Regime::Unix),
+            Err(StaticRefusal::RootNotText)
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_dir_gate_refuses_a_present_device_name_under_windows() {
+        use crate::path_core::Regime;
+        // Each name is a legal Linux file, so only the gate can refuse it.
+        let names = ["CON", "nul.txt", "x:stream", "a."];
+        let dir = static_fixture_dir("static-gate");
+        for name in names {
+            std::fs::write(dir.join(name), format!("body of {name}")).expect("static fixture file");
+        }
+        for name in names {
+            let uri = format!("/static/{name}");
+            let (status, body) = serve_static_dir(&dir, Regime::Windows, &uri).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri:?}");
+            assert!(!body.contains(name), "{uri:?} must not echo the path");
+            let (status, body) = serve_static_dir(&dir, Regime::Unix, &uri).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri:?}");
+            assert_eq!(body, format!("body of {name}"), "{uri:?}");
+        }
+        // `/a//b` names no entry, so it is refused on both regimes even though
+        // `ServeDir` alone would serve `a/b`.
+        std::fs::create_dir_all(dir.join("a")).expect("static fixture dir");
+        std::fs::write(dir.join("a").join("b"), "b body").expect("static fixture file");
+        for regime in [Regime::Windows, Regime::Unix] {
+            let (status, body) = serve_static_dir(&dir, regime, "/static/a//b").await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{regime:?}");
+            assert!(body.is_empty(), "{regime:?}: {body:?}");
+            let (status, body) = serve_static_dir(&dir, regime, "/static/a/b").await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{regime:?}");
+            assert_eq!(body, "b body", "{regime:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -3409,11 +3930,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    // A dev surface (dev build, loopback listener) emits the banner;
+    // `inject_dev_banner` runs on every text/html buffered response.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn to_axum_response_injects_dev_banner_into_html_before_body_close() {
-        // A dev posture emits the banner; injectDevBanner runs on every
-        // text/html buffered response.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -3428,6 +3952,19 @@ mod tests {
             banner_at < body_close,
             "banner must sit before </body>: {out}"
         );
+    }
+
+    // A release binary under `ENV=dev` on a loopback listener has no dev
+    // surface, so its HTML responses never carry the console banner.
+    #[cfg(not(feature = "dev-posture"))]
+    #[tokio::test]
+    async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        crate::telemetry::record_bind("127.0.0.1");
+        let html = "<html><body><h1>hi</h1></body></html>";
+        let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
+        crate::system::locked_remove_var("ENV");
+        assert_eq!(out, html, "release HTML must be verbatim");
     }
 
     #[tokio::test]
@@ -3537,11 +4074,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_upgrade_dev_rejects_cross_origin_without_allowlist() {
-        // The CSWSH default-deny path: dev posture (`ENV=dev`), empty
-        // originPatterns, cross-origin Origin/Host pair.
+    async fn ws_upgrade_rejects_cross_origin_without_allowlist() {
+        // The CSWSH default-deny path: `ENV=dev` on a loopback listener, empty
+        // originPatterns, cross-origin Origin/Host pair. A dev surface falls
+        // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -3551,39 +4090,17 @@ mod tests {
         // that PASSES the origin check would hit the `None => 400` upgrader
         // branch instead of 403 — the origin check must short-circuit before
         // that point for this assertion to distinguish the two paths.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 403,
-                "cross-origin WS upgrade must be rejected outside production too"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(403), got Err({e})"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ws_upgrade_dev_allows_same_origin_without_allowlist() {
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
-        let cfg = ws_server_default_cfg::<String>();
-        let req = mk_ws_req(&[
-            ("origin", "https://victim.example"),
-            ("host", "victim.example"),
-        ]);
-        // Same-origin passes the CSWSH check; falls through to the "no
-        // upgrader present" 400 (this unit test doesn't drive a real axum
-        // WS upgrade), which is enough to prove it did NOT hit the 403
-        // cross-origin branch.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 400,
-                "same-origin WS upgrade must pass the origin check (400 = no real upgrader in this unit test, not 403)"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(400), got Err({e})"),
-        }
+        let result = server_web_socket_upgrade::<String>(req, cfg).await;
+        crate::system::locked_remove_var("ENV");
+        let IpeResult::Ok(r) = result else {
+            assert!(matches!(result, IpeResult::Ok(_)), "upgrade returned Err");
+            return;
+        };
+        assert_eq!(r.status, 403, "cross-origin WS upgrade must be rejected");
     }
 
     /// The status a same-origin upgrade with no allowlist gets under the
-    /// given `ENV` / `IPE_ENV` (`None` = unset).
+    /// given `ENV` / `IPE_ENV` (`None` = unset), on a loopback listener.
     async fn same_origin_ws_status(env: Option<&str>, ipe_env: Option<&str>) -> i64 {
         for (key, value) in [("ENV", env), ("IPE_ENV", ipe_env)] {
             match value {
@@ -3591,6 +4108,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
+        crate::telemetry::record_bind("127.0.0.1");
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3606,16 +4124,42 @@ mod tests {
         resp.status
     }
 
-    // The WS origin gate reads the one posture parse: a release binary with
-    // nothing set is production (403 without an allowlist); an empty `ENV`
-    // defers to `IPE_ENV`.
+    // The no-allowlist refusal is waived only by a dev surface: never on a
+    // release binary, whatever dev marker `ENV`/`IPE_ENV` carry, even on a
+    // loopback listener.
     #[tokio::test]
-    async fn ws_origin_gate_reads_the_build_posture() {
+    async fn ws_origin_required_on_release_under_env_dev() {
+        let refusal = Some((403, "websocket: origin allowlist required in production"));
+        assert_eq!(ws_origin_decision(true, None), refusal);
+        assert_eq!(ws_origin_decision(false, None), None);
+        let surface = crate::telemetry::test_dev_surface();
+        assert_eq!(ws_origin_decision(true, Some(&surface)), None);
+        assert_eq!(ws_origin_decision(false, Some(&surface)), None);
         if !cfg!(feature = "dev-posture") {
-            assert_eq!(same_origin_ws_status(None, None).await, 403);
+            for (env, ipe_env) in [
+                (None, None),
+                (Some("dev"), None),
+                (Some(""), Some("dev")),
+                (Some("Development"), None),
+                (None, Some("LOCAL")),
+            ] {
+                assert_eq!(
+                    same_origin_ws_status(env, ipe_env).await,
+                    403,
+                    "{env:?} {ipe_env:?}"
+                );
+            }
         }
         assert_eq!(same_origin_ws_status(Some(""), Some("prod")).await, 403);
         assert_eq!(same_origin_ws_status(Some("staging"), None).await, 403);
+    }
+
+    // A dev build on a loopback listener passes a same-origin upgrade through
+    // the origin check (400 = no real upgrader in this unit test, not 403).
+    #[cfg(feature = "dev-posture")]
+    #[tokio::test]
+    async fn dev_posture_pin_ws_same_origin_passes_without_allowlist() {
+        assert_eq!(same_origin_ws_status(None, None).await, 400);
         assert_eq!(same_origin_ws_status(Some(""), Some("dev")).await, 400);
         assert_eq!(same_origin_ws_status(Some("dev"), None).await, 400);
     }
@@ -3625,12 +4169,10 @@ mod tests {
         // Pre-fill the live-peer registry to the ceiling, then a valid
         // same-origin upgrade must be turned away with 503 BEFORE any id/channel
         // is minted — distinguished from the `400 no-upgrader` fall-through the
-        // same-origin path would otherwise hit in a unit test. Dev posture,
-        // so the no-allowlist origin gate passes a same-origin request.
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
+        // same-origin path would otherwise hit in a unit test. The allowlist
+        // names the request's Origin, so the origin gate passes it.
         crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
-        let ceiling = ws_max_connections();
+        let ceiling = usize::try_from(WS_MAX_CONNECTIONS_CEILING.default_value()).unwrap();
         {
             let mut reg = ws_registry().lock().unwrap_or_else(|e| e.into_inner());
             reg.clear();
@@ -3639,7 +4181,8 @@ mod tests {
                 reg.insert(i, tx);
             }
         }
-        let cfg = ws_server_default_cfg::<String>();
+        let mut cfg = ws_server_default_cfg::<String>();
+        cfg.originPatterns = vec!["https://victim.example".to_owned()];
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3661,51 +4204,65 @@ mod tests {
     }
 
     #[test]
-    fn ws_max_connections_default_is_1024() {
+    fn ws_max_connections_default_and_override() {
         crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
-        assert_eq!(ws_max_connections(), DEFAULT_WS_MAX_CONNECTIONS);
-    }
-
-    #[test]
-    fn ws_max_connections_env_override() {
+        assert_eq!(ws_ceilings().map(|c| c.max_connections), Ok(1024));
         crate::system::locked_set_var("IPE_WS_MAX_CONNECTIONS", "7");
-        assert_eq!(ws_max_connections(), 7);
-        crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
-    }
-
-    #[test]
-    fn ws_max_connections_zero_falls_back_to_default() {
+        let overridden = ws_ceilings().map(|c| c.max_connections);
         crate::system::locked_set_var("IPE_WS_MAX_CONNECTIONS", "0");
-        assert_eq!(ws_max_connections(), DEFAULT_WS_MAX_CONNECTIONS);
+        let zero = ws_ceilings();
         crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
+        assert_eq!(overridden, Ok(7));
+        assert!(zero.is_err(), "a zero connection ceiling must be refused");
     }
 
     #[test]
-    fn http_request_timeout_default_is_30() {
+    fn listen_ceilings_default_override_and_zero() {
         crate::system::locked_remove_var("IPE_HTTP_REQUEST_TIMEOUT");
+        crate::system::locked_remove_var("IPE_HTTP_MAX_INFLIGHT");
         assert_eq!(
-            http_request_timeout_secs(),
-            DEFAULT_HTTP_REQUEST_TIMEOUT_SECS
+            listen_ceilings(),
+            Ok(ListenCeilings {
+                request_timeout_secs: 30,
+                max_inflight: 1024,
+            })
         );
         crate::system::locked_set_var("IPE_HTTP_REQUEST_TIMEOUT", "5");
-        assert_eq!(http_request_timeout_secs(), 5);
-        crate::system::locked_set_var("IPE_HTTP_REQUEST_TIMEOUT", "0"); // invalid → default
-        assert_eq!(
-            http_request_timeout_secs(),
-            DEFAULT_HTTP_REQUEST_TIMEOUT_SECS
-        );
+        crate::system::locked_set_var("IPE_HTTP_MAX_INFLIGHT", "16");
+        let overridden = listen_ceilings();
+        crate::system::locked_set_var("IPE_HTTP_REQUEST_TIMEOUT", "0");
+        let zero_timeout = listen_ceilings();
         crate::system::locked_remove_var("IPE_HTTP_REQUEST_TIMEOUT");
+        crate::system::locked_set_var("IPE_HTTP_MAX_INFLIGHT", "0");
+        let zero_inflight = listen_ceilings();
+        crate::system::locked_remove_var("IPE_HTTP_MAX_INFLIGHT");
+        assert_eq!(
+            overridden,
+            Ok(ListenCeilings {
+                request_timeout_secs: 5,
+                max_inflight: 16,
+            })
+        );
+        assert!(zero_timeout.is_err_and(|r| r.name() == "IPE_HTTP_REQUEST_TIMEOUT"));
+        assert!(zero_inflight.is_err_and(|r| r.name() == "IPE_HTTP_MAX_INFLIGHT"));
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
-    fn http_max_inflight_default_is_1024() {
-        crate::system::locked_remove_var("IPE_HTTP_MAX_INFLIGHT");
-        assert_eq!(http_max_inflight(), DEFAULT_HTTP_MAX_INFLIGHT);
-        crate::system::locked_set_var("IPE_HTTP_MAX_INFLIGHT", "16");
-        assert_eq!(http_max_inflight(), 16);
-        crate::system::locked_set_var("IPE_HTTP_MAX_INFLIGHT", "0"); // invalid → default
-        assert_eq!(http_max_inflight(), DEFAULT_HTTP_MAX_INFLIGHT);
-        crate::system::locked_remove_var("IPE_HTTP_MAX_INFLIGHT");
+    fn a_malformed_auth_ceiling_refuses_listen() {
+        for (name, raw) in [
+            ("IPE_AUTH_MAX_LIFETIME", "8h"),
+            ("IPE_AUTH_SLIDE_WINDOW", "0"),
+            ("IPE_REVOCATION_CAPACITY", " 1024"),
+        ] {
+            crate::system::locked_set_var(name, raw);
+            let refused = listen_ceilings();
+            crate::system::locked_remove_var(name);
+            assert!(
+                refused.is_err_and(|r| r.name() == name),
+                "{name}={raw:?} must refuse Server.listen"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3715,8 +4272,12 @@ mod tests {
         // ceiling is on the served path — not merely configured.
         use tower::ServiceExt;
         crate::system::locked_set_var("IPE_HTTP_REQUEST_TIMEOUT", "1");
-        let timeout = http_request_timeout_secs();
-        let inflight = http_max_inflight();
+        let ceilings = listen_ceilings();
+        crate::system::locked_remove_var("IPE_HTTP_REQUEST_TIMEOUT");
+        let ListenCeilings {
+            request_timeout_secs: timeout,
+            max_inflight: inflight,
+        } = ceilings.expect("the listen ceilings must resolve");
         let app: axum::Router = axum::Router::new()
             .route(
                 "/slow",
@@ -3773,13 +4334,14 @@ mod tests {
     #[test]
     fn max_body_env_override() {
         crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
-        assert_eq!(max_body(), DEFAULT_MAX_BODY);
-        // New name takes effect.
+        assert_eq!(max_body(), Ok(32 * 1024 * 1024));
         crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", "1024");
-        assert_eq!(max_body(), 1024);
-        crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", "0"); // invalid → default
-        assert_eq!(max_body(), DEFAULT_MAX_BODY);
+        let overridden = max_body();
+        crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", "0");
+        let zero = max_body();
         crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
+        assert_eq!(overridden, Ok(1024));
+        assert!(zero.is_err(), "a zero body ceiling must be refused");
     }
 
     #[tokio::test]
@@ -4345,7 +4907,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_without_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "a".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "a".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
             Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
                 as IpeTask<String, ServerResponse>
@@ -4359,11 +4921,9 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_post_with_matching_cookie_and_header_allowed() {
-        // Dev posture: the CSRF cookie carries its plain-http name `ipe_csrf`.
-        crate::system::locked_set_var("ENV", "dev");
         let tok = "b".repeat(64);
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), tok.clone());
+        cookies.insert(csrf_cookie_name().text().to_owned(), tok.clone());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), tok);
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4380,7 +4940,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_mismatched_cookie_and_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "c".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "c".repeat(64));
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "d".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4401,7 +4961,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_matching_but_malformed_tokens_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "x".to_string());
+        cookies.insert(csrf_cookie_name().text().to_owned(), "x".to_string());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "x".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4444,29 +5004,58 @@ mod tests {
         assert!(!request_is_https_with_trust(&headers, true));
     }
 
-    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER
-    /// production OR the (pre-captured) request-scoped TLS signal is true.
-    /// Exercises all four (production, request_is_https) combinations —
-    /// this is the pure-function core, independent of env-var mutation.
+    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER there is
+    /// no dev intent OR the (pre-captured) request-scoped TLS signal is true.
+    /// Exercises all four (dev intent, `request_is_https`) combinations and
+    /// the cookie name — the pure-function core, independent of env mutation.
     #[test]
     fn csrf_cookie_secure_or_gate_truth_table() {
-        // production=false is simulated by calling with request_is_https
-        // directly; production is exercised via the ENV-var tests below
-        // (per-process under nextest, so mutating ENV here is safe).
         let tok = "a".repeat(64);
+        let dev = crate::telemetry::test_dev_intent();
+        // (a) dev intent, request IS https -> Secure.
+        assert!(
+            csrf_set_cookie_value_with(&tok, true, Some(&dev)).contains("; Secure"),
+            "TLS-detected request must get Secure regardless of posture"
+        );
+        // (b) dev intent, request NOT https -> no Secure (dev-mode-correct).
+        let plain = csrf_set_cookie_value_with(&tok, false, Some(&dev));
+        assert!(!plain.contains("; Secure"), "{plain}");
+        assert!(plain.starts_with("ipe_csrf="), "{plain}");
+        // (c)/(d) no dev intent -> Secure and `__Host-`, TLS or not.
+        for https in [false, true] {
+            let cookie = csrf_set_cookie_value_with(&tok, https, None);
+            assert!(cookie.contains("; Secure"), "{cookie}");
+            assert!(cookie.starts_with("__Host-ipe_csrf="), "{cookie}");
+        }
+        assert!(cookie_secure_floor_with(None));
+        assert!(!cookie_secure_floor_with(Some(&dev)));
+    }
 
+    // A release binary under `ENV=dev` keeps every `Ipe.Http.Server` cookie
+    // `Secure`, and the CSRF cookie `__Host-`-prefixed.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn cookies_secure_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
+        crate::system::locked_set_var("IPE_ENV", "dev");
+        let tok = "e".repeat(64);
+        let csrf = csrf_set_cookie_value(&tok, false);
+        let name = csrf_cookie_name();
+        let resp = server_with_cookie(cookie("sid", "v"), server_text("ok".into()));
+        #[cfg(feature = "web")]
+        let web_secure = crate::web::csrf::cookies_secure();
+        #[cfg(not(feature = "web"))]
+        let web_secure = true;
+        crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        // (a) not production, request IS https -> Secure.
+        assert!(csrf.contains("; Secure"), "{csrf}");
+        assert_eq!(name.as_str(), "__Host-ipe_csrf");
         assert!(
-            csrf_set_cookie_value(&tok, true).contains("; Secure"),
-            "TLS-detected request must get Secure regardless of ENV"
+            resp.cookies.iter().all(|c| c.contains("; Secure")),
+            "{:?}",
+            resp.cookies
         );
-        // (b) not production, request NOT https -> no Secure (dev-mode-correct).
-        assert!(
-            !csrf_set_cookie_value(&tok, false).contains("; Secure"),
-            "plain-HTTP dev request must NOT get Secure"
-        );
+        assert!(web_secure);
     }
 
     #[test]
@@ -4500,13 +5089,15 @@ mod tests {
 
     /// End-to-end through `middleware_with_csrf` (not just the pure
     /// `csrf_set_cookie_value` helper): a GET request carrying
-    /// `X-Forwarded-Proto: https` mints a Secure cookie when
-    /// `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
+    /// `X-Forwarded-Proto: https` on a dev build mints a non-Secure cookie
+    /// unless `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
     /// capture-before-move + thread-through-the-closure adaptation.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn csrf_middleware_mints_secure_cookie_for_trusted_https_request() {
-        // Dev posture, so `Secure` can only come from the forwarded scheme.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_csrf_middleware_ignores_untrusted_forwarded_proto() {
+        // Dev build, nothing set, so `Secure` can only come from the forwarded scheme.
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
         let mut headers = HashMap::new();
         headers.insert("x-forwarded-proto".to_string(), "https".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4519,17 +5110,20 @@ mod tests {
         // `IPE_TRUSTED_PROXY` set never trusts the header — so this test
         // documents the untrusted-by-default floor: no Secure without the
         // operator's opt-in, even though the header claims https.
-        match h(req).await {
-            IpeResult::Ok(r) => {
-                assert_eq!(r.cookies.len(), 1);
-                assert!(
-                    !r.cookies[0].contains("; Secure"),
-                    "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {}",
-                    r.cookies[0]
-                );
-            }
-            IpeResult::Err(_) => panic!("GET must never be rejected"),
-        }
+        let result = h(req).await;
+        let IpeResult::Ok(r) = result else {
+            assert!(
+                matches!(result, IpeResult::Ok(_)),
+                "GET must never be rejected"
+            );
+            return;
+        };
+        assert_eq!(r.cookies.len(), 1);
+        assert!(
+            r.cookies.iter().all(|c| !c.contains("; Secure")),
+            "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {:?}",
+            r.cookies
+        );
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────
@@ -4766,43 +5360,36 @@ mod tests {
 
         // ── reissue Secure parity ──────────────────────────────────────────
 
-        /// `reissue_set_cookie` pure-function truth-table:
-        ///   (cookies_secure=false, is_https=true)  → Secure
-        ///   (cookies_secure=false, is_https=false) → no Secure
+        /// `reissue_set_cookie_with` truth-table under a dev intent:
+        ///   (`is_https`=true)  → Secure
+        ///   (`is_https`=false) → no Secure
         /// Mirrors the combined gate in `page_response`:
         /// a re-issued cookie must never be less-Secure than the initial one.
         #[test]
         fn reissue_set_cookie_secure_matches_initial_gate() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
+            let dev = crate::telemetry::test_dev_intent();
+            let floor = cookie_secure_floor_with(Some(&dev));
 
-            // is_https=true, cookies_secure()=false → Secure must fire.
-            let c_https = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, true);
+            let c_https = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, true);
             assert!(
                 c_https.contains("; Secure"),
                 "reissue behind TLS proxy must carry Secure: {c_https}"
             );
 
-            // is_https=false, cookies_secure()=false → no Secure (dev default).
-            let c_plain = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, false);
+            let c_plain = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, floor);
             assert!(
                 !c_plain.contains("; Secure"),
                 "reissue over plain HTTP in dev must NOT carry Secure: {c_plain}"
             );
         }
 
-        /// End-to-end: a cookie-source authed route where the request carries
-        /// `X-Forwarded-Proto: https` (trusted-proxy opt-in via the testable
-        /// `request_is_https_with_trust` overload) produces a re-issued cookie
-        /// that carries `Secure`.
+        /// A trusted `X-Forwarded-Proto: https` header produces a re-issued
+        /// cookie that carries `Secure`, on every build.
         ///
         /// Uses `request_is_https_with_trust(..., true)` directly to bypass the
         /// `OnceLock`-cached `trust_proxy_headers()` without mutating process env.
         #[test]
         fn reissue_set_cookie_https_proxy_sets_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let mut headers = HashMap::new();
             headers.insert("x-forwarded-proto".to_string(), "https".to_string());
             let is_https = request_is_https_with_trust(&headers, true);
@@ -4815,17 +5402,28 @@ mod tests {
             );
         }
 
-        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure on reissue.
+        // A release binary under `ENV=dev` re-issues a `Secure` cookie even
+        // over plain HTTP.
+        #[cfg(not(feature = "dev-posture"))]
+        #[test]
+        fn reissue_set_cookie_secure_on_release_under_env_dev() {
+            crate::system::locked_set_var("ENV", "dev");
+            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, false);
+            crate::system::locked_remove_var("ENV");
+            assert!(cookie.contains("; Secure"), "{cookie}");
+        }
+
+        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure
+        /// on a dev-intent reissue.
         #[test]
         fn reissue_set_cookie_plain_http_no_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let headers = HashMap::new();
             let is_https = request_is_https_with_trust(&headers, false);
             assert!(!is_https);
 
-            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, is_https);
+            let dev = crate::telemetry::test_dev_intent();
+            let secure = cookie_secure_floor_with(Some(&dev)) || is_https;
+            let cookie = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, secure);
             assert!(
                 !cookie.contains("; Secure"),
                 "reissue over plain HTTP must NOT carry Secure: {cookie}"

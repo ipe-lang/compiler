@@ -40,7 +40,7 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 pat_bound_symbols(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 pat_bound_symbols(p, out);
             }
@@ -292,6 +292,8 @@ mod tests {
         let slice = Pat::Slice {
             prefix: vec![lit()],
             rest: None,
+            own: crate::SliceOwnership::BorrowClone,
+            elem: crate::IrType::Int,
         };
         assert!(!pat_has_str_guard_slot(&slice));
         assert!(!pat_moves_scrutinee(&slice));

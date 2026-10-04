@@ -9,10 +9,10 @@
 //!
 //! - `tested` — the crate has at least one `#[test]` attribute anywhere in its
 //!   `src/` or `tests/` trees, signalling standing tests.
-//! - `no-panic` — no `unwrap()`, `expect(`, `panic!(`, or `.index(` appears in
-//!   production code within `src/`: source lines outside `#[cfg(test)]` /
-//!   `mod tests { … }` blocks, in files that are not a confirmed out-of-line
-//!   test module ([`panic_scan::is_verified_test_path`]).
+//! - `no-panic` — `panic_scan::scan_str` (the same AST scanner the
+//!   `panic-scan` CI job runs) finds no unsanctioned panic site in production
+//!   code within `src/`, outside the confirmed out-of-line test modules
+//!   ([`panic_scan::is_verified_test_path`]).
 //! - `documented` — `src/lib.rs` opens with at least one `//!` inner doc line.
 //!
 //! `staleness` was considered but dropped: measuring whether test coverage has
@@ -52,6 +52,7 @@ static COMPILER_CRATES: &[(&str, &str)] = &[
     ("ipe_db", "db"),
     ("ipe_diagnostics", "diagnostics"),
     ("ipe_ffi", "ffi"),
+    ("ipe_fs_open", "fs_open"),
     ("ipe_intern", "intern"),
     ("ipe_ir", "ir"),
     ("ipe_kernels", "kernels"),
@@ -107,108 +108,6 @@ fn compiler_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("src/compiler")
-}
-
-// ── prod-source scanner ───────────────────────────────────────────────────────
-
-/// Strip `#[cfg(test)]` blocks and `mod tests { … }` blocks from Rust source so
-/// only production lines remain.
-///
-/// The strip is conservative: it recognises the two canonical test-gating
-/// patterns used in this codebase (`#[cfg(test)]` before an item, and
-/// `mod tests { … }` with an arbitrary depth). Any line inside such a block is
-/// excluded from the scan result. Lines that are merely comments mentioning
-/// "test" are kept — only attribute-gated blocks are removed.
-///
-/// A brace-balance counter is used to skip the body once the opening `{` of a
-/// test block is found. This is not a full parser; it can mis-count over raw
-/// strings or macros with unbalanced braces, but the codebase's style does not
-/// use those in test blocks.
-#[must_use]
-pub fn prod_source(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut in_test_block = false;
-    let mut depth: usize = 0;
-    let mut skip_next_item = false;
-
-    for line in src.lines() {
-        let trimmed = line.trim();
-
-        if in_test_block {
-            for ch in line.chars() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            in_test_block = false;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            continue;
-        }
-
-        // `#[cfg(test)]` or `#[test]` gates the *next* item.
-        if trimmed == "#[cfg(test)]" || trimmed == "#[test]" {
-            skip_next_item = true;
-            continue;
-        }
-
-        if skip_next_item {
-            skip_next_item = false;
-            // Any braced item gated by #[cfg(test)]: enter test-block mode and
-            // skip until the matching closing brace.
-            if trimmed.contains('{') {
-                in_test_block = true;
-                depth = 0;
-                for ch in line.chars() {
-                    match ch {
-                        '{' => depth += 1,
-                        '}' => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                in_test_block = false;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                continue;
-            }
-            // A non-braced item (a `use` or `type` alias) — skip only this line.
-            continue;
-        }
-
-        // `mod tests {` (without a preceding `#[cfg(test)]`) is also a
-        // conventional test module.
-        if (trimmed.starts_with("mod tests") || trimmed.starts_with("pub mod tests"))
-            && trimmed.contains('{')
-        {
-            in_test_block = true;
-            depth = 1;
-            continue;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-/// Whether a prod-stripped source string contains any panic-prone pattern.
-///
-/// Patterns checked: `unwrap()`, `expect(`, `panic!(`, `.index(`.
-/// All four are prohibited in production code per the soundness principle.
-#[must_use]
-pub fn has_prod_panic(prod: &str) -> bool {
-    prod.contains("unwrap()")
-        || prod.contains("expect(")
-        || prod.contains("panic!(")
-        || prod.contains(".index(")
 }
 
 /// Collect every `.rs` file under `root`, skipping hidden directories and

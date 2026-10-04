@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use ipe_diagnostics::terminal::is_denied_format_char;
+use ipe_diagnostics::terminal::is_display_hazard;
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, RoutePatternDefect, Span};
 use ipe_ir::{Callee, Expr, KernelFn, Program};
 
@@ -32,7 +32,7 @@ pub fn excerpt(raw: &str) -> Box<str> {
     let mut out = String::new();
     let mut chars = raw.chars();
     for c in chars.by_ref().take(EXCERPT_CHARS) {
-        if c.is_control() || is_denied_format_char(c) {
+        if is_display_hazard(c) {
             out.extend(c.escape_debug());
         } else {
             out.push(c);

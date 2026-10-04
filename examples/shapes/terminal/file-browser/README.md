@@ -17,7 +17,7 @@ program in the `Web` or `WebView` shape is rejected at compile time with
 ## Run
 
 ```
-ipe run examples/shapes/terminal/file-browser
+ipe dev run examples/shapes/terminal/file-browser
 ```
 
 This is a full-screen terminal app, so it needs a real terminal (a TTY); run it

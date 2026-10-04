@@ -1,0 +1,14 @@
+-- fuzz-hole arg
+--   base: @n1@
+--   mutant: "oops@n1@"
+-- fuzz-slot n1 : Int 1 90
+-- fuzz-expect IPE-T0001
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+import Lib
+
+
+main =
+    Io.println (String.fromInt (Lib.inc @arg@))

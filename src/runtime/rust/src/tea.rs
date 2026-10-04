@@ -982,6 +982,10 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
 
 // ─── Ipe.Terminal — line-oriented TEA loop ─────────────────────────────────────
 
+/// The name of the `console_app` stdin reader thread.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+const STDIN_READER_THREAD: &str = "ipe-stdin-reader";
+
 /// Cli.tea { init, update, view, subscriptions } : Task Error ().
 ///
 /// init -> fire cmd -> subs -> view; then fold each event (a stdin line through
@@ -1017,7 +1021,7 @@ pub fn console_app<
     #[cfg(feature = "debugger")] codec: Codec,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromUnavailable + Send + 'static,
     Model: Clone + Send + crate::stringify::IpeStringify + 'static,
     Msg: Clone + Send + crate::stringify::IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -1056,8 +1060,11 @@ where
         // shutdown flag wouldn't help since the read blocks until the next line
         // regardless. Do NOT compose `console_app` under a cancelling parent or
         // invoke it twice in one process without first accounting for this.
+        //
+        // A refused reader thread ends the app with an `Unavailable` error
+        // before any input is read.
         let line_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(STDIN_READER_THREAD, move || {
             let budget = InputBudget::new(MAX_QUEUED_INPUT);
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
@@ -1077,6 +1084,11 @@ where
             }
             let _ = line_tx.send(CliEvent::Eof);
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(STDIN_READER_THREAD, &e).into_error(),
+            );
+        }
 
         // Count of one-shot `Perform` effects that were issued but whose Msg has
         // not yet been folded through `update`. EOF must not terminate the loop

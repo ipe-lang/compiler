@@ -53,6 +53,64 @@ pub fn is_denied_format_char(c: char) -> bool {
     DENIED_FORMAT_CHARS.iter().any(|range| range.contains(&c))
 }
 
+/// Whether `c` reorders, hides, or breaks visible text: `Cc ∪ Cf ∪ Zl ∪ Zp`.
+///
+/// Every control character (C0, `DEL`, C1) plus the [`DENIED_FORMAT_CHARS`].
+/// The one predicate an identity-name constructor refuses and a print sink
+/// escapes or drops.
+#[must_use]
+pub fn is_display_hazard(c: char) -> bool {
+    c.is_control() || is_denied_format_char(c)
+}
+
+/// The first display hazard in a name: which code point, at which character.
+///
+/// Its [`fmt::Display`] is the one teaching hint every refusal of a hazardous
+/// name renders, ASCII only so the hint itself carries no hazard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayHazard {
+    ch: char,
+    position: usize,
+}
+
+impl DisplayHazard {
+    /// The first [`is_display_hazard`] character in `raw`, if any.
+    #[must_use]
+    pub fn find(raw: &str) -> Option<Self> {
+        raw.chars()
+            .enumerate()
+            .find(|&(_, c)| is_display_hazard(c))
+            .map(|(index, ch)| Self {
+                ch,
+                position: index.saturating_add(1),
+            })
+    }
+
+    /// The hazardous code point.
+    #[must_use]
+    pub const fn ch(self) -> char {
+        self.ch
+    }
+
+    /// The 1-based position of the hazard, counted in characters.
+    #[must_use]
+    pub const fn position(self) -> usize {
+        self.position
+    }
+}
+
+impl fmt::Display for DisplayHazard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "character {} is U+{:04X}, an invisible or text-reordering code point, so the name \
+             would print differently from what is compared; retype it without that character",
+            self.position,
+            u32::from(self.ch)
+        )
+    }
+}
+
 /// Text that has been proven safe to write to a terminal.
 ///
 /// No ANSI escape sequences, no C0/C1 control bytes, no `DEL`, no
@@ -124,7 +182,7 @@ impl TerminalSafe {
                 }
                 continue;
             }
-            if c == '\n' || c == '\t' || (!c.is_control() && !is_denied_format_char(c)) {
+            if c == '\n' || c == '\t' || !is_display_hazard(c) {
                 out.push(c);
             }
         }
@@ -356,5 +414,53 @@ mod tests {
         assert_eq!(safe.as_str(), "abcd");
         assert!(!safe.is_empty());
         assert!(TerminalLine::sanitize("\n\t").is_empty());
+    }
+
+    /// Every endpoint of the control and format ranges is a hazard, and each
+    /// neighbour outside all of them is not.
+    #[test]
+    fn display_hazard_endpoints() {
+        let control: [RangeInclusive<char>; 2] = ['\u{0}'..='\u{1F}', '\u{7F}'..='\u{9F}'];
+        let ranges: Vec<&RangeInclusive<char>> =
+            DENIED_FORMAT_CHARS.iter().chain(control.iter()).collect();
+        let in_any = |c: char| ranges.iter().any(|range| range.contains(&c));
+        for range in &ranges {
+            let (lo, hi) = (u32::from(*range.start()), u32::from(*range.end()));
+            assert!(is_display_hazard(*range.start()), "U+{lo:04X} is a hazard");
+            assert!(is_display_hazard(*range.end()), "U+{hi:04X} is a hazard");
+            let neighbours = [lo.checked_sub(1), hi.checked_add(1)];
+            for c in neighbours.into_iter().flatten().filter_map(char::from_u32) {
+                assert_eq!(
+                    is_display_hazard(c),
+                    in_any(c),
+                    "neighbour U+{:04X}",
+                    u32::from(c)
+                );
+            }
+        }
+        assert!(!is_display_hazard(' '));
+        assert!(!is_display_hazard('\u{00AC}'));
+        assert!(!is_display_hazard('\u{FFFC}'));
+    }
+
+    /// `find` reports the first hazard and its 1-based character position.
+    #[test]
+    fn display_hazard_find_reports_first_position() {
+        let hit = DisplayHazard::find("ab\u{202E}c\u{200B}");
+        assert_eq!(hit.map(DisplayHazard::ch), Some('\u{202E}'));
+        assert_eq!(hit.map(DisplayHazard::position), Some(3));
+        assert_eq!(DisplayHazard::find("plain name"), None);
+        assert_eq!(DisplayHazard::find("Geo App"), None);
+    }
+
+    /// The rendered hint is ASCII and names the code point and its position.
+    #[test]
+    fn display_hazard_hint_is_ascii() {
+        let hint = DisplayHazard::find("\u{E007F}x")
+            .map(|hit| hit.to_string())
+            .unwrap_or_default();
+        assert!(hint.is_ascii(), "{hint:?}");
+        assert!(hint.contains("U+E007F"), "{hint:?}");
+        assert!(hint.contains("character 1"), "{hint:?}");
     }
 }

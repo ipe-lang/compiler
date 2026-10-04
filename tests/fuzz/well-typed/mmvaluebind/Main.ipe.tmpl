@@ -1,0 +1,14 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot s1 : Lower 1 6
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Lib
+
+
+main =
+    Io.println
+        (String.fromInt
+            (List.length (@n1@ :: Lib.empty) + List.length ("@s1@" :: Lib.empty)))

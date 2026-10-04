@@ -155,7 +155,7 @@ fn a_named_descriptor_is_read_from_offset_zero() {
 /// In probe mode a returned error is the refused replacement.
 #[test]
 fn an_exec_replacement_inherits_only_named() -> std::io::Result<()> {
-    if std::env::args().any(|arg| arg == EXEC_PROBE_MARKER) {
+    if std::env::args_os().any(|arg| arg == EXEC_PROBE_MARKER) {
         // Probe mode: replace this process with a shell that checks its table.
         let leaked = dev_null(false).expect("open /dev/null");
         let named_fd = dev_null(true).expect("open /dev/null");

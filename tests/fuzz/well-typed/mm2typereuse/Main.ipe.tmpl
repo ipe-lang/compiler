@@ -1,0 +1,11 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot s1 : Lower 1 6
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+import Lib exposing (ident)
+
+
+main =
+    Io.println (String.fromInt (ident @n1@) ++ "|" ++ ident "@s1@")

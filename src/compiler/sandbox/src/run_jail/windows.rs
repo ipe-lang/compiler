@@ -165,51 +165,140 @@ pub fn build_windows_jailed(
     windows_jail::run_confined(profile, scoped_tmp, working_tree, Path::new(app), args)
 }
 
-/// The scrubbed `(name, value)` environment pairs the Windows launcher passes to
-/// `CreateProcess` as `lpEnvironment` — the `env` axis enforced launcher-side,
-/// mirroring [`crate::build_jail::macos_scrubbed_env`] and the Linux jail's
-/// `--clearenv` + re-export.
+/// One name every jailed Windows child receives ahead of the profile's allowlist.
 ///
-/// A pure function of the profile and a host-env lookup, so the exact set of
-/// variables that survive into the child is unit-testable on any host (the
+/// The base set is the launcher's whole fixed env contract: [`windows_scrubbed_env`]
+/// emits exactly these names (each when it has a value) plus the profile's
+/// allowlisted names, and nothing else. The Windows e2e asserts that the jailed
+/// child observes this set.
+///
+/// - `SystemRoot` — Win32 calls and the loader fail without it.
+/// - `PATH` — system tool resolution.
+/// - `TMP` / `TEMP` — pointed at the always-writable scratch (different runtimes
+///   read different ones).
+/// - `LANG` — re-exported when the host sets it, matching the Unix arms.
+/// - `LOCALAPPDATA`, `APPDATA`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH` — the
+///   profile variables `CreateProcessW` reads from the supplied block when it
+///   launches an `AppContainer` child. A block without them fails process
+///   creation with `ERROR_ENVVAR_NOT_FOUND` (203) before the child runs; with the
+///   host's values the child starts. Only the host's values are proven to start
+///   it, so each is the host value, re-exported only when the host sets it. The
+///   values name host profile folders but grant nothing: the `AppContainer` token
+///   reaches only what is granted to the container SID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsBaseEnv {
+    /// `SystemRoot`: the host value, else `C:\Windows`.
+    SystemRoot,
+    /// `PATH`: the host value when set.
+    Path,
+    /// `TMP`: the scratch directory.
+    Tmp,
+    /// `TEMP`: the scratch directory.
+    Temp,
+    /// `LANG`: the host value when set.
+    Lang,
+    /// `LOCALAPPDATA`: the host value when set.
+    LocalAppData,
+    /// `APPDATA`: the host value when set.
+    AppData,
+    /// `USERPROFILE`: the host value when set.
+    UserProfile,
+    /// `HOMEDRIVE`: the host value when set.
+    HomeDrive,
+    /// `HOMEPATH`: the host value when set.
+    HomePath,
+}
+
+/// Where a [`WindowsBaseEnv`] name takes its value from.
+enum BaseEnvValue {
+    /// The scratch directory the child may always write.
+    Scratch,
+    /// The host's value; absent when the host leaves it unset.
+    Host,
+    /// The host's value, else this fixed default.
+    HostOr(&'static str),
+}
+
+impl WindowsBaseEnv {
+    /// Every base name, in declaration order.
+    pub const ALL: [Self; 10] = [
+        Self::SystemRoot,
+        Self::Path,
+        Self::Tmp,
+        Self::Temp,
+        Self::Lang,
+        Self::LocalAppData,
+        Self::AppData,
+        Self::UserProfile,
+        Self::HomeDrive,
+        Self::HomePath,
+    ];
+
+    /// The variable name as it appears in the child's environment block.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SystemRoot => "SystemRoot",
+            Self::Path => "PATH",
+            Self::Tmp => "TMP",
+            Self::Temp => "TEMP",
+            Self::Lang => "LANG",
+            Self::LocalAppData => "LOCALAPPDATA",
+            Self::AppData => "APPDATA",
+            Self::UserProfile => "USERPROFILE",
+            Self::HomeDrive => "HOMEDRIVE",
+            Self::HomePath => "HOMEPATH",
+        }
+    }
+
+    const fn value(self) -> BaseEnvValue {
+        match self {
+            Self::SystemRoot => BaseEnvValue::HostOr("C:\\Windows"),
+            Self::Tmp | Self::Temp => BaseEnvValue::Scratch,
+            Self::Path
+            | Self::Lang
+            | Self::LocalAppData
+            | Self::AppData
+            | Self::UserProfile
+            | Self::HomeDrive
+            | Self::HomePath => BaseEnvValue::Host,
+        }
+    }
+}
+
+/// The scrubbed `(name, value)` environment pairs the Windows launcher passes to `CreateProcess`.
+///
+/// This is the `env` axis enforced launcher-side (`lpEnvironment`), mirroring
+/// [`crate::build_jail::macos_scrubbed_env`] and the Linux jail's `--clearenv` +
+/// re-export. A pure function of the profile and a host-env lookup, so the exact
+/// set of variables that survive into the child is unit-testable on any host (the
 /// UTF-16 block-building that consumes it is the only Windows-specific step). The
-/// child never inherits the launcher's environment: only this fixed minimal base
-/// plus the profile's allowlisted names (and only when the host actually sets
+/// child never inherits the launcher's environment: it gets the [`WindowsBaseEnv`]
+/// set plus the profile's allowlisted names (and only when the host actually sets
 /// them — a granted-but-unset name is simply absent, never a placeholder).
 ///
-/// The base is the Windows-shaped analogue of the Unix arms' `PATH`/`TMPDIR`:
-/// `SystemRoot` (Win32 API calls fail without it), `PATH` (system tool
-/// resolution), and `TMP`/`TEMP` pointed at the always-writable scratch. `LANG`
-/// re-exports when the host sets it, matching the Unix arms.
-///
-/// The returned pairs are sorted by name (case-insensitively) so the UTF-16 block
-/// built from them satisfies `CreateProcessW`'s `CREATE_UNICODE_ENVIRONMENT`
-/// sorted-block requirement — an unsorted block fails process creation with
-/// `ERROR_ENVVAR_NOT_FOUND` (203).
+/// The returned pairs are sorted by name in Windows' case-insensitive
+/// uppercase-ordinal order, the order `CreateProcessW` documents for a
+/// `CREATE_UNICODE_ENVIRONMENT` block, and hold no two names that collide
+/// case-insensitively.
 #[must_use]
-#[allow(clippy::too_long_first_doc_paragraph)]
 pub fn windows_scrubbed_env(
     profile: &SandboxProfile,
     scoped_tmp: &Path,
     host_env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = Vec::new();
-    // `SystemRoot` is load-bearing on Windows: without it many Win32 calls (and
-    // the loader) fail. Re-export the host's value when present, else the
-    // conventional default, so the child is never left without it.
-    let system_root = host_env("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
-    env.push((OsString::from("SystemRoot"), system_root));
-    // A minimal system PATH (the loader/tool resolution base), re-exported from
-    // the host when set so a relocated system dir still resolves.
-    if let Some(path) = host_env("PATH") {
-        env.push((OsString::from("PATH"), path));
-    }
-    // Both TMP and TEMP point at the always-writable scratch (the Windows env has
-    // two temp variables; different runtimes read different ones).
-    env.push((OsString::from("TMP"), scoped_tmp.as_os_str().to_owned()));
-    env.push((OsString::from("TEMP"), scoped_tmp.as_os_str().to_owned()));
-    if let Some(lang) = host_env("LANG") {
-        env.push((OsString::from("LANG"), lang));
+    for base in WindowsBaseEnv::ALL {
+        let value = match base.value() {
+            BaseEnvValue::Scratch => Some(scoped_tmp.as_os_str().to_owned()),
+            BaseEnvValue::Host => host_env(base.name()),
+            BaseEnvValue::HostOr(default) => {
+                Some(host_env(base.name()).unwrap_or_else(|| OsString::from(default)))
+            }
+        };
+        if let Some(value) = value {
+            env.push((OsString::from(base.name()), value));
+        }
     }
     // Only the profile's declared env names re-enter, and only when the host
     // actually sets them. An empty name can never form a valid `NAME=VALUE` entry
@@ -223,24 +312,17 @@ pub fn windows_scrubbed_env(
             env.push((OsString::from(name), value));
         }
     }
-    // `CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT` requires the environment
-    // block sorted by name, case-insensitively in Windows' UPPERCASE-ordinal
-    // collation — the same order the child's CRT/loader expects when it does an
-    // ordered lookup on the block it is handed. An out-of-order block makes that
-    // lookup miss a variable the child needs to initialise (notably `SystemRoot`),
-    // and `CreateProcessW` fails with `ERROR_ENVVAR_NOT_FOUND` (203) before the
-    // child runs. The distinction is load-bearing: lowercasing puts `_` (0x5F)
-    // BEFORE the letters (`a`..=`z` = 0x61..=0x7A), whereas Windows uppercases and
-    // so puts `_` AFTER the letters (`A`..=`Z` = 0x41..=0x5A) — an env name with an
-    // underscore (the common case) sorts differently under the two, and only the
-    // uppercase order matches what the child scans. Sort by name only (an env name
-    // cannot contain `=`).
+    // Windows sorts an environment block by name, case-insensitively, in
+    // UPPERCASE-ordinal collation. The distinction from a lowercase sort is
+    // load-bearing: lowercasing puts `_` (0x5F) BEFORE the letters (`a`..=`z` =
+    // 0x61..=0x7A), whereas Windows uppercases and so puts `_` AFTER the letters
+    // (`A`..=`Z` = 0x41..=0x5A). Sort by name only (an env name cannot contain
+    // `=`).
     env.sort_by_key(|(name, _)| env_name_collation_key(name));
     // The environment is case-insensitive on Windows, so a block holding two names
-    // that collide under the collation key is malformed — the child's ordered lookup
-    // sees an ambiguous key and `CreateProcessW` can 203. The profile parser accepts
-    // an `env` name that collides with a fixed base name (e.g. a granted `SystemRoot`
-    // or `Path`), so drop any later collision, keeping the first: the fixed base wins
+    // that collide under the collation key is malformed. The profile parser accepts
+    // an `env` name that collides with a base name (e.g. a granted `SystemRoot`
+    // or `Path`), so drop any later collision, keeping the first: the base wins
     // over an allowlist re-grant, so a granted name can never displace a scrubbed base
     // to a different value. A stable sort keeps the base entry ahead of an allowlist
     // duplicate (the base was pushed first), so first-kept is fail-closed.
@@ -248,13 +330,12 @@ pub fn windows_scrubbed_env(
     env
 }
 
-/// The case-insensitive collation key `CreateProcessW`'s `CREATE_UNICODE_ENVIRONMENT`
-/// block must be sorted on: Windows compares environment names by UPPERCASE ordinal,
-/// so an env block the child can scan in order is one sorted on the ASCII-uppercased
-/// name (matching the child CRT/loader's own ordered lookup). Sorting on the
-/// lowercased name instead reorders any name containing a character that case-folds
-/// across the letter range — `_` most notably — and the child then misses a required
-/// variable, so process creation fails with `ERROR_ENVVAR_NOT_FOUND` (203).
+/// The case-insensitive collation key a `CREATE_UNICODE_ENVIRONMENT` block is sorted on.
+///
+/// Windows compares environment names by UPPERCASE ordinal, so the block is sorted
+/// on the ASCII-uppercased name. Sorting on the lowercased name instead reorders any
+/// name containing a character that case-folds across the letter range (`_` most
+/// notably).
 ///
 /// Pure and host-independent (the produced pairs are unit-tested on any host); env
 /// names are ASCII, so ASCII-uppercasing reproduces Windows' uppercase-ordinal order
@@ -361,8 +442,9 @@ mod windows_jail {
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, FreeSid, GetTokenInformation, NO_INHERITANCE, PSID,
-        SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientSid,
+        SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE, GetVolumeInformationW,
@@ -385,6 +467,10 @@ mod windows_jail {
 
     /// Access rights ACLed onto a granted path for the container SID (read+write).
     const FILE_RW: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+
+    /// Inheritance of the read+write grants: every file and subdirectory below a
+    /// granted root, present and future, carries the grant.
+    const GRANT_INHERITANCE: u32 = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 
     /// Keep the pure, cross-platform [`crate::run_jail::FILE_PERSISTENT_ACLS_FLAG`] (used by
     /// the host-independent volume-capability decision + its unit tests) in
@@ -517,12 +603,12 @@ mod windows_jail {
         // between the volume root and the scratch in order for CreateProcessW to
         // resolve `scoped_tmp` as `lpCurrentDirectory`. ACLing the scratch itself
         // is not enough: Windows path resolution walks each component, and a
-        // directory that denies `FILE_TRAVERSE` to the container SID makes the walk
-        // stop, returning ERROR_ENVVAR_NOT_FOUND (203) from CreateProcessW before
-        // the child starts. This grants the minimal traverse right on each ancestor
-        // up to (but not including) the volume root, which already allows traversal
-        // to everyone by default. The grant is additive (not a replace-DACL), so
-        // it never removes existing permissions.
+        // directory that denies `FILE_TRAVERSE` to the container SID stops the
+        // walk, so CreateProcessW cannot start the child there. This grants the
+        // minimal traverse right on each ancestor up to (but not including) the
+        // volume root, which already allows traversal to everyone by default. The
+        // grant is additive (not a replace-DACL), so it never removes existing
+        // permissions.
         grant_traverse_to_ancestors(scoped_tmp, container.sid())?;
         if profile.filesystem == FilesystemScope::WorkingTreeReadWrite {
             probe_volume_persists_acls(working_tree)?;
@@ -542,10 +628,9 @@ mod windows_jail {
         //    is the always-ACLed scratch — the ONE directory the container token can
         //    always reach. The working tree cannot be the CWD: under a
         //    filesystem-withholding profile it is NOT ACLed to the container SID, so
-        //    CreateProcessW would fail resolving the current directory with
-        //    ERROR_ENVVAR_NOT_FOUND (203) before the child ran. The CWD is not a
-        //    capability, so scratch-as-CWD neither grants nor widens any axis (and
-        //    matches the Unix arms, which do not chdir into the working tree either).
+        //    CreateProcessW could not resolve the current directory for the child.
+        //    The CWD is not a capability, so scratch-as-CWD neither grants nor
+        //    widens any axis.
         let child = create_suspended_appcontainer_process(
             app,
             app_args,
@@ -572,7 +657,7 @@ mod windows_jail {
         Ok(code)
     }
 
-    /// A per-run AppContainer name: unique enough that concurrent `ipe run`
+    /// A per-run AppContainer name: unique enough that concurrent `ipe dev run`
     /// invocations do not collide on the same container profile.
     fn per_run_container_name() -> OsString {
         let pid = std::process::id();
@@ -807,7 +892,7 @@ mod windows_jail {
         let active_cap = active_process_cap(profile);
         // The address-space and CPU-second ceilings the profile mandates. On the
         // Unix arms these are `prlimit --as`/`--cpu`; the Job Object enforces the
-        // equivalents so a runaway or memory-bomb under an untrusted `ipe run` is
+        // equivalents so a runaway or memory-bomb under an untrusted `ipe dev run` is
         // bounded on every platform, not just Unix (PRINCIPLES.md: bounded by
         // construction — a process that could exhaust host memory or spin forever
         // has broken soundness, and over the network principle 1's exhaustion
@@ -861,12 +946,22 @@ mod windows_jail {
     /// ACL a path's DACL to grant read+write to exactly two trustees — the
     /// AppContainer SID (so the sandboxed process can reach its scratch/working
     /// tree) and the launcher's own user SID (so this process and SYSTEM keep the
-    /// access post-run cleanup — `remove_dir_all(scoped_tmp)` — needs). Everyone
-    /// else stays implicitly denied: this is a fresh DACL with only these two
-    /// grants, so deny-by-default holds. The launcher grant does NOT widen the
-    /// sandboxed app's reach: the AppContainer process runs as the container SID,
-    /// never as the launcher user. A failure refuses — never run with an
-    /// unenforced write boundary.
+    /// access post-run cleanup — `remove_dir_all(scoped_tmp)` — needs). These two
+    /// replace every explicit entry of `path`'s DACL. Unless that DACL is
+    /// protected, `SetNamedSecurityInfoW` also keeps the entries `path` inherits
+    /// from its parent; those name host principals, never this per-run container
+    /// SID (the ancestor traverse grant does not inherit), so the container
+    /// reaches only what these two grants give it. The launcher grant does NOT
+    /// widen the sandboxed app's reach: the AppContainer process runs as the
+    /// container SID, never as the launcher user. A failure refuses — never run
+    /// with an unenforced write boundary.
+    ///
+    /// Both grants inherit to every file and directory below `path`
+    /// ([`GRANT_INHERITANCE`]): a granted root is granted as a whole subtree. A
+    /// grant on the root alone leaves every entry the child creates (and every
+    /// entry already in a granted working tree) without the container SID, so the
+    /// child could create a file but not reopen it, and could not write inside a
+    /// directory it made.
     ///
     /// The caller must have already established, via
     /// [`probe_volume_persists_acls`], that `path` lives on a volume with
@@ -899,7 +994,7 @@ mod windows_jail {
             EXPLICIT_ACCESS_W {
                 grfAccessPermissions: FILE_RW,
                 grfAccessMode: SET_ACCESS,
-                grfInheritance: NO_INHERITANCE,
+                grfInheritance: GRANT_INHERITANCE,
                 Trustee: TRUSTEE_W {
                     pMultipleTrustee: std::ptr::null_mut(),
                     MultipleTrusteeOperation: 0,
@@ -911,7 +1006,7 @@ mod windows_jail {
             EXPLICIT_ACCESS_W {
                 grfAccessPermissions: FILE_RW,
                 grfAccessMode: SET_ACCESS,
-                grfInheritance: NO_INHERITANCE,
+                grfInheritance: GRANT_INHERITANCE,
                 Trustee: TRUSTEE_W {
                     pMultipleTrustee: std::ptr::null_mut(),
                     MultipleTrusteeOperation: 0,
@@ -976,10 +1071,9 @@ mod windows_jail {
     /// `CreateProcessW` resolves `lpCurrentDirectory` by walking every path
     /// component through the AppContainer token. If any ancestor directory does
     /// not have `FILE_TRAVERSE` granted to the container SID, the walk stops and
-    /// the call returns `ERROR_ENVVAR_NOT_FOUND` (203) before the child process
-    /// starts. ACLing the scratch directory itself (done by `acl_path_for_container`)
-    /// is therefore not enough: every ancestor up to the volume root must also allow
-    /// the container SID to traverse it.
+    /// the child cannot start there. ACLing the scratch directory itself (done by
+    /// `acl_path_for_container`) is therefore not enough: every ancestor up to the
+    /// volume root must also allow the container SID to traverse it.
     ///
     /// The grant is additive: the function merges a single `GRANT_ACCESS`
     /// `FILE_TRAVERSE` entry into the existing DACL of each ancestor via
@@ -1305,10 +1399,10 @@ mod windows_jail {
     /// app path + args with proper quoting; there is no shell.
     ///
     /// `current_dir` is the child's `lpCurrentDirectory`. It MUST be a directory the
-    /// AppContainer token can access — otherwise `CreateProcessW` fails resolving
-    /// the current directory with `ERROR_ENVVAR_NOT_FOUND` (203) before the child
-    /// starts. The caller passes the always-ACLed scratch (never the working tree,
-    /// which is unreachable to the container when the filesystem axis is withheld).
+    /// AppContainer token can access — otherwise `CreateProcessW` cannot resolve
+    /// the current directory for the child. The caller passes the always-ACLed
+    /// scratch (never the working tree, which is unreachable to the container when
+    /// the filesystem axis is withheld).
     /// The CWD is not a capability: the child can still reach only what is ACLed to
     /// the container SID, so pointing it at the scratch neither grants nor widens
     /// any axis.
@@ -1625,7 +1719,7 @@ mod windows_jail {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
     fn env_profile(names: &[&str]) -> SandboxProfile {
@@ -1757,7 +1851,7 @@ mod tests {
     #[test]
     fn an_allowlisted_name_colliding_case_insensitively_with_a_base_is_deduped() {
         // Windows environments are case-insensitive: a block holding two names that
-        // fold to the same key is malformed and can 203. A profile can grant a name
+        // fold to the same key is malformed. A profile can grant a name
         // that collides with a fixed base (`SystemRoot`), so the collision must
         // collapse to ONE entry — the base value, never the allowlist re-grant's.
         let profile = env_profile(&["systemroot"]);
@@ -1800,5 +1894,122 @@ mod tests {
             "a `=` inside a value must survive whole: {:?}",
             decode_block(&block)
         );
+    }
+
+    /// The `AppContainer` profile variables `CreateProcessW` reads from the block.
+    const PROFILE_VARS: [&str; 5] = [
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    ];
+
+    /// A host that sets every base name, the profile variables, and one secret.
+    fn full_host(name: &str) -> Option<OsString> {
+        match name {
+            "SystemRoot" => Some(OsString::from("C:\\Windows")),
+            "PATH" => Some(OsString::from("C:\\Windows\\System32")),
+            "LANG" => Some(OsString::from("C.UTF-8")),
+            "LOCALAPPDATA" => Some(OsString::from("C:\\Users\\u\\AppData\\Local")),
+            "APPDATA" => Some(OsString::from("C:\\Users\\u\\AppData\\Roaming")),
+            "USERPROFILE" => Some(OsString::from("C:\\Users\\u")),
+            "HOMEDRIVE" => Some(OsString::from("C:")),
+            "HOMEPATH" => Some(OsString::from("\\Users\\u")),
+            "ALLOWED" => Some(OsString::from("yes")),
+            "SECRET" => Some(OsString::from("leak")),
+            _ => None,
+        }
+    }
+
+    fn value_of<'a>(pairs: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsString> {
+        pairs
+            .iter()
+            .find(|(n, _)| n.as_os_str() == OsStr::new(name))
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn windows_scrubbed_env_carries_the_appcontainer_profile_base() {
+        let pairs = windows_scrubbed_env(&env_profile(&[]), Path::new("C:\\scratch"), &full_host);
+        for name in PROFILE_VARS {
+            assert_eq!(
+                value_of(&pairs, name),
+                full_host(name).as_ref(),
+                "`{name}` must reach the child with the host value: {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrubbed_env_is_exactly_the_base_set_plus_the_allowlist() {
+        let pairs = windows_scrubbed_env(
+            &env_profile(&["ALLOWED"]),
+            Path::new("C:\\scratch"),
+            &full_host,
+        );
+        let mut got: Vec<&str> = pairs.iter().filter_map(|(n, _)| n.to_str()).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = WindowsBaseEnv::ALL
+            .into_iter()
+            .map(WindowsBaseEnv::name)
+            .chain(["ALLOWED"])
+            .collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "the child env is the declared set, nothing else");
+        assert_eq!(
+            value_of(&pairs, "TMP"),
+            Some(&OsString::from("C:\\scratch")),
+            "TMP is the scratch"
+        );
+        assert_eq!(
+            value_of(&pairs, "TEMP"),
+            Some(&OsString::from("C:\\scratch")),
+            "TEMP is the scratch"
+        );
+    }
+
+    #[test]
+    fn a_profile_variable_the_host_leaves_unset_is_absent() {
+        // No placeholder value is invented for a profile variable the host lacks.
+        let host = |k: &str| match k {
+            "SystemRoot" => Some(OsString::from("C:\\Windows")),
+            _ => None,
+        };
+        let pairs = windows_scrubbed_env(&env_profile(&[]), Path::new("C:\\scratch"), &host);
+        for name in PROFILE_VARS {
+            assert_eq!(value_of(&pairs, name), None, "`{name}` must stay absent");
+        }
+    }
+
+    #[test]
+    fn a_granted_profile_variable_keeps_the_base_host_value() {
+        // A profile re-grant of a base name never forms a second, colliding entry.
+        let pairs = windows_scrubbed_env(
+            &env_profile(&["userprofile"]),
+            Path::new("C:\\scratch"),
+            &|k: &str| match k {
+                "userprofile" => Some(OsString::from("C:\\Elsewhere")),
+                other => full_host(other),
+            },
+        );
+        let hits: Vec<&OsString> = pairs
+            .iter()
+            .filter(|(n, _)| env_name_collation_key(n) == "USERPROFILE")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(hits, vec![&OsString::from("C:\\Users\\u")]);
+    }
+
+    #[test]
+    fn base_names_are_distinct_under_the_collation_key() {
+        let mut keys: Vec<String> = WindowsBaseEnv::ALL
+            .into_iter()
+            .map(|base| env_name_collation_key(OsStr::new(base.name())))
+            .collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "two base names collide: {keys:?}");
     }
 }

@@ -62,7 +62,7 @@ use crate::cli_args::OutputFormat;
 use crate::project::{self, ProjectManifest};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
-use crate::scratch::{LeafName, ScratchDir};
+use crate::scratch::ScratchDir;
 use crate::text;
 
 /// The package-gate checks, in the fixed order [`run_audit`] runs them. Naming
@@ -226,68 +226,6 @@ struct Prepared {
     emitted_dir: PathBuf,
 }
 
-/// The wrapper-owned Tier-2 admission probe fixture, embedded in the binary and
-/// materialized to a host-only scratch path on use. Tier-2 runs it as the
-/// exit-owning wrapper (ADR 0004): passed inline on POSIX, staged afresh for
-/// each run on Windows.
-///
-/// The fixture SOURCE is embedded at build time (the tracked fixture files stay
-/// the single source of truth); a shipped binary can find it with no source
-/// checkout beside it. Nothing depends on a compile-time source path at runtime.
-///
-/// The wrapper is platform-native: a POSIX `/bin/sh` script on Linux/macOS/
-/// FreeBSD (its source passed inline to `/usr/bin/env … /bin/sh -c`), and a
-/// PowerShell `.ps1` on Windows (the Windows jail runs `payload[0]` directly
-/// through `CreateProcessW` with no shell, so `powershell.exe -File` is the
-/// interpreter). Both implement the SAME wrapper-owned per-axis exit contract
-/// the decoder reads. Tier-2 reads the materialized fixture back on the host;
-/// the jailed payload never sees a copy it could rewrite between runs.
-const TIER2_PROBE_POSIX: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/admission/untrusted-build.sh"
-));
-const TIER2_PROBE_WINDOWS: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/admission/untrusted-build.ps1"
-));
-
-// Tier-2 reads the wrapper back under this cap before running it, so an
-// embedded fixture that outgrew it would refuse every native audit.
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an embedded Tier-2 wrapper outgrows the host read cap [ledger #boundary]
-const _: () = assert!(
-    TIER2_PROBE_POSIX.len() as u64 <= crate::io_bounded::PROBE_WRAPPER_READ_CAP
-        && TIER2_PROBE_WINDOWS.len() as u64 <= crate::io_bounded::PROBE_WRAPPER_READ_CAP
-);
-
-/// Materialize the platform-appropriate embedded Tier-2 probe fixture to a
-/// per-process scratch file and return its path.
-///
-/// # Errors
-/// [`CliError::Io`] when the scratch directory or the fixture file cannot be
-/// written — a fail-closed refusal, never a run against a missing wrapper.
-fn tier2_probe_fixture() -> Result<PathBuf, CliError> {
-    let (name, bytes): (&str, &[u8]) = if cfg!(target_os = "windows") {
-        ("untrusted-build.ps1", TIER2_PROBE_WINDOWS)
-    } else {
-        ("untrusted-build.sh", TIER2_PROBE_POSIX)
-    };
-    let scratch = ScratchDir::new("ipe-tier2-fixture").map_err(|e| CliError::Io {
-        path: PathBuf::from("ipe-tier2-fixture"),
-        source: e,
-    })?;
-    let path = scratch.child(&LeafName::new(name).map_err(|e| CliError::Io {
-        path: PathBuf::from(name),
-        source: e.into(),
-    })?);
-    std::fs::write(&path, bytes).map_err(|e| CliError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-    // The caller removes the directory via `remove_dir_all` after use.
-    let _dir = scratch.into_path();
-    Ok(path)
-}
-
 /// `ipe package audit [<path>]` — run the full Tier-1 gate on the working
 /// package and exit non-zero with the failing check's diagnostic.
 ///
@@ -413,7 +351,6 @@ fn audit_gate(
         has_rust_deps: !prepared.manifest.rust_dependencies.is_empty(),
         root: &prepared.manifest.root,
         emitted_dir: &prepared.emitted_dir,
-        probe_fixture: tier2_probe_fixture()?,
     })?;
 
     // Control-model consent (defence-in-depth boundary, sibling of the build-time
@@ -734,7 +671,7 @@ fn prepare(path: &Path) -> Result<Prepared, CliError> {
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
     let emitted_dir = audit_scratch_dir(&manifest.name)?;
-    // Resolve the runtime exactly as `ipe build` does — one resolver for every
+    // Resolve the runtime exactly as `ipe dev build` does — one resolver for every
     // command. Under the default dependency model the emitted project names the
     // runtime as a path dependency, which the build materializes from the
     // embedded source under `IPE_HOME`; no vendored module tree is needed, so an
@@ -2261,110 +2198,6 @@ mod tests {
         );
     }
 
-    /// The Tier-2 probe fixture the gate runs is materialized from the embedded
-    /// bytes, NOT read from a compile-time source path — so a shipped binary with
-    /// no source checkout beside it still finds the wrapper. The returned path
-    /// exists on disk (a runtime scratch file, never the `CARGO_MANIFEST_DIR`
-    /// source tree) and its bytes equal the embedded copy exactly.
-    #[test]
-    fn tier2_probe_fixture_materializes_from_the_embedded_copy() {
-        let path = tier2_probe_fixture().expect("materialize the embedded probe fixture");
-        assert!(
-            path.is_file(),
-            "the materialized probe fixture must exist on disk at {}",
-            path.display()
-        );
-        assert!(
-            !path.starts_with(env!("CARGO_MANIFEST_DIR")),
-            "the materialized fixture must live under a runtime scratch path, not the source tree"
-        );
-        let expected: &[u8] = if cfg!(target_os = "windows") {
-            TIER2_PROBE_WINDOWS
-        } else {
-            TIER2_PROBE_POSIX
-        };
-        let on_disk = std::fs::read(&path).expect("read the materialized probe fixture");
-        assert_eq!(
-            on_disk, expected,
-            "the materialized fixture bytes must equal the embedded copy"
-        );
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("the fixture path has a file name");
-        let expected_name = if cfg!(target_os = "windows") {
-            "untrusted-build.ps1"
-        } else {
-            "untrusted-build.sh"
-        };
-        assert_eq!(
-            name, expected_name,
-            "the fixture keeps the platform-native file name the jail resolves by"
-        );
-        let _ = std::fs::remove_dir_all(path.parent().expect("the fixture has a parent dir"));
-    }
-
-    /// The embedded probe fixtures are the byte-exact contents of the tracked
-    /// fixture files: the tracked files are the single source of truth, embedded
-    /// (not duplicated inline). If a fixture is edited, this equality asserts the
-    /// binary carries the new bytes — no hand-sync, no drift.
-    #[test]
-    fn embedded_probe_fixtures_match_the_tracked_files() {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/admission");
-        let posix = std::fs::read(base.join("untrusted-build.sh"))
-            .expect("read the tracked POSIX probe fixture");
-        assert_eq!(
-            posix, TIER2_PROBE_POSIX,
-            "the embedded POSIX fixture must equal the tracked file"
-        );
-        let windows = std::fs::read(base.join("untrusted-build.ps1"))
-            .expect("read the tracked Windows probe fixture");
-        assert_eq!(
-            windows, TIER2_PROBE_WINDOWS,
-            "the embedded Windows fixture must equal the tracked file"
-        );
-    }
-
-    #[test]
-    fn tier2_probe_fixture_dir_is_created_exclusively() {
-        // `tier2_probe_fixture` creates its scratch dir through `ScratchDir`, so
-        // the name is unpredictable — `ipe-tier2-fixture-<pid>-<32 hex entropy>` —
-        // and the dir is created exclusively (a pre-seeded entry is not followed).
-        // A predictable pid-only name would let a same-user attacker pre-seed the
-        // path; the entropy component is what closes that.
-        let fixture_path =
-            tier2_probe_fixture().expect("tier2_probe_fixture must succeed on a clean temp dir");
-        let dir = fixture_path.parent().expect("fixture path has parent");
-        let dir_name = dir.file_name().unwrap_or_default().to_string_lossy();
-        let suffix = dir_name
-            .strip_prefix("ipe-tier2-fixture-")
-            .expect("scratch dir uses the ipe-tier2-fixture- prefix");
-        // The suffix is `<pid>-<32 hex entropy>`: the pid, a dash, then 32 hex
-        // chars. The entropy makes the name unpredictable (not the bare pid).
-        let (pid_part, hex_part) = suffix
-            .split_once('-')
-            .expect("suffix is <pid>-<hex entropy>");
-        assert!(
-            pid_part.chars().all(|c| c.is_ascii_digit()),
-            "pid component is decimal: {pid_part}"
-        );
-        assert_eq!(
-            pid_part,
-            std::process::id().to_string(),
-            "pid in dir name matches the current process"
-        );
-        assert_eq!(hex_part.len(), 32, "128 bits of entropy as 32 hex chars");
-        assert!(
-            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
-            "entropy component is hex: {hex_part}"
-        );
-        assert!(
-            fixture_path.exists(),
-            "fixture file was written at {fixture_path:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// Build a unique throwaway directory under the OS temp root for a test.
     /// Returns the path; the caller must remove it when done.
     fn make_test_dir(tag: &str) -> PathBuf {
@@ -3118,7 +2951,7 @@ mod tests {
 
     // ── Runtime resolution ───────────────────────────────────────────────────
 
-    /// `prepare` resolves the runtime through the SAME path `ipe build` uses — the
+    /// `prepare` resolves the runtime through the SAME path `ipe dev build` uses — the
     /// materialize-capable resolver — never a separate walk-up that cannot
     /// materialize. Under the default dependency model no vendored module tree is
     /// needed, so with `IPE_RUNTIME_DIR` unset the resolution succeeds with an

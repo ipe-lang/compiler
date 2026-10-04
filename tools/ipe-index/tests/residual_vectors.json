@@ -1,0 +1,17 @@
+[
+  {"name": "no_spans_keeps_every_non_blank_line", "src": "use a;\n\nfn f() {}\n", "spans": [], "residual": "use a;\nfn f() {}", "hash": "sha256:da1defaad4630b79fbe0ce7bce082174a1fb19076e30126ba73b11bf62ce3e87"},
+  {"name": "nested_and_overlapping_spans_cover_their_union", "src": "a\nb\nc\nd\ne\nf\n", "spans": [[2, 4], [3, 3], [4, 5]], "residual": "a\n\u0000\nf", "hash": "sha256:8ba1ab5dc24b271d1c2725adcfbe54ad557cec3d0de03fca411a4a45a7095385"},
+  {"name": "a_span_past_eof_covers_its_in_range_part", "src": "a\nb\n", "spans": [[2, 99]], "residual": "a", "hash": "sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"},
+  {"name": "a_start_at_zero_covers_from_line_one", "src": "a\nb\nc\n", "spans": [[0, 1]], "residual": "b\nc", "hash": "sha256:6c516cfc306e53636a409aa84780db9730490c6b3928ccab0f183a8fbc39124e"},
+  {"name": "a_negative_start_covers_from_line_one", "src": "a\nb\nc\n", "spans": [[-5, 1]], "residual": "b\nc", "hash": "sha256:6c516cfc306e53636a409aa84780db9730490c6b3928ccab0f183a8fbc39124e"},
+  {"name": "an_end_before_start_covers_nothing", "src": "a\nb\nc\n", "spans": [[3, 2]], "residual": "a\nb\nc", "hash": "sha256:ea7fb08b7a2dc4619ffb7c7bb38d95a2047935fa165d71b12efd3852a2e6d0cc"},
+  {"name": "a_negative_end_covers_nothing", "src": "a\nb\n", "spans": [[1, -1]], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
+  {"name": "crlf_keeps_cr_and_drops_cr_only_lines", "src": "use a;\r\n\r\nfn f() {\r\n}\r\nx\r\n", "spans": [[3, 4]], "residual": "use a;\r\n\u0000\nx\r", "hash": "sha256:27622e348c8199c136c07d6ff8e98be3fdba40266992387a0c292f52201dc282"},
+  {"name": "blank_only_lines_are_dropped_without_a_gap", "src": "a\n\n  \t\nb\n", "spans": [], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
+  {"name": "blank_lines_after_a_covered_run_keep_one_gap", "src": "a\nf\n\nb\n", "spans": [[2, 2]], "residual": "a\n\u0000\nb", "hash": "sha256:024b377cb47b5a04b275ad6a6a11cedf387265de5c543777ea0a4f2dc5841925"},
+  {"name": "a_leading_covered_run_has_no_leading_gap", "src": "fn f() {\n}\nuse a;\n", "spans": [[1, 2]], "residual": "use a;", "hash": "sha256:3c243c21994a09f1c8d8c38c1be247a528ce03298d11f05979ee3315630e8d7e"},
+  {"name": "a_trailing_covered_run_has_no_trailing_gap", "src": "a\nfn\n", "spans": [[2, 2]], "residual": "a", "hash": "sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"},
+  {"name": "a_no_break_space_line_is_blank", "src": "a\n\u00a0\nb\n", "spans": [], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
+  {"name": "an_ideographic_space_line_is_blank", "src": "a\n\u3000\u3000\nb\n", "spans": [], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
+  {"name": "an_all_covered_file_has_an_empty_residual", "src": "fn f() {\n}\n", "spans": [[1, 2]], "residual": "", "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+]

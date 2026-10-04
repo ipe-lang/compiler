@@ -23,6 +23,7 @@
 //! sink keeps serving. No `unwrap`/`expect`/indexing in any reachable path.
 
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -107,22 +108,13 @@ pub async fn enable_from_env() {
     if SENDER.get().is_some() {
         return; // already enabled
     }
-    let url = format!("sqlite:{path}?mode=rwc");
-    let pool = match SqlitePool::connect(&url).await {
+    let pool = match open_spill_pool(&path).await {
         Ok(p) => p,
         Err(e) => {
             crate::system::emit_runtime_log("spill", &format!("open {path}: {e}"));
             return;
         }
     };
-    // WAL mode: the parent writes telemetry frequently while the console child
-    // reads — WAL is the only journal mode that allows a concurrent reader + one
-    // writer without each blocking the other (rollback-journal serializes them,
-    // livelocking under sustained writes). The console reader MUST open `mode=rw`
-    // (not ro) to attach the -wal/-shm and see committed frames — see
-    // `live/hub.rs::open_spill`. busy_timeout absorbs brief contention.
-    let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
-    let _ = sqlx::query("PRAGMA busy_timeout=2000").execute(&pool).await;
     for stmt in SPILL_SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
         if let Err(e) = sqlx::query(stmt).execute(&pool).await {
             crate::system::emit_runtime_log("spill", &format!("schema: {e}"));
@@ -140,6 +132,22 @@ pub async fn enable_from_env() {
 
 /// Write one entry to the spill (the unit of work the batcher repeats). Mapping
 /// to the hub schema lives here so it's directly testable without the channel.
+/// Open (creating it when absent) the spill file at `path` in WAL mode.
+///
+/// Every connection carries [`crate::system::SQLITE_BUSY_TIMEOUT`] from its connect
+/// options. WAL is the only journal mode that lets the console child read while
+/// this process writes without each blocking the other; the console reader opens
+/// read-write to attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`).
+async fn open_spill_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .busy_timeout(crate::system::SQLITE_BUSY_TIMEOUT);
+    let pool = SqlitePool::connect_with(options).await?;
+    let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
+    Ok(pool)
+}
+
 async fn write_entry(pool: &SqlitePool, svc: &str, entry: SpillEntry) -> Result<(), sqlx::Error> {
     match entry {
         SpillEntry::Log {
@@ -336,6 +344,41 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every connection the spill pool hands out at once carries the declared
+    /// busy timeout.
+    #[tokio::test]
+    async fn the_spill_pool_carries_the_declared_busy_timeout() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("spill-busy-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        let pool = open_spill_pool(&path).await.expect("open spill");
+        let expected = i64::try_from(crate::system::SQLITE_BUSY_TIMEOUT.as_millis())
+            .expect("timeout fits i64");
+        let size = pool.options().get_max_connections();
+        let mut held = Vec::new();
+        for _ in 0..size {
+            held.push(pool.acquire().await.expect("acquire spill connection"));
+        }
+        assert!(
+            held.len() > 1,
+            "the spill pool holds more than one connection"
+        );
+        for conn in &mut held {
+            let ms = sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+                .fetch_one(&mut **conn)
+                .await
+                .expect("read busy_timeout");
+            assert_eq!(ms, expected);
+        }
+        drop(held);
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     #[test]

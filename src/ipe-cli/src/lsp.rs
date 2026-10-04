@@ -4,17 +4,18 @@
 //! `ipe_lsp_features`; this module supplies the one driver-side ingredient
 //! the server cannot own — project resolution. [`DriverLoader`] first
 //! classifies the opened document as a [`ProjectRoot`]. A package routes
-//! through the SAME manifest-discovery/stdlib-injection code path `ipe build`
-//! and `ipe watch` use, so the module set the editor analyzes can never
+//! through the SAME manifest-discovery/stdlib-injection code path `ipe dev build`
+//! and `ipe dev watch` use, so the module set the editor analyzes can never
 //! diverge from the one the batch build compiles. A loose file (no
 //! `package.ipe` above it) resolves through [`crate::loose_file`], the same
-//! resolver `ipe build` and `ipe watch` use for it.
+//! resolver `ipe dev build` and `ipe dev watch` use for it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ipe_lsp_server::{LimitSource, LoadError, LoadedFile, LoadedProject, ProjectLoader};
 
+use crate::ffi::FfiPrepError;
 use crate::loose_file::{LooseFileLimits, ProjectRoot, resolve_loose_file};
 use crate::{CliError, project, text, watch};
 
@@ -81,6 +82,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         CliError::Io { .. }
         | CliError::ScratchUnavailable { .. }
         | CliError::ChildPipeHeld(_)
+        | CliError::ThreadRefused { .. }
         | CliError::Interrupted => LoadError::Io(detail),
         CliError::SourceRefused { .. } | CliError::DeviceNamedModule { .. } => {
             LoadError::Refused(detail)
@@ -93,6 +95,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
             TrustSubject::Ffi => LoadError::FfiUntrusted(detail),
             TrustSubject::Manifest => LoadError::ManifestUntrusted(detail),
         },
+        CliError::FfiPrep(refusal) => ffi_prep_load_error(refusal, detail),
         CliError::Usage(_)
         | CliError::UnknownCommand { .. }
         | CliError::Pipeline { .. }
@@ -120,6 +123,9 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::DocExamplesFailed(_)
         | CliError::CommandUsage { .. }
         | CliError::UnknownGroupSub { .. }
+        | CliError::GroupRequired { .. }
+        | CliError::NoRunForm { .. }
+        | CliError::WrapperSourceRefused(_)
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }
@@ -138,6 +144,28 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::WasiRunFeatureDisabled
         | CliError::WasiRunFailed { .. }
         | CliError::WasiRunExited { .. } => LoadError::Pipeline(detail),
+    }
+}
+
+/// Classify an FFI prep refusal by whether an edit to the project can fix it.
+///
+/// A refusal caused by project source (a module path, a `Rust.Ffi.call` site)
+/// degrades the load, since an edit can lift it. A conflict inside the
+/// installed catalog refuses it: no buffer edit fixes it, and degrading would
+/// serve analysis over a program `ipe dev build` rejects. The match names every
+/// variant with no fallback arm, so a new refusal cannot reach the editor
+/// until its disposition is decided.
+const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadError {
+    match refusal {
+        FfiPrepError::ModuleClaimed { .. }
+        | FfiPrepError::ReservedModuleExists
+        | FfiPrepError::AssertedRefused(_)
+        | FfiPrepError::AssertedShimSeal(_) => LoadError::Pipeline(detail),
+        FfiPrepError::DefineOpaqueCollision { .. }
+        | FfiPrepError::DependencyMerge(_)
+        | FfiPrepError::CatalogSeal(_)
+        | FfiPrepError::TransparentWithoutShape { .. }
+        | FfiPrepError::AssertedWithoutCatalog => LoadError::FfiCatalogRefused(detail),
     }
 }
 
@@ -161,7 +189,7 @@ impl ProjectLoader for DriverLoader {
             .map_err(|e| load_error(&e, user_sources_limit(&root)))?;
         let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
         // Load the FFI catalog and inject installed-crate interface modules so
-        // the LSP sees `Rust.<Crate>` bindings exactly as `ipe build` does. A
+        // the LSP sees `Rust.<Crate>` bindings exactly as `ipe dev build` does. A
         // missing/empty catalog is fine (no crates installed); a tampered
         // cache is surfaced as a `LoadError`.
         let ffi_injected = crate::ffi::prepare_ffi(&mut sources, &blame_path)
@@ -295,6 +323,138 @@ mod tests {
                 load_error(&pipeline, filesystem),
                 LoadError::Pipeline(pipeline.to_string()),
                 "{pipeline:?}"
+            );
+        }
+    }
+
+    /// Every FFI prep refusal, one per variant.
+    ///
+    /// The exhaustive match over a witness value makes a new variant a build
+    /// error here until it joins the list.
+    fn every_ffi_prep_error() -> [FfiPrepError; 9] {
+        let witness = FfiPrepError::ReservedModuleExists;
+        match witness {
+            FfiPrepError::ModuleClaimed { .. }
+            | FfiPrepError::ReservedModuleExists
+            | FfiPrepError::AssertedRefused(_)
+            | FfiPrepError::AssertedShimSeal(_)
+            | FfiPrepError::DefineOpaqueCollision { .. }
+            | FfiPrepError::DependencyMerge(_)
+            | FfiPrepError::CatalogSeal(_)
+            | FfiPrepError::TransparentWithoutShape { .. }
+            | FfiPrepError::AssertedWithoutCatalog => {}
+        }
+        let dropped = || crate::ffi::SealRefusal::DroppedTransitive {
+            package: "syn".to_owned(),
+            ident: "syn".to_owned(),
+            site: "src/ffi.rs".to_owned(),
+        };
+        [
+            FfiPrepError::ModuleClaimed {
+                module: "Rust.A".to_owned(),
+                slug: "a".to_owned(),
+            },
+            FfiPrepError::ReservedModuleExists,
+            FfiPrepError::AssertedRefused(Box::new(ipe_ffi::diag::Diagnostic::ArtifactIo {
+                path: "/p/x.consumer.json".to_owned(),
+                detail: "refused".to_owned(),
+            })),
+            FfiPrepError::AssertedShimSeal(dropped()),
+            FfiPrepError::DefineOpaqueCollision {
+                slug: "a".to_owned(),
+                name: "T".to_owned(),
+            },
+            FfiPrepError::DependencyMerge(crate::ffi::MergeRefusal::PinConflict {
+                name: "serde".to_owned(),
+                first: "1.0.1".to_owned(),
+                second: "1.0.2".to_owned(),
+            }),
+            FfiPrepError::CatalogSeal(dropped()),
+            FfiPrepError::TransparentWithoutShape {
+                slug: "a".to_owned(),
+                name: "Shape".to_owned(),
+                binding: "make".to_owned(),
+            },
+            FfiPrepError::AssertedWithoutCatalog,
+        ]
+    }
+
+    /// Whether an FFI prep refusal comes from project source an edit can fix.
+    const fn is_source_side(refusal: &FfiPrepError) -> bool {
+        matches!(
+            refusal,
+            FfiPrepError::ModuleClaimed { .. }
+                | FfiPrepError::ReservedModuleExists
+                | FfiPrepError::AssertedRefused(_)
+                | FfiPrepError::AssertedShimSeal(_)
+        )
+    }
+
+    #[test]
+    fn ffi_prep_each_variant_maps_to_named_load_error() {
+        for refusal in every_ffi_prep_error() {
+            let source_side = is_source_side(&refusal);
+            let err = CliError::FfiPrep(Box::new(refusal));
+            let detail = err.to_string();
+            let expected = if source_side {
+                LoadError::Pipeline(detail)
+            } else {
+                LoadError::FfiCatalogRefused(detail)
+            };
+            assert_eq!(
+                load_error(&err, LimitSource::Filesystem),
+                expected,
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ffi_catalog_conflicts_refuse() {
+        for refusal in every_ffi_prep_error()
+            .into_iter()
+            .filter(|r| !is_source_side(r))
+        {
+            let err = CliError::FfiPrep(Box::new(refusal));
+            assert_eq!(
+                load_error(&err, LimitSource::Buffer).disposition(),
+                ipe_lsp_server::LoadDisposition::Refuse,
+                "{err:?}"
+            );
+        }
+        let opaque_collision = CliError::FfiPrep(Box::new(FfiPrepError::DefineOpaqueCollision {
+            slug: "a".to_owned(),
+            name: "T".to_owned(),
+        }));
+        let pin_conflict = CliError::FfiPrep(Box::new(FfiPrepError::DependencyMerge(
+            crate::ffi::MergeRefusal::PinConflict {
+                name: "serde".to_owned(),
+                first: "1.0.1".to_owned(),
+                second: "1.0.2".to_owned(),
+            },
+        )));
+        for named in [opaque_collision, pin_conflict] {
+            assert_eq!(
+                load_error(&named, LimitSource::Buffer).disposition(),
+                ipe_lsp_server::LoadDisposition::Refuse,
+                "{named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ffi_source_side_refusals_degrade() {
+        let source_side: Vec<FfiPrepError> = every_ffi_prep_error()
+            .into_iter()
+            .filter(is_source_side)
+            .collect();
+        assert_eq!(source_side.len(), 4, "{source_side:?}");
+        for refusal in source_side {
+            let err = CliError::FfiPrep(Box::new(refusal));
+            assert_eq!(
+                load_error(&err, LimitSource::Filesystem).disposition(),
+                ipe_lsp_server::LoadDisposition::Degrade,
+                "{err:?}"
             );
         }
     }

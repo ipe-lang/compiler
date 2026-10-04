@@ -1,6 +1,6 @@
 //! Ipe.Tui — the one typed "is an interactive terminal available" probe.
 //!
-//! Std-only (no crossterm, no feature gate): both the `ipe run`/`ipe watch`
+//! Std-only (no crossterm, no feature gate): both the `ipe dev run`/`ipe dev watch`
 //! pre-build gate (over `Shape::Tui`, before any cargo work starts) and the
 //! `tui`-feature runtime guard (`TuiGuard::enter*`, right before
 //! `crossterm::terminal::enable_raw_mode`) decide from the SAME facts and the
@@ -94,8 +94,10 @@ pub fn decide(facts: &TerminalFacts) -> TerminalAccess {
 pub fn probe() -> TerminalAccess {
     let stdout_tty = std::io::stdout().is_terminal();
     let stdin_tty = std::io::stdin().is_terminal();
-    #[allow(clippy::disallowed_methods)]
-    // crossterm reads the real env directly; this probe must observe the same, overlay or not
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "crossterm reads the real env directly; this probe must observe the same, overlay or not"
+    )]
     let term = std::env::var_os("TERM");
     let dev_tty_opens = stdin_tty || open_dev_tty();
     decide(&TerminalFacts {

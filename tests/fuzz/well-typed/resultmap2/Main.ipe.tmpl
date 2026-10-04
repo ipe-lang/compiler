@@ -1,0 +1,17 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Result as Result
+import Ipe.String as String
+
+
+main =
+    let
+        ra = Ok @n1@
+        rb = Ok @n2@
+        rc = Result.map2 (\a b -> a * b) ra rb
+        result = Result.withDefault 0 rc
+    in
+    Io.println (String.fromInt result)

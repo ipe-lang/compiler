@@ -1,0 +1,20 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+-- fuzz-slot s1 : Lower 1 6
+module Main exposing (main)
+
+import Ipe.Dict as Dict
+import Ipe.Io as Io
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+main =
+    let
+        d0 = Dict.empty
+        d1 = Dict.insert "x" @n1@ d0
+        d2 = Dict.insert "@s1@" @n2@ d1
+        vx = Maybe.withDefault 0 (Dict.get "x" d2)
+        sz = Dict.size d2
+    in
+    Io.println (String.fromInt (vx + sz))

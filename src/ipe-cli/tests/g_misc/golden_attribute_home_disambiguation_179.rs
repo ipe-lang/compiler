@@ -17,7 +17,7 @@
 //!
 //! ## What is tested
 //!
-//! * `ipe build` compiles `tests/golden/attribute_home_disambiguation_179/
+//! * `ipe dev build` compiles `tests/golden/attribute_home_disambiguation_179/
 //!   Main.ipe` (canon → types → lower → Rust backend).
 //! * The emitted Rust project `cargo build`s (the type-identity fix means the
 //!   `html::Attribute`-producing bodies now agree with their return-type
@@ -60,7 +60,7 @@ fn build_run_attribute_home_179() -> crate::support::RunOutcome {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for attribute_home_disambiguation_179: {:?}",
+        "ipe dev build must succeed for attribute_home_disambiguation_179: {:?}",
         built.err()
     );
 

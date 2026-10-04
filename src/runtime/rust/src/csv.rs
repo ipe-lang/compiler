@@ -20,29 +20,10 @@ use super::*;
 // a large/slow file can't stall the tokio worker thread. This module is
 // gated on the raw `csv` Cargo feature (`#[cfg(feature = "csv")]` in
 // `mod.rs`), NOT the composite `csv_kernel = ["csv", "tokio"]` feature, so
-// `tokio` is not guaranteed present — same constraint `file.rs` documents
-// for its own `run_blocking` helper (see
+// `tokio` is not guaranteed present (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
-#[cfg(feature = "tokio")]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err("background csv task panicked".to_string()),
-    }
-}
-
-#[cfg(not(feature = "tokio"))]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    f()
-}
+// The offload is `threads::run_blocking`: a pool that cannot start a thread is
+// an `Unavailable` error, and a build without the pool runs the parse inline.
 
 /// Runtime representation of the Ipê `Ipe.Csv.Csv` record. Field names + types
 /// must match the Ipê alias exactly (List String -> Vec<String>, etc.).
@@ -74,12 +55,16 @@ fn validated_delimiter<E: From<String>>(delim: &str) -> IpeResult<E, u8> {
 /// Row-count ceiling (default 10M). A large/untrusted input would otherwise
 /// accumulate rows unbounded; past the cap the parse `Err`s rather than OOMs.
 /// Overridable via `IPE_CSV_MAX_ROWS`.
-fn csv_max_rows() -> usize {
-    crate::system::read_env_var("IPE_CSV_MAX_ROWS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(10_000_000)
+const CSV_ROWS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_CSV_MAX_ROWS",
+    10_000_000,
+    crate::system::ZeroCeiling::Refused,
+    "decimal row count",
+);
+
+/// Resolves [`CSV_ROWS_CEILING`]; a malformed setting fails the parse closed.
+fn csv_max_rows() -> Result<usize, String> {
+    CSV_ROWS_CEILING.read().map_err(String::from)
 }
 
 /// Total-decoded-bytes ceiling (default 512 MiB, the same default as `File.readFile`'s
@@ -89,12 +74,16 @@ fn csv_max_rows() -> usize {
 /// and §1's exhaustion clause when the CSV arrives over the network): the sum of
 /// decoded field bytes is tracked and the parse `Err`s the moment it exceeds the
 /// ceiling, never OOMs. Overridable via `IPE_CSV_MAX_BYTES`.
-fn csv_max_bytes() -> u64 {
-    crate::system::read_env_var("IPE_CSV_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(512 * 1024 * 1024)
+const CSV_BYTES_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_CSV_MAX_BYTES",
+    512 * 1024 * 1024,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
+
+/// Resolves [`CSV_BYTES_CEILING`]; a malformed setting fails the parse closed.
+fn csv_max_bytes() -> Result<u64, String> {
+    CSV_BYTES_CEILING.read().map_err(String::from)
 }
 
 /// Add this record's decoded field bytes to `seen`, returning `Err` when the
@@ -123,8 +112,10 @@ fn parse_delim<E: From<String>>(text: &str, delim: u8) -> IpeResult<E, CsvDoc> {
     // unbounded into `rows` — either by row COUNT (many small rows) or by decoded
     // BYTES (one huge record / oversized fields that slips under any row count).
     // Bound both → Err rather than OOM. Mirrors csv_parse_stream_from_file's caps.
-    let max_rows = csv_max_rows();
-    let max_bytes = csv_max_bytes();
+    let (max_rows, max_bytes) = match (csv_max_rows(), csv_max_bytes()) {
+        (Ok(rows), Ok(bytes)) => (rows, bytes),
+        (Err(e), _) | (_, Err(e)) => return IpeResult::Err(format!("Csv.parse: {e}").into()),
+    };
     let mut seen_bytes: u64 = 0;
     let header: Vec<String> = match rdr.headers() {
         Ok(h) => {
@@ -256,8 +247,8 @@ fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, Strin
     // by row COUNT or by decoded BYTES (a single monster record / oversized
     // fields slips under any row count). Bound both (IPE_CSV_MAX_ROWS default 10M,
     // IPE_CSV_MAX_BYTES default 512 MiB) → Err rather than OOM.
-    let max_rows = csv_max_rows();
-    let max_bytes = csv_max_bytes();
+    let max_rows = csv_max_rows()?;
+    let max_bytes = csv_max_bytes()?;
     let mut seen_bytes: u64 = 0;
     let mut out = Vec::new();
     for rec in rdr.records() {
@@ -282,16 +273,25 @@ fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, Strin
 /// extracted once before the async move.
 ///
 /// file I/O + incremental CSV parsing (bounded by `IPE_CSV_MAX_ROWS` AND
-/// `IPE_CSV_MAX_BYTES`) is offloaded to tokio's blocking pool via `run_blocking`
-/// — see the module-level doc comment on `run_blocking` above.
-pub fn csv_parse_stream_from_file<E: From<String> + Send + 'static>(
+/// `IPE_CSV_MAX_BYTES`) is offloaded to tokio's blocking pool via
+/// `threads::run_blocking`.
+pub fn csv_parse_stream_from_file<E: From<String> + crate::FromUnavailable + Send + 'static>(
     path: crate::path::Path,
 ) -> IpeTask<E, Vec<Vec<String>>> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || csv_parse_stream_from_file_sync(&path)).await {
+        let parsed = crate::threads::run_blocking(
+            "Csv.parseStreamFromFile",
+            "Csv.parseStreamFromFile: background csv task panicked",
+            move || {
+                csv_parse_stream_from_file_sync(&path)
+                    .map_err(|e| format!("Csv.parseStreamFromFile: {e}"))
+            },
+        )
+        .await;
+        match parsed {
             Ok(v) => ok_res(v),
-            Err(e) => IpeResult::Err(format!("Csv.parseStreamFromFile: {}", e).into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -299,6 +299,12 @@ pub fn csv_parse_stream_from_file<E: From<String> + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(CSV_ROWS_CEILING);
+        crate::system::assert_env_ceiling_contract(CSV_BYTES_CEILING);
+    }
 
     #[test]
     fn formula_guard_is_opt_in() {
@@ -385,8 +391,8 @@ mod tests {
         sealed.expect("test fixture path passes the seal")
     }
 
-    /// Functional correctness (independent of whether `run_blocking` takes
-    /// the real `spawn_blocking` path or the no-tokio-feature fallback —
+    /// Functional correctness (independent of whether the offload takes
+    /// the blocking pool or the no-tokio-feature inline fallback —
     /// both paths must return the same rows).
     #[test]
     fn parse_stream_from_file_reads_all_rows() {
@@ -467,8 +473,7 @@ mod stream_from_file_spawn_blocking_tests {
     /// blocking file read + CSV parse inside `csv_parse_stream_from_file`
     /// would starve every other task on that runtime until it completes
     /// (worse still, pre-fix this work ran EAGERLY before the returned
-    /// future was even polled — see the module-level doc comment on
-    /// `run_blocking` above). This proves the work is offloaded to tokio's
+    /// future was even polled). This proves the work is offloaded to tokio's
     /// blocking-thread pool: a concurrently-spawned cheap ticker task must
     /// make progress (ticks > 0) WHILE the parse is in flight.
     ///

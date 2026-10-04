@@ -1,0 +1,138 @@
+module Main exposing (main)
+
+import Ipe.Dict as Dict exposing (Dict)
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking `Dict`
+-- kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe, as a kernel argument and
+-- as a top-level function's argument.
+
+
+type alias Fns =
+    { keep : String -> Int -> Bool
+    , scale : String -> Int -> Int
+    , sum : String -> Int -> Int -> Int
+    , bump : Maybe Int -> Maybe Int
+    }
+
+
+type Holder
+    = Holder (String -> Int -> Bool)
+
+
+bumped : Maybe Int -> Maybe Int
+bumped m =
+    case m of
+        Just v ->
+            Just (v + 100)
+
+        Nothing ->
+            Just 1
+
+
+fns : Fns
+fns =
+    { keep = \_k v -> v > 1
+    , scale = \_k v -> v * 10
+    , sum = \_k v acc -> v + acc
+    , bump = bumped
+    }
+
+
+table : Dict String Int
+table =
+    Dict.fromList [ ( "a", 1 ), ( "b", 2 ), ( "c", 3 ) ]
+
+
+total : Dict String Int -> String
+total d =
+    String.fromInt (Dict.foldl (\_k v acc -> v + acc) 0 d)
+
+
+direct : Fns -> List String
+direct f =
+    [ total (Dict.filter f.keep table)
+    , total (fst (Dict.partition f.keep table))
+    , total (Dict.update "a" f.bump table)
+    , total (Dict.map f.scale table)
+    , String.fromInt (Dict.foldl f.sum 0 table)
+    , String.fromInt (Dict.foldr f.sum 0 table)
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ total ((Dict.filter f.keep) table)
+    , total (table |> Dict.map f.scale)
+    , total (table |> Dict.update "z" f.bump)
+    , String.fromInt (table |> Dict.foldl f.sum 0)
+    , total ((f.bump |> Dict.update "z") table)
+    , total (bumpAll f.bump |> (\h -> h table))
+    , viaPartial f
+    ]
+
+
+bumpAll : (Maybe Int -> Maybe Int) -> Dict String Int -> Dict String Int
+bumpAll bump d =
+    Dict.update "a" bump d
+
+
+viaPartial : Fns -> String
+viaPartial f =
+    let
+        h =
+            bumpAll f.bump
+    in
+    total (h table)
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            total (Dict.filter p table)
+
+
+fromTuple : ( Maybe Int -> Maybe Int, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            total (Dict.update "b" p table) ++ String.fromInt n
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { scale } =
+    total (Dict.map scale table)
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.sum
+    in
+    String.fromInt (Dict.foldr g 0 table)
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    total (snd (Dict.partition (if flag then f.keep else fns.keep) table))
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\_k v -> v < 3))
+                   , fromTuple ( \_m -> Nothing, 4 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf True fns
+                   ]
+            )
+        )

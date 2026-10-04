@@ -83,8 +83,7 @@ pub fn csrf_enabled() -> bool {
 // `csrf::frame_ancestors` / `csrf::security_headers` call sites keep resolving.
 pub use crate::telemetry::{frame_ancestors, security_headers};
 
-/// Whether to mark cookies `Secure`. Production (or frame-ancestors mode, which
-/// is always HTTPS) → Secure (env `IPE_WEB_SECURE` or `X-Forwarded-Proto: https`).
+/// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.
 ///
 /// Snapshotted once into a `OnceLock` on first call (env is stable at process
 /// start; eliminates per-request `getenv` + the TOCTOU race between
@@ -92,7 +91,21 @@ pub use crate::telemetry::{frame_ancestors, security_headers};
 pub fn cookies_secure() -> bool {
     use std::sync::OnceLock;
     static SECURE: OnceLock<bool> = OnceLock::new();
-    *SECURE.get_or_init(|| telemetry::production_from_env() || frame_ancestors().is_some())
+    *SECURE.get_or_init(|| {
+        cookies_secure_with(
+            telemetry::dev_intent_from_env().as_ref(),
+            frame_ancestors().is_some(),
+        )
+    })
+}
+
+/// Whether cookies are `Secure` under an explicit dev-intent proof.
+///
+/// `Secure` unless `dev` holds; frame-ancestors mode (always HTTPS) is
+/// `Secure` even then. Every release build is therefore `Secure`.
+#[must_use]
+pub const fn cookies_secure_with(dev: Option<&telemetry::DevIntent>, framed: bool) -> bool {
+    dev.is_none() || framed
 }
 
 /// ~244 random bits (two concatenated UUIDv4s) as 64 lowercase-hex chars —
@@ -166,7 +179,7 @@ pub fn csrf_set_cookie(token: &str, base: &str) -> crate::server::SetCookie {
 ///
 /// The `/_ipe/hot-*` family (`hot-appearance`, `hot-transition`, `hot-msg`,
 /// `hot-subs`, `hot-init`, `hot-wiring`) is exempt because these are not
-/// browser-driven POSTs: each is a server-to-server call from the `ipe watch`
+/// browser-driven POSTs: each is a server-to-server call from the `ipe dev watch`
 /// process, authenticated by its own per-process `X-Ipe-Hot-Token` (a stronger
 /// control here than the browser-oriented CSRF cookie, which the watch does not
 /// hold). All these routes are mounted only under the dev overlay gate, so they do
@@ -306,7 +319,7 @@ mod tests {
     }
 
     // The dev-only transition-hot-swap POST is CSRF-exempt for the same reason as
-    // the appearance one: a loopback `ipe watch` call carrying its own
+    // the appearance one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_transition_is_csrf_exempt() {
@@ -315,7 +328,7 @@ mod tests {
     }
 
     // The dev-only additive-`Msg`-set POST is CSRF-exempt for the same reason as
-    // the appearance/transition ones: a loopback `ipe watch` call carrying its own
+    // the appearance/transition ones: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_msg_is_csrf_exempt() {
@@ -324,7 +337,7 @@ mod tests {
     }
 
     // The dev-only subscription-hot-swap POST is CSRF-exempt for the same reason
-    // as the transition one: a loopback `ipe watch` call carrying its own
+    // as the transition one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_subs_is_csrf_exempt() {
@@ -334,7 +347,7 @@ mod tests {
 
     // The dev-only init-datum and Cmd-wiring hot-swap POSTs are CSRF-exempt for
     // the same reason as the appearance and transition siblings: loopback `ipe
-    // watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
+    // dev watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
     // dev overlay gate, never reachable in a production build.
     #[test]
     fn hot_init_and_hot_wiring_are_csrf_exempt() {

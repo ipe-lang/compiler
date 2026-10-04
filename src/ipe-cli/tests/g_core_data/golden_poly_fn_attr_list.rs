@@ -53,7 +53,7 @@ fn poly_fn_attr_list_ipec_and_cargo_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for poly_fn_attr_list: {:?}",
+        "ipe dev build must succeed for poly_fn_attr_list: {:?}",
         built.err()
     );
 

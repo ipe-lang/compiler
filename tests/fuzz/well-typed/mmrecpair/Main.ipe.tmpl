@@ -1,0 +1,12 @@
+-- fuzz-slot lst : IntList 1 5 0 99
+-- fuzz-slot s1 : Lower 1 6
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Lib
+
+
+main =
+    let a = if Lib.evenLen @lst@ then "E" else "O" in
+    let b = if Lib.evenLen [ "@s1@" ] then "E" else "O" in
+    Io.println (a ++ b)

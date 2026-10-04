@@ -124,7 +124,7 @@ pub struct ProjectManifest {
 /// Per-host delivery configuration, parsed from the `delivery = { … }` field.
 ///
 /// All three sections are present and live: every project's manifest carries
-/// defaults for all hosts, and `ipe build` reads only the one matching the
+/// defaults for all hosts, and `ipe dev build` reads only the one matching the
 /// resolved target. There is no `active` selector — that is the CLI.
 #[derive(Clone, Debug, Default)]
 pub struct DeliveryConfig {
@@ -208,16 +208,26 @@ impl ProjectManifest {
     /// program's declared entry-file through to a module path. A multi-program
     /// manifest builds its first program's entry; named selection of the others is
     /// not yet wired, so [`Self::multi_program_notice`] surfaces which one was
-    /// chosen and how many were declared.
+    /// chosen and how many were declared. Every program's entry goes through
+    /// [`parse_entry`], so a malformed entry on any program refuses the manifest,
+    /// not only on the one built.
     ///
     /// # Errors
-    /// [`CliError::Usage`] when a program's entry file does not map to a
-    /// valid module path (a non-module path segment).
+    /// [`CliError::Usage`] when any program's entry file is refused by
+    /// [`parse_entry`].
     pub fn resolved_entry(&self) -> Result<Vec<String>, CliError> {
-        let Some(program) = self.default_program() else {
+        let mut entries = self.programs.iter().map(|program| {
+            parse_entry(&program.entry)
+                .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))
+        });
+        let Some(built) = entries.next() else {
             return Ok(vec!["Main".to_owned()]);
         };
-        entry_file_to_module_path(&program.entry)
+        let built = built?;
+        for other in entries {
+            other?;
+        }
+        Ok(built)
     }
 
     /// The default program: the sole program of a single-program manifest, or the
@@ -306,41 +316,86 @@ impl EntryShape {
     }
 }
 
-/// Map an entry-file string (relative to the source root, e.g. `Main.ipe` or
-/// `Client/App.ipe`) to its module path (`["Main"]`, `["Client", "App"]`).
+/// Why a raw entry-file string is not an entry module path.
 ///
-/// The `.ipe` extension is stripped; each remaining path segment must be a valid
-/// Ipê module segment (`[A-Z][A-Za-z0-9_]*`). A path with a non-module segment or
-/// no segments at all is a manifest error, never a silently-dropped entry.
+/// One variant per refused spelling, so every refusal is a distinct, testable
+/// case and no spelling is silently normalised into a different module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryRefusal {
+    /// The entry string is empty.
+    Empty,
+    /// A leading, trailing, or doubled `/` leaves an empty segment.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A `\` byte: the separator is `/` on every platform.
+    Backslash,
+    /// A drive prefix (`C:`): an entry is relative to the source root.
+    DrivePrefix,
+    /// The final segment does not end in exactly `.ipe`.
+    Extension,
+    /// A segment that is not an Ipê module segment (`[A-Z][A-Za-z0-9_]*`, no
+    /// Windows device name).
+    NotModuleSegment {
+        /// The refused segment, with any `.ipe` suffix already stripped.
+        segment: String,
+    },
+}
+
+/// Parse an entry-file string relative to the source root into its module path.
+///
+/// `Main.ipe` maps to `["Main"]` and `Client/App.ipe` to `["Client", "App"]`.
+/// The raw string is split on `/` bytes and never passed through
+/// [`Path::components`], which would silently drop a `.` segment, a doubled
+/// or trailing `/`, and accept any extension; each of those is refused here, so
+/// the module path is the one reading of the string every consumer shares.
 ///
 /// # Errors
-/// [`CliError::Usage`] naming the offending entry file.
-fn entry_file_to_module_path(entry: &str) -> Result<Vec<String>, CliError> {
-    let rel = Path::new(entry);
-    let without_ext = rel.with_extension("");
-    let mut segments: Vec<String> = Vec::new();
-    for component in without_ext.components() {
-        let seg = match component {
-            std::path::Component::Normal(s) => s.to_str(),
-            _ => None,
-        };
-        let seg = seg.ok_or_else(|| {
-            CliError::Usage(text::msg::manifest_entry_invalid(&format!("{entry:?}")))
-        })?;
-        if !is_module_segment(seg) {
-            return Err(CliError::Usage(text::msg::manifest_entry_segment_invalid(
-                &format!("{entry:?}"),
-                &format!("{seg:?}"),
-            )));
+/// The [`EntryRefusal`] naming the first refused spelling.
+pub fn parse_entry(raw: &str) -> Result<crate::api_surface::ModulePath, EntryRefusal> {
+    if raw.is_empty() {
+        return Err(EntryRefusal::Empty);
+    }
+    if raw.contains('\\') {
+        return Err(EntryRefusal::Backslash);
+    }
+    if has_drive_prefix(raw) {
+        return Err(EntryRefusal::DrivePrefix);
+    }
+    let segments: Vec<&str> = raw.split('/').collect();
+    for segment in &segments {
+        match *segment {
+            "" => return Err(EntryRefusal::EmptySegment),
+            "." | ".." => return Err(EntryRefusal::DotSegment),
+            _ => {}
         }
-        segments.push(seg.to_owned());
     }
-    if segments.is_empty() {
-        return Err(CliError::Usage(text::msg::manifest_entry_no_module(
-            &format!("{entry:?}"),
-        )));
-    }
-    Ok(segments)
+    let Some((last, dirs)) = segments.split_last() else {
+        return Err(EntryRefusal::Empty);
+    };
+    let stem = last.strip_suffix(".ipe").ok_or(EntryRefusal::Extension)?;
+    dirs.iter()
+        .copied()
+        .chain(std::iter::once(stem))
+        .map(|segment| {
+            if is_module_segment(segment) {
+                Ok(segment.to_owned())
+            } else {
+                Err(EntryRefusal::NotModuleSegment {
+                    segment: segment.to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Whether `raw` opens with a drive prefix (an ASCII letter then `:`).
+fn has_drive_prefix(raw: &str) -> bool {
+    let mut bytes = raw.bytes();
+    matches!(
+        (bytes.next(), bytes.next()),
+        (Some(letter), Some(b':')) if letter.is_ascii_alphabetic()
+    )
 }
 
 /// `[wasm]` section of a `package.ipe` manifest (spec: `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q6
@@ -351,7 +406,7 @@ fn entry_file_to_module_path(entry: &str) -> Result<Vec<String>, CliError> {
 /// mode      = "solo"             # solo (MVP) | hydrate (MVP+1) | off (default)
 /// entry     = "src/Client.ipe"   # client entry; its reachability closure is the bundle
 /// mount     = "#app"             # SPA mount node
-/// publicEnv = ["API_BASE_URL"]   # default-deny allowlist; rejects IPE_* / secret patterns
+/// publicEnv = ["API_BASE_URL"]   # default-deny allowlist; see `PublicEnvName`
 /// optLevel  = "z"
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -359,7 +414,7 @@ pub struct WasmConfig {
     /// `"solo"` / `"hydrate"` / `"off"` (default when the key or section is
     /// absent — `--target wasm` still works without a `[wasm]` section; this
     /// field is metadata for the eventual SSR+hydration/SPA-shell split, not
-    /// a gate on `ipe build --target wasm` itself).
+    /// a gate on `ipe dev build --target wasm` itself).
     pub mode: Option<String>,
     /// The client entry module's file, relative to the project root
     /// (defaults to the build's own entry file when absent — see M6).
@@ -367,10 +422,10 @@ pub struct WasmConfig {
     /// The SPA mount selector (e.g. `"#app"`).
     pub mount: Option<String>,
     /// The `Ipe.Env.public` default-deny allowlist: environment variable
-    /// names the wasm bundle may read at build time. Validated against the
-    /// secret-name denylist at PARSE time (below) — listing a denylisted
-    /// name here is a build error, never a runtime refusal.
-    pub public_env: Vec<String>,
+    /// names the wasm bundle may read at build time. Parsed at manifest read
+    /// time into [`PublicEnvName`]s — a refused name is a build error, never
+    /// a runtime refusal.
+    pub public_env: PublicEnvAllowlist,
     /// `wasm-opt` optimisation level (`"z"`/`"s"`/`"0"`..`"3"`).
     pub opt_level: Option<String>,
 }
@@ -432,6 +487,169 @@ pub fn is_denylisted_public_env_name(name: &str) -> bool {
         || upper
             .split('_')
             .any(|component| SECRET_WORDS.contains(&component))
+}
+
+/// Whether `name` is a portable environment variable name.
+///
+/// The portable grammar is ASCII letters, digits and `_`, not starting with a
+/// digit (POSIX `name`): every such name survives the emitted `option_env!`
+/// literal and the native `std::env::var` lookup unchanged.
+fn is_portable_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// One `[wasm] publicEnv` entry, parsed once at the manifest boundary.
+///
+/// A held value is a portable environment variable name that is neither
+/// secret-bearing ([`is_denylisted_public_env_name`]) nor a name the
+/// compiler's audited environment reader refuses ([`ipe_env::is_refused_key`]:
+/// a temp-root or home variable). [`PublicEnvName::parse`] is the only mint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicEnvName(String);
+
+impl PublicEnvName {
+    /// Parse one allowlist entry.
+    ///
+    /// # Errors
+    ///
+    /// A [`PublicEnvRefusal`] naming `raw` and the rule it breaks.
+    pub fn parse(raw: &str) -> Result<Self, PublicEnvRefusal> {
+        let held = || raw.to_owned();
+        if !is_portable_env_name(raw) {
+            return Err(PublicEnvRefusal::IllFormed(held()));
+        }
+        if is_denylisted_public_env_name(raw) {
+            return Err(PublicEnvRefusal::Secret(held()));
+        }
+        let key = std::ffi::OsStr::new(raw);
+        if ipe_env::is_temp_root_key(key) {
+            return Err(PublicEnvRefusal::TempRoot(held()));
+        }
+        if ipe_env::is_refused_key(key) {
+            return Err(PublicEnvRefusal::Home(held()));
+        }
+        Ok(Self(held()))
+    }
+
+    /// The variable name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a `[wasm] publicEnv` entry was refused; each arm carries the entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicEnvRefusal {
+    /// Not a portable environment variable name (empty, a leading digit, or a
+    /// character outside ASCII letters, digits and `_`).
+    IllFormed(String),
+    /// Matches the secret-name denylist ([`is_denylisted_public_env_name`]).
+    Secret(String),
+    /// Names the process temp root ([`ipe_env::TEMP_ROOT_NAMES`]).
+    TempRoot(String),
+    /// Names the user's home directory ([`ipe_env::HOME_NAMES`]).
+    Home(String),
+    /// Repeats an earlier entry, compared ignoring ASCII case.
+    Duplicate {
+        /// The repeated entry.
+        name: String,
+        /// The earlier entry it repeats.
+        first: String,
+    },
+}
+
+impl PublicEnvRefusal {
+    /// The author-facing reason: the offending entry, the rule, and the fix.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::IllFormed(name) => format!(
+                "`publicEnv` lists {name:?}, which is not an environment variable name \
+                 — a name is ASCII letters, digits and `_`, and does not start with a digit"
+            ),
+            Self::Secret(name) => format!(
+                "`publicEnv` lists {name:?}, which matches the secret-name denylist \
+                 (a SECRET / TOKEN / KEY / PASSWORD / PASSWD / CREDENTIAL / AUTH / APIKEY \
+                 word, DATABASE_URL, or the internal IPE_* namespace) — a secret \
+                 environment variable can never be allowlisted into the public wasm bundle"
+            ),
+            Self::TempRoot(name) => format!(
+                "`publicEnv` lists {name:?}, which names the process temp root ({}, any case) \
+                 — it steers where the runtime creates scratch directories, so it can never \
+                 be allowlisted into the public wasm bundle; remove it from `publicEnv`",
+                ipe_env::TEMP_ROOT_NAMES.join(" / ")
+            ),
+            Self::Home(name) => format!(
+                "`publicEnv` lists {name:?}, which names the user's home directory ({}, any \
+                 case) — it steers where caches live and would publish a build-machine path, \
+                 so it can never be allowlisted into the public wasm bundle; remove it from \
+                 `publicEnv`",
+                ipe_env::HOME_NAMES.join(" / ")
+            ),
+            Self::Duplicate { name, first } => format!(
+                "`publicEnv` lists {name:?}, which repeats {first:?} (names are compared \
+                 ignoring ASCII case) — list each variable once"
+            ),
+        }
+    }
+}
+
+/// The `[wasm] publicEnv` allowlist: distinct [`PublicEnvName`]s in manifest
+/// order.
+///
+/// No two entries are equal ignoring ASCII case: [`Self::insert`] refuses the
+/// repeat, so the emitted lookup never carries a second arm for one name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublicEnvAllowlist {
+    names: Vec<PublicEnvName>,
+    folded: BTreeMap<String, usize>,
+}
+
+impl PublicEnvAllowlist {
+    /// Append `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`PublicEnvRefusal::Duplicate`] when an entry equal to `name` ignoring
+    /// ASCII case is already held; the allowlist is then unchanged.
+    pub fn insert(&mut self, name: PublicEnvName) -> Result<(), PublicEnvRefusal> {
+        let folded = name.as_str().to_ascii_uppercase();
+        if let Some(first) = self.folded.get(&folded) {
+            let first = self
+                .names
+                .get(*first)
+                .map_or_else(String::new, |held| held.0.clone());
+            return Err(PublicEnvRefusal::Duplicate {
+                name: name.0,
+                first,
+            });
+        }
+        self.folded.insert(folded, self.names.len());
+        self.names.push(name);
+        Ok(())
+    }
+
+    /// Whether no name is allowlisted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The entries in manifest order.
+    pub fn iter(&self) -> impl Iterator<Item = &PublicEnvName> {
+        self.names.iter()
+    }
+
+    /// The names as plain text, for the compile pipeline outside this crate.
+    #[must_use]
+    pub fn to_names(&self) -> Vec<String> {
+        self.names.iter().map(|n| n.0.clone()).collect()
+    }
 }
 
 /// A discovered Ipê source file with its resolved module path.
@@ -661,7 +879,7 @@ pub const MAX_DISCOVERY_DEPTH: usize = 64;
 
 /// The most `.ipe` modules the module-discovery walk collects.
 ///
-/// The same bound `ipe watch` holds its watched source files to, so the one
+/// The same bound `ipe dev watch` holds its watched source files to, so the one
 /// walk that feeds both a build and a watch session refuses a pathological
 /// tree once, with one limit.
 pub const MAX_DISCOVERED_MODULES: usize = ipe_watch::MAX_WATCHED_FILES;
@@ -1043,6 +1261,132 @@ mod tests {
         assert!(!is_module_segment("123"));
         assert!(!is_module_segment(""));
         assert!(!is_module_segment("_Foo"));
+    }
+
+    fn module(segments: &[&str]) -> Vec<String> {
+        segments.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_entry_accepts_a_root_and_a_nested_module_file() {
+        assert_eq!(parse_entry("Main.ipe"), Ok(module(&["Main"])));
+        assert_eq!(parse_entry("Cli/Main.ipe"), Ok(module(&["Cli", "Main"])));
+    }
+
+    #[test]
+    fn parse_entry_refuses_an_empty_string() {
+        assert_eq!(parse_entry(""), Err(EntryRefusal::Empty));
+    }
+
+    #[test]
+    fn parse_entry_refuses_every_empty_segment() {
+        for raw in [
+            "/Main.ipe",
+            "Cli//Main.ipe",
+            "Cli/Main.ipe/",
+            "//host/Main.ipe",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::EmptySegment), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_dot_segment() {
+        for raw in [
+            "Cli/./Main.ipe",
+            "./Main.ipe",
+            "../Main.ipe",
+            "Cli/../Main.ipe",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::DotSegment), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_backslash() {
+        for raw in ["Cli\\Main.ipe", "\\\\host\\share\\Main.ipe"] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::Backslash), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_drive_prefix() {
+        for raw in ["C:Main.ipe", "c:/Main.ipe"] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::DrivePrefix), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_any_extension_but_ipe() {
+        for raw in [
+            "Main.rs",
+            "Main.txt",
+            "Main",
+            "Main.IPE",
+            "Cli/Main.ipe.bak",
+        ] {
+            assert_eq!(parse_entry(raw), Err(EntryRefusal::Extension), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_entry_refuses_a_non_module_segment() {
+        for (raw, segment) in [
+            ("lower/App.ipe", "lower"),
+            ("Cli/main.ipe", "main"),
+            (".ipe", ""),
+            ("Main.ipe.ipe", "Main.ipe"),
+            ("Con.ipe", "Con"),
+            ("Cli/My Mod.ipe", "My Mod"),
+        ] {
+            assert_eq!(
+                parse_entry(raw),
+                Err(EntryRefusal::NotModuleSegment {
+                    segment: segment.to_owned()
+                }),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_entry_names_the_entry_escaped() {
+        let err = CliError::manifest_entry_refused("Cli/\u{1b}[31m.ipe", &EntryRefusal::Extension);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("\"Cli/\\u{1b}[31m.ipe\"") && !rendered.contains('\u{1b}'),
+            "the entry renders escaped, never raw: {rendered}"
+        );
+    }
+
+    #[test]
+    fn each_entry_refusal_renders_its_own_teaching_message() {
+        let cases = [
+            (EntryRefusal::Empty, "names no module"),
+            (EntryRefusal::EmptySegment, "empty path segment"),
+            (EntryRefusal::DotSegment, "`..` path segment"),
+            (EntryRefusal::Backslash, "contains a backslash"),
+            (EntryRefusal::DrivePrefix, "drive prefix"),
+            (EntryRefusal::Extension, "does not end in `.ipe`"),
+            (
+                EntryRefusal::NotModuleSegment {
+                    segment: "lower".to_owned(),
+                },
+                "segment \"lower\" that is not a valid module name",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (refusal, phrase) in cases {
+            let rendered = CliError::manifest_entry_refused("X", &refusal).to_string();
+            assert!(
+                rendered.contains(phrase),
+                "{refusal:?} must say {phrase:?}: {rendered}"
+            );
+            assert!(
+                seen.insert(rendered),
+                "{refusal:?} shares another refusal's message"
+            );
+        }
     }
 
     #[test]
@@ -1514,6 +1858,65 @@ import String
         }
     }
 
+    #[test]
+    fn public_env_name_parse_classifies_each_refusal() {
+        /// Whether a refusal is the expected arm for its entry.
+        type RefusalCheck = fn(&PublicEnvRefusal) -> bool;
+        let cases: [(&str, RefusalCheck); 6] = [
+            (
+                "TMPDIR",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "TMPDIR"),
+            ),
+            (
+                "tmp",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "tmp"),
+            ),
+            (
+                "TEMP",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "TEMP"),
+            ),
+            (
+                "HOME",
+                |r| matches!(r, PublicEnvRefusal::Home(n) if n == "HOME"),
+            ),
+            (
+                "API_TOKEN",
+                |r| matches!(r, PublicEnvRefusal::Secret(n) if n == "API_TOKEN"),
+            ),
+            (
+                "",
+                |r| matches!(r, PublicEnvRefusal::IllFormed(n) if n.is_empty()),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let refusal = PublicEnvName::parse(raw).err();
+            assert!(
+                refusal.as_ref().is_some_and(expected),
+                "{raw:?} refused as {refusal:?}"
+            );
+        }
+        assert_eq!(
+            PublicEnvName::parse("API_BASE_URL").map(|n| n.as_str().to_owned()),
+            Ok("API_BASE_URL".to_owned())
+        );
+    }
+
+    #[test]
+    fn public_env_allowlist_refuses_a_repeat_and_stays_unchanged() {
+        let mut allowlist = PublicEnvAllowlist::default();
+        let first = PublicEnvName::parse("APP_VERSION").expect("benign name parses");
+        assert_eq!(allowlist.insert(first), Ok(()));
+        let repeat = PublicEnvName::parse("App_Version").expect("benign name parses");
+        assert_eq!(
+            allowlist.insert(repeat),
+            Err(PublicEnvRefusal::Duplicate {
+                name: "App_Version".to_owned(),
+                first: "APP_VERSION".to_owned(),
+            })
+        );
+        assert_eq!(allowlist.to_names(), vec!["APP_VERSION"]);
+    }
+
     // ── WasmConfig::implies_wasm_target ──────────────────────────────────────
 
     #[test]
@@ -1731,6 +2134,40 @@ import String
             "a single-program manifest has nothing to disambiguate"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_malformed_entry_on_a_program_not_built_still_refuses_the_manifest() {
+        let manifest_with_second_entry = |name: &str, second: &str| {
+            let root = discovery_dir(
+                name,
+                Some(&format!(
+                    "module Package exposing (package)\n\n\
+                     package =\n    \
+                     {{ name = \"multi\"\n    \
+                     , programs =\n        \
+                     [ {{ name = \"server\", entry = \"Main.ipe\" }}\n        \
+                     , {{ name = \"cli\", entry = \"{second}\" }}\n        \
+                     ]\n    \
+                     }}\n"
+                )),
+                None,
+            );
+            let manifest = parse_manifest(&root.join("package.ipe")).expect("manifest must parse");
+            let _ = fs::remove_dir_all(&root);
+            manifest
+        };
+        let legal = manifest_with_second_entry("second_entry_legal", "Cli/Main.ipe");
+        assert_eq!(legal.resolved_entry().ok(), Some(module(&["Main"])));
+        let refused = manifest_with_second_entry("second_entry_refused", "Cli/./Main.ipe");
+        let expected =
+            CliError::manifest_entry_refused("Cli/./Main.ipe", &EntryRefusal::DotSegment)
+                .to_string();
+        assert_eq!(
+            refused.resolved_entry().map_err(|err| err.to_string()),
+            Err(expected),
+            "the second program's `./` entry refuses the manifest as a dot segment"
+        );
     }
 
     #[test]

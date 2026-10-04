@@ -38,7 +38,7 @@ fn json_decode_nullable_ipec_accepts_and_emits_shared_builder() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept Json.Decode.nullable: {:?}",
+        "ipe dev build must accept Json.Decode.nullable: {:?}",
         built.err()
     );
 
@@ -73,7 +73,7 @@ fn json_decode_nullable_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for json_decode_nullable: {:?}",
+        "ipe dev build must succeed for json_decode_nullable: {:?}",
         built.err()
     );
 

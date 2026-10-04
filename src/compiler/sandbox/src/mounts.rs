@@ -1,14 +1,16 @@
-//! The mount plan shared by every bwrap jail that binds `/` read-only.
+//! The one mount plan every jail that exposes the host root read-only applies.
 //!
-//! The root bind exposes the whole host filesystem, so the invoker's homes — the
+//! The root view exposes the whole host filesystem, so the invoker's homes — the
 //! user home (`~/.ssh`, shell history) and the cargo home (`credentials.toml`) —
 //! are masked with a tmpfs wherever they live, not only under `/home`. The only
 //! paths visible below a mask are the explicit binds the caller asks for.
 //!
-//! bwrap applies mount ops in argv order: a later `--tmpfs` hides every earlier
-//! mount below it, and a later bind re-exposes what it covers. [`push_mounts`]
-//! orders the ops so that no bind emitted after `--tmpfs M` equals or contains
-//! `M`: a bind that would re-expose a whole home is itself masked afterwards.
+//! Mounts apply in order: a later mask hides every earlier mount below it, and
+//! a later bind re-exposes what it covers. [`mount_plan`] orders the steps so
+//! that no bind after mask `M` equals or contains `M`: a bind that would
+//! re-expose a whole home is itself masked afterwards. bwrap renders the plan
+//! as argv ([`push_mounts`]); the FreeBSD jail renders it as `tmpfs` and
+//! `mount_nullfs` mounts under its chroot.
 //!
 //! Every path a jail binds, and every path it hands the payload (`--chdir`,
 //! `PATH`, `TMPDIR`, `RUSTUP_HOME`, the app), is one [`CanonicalPath`] value:
@@ -18,7 +20,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::home::RelativeToolHome;
+use crate::home::{HomeDir, HomeRefusal, RelativeToolHome, ToolHome};
 
 /// Directories masked in every jail, whoever the invoker is.
 const STATIC_MASKS: [&str; 3] = ["/home", "/root", "/tmp"];
@@ -33,8 +35,9 @@ pub enum JailPathError {
         /// Why resolution failed.
         kind: std::io::ErrorKind,
     },
-    /// The invoker's home is unset or relative, so it cannot be masked.
-    UserHomeUnresolved,
+    /// The invoker's home is not a [`HomeDir`], so which directory to mask is
+    /// unknown; the refusal says why.
+    UserHomeUnresolved(HomeRefusal),
     /// A tool-home variable is set to a relative path.
     ToolHomeRelative(RelativeToolHome),
     /// A path resolved earlier no longer resolves to itself: a component was
@@ -61,9 +64,9 @@ impl fmt::Display for JailPathError {
                 "the jail path {} does not resolve ({kind}); refusing to build the jail",
                 path.display()
             ),
-            Self::UserHomeUnresolved => f.write_str(
-                "the invoker's home is unset or not absolute, so it cannot be masked; \
-                 refusing to build the jail",
+            Self::UserHomeUnresolved(refusal) => write!(
+                f,
+                "the invoker's home cannot be masked: {refusal}; refusing to build the jail"
             ),
             Self::ToolHomeRelative(relative) => {
                 write!(f, "{relative}; refusing to build the jail")
@@ -203,27 +206,21 @@ impl HomeMasks {
     /// A home that resolves to no directory gets no mask: nothing is there to
     /// hide.
     ///
+    /// Both homes arrive proven absolute ([`HomeDir`], [`ToolHome`]), so no
+    /// judgement on their spelling is made here.
+    ///
     /// # Errors
-    /// - [`JailPathError::UserHomeUnresolved`] when `user_home` is absent or
-    ///   relative: which directory to hide is unknown.
-    /// - [`JailPathError::ToolHomeRelative`] when `cargo_home` is relative.
+    /// [`JailPathError::UserHomeUnresolved`] carrying the refusal when
+    /// `user_home` is not a [`HomeDir`]: which directory to hide is unknown.
     pub fn resolve(
-        user_home: Option<&Path>,
-        cargo_home: Option<&Path>,
+        user_home: Result<&HomeDir, HomeRefusal>,
+        cargo_home: Option<&ToolHome>,
     ) -> Result<Self, JailPathError> {
-        let user_home = user_home
-            .filter(|home| home.is_absolute())
-            .ok_or(JailPathError::UserHomeUnresolved)?;
-        let cargo_home = match cargo_home {
-            Some(dir) if !dir.is_absolute() => {
-                return Err(JailPathError::ToolHomeRelative(RelativeToolHome {
-                    var: "CARGO_HOME",
-                }));
-            }
-            Some(dir) => MaskedDir::resolve(dir),
-            None => None,
-        };
-        Ok(Self::new(MaskedDir::resolve(user_home), cargo_home))
+        let user_home = user_home.map_err(JailPathError::UserHomeUnresolved)?;
+        Ok(Self::new(
+            MaskedDir::resolve(user_home.as_path()),
+            cargo_home.and_then(|dir| MaskedDir::resolve(dir.as_path())),
+        ))
     }
 
     /// The homes of the invoking process: `HOME` and the cargo home
@@ -233,9 +230,13 @@ impl HomeMasks {
     /// As [`Self::resolve`]; [`JailPathError::ToolHomeRelative`] also when
     /// `CARGO_HOME` is set to a relative path.
     pub fn of_invoker() -> Result<Self, JailPathError> {
-        let cargo_home = crate::home::tool_home("CARGO_HOME", ".cargo")
+        let home = crate::home::home_dir();
+        let cargo_home = crate::home::tool_home("CARGO_HOME", home.as_ref().ok(), ".cargo")
             .map_err(JailPathError::ToolHomeRelative)?;
-        Self::resolve(crate::home::home_dir().as_deref(), cargo_home.as_deref())
+        Self::resolve(
+            home.as_ref().map_err(|refusal| *refusal),
+            cargo_home.as_ref(),
+        )
     }
 
     /// Test-only: no home masks, for pure argv tests.
@@ -254,7 +255,7 @@ impl HomeMasks {
 }
 
 /// One path a jail re-exposes at the same location inside the jail.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bind<'a> {
     /// `--ro-bind`: visible, never writable.
     ReadOnly(&'a CanonicalPath),
@@ -295,16 +296,29 @@ fn depth(path: &Path) -> usize {
     path.components().count()
 }
 
-/// Push the masks and `binds` onto `argv`.
+/// One mount operation of a jail's mount plan, in the order it is applied.
 ///
-/// Masks are emitted shallowest first. Each bind is emitted right after the
-/// mask that most closely contains it, strictly; a bind no mask strictly
-/// contains is emitted before every mask. A bind that equals or contains a
-/// mask therefore always precedes that mask's `--tmpfs`, which hides what the
-/// bind would have exposed there. Binds keep their relative order within one
-/// mask; a path bound twice is emitted once, at its first position, read-only
-/// when any of its binds is.
-pub fn push_mounts(argv: &mut Vec<OsString>, homes: &HomeMasks, binds: &[Bind<'_>]) {
+/// A later mask hides every earlier mount below it; a later bind re-exposes
+/// the path it names. Each platform renders the same plan: bwrap as
+/// `--tmpfs`/`--ro-bind`/`--bind`, FreeBSD as `tmpfs` and `mount_nullfs` mounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountStep<'a> {
+    /// A fresh empty tmpfs over the directory: nothing below it stays visible.
+    Mask(PathBuf),
+    /// The path re-exposed at the same location.
+    Bind(Bind<'a>),
+}
+
+/// The masks and `binds` of one jail, in the order a jail applies them.
+///
+/// Masks come shallowest first. Each bind comes right after the mask that most
+/// closely contains it, strictly; a bind no mask strictly contains comes before
+/// every mask. A bind that equals or contains a mask therefore always precedes
+/// that mask, which hides what the bind would have exposed there. Binds keep
+/// their relative order within one mask; a path bound twice appears once, at
+/// its first position, read-only when any of its binds is.
+#[must_use]
+pub fn mount_plan<'a>(homes: &HomeMasks, binds: &[Bind<'a>]) -> Vec<MountStep<'a>> {
     let mut masks: Vec<PathBuf> = STATIC_MASKS
         .iter()
         .map(|mask| canonical_or_given(Path::new(mask)))
@@ -312,7 +326,7 @@ pub fn push_mounts(argv: &mut Vec<OsString>, homes: &HomeMasks, binds: &[Bind<'_
         .collect();
     masks.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
     masks.dedup();
-    let mut unique: Vec<Bind<'_>> = Vec::with_capacity(binds.len());
+    let mut unique: Vec<Bind<'a>> = Vec::with_capacity(binds.len());
     let mut first_at: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
     for bind in binds {
         match first_at.entry(bind.path()) {
@@ -327,52 +341,146 @@ pub fn push_mounts(argv: &mut Vec<OsString>, homes: &HomeMasks, binds: &[Bind<'_
             }
         }
     }
-    let placed: Vec<(Option<usize>, &'static str, &Path)> = unique
+    let owners: Vec<Option<usize>> = unique
         .iter()
         .map(|bind| {
             let path = bind.path().as_path();
-            let mask = masks
+            masks
                 .iter()
                 .enumerate()
                 .filter(|(_, mask)| path != mask.as_path() && path.starts_with(mask))
                 .max_by_key(|(_, mask)| depth(mask))
-                .map(|(index, _)| index);
-            (mask, bind.flag(), path)
+                .map(|(index, _)| index)
         })
         .collect();
-    let push_binds_of = |argv: &mut Vec<OsString>, owner: Option<usize>| {
-        for (_, flag, path) in placed.iter().filter(|(mask, _, _)| *mask == owner) {
-            argv.push((*flag).into());
-            argv.push(path.as_os_str().to_owned());
-            argv.push(path.as_os_str().to_owned());
-        }
+    let binds_of = |owner: Option<usize>| {
+        unique
+            .iter()
+            .zip(&owners)
+            .filter(move |(_, at)| **at == owner)
+            .map(|(bind, _)| MountStep::Bind(*bind))
     };
-    push_binds_of(argv, None);
-    for (index, mask) in masks.iter().enumerate() {
-        argv.push("--tmpfs".into());
-        argv.push(mask.clone().into());
-        push_binds_of(argv, Some(index));
+    let mut plan: Vec<MountStep<'a>> = Vec::with_capacity(masks.len() + unique.len());
+    plan.extend(binds_of(None));
+    for (index, mask) in masks.into_iter().enumerate() {
+        plan.push(MountStep::Mask(mask));
+        plan.extend(binds_of(Some(index)));
+    }
+    plan
+}
+
+/// Whether a jail binds its working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingTree {
+    /// Not bound: the jail sees only what the masks leave of it, read-only.
+    Unbound,
+    /// Bound read-write.
+    ReadWrite,
+}
+
+impl WorkingTree {
+    /// The working-tree bind the filesystem axis `scope` grants.
+    #[must_use]
+    pub const fn granted_by(scope: &crate::run_jail::FilesystemScope) -> Self {
+        match scope {
+            crate::run_jail::FilesystemScope::Isolated => Self::Unbound,
+            crate::run_jail::FilesystemScope::WorkingTreeReadWrite => Self::ReadWrite,
+        }
     }
 }
 
-/// Test oracle: the first bind that follows a `--tmpfs` it equals or contains
-/// (which would re-expose the masked tree), as `(mask, bind)`.
+/// The bind set a jail over `mounts` exposes through its masks.
+///
+/// The read-only binds, the scratch read-write, and the working tree
+/// read-write only when `working_tree` is [`WorkingTree::ReadWrite`]. Every
+/// jail built from a [`crate::JailMounts`] binds exactly this set.
+#[must_use]
+pub fn jail_binds(mounts: &crate::JailMounts, working_tree: WorkingTree) -> Vec<Bind<'_>> {
+    let mut binds: Vec<Bind<'_>> = mounts.read_only().iter().map(Bind::ReadOnly).collect();
+    binds.push(Bind::ReadWrite(mounts.scoped_tmp()));
+    if working_tree == WorkingTree::ReadWrite {
+        binds.push(Bind::ReadWrite(mounts.working_tree()));
+    }
+    binds
+}
+
+/// Push the bwrap rendering of the mount plan of `homes` and `binds` onto
+/// `argv`.
+///
+/// Each mask is `--tmpfs <mask>` and each bind `--ro-bind`/`--bind <path>
+/// <path>`, in [`mount_plan`] order.
+pub fn push_mounts(argv: &mut Vec<OsString>, homes: &HomeMasks, binds: &[Bind<'_>]) {
+    for step in mount_plan(homes, binds) {
+        match step {
+            MountStep::Mask(mask) => {
+                argv.push("--tmpfs".into());
+                argv.push(mask.into());
+            }
+            MountStep::Bind(bind) => {
+                let path = bind.path().as_path().as_os_str();
+                argv.push(bind.flag().into());
+                argv.push(path.to_owned());
+                argv.push(path.to_owned());
+            }
+        }
+    }
+}
+
+/// Test oracle: the first bind of `plan` that follows a mask it equals or
+/// contains (which would re-expose the masked tree), as `(mask, bind)`.
+#[cfg(test)]
+pub fn plan_bind_after_covered_mask(plan: &[MountStep<'_>]) -> Option<(PathBuf, PathBuf)> {
+    first_bind_after_covered_mask(plan.iter().map(|step| match step {
+        MountStep::Mask(mask) => OracleStep::Mask(mask.as_path()),
+        MountStep::Bind(bind) => OracleStep::Bind(bind.path().as_path()),
+    }))
+    .map(|(mask, bind)| (mask.to_path_buf(), bind.to_path_buf()))
+}
+
+/// Test oracle: [`plan_bind_after_covered_mask`] over a rendered bwrap argv.
 #[cfg(test)]
 pub fn bind_after_covered_mask(argv: &[String]) -> Option<(String, String)> {
-    let mut masks: Vec<&str> = Vec::new();
+    let mut steps = Vec::new();
     let mut ops = argv.iter().map(String::as_str);
     while let Some(op) = ops.next() {
         match op {
-            "--tmpfs" => masks.extend(ops.next()),
+            "--tmpfs" => steps.extend(ops.next().map(|mask| OracleStep::Mask(Path::new(mask)))),
             "--bind" | "--ro-bind" => {
-                let Some(dest) = ops.nth(1) else {
-                    continue;
-                };
-                if let Some(mask) = masks.iter().find(|mask| Path::new(mask).starts_with(dest)) {
-                    return Some(((*mask).to_owned(), dest.to_owned()));
-                }
+                steps.extend(ops.nth(1).map(|dest| OracleStep::Bind(Path::new(dest))));
             }
             _ => {}
+        }
+    }
+    first_bind_after_covered_mask(steps).map(|(mask, bind)| {
+        (
+            mask.to_string_lossy().into_owned(),
+            bind.to_string_lossy().into_owned(),
+        )
+    })
+}
+
+/// One applied mount, as the test oracles read it.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum OracleStep<'p> {
+    Mask(&'p Path),
+    Bind(&'p Path),
+}
+
+/// The first bind that equals or contains a mask applied before it.
+#[cfg(test)]
+fn first_bind_after_covered_mask<'p>(
+    steps: impl IntoIterator<Item = OracleStep<'p>>,
+) -> Option<(&'p Path, &'p Path)> {
+    let mut masks: Vec<&Path> = Vec::new();
+    for step in steps {
+        match step {
+            OracleStep::Mask(mask) => masks.push(mask),
+            OracleStep::Bind(bind) => {
+                if let Some(mask) = masks.iter().find(|mask| mask.starts_with(bind)) {
+                    return Some((mask, bind));
+                }
+            }
         }
     }
     None
@@ -480,32 +588,50 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_or_relative_user_home_refuses_the_jail() {
-        for home in [None, Some(Path::new("home/u")), Some(Path::new(""))] {
+    fn an_unset_user_home_refuses_the_jail() {
+        for refusal in [
+            HomeRefusal::Unset,
+            HomeRefusal::NotUtf8,
+            HomeRefusal::ContainsNul,
+            HomeRefusal::NotAbsolute,
+            HomeRefusal::ParentComponent,
+            HomeRefusal::WindowsDeviceOrVerbatim,
+            HomeRefusal::WindowsUnc,
+        ] {
+            let refused = HomeMasks::resolve(Err(refusal), None);
             assert_eq!(
-                HomeMasks::resolve(home, None),
-                Err(JailPathError::UserHomeUnresolved),
-                "{home:?}"
+                refused,
+                Err(JailPathError::UserHomeUnresolved(refusal)),
+                "{refusal:?}"
             );
+            let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(message.contains(&refusal.to_string()), "{message:?}");
         }
     }
 
     #[test]
-    fn a_relative_cargo_home_refuses_the_jail() {
-        let user_home_dir = temp_dir("relative-cargo");
-        let user_home = user_home_dir.path();
+    fn a_parsed_cargo_home_is_masked() {
+        let user_home_dir = temp_dir("parsed-user");
+        let cargo_home_dir = temp_dir("parsed-cargo");
+        let user = crate::home::test_home(user_home_dir.path());
+        let cargo = crate::home::test_tool_home(cargo_home_dir.path());
+        let homes = HomeMasks::resolve(Ok(&user), Some(&cargo)).expect("parsed homes");
         assert_eq!(
-            HomeMasks::resolve(Some(user_home), Some(Path::new("cargo"))),
-            Err(JailPathError::ToolHomeRelative(RelativeToolHome {
-                var: "CARGO_HOME"
-            }))
+            homes,
+            HomeMasks::new(
+                MaskedDir::resolve(user_home_dir.path()),
+                MaskedDir::resolve(cargo_home_dir.path()),
+            )
         );
+        assert_eq!(homes.dirs().count(), 2);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn an_absolute_user_home_that_does_not_exist_gets_no_mask() {
+        let missing = crate::home::test_home(Path::new("/nonexistent/ipe-sandbox-home"));
         assert_eq!(
-            HomeMasks::resolve(Some(Path::new("/nonexistent/ipe-sandbox-home")), None),
+            HomeMasks::resolve(Ok(&missing), None),
             Ok(HomeMasks::unmasked())
         );
     }
@@ -632,5 +758,129 @@ mod tests {
             bind_after_covered_mask(&argv),
             Some(("/srv/home".to_owned(), "/srv".to_owned()))
         );
+    }
+
+    fn assumed_homes(user_home: &str, cargo_home: &str) -> HomeMasks {
+        HomeMasks::new(
+            Some(MaskedDir(PathBuf::from(user_home))),
+            Some(MaskedDir(PathBuf::from(cargo_home))),
+        )
+    }
+
+    #[test]
+    fn the_plan_oracle_flags_a_bind_that_re_exposes_a_mask() {
+        let srv = CanonicalPath::assumed("/srv");
+        let plan = [
+            MountStep::Mask(PathBuf::from("/srv/home")),
+            MountStep::Bind(Bind::ReadOnly(&srv)),
+        ];
+        assert_eq!(
+            plan_bind_after_covered_mask(&plan),
+            Some((PathBuf::from("/srv/home"), PathBuf::from("/srv")))
+        );
+    }
+
+    #[test]
+    fn mount_plan_masks_every_home_before_any_bind_it_contains() {
+        let user = "/srv/a/b/u";
+        let cargo = "/srv/a/b/u/.cargo";
+        let homes = assumed_homes(user, cargo);
+        let whole_user = CanonicalPath::assumed(user);
+        let whole_cargo = CanonicalPath::assumed(cargo);
+        let above = CanonicalPath::assumed("/srv/a/b");
+        let bin = CanonicalPath::assumed("/srv/a/b/u/.cargo/bin");
+        let tree = CanonicalPath::assumed("/srv/a/b/u/tree");
+        let plan = mount_plan(
+            &homes,
+            &[
+                Bind::ReadOnly(&whole_user),
+                Bind::ReadOnly(&bin),
+                Bind::ReadWrite(&whole_cargo),
+                Bind::ReadWrite(&above),
+                Bind::ReadWrite(&tree),
+            ],
+        );
+        assert_eq!(plan_bind_after_covered_mask(&plan), None, "{plan:?}");
+        let mask_at = |mask: &str| {
+            plan.iter()
+                .position(|step| *step == MountStep::Mask(PathBuf::from(mask)))
+        };
+        let masks = (mask_at(user), mask_at(cargo));
+        assert!(
+            masks.0.is_some() && masks.1.is_some(),
+            "both homes are masked: {plan:?}"
+        );
+        let (Some(user_mask), Some(cargo_mask)) = masks else {
+            return;
+        };
+        assert!(user_mask < cargo_mask, "shallowest mask first: {plan:?}");
+        for (at, step) in plan.iter().enumerate() {
+            let MountStep::Bind(bind) = step else {
+                continue;
+            };
+            let path = bind.path().as_path();
+            for (mask, mask_index) in [(user, user_mask), (cargo, cargo_mask)] {
+                if path != Path::new(mask) && path.starts_with(mask) {
+                    assert!(
+                        mask_index < at,
+                        "{} must follow the mask {mask}: {plan:?}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bwrap_argv_is_the_rendered_plan() {
+        let user = "/srv/a/b/u";
+        let cargo = "/srv/a/b/u/.cargo";
+        let homes = assumed_homes(user, cargo);
+        let bin = CanonicalPath::assumed("/srv/a/b/u/.cargo/bin");
+        let scratch = CanonicalPath::assumed("/var/lib/ipe/scratch");
+        let tree = CanonicalPath::assumed("/srv/a/b/u/tree");
+        let argv = rendered(
+            &homes,
+            &[
+                Bind::ReadOnly(&bin),
+                Bind::ReadWrite(&scratch),
+                Bind::ReadWrite(&tree),
+            ],
+        );
+        let mut statics: Vec<PathBuf> = STATIC_MASKS
+            .iter()
+            .map(|mask| canonical_or_given(Path::new(mask)))
+            .collect();
+        statics.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
+        statics.dedup();
+        assert!(
+            statics
+                .iter()
+                .all(|mask| depth(mask) < depth(Path::new(user))),
+            "the fixture homes sit below every static mask: {statics:?}"
+        );
+        let mut expected: Vec<String> = ["--bind", "/var/lib/ipe/scratch", "/var/lib/ipe/scratch"]
+            .map(str::to_owned)
+            .to_vec();
+        for mask in &statics {
+            expected.push("--tmpfs".to_owned());
+            expected.push(mask.to_string_lossy().into_owned());
+        }
+        expected.extend(
+            [
+                "--tmpfs",
+                user,
+                "--bind",
+                "/srv/a/b/u/tree",
+                "/srv/a/b/u/tree",
+                "--tmpfs",
+                cargo,
+                "--ro-bind",
+                "/srv/a/b/u/.cargo/bin",
+                "/srv/a/b/u/.cargo/bin",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(argv, expected);
     }
 }

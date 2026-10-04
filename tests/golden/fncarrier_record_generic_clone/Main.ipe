@@ -10,7 +10,7 @@ import Ipe.Result exposing (Result(..))
 -- concrete type and reused across more than one closure, which forces a
 -- `.clone()` of the whole value.
 --
--- Pre-fix: `ipe build` accepts, but the emitted crate fails `cargo build` with
+-- Pre-fix: `ipe dev build` accepts, but the emitted crate fails `cargo build` with
 -- E0599 (`no method named clone`) on the synthesized `Rec…<T1>` struct. The
 -- record `is_clone` fixpoint consulted the bare `carrier_is_clone` leaf test,
 -- which returns false for a bare generic field (`seed : a`) even though the

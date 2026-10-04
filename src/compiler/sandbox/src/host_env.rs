@@ -1,7 +1,7 @@
 //! The host environment re-exported, uninterpreted, into a jail's scrubbed env.
 //!
-//! A jail starts from an empty environment and receives only a fixed minimal
-//! set (`LANG`, and on Windows `PATH` / `SystemRoot`) plus the names the
+//! A jail starts from an empty environment and receives only its arm's fixed
+//! base set (on Windows, [`crate::run_jail::WindowsBaseEnv`]) plus the names the
 //! profile's `env` capability granted. [`granted`] is the one raw read behind
 //! every such re-export and is crate-private: only this crate's jail builders
 //! call it, with a fixed base name or a name drawn from `profile.env_allowlist`.

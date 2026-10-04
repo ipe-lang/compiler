@@ -1167,34 +1167,49 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
     let cancel = Arc::new(AtomicBool::new(false));
     state.worker_cancel = Some(cancel.clone());
     let tx = diag_tx.clone();
-    state.worker = Some(thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                compute_batch(
-                    &db,
-                    root,
-                    entry_file,
-                    &uri_of,
-                    &entry_module,
-                    encoding,
-                    &cancel,
-                    &lint,
-                )
-            }))
-        }));
-        match outcome {
-            Ok(Ok(per_uri)) => {
-                let _ = tx.send(DiagnosticsBatch {
-                    generation,
-                    per_uri,
-                });
+    let spawned = thread::Builder::new()
+        .name("ipe-lsp-diagnostics".to_owned())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                    compute_batch(
+                        &db,
+                        root,
+                        entry_file,
+                        &uri_of,
+                        &entry_module,
+                        encoding,
+                        &cancel,
+                        &lint,
+                    )
+                }))
+            }));
+            match outcome {
+                Ok(Ok(per_uri)) => {
+                    let _ = tx.send(DiagnosticsBatch {
+                        generation,
+                        per_uri,
+                    });
+                }
+                Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
+                Err(_panic) => {
+                    eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
+                }
             }
-            Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
-            Err(_panic) => {
-                eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
-            }
+        });
+    match spawned {
+        Ok(handle) => state.worker = Some(handle),
+        Err(e) => {
+            // No worker is running for this generation; the next edit's
+            // recompute spawns a fresh one, so this is a skipped cycle, not a
+            // stuck one.
+            state.worker = None;
+            eprintln!(
+                "[ipe lsp] internal error: diagnostics worker thread refused: {:?}",
+                e.kind()
+            );
         }
-    }));
+    }
 }
 
 /// The diagnostic a refused project load publishes on the refused path.
@@ -1796,9 +1811,11 @@ mod tests {
             .status();
         assert!(matches!(made, Ok(s) if s.success()), "mkfifo: {made:?}");
         let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send(load_lint_config(&dir));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(load_lint_config(&dir));
+            })
+            .expect("spawn test thread");
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(10)),
             Ok(Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile)))
@@ -2136,6 +2153,7 @@ mod tests {
                 detail: detail(),
             },
             LoadError::FfiUntrusted(detail()),
+            LoadError::FfiCatalogRefused(detail()),
             LoadError::ManifestUntrusted(detail()),
         ] {
             assert_eq!(
@@ -2162,13 +2180,14 @@ mod tests {
     }
 
     /// Every refusal a load can end in, one per refusing variant.
-    fn every_refusal() -> [LoadError; 3] {
+    fn every_refusal() -> [LoadError; 4] {
         [
             LoadError::Limit {
                 lifted_by: LimitSource::Filesystem,
                 detail: "ceiling".to_owned(),
             },
             LoadError::FfiUntrusted("untrusted".to_owned()),
+            LoadError::FfiCatalogRefused("inconsistent".to_owned()),
             LoadError::ManifestUntrusted("untrusted".to_owned()),
         ]
     }

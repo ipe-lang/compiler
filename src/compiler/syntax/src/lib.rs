@@ -4,6 +4,7 @@
 //! supported subset of the surface language.
 
 mod ast;
+pub mod fixity;
 mod literal;
 
 pub use ast::{

@@ -1,0 +1,106 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Set as Set
+import Ipe.String as String
+
+
+-- Function values read out of storage, passed to every function-taking `Set`
+-- kernel: a record field, a constructor payload, a tuple component, a
+-- destructured record field, a single-use `let` alias, and an `if` over fields,
+-- applied directly, partially, and through a pipe.
+
+
+type alias Fns =
+    { keep : Int -> Bool
+    , step : Int -> Int
+    , add : Int -> Int -> Int
+    }
+
+
+type Holder
+    = Holder (Int -> Bool)
+
+
+fns : Fns
+fns =
+    { keep = \n -> n > 1
+    , step = \n -> n * 10
+    , add = \a b -> a + b
+    }
+
+
+nums : Set Int
+nums =
+    Set.fromList [ 1, 2, 3 ]
+
+
+total : Set Int -> String
+total s =
+    String.fromInt (Set.foldl (\v acc -> v + acc) 0 s)
+
+
+direct : Fns -> List String
+direct f =
+    [ total (Set.filter f.keep nums)
+    , total (fst (Set.partition f.keep nums))
+    , total (Set.map f.step nums)
+    , String.fromInt (Set.foldl f.add 0 nums)
+    , String.fromInt (Set.foldr f.add 0 nums)
+    ]
+
+
+applied : Fns -> List String
+applied f =
+    [ total ((Set.filter f.keep) nums)
+    , total (nums |> Set.map f.step)
+    , String.fromInt (nums |> Set.foldr f.add 0)
+    ]
+
+
+fromPayload : Holder -> String
+fromPayload holder =
+    case holder of
+        Holder p ->
+            total (Set.filter p nums)
+
+
+fromTuple : ( Int -> Int, Int ) -> String
+fromTuple pair =
+    case pair of
+        ( p, n ) ->
+            total (Set.map p nums) ++ String.fromInt n
+
+
+fromRecordPattern : Fns -> String
+fromRecordPattern { add } =
+    String.fromInt (Set.foldl add 0 nums)
+
+
+fromLet : Fns -> String
+fromLet f =
+    let
+        g =
+            f.keep
+    in
+    total (snd (Set.partition g nums))
+
+
+fromIf : Bool -> Fns -> String
+fromIf flag f =
+    total (Set.map (if flag then f.step else fns.step) nums)
+
+
+main =
+    Io.println
+        (String.join " "
+            (direct fns
+                ++ applied fns
+                ++ [ fromPayload (Holder (\n -> n < 3))
+                   , fromTuple ( \n -> n + 1, 8 )
+                   , fromRecordPattern fns
+                   , fromLet fns
+                   , fromIf True fns
+                   ]
+            )
+        )

@@ -1,0 +1,20 @@
+-- fuzz-hole field
+--   base: value
+--   mutant: value@sfx@
+-- fuzz-slot sfx : Hex4
+-- fuzz-expect IPE-T0012
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+type alias Point =
+    { x : Int, y : Int, value : Int }
+
+
+main =
+    let
+        pt = { x = 10, y = 20, value = 42 }
+    in
+    Io.println (String.fromInt pt.@field@)

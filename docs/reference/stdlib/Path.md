@@ -89,8 +89,8 @@ under : Path -> Path -> Result Error Path
 `fromString` never holds a `..` that escapes, so `a/../b` joins as `b`.
 On Windows, a `child` element containing `:` (a drive or an alternate data
 stream), made only of dots and spaces (which Windows strips to `.` or
-`..`), or naming a reserved device (`CON`, `NUL`, `COM1`, `nul.txt`, ...)
-is refused too.
+`..`), naming a reserved device (`CON`, `NUL`, `COM1`, `nul.txt`, ...), or
+ending in a dot or space (Windows strips it to another name) is refused too.
 
 ## `absolute`
 

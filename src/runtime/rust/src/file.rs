@@ -18,49 +18,31 @@ use super::{IpeError, IpeResult, IpeTask, from_u8_slice, ok_res, str_err};
 // a blocking syscall stalls that worker for its full duration — reactor
 // starvation under concurrent load, or a real multi-second stall on a
 // slow/network filesystem. `run_blocking` offloads the closure to tokio's
-// blocking-thread pool via `spawn_blocking`, mirroring the pattern already
-// used by `auth.rs` for bcrypt (`auth_register`/`auth_login`/`auth_set_role`).
-//
-// Feature-gating note: `pub mod file;` (`mod.rs`) is UNCONDITIONAL — unlike
-// `compression.rs`, which is gated on a `compression` feature that always
-// pulls in `tokio` — while `tokio` itself is an `optional = true` dependency.
-// The main CI clippy job (`cargo clippy --all-targets --workspace`) builds
-// with the crate's `default = []` features, i.e. `tokio` NOT enabled, so an
-// unconditional `tokio::task::spawn_blocking` reference here would break that
-// job. Every REAL generated Ipê project always has `tokio` (`Task.run`/
-// `block_on` need it regardless of which kernels are used — see
-// `tests/golden/basics/Cargo.toml`), so the `#[cfg(not(feature = "tokio"))]`
-// fallback below only matters for the standalone `ipe-runtime-rust` crate's
-// own narrow-feature builds, never for a real Ipê program. See
-// `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2.
-// tokio is native-only (declared under the `cfg(not(target_arch = "wasm32"))`
-// dependency table), so the `spawn_blocking` offload compiles only there. On
-// wasm32 the synchronous fallback runs even when `feature = "tokio"` is set —
-// the browser has no blocking-thread pool to offload to.
-#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-async fn run_blocking<T, Er, F>(f: F) -> Result<T, Er>
-where
-    F: FnOnce() -> Result<T, Er> + Send + 'static,
-    T: Send + 'static,
-    Er: From<String> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err(Er::from("background file task panicked".to_string())),
-    }
-}
+// blocking-thread pool through `threads::join_blocking`; a build without the
+// pool (no `tokio`, or wasm32) runs it inline.
 
-#[cfg(any(not(feature = "tokio"), target_arch = "wasm32"))]
-// `async` is required here to match the tokio variant's signature; callers
-// always use `.await` to work with both feature configurations uniformly.
-#[allow(clippy::unused_async)]
-async fn run_blocking<T, Er, F>(f: F) -> Result<T, Er>
+/// Runs the blocking file operation `f` off the async worker.
+///
+/// A pool that cannot start a thread is an `Unavailable` error; a panic in `f`
+/// is the "background file task panicked" error.
+///
+/// # Errors
+///
+/// `f` failed, no thread could be started for it, or it panicked.
+async fn run_blocking<T, Ce, E, F>(f: F) -> Result<T, E>
 where
-    F: FnOnce() -> Result<T, Er> + Send + 'static,
+    F: FnOnce() -> Result<T, Ce> + Send + 'static,
     T: Send + 'static,
-    Er: From<String> + Send + 'static,
+    Ce: From<String> + Send + 'static,
+    E: From<Ce> + crate::FromUnavailable,
 {
-    f()
+    match crate::threads::join_blocking("File", f).await {
+        Ok(done) => done.map_err(E::from),
+        Err(crate::threads::BlockingFailure::Refused(refused)) => Err(refused.into_error()),
+        Err(crate::threads::BlockingFailure::Panicked) => Err(E::from(Ce::from(
+            "background file task panicked".to_owned(),
+        ))),
+    }
 }
 
 /// Default `File.readFile` ceiling in bytes, applied only when `IPE_FILE_READ_MAX` is unset.
@@ -72,79 +54,13 @@ pub const READ_FILE_DEFAULT_CEILING: u64 = 512 * 1024 * 1024;
 /// eight-byte `i64`.
 const READ_FILE_BYTES_CEILING: u64 = 10 * 1024 * 1024;
 
-/// Longest prefix of a malformed `IPE_FILE_READ_MAX` value echoed in its refusal.
-const READ_CEILING_SHOWN_CHARS: usize = 32;
-
-/// The operator's `IPE_FILE_READ_MAX` setting, parsed once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadCeiling {
-    /// The variable is absent; `READ_FILE_DEFAULT_CEILING` applies.
-    Unset,
-    /// An explicit byte ceiling; `0` refuses every non-empty file.
-    Bytes(u64),
-}
-
-impl ReadCeiling {
-    const fn bytes(self) -> u64 {
-        match self {
-            Self::Unset => READ_FILE_DEFAULT_CEILING,
-            Self::Bytes(n) => n,
-        }
-    }
-}
-
-/// Parses the raw `IPE_FILE_READ_MAX` lookup into a ceiling.
-///
-/// Only an absent variable yields the default. A present value must be a plain
-/// decimal byte count (`0` included); anything else — empty, signed, padded,
-/// suffixed, overflowing, non-Unicode — is a refusal, so a typo never widens
-/// the ceiling.
-fn parse_read_ceiling(raw: Result<String, std::env::VarError>) -> Result<ReadCeiling, String> {
-    let shown = match raw {
-        Err(std::env::VarError::NotPresent) => return Ok(ReadCeiling::Unset),
-        Err(std::env::VarError::NotUnicode(os)) => shown_env_value(os.as_encoded_bytes()),
-        Ok(v) => {
-            if !v.is_empty()
-                && v.bytes().all(|b| b.is_ascii_digit())
-                && let Ok(n) = v.parse::<u64>()
-            {
-                return Ok(ReadCeiling::Bytes(n));
-            }
-            shown_env_value(v.as_bytes())
-        }
-    };
-    Err(format!(
-        "IPE_FILE_READ_MAX must be a decimal byte count (got \"{shown}\")"
-    ))
-}
-
-/// Renders a refused environment value for its error text without losing or
-/// smuggling a byte: valid UTF-8 keeps its printable characters and escapes
-/// every other one (`char::escape_debug` — controls, ESC, CR/LF, bidi
-/// overrides, `"` and `\`), and each byte that is not UTF-8 shows as `\xNN`.
-/// At most `READ_CEILING_SHOWN_CHARS` source characters or bytes are shown.
-fn shown_env_value(raw: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let mut budget = READ_CEILING_SHOWN_CHARS;
-    for chunk in raw.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            let Some(left) = budget.checked_sub(1) else {
-                return out;
-            };
-            budget = left;
-            out.extend(c.escape_debug());
-        }
-        for b in chunk.invalid() {
-            let Some(left) = budget.checked_sub(1) else {
-                return out;
-            };
-            budget = left;
-            let _ = write!(out, "\\x{b:02X}");
-        }
-    }
-    out
-}
+/// The operator's `IPE_FILE_READ_MAX` setting; `0` refuses every non-empty file.
+const FILE_READ_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_FILE_READ_MAX",
+    READ_FILE_DEFAULT_CEILING,
+    crate::system::ZeroCeiling::Accepted,
+    "decimal byte count",
+);
 
 /// Resolves the `File.readFile` ceiling from `IPE_FILE_READ_MAX`.
 ///
@@ -152,7 +68,7 @@ fn shown_env_value(raw: &[u8]) -> String {
 /// source (`/dev/zero`, a named pipe, a multi-GiB file) so it cannot exhaust
 /// memory. A malformed setting fails the read closed rather than falling back.
 fn file_read_ceiling() -> Result<u64, String> {
-    parse_read_ceiling(crate::system::read_env_var("IPE_FILE_READ_MAX")).map(ReadCeiling::bytes)
+    FILE_READ_CEILING.read().map_err(String::from)
 }
 
 fn file_read_file_sync(path: &str, cap: u64) -> Result<String, String> {
@@ -174,7 +90,9 @@ fn file_read_file_sync(path: &str, cap: u64) -> Result<String, String> {
 }
 
 #[must_use]
-pub fn file_read_file<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E, String> {
+pub fn file_read_file<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, String> {
     let path = path.into_string();
     Box::pin(async move {
         let cap = match file_read_ceiling() {
@@ -183,7 +101,7 @@ pub fn file_read_file<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E
         };
         match run_blocking(move || file_read_file_sync(&path, cap)).await {
             Ok(s) => ok_res(s),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -193,7 +111,7 @@ fn file_write_file_sync(path: &str, content: &str) -> Result<(), String> {
 }
 
 #[must_use]
-pub fn file_write_file<E: Send + From<String> + 'static>(
+pub fn file_write_file<E: Send + From<String> + crate::FromUnavailable + 'static>(
     path: Path,
     content: String,
 ) -> IpeTask<E, ()> {
@@ -201,31 +119,32 @@ pub fn file_write_file<E: Send + From<String> + 'static>(
     Box::pin(async move {
         match run_blocking(move || file_write_file_sync(&path, &content)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
 
 #[must_use]
-pub fn file_exists<E: Send + 'static>(path: Path) -> IpeTask<E, bool> {
+pub fn file_exists<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, bool> {
     let path = path.into_string();
     Box::pin(async move {
-        // Infallible closure — `run_blocking`'s `Err` arm is unreachable here
-        // (kept `Result`-shaped only to satisfy the shared helper's bound), so
-        // a hypothetical `JoinError` (task panicked) falls back to `false`
-        // rather than propagating — there is no `Err` channel on this
-        // kernel's existing `IpeTask<E, bool>` signature to propagate into.
-        let exists = run_blocking(move || Ok::<_, String>(std::path::Path::new(&path).exists()))
-            .await
-            .unwrap_or(false);
-        ok_res(exists)
+        // The probe itself cannot fail; an `Err` here is a refused or panicked
+        // offload, which is no answer about the path, so it is never `false`.
+        match run_blocking(move || Ok::<_, String>(std::path::Path::new(&path).exists())).await {
+            Ok(exists) => ok_res(exists),
+            Err(e) => IpeResult::Err(e),
+        }
     })
 }
 
 /// Alias of `file_remove` (the `remove` contract). Kept as a public name for
 /// ABI stability; delegates so the two never drift.
 #[must_use]
-pub fn file_delete<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E, ()> {
+pub fn file_delete<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, ()> {
     file_remove(path)
 }
 
@@ -237,12 +156,14 @@ fn file_mkdir_all_sync(path: &str) -> Result<(), String> {
 /// and every missing parent (mkdir -p). Already-exists is `Ok` (matching
 /// `std::fs::create_dir_all`); a real I/O failure is `Err`.
 #[must_use]
-pub fn file_mkdir_all<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E, ()> {
+pub fn file_mkdir_all<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
         match run_blocking(move || file_mkdir_all_sync(&path)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -290,7 +211,7 @@ fn read_limit(limit: i64) -> Result<u64, String> {
 /// `file_read_file`, and `compression.rs`'s decompression-bomb check) leaves
 /// nothing to race against.
 #[must_use]
-pub fn file_read_file_limit<E: Send + From<String> + 'static>(
+pub fn file_read_file_limit<E: Send + From<String> + crate::FromUnavailable + 'static>(
     path: Path,
     limit: i64,
 ) -> IpeTask<E, String> {
@@ -303,7 +224,7 @@ pub fn file_read_file_limit<E: Send + From<String> + 'static>(
         };
         match run_blocking(move || file_read_file_limit_sync(&path, cap)).await {
             Ok(s) => ok_res(s),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -333,12 +254,14 @@ fn file_read_file_bytes_sync(path: &str) -> Result<Vec<i64>, String> {
 /// over the cap is an `Err`, never a silent truncation. For text content with
 /// guaranteed UTF-8, prefer `readFile` / `readFileLimit`.
 #[must_use]
-pub fn file_read_file_bytes<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E, Vec<i64>> {
+pub fn file_read_file_bytes<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, Vec<i64>> {
     let path = path.into_string();
     Box::pin(async move {
         match run_blocking(move || file_read_file_bytes_sync(&path)).await {
             Ok(v) => ok_res(v),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -359,7 +282,7 @@ fn file_append_sync(path: &str, content: &str) -> Result<(), String> {
 /// Append `content` to the end of the file at `path`, creating it if absent.
 /// Implements `os.OpenFile(…, O_APPEND|O_CREATE|O_WRONLY, 0644)`.
 #[must_use]
-pub fn file_append<E: Send + From<String> + 'static>(
+pub fn file_append<E: Send + From<String> + crate::FromUnavailable + 'static>(
     path: Path,
     content: String,
 ) -> IpeTask<E, ()> {
@@ -367,7 +290,7 @@ pub fn file_append<E: Send + From<String> + 'static>(
     Box::pin(async move {
         match run_blocking(move || file_append_sync(&path, &content)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -382,12 +305,14 @@ fn file_remove_sync(path: &str) -> Result<(), String> {
 /// Remove the file at `path`. Returns `Err` on any I/O failure (including
 /// "not found"). Implements `os.Remove`.
 #[must_use]
-pub fn file_remove<E: Send + From<String> + 'static>(path: Path) -> IpeTask<E, ()> {
+pub fn file_remove<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, ()> {
     let path = path.into_string();
     Box::pin(async move {
         match run_blocking(move || file_remove_sync(&path)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -413,12 +338,14 @@ fn file_read_dir_sync(path: &str) -> Result<Vec<String>, IpeError> {
 /// Return the names (not full paths) of all entries in the directory at
 /// `path`, in filesystem order. Implements `os.ReadDir` → `e.Name()`.
 #[must_use]
-pub fn file_read_dir<E: Send + From<IpeError> + 'static>(path: Path) -> IpeTask<E, Vec<String>> {
+pub fn file_read_dir<E: Send + From<IpeError> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, Vec<String>> {
     let path = path.into_string();
     Box::pin(async move {
         match run_blocking(move || file_read_dir_sync(&path)).await {
             Ok(names) => ok_res(names),
-            Err(e) => IpeResult::Err(e.into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -428,16 +355,20 @@ pub fn file_read_dir<E: Send + From<IpeError> + 'static>(path: Path) -> IpeTask<
 /// it exists and is not a directory, and `Ok(false)` (not `Err`) when the path
 /// does not exist — matching  shape (`os.Stat` error → `false`).
 #[must_use]
-pub fn file_is_dir<E: Send + 'static>(path: Path) -> IpeTask<E, bool> {
+pub fn file_is_dir<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    path: Path,
+) -> IpeTask<E, bool> {
     let path = path.into_string();
     Box::pin(async move {
-        // Same infallible-closure shape as `file_exists` above.
-        let is_dir = run_blocking(move || {
+        // As in `file_exists`: an `Err` is a failed offload, never `false`.
+        match run_blocking(move || {
             Ok::<_, String>(std::fs::metadata(&path).is_ok_and(|m| m.is_dir()))
         })
         .await
-        .unwrap_or(false);
-        ok_res(is_dir)
+        {
+            Ok(is_dir) => ok_res(is_dir),
+            Err(e) => IpeResult::Err(e),
+        }
     })
 }
 
@@ -452,11 +383,13 @@ pub fn file_is_dir<E: Send + 'static>(path: Path) -> IpeTask<E, bool> {
 /// temp base, exclusively, never through a symlink, mode 0600, with a name
 /// carrying 128 bits of OS CSPRNG entropy.
 #[must_use]
-pub fn file_temp_file<E: Send + From<IpeError> + 'static>(prefix: String) -> IpeTask<E, String> {
+pub fn file_temp_file<E: Send + From<IpeError> + crate::FromUnavailable + 'static>(
+    prefix: String,
+) -> IpeTask<E, String> {
     Box::pin(async move {
         match run_blocking(move || temp_file_sync(&prefix)).await {
             Ok(p) => ok_res(p),
-            Err(e) => IpeResult::Err(e.into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -470,11 +403,13 @@ pub fn file_temp_file<E: Send + From<IpeError> + 'static>(prefix: String) -> Ipe
 /// verified temp base, exclusively, mode 0700, re-verified as the effective
 /// user's, with a name carrying 128 bits of OS CSPRNG entropy.
 #[must_use]
-pub fn file_temp_dir<E: Send + From<IpeError> + 'static>(prefix: String) -> IpeTask<E, String> {
+pub fn file_temp_dir<E: Send + From<IpeError> + crate::FromUnavailable + 'static>(
+    prefix: String,
+) -> IpeTask<E, String> {
     Box::pin(async move {
         match run_blocking(move || temp_dir_sync(&prefix)).await {
             Ok(p) => ok_res(p),
-            Err(e) => IpeResult::Err(e.into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -526,12 +461,15 @@ fn file_copy_sync(src: &str, dst: &str) -> Result<(), String> {
 /// Copy the file at `src` to `dst`, creating or overwriting `dst`.
 /// Implements `io.Copy(out, in)` pattern.
 #[must_use]
-pub fn file_copy<E: Send + From<String> + 'static>(src: Path, dst: Path) -> IpeTask<E, ()> {
+pub fn file_copy<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    src: Path,
+    dst: Path,
+) -> IpeTask<E, ()> {
     let (src, dst) = (src.into_string(), dst.into_string());
     Box::pin(async move {
         match run_blocking(move || file_copy_sync(&src, &dst)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -544,12 +482,15 @@ fn file_rename_sync(src: &str, dst: &str) -> Result<(), String> {
 /// Rename (move) the file or directory at `src` to `dst`.
 /// Implements `os.Rename`.
 #[must_use]
-pub fn file_rename<E: Send + From<String> + 'static>(src: Path, dst: Path) -> IpeTask<E, ()> {
+pub fn file_rename<E: Send + From<String> + crate::FromUnavailable + 'static>(
+    src: Path,
+    dst: Path,
+) -> IpeTask<E, ()> {
     let (src, dst) = (src.into_string(), dst.into_string());
     Box::pin(async move {
         match run_blocking(move || file_rename_sync(&src, &dst)).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -663,11 +604,13 @@ fn file_walk_matching_sync(
 /// subtrees are silently skipped (fail-closed for traversal safety). An error
 /// is returned only if `root` itself is not a readable directory.
 #[must_use]
-pub fn file_walk<E: Send + From<IpeError> + 'static>(root: Path) -> IpeTask<E, Vec<Path>> {
+pub fn file_walk<E: Send + From<IpeError> + crate::FromUnavailable + 'static>(
+    root: Path,
+) -> IpeTask<E, Vec<Path>> {
     Box::pin(async move {
         match run_blocking(move || file_walk_sync(&root)).await {
             Ok(paths) => ok_res(paths),
-            Err(e) => IpeResult::Err(e.into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -678,7 +621,7 @@ pub fn file_walk<E: Send + From<IpeError> + 'static>(root: Path) -> IpeTask<E, V
 /// during the walk (no `Task`, no I/O inside the predicate). Returns files in
 /// deterministic (lexicographically sorted) order.
 #[must_use]
-pub fn file_walk_matching<E: Send + From<IpeError> + 'static>(
+pub fn file_walk_matching<E: Send + From<IpeError> + crate::FromUnavailable + 'static>(
     root: Path,
     pred: Box<dyn Fn(Path) -> bool + Send + Sync + 'static>,
 ) -> IpeTask<E, Vec<Path>> {
@@ -690,7 +633,7 @@ pub fn file_walk_matching<E: Send + From<IpeError> + 'static>(
             Box::new(move |p: &Path| pred(p.clone()));
         match run_blocking(move || file_walk_matching_sync(&root, adapter.as_ref())).await {
             Ok(paths) => ok_res(paths),
-            Err(e) => IpeResult::Err(e.into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -711,6 +654,11 @@ fn tp(p: &std::path::Path) -> Path {
 #[cfg(not(target_arch = "wasm32"))]
 mod read_ceiling_tests {
     use super::*;
+
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(FILE_READ_CEILING);
+    }
 
     fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
@@ -753,28 +701,26 @@ mod read_ceiling_tests {
         );
     }
 
+    /// The `IPE_FILE_READ_MAX` parse as `File.readFile` surfaces it.
+    fn parse_read_ceiling(raw: Result<String, std::env::VarError>) -> Result<u64, String> {
+        FILE_READ_CEILING.parse(raw).map_err(String::from)
+    }
+
     #[test]
     fn ceiling_unset_is_the_default() {
         assert_eq!(
             parse_read_ceiling(Err(std::env::VarError::NotPresent)),
-            Ok(ReadCeiling::Unset)
+            Ok(READ_FILE_DEFAULT_CEILING)
         );
-        assert_eq!(ReadCeiling::Unset.bytes(), READ_FILE_DEFAULT_CEILING);
     }
 
     #[test]
     fn ceiling_decimal_values_are_bytes() {
-        assert_eq!(
-            parse_read_ceiling(Ok("0".into())),
-            Ok(ReadCeiling::Bytes(0))
-        );
-        assert_eq!(
-            parse_read_ceiling(Ok("1024".into())),
-            Ok(ReadCeiling::Bytes(1024))
-        );
+        assert_eq!(parse_read_ceiling(Ok("0".into())), Ok(0));
+        assert_eq!(parse_read_ceiling(Ok("1024".into())), Ok(1024));
         assert_eq!(
             parse_read_ceiling(Ok("18446744073709551615".into())),
-            Ok(ReadCeiling::Bytes(u64::MAX))
+            Ok(u64::MAX)
         );
     }
 
@@ -841,8 +787,8 @@ mod read_ceiling_tests {
         let long = "x".repeat(200);
         let res = parse_read_ceiling(Ok(long));
         assert!(
-            matches!(&res, Err(e) if !e.contains(&"x".repeat(READ_CEILING_SHOWN_CHARS + 1))
-                && e.contains(&"x".repeat(READ_CEILING_SHOWN_CHARS))),
+            matches!(&res, Err(e) if !e.contains(&"x".repeat(crate::system::ENV_VALUE_SHOWN_CHARS + 1))
+                && e.contains(&"x".repeat(crate::system::ENV_VALUE_SHOWN_CHARS))),
             "{res:?}"
         );
     }

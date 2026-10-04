@@ -4,7 +4,7 @@
 //! `Ipe.<M>.Unsafe` submodule flips [`Capability::Unsafe`], visible in
 //! `ipe capabilities`). Disclosure serves the auditor of a dependency; this gate
 //! serves the author exposing *their own* program. When user code reaches for a
-//! disclosed hatch, `ipe build`/`ipe run` surface the risk (which module, what
+//! disclosed hatch, `ipe dev build`/`ipe dev run` surface the risk (which module, what
 //! risk) and require consent before proceeding.
 //!
 //! The stance is non-patronizing: the safe path (no `.Unsafe` import) is silent —

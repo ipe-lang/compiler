@@ -66,6 +66,409 @@ pub(crate) fn read_env_var(key: &str) -> Result<String, std::env::VarError> {
     }
 }
 
+/// Longest prefix of a refused environment value echoed in its refusal.
+pub const ENV_VALUE_SHOWN_CHARS: usize = 32;
+
+/// What a present `0` means for one environment ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroCeiling {
+    /// `0` is refused like any other malformed value.
+    Refused,
+    /// `0` is a legal setting whose meaning the ceiling's consumer documents.
+    Accepted,
+}
+
+/// One operator-tunable numeric ceiling read from the environment.
+///
+/// Every `IPE_*` numeric limit parses through [`EnvCeiling::parse`], the one
+/// parser: an absent variable yields the default; a present value must be a
+/// plain decimal (ASCII digits only) no larger than the ceiling's
+/// [`Self::at_most`] bound and the consumer's integer type, and `0` follows the
+/// ceiling's [`ZeroCeiling`]. Anything else — empty, signed,
+/// padded, suffixed, overflowing, non-Unicode — is an [`EnvCeilingRefusal`], so
+/// a typo never widens the ceiling to its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvCeiling {
+    name: &'static str,
+    default: u64,
+    zero: ZeroCeiling,
+    unit: &'static str,
+    max: u64,
+}
+
+impl EnvCeiling {
+    /// A ceiling read from `name`, with its default, zero rule and unit phrase.
+    ///
+    /// `unit` completes the refusal "`name` must be a …", e.g. `"decimal byte count"`.
+    #[must_use]
+    pub const fn new(
+        name: &'static str,
+        default: u64,
+        zero: ZeroCeiling,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            default,
+            zero,
+            unit,
+            max: u64::MAX,
+        }
+    }
+
+    /// This ceiling with the largest value its consumer can apply without
+    /// failing (e.g. a `tokio` semaphore's permit limit); a larger setting is
+    /// refused as too large.
+    #[must_use]
+    pub const fn at_most(self, max: u64) -> Self {
+        Self { max, ..self }
+    }
+
+    /// The largest accepted value.
+    #[must_use]
+    pub const fn max_value(self) -> u64 {
+        self.max
+    }
+
+    /// The environment variable this ceiling reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    /// The value applied while the variable is absent.
+    #[must_use]
+    pub const fn default_value(self) -> u64 {
+        self.default
+    }
+
+    /// Parses a raw lookup of this ceiling's variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal naming the variable when the value is present but not a
+    /// plain decimal, is a refused `0`, or exceeds [`Self::max_value`].
+    pub fn parse(self, raw: Result<String, std::env::VarError>) -> Result<u64, EnvCeilingRefusal> {
+        let (shown, defect) = match raw {
+            Err(std::env::VarError::NotPresent) => return Ok(self.default),
+            Err(std::env::VarError::NotUnicode(os)) => (
+                shown_env_value(os.as_encoded_bytes()),
+                CeilingDefect::NotDecimal,
+            ),
+            Ok(v) => {
+                let defect = if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    CeilingDefect::NotDecimal
+                } else {
+                    match v.parse::<u64>() {
+                        Ok(n) => match self.check(n) {
+                            Ok(n) => return Ok(n),
+                            Err(defect) => defect,
+                        },
+                        Err(_) => CeilingDefect::TooLarge,
+                    }
+                };
+                (shown_env_value(v.as_bytes()), defect)
+            }
+        };
+        Err(self.refusal(shown, defect))
+    }
+
+    /// [`Self::parse`] narrowed to the consumer's integer type `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::parse`] refusal, or a too-large refusal when the
+    /// value (the default included) does not fit `T` on this platform.
+    pub fn parse_as<T: TryFrom<u64>>(
+        self,
+        raw: Result<String, std::env::VarError>,
+    ) -> Result<T, EnvCeilingRefusal> {
+        let n = self.parse(raw)?;
+        T::try_from(n).map_err(|_| self.refusal(n.to_string(), CeilingDefect::TooLarge))
+    }
+
+    /// The raw lookup of this ceiling's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// [`std::env::VarError::NotPresent`] while the variable is unset, or
+    /// `NotUnicode` for a non-UTF-8 value; [`Self::parse`] judges either.
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        read_env_var(self.name)
+    }
+
+    /// Reads and parses this ceiling from the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::parse_as`] refusal for a present, malformed value.
+    pub fn read<T: TryFrom<u64>>(self) -> Result<T, EnvCeilingRefusal> {
+        self.parse_as(self.lookup())
+    }
+
+    /// A parsed value under this ceiling's zero rule and bound.
+    const fn check(self, n: u64) -> Result<u64, CeilingDefect> {
+        if n == 0 && matches!(self.zero, ZeroCeiling::Refused) {
+            Err(CeilingDefect::Zero)
+        } else if n > self.max {
+            Err(CeilingDefect::TooLarge)
+        } else {
+            Ok(n)
+        }
+    }
+
+    const fn refusal(self, shown: String, defect: CeilingDefect) -> EnvCeilingRefusal {
+        EnvCeilingRefusal {
+            name: self.name,
+            unit: self.unit,
+            shown,
+            defect,
+        }
+    }
+}
+
+/// One operator-tunable duration read from the environment, in whole seconds.
+///
+/// A present value is a bare decimal second count or one to three `<n>h`,
+/// `<n>m`, `<n>s` segments, each unit at most once and in that order (`90s`,
+/// `30m`, `1h30m`), ASCII only and unpadded. It then obeys the bound of
+/// [`Self::at_most`] and a positive total, so every refusal is the
+/// [`EnvCeilingRefusal`] an [`EnvCeiling`] raises, with the same escaped echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvDuration {
+    ceiling: EnvCeiling,
+}
+
+impl EnvDuration {
+    /// A duration read from `name`, with its default in seconds and unit phrase.
+    ///
+    /// `unit` completes the refusal "`name` must be a …", e.g. `"duration"`.
+    #[must_use]
+    pub const fn new(name: &'static str, default_secs: u64, unit: &'static str) -> Self {
+        Self {
+            ceiling: EnvCeiling::new(name, default_secs, ZeroCeiling::Refused, unit),
+        }
+    }
+
+    /// This duration with the largest total, in seconds, its consumer can apply.
+    #[must_use]
+    pub const fn at_most(self, max_secs: u64) -> Self {
+        Self {
+            ceiling: self.ceiling.at_most(max_secs),
+        }
+    }
+
+    /// The environment variable this duration reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.ceiling.name()
+    }
+
+    /// The largest accepted total, in seconds.
+    #[must_use]
+    pub const fn max_value(self) -> u64 {
+        self.ceiling.max_value()
+    }
+
+    /// The seconds applied while the variable is absent.
+    #[must_use]
+    pub const fn default_value(self) -> u64 {
+        self.ceiling.default_value()
+    }
+
+    /// Parses a raw lookup of this duration's variable into whole seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal naming the variable when the value is present but not
+    /// in the duration grammar, totals zero, or exceeds [`Self::max_value`].
+    pub fn parse(self, raw: Result<String, std::env::VarError>) -> Result<u64, EnvCeilingRefusal> {
+        let (shown, defect) = match raw {
+            Err(std::env::VarError::NotPresent) => return Ok(self.ceiling.default),
+            Err(std::env::VarError::NotUnicode(os)) => (
+                shown_env_value(os.as_encoded_bytes()),
+                CeilingDefect::NotDecimal,
+            ),
+            Ok(v) => match duration_secs(&v).and_then(|n| self.ceiling.check(n)) {
+                Ok(n) => return Ok(n),
+                Err(defect) => (shown_env_value(v.as_bytes()), defect),
+            },
+        };
+        Err(self.ceiling.refusal(shown, defect))
+    }
+
+    /// The raw lookup of this duration's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// As [`EnvCeiling::lookup`].
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        self.ceiling.lookup()
+    }
+
+    /// Reads and parses this duration from the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::parse`] refusal for a present, malformed value.
+    pub fn read(self) -> Result<u64, EnvCeilingRefusal> {
+        self.parse(self.lookup())
+    }
+}
+
+/// The seconds of a bare second count or `h`/`m`/`s` segments.
+///
+/// Each unit appears at most once, largest first, so the loop runs at most
+/// three times.
+fn duration_secs(raw: &str) -> Result<u64, CeilingDefect> {
+    let (mut digits, mut tail) = split_digits(raw);
+    if digits.is_empty() {
+        return Err(CeilingDefect::NotDecimal);
+    }
+    if tail.is_empty() {
+        return digits_value(digits);
+    }
+    let mut total: u64 = 0;
+    let mut previous = u64::MAX;
+    loop {
+        let mut chars = tail.chars();
+        let unit: u64 = match chars.next() {
+            Some('h') => 3600,
+            Some('m') => 60,
+            Some('s') => 1,
+            _ => return Err(CeilingDefect::NotDecimal),
+        };
+        if unit >= previous {
+            return Err(CeilingDefect::NotDecimal);
+        }
+        previous = unit;
+        total = digits_value(digits)?
+            .checked_mul(unit)
+            .and_then(|segment| total.checked_add(segment))
+            .ok_or(CeilingDefect::TooLarge)?;
+        let after = chars.as_str();
+        if after.is_empty() {
+            return Ok(total);
+        }
+        (digits, tail) = split_digits(after);
+        if digits.is_empty() {
+            return Err(CeilingDefect::NotDecimal);
+        }
+    }
+}
+
+/// `text` split after its leading run of ASCII digits.
+fn split_digits(text: &str) -> (&str, &str) {
+    let run = text.bytes().take_while(u8::is_ascii_digit).count();
+    text.split_at_checked(run).unwrap_or(("", text))
+}
+
+/// The value of a run of ASCII digits, or too large when it overflows `u64`.
+fn digits_value(digits: &str) -> Result<u64, CeilingDefect> {
+    digits
+        .chars()
+        .try_fold(0u64, |acc, c| {
+            acc.checked_mul(10)?.checked_add(u64::from(c.to_digit(10)?))
+        })
+        .ok_or(CeilingDefect::TooLarge)
+}
+
+/// Why a present ceiling value was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingDefect {
+    /// Not a plain run of ASCII digits (empty, signed, padded, suffixed, non-Unicode).
+    NotDecimal,
+    /// `0` on a ceiling whose [`ZeroCeiling`] refuses it.
+    Zero,
+    /// Digits only, but larger than the ceiling's bound or the consumer's
+    /// integer type holds.
+    TooLarge,
+}
+
+/// A present-but-malformed environment ceiling, naming the variable.
+///
+/// The echoed value is truncated to [`ENV_VALUE_SHOWN_CHARS`] and escaped, so
+/// the refusal can neither flood nor forge the line it lands on. It reaches an
+/// `IpeError` channel as `InvalidInput`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvCeilingRefusal {
+    name: &'static str,
+    unit: &'static str,
+    shown: String,
+    defect: CeilingDefect,
+}
+
+impl EnvCeilingRefusal {
+    /// The refused variable's name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Why the value was refused.
+    #[must_use]
+    pub const fn defect(&self) -> CeilingDefect {
+        self.defect
+    }
+}
+
+impl std::fmt::Display for EnvCeilingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name, unit, shown, ..
+        } = self;
+        match self.defect {
+            CeilingDefect::NotDecimal => write!(f, "{name} must be a {unit} (got \"{shown}\")"),
+            CeilingDefect::Zero => write!(f, "{name} must be a positive {unit} (got \"{shown}\")"),
+            CeilingDefect::TooLarge => {
+                write!(f, "{name} is too large for this platform (got \"{shown}\")")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnvCeilingRefusal {}
+
+impl From<EnvCeilingRefusal> for String {
+    fn from(refusal: EnvCeilingRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
+impl From<EnvCeilingRefusal> for IpeError {
+    fn from(refusal: EnvCeilingRefusal) -> Self {
+        Self::invalid_input(refusal.to_string())
+    }
+}
+
+/// Renders a refused environment value for its error text without losing or
+/// smuggling a byte: valid UTF-8 keeps its printable characters and escapes
+/// every other one (`char::escape_debug` — controls, ESC, CR/LF, bidi
+/// overrides, `"` and `\`), and each byte that is not UTF-8 shows as `\xNN`.
+/// At most [`ENV_VALUE_SHOWN_CHARS`] source characters or bytes are shown.
+fn shown_env_value(raw: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut budget = ENV_VALUE_SHOWN_CHARS;
+    for chunk in raw.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            let Some(left) = budget.checked_sub(1) else {
+                return out;
+            };
+            budget = left;
+            out.extend(c.escape_debug());
+        }
+        for b in chunk.invalid() {
+            let Some(left) = budget.checked_sub(1) else {
+                return out;
+            };
+            budget = left;
+            let _ = write!(out, "\\x{b:02X}");
+        }
+    }
+    out
+}
+
 /// The invoking user's home directory: the one runtime home reader.
 ///
 /// Reads the shared platform variable [`super::home_core::HOME_VAR`]
@@ -97,9 +500,9 @@ fn home_dir_from_var(raw: Result<String, std::env::VarError>) -> Option<std::pat
 /// downstream `contains(...)` matchers see the bare line. The `is_terminal`
 /// decision is a parameter so the indent rule is testable without a pty.
 ///
-/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe watch`, these
+/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe dev watch`, these
 /// lines are the spawned app's own output, printed one level deeper than the
-/// `[ipe watch] ...` status lines that frame it (which themselves render at
+/// `[ipe dev watch] ...` status lines that frame it (which themselves render at
 /// two gutter-widths) — so this nests under them rather than under the
 /// top-level banner.
 ///
@@ -113,6 +516,18 @@ pub(crate) fn gutter_line(msg: &str, is_terminal: bool) -> String {
         msg.to_string()
     }
 }
+
+/// How long every SQLite connection waits on another connection's lock.
+///
+/// Applied through the connect options, so the driver sets it on each
+/// connection it opens and no pooled connection can carry another value. It
+/// outlasts a full index rebuild holding the write lock; a writer still
+/// waiting past it fails with `SQLITE_BUSY` through its caller's typed error.
+///
+/// It lives here, not in `db`, because `web::hub` and `telemetry_spill` open
+/// SQLite connections in programs whose module set declares no `db`.
+#[cfg(feature = "db")]
+pub(crate) const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Format characters that reorder, hide, or break a log line without being control bytes.
 ///
@@ -161,32 +576,75 @@ pub(crate) fn is_log_hazard(c: char) -> bool {
     c.is_control() || LOG_FORMAT_HAZARDS.iter().any(|range| range.contains(&c))
 }
 
-/// Neutralise every log-hazard character (see [`is_log_hazard`]) in text
-/// bound for an operator log line by escaping it — `\n`, `\r`, `\t`, else
-/// `\u{XX}` — so untrusted
-/// input (a driver error, a request path, an env-derived path, a trace value)
-/// can neither forge extra records nor inject terminal escape sequences, and
-/// the escape stays visible rather than silently erased. The single log
-/// scrubber: every plain-text log sink routes untrusted text through it. Not a
-/// JSON escaper — JSON records keep `telemetry::json_escape`.
+/// Escape text bound for a plain operator log line, visibly and injectively.
+///
+/// Every log-hazard character (see [`is_log_hazard`]) becomes an escape (`\n`,
+/// `\r`, `\t`, else `\u{XX}`) and `\` itself becomes `\\`, so untrusted input
+/// (a driver error, a request path, an env-derived path, a trace value) can
+/// neither forge extra records nor inject terminal escape sequences, the
+/// escape stays visible rather than silently erased, and two distinct inputs
+/// never print alike (the literal text `\u{200b}` prints as `\\u{200b}`, a
+/// real U+200B as `\u{200b}`). The single plain-text log scrubber: every
+/// plain-text log sink routes untrusted text through it. Its JSON counterpart
+/// is `escape::json_str_body` (through `telemetry::json_escape`), which
+/// escapes the same hazard set.
 pub(crate) fn scrub_log_controls(s: &str) -> std::borrow::Cow<'_, str> {
-    use std::fmt::Write as _;
-    if !s.chars().any(is_log_hazard) {
+    if !s.chars().any(|c| c == '\\' || is_log_hazard(c)) {
         return std::borrow::Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len().saturating_add(16));
     for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if is_log_hazard(c) => {
-                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
-            }
-            c => out.push(c),
-        }
+        push_scrubbed(c, &mut out);
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// The marker [`scrub_log_controls_capped`] appends when it cuts its output.
+///
+/// The scrub writes `\` only as the start of `\\`, `\n`, `\r`, `\t` or
+/// `\u{…}`, so `\…` never occurs in scrubbed text: a cut record cannot pass
+/// for an uncut one.
+pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
+
+/// [`scrub_log_controls`] for an untrusted record, bounded to `max_bytes`.
+///
+/// The bound applies to the escaped output, never the input, and to whole
+/// escapes only: when the next character's spelling would cross `max_bytes`
+/// the output stops there and ends in [`SCRUB_TRUNCATED`]. The result is at
+/// most `max_bytes + SCRUB_TRUNCATED.len()` bytes, and an uncut result decodes
+/// to its input, so a hazard in a remote request path or an ingested record
+/// shows as a visible escape and two distinct inputs never record alike.
+#[cfg_attr(
+    not(all(feature = "web-core", feature = "server")),
+    allow(dead_code) // only the served request log and console ingest call it
+)]
+pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_bytes));
+    for c in s.chars() {
+        let before = out.len();
+        push_scrubbed(c, &mut out);
+        if out.len() > max_bytes {
+            out.truncate(before);
+            out.push_str(SCRUB_TRUNCATED);
+            break;
+        }
+    }
+    out
+}
+
+/// Append the scrubbed spelling of one character to `out`.
+fn push_scrubbed(c: char, out: &mut String) {
+    use std::fmt::Write as _;
+    match c {
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        c if is_log_hazard(c) => {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
+        c => out.push(c),
+    }
 }
 
 /// Write one line to stderr fallibly, dropping the error: `eprintln!` panics
@@ -332,13 +790,13 @@ impl ResolvedPort {
         match self.origin {
             PortOrigin::Relocated => format!(
                 "port {port} is already in use — another application is bound to it.\n\
-                 The port was chosen by the supervisor (`ipe watch` or the dev console); \
+                 The port was chosen by the supervisor (`ipe dev watch` or the dev console); \
                  restart it to pick a free port."
             ),
             PortOrigin::Operator | PortOrigin::Source => format!(
                 "port {port} is already in use — another application is bound to it.\n\
                  Set a different port with the {var} environment variable, e.g.:\n\
-                 {var}=8123 ipe run"
+                 {var}=8123 ipe dev run"
             ),
         }
     }
@@ -535,32 +993,16 @@ fn decode_arg_at(
 // see `docs/adr/0003-security-render-and-data-access-invariants.md`
 // §2.2 — so the fallback only matters for this crate's own narrow-feature
 // standalone builds).
-// tokio is native-only (declared under the `cfg(not(target_arch = "wasm32"))`
-// dependency table), so the `spawn_blocking` offload compiles only there. On
-// wasm32 the synchronous fallback runs even when `feature = "tokio"` is set —
-// the browser has no blocking-thread pool to offload to.
-#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
+// The offload is `threads::run_blocking`: a blocking pool that cannot start a
+// thread is an `Unavailable` error, and a build without the pool (no `tokio`, or
+// wasm32) runs the closure inline.
+async fn run_blocking<T, E, F>(f: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
+    E: From<String> + crate::FromUnavailable,
 {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err("background process task panicked".to_string()),
-    }
-}
-
-#[cfg(any(not(feature = "tokio"), target_arch = "wasm32"))]
-// `async` is required here to match the tokio variant's signature; callers
-// always use `.await` to work with both feature configurations uniformly.
-#[allow(clippy::unused_async)]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    f()
+    crate::threads::run_blocking("Process", "background process task panicked", f).await
 }
 
 /// The default combined-output capture ceiling (16 MiB), overridable via
@@ -569,12 +1011,23 @@ where
 /// `Command::output()` buffers ALL of it in memory and can OOM the host. Reading
 /// past the ceiling is an `Err`, never a silent truncation of a returned success
 /// value.
-fn process_output_ceiling() -> u64 {
-    read_env_var("IPE_PROCESS_OUTPUT_MAX")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(16 * 1024 * 1024)
+const PROCESS_OUTPUT_CEILING: EnvCeiling = EnvCeiling::new(
+    "IPE_PROCESS_OUTPUT_MAX",
+    16 * 1024 * 1024,
+    ZeroCeiling::Refused,
+    "decimal byte count",
+);
+
+/// Resolves [`PROCESS_OUTPUT_CEILING`]; a malformed setting fails the spawn closed.
+fn process_output_ceiling() -> Result<u64, EnvCeilingRefusal> {
+    PROCESS_OUTPUT_CEILING.read()
+}
+
+/// The task a spawn kernel returns when its output ceiling is malformed.
+fn refused_spawn<E: Send + From<String> + 'static, T: Send + 'static>(
+    refusal: EnvCeilingRefusal,
+) -> IpeTask<E, T> {
+    crate::task::task_fail(String::from(refusal).into())
 }
 
 /// The captured result of a subprocess: its combined stdout+stderr (bounded)
@@ -628,14 +1081,18 @@ impl Drop for ChildGuard {
 /// caps peak per-stream allocation regardless of how much the child writes.
 /// `limit` is a per-call value (`cap + 1`) passed by ownership, so concurrent
 /// `process_run` calls never share or clobber it.
+///
+/// # Errors
+///
+/// The OS refused the thread.
 fn spawn_capture_thread<R>(
     reader: Option<R>,
     limit: u64,
-) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>
 where
     R: std::io::Read + Send + 'static,
 {
-    std::thread::spawn(move || {
+    crate::threads::spawn_named(CAPTURE_THREAD, move || {
         use std::io::Read as _;
         let mut buf = Vec::new();
         if let Some(reader) = reader {
@@ -644,6 +1101,13 @@ where
         Ok::<_, std::io::Error>(buf)
     })
 }
+
+/// The name of each subprocess output capture thread.
+const CAPTURE_THREAD: &str = "ipe-capture";
+
+/// The name of the pty master reader thread.
+#[cfg(unix)]
+const PTY_READ_THREAD: &str = "ipe-pty-read";
 
 /// Spawn `cmd args` with NO shell (direct argv), capturing combined
 /// stdout+stderr under `cap`. stdout and stderr are drained on SEPARATE threads
@@ -683,7 +1147,7 @@ fn apply_env_directives(
     builder.env_remove(crate::LISTEN_PORT_RELOCATION_ENV);
 }
 
-/// Env var a supervisor (`ipe watch`, the dev console proxy) sets on the child
+/// Env var a supervisor (`ipe dev watch`, the dev console proxy) sets on the child
 /// it spawns to place that child's HTTP listener on a port the supervisor chose.
 ///
 /// Internal plumbing, never operator configuration: it outranks the operator
@@ -1623,8 +2087,12 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
             .ok_or_else(|| format!("{cmd}: child unexpectedly reaped"))?;
         (c.stdout.take(), c.stderr.take())
     };
-    let out_handle = spawn_capture_thread(stdout, limit);
-    let err_handle = spawn_capture_thread(stderr, limit);
+    // A refused capture thread returns through `?`; `guard` kills and reaps the
+    // child, which ends any capture already started.
+    let out_handle = spawn_capture_thread(stdout, limit)
+        .map_err(|e| format!("{cmd}: stdout capture thread refused: {e}"))?;
+    let err_handle = spawn_capture_thread(stderr, limit)
+        .map_err(|e| format!("{cmd}: stderr capture thread refused: {e}"))?;
 
     // A thread panic (e.g. OOM in the reader) surfaces as an `Err`, never a
     // propagated panic; `guard` still reaps the child on the `?` return.
@@ -1674,11 +2142,14 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
 /// doc comment above) so a long-running subprocess can't stall the tokio worker
 /// thread polling this future.
 #[must_use]
-pub fn process_run<E: Send + From<String> + 'static>(
+pub fn process_run<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cmd: String,
     args: Vec<String>,
 ) -> IpeTask<E, String> {
-    process_run_with_cap(cmd, args, process_output_ceiling())
+    match process_output_ceiling() {
+        Ok(cap) => process_run_with_cap(cmd, args, cap),
+        Err(refusal) => refused_spawn(refusal),
+    }
 }
 
 /// `process_run` with the capture ceiling supplied explicitly rather than read
@@ -1687,16 +2158,16 @@ pub fn process_run<E: Send + From<String> + 'static>(
 /// so no test mutates the process-global environment (which would race a
 /// concurrent subprocess call reading the same var).
 #[must_use]
-fn process_run_with_cap<E: Send + From<String> + 'static>(
+fn process_run_with_cap<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cmd: String,
     args: Vec<String>,
     cap: u64,
 ) -> IpeTask<E, String> {
     Box::pin(async move {
         // `process_run_sync` folds `cmd` into every `Err` string, so the outer
-        // `Err` arm (a `run_blocking` `JoinError`, i.e. the blocking task
-        // panicked) doesn't need `cmd` — it's moved into the closure.
-        match run_blocking(move || process_run_sync(&cmd, &args, cap)).await {
+        // `Err` arm (a refused or panicked blocking task) doesn't need `cmd` —
+        // it's moved into the closure.
+        match run_blocking::<_, E, _>(move || process_run_sync(&cmd, &args, cap)).await {
             Ok(out) => {
                 #[allow(clippy::disallowed_methods)] // process output reaches Ipê as `String` text
                 let text = String::from_utf8_lossy(&out.combined).into_owned();
@@ -1723,7 +2194,7 @@ fn process_run_with_cap<E: Send + From<String> + 'static>(
                     IpeResult::Err(str_err(&format!("{}: {}", snippet, out.status)))
                 }
             }
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -1787,8 +2258,12 @@ fn process_run_with_sync(
             .ok_or_else(|| format!("{cmd}: child unexpectedly reaped"))?;
         (c.stdout.take(), c.stderr.take())
     };
-    let out_handle = spawn_capture_thread(stdout_pipe, limit);
-    let err_handle = spawn_capture_thread(stderr_pipe, limit);
+    // A refused capture thread returns through `?`; `guard` kills and reaps the
+    // child, which ends any capture already started.
+    let out_handle = spawn_capture_thread(stdout_pipe, limit)
+        .map_err(|e| format!("{cmd}: stdout capture thread refused: {e}"))?;
+    let err_handle = spawn_capture_thread(stderr_pipe, limit)
+        .map_err(|e| format!("{cmd}: stderr capture thread refused: {e}"))?;
 
     let stdout_bytes = out_handle
         .join()
@@ -1840,10 +2315,13 @@ fn process_run_with_sync(
 /// inherits its confined environment from the parent, and the overrides are
 /// applied ON TOP of that already-confined environment.
 #[must_use]
-pub fn process_run_with<E: Send + From<String> + 'static>(
+pub fn process_run_with<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cfg: ProcessRunWithCfg,
 ) -> IpeTask<E, ProcessRunOutput> {
-    process_run_with_impl(cfg, process_output_ceiling())
+    match process_output_ceiling() {
+        Ok(cap) => process_run_with_impl(cfg, cap),
+        Err(refusal) => refused_spawn(refusal),
+    }
 }
 
 /// `ProcessRunWithCfg` — the Ipê record `{ command, args, cwd, env }` lowered
@@ -1863,12 +2341,12 @@ pub struct ProcessRunWithCfg {
 }
 
 #[must_use]
-fn process_run_with_impl<E: Send + From<String> + 'static>(
+fn process_run_with_impl<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cfg: ProcessRunWithCfg,
     cap: u64,
 ) -> IpeTask<E, ProcessRunOutput> {
     Box::pin(async move {
-        let result = run_blocking(move || {
+        let result = run_blocking::<_, E, _>(move || {
             let cwd_path: Option<std::path::PathBuf> = match &cfg.cwd {
                 IpeMaybe::Just(p) => Some(std::path::PathBuf::from(p)),
                 IpeMaybe::Nothing => None,
@@ -1878,7 +2356,7 @@ fn process_run_with_impl<E: Send + From<String> + 'static>(
         .await;
         match result {
             Ok(out) => ok_res(out),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -1929,21 +2407,24 @@ pub struct ProcessPtyOutput {
 /// rather than a silent no-op. The blocking spawn+read+wait is offloaded via
 /// `run_blocking` so a long-running child cannot stall the tokio worker thread.
 #[must_use]
-pub fn process_run_in_pty<E: Send + From<String> + 'static>(
+pub fn process_run_in_pty<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cfg: ProcessRunInPtyCfg,
 ) -> IpeTask<E, ProcessPtyOutput> {
-    process_run_in_pty_impl(cfg, process_output_ceiling())
+    match process_output_ceiling() {
+        Ok(cap) => process_run_in_pty_impl(cfg, cap),
+        Err(refusal) => refused_spawn(refusal),
+    }
 }
 
 #[must_use]
-fn process_run_in_pty_impl<E: Send + From<String> + 'static>(
+fn process_run_in_pty_impl<E: Send + From<String> + crate::FromUnavailable + 'static>(
     cfg: ProcessRunInPtyCfg,
     cap: u64,
 ) -> IpeTask<E, ProcessPtyOutput> {
     Box::pin(async move {
-        match run_blocking(move || process_run_in_pty_sync(cfg, cap)).await {
+        match run_blocking::<_, E, _>(move || process_run_in_pty_sync(cfg, cap)).await {
             Ok(out) => ok_res(out),
-            Err(e) => IpeResult::Err(str_err(&e)),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -2088,8 +2569,10 @@ fn process_run_in_pty_sync(cfg: ProcessRunInPtyCfg, cap: u64) -> Result<ProcessP
     // ceiling on peak allocation regardless.
     let mut master_file = std::fs::File::from(master);
     let limit = cap.saturating_add(1);
+    // A refused reader drops the master with its closure and returns through
+    // `?`; `guard` kills and reaps the child.
     let read_handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>> =
-        std::thread::spawn(move || {
+        crate::threads::spawn_named(PTY_READ_THREAD, move || {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
             loop {
@@ -2112,7 +2595,8 @@ fn process_run_in_pty_sync(cfg: ProcessRunInPtyCfg, cap: u64) -> Result<ProcessP
                 }
             }
             Ok(buf)
-        });
+        })
+        .map_err(|e| format!("{cmd}: pty read thread refused: {e}"))?;
 
     let combined = read_handle
         .join()
@@ -2336,27 +2820,486 @@ fn system_load_env_sync() {
 /// (process env wins, matching Ipê's precedence). A missing `.env` is a no-op
 /// success.
 ///
-/// `std::fs::read_to_string(".env")` is a blocking syscall, so it routes
-/// through the `run_blocking` helper this module defines (above, for
-/// `process_run`) rather than running inline inside the `async move` body —
-/// the same offload `file.rs`/`compression.rs`/`csv.rs`/`config_decode.rs`
-/// use. Real-world impact is low (`.env` is small and read once at startup),
-/// but on a slow/network filesystem an inline read would stall the tokio
-/// worker thread polling this future.
+/// `std::fs::read_to_string(".env")` is a blocking syscall, so it is offloaded
+/// to the blocking pool (`threads::join_blocking`) rather than run inline inside
+/// the `async move` body — the same offload `file.rs`/`compression.rs`/`csv.rs`/
+/// `config_decode.rs` use. Real-world impact is low (`.env` is small and read
+/// once at startup), but on a slow/network filesystem an inline read would stall
+/// the tokio worker thread polling this future.
 #[must_use]
 pub fn system_load_env<E: Send + 'static>(_: ()) -> IpeTask<E, ()> {
     Box::pin(async move {
-        // `run_blocking`'s `Err` arm (the blocking task panicked) is folded
-        // back into `Ok(())` here — `loadEnv` never surfaces an `Err` for a
-        // missing/unreadable `.env`, and a panicked blocking task shouldn't
-        // change that contract either.
-        let _: Result<(), String> = run_blocking(|| {
+        // `loadEnv` never surfaces an `Err` for a missing/unreadable `.env`, and
+        // a panicked read does not change that contract. A pool that cannot
+        // start a thread reads the small file inline instead, so the overlay is
+        // loaded either way.
+        let offloaded = crate::threads::join_blocking("System.loadEnv", system_load_env_sync).await;
+        if matches!(offloaded, Err(crate::threads::BlockingFailure::Refused(_))) {
             system_load_env_sync();
-            Ok(())
-        })
-        .await;
+        }
         ok_res(())
     })
+}
+
+/// Asserts the shared [`EnvCeiling`] contract on `ceiling`.
+///
+/// Absent yields the default; every malformed spelling (empty, signed,
+/// suffixed, padded, separated, hex, fractional, non-ASCII digits, overflowing,
+/// non-Unicode) is refused naming the variable; `1` and the bound are
+/// accepted and one past the bound is refused; `0` follows the ceiling's
+/// [`ZeroCeiling`].
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn assert_env_ceiling_contract(ceiling: EnvCeiling) {
+    assert_decimal_contract(ceiling, |raw| ceiling.parse(raw));
+}
+
+/// Asserts the [`EnvCeiling`] contract on an [`EnvDuration`].
+///
+/// A bare second count honours every clause of the decimal contract, and the
+/// duration grammar adds its own refusals.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn assert_env_duration_contract(duration: EnvDuration) {
+    assert_decimal_contract(duration.ceiling, |raw| duration.parse(raw));
+    let name = duration.name();
+    let parse = |raw: &str| duration.parse(Ok(raw.to_owned()));
+    for refused in [
+        "1h30",
+        "1d",
+        "m",
+        "h",
+        "1h ",
+        "1H",
+        "1hm",
+        "h1",
+        "1m1h",
+        "1h1h",
+        "1h 30m",
+        "1h-30m",
+        "1h\u{FF11}m",
+        "0s",
+        "0h0m",
+    ] {
+        assert!(
+            parse(refused).is_err_and(|r| r.name() == name),
+            "{name}: {refused:?} must be refused naming the variable"
+        );
+    }
+    for (spelled, secs) in [
+        ("1s", 1),
+        ("90s", 90),
+        ("30m", 1800),
+        ("1h", 3600),
+        ("1h30m", 5400),
+        ("1h30m15s", 5415),
+        ("1h15s", 3615),
+        ("0h30m", 1800),
+    ] {
+        if secs <= duration.max_value() {
+            assert_eq!(
+                parse(spelled),
+                Ok(secs),
+                "{name}: {spelled:?} is {secs} seconds"
+            );
+        }
+    }
+    assert!(
+        parse("18446744073709551615h").is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+        "{name}: an overflowing segment is refused as too large"
+    );
+}
+
+/// The decimal clauses of the ceiling contract over one parser of raw lookups.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn assert_decimal_contract(
+    ceiling: EnvCeiling,
+    parse_raw: impl Fn(Result<String, std::env::VarError>) -> Result<u64, EnvCeilingRefusal>,
+) {
+    use std::env::VarError;
+    let name = ceiling.name();
+    let parse = |raw: &str| parse_raw(Ok(raw.to_owned()));
+    assert_eq!(
+        parse_raw(Err(VarError::NotPresent)),
+        Ok(ceiling.default_value()),
+        "{name}: an absent value yields the default"
+    );
+    for refused in [
+        "",
+        "-1",
+        "+1024",
+        "16MiB",
+        "1k",
+        " 1024",
+        "1024 ",
+        "\t1",
+        "1024\n",
+        "1_024",
+        "1,024",
+        "0x10",
+        "1.5",
+        "1e3",
+        "\u{FF11}",
+        "18446744073709551616",
+    ] {
+        let outcome = parse(refused);
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|r| r.name() == name && r.to_string().starts_with(name)),
+            "{name}: {refused:?} must be refused naming the variable, got {outcome:?}"
+        );
+    }
+    assert!(
+        parse("18446744073709551616").is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+        "{name}: an overflowing value is refused as too large"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        let not_unicode = std::ffi::OsString::from_vec(vec![b'1', 0xFF]);
+        assert!(
+            parse_raw(Err(VarError::NotUnicode(not_unicode)))
+                .is_err_and(|r| r.defect() == CeilingDefect::NotDecimal),
+            "{name}: a non-Unicode value is refused"
+        );
+    }
+    assert_eq!(
+        parse("1"),
+        Ok(1),
+        "{name}: the least positive value is accepted"
+    );
+    let max = ceiling.max_value();
+    assert!(
+        ceiling.default_value() <= max,
+        "{name}: the default is within the bound"
+    );
+    assert_eq!(
+        parse(&max.to_string()),
+        Ok(max),
+        "{name}: the largest value is accepted"
+    );
+    if let Some(past) = max.checked_add(1) {
+        assert!(
+            parse(&past.to_string()).is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+            "{name}: one past the bound is refused as too large"
+        );
+    }
+    match ceiling.zero {
+        ZeroCeiling::Refused => assert!(
+            parse("0").is_err_and(|r| r.defect() == CeilingDefect::Zero),
+            "{name}: a refused zero is refused"
+        ),
+        ZeroCeiling::Accepted => assert_eq!(parse("0"), Ok(0), "{name}: zero is accepted"),
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod env_ceiling_tests {
+    use super::{
+        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, PROCESS_OUTPUT_CEILING,
+        ZeroCeiling, assert_env_ceiling_contract, assert_env_duration_contract, locked_remove_var,
+        locked_set_var, process_output_ceiling,
+    };
+
+    #[test]
+    fn a_duration_honours_the_contract_at_every_bound() {
+        let base = EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+        for duration in [
+            base,
+            base.at_most(59),
+            base.at_most(86_400),
+            base.at_most(34_560_000),
+        ] {
+            assert_env_duration_contract(duration);
+        }
+    }
+
+    #[test]
+    fn a_duration_total_past_its_bound_is_refused_whatever_the_spelling() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration").at_most(5400);
+        let parse = |raw: &str| duration.parse(Ok(raw.to_owned()));
+        assert_eq!(parse("1h30m"), Ok(5400));
+        assert_eq!(parse("5400"), Ok(5400));
+        for past in ["1h30m1s", "5401", "2h", "91m"] {
+            assert!(
+                parse(past).is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+                "{past:?} is past the bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duration_echo_is_truncated_and_escaped() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+        let shown = duration
+            .parse(Ok(format!("\u{1b}[31m{}", "9x".repeat(64))))
+            .map_err(|r| r.to_string())
+            .expect_err("a malformed duration is refused");
+        assert!(
+            !shown.contains('\u{1b}'),
+            "a control byte is escaped: {shown}"
+        );
+        assert!(
+            shown.starts_with("IPE_TEST_DURATION must be a duration"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_duration_reads_the_live_environment() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION_LIVE", 30, "duration");
+        locked_remove_var("IPE_TEST_DURATION_LIVE");
+        let absent = duration.read();
+        locked_set_var("IPE_TEST_DURATION_LIVE", "1h30m");
+        let set = duration.read();
+        locked_set_var("IPE_TEST_DURATION_LIVE", "1h30");
+        let malformed = duration.read();
+        locked_remove_var("IPE_TEST_DURATION_LIVE");
+        assert_eq!(absent, Ok(30));
+        assert_eq!(set, Ok(5400));
+        assert!(malformed.is_err_and(|r| r.name() == "IPE_TEST_DURATION_LIVE"));
+    }
+
+    #[test]
+    fn both_zero_rules_honour_the_contract() {
+        for zero in [ZeroCeiling::Refused, ZeroCeiling::Accepted] {
+            assert_env_ceiling_contract(EnvCeiling::new("IPE_TEST_CEILING", 7, zero, "count"));
+        }
+    }
+
+    #[test]
+    fn process_output_ceiling_refuses_a_malformed_value() {
+        assert_env_ceiling_contract(PROCESS_OUTPUT_CEILING);
+        locked_set_var("IPE_PROCESS_OUTPUT_MAX", "16MiB");
+        let refused = process_output_ceiling();
+        locked_remove_var("IPE_PROCESS_OUTPUT_MAX");
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_PROCESS_OUTPUT_MAX"),
+            "a suffixed output ceiling must refuse the spawn"
+        );
+    }
+
+    #[test]
+    fn a_narrowing_overflow_is_refused_too_large() {
+        let ceiling = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
+        let refused = ceiling.parse_as::<u8>(Ok("256".to_owned()));
+        assert!(refused.is_err_and(|r| r.defect() == CeilingDefect::TooLarge));
+        assert_eq!(ceiling.parse_as::<u8>(Ok("255".to_owned())), Ok(255));
+    }
+
+    #[test]
+    fn the_echoed_value_is_truncated_and_escaped() {
+        let ceiling = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
+        let long = format!("\u{1b}[31m{}", "9x".repeat(64));
+        let shown = ceiling
+            .parse(Ok(long))
+            .map_err(|r| r.to_string())
+            .expect_err("a non-decimal value is refused");
+        assert!(
+            !shown.contains('\u{1b}'),
+            "a control byte is escaped: {shown}"
+        );
+        assert!(
+            shown.len()
+                < "IPE_TEST_CEILING must be a count (got \"\")".len() + 8 * ENV_VALUE_SHOWN_CHARS,
+            "the echo is bounded: {shown}"
+        );
+    }
+
+    /// Every runtime source file, as `(path under src/, text)`.
+    fn runtime_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root.clone()];
+        let mut out = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the runtime source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .expect("under src/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = std::fs::read_to_string(&path).expect("a UTF-8 source file");
+                    out.push((rel, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// The functions that read the environment and parse a number without
+    /// [`EnvCeiling`], as `(file, fn, why)`.
+    const NON_CEILING_READS: [(&str, &str, &str); 5] = [
+        (
+            "control.rs",
+            "control_port_from_env",
+            "a port: absent or malformed opens no control socket",
+        ),
+        (
+            "system.rs",
+            "system_getenv_int",
+            "`Env.getInt`: the parse failure is the kernel's own `Err` result",
+        ),
+        (
+            "server.rs",
+            "build_request",
+            "the number parsed is a request's `Content-Length`; the environment read is `IPE_TRUSTED_PROXY`",
+        ),
+        (
+            "regex_kernel.rs",
+            "regex_max_input_bytes",
+            "pending: the regex kernels have no error channel to refuse through",
+        ),
+        (
+            "core.rs",
+            "recursion_limit",
+            "pending: the depth guard has no error channel to refuse through",
+        ),
+    ];
+
+    /// The environment reads the scan follows.
+    const ENV_READS: [&str; 3] = [
+        concat!("read_env_var", "("),
+        concat!("read_env_var_os", "("),
+        concat!("std::env::var", "("),
+    ];
+
+    /// The exporter registry reads its names through a method on the variant.
+    const EXPORTER_READ: (&str, [&str; 2]) = (
+        concat!("ExporterEnv", "::"),
+        [concat!(".read", "()"), concat!(".raw", "()")],
+    );
+
+    /// The integer and float types a numeric `str::parse` names.
+    const NUMERIC_TYPES: [&str; 15] = [
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "NonZero",
+    ];
+
+    /// Each `fn` item of a source file, as `(name, text up to the next item)`.
+    fn fn_items(text: &str) -> Vec<(&str, &str)> {
+        let mut starts = Vec::new();
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let mut head = line.trim_start();
+            while let Some(rest) = ["pub(crate) ", "pub(super) ", "pub ", "const ", "async "]
+                .into_iter()
+                .find_map(|prefix| head.strip_prefix(prefix))
+            {
+                head = rest;
+            }
+            if let Some(after) = head.strip_prefix("fn ") {
+                let len = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                if len > 0 {
+                    starts.push((after.get(..len).unwrap_or_default(), offset));
+                }
+            }
+            offset += line.len();
+        }
+        let ends = starts.iter().skip(1).map(|&(_, at)| at).chain([text.len()]);
+        starts
+            .iter()
+            .zip(ends)
+            .map(|(&(name, at), end)| (name, text.get(at..end).unwrap_or_default()))
+            .collect()
+    }
+
+    fn reads_env(body: &str) -> bool {
+        let (exporter, methods) = EXPORTER_READ;
+        ENV_READS.iter().any(|read| body.contains(read))
+            || (body.contains(exporter) && methods.iter().any(|m| body.contains(m)))
+    }
+
+    fn parses_number(body: &str) -> bool {
+        body.contains(concat!(".parse", "()"))
+            || NUMERIC_TYPES
+                .iter()
+                .any(|ty| body.contains(&format!("{}{ty}", concat!(".parse", "::<"))))
+    }
+
+    /// Whether `body` calls the free function `name` (not a method of that name).
+    fn calls(body: &str, name: &str) -> bool {
+        body.match_indices(&format!("{name}(")).any(|(at, _)| {
+            body.get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        })
+    }
+
+    /// No function reads the environment and parses a number outside
+    /// [`EnvCeiling`] — directly, or through a same-file helper it hands the
+    /// read to. Every hit must be a listed non-ceiling read; a listed function
+    /// that no longer reads a number fails too.
+    #[test]
+    fn no_env_numeric_parse_bypasses_the_ceiling_parser() {
+        let mut seen = Vec::new();
+        let mut bypasses = Vec::new();
+        for (file, text) in runtime_sources() {
+            let items = fn_items(&text);
+            let helpers: Vec<&str> = items
+                .iter()
+                .filter(|(_, body)| parses_number(body))
+                .map(|&(name, _)| name)
+                .collect();
+            for &(name, body) in &items {
+                if !reads_env(body) {
+                    continue;
+                }
+                let helper = helpers
+                    .iter()
+                    .find(|&&helper| helper != name && calls(body, helper));
+                if !parses_number(body) && helper.is_none() {
+                    continue;
+                }
+                match NON_CEILING_READS
+                    .iter()
+                    .find(|(f, n, _)| *f == file && *n == name)
+                {
+                    Some(listed) => seen.push(*listed),
+                    None => bypasses.push(match helper {
+                        Some(helper) => format!("{file}: {name} via {helper}"),
+                        None => format!("{file}: {name}"),
+                    }),
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "parse these through `system::EnvCeiling`: {bypasses:#?}"
+        );
+        for listed in NON_CEILING_READS {
+            assert!(
+                seen.contains(&listed),
+                "{listed:?} no longer reads a number; drop it from the list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scan_follows_a_read_into_a_same_file_helper() {
+        let text = concat!(
+            "fn limit() -> usize {\n    helper(crate::system::",
+            "read_env_var",
+            "(\"IPE_X\").ok())\n}\n\nfn helper(raw: Option<String>) -> usize {\n    raw.and_then(|v| v",
+            ".parse",
+            "::<usize>().ok()).unwrap_or(1)\n}\n\nfn other() {\n    x.helper(1);\n}\n",
+        );
+        let items = fn_items(text);
+        let names: Vec<&str> = items.iter().map(|&(name, _)| name).collect();
+        assert_eq!(names, ["limit", "helper", "other"]);
+        let body = |i: usize| items.get(i).map(|&(_, body)| body).unwrap_or_default();
+        assert!(reads_env(body(0)) && !parses_number(body(0)) && calls(body(0), "helper"));
+        assert!(parses_number(body(1)));
+        assert!(
+            !calls(body(2), "helper"),
+            "a method of the same name is not the helper"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2440,7 +3383,7 @@ mod gutter_line_tests {
     #[test]
     fn indents_only_under_a_terminal() {
         // Terminal stderr → 4-space gutter for the human dev loop (nests under
-        // the CLI's own `[ipe watch] ...` status lines).
+        // the CLI's own `[ipe dev watch] ...` status lines).
         assert_eq!(
             gutter_line("[ipe.http.server] listening on http://127.0.0.1:8000", true),
             "    [ipe.http.server] listening on http://127.0.0.1:8000"
@@ -2616,7 +3559,7 @@ mod scrub_log_controls_tests {
     #[test]
     fn is_log_hazard_is_the_terminal_set_for_every_char() {
         for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
-            let terminal = c.is_control() || ipe_diagnostics::terminal::is_denied_format_char(c);
+            let terminal = ipe_diagnostics::terminal::is_display_hazard(c);
             assert_eq!(super::is_log_hazard(c), terminal, "U+{:04X}", u32::from(c));
         }
     }
@@ -2651,6 +3594,97 @@ mod scrub_log_controls_tests {
             }))
             .collect();
         assert_eq!(parsed, expected);
+    }
+
+    /// Inverse of the scrub, for the injectivity proof: `\\`, `\n`, `\r`, `\t`, `\u{h}`.
+    fn unscrub(s: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next()? {
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    if chars.next()? != '{' {
+                        return None;
+                    }
+                    let hex: String = chars.by_ref().take_while(|&h| h != '}').collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn backslash_is_escaped_so_distinct_inputs_never_print_alike() {
+        assert_ne!(
+            scrub_log_controls("a\\u{200b}"),
+            scrub_log_controls("a\u{200b}")
+        );
+        assert_ne!(scrub_log_controls("a\\nb"), scrub_log_controls("a\nb"));
+        let path = scrub_log_controls("C:\\x");
+        assert!(matches!(path, std::borrow::Cow::Owned(_)), "{path:?}");
+        assert_eq!(path, "C:\\\\x");
+    }
+
+    #[test]
+    fn scrub_output_decodes_back_to_its_input() {
+        for input in [
+            "a\nb\r\x1b[2J\x7f\u{9b}\u{85}\0c\td",
+            "a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{2069}f\u{200f}g\u{61c}h\u{202a}i",
+            "adm\u{200B}in\u{E0041}\u{AD}\u{2060}\u{FEFF}",
+            "GET /caf\u{e9} 200 3ms",
+            "a\\u{200b}",
+            "a\u{200b}",
+            "C:\\x\\\\y\\",
+        ] {
+            let out = scrub_log_controls(input);
+            assert_eq!(unscrub(&out).as_deref(), Some(input), "{out:?}");
+        }
+    }
+
+    /// The cap bounds the escaped output, cuts on a whole escape, and marks the cut.
+    #[test]
+    fn capped_scrub_is_visible_bounded_and_marks_the_cut() {
+        use super::{SCRUB_TRUNCATED, scrub_log_controls_capped};
+        assert_ne!(
+            scrub_log_controls_capped("/adm\u{200b}in", 256),
+            scrub_log_controls_capped("/admin", 256)
+        );
+        assert_eq!(
+            scrub_log_controls_capped("/adm\u{200b}in", 256),
+            "/adm\\u{200b}in"
+        );
+        assert_eq!(scrub_log_controls_capped("/admin", 256), "/admin");
+        // A cut never splits an escape and never passes for an uncut record.
+        let cut = scrub_log_controls_capped("abc\u{e0041}", 8);
+        assert_eq!(cut, format!("abc{SCRUB_TRUNCATED}"));
+        assert_ne!(cut, scrub_log_controls_capped("abc\\…", 64));
+        assert_eq!(unscrub("abc\\…"), None);
+        for input in ["\u{202e}".repeat(100), "\\".repeat(300), "é".repeat(300)] {
+            let out = scrub_log_controls_capped(&input, 256);
+            assert!(out.len() <= 256 + SCRUB_TRUNCATED.len(), "{}", out.len());
+            assert!(out.ends_with(SCRUB_TRUNCATED), "{out:?}");
+            let kept = out.strip_suffix(SCRUB_TRUNCATED).unwrap_or(&out);
+            let decoded = unscrub(kept);
+            assert!(
+                decoded.as_deref().is_some_and(|d| input.starts_with(d)),
+                "{out:?}"
+            );
+        }
+        for input in ["GET /caf\u{e9}", "a\u{2028}b\u{200B}c\u{E0041}d", "C:\\x"] {
+            let out = scrub_log_controls_capped(input, 256);
+            assert_eq!(out, scrub_log_controls(input));
+            assert_eq!(unscrub(&out).as_deref(), Some(input));
+        }
     }
 
     #[test]
@@ -2804,7 +3838,9 @@ mod parent_death_floor_tests {
         }))
         .expect("queue the next job");
         drop(jobs);
-        let runner = std::thread::spawn(move || run_spawn_jobs(&queue));
+        let runner = std::thread::Builder::new()
+            .spawn(move || run_spawn_jobs(&queue))
+            .expect("spawn test thread");
         let next = seen.recv_timeout(Duration::from_secs(10));
         runner.join().expect("the spawner loop must not unwind");
         assert_eq!(next, Ok(()), "the job after an unwind must still run");
@@ -2816,7 +3852,9 @@ mod parent_death_floor_tests {
     fn a_panicking_spawn_is_refused_as_spawn_panicked() {
         use super::request_spawn;
         let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
-        let runner = std::thread::spawn(move || run_spawn_jobs(&queue));
+        let runner = std::thread::Builder::new()
+            .spawn(move || run_spawn_jobs(&queue))
+            .expect("spawn test thread");
         let refused = request_spawn(
             &jobs,
             Duration::from_secs(10),
@@ -2860,10 +3898,12 @@ mod parent_death_floor_tests {
             "{refused:?}"
         );
         let (drained, eof) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = drained.send(reader.read_to_end(&mut out).map(|_| out));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut out = Vec::new();
+                let _ = drained.send(reader.read_to_end(&mut out).map(|_| out));
+            })
+            .expect("spawn test thread");
         let written = eof.recv_timeout(Duration::from_secs(10));
         assert!(
             matches!(&written, Ok(Ok(out)) if out.is_empty()),
@@ -2876,7 +3916,9 @@ mod parent_death_floor_tests {
     #[test]
     fn a_dropped_request_is_reported_gone() {
         let (jobs, queue) = std::sync::mpsc::sync_channel::<SpawnJob>(1);
-        let dropper = std::thread::spawn(move || drop(queue.recv()));
+        let dropper = std::thread::Builder::new()
+            .spawn(move || drop(queue.recv()))
+            .expect("spawn test thread");
         let refused = spawn_hardened_on(
             &jobs,
             Duration::from_secs(5),
@@ -3142,7 +4184,7 @@ mod listen_port_tests {
             for r in [resolve(None, var, Some("9200")), resolve(None, var, None)] {
                 let msg = r.addr_in_use_message();
                 assert!(
-                    msg.contains(&format!("{var}=8123 ipe run")),
+                    msg.contains(&format!("{var}=8123 ipe dev run")),
                     "the advice must name {var}: {msg}"
                 );
                 assert!(
@@ -3244,22 +4286,26 @@ mod env_overlay_tests {
         let writer = {
             let key = key.clone();
             let stop = stop.clone();
-            std::thread::spawn(move || {
-                let mut i: u64 = 0;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    locked_set_var(&key, &i.to_string());
-                    locked_remove_var(&key);
-                    i = i.wrapping_add(1);
-                }
-            })
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let mut i: u64 = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        locked_set_var(&key, &i.to_string());
+                        locked_remove_var(&key);
+                        i = i.wrapping_add(1);
+                    }
+                })
+                .expect("spawn test thread")
         };
 
-        let reader = std::thread::spawn(move || {
-            for _ in 0..200 {
-                // Exercises libc `getaddrinfo`, the unlocked `environ` reader.
-                let _ = "localhost:0".to_socket_addrs().map(Iterator::count);
-            }
-        });
+        let reader = std::thread::Builder::new()
+            .spawn(move || {
+                for _ in 0..200 {
+                    // Exercises libc `getaddrinfo`, the unlocked `environ` reader.
+                    let _ = "localhost:0".to_socket_addrs().map(Iterator::count);
+                }
+            })
+            .expect("spawn test thread");
 
         let _ = reader.join();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3390,6 +4436,62 @@ mod process_run_tests {
             "64 bytes of output under an 8-byte ceiling must Err, not OOM/truncate"
         );
     }
+
+    /// Whether a live process's command line carries `marker`.
+    #[cfg(target_os = "linux")]
+    fn a_process_carries(marker: &str) -> bool {
+        std::fs::read_dir("/proc").is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                std::fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
+                    cmdline
+                        .split(|b| *b == 0)
+                        .any(|arg| arg == marker.as_bytes())
+                })
+            })
+        })
+    }
+
+    /// A refused capture thread is an `Err`, and the child it would have
+    /// drained is killed and reaped rather than left running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_capture_thread_errs_and_reaps_the_child() {
+        let marker = format!("ipe-capture-refusal-probe-{}", std::process::id());
+        let _refusing = crate::threads::refusal_hook::refuse(CAPTURE_THREAD);
+        let args = [
+            "-c".to_owned(),
+            // A builtin-only loop: `sh` never forks, so no grandchild can carry
+            // the marker past the kill.
+            "while :; do :; done".to_owned(),
+            marker.clone(),
+        ];
+        let refused = process_run_sync("sh", &args, 64);
+        assert!(
+            matches!(&refused, Err(e) if e.contains("capture thread refused")),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        assert!(
+            !a_process_carries(&marker),
+            "the child of a refused capture must be killed and reaped"
+        );
+    }
+
+    /// A blocking pool that cannot start a thread makes the Task fail as
+    /// `Unavailable`, the retryable kind.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_refused_offload_is_an_unavailable_task_error() {
+        let _refusing = crate::threads::refusal_hook::refuse("Process");
+        let res = block(process_run::<IpeError>("true".to_owned(), vec![]));
+        assert!(
+            matches!(
+                res,
+                IpeResult::Err(ref e) if crate::ipe_error_kind(e.clone()) == crate::IpeErrorKind::Unavailable
+            ),
+            "{res:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3476,12 +4578,20 @@ mod process_run_with_tests {
         assert!(matches!(res, IpeResult::Err(_)));
     }
 
-    /// cwd override is honoured: `pwd` must echo the target directory.
+    /// A cwd override is honoured: the child's own idea of its directory
+    /// must echo the target.
+    ///
+    /// `cmd /C cd` on Windows, never `sh`/`pwd` — Git Bash's `sh` rewrites
+    /// the native path through its own MSYS translation, so its `pwd`
+    /// output would never match the native override we set and check.
     #[test]
     fn cwd_override_is_honoured() {
         let tmp = crate::scratch_core::test_temp_root();
         let tmp_str = tmp.to_string_lossy().into_owned();
+        #[cfg(not(windows))]
         let mut c = cfg("sh", &["-c", "pwd"]);
+        #[cfg(windows)]
+        let mut c = cfg("cmd", &["/C", "cd"]);
         c.cwd = IpeMaybe::Just(tmp_str.clone());
         let res: IpeResult<String, ProcessRunOutput> = block(process_run_with::<String>(c));
         match res {

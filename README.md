@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh |
 ```sh
 ipe init counter        # scaffolds a served web app — the default shape
 cd counter
-ipe run                 # serves at http://localhost:8000 (server-rendered HTML + live SSE)
+ipe dev run             # serves at http://localhost:8000 (server-rendered HTML + live SSE)
 ```
 
 On a TTY `ipe init` asks the shape (`web` / `tui` / `cli` / `worker` / `server` / `script`) and, for the web shape, 
@@ -126,26 +126,26 @@ served counter with the released binary, once the runtime's dependencies are com
 
 - **Elm syntax** — Hindley–Milner inference, exhaustive `case`, immutable data; no `null`, no runtime exceptions.
 - **Comprehensive stdlib** — web (SSR + SSE), typed HTTP and SQL, auth, email, cache, pub/sub, WebSockets — all behind one `Task Error a` boundary with a typed `Error`.
-- **Compiles to readable Rust**, incrementally (salsa); `ipe watch` hot-swaps most edits and recompiles only on a type change.
+- **Compiles to readable Rust**, incrementally (salsa); `ipe dev watch` hot-swaps most edits and recompiles only on a type change.
 - **No authored abrupt failure** — the compiler and runtime carry no `panic!` / `unwrap` / `expect` / index panic; every failure is a typed `Result` or diagnostic.
 - **Capabilities are inferred, not declared** — `ipe capabilities <entry>` reports exactly what a program may do (network, fs, env, ffi, …). → [capabilities](docs/reference/capabilities.md)
 - **Accessible by default** — real `<button>`s, semantic landmarks, a contrast-safe focus ring, and reduced-motion honored out of the box.
 - **Rust FFI** — `ipe rust add <crate>` binds a crate as a generated `Rust.<Crate>` interface (sandbox-inspected; discloses the `native-ffi` capability). → [dependencies](docs/guide/getting-started.md)
-- **Delivery grammar** — `ipe build web desktop|ios|android` for a fast dev bundle, `ipe release web desktop|ios|android` for a production distributable (desktop-webview or mobile system-webview shell).
-- **Eject to plain Rust** — `ipe eject` vendors and tree-shakes the runtime into a standalone Cargo project you build with no `ipe` toolchain.
-- **Static binary** — `ipe build --static` produces a fully-static musl single binary — copy and run anywhere.
+- **Delivery grammar** — `ipe dev build web desktop|ios|android` for a fast dev bundle, `ipe release build web desktop|ios|android` for a production distributable (desktop-webview or mobile system-webview shell).
+- **Eject to plain Rust** — `ipe release eject` vendors and tree-shakes the runtime into a standalone Cargo project you build with no `ipe` toolchain.
+- **Static binary** — `ipe dev build --static` produces a fully-static musl single binary — copy and run anywhere.
 
 ## Tooling
 
 - `ipe lint` / `ipe lint --fix` — advisory static analysis, configured by a `lint.ipe`. → [lint guide](docs/guide/lint.md)
 - `ipe lsp` — completion, go-to-definition, find-references, rename, code actions, semantic tokens over stdio. → [editor setup](docs/topics/editor-integration.md)
-- `ipe run --record` records a cli/worker app's TEA session (each `(msg, model)` step, bounded ring) to `out/session.ipelog` as plain text, plus a typed `out/session.ipemsgs` when the app's `Msg` is encodable. `ipe run --replay [<log>]` rebuilds the app and re-folds `update` over that log from `init` (or from the recorded base, if the ring overflowed) with no `Cmd` fired — no I/O, network or DB effect runs again — printing each step, control bytes stripped, and the final model. The same program and log give byte-identical output, so a hand-typed bug reproduction becomes a shareable regression. A log from a changed program, or a truncated or oversized one, is refused whole. A `Msg` carrying a `Secret` is recorded as a trace only; `--replay` then shows that trace (the default when no typed log exists, or any `.ipelog` you name) — labelled as a trace, nothing re-run, capped, and with every control character stripped, so a handed-over or planted log cannot drive your terminal. Read logs with `--replay`, not `cat`.
+- `ipe dev run --record` records a cli/worker app's TEA session (each `(msg, model)` step, bounded ring) to `out/session.ipelog` as plain text, plus a typed `out/session.ipemsgs` when the app's `Msg` is encodable. `ipe dev run --replay [<log>]` rebuilds the app and re-folds `update` over that log from `init` (or from the recorded base, if the ring overflowed) with no `Cmd` fired — no I/O, network or DB effect runs again — printing each step, control bytes stripped, and the final model. The same program and log give byte-identical output, so a hand-typed bug reproduction becomes a shareable regression. A log from a changed program, or a truncated or oversized one, is refused whole. A `Msg` carrying a `Secret` is recorded as a trace only; `--replay` then shows that trace (the default when no typed log exists, or any `.ipelog` you name) — labelled as a trace, nothing re-run, capped, and with every control character stripped, so a handed-over or planted log cannot drive your terminal. Read logs with `--replay`, not `cat`.
 
   ```sh
-  printf 'add 2\nadd 5\n' | ipe run --record  # runs the app, writes out/session.ipelog + out/session.ipemsgs
-  ipe run --replay                               # start + one "<msg> => <model>" line per step + final model
-  ipe run --replay bug.ipemsgs                   # replay a log someone sent you
-  ipe run --replay bug.ipelog                    # show a trace someone sent you, sanitised
+  printf 'add 2\nadd 5\n' | ipe dev run --record  # runs the app, writes out/session.ipelog + out/session.ipemsgs
+  ipe dev run --replay                               # start + one "<msg> => <model>" line per step + final model
+  ipe dev run --replay bug.ipemsgs                   # replay a log someone sent you
+  ipe dev run --replay bug.ipelog                    # show a trace someone sent you, sanitised
   ```
 - `ipe add <pkg>[@<req>]` / `ipe remove <pkg>` — add or remove an Ipê package dependency. `add` resolves the requirement through the index (fetch, hash-verify), records the exact pin in `ipe.lock`, and writes the requirement into `package.ipe`'s `dependencies` block so a fresh clone re-resolves the same dependency; `remove` drops it from both. Author-written `depGit`/`depPath` escapes are left untouched — `add` never overwrites one.
 
@@ -158,7 +158,7 @@ served counter with the released binary, once the runtime's dependencies are com
 
 ## Static compilation
 
-`ipe build --static` produces a fully-static musl binary (zero runtime dependencies), after running
+`ipe dev build --static` produces a fully-static musl binary (zero runtime dependencies), after running
 `rustup target add x86_64-unknown-linux-musl`.
 
 ## Support

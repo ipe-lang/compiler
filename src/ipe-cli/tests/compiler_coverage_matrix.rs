@@ -16,12 +16,6 @@ use ipe::coverage::matrix;
 /// tracked gaps. Remove an entry once the gap is fixed; the
 /// `allowlisted_holes_are_still_real` test will catch stale entries.
 const ALLOWLIST: &[(&str, &str, &str)] = &[
-    // ── no-panic gaps ────────────────────────────────────────────────────────
-    (
-        "no-panic",
-        "ipe_ffi",
-        "production source contains unwrap/expect/panic — tracked soundness debt",
-    ),
     // ── tested gaps ──────────────────────────────────────────────────────────
     (
         "tested",

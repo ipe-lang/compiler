@@ -38,7 +38,7 @@ pulse =
         |> Animation.withFillMode Animation.forwards
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 animation shorthand tail (name is added by the render sink):

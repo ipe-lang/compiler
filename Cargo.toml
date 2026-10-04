@@ -21,6 +21,7 @@ members = [
     "src/ffi-bindgen-macro",
     "src/compiler/sandbox",
     "src/compiler/watch",
+    "src/compiler/fs_open",
     "src/stdlib",
     "src/wasm",
     "src/lsp/features",

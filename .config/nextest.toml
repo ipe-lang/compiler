@@ -34,7 +34,7 @@ path = "junit.xml"
 # Serialized resource groups. A group caps how many of its members run at once;
 # use it only for tests that contend on a resource a code fix cannot isolate.
 #
-# `heavy-server-e2e` (max 1): each member spawns a REAL `ipe watch` / server
+# `heavy-server-e2e` (max 1): each member spawns a REAL `ipe dev watch` / server
 # subprocess that cold-`cargo build`s a full axum/tokio crate into the one shared
 # emitted-crate target and then binds a real TCP port. Run in parallel these
 # starve each other's cold build (read as a spurious teardown/serve-budget

@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! End-to-end proof for the DEV-ONLY blue-green front proxy in `ipe watch`
+//! End-to-end proof for the DEV-ONLY blue-green front proxy in `ipe dev watch`
 //! (`crate::watch` with `WatchOptions::bluegreen`).
 //!
 //! The load-bearing property: a rebuild behind the proxy does NOT drop the
@@ -169,6 +169,7 @@ fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })
 }
 
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch(
     entry: &Path,
     out_dir: &Path,
@@ -190,7 +191,7 @@ fn start_watch(
         quiescence: Duration::from_millis(120),
         hard_cap: Duration::from_millis(600),
     };
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 /// One `GET / HTTP/1.1` on an ALREADY-OPEN keep-alive socket, returning the
@@ -464,9 +465,8 @@ fn run_measurement(bluegreen: bool, port: u16, tag: &str) -> Result<(), BoxError
         // Kick a background prober that measures the tail across the edit.
         let old_c = old.clone();
         let new_c = new.clone();
-        let prober = std::thread::spawn(move || {
-            measure_rebuild_tail(port, &old_c, &new_c, Duration::from_mins(2))
-        });
+        let prober = std::thread::Builder::new()
+            .spawn(move || measure_rebuild_tail(port, &old_c, &new_c, Duration::from_mins(2)))?;
         // Give the prober a beat to establish the baseline, then edit.
         std::thread::sleep(Duration::from_millis(50));
         write_main(&ipe_dir, &web_fixture(&new))?;
@@ -845,7 +845,7 @@ fn bluegreen_rebuild_preserves_state_on_additive_model_change() -> Result<(), Bo
     stop_and_join(&handle, join)
 }
 
-/// The flag-OFF control: with `bluegreen` disabled, `ipe watch` keeps its
+/// The flag-OFF control: with `bluegreen` disabled, `ipe dev watch` keeps its
 /// direct-bind behaviour — a rebuild still swaps the served binary (proving
 /// the default path is unchanged). It does NOT assert socket survival (the
 /// direct path drops connections on restart by design).

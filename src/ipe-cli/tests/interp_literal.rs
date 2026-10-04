@@ -1,6 +1,6 @@
 //! Regression: a numeric literal argument inside a `{{...}}` interpolation.
 //!
-//! The no-panic fuzzer (`tools/scripts/fuzz-well-typed.sh`, template `multilineinterp`)
+//! The no-panic fuzzer (template `tests/fuzz/well-typed/multilineinterp/Main.ipe.tmpl`)
 //! built the well-typed program
 //!
 //! ```ipe
@@ -16,7 +16,7 @@
 //! rather than compiling. The fix recognises the literal (`Expr_::Int(54)`), so
 //! `{{String.fromInt 54}}` lowers to `String.fromInt 54` and prints "54".
 //!
-//! The compile check is a PURE ipe build (no cargo) — it always runs and
+//! The compile check is a PURE ipe dev build (no cargo) — it always runs and
 //! directly reproduces the fuzzer failure at the ipe level. The run check is
 //! `IPE_E2E`-gated (builds + runs the emitted binary).
 

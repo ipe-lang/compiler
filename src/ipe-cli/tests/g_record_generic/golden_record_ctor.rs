@@ -174,7 +174,7 @@ fn seal_fn_field_alias_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build failed: {:?}", built.err());
+    assert!(built.is_ok(), "ipe dev build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("record_ctor_fn_field", &out);
     assert_eq!(
@@ -251,7 +251,7 @@ fn seal_opaque_field_alias_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build failed: {:?}", built.err());
+    assert!(built.is_ok(), "ipe dev build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("record_ctor_opaque_field", &out);
     assert_eq!(
@@ -288,7 +288,7 @@ fn seal_opaque_field_used_as_ctor_fails_closed() {
     // Fail-closed at the name-resolution stage: no `main.rs` was emitted.
     assert!(
         !out.join("src").join("main.rs").exists(),
-        "a fail-closed ipe build must not emit a project"
+        "a fail-closed ipe dev build must not emit a project"
     );
 }
 

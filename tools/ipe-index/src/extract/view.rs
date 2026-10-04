@@ -1,9 +1,13 @@
 //! The canonical view of a unit's source and its attestation hash.
 //!
-//! This is the one definition of "the bytes a unit names": every `body_hash`
-//! the index stores is `attest(view_text(src, line_start, line_end))`, and the
-//! code-review app re-derives it with the same rule before showing a unit. The
-//! rule is pinned for both sides by `tests/view_hash_vectors.json`.
+//! This is the one definition of "the bytes a unit names" and of their
+//! attestation: every `body_hash` the index stores is `attest` of the text the
+//! unit reviews. For every unit but a `file` unit that text is
+//! `view_text(src, line_start, line_end)`; a `file` unit attests its residual
+//! (`extract::residual_text`), built from `view_lines`. The code-review app
+//! re-derives the hash with the same rules before showing a unit. The rules are
+//! pinned for both sides by `tests/view_hash_vectors.json` and
+//! `tests/residual_vectors.json`.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;

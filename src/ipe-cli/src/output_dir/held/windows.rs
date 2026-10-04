@@ -1,13 +1,12 @@
-//! Windows directory primitives: handle-relative opens, and path acts under a pin.
+//! Windows write-side primitives: handle-relative creates and deletes, and path acts under a pin.
 //!
-//! Every open, classification, create, and file removal names one entry
-//! relative to the held directory handle (`NtCreateFile` with a root directory,
-//! through `cap-primitives`), with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse
-//! point at the entry is refused or removed as itself, never traversed. A
-//! reparse point set on the held directory afterwards does not redirect those
-//! acts: they start from the directory object the handle holds, not from a path.
-//! A handle-relative delete never admits a directory: it opens without backup
-//! semantics, which makes the open fail on any directory.
+//! Opening, classifying, and identifying a held level live in [`ipe_fs_open`].
+//! Creating a file and removing a non-directory name one entry relative to the
+//! held directory handle (`NtCreateFile` with a root directory, through
+//! `cap-primitives`), with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse point at
+//! the entry is removed as itself, never traversed. A handle-relative delete
+//! never admits a directory: it opens without backup semantics, which makes the
+//! open fail on any directory.
 //!
 //! Creating a subdirectory, removing one, renaming, and listing have no
 //! handle-relative form without raw system calls, so they name the entry by the
@@ -27,13 +26,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::MetadataExt as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
-
-use super::super::win32_name;
-use super::{DirId, EntryKind};
+use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -63,12 +60,6 @@ const ERROR_LOCK_VIOLATION: i32 = 33;
 const PIN_PREFIX: &str = ".ipe-pin-";
 /// How many sentinel names a pin tries before giving up.
 const PIN_ATTEMPTS: u32 = 8;
-/// A held directory handle and the reparse-free path proven to name it.
-#[derive(Debug)]
-pub struct Dir {
-    file: File,
-    real: PathBuf,
-}
 
 /// The error for a reparse point met where a plain entry was required.
 fn reparse_point() -> io::Error {
@@ -93,26 +84,24 @@ pub fn is_in_use(error: &io::Error) -> bool {
     )
 }
 
-/// Check that `file` holds a plain directory, never a reparse point.
-fn require_plain_dir(file: &File) -> io::Result<()> {
-    let attributes = file.metadata()?.file_attributes();
-    if attributes & ATTR_REPARSE_POINT != 0 {
-        Err(reparse_point())
-    } else if attributes & ATTR_DIRECTORY == 0 {
-        Err(io::ErrorKind::NotADirectory.into())
-    } else {
-        Ok(())
+/// The [`io::Error`] a refused re-proof of a held directory stands for.
+///
+/// A held directory that became a reparse point answers the raw reparse
+/// refusal ([`is_reparse_refusal`]) and one held elsewhere the raw sharing
+/// violation ([`is_in_use`]), so callers classify both as before.
+fn reproof_error(refusal: OpenRefusal) -> io::Error {
+    match refusal {
+        OpenRefusal::Link => reparse_point(),
+        OpenRefusal::InUse => io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION),
+        OpenRefusal::Absent
+        | OpenRefusal::NotRegular(_)
+        | OpenRefusal::Denied
+        | OpenRefusal::TooLarge(_)
+        | OpenRefusal::TooManyEntries(_)
+        | OpenRefusal::BadName
+        | OpenRefusal::NotUtf8
+        | OpenRefusal::Io(_) => refusal.into_io(),
     }
-}
-
-/// Options opening a directory handle that denies delete sharing and never follows a reparse point.
-fn dir_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .share_mode(SHARE_NO_DELETE)
-        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT);
-    options
 }
 
 /// Options opening any entry for its attributes only, never following a reparse point.
@@ -138,95 +127,20 @@ fn delete_options() -> OpenOptions {
     options
 }
 
-/// Open `real` by path as a directory handle, never through a reparse point at its final component.
-fn open_dir_at(real: PathBuf) -> io::Result<Dir> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(SHARE_NO_DELETE)
-        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
-        .open(&real)?;
-    require_plain_dir(&file)?;
-    Ok(Dir { file, real })
-}
-
-/// Open `path` as a directory, following links on the way.
-///
-/// The canonical path is walked again from the volume root, each level opened
-/// through the held level above it without following a reparse point, so the
-/// returned handle is the one its real path names.
-///
-/// # Errors
-/// [`io::ErrorKind::NotFound`] when absent; [`io::ErrorKind::NotADirectory`]
-/// for a non-directory; a reparse refusal ([`is_reparse_refusal`]) for a level
-/// that is a reparse point; another error on another failure.
-pub fn open_following(path: &Path) -> io::Result<Dir> {
-    let real = std::fs::canonicalize(path)?;
-    let mut parts = real.components();
-    let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) = (parts.next(), parts.next())
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} has no volume root", real.display()),
-        ));
-    };
-    let mut root = PathBuf::from(prefix.as_os_str());
-    root.push(Component::RootDir.as_os_str());
-    let mut dir = open_dir_at(root)?;
-    for part in parts {
-        let Component::Normal(name) = part else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a canonical path", real.display()),
-            ));
-        };
-        dir = dir.open_dir(name)?;
-    }
-    Ok(dir)
-}
-
-/// The identity of the directory looking `path` up now reaches, following links.
-///
-/// # Errors
-/// When `path` cannot be opened.
-pub fn id_of_path(path: &Path) -> io::Result<DirId> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(BACKUP_SEMANTICS)
-        .open(path)?;
-    id_of(&file)
-}
-
-/// The volume serial number and file index of the object `file` holds.
-fn id_of(file: &File) -> io::Result<DirId> {
-    let info = winapi_util::file::information(file)?;
-    Ok(DirId {
-        dev: info.volume_serial_number(),
-        ino: info.file_index(),
-    })
-}
-
-/// Whether `name` is a single plain entry name ([`win32_name::is_verbatim_entry_name`]).
-///
-/// A name that is not valid Unicode cannot be checked, so it is refused.
-pub fn is_plain_name(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(win32_name::is_verbatim_entry_name)
-}
-
-/// The error refusing `name` as not a plain entry name.
-fn not_plain(name: &OsStr) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("{} is not a plain entry name", name.to_string_lossy()),
-    )
-}
-
 /// Whether `name` is a pin sentinel, which a listing never shows.
 fn is_pin_name(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(PIN_PREFIX))
+}
+
+/// Open the entry `name` of `dir` relative to its handle.
+fn open_at(dir: &HeldDir, name: &EntryName, options: &OpenOptions) -> io::Result<File> {
+    cap_primitives::fs::open(dir.handle(), Path::new(name.as_os_str()), options)
+}
+
+/// The real path of the entry `name` of `dir`.
+fn entry_path(dir: &HeldDir, name: &EntryName) -> PathBuf {
+    dir.real_path().join(name.as_os_str())
 }
 
 /// A sentinel file held open inside a directory, which keeps it from becoming a reparse point.
@@ -241,214 +155,139 @@ struct Pin {
 /// Sequence number that keeps concurrent pins of one process apart.
 static PIN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-impl Dir {
-    /// Open the entry `name` relative to this handle.
-    fn open_at(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
-        if is_plain_name(name) {
-            cap_primitives::fs::open(&self.file, Path::new(name), options)
-        } else {
-            Err(not_plain(name))
-        }
-    }
-
-    /// The real path of the entry `name`, which must be a plain name.
-    fn entry(&self, name: &OsStr) -> io::Result<PathBuf> {
-        if is_plain_name(name) {
-            Ok(self.real.join(name))
-        } else {
-            Err(not_plain(name))
-        }
-    }
-
-    /// Pin this directory for the duration of a path act.
-    ///
-    /// # Errors
-    /// A reparse refusal when the directory already is a reparse point; another
-    /// error when no sentinel can be created.
-    fn pin(&self) -> io::Result<Pin> {
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .share_mode(SHARE_READ)
-            .attributes(ATTR_HIDDEN_TEMPORARY)
-            .custom_flags(DELETE_ON_CLOSE | OPEN_REPARSE_POINT);
-        let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
-        for _ in 0..PIN_ATTEMPTS {
-            let sequence = PIN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!("{PIN_PREFIX}{}-{sequence}", std::process::id());
-            match self.open_at(OsStr::new(&name), &options) {
-                Ok(sentinel) => {
-                    let pin = Pin {
-                        _sentinel: sentinel,
-                    };
-                    require_plain_dir(&self.file)?;
-                    return Ok(pin);
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = e,
-                Err(e) => return Err(e),
+/// Pin `dir` for the duration of a path act.
+///
+/// # Errors
+/// A reparse refusal when the directory already is a reparse point; another
+/// error when no sentinel can be created.
+fn pin(dir: &HeldDir) -> io::Result<Pin> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .share_mode(SHARE_READ)
+        .attributes(ATTR_HIDDEN_TEMPORARY)
+        .custom_flags(DELETE_ON_CLOSE | OPEN_REPARSE_POINT);
+    let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
+    for _ in 0..PIN_ATTEMPTS {
+        let sequence = PIN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{PIN_PREFIX}{}-{sequence}", std::process::id());
+        let name = EntryName::parse(OsStr::new(&name)).map_err(OpenRefusal::into_io)?;
+        match open_at(dir, &name, &options) {
+            Ok(sentinel) => {
+                let pin = Pin {
+                    _sentinel: sentinel,
+                };
+                dir.reprove().map_err(reproof_error)?;
+                return Ok(pin);
             }
-        }
-        Err(last)
-    }
-
-    /// The attributes of the entry `name`, read without following a reparse point; `None` when absent.
-    fn attributes(&self, name: &OsStr) -> io::Result<Option<u32>> {
-        match self.open_at(name, &stat_options()) {
-            Ok(file) => Ok(Some(file.metadata()?.file_attributes())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
         }
     }
+    Err(last)
+}
 
-    /// Open the subdirectory `name`, failing on a reparse point or a non-directory.
-    pub fn open_dir(&self, name: &OsStr) -> io::Result<Self> {
-        let file = self.open_at(name, &dir_options())?;
-        require_plain_dir(&file)?;
-        Ok(Self {
-            file,
-            real: self.real.join(name),
-        })
+/// The attributes of the entry `name` of `dir`, read without following a reparse point; `None` when absent.
+fn attributes(dir: &HeldDir, name: &EntryName) -> io::Result<Option<u32>> {
+    match open_at(dir, name, &stat_options()) {
+        Ok(file) => Ok(Some(file.metadata()?.file_attributes())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
+}
 
-    /// Classify the entry `name` without following a reparse point.
-    ///
-    /// Every reparse point counts as a link.
-    pub fn kind(&self, name: &OsStr) -> io::Result<EntryKind> {
-        Ok(self
-            .attributes(name)?
-            .map_or(EntryKind::Absent, |attributes| {
-                if attributes & ATTR_REPARSE_POINT != 0 {
-                    EntryKind::Symlink
-                } else if attributes & ATTR_DIRECTORY != 0 {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::Other
-                }
-            }))
+/// Create the subdirectory `name` of `dir`.
+pub fn mkdir(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
+    let path = entry_path(dir, name);
+    let _pin = pin(dir)?;
+    std::fs::create_dir(path)
+}
+
+/// Exclusively create the new file `name` in `dir` for writing.
+pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .custom_flags(OPEN_REPARSE_POINT);
+    open_at(dir, name, &options)
+}
+
+/// Rename the entry `from` over the entry `to`, both in `dir`.
+pub fn rename(dir: &HeldDir, from: &EntryName, to: &EntryName) -> io::Result<()> {
+    let (from, to) = (entry_path(dir, from), entry_path(dir, to));
+    let _pin = pin(dir)?;
+    std::fs::rename(from, to)
+}
+
+/// Remove the non-directory entry `name` of `dir`; a reparse point is removed as itself.
+///
+/// A directory junction or directory link is removed as the link it is; a
+/// plain directory is refused. A non-directory is removed through an open
+/// that fails on any directory, so a directory swapped in after the check is
+/// never removed; a directory reparse point is removed by
+/// [`remove_directory`], so a file or a populated tree swapped in for it is
+/// never removed either.
+pub fn unlink(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
+    let attributes =
+        attributes(dir, name)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    if attributes & ATTR_DIRECTORY == 0 {
+        drop(open_at(dir, name, &delete_options())?);
+        Ok(())
+    } else if attributes & ATTR_REPARSE_POINT != 0 {
+        remove_directory(dir, name)
+    } else {
+        Err(io::ErrorKind::IsADirectory.into())
     }
+}
 
-    /// Create the subdirectory `name`.
-    pub fn mkdir(&self, name: &OsStr) -> io::Result<()> {
-        let path = self.entry(name)?;
-        let _pin = self.pin()?;
-        std::fs::create_dir(path)
+/// Remove the empty subdirectory `name` of `dir`, refusing anything else found there.
+///
+/// A reparse point is refused ([`is_reparse_refusal`]) and a non-directory
+/// with [`io::ErrorKind::NotADirectory`] before any removal; the removal
+/// itself fails on a non-empty directory
+/// ([`io::ErrorKind::DirectoryNotEmpty`]) and on a file swapped in after the
+/// check, so it can only ever remove an empty directory.
+pub fn rmdir(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
+    let attributes =
+        attributes(dir, name)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    if attributes & ATTR_REPARSE_POINT != 0 {
+        Err(reparse_point())
+    } else if attributes & ATTR_DIRECTORY == 0 {
+        Err(io::ErrorKind::NotADirectory.into())
+    } else {
+        remove_directory(dir, name)
     }
+}
 
-    /// Exclusively create the new file `name` for writing.
-    pub fn create_new(&self, name: &OsStr) -> io::Result<File> {
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .custom_flags(OPEN_REPARSE_POINT);
-        self.open_at(name, &options)
-    }
+/// Remove the entry `name` of `dir` with `RemoveDirectoryW`, under a pin.
+///
+/// `RemoveDirectoryW` opens the entry as a directory without following a
+/// reparse point: it removes an empty directory, or a directory reparse
+/// point as itself, and fails on a file and on a non-empty directory.
+fn remove_directory(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
+    let path = entry_path(dir, name);
+    let _pin = pin(dir)?;
+    std::fs::remove_dir(path)
+}
 
-    /// Open the existing entry `name` for reading, failing on a reparse point.
-    pub fn open_file(&self, name: &OsStr) -> io::Result<File> {
-        let mut options = OpenOptions::new();
-        options.read(true).custom_flags(OPEN_REPARSE_POINT);
-        let file = self.open_at(name, &options)?;
-        if file.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
-            return Err(reparse_point());
+/// The names of the entries of `dir`, pin sentinels excluded.
+///
+/// The listing handle is opened under a pin; once open it enumerates the
+/// directory object it holds.
+pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+    let entries = {
+        let _pin = pin(dir)?;
+        std::fs::read_dir(dir.real_path())?
+    };
+    Ok(entries.filter_map(|entry| match entry {
+        Ok(entry) => {
+            let name = entry.file_name();
+            (!is_pin_name(&name)).then_some(Ok(name))
         }
-        Ok(file)
-    }
-
-    /// Rename the entry `from` over the entry `to`, both in this directory.
-    pub fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
-        let (from, to) = (self.entry(from)?, self.entry(to)?);
-        let _pin = self.pin()?;
-        std::fs::rename(from, to)
-    }
-
-    /// Remove the non-directory entry `name`; a reparse point is removed as itself.
-    ///
-    /// A directory junction or directory link is removed as the link it is; a
-    /// plain directory is refused. A non-directory is removed through an open
-    /// that fails on any directory, so a directory swapped in after the check is
-    /// never removed; a directory reparse point is removed by
-    /// [`Dir::remove_directory`], so a file or a populated tree swapped in for
-    /// it is never removed either.
-    pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
-        let attributes = self
-            .attributes(name)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        if attributes & ATTR_DIRECTORY == 0 {
-            drop(self.open_at(name, &delete_options())?);
-            Ok(())
-        } else if attributes & ATTR_REPARSE_POINT != 0 {
-            self.remove_directory(name)
-        } else {
-            Err(io::ErrorKind::IsADirectory.into())
-        }
-    }
-
-    /// Remove the empty subdirectory `name`, refusing anything else found there.
-    ///
-    /// A reparse point is refused ([`is_reparse_refusal`]) and a non-directory
-    /// with [`io::ErrorKind::NotADirectory`] before any removal; the removal
-    /// itself fails on a non-empty directory
-    /// ([`io::ErrorKind::DirectoryNotEmpty`]) and on a file swapped in after the
-    /// check, so it can only ever remove an empty directory.
-    pub fn rmdir(&self, name: &OsStr) -> io::Result<()> {
-        let attributes = self
-            .attributes(name)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        if attributes & ATTR_REPARSE_POINT != 0 {
-            Err(reparse_point())
-        } else if attributes & ATTR_DIRECTORY == 0 {
-            Err(io::ErrorKind::NotADirectory.into())
-        } else {
-            self.remove_directory(name)
-        }
-    }
-
-    /// Remove the entry `name` with `RemoveDirectoryW`, under a pin.
-    ///
-    /// `RemoveDirectoryW` opens the entry as a directory without following a
-    /// reparse point: it removes an empty directory, or a directory reparse
-    /// point as itself, and fails on a file and on a non-empty directory.
-    fn remove_directory(&self, name: &OsStr) -> io::Result<()> {
-        let path = self.entry(name)?;
-        let _pin = self.pin()?;
-        std::fs::remove_dir(path)
-    }
-
-    /// The names of this directory's entries, pin sentinels excluded.
-    ///
-    /// The listing handle is opened under a pin; once open it enumerates the
-    /// directory object it holds.
-    pub fn names(&self) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
-        let entries = {
-            let _pin = self.pin()?;
-            std::fs::read_dir(&self.real)?
-        };
-        Ok(entries.filter_map(|entry| match entry {
-            Ok(entry) => {
-                let name = entry.file_name();
-                (!is_pin_name(&name)).then_some(Ok(name))
-            }
-            Err(e) => Some(Err(e)),
-        }))
-    }
-
-    /// Open the directory above this one; `None` at the volume root.
-    ///
-    /// The parent holds this directory, so it is not empty and cannot become a
-    /// reparse point, and it cannot be renamed while this handle is open.
-    pub fn parent(&self) -> io::Result<Option<Self>> {
-        self.real
-            .parent()
-            .map(|parent| open_dir_at(parent.to_path_buf()))
-            .transpose()
-    }
-
-    /// The identity of this directory.
-    pub fn id(&self) -> io::Result<DirId> {
-        id_of(&self.file)
-    }
+        Err(e) => Some(Err(e)),
+    }))
 }
 
 #[cfg(test)]
@@ -464,57 +303,14 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn plain_names_are_accepted() {
-        for name in [
-            "out",
-            "a.txt",
-            ".ipe-output",
-            "console.log",
-            "COM10",
-            "nul-ish",
-            "é.txt",
-        ] {
-            assert!(is_plain_name(OsStr::new(name)), "{name}");
-        }
+    /// Hold `dir` open.
+    fn held(dir: &Path) -> HeldDir {
+        HeldDir::open_root(dir).unwrap()
     }
 
-    #[test]
-    fn non_plain_names_are_refused() {
-        for name in [
-            "",
-            ".",
-            "..",
-            "a\\b",
-            "a/b",
-            "a:stream",
-            "C:",
-            "a*",
-            "a?",
-            "a\"",
-            "a<",
-            "a>",
-            "a|",
-            "a\u{1}",
-            "CON",
-            "con",
-            "NUL.txt",
-            "nul .txt",
-            "Com1",
-            "LPT9.log",
-            "COM\u{b9}",
-            "AUX ",
-        ] {
-            assert!(!is_plain_name(OsStr::new(name)), "{name:?}");
-        }
-    }
-
-    /// A name that is not valid Unicode is refused, never decoded lossily.
-    #[test]
-    fn a_non_unicode_name_is_refused() {
-        use std::os::windows::ffi::OsStringExt as _;
-        let lone_surrogate = OsString::from_wide(&[0xD800, 0x61]);
-        assert!(!is_plain_name(&lone_surrogate), "{lone_surrogate:?}");
+    /// The entry name `name`.
+    fn name(name: &str) -> EntryName {
+        EntryName::parse(OsStr::new(name)).unwrap()
     }
 
     #[test]
@@ -524,24 +320,11 @@ mod tests {
     }
 
     #[test]
-    fn a_non_plain_name_is_refused_before_any_open() {
-        let dir = scratch("nonplain");
-        let held = open_following(dir.as_path()).unwrap();
-        for name in ["..", "a:stream", "NUL", "x\\..\\y"] {
-            let refused = held.kind(OsStr::new(name));
-            assert!(
-                matches!(&refused, Err(e) if e.kind() == io::ErrorKind::InvalidInput),
-                "{name}: {refused:?}"
-            );
-        }
-    }
-
-    #[test]
     fn a_pin_leaves_no_sentinel_behind() {
         let dir = scratch("pin");
-        let held = open_following(dir.as_path()).unwrap();
-        held.mkdir(OsStr::new("sub")).unwrap();
-        let names: Vec<_> = held.names().unwrap().map(Result::unwrap).collect();
+        let held = held(dir.as_path());
+        mkdir(&held, &name("sub")).unwrap();
+        let names: Vec<_> = names(&held).unwrap().map(Result::unwrap).collect();
         assert_eq!(names, vec![OsString::from("sub")]);
         let on_disk: Vec<_> = std::fs::read_dir(dir.as_path())
             .unwrap()
@@ -556,14 +339,14 @@ mod tests {
         std::fs::create_dir(dir.as_path().join("full")).unwrap();
         std::fs::write(dir.as_path().join("full").join("keep.txt"), b"keep").unwrap();
         std::fs::create_dir(dir.as_path().join("empty")).unwrap();
-        let held = open_following(dir.as_path()).unwrap();
-        let refused = held.rmdir(OsStr::new("full"));
+        let held = held(dir.as_path());
+        let refused = rmdir(&held, &name("full"));
         assert!(
             matches!(&refused, Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty),
             "{refused:?}"
         );
         assert!(dir.as_path().join("full").join("keep.txt").is_file());
-        held.rmdir(OsStr::new("empty")).unwrap();
+        rmdir(&held, &name("empty")).unwrap();
         assert!(!dir.as_path().join("empty").exists());
     }
 
@@ -571,8 +354,8 @@ mod tests {
     fn rmdir_refuses_a_regular_file_and_leaves_it() {
         let dir = scratch("rmdir_file");
         std::fs::write(dir.as_path().join("file.txt"), b"keep").unwrap();
-        let held = open_following(dir.as_path()).unwrap();
-        let refused = held.rmdir(OsStr::new("file.txt"));
+        let held = held(dir.as_path());
+        let refused = rmdir(&held, &name("file.txt"));
         assert!(
             matches!(&refused, Err(e) if e.kind() == io::ErrorKind::NotADirectory),
             "{refused:?}"
@@ -589,8 +372,8 @@ mod tests {
     fn remove_directory_never_removes_a_file() {
         let dir = scratch("remove_directory_file");
         std::fs::write(dir.as_path().join("file.txt"), b"keep").unwrap();
-        let held = open_following(dir.as_path()).unwrap();
-        let refused = held.remove_directory(OsStr::new("file.txt"));
+        let held = held(dir.as_path());
+        let refused = remove_directory(&held, &name("file.txt"));
         assert!(refused.is_err(), "{refused:?}");
         assert!(dir.as_path().join("file.txt").is_file());
     }
@@ -606,12 +389,12 @@ mod tests {
             .custom_flags(BACKUP_SEMANTICS)
             .open(dir.as_path().join("busy"))
             .unwrap();
-        let held = open_following(dir.as_path()).unwrap();
-        let refused = held.rmdir(OsStr::new("busy"));
+        let held = held(dir.as_path());
+        let refused = rmdir(&held, &name("busy"));
         assert!(matches!(&refused, Err(e) if is_in_use(e)), "{refused:?}");
         assert!(dir.as_path().join("busy").is_dir());
         drop(other);
-        held.rmdir(OsStr::new("busy")).unwrap();
+        rmdir(&held, &name("busy")).unwrap();
         assert!(!dir.as_path().join("busy").exists());
     }
 
@@ -619,8 +402,8 @@ mod tests {
     fn unlink_refuses_a_plain_directory() {
         let dir = scratch("unlink");
         std::fs::create_dir(dir.as_path().join("sub")).unwrap();
-        let held = open_following(dir.as_path()).unwrap();
-        let refused = held.unlink(OsStr::new("sub"));
+        let held = held(dir.as_path());
+        let refused = unlink(&held, &name("sub"));
         assert!(
             matches!(&refused, Err(e) if e.kind() == io::ErrorKind::IsADirectory),
             "{refused:?}"

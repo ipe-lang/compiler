@@ -82,7 +82,7 @@ type alias Package =
 -- | Per-host delivery configuration.
 --
 -- All three sections are present and live — the active target is the CLI's
--- resolved shape+runtime+host, not a field here. `ipe build` reads only the
+-- resolved shape+runtime+host, not a field here. `ipe dev build` reads only the
 -- section matching the resolved target; the others are inert at that run.
 type alias Delivery =
     { ships : List Ship
@@ -295,7 +295,8 @@ type WasmMode
 
 -- | The options of an active wasm client bundle. `publicEnv` is a default-deny
 -- allowlist of environment-variable names the bundle may read at build time;
--- listing a secret-pattern name is a read-time build error.
+-- listing a secret-pattern name, a temp-root or home variable (`TMPDIR`,
+-- `HOME`, …), a malformed name, or one name twice is a read-time build error.
 type alias WasmOptions =
     { mode : WasmMode
     , entry : String

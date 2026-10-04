@@ -103,8 +103,55 @@ impl ExporterEnv {
 
     /// This process's value for the name; `None` when unset or not UTF-8.
     pub(crate) fn read(self) -> Option<String> {
-        crate::system::read_env_var(self.name()).ok()
+        self.raw().ok()
     }
+
+    /// The numeric ceiling this tuning name carries; `0` is refused, and a
+    /// queue depth is bounded by what a `tokio` channel can hold.
+    pub(crate) const fn ceiling(
+        self,
+        default: u64,
+        unit: &'static str,
+    ) -> crate::system::EnvCeiling {
+        let ceiling = crate::system::EnvCeiling::new(
+            self.name(),
+            default,
+            crate::system::ZeroCeiling::Refused,
+            unit,
+        );
+        match self {
+            Self::PushBuffer => ceiling.at_most(tokio::sync::Semaphore::MAX_PERMITS as u64),
+            Self::ParentUrl
+            | Self::IngestToken
+            | Self::PushInterval
+            | Self::HubUrl
+            | Self::HubToken
+            | Self::HubInterval
+            | Self::ServiceName => ceiling,
+        }
+    }
+
+    /// This process's value for the name, parsed as [`Self::ceiling`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for a present, malformed value.
+    pub(crate) fn read_ceiling<T: TryFrom<u64>>(
+        self,
+        default: u64,
+        unit: &'static str,
+    ) -> Result<T, crate::system::EnvCeilingRefusal> {
+        self.ceiling(default, unit).parse_as(self.raw())
+    }
+
+    fn raw(self) -> Result<String, std::env::VarError> {
+        crate::system::read_env_var(self.name())
+    }
+}
+
+/// Logs a refused exporter ceiling; the exporter stays disabled.
+pub(crate) fn log_refused_ceiling(label: &str, refusal: &crate::system::EnvCeilingRefusal) {
+    crate::system::emit_runtime_log(label, &format!("{refusal}; exporter disabled"));
 }
 
 const DEFAULT_QUEUE_CAP: usize = 1024;
@@ -218,10 +265,12 @@ pub async fn enable_from_env() {
         );
         return;
     }
-    let interval_ms = ExporterEnv::PushInterval
-        .read()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INTERVAL_MS);
+    let interval_ms: u64 = match ExporterEnv::PushInterval
+        .read_ceiling(DEFAULT_INTERVAL_MS, "decimal millisecond count")
+    {
+        Ok(ms) => ms,
+        Err(refusal) => return log_refused_ceiling("push", &refusal),
+    };
     let ingest_url = format!("{}/_ipe/observability/ingest", parent.trim_end_matches('/'));
     enable(
         "federation",
@@ -351,11 +400,12 @@ fn enable(label: &str, pipeline: Pipeline) {
         );
         return;
     };
-    let cap = ExporterEnv::PushBuffer
-        .read()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&c| c > 0)
-        .unwrap_or(DEFAULT_QUEUE_CAP);
+    let cap: usize = match ExporterEnv::PushBuffer
+        .read_ceiling(DEFAULT_QUEUE_CAP as u64, "decimal entry count")
+    {
+        Ok(cap) => cap,
+        Err(refusal) => return log_refused_ceiling("push", &refusal),
+    };
     let (tx, rx) = mpsc::channel::<Entry>(cap);
     if SENDER.set(tx).is_err() {
         return; // lost an enable race
@@ -759,14 +809,19 @@ mod tests {
     /// `flush_now`: the ack proves the buffered batch was processed before
     /// the pre-exit window expires.
     ///
-    /// Uses a fake HTTP server (httptest) is not a dep here — instead we
-    /// verify the sentinel path purely at the channel level: the batcher
-    /// receives the Flush, calls flush() on the buf (which POSTs; we use a
-    /// channel cap=0 so the buf is empty → the POST is skipped), and sends
-    /// the ack. We send a Log first to ensure non-empty buf, but since
-    /// we can't stand up a real HTTP server in a unit test, we rely on the
-    /// "flush POST fails with a log warning" path (best-effort) and confirm
-    /// the ack still arrives — i.e. a flush failure does NOT prevent the ack.
+    /// A flush failure must never withhold the ack.
+    ///
+    /// The ingest endpoint is a bare listener that accepts the flush POST's
+    /// connection and closes it unread: the connect succeeds immediately on
+    /// every host, so the POST still fails (a reset, never a response),
+    /// exercising the "flush POST fails with a log warning" best-effort
+    /// path. We send a Log first so the buf is non-empty, then confirm the
+    /// ack still arrives. An unreachable port would instead measure the
+    /// OS's own connection-refused timing, which is platform-dependent (on
+    /// Windows a refused connect can take seconds of SYN retries) and would
+    /// make this 500 ms bound flaky by host rather than by the code under
+    /// test.
+    #[allow(clippy::expect_used)] // test setup: a bind/local_addr failure is a test environment issue
     #[tokio::test]
     async fn flush_sentinel_acks_even_when_ingest_unreachable() {
         let (tx, rx) = mpsc::channel::<Entry>(16);
@@ -783,8 +838,19 @@ mod tests {
         // Drop the sender so the batcher exits after the ack.
         drop(tx);
 
-        // Spawn the batcher against an unreachable URL.
-        let url = "http://127.0.0.1:19999".to_string();
+        // Accept-then-close: the flush POST connects at once, then the
+        // connection resets before any response, on every host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an accept-then-close listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+
+        let url = format!("http://{addr}");
         tokio::spawn(batcher(
             rx,
             client(&url),
@@ -907,7 +973,7 @@ mod tests {
     }
 
     /// A loopback ingest gated by the console's own receiver decision with
-    /// `want` configured and `dev_open` false (a Release child under any
+    /// `want` configured and no dev surface (a Release child under any
     /// posture). Returns its port, its ingest URL and its count of admitted
     /// pushes.
     #[cfg(feature = "server")]
@@ -919,7 +985,7 @@ mod tests {
             State((want, accepted)): State<(String, Arc<AtomicUsize>)>,
             headers: axum::http::HeaderMap,
         ) -> axum::response::Response {
-            match super::super::console::ingest_decision(&headers, Some(&want), false) {
+            match super::super::console::ingest_decision(&headers, Some(&want), None) {
                 Some(refusal) => refusal,
                 None => {
                     accepted.fetch_add(1, Ordering::SeqCst);
@@ -1066,6 +1132,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn exporter_ceilings_honour_the_shared_contract() {
+        for env in [
+            ExporterEnv::PushInterval,
+            ExporterEnv::PushBuffer,
+            ExporterEnv::HubInterval,
+        ] {
+            assert_eq!(env.role(), ExporterEnvRole::Tuning);
+            crate::system::assert_env_ceiling_contract(env.ceiling(2000, "decimal count"));
+        }
+    }
+
+    #[test]
+    fn a_push_buffer_past_the_tokio_permit_limit_is_refused() {
+        let ceiling = ExporterEnv::PushBuffer.ceiling(DEFAULT_QUEUE_CAP as u64, "decimal count");
+        let limit = tokio::sync::Semaphore::MAX_PERMITS as u64;
+        assert_eq!(ceiling.parse(Ok(limit.to_string())), Ok(limit));
+        assert!(
+            ceiling
+                .parse(Ok((limit + 1).to_string()))
+                .is_err_and(|r| r.defect() == crate::system::CeilingDefect::TooLarge),
+            "a queue depth tokio cannot hold must be refused, not reach mpsc::channel"
+        );
     }
 
     #[test]

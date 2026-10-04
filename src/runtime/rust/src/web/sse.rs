@@ -7,18 +7,24 @@ pub struct SsePatch(pub String);
 pub type SseTx = mpsc::Sender<SsePatch>;
 pub type SseRx = mpsc::Receiver<SsePatch>;
 
-/// Buffer capacity, honouring `IPE_WEB_SSE_BUFFER` (clamped to `[1, 1024]`,
-/// default 16). Parse failures and out-of-range values fall back to the
-/// clamp/default.
-fn buffer_capacity() -> usize {
-    const DEFAULT: usize = 16;
-    const MIN: usize = 1;
-    const MAX: usize = 1024;
-    crate::system::read_env_var("IPE_WEB_SSE_BUFFER")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(MIN, MAX))
-        .unwrap_or(DEFAULT)
+/// Per-stream buffer depth: `IPE_WEB_SSE_BUFFER`, default 16.
+const BUFFER_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WEB_SSE_BUFFER",
+    16,
+    crate::system::ZeroCeiling::Refused,
+    "decimal patch count",
+);
+
+/// The largest buffer depth applied; a larger setting is narrowed to it.
+const BUFFER_MAX: usize = 1024;
+
+/// Buffer capacity: `IPE_WEB_SSE_BUFFER`, at most [`BUFFER_MAX`].
+///
+/// # Errors
+///
+/// Returns the refusal for a present, malformed value (zero included).
+pub fn buffer_capacity() -> Result<usize, crate::system::EnvCeilingRefusal> {
+    BUFFER_CEILING.read::<usize>().map(|n| n.min(BUFFER_MAX))
 }
 
 /// Bounded buffer (default 16, configurable via `IPE_WEB_SSE_BUFFER`). The
@@ -26,8 +32,12 @@ fn buffer_capacity() -> usize {
 /// TCP backpressure) when full rather than dropping — it does not implement the
 /// drop-oldest + `ipe_web_sse_drops_total` behaviour. hello/heartbeat framing
 /// is done in mod.rs when wiring axum.
-pub fn channel() -> (SseTx, SseRx) {
-    mpsc::channel(buffer_capacity())
+///
+/// # Errors
+///
+/// Returns the [`buffer_capacity`] refusal.
+pub fn channel() -> Result<(SseTx, SseRx), crate::system::EnvCeilingRefusal> {
+    Ok(mpsc::channel(buffer_capacity()?))
 }
 
 /// SSE event framing: `event: <name>\ndata: <payload>\n\n`.
@@ -102,9 +112,14 @@ mod tests {
 
     #[test]
     fn channel_returns_bounded_pair() {
-        let (tx, _rx) = channel();
+        let (tx, _rx) = channel().expect("the default SSE buffer resolves");
         // capacity is 16; can send without await from sync context via try_send
         assert!(tx.try_send(SsePatch("test".into())).is_ok());
+    }
+
+    #[test]
+    fn buffer_ceiling_honours_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(BUFFER_CEILING);
     }
 
     #[test]

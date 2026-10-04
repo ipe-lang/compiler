@@ -31,7 +31,7 @@
 //!   root itself and the leaf area are always claimed (created and marked, or
 //!   adopted); the levels between them and above the root are passed through.
 //!
-//! A tree ipe hands over to the user (`ipe eject`) goes through [`HandoverRoot`]
+//! A tree ipe hands over to the user (`ipe release eject`) goes through [`HandoverRoot`]
 //! and [`HandoverDir`] instead: it must lie outside every tree ipe owns or may
 //! delete, and claiming it marks no ancestor, so once its own marker is dropped
 //! nothing ipe later cleans can contain it.
@@ -43,8 +43,6 @@ use crate::{CliError, io_err, text};
 
 pub(crate) mod held;
 mod proven;
-#[cfg(any(windows, test))]
-mod win32_name;
 
 use proven::{ProvenOutPath, prove_parent_steps};
 
@@ -313,13 +311,14 @@ impl OwnedDir {
     /// Claim the owned subdirectory `name`, a single plain path component.
     ///
     /// # Errors
-    /// [`OutputRefusal::UnsafeComponent`] for anything but one plain name; as
+    /// [`OutputRefusal::UnsafeComponent`] unless `name` is one name that reads
+    /// back as itself (`ipe_fs_open::is_one_spelled_name`); as
     /// [`OutputRoot::claim`] otherwise.
     pub fn child(&self, name: &str) -> Result<Self, CliError> {
-        let mut parts = Path::new(name).components();
-        match (parts.next(), parts.next()) {
-            (Some(Component::Normal(_)), None) => self.claim_child(name),
-            _ => Err(OutputRefusal::UnsafeComponent(PathBuf::from(name)).into()),
+        if ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(name)) {
+            self.claim_child(name)
+        } else {
+            Err(OutputRefusal::UnsafeComponent(PathBuf::from(name)).into())
         }
     }
 
@@ -371,13 +370,16 @@ impl OwnedDir {
         })
     }
 
-    /// The [`OwnedPath`] for `rel`, refused unless it is one or more plain names.
+    /// The [`OwnedPath`] for `rel`, refused unless every part is a name that reads back as itself.
     fn owned_path(&self, rel: &Path) -> Result<OwnedPath, CliError> {
         let mut parts: Vec<std::ffi::OsString> = Vec::new();
         for component in rel.components() {
             match component {
-                Component::Normal(name) => parts.push(name.to_os_string()),
-                Component::CurDir
+                Component::Normal(name) if ipe_fs_open::is_one_spelled_name(name) => {
+                    parts.push(name.to_os_string());
+                }
+                Component::Normal(_)
+                | Component::CurDir
                 | Component::ParentDir
                 | Component::RootDir
                 | Component::Prefix(_) => {
@@ -1019,7 +1021,7 @@ impl OutputRoot {
         })
     }
 
-    /// Resolve a fresh directory for a project handed to the user (`ipe eject`).
+    /// Resolve a fresh directory for a project handed to the user (`ipe release eject`).
     ///
     /// The overlap checks are those of [`OutputRoot::resolve`], which already
     /// refuse every [`ReservedName`] — any project's [`CACHE_NAMESPACE_DIR`]
@@ -2482,14 +2484,55 @@ mod tests {
                 "{rel:?} must be refused, got {result:?}"
             );
         }
-        let child = out.child("../x");
-        assert!(
-            matches!(
-                child,
-                Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
-            ),
-            "a non-plain child name must be refused, got {child:?}"
-        );
+        for name in ["../x", "a\0b"] {
+            let child = out.child(name);
+            assert!(
+                matches!(
+                    child,
+                    Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+                ),
+                "child name {name:?} must be refused, got {child:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn owned_paths_refuse_names_that_do_not_read_back_as_themselves() {
+        let base = scratch("spelled");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let mut refused = vec!["a\0b", "dir/a\0b"];
+        if cfg!(windows) {
+            refused.extend(["e1.", "dir/e1.", "e1 ", "a:stream", "NUL"]);
+        }
+        for rel in refused {
+            let result = out.path_to(rel);
+            assert!(
+                matches!(
+                    result,
+                    Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+                ),
+                "{rel:?} must be refused, got {result:?}"
+            );
+            let unlinked = out.unlink(rel);
+            assert!(
+                matches!(
+                    unlinked,
+                    Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+                ),
+                "unlink {rel:?} must be refused, got {unlinked:?}"
+            );
+        }
+        if cfg!(windows) {
+            let child = out.child("e1.");
+            assert!(
+                matches!(
+                    child,
+                    Err(CliError::OutputRefused(OutputRefusal::UnsafeComponent(_)))
+                ),
+                "a child name Win32 rewrites must be refused, got {child:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3888,13 +3931,15 @@ mod tests {
                 .map(|n| {
                     let leaf = shared.join(format!("s{n}"));
                     let (proj, barrier) = (proj.clone(), std::sync::Arc::clone(&barrier));
-                    std::thread::spawn(move || {
-                        barrier.wait();
-                        OutputRoot::resolve(Some(&leaf.to_string_lossy()), &proj)
-                            .and_then(|root| root.claim())
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:?}"))
-                    })
+                    std::thread::Builder::new()
+                        .spawn(move || {
+                            barrier.wait();
+                            OutputRoot::resolve(Some(&leaf.to_string_lossy()), &proj)
+                                .and_then(|root| root.claim())
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:?}"))
+                        })
+                        .expect("spawn test thread")
                 })
                 .collect();
             for (n, claim) in claims.into_iter().enumerate() {

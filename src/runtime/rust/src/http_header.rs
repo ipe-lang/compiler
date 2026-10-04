@@ -216,8 +216,19 @@ pub mod cookie {
     }
 
     /// A cookie value made only of RFC 6265 `cookie-octet` bytes other than `%`.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    ///
+    /// A cookie value is the cookie's secret half (a session id, a token), so
+    /// its `Debug` prints [`crate::redact::REDACTED`], never the value.
+    #[derive(Clone, PartialEq, Eq)]
     pub struct CookieValue(String);
+
+    impl std::fmt::Debug for CookieValue {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("CookieValue")
+                .field(&crate::redact::Redacted::new(()))
+                .finish()
+        }
+    }
 
     impl CookieValue {
         /// Encode `raw`, percent-encoding `%` and every byte that is not a `cookie-octet`.
@@ -331,6 +342,13 @@ pub mod cookie {
             }
             assert_eq!(CookieValue::encode("é").as_str(), "%C3%A9");
             assert_eq!(decode("%c3%a9").as_deref(), Some("é"));
+        }
+
+        /// A cookie value's `Debug` never prints the value it holds.
+        #[test]
+        fn cookie_value_debug_prints_no_value() {
+            let shown = format!("{:?}", CookieValue::encode("T0K3N"));
+            assert_eq!(shown, "CookieValue(<redacted>)");
         }
     }
 }

@@ -209,7 +209,8 @@ fn program_metadata_short_circuits_on_lower_error() {
         .clone()
         .expect_err("program_metadata must refuse to analyse an unlowered program");
     assert_eq!(
-        lower_err, meta_err,
+        <(ipe_diagnostics::Diagnostic, Vec<ipe_intern::Symbol>)>::from(lower_err),
+        meta_err,
         "program_metadata's short-circuit must surface lower_program's own diagnostic verbatim"
     );
 }

@@ -24,7 +24,7 @@
 //! `Main.ipe` files to the same stdout:
 //!
 //! ```text
-//! $ ipe run Main.ipe
+//! $ ipe dev run Main.ipe
 //! 1.5            # float_literal
 //! 12.56          # float_area
 //! 1500           # float_compare

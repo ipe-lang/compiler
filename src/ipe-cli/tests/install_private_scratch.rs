@@ -8,45 +8,62 @@
 //! are driven with synthetic `ls -l` facts, so the foreign-owner and
 //! foreign-group refusals need no second account. Every refusal also pins the
 //! reason token the installer's diagnostic names, and that the printed facts are
-//! terminal-safe.
+//! terminal-safe. The private-scratch block reports through the message helpers,
+//! so every run loads both blocks.
 #![cfg(unix)]
 
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use ipe_sandbox::scratch::{LeafName, ScratchDir};
 
-const BEGIN: &str = "# >>> private-scratch helpers";
-const END: &str = "# <<< private-scratch helpers";
+const MESSAGE_BLOCK: (&str, &str) = ("# >>> message helpers", "# <<< message helpers");
+const SCRATCH_BLOCK: (&str, &str) = (
+    "# >>> private-scratch helpers",
+    "# <<< private-scratch helpers",
+);
 
-/// The helper block of `install.sh`, markers included.
-fn helpers() -> io::Result<String> {
-    let script = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../install.sh"))?;
-    let block = script
-        .find(BEGIN)
+/// The `(begin, end)` marked block of `script`, markers included.
+fn block<'s>(script: &'s str, (begin, end): (&str, &str)) -> io::Result<&'s str> {
+    script
+        .find(begin)
         .and_then(|start| {
             script
                 .get(start..)
-                .and_then(|tail| tail.find(END).map(|end| (start, start + end + END.len())))
+                .and_then(|tail| tail.find(end).map(|at| (start, start + at + end.len())))
         })
-        .and_then(|(start, end)| script.get(start..end));
-    block.map(str::to_owned).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "install.sh lost its private-scratch helper markers",
-        )
-    })
+        .and_then(|(start, stop)| script.get(start..stop))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("install.sh lost its `{begin}` markers"),
+            )
+        })
+}
+
+/// The message and private-scratch helper blocks of `install.sh`, in order.
+fn helpers() -> io::Result<String> {
+    let script = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../install.sh"))?;
+    Ok(format!(
+        "{}\n{}",
+        block(&script, MESSAGE_BLOCK)?,
+        block(&script, SCRATCH_BLOCK)?
+    ))
+}
+
+/// An `sh -c` command over `script` in the C locale, with `$0` set to `sh`.
+fn shell(script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.env("LC_ALL", "C").arg("-c").arg(script).arg("sh");
+    command
 }
 
 /// Whether `sh` running the helper `function` on `arg` succeeds.
 fn helper_accepts(function: &str, arg: &Path) -> io::Result<bool> {
     let script = format!("{}\n{function} \"$1\"\n", helpers()?);
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
+    let status = shell(&script)
         .arg(arg)
         .stdout(std::process::Stdio::null())
         .status()?;
@@ -56,26 +73,33 @@ fn helper_accepts(function: &str, arg: &Path) -> io::Result<bool> {
 /// Whether `sh` running the helper `function` on the literal `args` succeeds.
 fn verdict_accepts(function: &str, args: &[&str]) -> io::Result<bool> {
     let script = format!("{}\n{function} \"$@\"\n", helpers()?);
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
+    let status = shell(&script)
         .args(args)
         .stdout(std::process::Stdio::null())
         .status()?;
     Ok(status.success())
 }
 
-/// The stdout of `sh` running `body` after the helper block, with `args` as `$@`.
-fn helper_stdout(body: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+/// The output of `sh` running `body` after the helper blocks in `locale`, with
+/// `args` as `$@`.
+fn helper_output(body: &str, args: &[&str], locale: &str) -> io::Result<Output> {
     let script = format!("{}\n{body}\n", helpers()?);
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .args(args)
-        .output()?;
-    Ok(output.stdout)
+    shell(&script).env("LC_ALL", locale).args(args).output()
+}
+
+/// The stdout of `sh` running `body` after the helper blocks, with `args` as `$@`.
+fn helper_stdout(body: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+    Ok(helper_output(body, args, "C")?.stdout)
+}
+
+/// The stdout (refused path and reason token) and stderr (refusal sentence)
+/// of `body` run on `args`.
+fn refusal(body: &str, args: &[&str]) -> io::Result<(String, String)> {
+    let output = helper_output(body, args, "C")?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
 }
 
 /// The reason token `scratch_base_reason` prints for the literal `args`.
@@ -84,10 +108,11 @@ fn base_reason(args: &[&str]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&stdout).trim_end().to_owned())
 }
 
-/// Prints the refused path, reason token and refusal sentence `trusted_tmp_base`
-/// leaves for `$1`, one per line; nothing when `$1` is trusted.
+/// Prints the refused path and reason token `trusted_tmp_base` leaves for `$1`,
+/// one per line on stdout, then dies with the refusal sentence on stderr;
+/// nothing when `$1` is trusted.
 const REFUSAL_REPORT: &str = "trusted_tmp_base \"$1\" >/dev/null || \
-     { printf '%s\\n%s\\n' \"$TMP_REFUSED_PATH\" \"$TMP_REFUSED_REASON\"; tmp_base_refusal; }";
+     { printf '%s\\n%s\\n' \"$TMP_REFUSED_PATH\" \"$TMP_REFUSED_REASON\"; die_tmp_base_refused; }";
 
 /// A test root under the per-binary target temp dir.
 fn root(label: &str) -> io::Result<ScratchDir> {
@@ -190,7 +215,7 @@ fn the_installer_routes_its_scratch_through_the_helpers() -> io::Result<()> {
     let script = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../install.sh"))?;
     for needle in [
         "tag_file_ok \"$TAG_FILE\"",
-        "trusted_tmp_base \"${TMPDIR:-/tmp}\" >/dev/null || die \"$(tmp_base_refusal)\"",
+        "trusted_tmp_base \"${TMPDIR:-/tmp}\" >/dev/null || die_tmp_base_refused",
         "scratch_base=\"$TMP_TRUSTED_BASE\"",
         "mktemp -d \"$scratch_base/ipe-install.XXXXXX\"",
         "private_dir_ok \"$tmp\"",
@@ -341,8 +366,7 @@ fn scratch_base_verdict_refuses_empty_or_unexpected_reason_output() -> io::Resul
         "scratch_base_reason() { printf 'garbage\\033[2J'; }",
     ] {
         let body = format!("{stub}\n{REFUSAL_REPORT}");
-        let report = String::from_utf8_lossy(&helper_stdout(&body, &[&base_arg])?).into_owned();
-        let sentence = report.lines().nth(2).unwrap_or_default();
+        let (report, sentence) = refusal(&body, &[&base_arg])?;
         for needle in ["failed the private-scratch check", "[unknown]"] {
             assert!(
                 sentence.contains(needle),
@@ -366,12 +390,10 @@ fn trusted_tmp_base_refuses_a_base_nested_too_deep() -> io::Result<()> {
     }
     std::fs::create_dir_all(&deep)?;
     let deep_arg = deep.to_string_lossy().into_owned();
-    let report =
-        String::from_utf8_lossy(&helper_stdout(REFUSAL_REPORT, &[&deep_arg])?).into_owned();
+    let (report, sentence) = refusal(REFUSAL_REPORT, &[&deep_arg])?;
     let mut lines = report.lines();
     assert!(lines.next().is_some(), "a too-deep base must be refused");
     assert_eq!(lines.next(), Some("too-deep"));
-    let sentence = lines.next().unwrap_or_default();
     for needle in ["nested too deep to verify", "[too-deep]"] {
         assert!(
             sentence.contains(needle),
@@ -388,11 +410,10 @@ fn trusted_tmp_base_refuses_a_component_ls_cannot_describe() -> io::Result<()> {
     mkdir_mode(&base, 0o700)?;
     let base_arg = base.to_string_lossy().into_owned();
     let body = format!("ls() {{ return 2; }}\n{REFUSAL_REPORT}");
-    let report = String::from_utf8_lossy(&helper_stdout(&body, &[&base_arg])?).into_owned();
+    let (report, sentence) = refusal(&body, &[&base_arg])?;
     let mut lines = report.lines();
     assert!(lines.next().is_some(), "an unlistable base must be refused");
     assert_eq!(lines.next(), Some("unreadable"));
-    let sentence = lines.next().unwrap_or_default();
     for needle in ["it could not be listed", "[unreadable]"] {
         assert!(
             sentence.contains(needle),
@@ -410,8 +431,7 @@ fn trusted_tmp_base_names_the_refused_ancestor_not_the_leaf() -> io::Result<()> 
     let nested = open.join("leaf");
     mkdir_mode(&nested, 0o700)?;
     let leaf_arg = nested.to_string_lossy().into_owned();
-    let report =
-        String::from_utf8_lossy(&helper_stdout(REFUSAL_REPORT, &[&leaf_arg])?).into_owned();
+    let (report, sentence) = refusal(REFUSAL_REPORT, &[&leaf_arg])?;
     let open_physical = std::fs::canonicalize(&open)?.to_string_lossy().into_owned();
     let mut lines = report.lines();
     assert_eq!(
@@ -420,7 +440,6 @@ fn trusted_tmp_base_names_the_refused_ancestor_not_the_leaf() -> io::Result<()> 
         "the refused path must be the non-sticky ancestor"
     );
     assert_eq!(lines.next(), Some("world-writable-not-sticky"));
-    let sentence = lines.next().unwrap_or_default();
     for needle in [
         open_physical.as_str(),
         "mode drwxrwxrwx",
@@ -451,8 +470,8 @@ fn trusted_tmp_base_names_the_refused_ancestor_not_the_leaf() -> io::Result<()> 
 #[test]
 fn tmp_base_refusal_names_an_unmapped_owner() -> io::Result<()> {
     let body = "TMP_REFUSED_PATH=/tmp TMP_REFUSED_OWNER=65534 TMP_REFUSED_MODE=drwxrwxrwt \
-                TMP_REFUSED_REASON=foreign-owner; tmp_base_refusal";
-    let sentence = String::from_utf8_lossy(&helper_stdout(body, &[])?).into_owned();
+                TMP_REFUSED_REASON=foreign-owner; die_tmp_base_refused";
+    let (_, sentence) = refusal(body, &[])?;
     for needle in ["owner uid 65534", "[foreign-owner]", "user namespace"] {
         assert!(
             sentence.contains(needle),
@@ -464,42 +483,45 @@ fn tmp_base_refusal_names_an_unmapped_owner() -> io::Result<()> {
 
 #[test]
 fn the_refusal_escapes_control_bytes_in_printed_facts() -> io::Result<()> {
-    let escaped = helper_stdout(
-        "safe_text \"$1\"",
-        &["a\u{1b}[31mb\u{9b}c\u{7f}\u{e9}\r\u{1}z"],
-    )?;
+    let hostile_text = ["a\u{1b}[31mb\u{9b}c\u{7f}\u{e9}\r\u{1}z"];
+    let escaped = helper_stdout("safe_text \"$1\"", &hostile_text)?;
     assert_eq!(
         String::from_utf8_lossy(&escaped),
         "a\\033[31mb\\302\\233c\\177\\303\\251\\015\\001z",
-        "C0, DEL and every byte >= 0x80 must print as octal escapes; ASCII stays"
+        "in the C locale C0, DEL and every byte >= 0x80 must print as octal escapes"
+    );
+    let utf8 = helper_output("safe_text \"$1\"", &hostile_text, "C.UTF-8")?.stdout;
+    assert_eq!(
+        String::from_utf8_lossy(&utf8),
+        "a\\033[31mb\\302\\233c\\177\u{e9}\\015\\001z",
+        "in a UTF-8 locale only a printable character may stay raw; C1 stays escaped"
     );
     // A raw C1 byte after another high byte is CSI on a Latin-1 terminal.
-    let raw = helper_stdout("safe_text \"$(printf 'a\\240\\233[2J|\\340\\233')\"", &[])?;
-    assert_eq!(
-        String::from_utf8_lossy(&raw),
-        "a\\240\\233[2J|\\340\\233",
-        "a C1 byte must be escaped whatever byte precedes it"
-    );
-    assert!(
-        raw.iter().all(|byte| (0x20..0x7f).contains(byte)),
-        "safe_text must print printable ASCII only"
-    );
+    let raw_body = "safe_text \"$(printf 'a\\240\\233[2J|\\340\\233')\"";
+    for locale in ["C", "C.UTF-8"] {
+        let raw = helper_output(raw_body, &[], locale)?.stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&raw),
+            "a\\240\\233[2J|\\340\\233",
+            "a C1 byte must be escaped whatever byte precedes it ({locale})"
+        );
+        assert!(
+            raw.iter().all(|byte| (0x20..0x7f).contains(byte)),
+            "safe_text must print printable ASCII only for invalid UTF-8 ({locale})"
+        );
+    }
 
     let r = root("install-escape")?;
     let hostile = r.path().join("open\u{1b}[31m");
     mkdir_mode(&hostile, 0o777)?;
     let hostile_arg = hostile.to_string_lossy().into_owned();
-    let report = helper_stdout(REFUSAL_REPORT, &[&hostile_arg])?;
-    let sentence = report
-        .split(|byte| *byte == b'\n')
-        .nth(2)
-        .unwrap_or_default();
+    let sentence = helper_output(REFUSAL_REPORT, &[&hostile_arg], "C")?.stderr;
     assert!(
         !sentence.contains(&0x1b),
         "the refusal must not carry a raw ESC byte"
     );
     assert!(
-        String::from_utf8_lossy(sentence).contains("open\\033[31m"),
+        String::from_utf8_lossy(&sentence).contains("open\\033[31m"),
         "the refusal must print the ESC byte escaped"
     );
     Ok(())

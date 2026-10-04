@@ -48,15 +48,15 @@ impl CargoBin {
 /// (build vs run vs test vs the browser bundle) rather than a generic one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolIntent {
-    /// `ipe build` — compile the program to a native artifact.
+    /// `ipe dev build` — compile the program to a native artifact.
     Build,
-    /// `ipe run` — compile and execute the program.
+    /// `ipe dev run` — compile and execute the program.
     Run,
-    /// `ipe build --target wasm` — compile and bundle the browser artifact.
+    /// `ipe dev build --target wasm` — compile and bundle the browser artifact.
     BundleWasm,
     /// `ipe verify` — compile and run the project's test entry.
     Test,
-    /// `ipe watch` — rebuild and re-run on every source change.
+    /// `ipe dev watch` — rebuild and re-run on every source change.
     Watch,
 }
 
@@ -229,13 +229,14 @@ fn known_install_dirs() -> Vec<PathBuf> {
     // relative `CARGO_HOME` names no directory to probe; this is a read-only
     // hint for the "not on the `PATH`" diagnosis, so it is skipped rather than
     // reported here.
-    let mut dirs: Vec<PathBuf> = crate::env_dir::tool_home("CARGO_HOME", ".cargo")
+    let home = crate::env_dir::home().ok();
+    let mut dirs: Vec<PathBuf> = crate::env_dir::tool_home("CARGO_HOME", home.as_ref(), ".cargo")
         .ok()
         .flatten()
         .map(|cargo_home| cargo_home.join("bin"))
         .into_iter()
         .collect();
-    if let Some(default) = crate::env_dir::home().map(|home| home.join(".cargo").join("bin"))
+    if let Some(default) = home.map(|home| home.join(".cargo").join("bin"))
         && !dirs.contains(&default)
     {
         dirs.push(default);

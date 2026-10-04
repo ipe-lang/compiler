@@ -48,7 +48,7 @@ fn i186_false_positive_ipec_no_spurious_display() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for display_false_positive: {:?}",
+        "ipe dev build must succeed for display_false_positive: {:?}",
         built.err()
     );
 
@@ -92,7 +92,7 @@ fn i186_false_positive_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for display_false_positive: {:?}",
+        "ipe dev build must succeed for display_false_positive: {:?}",
         built.err()
     );
 

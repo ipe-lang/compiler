@@ -4,7 +4,7 @@
 //! The reuse gate counts a bare field read `w.tag` as a borrow, not a consume,
 //! so `run w = both (consume w) w.tag` sees ONE consume and would pass. But the
 //! emitted call evaluates its arguments left to right: `consume(w)` moves `w`,
-//! then `(w).tag` reads the moved value — `ipe build` exit 0, then `cargo build`
+//! then `(w).tag` reads the moved value — `ipe dev build` exit 0, then `cargo build`
 //! E0382. An order-aware walk now rejects a borrow evaluated after a move with
 //! IPE-L0135, while the borrow-then-consume order stays accepted.
 //!

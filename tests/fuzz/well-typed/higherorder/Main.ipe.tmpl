@@ -1,0 +1,20 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot lst : IntList 1 5 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+addN : Int -> Int -> Int
+addN n x =
+    n + x
+
+
+main =
+    let
+        bumped = List.map (addN @n1@) @lst@
+        strs = List.map String.fromInt bumped
+    in
+    Io.println (String.join "," strs)

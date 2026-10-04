@@ -73,7 +73,7 @@ fn i193_ipec_accepts_asymmetric_arms() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for asymmetric_arms_cloneok: {:?}",
+        "ipe dev build must succeed for asymmetric_arms_cloneok: {:?}",
         built.err()
     );
 
@@ -155,7 +155,11 @@ fn i193_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("asymmetric_arms_cloneok", &out);
     assert_eq!(

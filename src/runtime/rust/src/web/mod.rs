@@ -375,18 +375,62 @@ mod island_escape_tests {
 /// (already needed for same-origin resource loading). Adding a nonce to the
 /// inline script to tighten CSP is deferred; it requires threading the nonce
 /// through the response pipeline and is outside the scope of this change.
-/// Server-side client-config templating: read the `IPE_WEB_*` tuning env vars
-/// and emit the `window.__IPE_*` assignments the client (`client.js`) reads
-/// with a hardcoded fallback. Malformed values fall back to the default; never
-/// panics.
+/// The client's numeric tuning ceilings, each with the `window.__IPE_*` global
+/// it sets. `0` passes through to the client unchanged.
+#[cfg(feature = "server")]
+const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
+    const fn tuning(name: &'static str, default: u64) -> crate::system::EnvCeiling {
+        crate::system::EnvCeiling::new(
+            name,
+            default,
+            crate::system::ZeroCeiling::Accepted,
+            "decimal count",
+        )
+    }
+    [
+        ("RETRY_BASE_MS", tuning("IPE_WEB_RETRY_BASE_MS", 500)),
+        ("RETRY_MAX_MS", tuning("IPE_WEB_RETRY_MAX_MS", 16000)),
+        (
+            "RETRY_MAX_ATTEMPTS",
+            tuning("IPE_WEB_RETRY_MAX_ATTEMPTS", 10),
+        ),
+        ("RETRY_FAST_MS", tuning("IPE_WEB_RETRY_FAST_MS", 200)),
+        (
+            "RETRY_FAST_WINDOW_MS",
+            tuning("IPE_WEB_RETRY_FAST_WINDOW_MS", 3000),
+        ),
+        ("EVENT_QUEUE_MAX", tuning("IPE_WEB_QUEUE_MAX", 50)),
+        ("HELLO_TIMEOUT_MS", tuning("IPE_WEB_HELLO_TIMEOUT_MS", 8000)),
+        (
+            "HEARTBEAT_TTL_MS",
+            tuning("IPE_WEB_HEARTBEAT_TTL_MS", 35000),
+        ),
+    ]
+};
+
+/// The `window.__IPE_*` numeric tuning assignments, resolved once per process.
+///
+/// [`build_web_router`] refuses to start on a refusal here, so every page a
+/// served app renders reads the resolved `Ok`.
+#[cfg(feature = "server")]
+fn client_tuning_js() -> &'static Result<String, crate::system::EnvCeilingRefusal> {
+    static TUNING: std::sync::OnceLock<Result<String, crate::system::EnvCeilingRefusal>> =
+        std::sync::OnceLock::new();
+    TUNING.get_or_init(|| {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (global, ceiling) in CLIENT_TUNING_CEILINGS {
+            let value: u64 = ceiling.read()?;
+            let _ = write!(out, "window.__IPE_{global}={value};");
+        }
+        Ok(out)
+    })
+}
+
+/// Server-side client-config templating: emit the `window.__IPE_*` assignments
+/// the client (`client.js`) reads, each with a hardcoded client fallback.
 #[cfg(feature = "server")]
 fn web_client_config_js() -> String {
-    fn num(var: &str, default: u64) -> u64 {
-        crate::system::read_env_var(var)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(default)
-    }
     // IPE_WEB_BANNER: off/0/false → disabled; anything else → on.
     let banner = !matches!(
         crate::system::read_env_var("IPE_WEB_BANNER")
@@ -398,7 +442,7 @@ fn web_client_config_js() -> String {
     // dev-watch blue-green proxy, so a reconnect is an expected rebuild cutover,
     // not an outage. The client then greets a reconnect with a brief positive
     // "updated ✓" toast instead of the amber "Reconnecting…" banner. Only the
-    // `ipe watch` blue-green path sets this; a release/`ipe run` server never
+    // `ipe dev watch` blue-green path sets this; a release/`ipe dev run` server never
     // does, so the flag defaults off there.
     let swap_toast = matches!(
         crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
@@ -406,40 +450,37 @@ fn web_client_config_js() -> String {
             .map(|s| s.trim().to_string()),
         Some(ref v) if !v.is_empty() && v != "0"
     );
+    // A refused tuning value never reaches a served page (the router refused
+    // to start on it); an unserved render omits the numbers, so the client
+    // keeps its own fallbacks rather than an invented value.
+    let tuning = client_tuning_js().as_deref().unwrap_or_default();
     format!(
         "window.__IPE_BANNER_ENABLED={banner};\
          window.__IPE_SWAP_TOAST={swap_toast};\
-         window.__IPE_RETRY_BASE_MS={};\
-         window.__IPE_RETRY_MAX_MS={};\
-         window.__IPE_RETRY_MAX_ATTEMPTS={};\
-         window.__IPE_RETRY_FAST_MS={};\
-         window.__IPE_RETRY_FAST_WINDOW_MS={};\
-         window.__IPE_EVENT_QUEUE_MAX={};\
-         window.__IPE_HELLO_TIMEOUT_MS={};\
-         window.__IPE_HEARTBEAT_TTL_MS={};\
+         {tuning}\
          window.__IPE_MSG_RECONNECTING=\"Reconnecting…\";\
          window.__IPE_MSG_UPDATED=\"updated ✓\";\
-         window.__IPE_MSG_OFFLINE=\"Connection lost — refresh to retry\";",
-        num("IPE_WEB_RETRY_BASE_MS", 500),
-        num("IPE_WEB_RETRY_MAX_MS", 16000),
-        num("IPE_WEB_RETRY_MAX_ATTEMPTS", 10),
-        num("IPE_WEB_RETRY_FAST_MS", 200),
-        num("IPE_WEB_RETRY_FAST_WINDOW_MS", 3000),
-        num("IPE_WEB_QUEUE_MAX", 50),
-        num("IPE_WEB_HELLO_TIMEOUT_MS", 8000),
-        num("IPE_WEB_HEARTBEAT_TTL_MS", 35000),
+         window.__IPE_MSG_OFFLINE=\"Connection lost — refresh to retry\";"
     )
 }
 
 /// Whether the dev watch/status banner endpoint should be mounted.
 ///
-/// True when the banner is enabled (not explicitly disabled via `IPE_WEB_BANNER`
-/// off/0/false), the app is NOT in production, and the app is root-mounted
-/// (not a sub-app). Mirrors the three conditions the banner injection already
-/// uses so no new env var is needed.
+/// [`watch_banner_active_with`] over the process dev intent.
 #[cfg(feature = "server")]
 fn watch_banner_active(base: &str) -> bool {
-    if crate::telemetry::production_from_env() {
+    watch_banner_active_with(base, crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// Whether the banner endpoint mounts under an explicit dev-intent proof.
+///
+/// True when `dev` holds, the banner is enabled (not explicitly disabled via
+/// `IPE_WEB_BANNER` off/0/false), and the app is root-mounted (not a sub-app).
+/// Mirrors the conditions the banner injection already uses so no new env var
+/// is needed.
+#[cfg(feature = "server")]
+fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    if dev.is_none() {
         return false;
     }
     if !base.is_empty() {
@@ -605,7 +646,7 @@ struct PatchEnvelope<'a> {
 
 /// Body for the dev-only `POST /_ipe/watch/status` endpoint.
 ///
-/// Sent by `ipe watch` to push build state to connected browsers.
+/// Sent by `ipe dev watch` to push build state to connected browsers.
 /// Only mounted when the dev banner is active (non-production, root-mounted,
 /// and `IPE_WEB_BANNER` not explicitly disabled).
 #[derive(serde::Deserialize)]
@@ -621,7 +662,7 @@ struct WatchStatusBody {
     phase: Option<String>,
 }
 
-/// Latest build status from `ipe watch`, held in the server's shared state.
+/// Latest build status from `ipe dev watch`, held in the server's shared state.
 ///
 /// `None` = no status yet (initial state or production). Set by the
 /// `/_ipe/watch/status` endpoint and replayed to new SSE connections so a
@@ -964,7 +1005,7 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// an unbounded number of sessions. Decremented ONLY via `SessionSlot::drop`,
     /// so the leak fix (mortal driver) and this cap share one mechanism.
     session_count: Arc<AtomicUsize>,
-    /// Latest build status from `ipe watch`. `None` until the first status
+    /// Latest build status from `ipe dev watch`. `None` until the first status
     /// POST arrives. Replayed to new SSE connections so a browser refresh
     /// during a failed build immediately shows the sticky error banner.
     /// Populated only when the dev watch/status endpoint is mounted;
@@ -998,11 +1039,16 @@ impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
 /// enough to bound memory under a session-creation flood.
 /// Env `IPE_WEB_MAX_SESSIONS`.
 #[cfg(feature = "server")]
-fn max_sessions() -> usize {
-    crate::system::read_env_var("IPE_WEB_MAX_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(50_000)
+const MAX_SESSIONS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WEB_MAX_SESSIONS",
+    50_000,
+    crate::system::ZeroCeiling::Accepted,
+    "decimal session count",
+);
+
+#[cfg(feature = "server")]
+fn max_sessions() -> Result<usize, crate::system::EnvCeilingRefusal> {
+    MAX_SESSIONS_CEILING.read()
 }
 
 /// RAII admission slot: decrements `WebState::session_count` exactly once when
@@ -1435,9 +1481,15 @@ fn normalise_base_path(raw: &str) -> String {
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
 #[cfg(feature = "server")]
 fn cookie_name_for(base: &str) -> crate::server::CookieName {
+    cookie_name_with(base, csrf::cookies_secure())
+}
+
+/// [`cookie_name_for`] under an explicit `Secure` decision.
+#[cfg(feature = "server")]
+fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
     use crate::server::{CookieName, RuntimeCookie};
     if base.is_empty() {
-        let root = if csrf::cookies_secure() {
+        let root = if secure {
             RuntimeCookie::HostSession
         } else {
             RuntimeCookie::Session
@@ -1490,11 +1542,15 @@ fn cookie_path() -> String {
 }
 
 /// The session cookie line: `Path` is the app's base, `HttpOnly`, `Max-Age` is
-/// the store TTL. `Secure` when cookies are secure or this request arrived over
+/// the store `ttl`. `Secure` when cookies are secure or this request arrived over
 /// TLS at a trusted proxy; `SameSite=None` (always `Secure`) when the app may be
 /// framed cross-origin, else `Lax`.
 #[cfg(feature = "server")]
-fn session_set_cookie(sid: &str, headers: &axum::http::HeaderMap) -> crate::server::SetCookie {
+fn session_set_cookie(
+    sid: &str,
+    headers: &axum::http::HeaderMap,
+    ttl: std::time::Duration,
+) -> crate::server::SetCookie {
     use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
     SetCookie::new(
         &session_cookie_name(),
@@ -1508,7 +1564,7 @@ fn session_set_cookie(sid: &str, headers: &axum::http::HeaderMap) -> crate::serv
                 SameSite::Lax
             },
             secure: csrf::cookies_secure() || request_is_https(headers),
-            max_age_secs: Some(web_ttl().as_secs()),
+            max_age_secs: Some(ttl.as_secs()),
         },
     )
 }
@@ -1570,15 +1626,15 @@ fn page_response(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let html = render_page_full(sid, &web_base_path(), body, csrf_token);
-    // Session cookie carries `Secure` in production / frame-ancestors mode, OR
+    // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
-    // `csrf::cookies_secure()` snapshots `production_from_env() ||
-    // frame_ancestors().is_some()` ONCE at process start and never inspects this
+    // `csrf::cookies_secure()` snapshots the dev intent and
+    // `frame_ancestors().is_some()` ONCE at process start and never inspects this
     // request's TLS / `X-Forwarded-Proto`, so a dev process fronted by a TLS
     // proxy would otherwise emit a non-Secure session cookie even though the
     // browser connection was HTTPS). The untrusted-proxy case (operator hasn't
-    // set `IPE_TRUSTED_PROXY`) keeps ENV-only behaviour — still SOUND, just not
+    // set `IPE_TRUSTED_PROXY`) keeps the process-wide behaviour — still SOUND, just not
     // maximally precise, because it never marks a cookie Secure incorrectly,
     // only potentially fails to mark one Secure that could safely have been.
     //
@@ -1590,7 +1646,10 @@ fn page_response(
     // request-scoped.
     //
     // SameSite=Lax stays so top-level navigations keep the session.
-    let session_cookie = session_set_cookie(sid, headers);
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
     let mut resp = (
         axum::http::StatusCode::OK,
@@ -1630,7 +1689,10 @@ fn page_response_with_overlay(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let html = render_page_full_with_overlay(sid, &web_base_path(), body, csrf_token, overlay);
-    let session_cookie = session_set_cookie(sid, headers);
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
     let mut resp = (
         axum::http::StatusCode::OK,
@@ -1660,98 +1722,75 @@ fn page_response_with_overlay(
 /// default 5 MiB (5 << 20 = 5 242 880). The default covers `Event.onFile` /
 /// `Event.onImage` data-URL payloads; override for larger file uploads.
 #[cfg(feature = "server")]
-fn web_max_body_bytes() -> usize {
-    crate::system::read_env_var("IPE_WEB_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(5 << 20)
-}
+const WEB_MAX_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WEB_MAX_BODY_BYTES",
+    5 << 20,
+    crate::system::ZeroCeiling::Refused,
+    "decimal byte count",
+);
 
 #[cfg(test)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 mod web_max_body_bytes_tests {
-    // IPE_WEB_MAX_BODY_BYTES=0 must floor at the default, not disable the
-    // body (matching server::max_body's `.filter(|&n| n > 0)`). Without the
-    // floor a 0 value would 413 every /_ipe/event POST.
-    //
-    // This tests the parsing/filtering formula directly rather than mutating
-    // the real env var: `std::env::set_var` is not thread-safe under a
-    // parallel test harness, and `IPE_WEB_MAX_BODY_BYTES` already has an
-    // env-mutating test in server.rs (`max_body_env_override`) — a second
-    // unsynchronized mutator of the same key would make both tests
-    // intermittently flaky. Mirrors the established convention documented at
-    // `server::tests::ws_send_buffer_default_is_256`.
-    fn parse(raw: Option<&str>) -> usize {
-        raw.and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(5 << 20)
+    // A zero cap would 413 every /_ipe/event POST, so `0` is refused like any
+    // other malformed value; the parse is driven without touching the shared
+    // environment variable `server::tests::max_body_env_override` mutates.
+    use super::WEB_MAX_BODY_CEILING;
+
+    fn parse(raw: Option<&str>) -> Result<usize, crate::system::EnvCeilingRefusal> {
+        WEB_MAX_BODY_CEILING.parse_as(raw.map(str::to_owned).ok_or(std::env::VarError::NotPresent))
     }
 
     #[test]
-    fn web_max_body_bytes_floors_at_default_on_zero() {
-        assert_eq!(parse(None), 5 << 20);
-        assert_eq!(parse(Some("1024")), 1024);
-        assert_eq!(parse(Some("0")), 5 << 20); // invalid → default, not "reject everything"
+    fn web_max_body_bytes_refuses_zero() {
+        assert_eq!(parse(None), Ok(5 << 20));
+        assert_eq!(parse(Some("1024")), Ok(1024));
+        assert!(parse(Some("0")).is_err(), "a zero body cap is refused");
+        assert!(
+            parse(Some(" 1024")).is_err(),
+            "a padded body cap is refused"
+        );
     }
 }
+
+/// The session idle-TTL the environment may set: `IPE_WEB_TTL`, whole seconds
+/// or `h` / `m` / `s` segments (`30m`, `1h30m`), at most 400 days.
+#[cfg(feature = "server")]
+const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
+    "IPE_WEB_TTL",
+    1800,
+    "duration (whole seconds, or h/m/s segments such as 30m or 1h30m)",
+)
+.at_most(400 * 24 * 60 * 60);
 
 /// Session idle-TTL under the one config precedence `env > setting-in-code >
 /// fallback`: `IPE_WEB_TTL` wins, else an installed `Web.sessionTtl` setting,
 /// else the default 1800 (30 min).
+///
+/// # Errors
+///
+/// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
+/// duration within the bound; a present value is never replaced by a default.
 #[cfg(feature = "server")]
-fn web_ttl() -> std::time::Duration {
-    let secs = crate::system::read_env_var("IPE_WEB_TTL")
-        .ok()
-        .and_then(|s| parse_duration_secs(&s))
-        .or_else(crate::app_config::resolve_session_ttl_override)
-        .unwrap_or(1800u64);
-    std::time::Duration::from_secs(secs)
+fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
+    let raw = WEB_TTL.lookup();
+    if matches!(raw, Err(std::env::VarError::NotPresent))
+        && let Some(secs) = crate::app_config::resolve_session_ttl_override()
+    {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    WEB_TTL.parse(raw).map(std::time::Duration::from_secs)
 }
 
-/// Parse a duration string: a bare integer is seconds (legacy), otherwise one
-/// or more `<number><unit>` segments with units `h` / `m` / `s`
-/// (e.g. `30m`, `1h`, `24h`, `90s`, `1h30m`). Total: any malformed input
-/// returns `None` (caller falls back to the default) — never panics.
+/// The `503` a request answers when the session TTL cannot be resolved.
 #[cfg(feature = "server")]
-fn parse_duration_secs(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Bare integer → seconds (legacy form).
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
-    }
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    let mut saw_unit = false;
-    let mut saw_digit = false;
-    for ch in s.chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.checked_mul(10)?.checked_add(d as u64)?;
-            saw_digit = true;
-        } else {
-            let unit_secs = match ch {
-                'h' => 3600,
-                'm' => 60,
-                's' => 1,
-                _ => return None, // unknown unit / stray char → malformed
-            };
-            if !saw_digit {
-                return None; // a unit with no preceding number
-            }
-            total = total.checked_add(num.checked_mul(unit_secs)?)?;
-            num = 0;
-            saw_digit = false;
-            saw_unit = true;
-        }
-    }
-    // A trailing number with no unit (e.g. `1h30`) is malformed.
-    if saw_digit || !saw_unit {
-        return None;
-    }
-    Some(total)
+fn ttl_unavailable_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        FAIL_CLOSED_BODY,
+    )
+        .into_response()
 }
 
 /// Graceful-drain grace window: how long the pure axum graceful drain is allowed
@@ -1764,7 +1803,7 @@ fn parse_duration_secs(raw: &str) -> Option<u64> {
 /// When `true`, the web request handler skips the session-checkpoint lookup
 /// (`get_reconstructing`) and forces every returning session to a fresh `init`,
 /// bypassing the additive-splice algorithm entirely. This is the escape hatch
-/// for `ipe watch --reset-state`: the watch process sets the flag in the child's
+/// for `ipe dev watch --reset-state`: the watch process sets the flag in the child's
 /// env for the lifetime of that binary. Dev-only; a release binary is never
 /// launched with this flag by the CLI.
 ///
@@ -1783,12 +1822,19 @@ pub(crate) fn reset_state_from_env() -> bool {
 /// Tunable via `IPE_WEB_SHUTDOWN_GRACE_MS` (default 1500 ms; 0 = exit at
 /// once).
 #[cfg(feature = "server")]
-fn shutdown_grace() -> std::time::Duration {
-    let ms = crate::system::read_env_var("IPE_WEB_SHUTDOWN_GRACE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1500);
-    std::time::Duration::from_millis(ms)
+const SHUTDOWN_GRACE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_WEB_SHUTDOWN_GRACE_MS",
+    1500,
+    crate::system::ZeroCeiling::Accepted,
+    "decimal millisecond count",
+);
+
+/// The shutdown grace window, resolved by `serve_web` before it binds.
+#[cfg(feature = "server")]
+fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
+    SHUTDOWN_GRACE_CEILING
+        .read()
+        .map(std::time::Duration::from_millis)
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
@@ -1921,12 +1967,12 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
     }
 }
 
-/// The H23 production gate over [`push_reload_to_web_sessions`]: in
-/// production (`ENV`/`IPE_ENV` set to a non-dev marker) the push path is
-/// UNREACHABLE — same one-`if` shape every other production gate in this
-/// module uses (dev-console mount, metrics auth). Split from
-/// `web_shutdown_signal` so the gate itself is unit-testable without
-/// delivering a real signal.
+/// The dev-only gate over [`push_reload_to_web_sessions`], over the process dev intent.
+///
+/// Without a [`DevIntent`](crate::telemetry::DevIntent) (a release build, or a
+/// production posture) the push path is unreachable. Split from
+/// `web_shutdown_signal` so the gate is unit-testable without delivering a
+/// real signal.
 #[cfg(feature = "server")]
 async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1934,7 +1980,20 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    if !crate::telemetry::production_from_env() {
+    let dev = crate::telemetry::dev_intent_from_env();
+    maybe_push_reload_with(store, dev.as_ref()).await;
+}
+
+/// [`maybe_push_reload_to_web_sessions`] under an explicit dev-intent proof.
+#[cfg(feature = "server")]
+async fn maybe_push_reload_with<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    dev: Option<&crate::telemetry::DevIntent>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    if dev.is_some() {
         push_reload_to_web_sessions(store).await;
     }
 }
@@ -1945,7 +2004,7 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
 /// the generated entry exits 0).
 ///
 /// Two escapes guard against the drain hanging — both keep the no-panic thesis:
-///  - A bounded grace timer that force-exits 0 (CLEAN) after `shutdown_grace()`,
+///  - A bounded grace timer that force-exits 0 (CLEAN) after `grace`,
 ///    so a never-idle SSE stream can't wedge the process (drops long-lived
 ///    connections rather than waiting).
 ///  - A SECOND signal (Ctrl-C twice) that force-exits 130 immediately.
@@ -1953,8 +2012,10 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
 /// Robustness: a failed SIGTERM registration must NOT crash — it degrades to
 /// SIGINT-only (`ctrl_c`). On non-unix only `ctrl_c` is available.
 #[cfg(feature = "server")]
-async fn web_shutdown_signal<Model, Msg>(store: Arc<dyn store::SessionStore<Model, Msg>>)
-where
+async fn web_shutdown_signal<Model, Msg>(
+    store: Arc<dyn store::SessionStore<Model, Msg>>,
+    grace: std::time::Duration,
+) where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
@@ -1997,8 +2058,8 @@ where
     // immediately and let the axum drain
     // win the race when there are no long-lived connections (the common case →
     // sub-window exit). Exit 0 keeps the IpeTask-Ok / exit-0 contract.
-    tokio::spawn(async {
-        tokio::time::sleep(shutdown_grace()).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
         // Defense-in-depth: kill the console child again in case it was spawned
         // after the first teardown call (shutdown_console is idempotent).
         #[cfg(feature = "http_client")]
@@ -2108,10 +2169,16 @@ where
         // A fail-closed store config (e.g. prod `IPE_WEB_STORE=sqlite` in a
         // build with no `db` feature) surfaces as a task error → stderr + exit
         // 1, never a silent downgrade to a different backend.
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -2206,17 +2273,17 @@ where
             // router that answers every path with the fixed 503 body (the
             // operator detail goes to the runtime log) — never a silent downgrade to a different backend and never a mount
             // that quietly serves real sessions on the wrong store.
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2309,17 +2376,17 @@ where
                 routed_resolvers(routes, not_found, set_page, render);
             // A mount has no task-error channel, so an unhonourable store config
             // fails closed as a 503-everywhere router (see `web_embed_router`).
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2516,6 +2583,8 @@ pub(crate) enum StartupRefusal {
         base: String,
         refusal: crate::encoding::DecodeRefusal,
     },
+    /// An environment ceiling the app applies is present but malformed.
+    Ceiling(crate::system::EnvCeilingRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -2527,6 +2596,7 @@ impl std::fmt::Display for StartupRefusal {
             Self::BasePath { base, refusal } => {
                 write!(f, "web base path `{base}` is malformed: {refusal}")
             }
+            Self::Ceiling(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -2631,10 +2701,16 @@ where
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -2693,16 +2769,14 @@ fn is_browser_noise_path(p: &str) -> bool {
     .any(|ext| p.ends_with(ext))
 }
 
-///go `handleInitial`): serve an unrouted browser-noise file
-/// from the static dir's ROOT when it exists there. Browsers always probe
-/// `/favicon.ico` (and friends) at the origin root, never under `/static/`,
-/// so without this shortcut an author with a configured static dir has no
-/// way to suppress the 404. `None` → the caller 404s.
+/// Serve an unrouted browser-noise file from the static dir's root when it
+/// exists there.
 ///
-/// Security: the path is attacker-shaped. Any non-plain segment (empty, `.`,
-/// `..`) is rejected BEFORE the join — stricter than  `filepath.Clean`,
-/// no traversal can escape the dir. A directory (or unreadable file) reads
-/// as `Err` → `None` → 404.
+/// Browsers probe `/favicon.ico` (and friends) at the origin root, never under
+/// `/static/`, so without this shortcut an author with a configured static dir
+/// has no way to suppress the 404. `None` means the caller answers 404: no
+/// static dir, a request path [`noise_candidate`] refuses, or an entry that is
+/// absent, a directory or unreadable.
 #[cfg(feature = "server")]
 async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
@@ -2710,17 +2784,8 @@ async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Resp
     let dir = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
         .ok()
         .filter(|d| !d.is_empty())?;
-    let rel = path.trim_start_matches('/');
-    if rel.is_empty()
-        || rel
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
-    {
-        return None;
-    }
-    let candidate = std::path::Path::new(&dir).join(rel);
+    let (candidate, mime) = noise_candidate(&dir, path, crate::path_core::HOST)?;
     let bytes = tokio::fs::read(&candidate).await.ok()?;
-    let mime = static_noise_mime(rel.rsplit('.').next().unwrap_or(""));
     Some(
         (
             axum::http::StatusCode::OK,
@@ -2729,6 +2794,30 @@ async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Resp
         )
             .into_response(),
     )
+}
+
+/// The file beneath `dir` a browser-noise request path names under `regime`,
+/// with its content type, or `None` when the path may not reach the
+/// filesystem.
+///
+/// The request path is parsed by the one static-request parse
+/// ([`crate::server::static_request`]): decoded once by the strict core, every
+/// segment a plain name under the regime. The candidate is the checked join
+/// ([`crate::path::join_rel`]), never a raw `Path::join`.
+#[cfg(feature = "server")]
+fn noise_candidate(
+    dir: &str,
+    uri_path: &str,
+    regime: crate::path_core::Regime,
+) -> Option<(std::path::PathBuf, &'static str)> {
+    let crate::server::StaticRequest::File(rel) =
+        crate::server::static_request(uri_path, std::path::Path::new(dir), regime).ok()?
+    else {
+        return None;
+    };
+    let candidate = std::path::PathBuf::from(crate::path::join_rel(dir, &rel).ok()?);
+    let mime = static_noise_mime(rel.last().rsplit('.').next().unwrap_or(""));
+    Some((candidate, mime))
 }
 
 /// Content type for a browser-noise file served from the static root. The
@@ -2898,7 +2987,7 @@ mod handlers {
             let (m, _cmd) = (st.init)(req);
             m
         };
-        // `IPE_WEB_RESET_STATE=1` (set by `ipe watch --reset-state` in the child
+        // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
         // evaluated once per request (cheap env read, cached by the OS) and is
@@ -2977,9 +3066,14 @@ mod handlers {
                 // pass at cap-1. ALWAYS reserve (so the slot built below is
                 // paired 1:1 with a decrement); only the rejection is gated on
                 // cap>0 (0 = unlimited opt-out). Over cap → roll back + 503.
-                let cap = max_sessions();
+                // A malformed ceiling admits no new session (`usize::MIN` cap
+                // with the unlimited opt-out off), never the default.
+                let (cap, unlimited) = match max_sessions() {
+                    Ok(cap) => (cap, cap == 0),
+                    Err(_) => (usize::MIN, false),
+                };
                 let reserved = st.session_count.fetch_add(1, Ordering::SeqCst);
-                if cap > 0 && reserved >= cap {
+                if !unlimited && reserved >= cap {
                     st.session_count.fetch_sub(1, Ordering::SeqCst);
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -3146,7 +3240,10 @@ mod handlers {
             let _ = await_entry(reply_rx).await;
         }
 
-        let (tx, rx) = sse::channel();
+        // A malformed buffer ceiling refuses the stream, never the default.
+        let Ok((tx, rx)) = sse::channel() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
         {
             entry.lock().unwrap_or_else(|e| e.into_inner()).sse_tx = Some(tx.clone());
         }
@@ -3203,7 +3300,7 @@ mod handlers {
         // SSE open with a lightweight `swapped` frame. The client shows the
         // brief positive "updated ✓" toast only when it is a RECONNECT (it
         // already saw a prior `hello` this page-life), so a first page load is
-        // silent. A release / `ipe run` server never sets the env, so this
+        // silent. A release / `ipe dev run` server never sets the env, so this
         // frame is never emitted there.
         if crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
             .ok()
@@ -3215,7 +3312,7 @@ mod handlers {
 
         // Reconnect-resync.
         // A session restored from the store on a cold hit — or any process
-        // restart / `ipe watch` rebuild / redeploy paired with a persistent
+        // restart / `ipe dev watch` rebuild / redeploy paired with a persistent
         // store — has no live subscriptions from the previous process, so
         // nothing pushes until the next user Msg. Render the current view once
         // and ship it as a full-body `event: patch` frame; the client consumes
@@ -3237,7 +3334,7 @@ mod handlers {
 
         // Replay the latest build-status so a browser refresh during a failed
         // build immediately shows the sticky error banner without waiting for
-        // the next `ipe watch` status POST. A `None` status (no build has run
+        // the next `ipe dev watch` status POST. A `None` status (no build has run
         // yet, or production) sends nothing. Best-effort: a full channel is
         // fine — the next reload or real status event will catch up.
         {
@@ -3441,7 +3538,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-appearance (dev-only) ──────────────────────────
     // The running server's inbound leg of the appearance-hot-swap live socket.
-    // The `ipe watch` process (a SEPARATE process from the running app) computes
+    // The `ipe dev watch` process (a SEPARATE process from the running app) computes
     // an appearance-only table patch for an edited `view` and POSTs it here; the
     // handler registers it and re-renders every live session's `view(currentModel)`,
     // pushing the resulting VDOM diff over the existing SSE `patches` channel —
@@ -3507,7 +3604,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-transition (dev-only) ──────────────────────────
     // The running server's inbound leg of the `update`-arm transition-hot-swap
-    // live socket. The `ipe watch` process computes a transition patch for an
+    // live socket. The `ipe dev watch` process computes a transition patch for an
     // edited data-describable arm and POSTs it here; the handler registers the
     // replacement `Transition` under the arm's baked-datum signature, so the next
     // dispatch of that arm applies the edited transition through the SAME compiled
@@ -3585,7 +3682,7 @@ mod handlers {
     // ── POST /_ipe/hot-msg (dev-only) ─────────────────────────────────
     // The running server's inbound leg of the additive-`Msg`-variant hot-swap
     // live socket. When a source edit adds a `Msg` variant (plus its arm and a
-    // button firing it), `ipe watch` computes the edited program's `MsgSet`
+    // button firing it), `ipe dev watch` computes the edited program's `MsgSet`
     // descriptor and POSTs it here alongside the live baked descriptor. The
     // handler accepts it ONLY when it is a proven additive superset of the live
     // set (every live variant present, unchanged), so a returning session's live
@@ -3672,7 +3769,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-subs (dev-only) ────────────────────────────────
     // The running server's inbound leg of the `subscriptions`-entry hot-swap live
-    // socket. The `ipe watch` process computes a sub patch for an edited
+    // socket. The `ipe dev watch` process computes a sub patch for an edited
     // data-describable subscription (an interval or tick-message change) and POSTs
     // it here; the handler registers the replacement `SubDescription` under the
     // entry's baked-datum signature, so the next re-subscribe of that entry builds
@@ -3752,7 +3849,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-init (dev-only) ────────────────────────────────
     // The running server's inbound leg of the session-`init` hot-swap live
-    // socket. The `ipe watch` process computes an init patch for an edited
+    // socket. The `ipe dev watch` process computes an init patch for an edited
     // data-describable `init` and POSTs it here; the handler registers the
     // replacement `InitDatum` under the app's baked-datum signature, so the NEXT
     // NEW session decodes the edited init through the SAME compiled
@@ -3830,7 +3927,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-wiring (dev-only) ──────────────────────────────
     // The running server's inbound leg of the `update`-arm Cmd-WIRING hot-swap
-    // live socket. The `ipe watch` process computes a wiring patch for an edited
+    // live socket. The `ipe dev watch` process computes a wiring patch for an edited
     // arm (which compiled effect it fires) and POSTs it here; the handler
     // registers the replacement `CmdWiring` under the arm's baked-datum signature,
     // so the next dispatch of that arm fires the edited (already-compiled) effect
@@ -3908,12 +4005,12 @@ mod handlers {
     }
 
     // ── POST /_ipe/watch/status (dev-only) ───────────────────────────
-    // Inbound build-status notification from `ipe watch`. Guarded two ways
+    // Inbound build-status notification from `ipe dev watch`. Guarded two ways
     // so it is inert in production:
     //   1. The route is MOUNTED only when the dev banner is active (non-
     //      production + `IPE_WEB_BANNER` not disabled + root-mounted).
     //   2. The `X-Ipe-Hot-Token` header MUST match the per-process token
-    //      set by `ipe watch` (the same mechanism as `/_ipe/hot-appearance`).
+    //      set by `ipe dev watch` (the same mechanism as `/_ipe/hot-appearance`).
     //      A web page cannot obtain this token, so the token alone is the
     //      trust boundary (same model as `/_ipe/hot-appearance`).
     //
@@ -4723,11 +4820,11 @@ where
     // Only when `http_client` is active: the console proxy uses reqwest for
     // the reverse-proxy path. Without it, always use the in-process console.
     //
-    // The bind host is resolved once, here, and its listen scope installed
-    // before any console gate reads it: the console default opens only for a
-    // dev posture on a loopback listener.
+    // The bind host is resolved once, here, and its listen scope recorded
+    // before any console gate reads it: a dev surface exists only while every
+    // app listener is loopback.
     let host = crate::app_config::resolve_host_bind();
-    crate::telemetry::ListenScope::install(&host);
+    crate::telemetry::record_bind(&host);
     #[cfg(feature = "http_client")]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
@@ -4746,6 +4843,10 @@ where
     ) {
         Ok(app) => app,
         Err(cause) => return IpeResult::Err(cause.to_string().into()),
+    };
+    let grace = match shutdown_grace() {
+        Ok(grace) => grace,
+        Err(refusal) => return IpeResult::Err(format!("Web.tea: {refusal}").into()),
     };
 
     // Port precedence (shared with `Ipe.Http.Server`): the supervisor's
@@ -4777,7 +4878,7 @@ where
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
     // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
     match axum::serve(listener, app)
-        .with_graceful_shutdown(web_shutdown_signal(shutdown_store))
+        .with_graceful_shutdown(web_shutdown_signal(shutdown_store, grace))
         .await
     {
         Ok(()) => ok_res(()),
@@ -4826,6 +4927,20 @@ where
     // a malformed base refuses the router rather than a per-request re-parse
     // that silently matches the unstripped path.
     let sse_base = Arc::new(parse_route_base(&web_base_path())?);
+    // Every environment ceiling the app applies resolves here, so a malformed
+    // one refuses the router instead of a request; the per-request sites
+    // re-read and refuse that request on their own.
+    let body_limit: usize = WEB_MAX_BODY_CEILING
+        .read()
+        .map_err(StartupRefusal::Ceiling)?;
+    let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
+    max_sessions().map_err(StartupRefusal::Ceiling)?;
+    sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
+    if let Err(refusal) = client_tuning_js() {
+        return Err(StartupRefusal::Ceiling(refusal.clone()));
+    }
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               uri: axum::http::Uri,
@@ -4843,13 +4958,13 @@ where
     // before the handler sees the bytes, so an over-sized payload is
     // rejected at the extract layer with 413 Payload Too Large.
     let event_route = post(handlers::event_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-        .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes()));
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit));
 
     // Inbound `Ipe.Ffi.Js` port route: same body-size cap as `/_ipe/event`, so an
     // over-sized port frame is rejected at the extract layer (413) before the
     // handler's own seal-boundary budget even runs.
     let port_route = post(handlers::port_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-        .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes()));
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit));
 
     // Content-addressed client JS asset route. The URL is computed once at
     // startup from SHA-256(CLIENT_JS) so the path changes when the file
@@ -4952,7 +5067,7 @@ where
         router.route(
             "/_ipe/hot-appearance",
             post(handlers::hot_appearance_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -4966,7 +5081,7 @@ where
         router.route(
             "/_ipe/hot-transition",
             post(handlers::hot_transition_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -4981,7 +5096,7 @@ where
         router.route(
             "/_ipe/hot-msg",
             post(handlers::hot_msg_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -4995,7 +5110,7 @@ where
         router.route(
             "/_ipe/hot-init",
             post(handlers::hot_init_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -5009,7 +5124,7 @@ where
         router.route(
             "/_ipe/hot-subs",
             post(handlers::hot_subs_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -5023,7 +5138,7 @@ where
         router.route(
             "/_ipe/hot-wiring",
             post(handlers::hot_wiring_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -5036,7 +5151,7 @@ where
         router.route(
             "/_ipe/watch/status",
             post(handlers::watch_status_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>)
-                .layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
     } else {
         router
@@ -5053,7 +5168,7 @@ where
         // memory before the JSON parse.
         .route(
             "/_ipe/observability/ingest",
-            post(console::ingest).layer(axum::extract::DefaultBodyLimit::max(web_max_body_bytes())),
+            post(console::ingest).layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         );
 
     // The console + metrics auth gate applies whether or not a console is
@@ -5089,7 +5204,7 @@ where
         }
     };
     if !proxy_active && console::gate_allows() {
-        store::emit_memory_store_log(web_ttl());
+        store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
             &format!(
@@ -5146,8 +5261,9 @@ where
     // package.ipe `[web] static` (baked as IPE_WEB_STATIC_DIR) → serve files at
     // /static/* via ServeDir. MUST be added before the `/*path` page catch-all
     // so a /static/<file> request hits ServeDir, not the page handler (which
-    // would return HTML). ServeDir blocks `..` path traversal by construction
-    // (percent-decodes first, so `%2e%2e` is caught too). NOTE: like
+    // would return HTML). `strict_serve_dir` parses each request path through
+    // `server::static_request` (decoded once, every segment a plain name under
+    // the host regime, the join re-checked) before `ServeDir` reads it. NOTE: like
     // http.FileServer it FOLLOWS symlinks inside the dir — the dir is
     // author-controlled (package.ipe [web] static), so that is the intended
     // contract, NOT a confinement guarantee. Absent/empty → no static mount.
@@ -5260,7 +5376,7 @@ mod reload_push_tests {
     #[tokio::test]
     async fn push_reload_to_web_sessions_sends_one_frame_per_web_session() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store_impl.set("with_sse", handle_with(Some(sse_tx))).await;
         store_impl.set("without_sse", handle_with(None)).await;
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
@@ -5277,44 +5393,39 @@ mod reload_push_tests {
         );
     }
 
-    /// H23: with `ENV=production` the reload push is UNREACHABLE — the
-    /// gated path pushes nothing; in dev it pushes. (The gate is tested via
-    /// `maybe_push_reload_to_web_sessions`, the exact call
-    /// `web_shutdown_signal` makes right after `mark_draining` — split out
-    /// so no real OS signal is needed here.)
+    /// Without a dev intent the reload push is unreachable; with one it
+    /// pushes. The env-driven gate under `ENV=dev` on the release test binary
+    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact call
+    /// `web_shutdown_signal` makes right after `mark_draining`, split out so no
+    /// real OS signal is needed here.)
     #[tokio::test]
-    async fn web_shutdown_signal_skips_the_reload_push_in_production() {
-        use crate::system::{locked_remove_var, locked_set_var};
-        let prior_env = crate::system::read_env_var("ENV").ok();
-        let prior_ipe_env = crate::system::read_env_var("IPE_ENV").ok();
-
+    async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store_impl.set("s", handle_with(Some(sse_tx))).await;
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
-        locked_set_var("ENV", "production");
-        maybe_push_reload_to_web_sessions(&store).await;
+        maybe_push_reload_with(&store, None).await;
         assert!(
             sse_rx.try_recv().is_err(),
-            "production must have NO reachable path that pushes the reload frame"
+            "no dev intent: NO reachable path pushes the reload frame"
         );
+        if !cfg!(feature = "dev-posture") {
+            crate::system::locked_set_var("ENV", "dev");
+            maybe_push_reload_to_web_sessions(&store).await;
+            assert!(
+                sse_rx.try_recv().is_err(),
+                "ENV=dev on a release build must not push the reload frame"
+            );
+            crate::system::locked_remove_var("ENV");
+        }
 
-        locked_set_var("ENV", "dev");
-        maybe_push_reload_to_web_sessions(&store).await;
+        let dev = crate::telemetry::test_dev_intent();
+        maybe_push_reload_with(&store, Some(&dev)).await;
         assert!(
             sse_rx.try_recv().is_ok(),
-            "dev mode must push the reload frame"
+            "a dev intent pushes the reload frame"
         );
-
-        match prior_env {
-            Some(v) => locked_set_var("ENV", &v),
-            None => locked_remove_var("ENV"),
-        }
-        match prior_ipe_env {
-            Some(v) => locked_set_var("IPE_ENV", &v),
-            None => locked_remove_var("IPE_ENV"),
-        }
     }
 }
 
@@ -5404,7 +5515,7 @@ mod hot_appearance_push_tests {
             literal_table::clear_dev_overlay_for_test();
 
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
-            let (sse_tx, mut sse_rx) = sse::channel();
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
             // A non-initial Model, to prove the re-render uses the CURRENT Model.
             store_impl
                 .set("live", session_with_current_view(7, Some(sse_tx)))
@@ -5467,7 +5578,7 @@ mod hot_appearance_push_tests {
             literal_table::clear_dev_overlay_for_test();
 
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
-            let (sse_tx, mut sse_rx) = sse::channel();
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
             store_impl
                 .set("live", session_with_current_view(3, Some(sse_tx)))
                 .await;
@@ -5498,9 +5609,9 @@ mod dev_banner_tests {
     #[test]
     fn banner_byte_matches_go_dev_banner_markup() {
         // Same id, target/rel/title, monospace blue style, `&#128269;` ENTITY
-        // (not a literal emoji). The banner renders only under a dev posture.
-        crate::system::locked_set_var("ENV", "dev");
-        let b = dev_console_banner("");
+        // (not a literal emoji). The banner renders only under a dev surface.
+        let surface = crate::telemetry::test_dev_surface();
+        let b = crate::telemetry::dev_console_banner_with("", Some(&surface));
         let expected = "<a id=\"__ipe-dev-console\" href=\"/_ipe/console\" target=\"_blank\" \
             rel=\"noopener\" title=\"Ipe Console (dev only)\" \
             style=\"position:fixed;right:12px;bottom:12px;z-index:2147483646;\
@@ -5526,28 +5637,70 @@ mod dev_banner_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod duration_parse_tests {
-    use super::parse_duration_secs;
+    use super::{WEB_TTL, web_ttl};
+    use crate::system::{locked_remove_var, locked_set_var};
+    use std::time::Duration;
 
-    #[test]
-    fn duration_formats_and_bare_seconds() {
-        assert_eq!(parse_duration_secs("1800"), Some(1800)); // bare seconds (legacy)
-        assert_eq!(parse_duration_secs("30m"), Some(1800));
-        assert_eq!(parse_duration_secs("1h"), Some(3600));
-        assert_eq!(parse_duration_secs("24h"), Some(86400));
-        assert_eq!(parse_duration_secs("90s"), Some(90));
-        assert_eq!(parse_duration_secs("1h30m"), Some(5400));
-        assert_eq!(parse_duration_secs("45m"), Some(2700)); // the e2e check (IPE_WEB_TTL=45m)
-        assert_eq!(parse_duration_secs("  1h  "), Some(3600));
+    fn ttl_with(raw: &str) -> Result<Duration, crate::system::EnvCeilingRefusal> {
+        locked_set_var("IPE_WEB_TTL", raw);
+        let resolved = web_ttl();
+        locked_remove_var("IPE_WEB_TTL");
+        resolved
     }
 
     #[test]
-    fn malformed_is_none_never_panics() {
-        assert_eq!(parse_duration_secs(""), None);
-        assert_eq!(parse_duration_secs("abc"), None);
-        assert_eq!(parse_duration_secs("1d"), None); // unsupported unit
-        assert_eq!(parse_duration_secs("1h30"), None); // trailing unit-less number
-        assert_eq!(parse_duration_secs("m"), None); // unit with no number
-        assert_eq!(parse_duration_secs("-5m"), None);
+    fn the_web_ttl_honours_the_duration_contract() {
+        crate::system::assert_env_duration_contract(WEB_TTL);
+    }
+
+    #[test]
+    fn duration_formats_and_bare_seconds() {
+        for (raw, secs) in [
+            ("1800", 1800),
+            ("30m", 1800),
+            ("1h", 3600),
+            ("24h", 86_400),
+            ("90s", 90),
+            ("1h30m", 5400),
+            ("45m", 2700),
+            ("34560000", 34_560_000),
+            ("9600h", 34_560_000),
+        ] {
+            assert_eq!(ttl_with(raw), Ok(Duration::from_secs(secs)), "{raw:?}");
+        }
+        assert_eq!(
+            web_ttl(),
+            Ok(Duration::from_secs(1800)),
+            "absent is the default"
+        );
+    }
+
+    #[test]
+    fn a_malformed_ttl_is_refused_never_defaulted() {
+        for raw in [
+            "",
+            "abc",
+            "1d",
+            "1h30",
+            "m",
+            "-5m",
+            "0",
+            "0s",
+            "0h0m",
+            " 1h",
+            "1h ",
+            "30m1h",
+            "1m1m",
+            "34560001",
+            "9601h",
+            "99999999999999999999",
+        ] {
+            let outcome = ttl_with(raw);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == "IPE_WEB_TTL"),
+                "{raw:?} must be refused naming IPE_WEB_TTL, got {outcome:?}"
+            );
+        }
     }
 }
 
@@ -5774,7 +5927,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "server"))]
 mod base_path_tests {
     use super::{
-        client_js_path, cookie_name_for, cookie_path_for, normalise_base_path, render_page_full,
+        client_js_path, cookie_name_for, cookie_name_with, cookie_path_for, normalise_base_path,
+        render_page_full,
     };
 
     #[test]
@@ -5794,15 +5948,31 @@ mod base_path_tests {
 
     #[test]
     fn cookie_name_is_ipe_sid_at_root_distinct_under_base() {
-        // Dev posture: the root cookie keeps its plain-http name.
-        crate::system::locked_set_var("ENV", "dev");
-        assert_eq!(cookie_name_for("").text(), "ipe_sid");
+        // Plain-http dev: the root cookie keeps its plain name.
+        assert_eq!(cookie_name_with("", false).text(), "ipe_sid");
+        assert_eq!(cookie_name_with("", true).text(), "__Host-ipe_sid");
         // Distinct from the parent's `ipe_sid` so the proxied child can't clobber it.
+        for secure in [false, true] {
+            assert_eq!(
+                cookie_name_with("/_ipe/console", secure).text(),
+                "ipe_sid__ipe_console"
+            );
+        }
         assert_eq!(
             cookie_name_for("/_ipe/console").text(),
             "ipe_sid__ipe_console"
         );
-        assert_ne!(cookie_name_for("/_ipe/console").text(), "ipe_sid");
+    }
+
+    // A release binary under `ENV=dev` still names its root session cookie
+    // `__Host-`: it is always `Secure`.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn session_cookie_host_prefixed_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        assert!(super::csrf::cookies_secure());
+        assert_eq!(cookie_name_for("").text(), "__Host-ipe_sid");
+        crate::system::locked_remove_var("ENV");
     }
 
     #[test]
@@ -5817,6 +5987,7 @@ mod base_path_tests {
     #[test]
     fn session_set_cookie_keeps_the_session_line_bytes() {
         let headers = axum::http::HeaderMap::new();
+        let ttl = std::time::Duration::from_secs(1800);
         let secure = if super::csrf::cookies_secure() {
             "; Secure"
         } else {
@@ -5831,10 +6002,10 @@ mod base_path_tests {
             "{}=0f3a-sid; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={}",
             super::session_cookie_name(),
             super::cookie_path(),
-            super::web_ttl().as_secs()
+            ttl.as_secs()
         );
         assert_eq!(
-            super::session_set_cookie("0f3a-sid", &headers).as_str(),
+            super::session_set_cookie("0f3a-sid", &headers, ttl).as_str(),
             expected
         );
     }
@@ -6022,18 +6193,36 @@ mod admission_control_tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
-    // max_sessions(): env override, default, and the 0=unlimited opt-out.
+    // max_sessions(): env override, default, the 0=unlimited opt-out, and the
+    // refusal of a malformed value.
     #[test]
     fn max_sessions_parsing() {
         crate::system::locked_remove_var("IPE_WEB_MAX_SESSIONS");
-        assert_eq!(max_sessions(), 50_000);
+        let absent = max_sessions();
         crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "7");
-        assert_eq!(max_sessions(), 7);
+        let seven = max_sessions();
         crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "0");
-        assert_eq!(max_sessions(), 0, "0 = unlimited opt-out");
+        let zero = max_sessions();
         crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "garbage");
-        assert_eq!(max_sessions(), 50_000, "unparseable falls back to default");
+        let garbage = max_sessions();
         crate::system::locked_remove_var("IPE_WEB_MAX_SESSIONS");
+        assert_eq!(absent, Ok(50_000));
+        assert_eq!(seven, Ok(7));
+        assert_eq!(zero, Ok(0), "0 = unlimited opt-out");
+        assert!(
+            garbage.is_err_and(|r| r.name() == "IPE_WEB_MAX_SESSIONS"),
+            "a malformed value is refused, never the default"
+        );
+    }
+
+    #[test]
+    fn web_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(MAX_SESSIONS_CEILING);
+        crate::system::assert_env_ceiling_contract(WEB_MAX_BODY_CEILING);
+        crate::system::assert_env_ceiling_contract(SHUTDOWN_GRACE_CEILING);
+        for (_, ceiling) in CLIENT_TUNING_CEILINGS {
+            crate::system::assert_env_ceiling_contract(ceiling);
+        }
     }
 }
 
@@ -6551,7 +6740,58 @@ mod sse_reconnect_reconcile_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod static_noise_mime_tests {
-    use super::static_noise_mime;
+    use super::{noise_candidate, static_noise_mime};
+    use crate::path_core::Regime;
+
+    #[test]
+    fn noise_candidate_windows_refuses_escaping_paths() {
+        for uri in [
+            "/con.ico",
+            "/C:x.ico",
+            "/x:y.ico",
+            "/.well-known/..%5C..%5Cx",
+            "/.well-known/a.",
+        ] {
+            assert_eq!(
+                noise_candidate("C:\\site", uri, Regime::Windows),
+                None,
+                "{uri:?}"
+            );
+        }
+        let ok = noise_candidate("C:\\site", "/a/favicon.ico", Regime::Windows);
+        assert_eq!(
+            ok,
+            Some((
+                std::path::PathBuf::from("C:\\site\\a\\favicon.ico"),
+                "image/x-icon"
+            ))
+        );
+    }
+
+    #[test]
+    fn noise_candidate_unix_decodes_once_and_accepts_legal_names() {
+        assert_eq!(
+            noise_candidate("/srv/site", "/con.ico", Regime::Unix),
+            Some((
+                std::path::PathBuf::from("/srv/site/con.ico"),
+                "image/x-icon"
+            ))
+        );
+        assert_eq!(
+            noise_candidate("/srv/site", "/fav%69con.ico", Regime::Unix),
+            Some((
+                std::path::PathBuf::from("/srv/site/favicon.ico"),
+                "image/x-icon"
+            ))
+        );
+        for uri in ["/", "/a/../x.ico", "/a%2F..%2Fx.ico", "/a//b.ico"] {
+            assert_eq!(
+                noise_candidate("/srv/site", uri, Regime::Unix),
+                None,
+                "{uri:?}"
+            );
+        }
+    }
 
     #[test]
     fn known_browser_noise_extensions_map() {
@@ -6686,35 +6926,29 @@ mod security_env_tests {
 
     // ── IPE_WEB_MAX_BODY_BYTES (Web path) ────────────────────────────────────
     //
-    // `web_max_body_bytes()` reads live from env each call (not memoized), so
-    // we can test the production function directly.
+    // The Web path's ceiling reads live from env each call (not memoized), so
+    // the production read is driven directly.
 
     #[test]
     fn web_max_body_bytes_new_name_and_default() {
-        use super::web_max_body_bytes;
-        const DEFAULT: usize = 5 << 20;
-
+        let read = || super::WEB_MAX_BODY_CEILING.read::<usize>();
         crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
-
-        // (c) unset → default (5 MiB); a rename bug that silently zeros this
-        // would reject all /_ipe/event POSTs.
+        // Unset → default (5 MiB); a rename bug that silently zeros this would
+        // reject all /_ipe/event POSTs.
+        let absent = read();
+        crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", "8192");
+        let overridden = read();
+        crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
         assert_eq!(
-            web_max_body_bytes(),
-            DEFAULT,
+            absent,
+            Ok(5 << 20),
             "unset → 5 MiB default must be preserved"
         );
-
-        // Set → override takes effect.
-        crate::system::locked_set_var("IPE_WEB_MAX_BODY_BYTES", "8192");
         assert_eq!(
-            web_max_body_bytes(),
-            8192,
+            overridden,
+            Ok(8192),
             "IPE_WEB_MAX_BODY_BYTES must take effect"
         );
-        crate::system::locked_remove_var("IPE_WEB_MAX_BODY_BYTES");
-
-        // Restore default.
-        assert_eq!(web_max_body_bytes(), DEFAULT);
     }
 }
 
@@ -6913,7 +7147,7 @@ mod watch_status_handler_tests {
         locked_set_var("IPE_WATCH_HOT_TOKEN", "broadcast-token");
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store
             .set("live-session", make_session_handle(Some(sse_tx)))
             .await;
@@ -6947,27 +7181,35 @@ mod watch_status_handler_tests {
 
     // ── 2. Production inertness ───────────────────────────────────────────────
 
-    /// Under `ENV=production` `watch_banner_active` returns false regardless of
-    /// banner and base settings — the gate function is the single source of truth
-    /// for whether the route is mounted.
+    /// Without a dev intent `watch_banner_active_with` is false regardless of
+    /// banner and base settings, and the env-driven gate under `ENV=dev` on
+    /// the release test binary is false too: the gate function is the single
+    /// source of truth for whether the route is mounted.
     #[test]
-    fn watch_banner_active_false_in_production() {
+    fn watch_status_unmounted_on_release_under_env_dev() {
+        locked_remove_var("IPE_WEB_BANNER");
+        assert!(!watch_banner_active_with("", None));
         locked_set_var("ENV", "production");
-        assert!(
-            !watch_banner_active(""),
-            "watch_banner_active must be false in production"
-        );
+        assert!(!watch_banner_active(""), "production: never mounted");
+        if !cfg!(feature = "dev-posture") {
+            locked_set_var("ENV", "dev");
+            locked_set_var("IPE_ENV", "dev");
+            assert!(
+                !watch_banner_active(""),
+                "ENV=dev on a release build must not mount the route"
+            );
+            locked_remove_var("IPE_ENV");
+        }
         locked_remove_var("ENV");
     }
 
-    /// In dev mode (`ENV=dev`) with banner on, `watch_banner_active` is true.
+    /// Under a dev intent with banner on, `watch_banner_active_with` is true.
     #[test]
     fn watch_banner_active_true_in_dev() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            watch_banner_active(""),
+            watch_banner_active_with("", Some(&dev)),
             "watch_banner_active must be true in dev with no overrides"
         );
     }
@@ -6975,12 +7217,11 @@ mod watch_status_handler_tests {
     /// With banner explicitly disabled, `watch_banner_active` is false even in dev.
     #[test]
     fn watch_banner_active_false_when_banner_disabled() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
+        let dev = crate::telemetry::test_dev_intent();
         for v in ["off", "0", "false"] {
             locked_set_var("IPE_WEB_BANNER", v);
             assert!(
-                !watch_banner_active(""),
+                !watch_banner_active_with("", Some(&dev)),
                 "watch_banner_active must be false when IPE_WEB_BANNER={v}"
             );
         }
@@ -6990,11 +7231,10 @@ mod watch_status_handler_tests {
     /// A non-root base (sub-app) → `watch_banner_active` is false.
     #[test]
     fn watch_banner_active_false_for_subapp() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            !watch_banner_active("/sub"),
+            !watch_banner_active_with("/sub", Some(&dev)),
             "watch_banner_active must be false for a sub-app base"
         );
     }
@@ -7027,7 +7267,7 @@ mod watch_status_handler_tests {
     #[tokio::test]
     async fn no_sse_event_emitted_when_route_absent() {
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store
             .set("session", make_session_handle(Some(sse_tx)))
             .await;
@@ -7058,7 +7298,7 @@ mod watch_status_handler_tests {
         locked_set_var("IPE_WATCH_HOT_TOKEN", "injection-test-token");
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store.set("sess", make_session_handle(Some(sse_tx))).await;
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
@@ -7221,7 +7461,7 @@ mod watch_status_handler_tests {
         let body = format!(r#"{{"ok":false,"error":"{long_error}"}}"#);
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store.set("s", make_session_handle(Some(sse_tx))).await;
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
@@ -7281,7 +7521,7 @@ mod watch_status_handler_tests {
 
         // Simulate what the sse_handler replay block does: read the status and
         // send the SSE frame to the newly-connected session's tx.
-        let (sse_tx, mut sse_rx) = sse::channel();
+        let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         {
             let snapshot = watch_build_status
                 .lock()
@@ -7732,14 +7972,14 @@ mod hot_init_session_scoping_tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Extract the `ipe_sid` value from a `Set-Cookie` response header.
+    /// Extract the session-cookie value from a `Set-Cookie` response header.
     fn extract_sid(resp: &axum::response::Response) -> String {
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
             for part in s.split(';') {
                 let part = part.trim();
                 if let Some((k, v)) = part.split_once('=')
-                    && k.trim() == "ipe_sid"
+                    && k.trim() == cookie_name_for("").as_str()
                 {
                     return v.trim().to_string();
                 }
@@ -7784,8 +8024,6 @@ mod hot_init_session_scoping_tests {
         set_dev_overlay_active_for_test(Some(true));
         clear_dev_init_for_test();
         locked_set_var("IPE_WATCH_HOT_TOKEN", "seal-token");
-        // Dev posture: the session cookie keeps its plain-http name `ipe_sid`.
-        locked_set_var("ENV", "dev");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8571,7 +8809,7 @@ mod bind_error_tests {
         };
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
             let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe run"), "{msg}");
+            assert!(msg.contains("IPE_WEB_PORT=8123 ipe dev run"), "{msg}");
         }
         let relocated = resolve(Some("9100"), Some("9200"));
         assert_eq!(relocated.port, 9100);
@@ -8862,15 +9100,15 @@ mod emitted_router_behavior_tests {
         Some(after[..after.find('"')?].to_string())
     }
 
-    /// GET `path` (optionally with an `ipe_sid` cookie) and return
-    /// `(minted_sid, body)`. `minted_sid` is the `ipe_sid` from any `Set-Cookie`
+    /// GET `path` (optionally with a session cookie) and return
+    /// `(minted_sid, body)`. `minted_sid` is the session cookie from any `Set-Cookie`
     /// header (the response also sets a CSRF cookie, so scan ALL of them), or
     /// empty when none was set.
     #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn get(router: axum::Router, path: &str, cookie: Option<&str>) -> (String, String) {
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -8879,7 +9117,7 @@ mod emitted_router_behavior_tests {
         let mut sid = String::new();
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
-            if let Some(rest) = s.strip_prefix("ipe_sid=") {
+            if let Some(rest) = s.strip_prefix(&format!("{}=", cookie_name_for(""))) {
                 sid = rest.split(';').next().unwrap_or("").trim().to_string();
                 break;
             }
@@ -8901,7 +9139,7 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/event")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("ipe_sid={cookie}"))
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -8942,8 +9180,6 @@ mod emitted_router_behavior_tests {
         // Serialize env mutation across these tests; `IPE_CSRF` is process-global.
         let _g = crate::web::literal_table::overlay_test_lock();
         crate::system::locked_set_var("IPE_CSRF", "off");
-        // Dev posture: plain-http cookie names (`ipe_sid`).
-        crate::system::locked_set_var("ENV", "dev");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -8951,6 +9187,40 @@ mod emitted_router_behavior_tests {
             .expect("multi-thread runtime");
         rt.block_on(body());
         crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// A malformed session TTL or auth ceiling refuses the router at startup,
+    /// naming the variable, instead of answering requests under a default.
+    #[tokio::test]
+    async fn a_malformed_ttl_or_auth_ceiling_refuses_the_router() {
+        let mut cases = vec![("IPE_WEB_TTL", "1h30")];
+        if cfg!(feature = "jwt") {
+            cases.extend([
+                ("IPE_AUTH_MAX_LIFETIME", "8h"),
+                ("IPE_AUTH_SLIDE_WINDOW", "0"),
+                ("IPE_REVOCATION_CAPACITY", " 1024"),
+            ]);
+        }
+        for (name, raw) in cases {
+            crate::system::locked_set_var(name, raw);
+            let refused = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(
+                make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+                false,
+            )
+            .err();
+            crate::system::locked_remove_var(name);
+            assert!(
+                matches!(&refused, Some(StartupRefusal::Ceiling(r)) if r.name() == name),
+                "{name}={raw:?} must refuse the router, got {refused:?}"
+            );
+        }
     }
 
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────
@@ -9020,7 +9290,7 @@ mod emitted_router_behavior_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("ipe_sid={sid}"))
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -9125,7 +9395,7 @@ mod emitted_router_behavior_tests {
     ) -> (StatusCode, String) {
         let mut b = Request::builder().method("GET").uri(uri);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))

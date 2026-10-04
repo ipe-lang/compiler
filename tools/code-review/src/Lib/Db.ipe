@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, insertDrainCursor, migrate, open, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, recordDrain, storedReasonText)
+module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, open, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -14,6 +14,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
+import Lib.Index as Index exposing (Attested, DecidedPair)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (DbLocation)
 import Migrations exposing (all)
@@ -144,39 +145,36 @@ type alias ReviewRow =
 reviewCodec : Codec ReviewRow
 reviewCodec =
     Codec
-        { enc =
-            \row ->
-                Encode.object
-                    [ ( "uid", Encode.string row.uid )
-                    , ( "body_hash", Encode.string row.bodyHash )
-                    , ( "decision", Encode.string row.decision )
-                    , ( "reason"
-                      , case row.reason of
-                            Just r ->
-                                Encode.string (storedReasonString r)
+        { enc = \row ->
+            Encode.object
+                [ ( "uid", Encode.string row.uid )
+                , ( "body_hash", Encode.string row.bodyHash )
+                , ( "decision", Encode.string row.decision )
+                , ( "reason"
+                , case row.reason of
+                    Just r ->
+                        Encode.string (storedReasonString r)
 
-                            Nothing ->
-                                Encode.null
-                      )
-                    , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
-                    ]
-        , mkDec =
-            \_ ->
-                Config.map5 makeRow
-                    (Config.field "uid" Config.string)
-                    (Config.field "body_hash" Config.string)
-                    (Config.field "decision" Config.string)
-                    (Config.field "reason" (Config.nullable Config.string))
-                    (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
-                    |> Config.map rowFromStored
-        , shp =
-            SRecord
-                [ ( "uid", CText )
-                , ( "body_hash", CText )
-                , ( "decision", CText )
-                , ( "reason", CNull CText )
-                , ( "reviewed_at", CTime )
+                    Nothing ->
+                        Encode.null
+                )
+                , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
                 ]
+        , mkDec = \_ ->
+            Config.map5 makeRow
+                (Config.field "uid" Config.string)
+                (Config.field "body_hash" Config.string)
+                (Config.field "decision" Config.string)
+                (Config.field "reason" (Config.nullable Config.string))
+                (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
+                |> Config.map rowFromStored
+        , shp = SRecord
+            [ ( "uid", CText )
+            , ( "body_hash", CText )
+            , ( "decision", CText )
+            , ( "reason", CNull CText )
+            , ( "reviewed_at", CTime )
+            ]
         }
 
 
@@ -207,12 +205,11 @@ rowFromStored stored =
     { uid = stored.uid
     , bodyHash = stored.bodyHash
     , decision = stored.decision
-    , reason =
-        if stored.decision == "refuse" then
-            Just (storedReason (Maybe.withDefault "" stored.reason))
+    , reason = if stored.decision == "refuse" then
+        Just (storedReason (Maybe.withDefault "" stored.reason))
 
-        else
-            Nothing
+    else
+        Nothing
     , reviewedAt = stored.reviewedAt
     }
 
@@ -241,14 +238,12 @@ probe loc =
         |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
 
 
--- The review database from `IPE_REVIEW_DB`, opened and migrated.
+-- The review database from `IPE_REVIEW_DB`, opened, never migrated: `probe`
+-- is the one migrate, run at startup, so a review file deleted under a
+-- running server is never silently re-created empty.
 open : Task.Task Error Db
 open =
-    do
-        loc <- Settings.reviewDb
-        db <- openAt loc
-        migrate db
-        Task.succeed db
+    Settings.reviewDb |> Task.andThen openAt
 
 
 -- The review database at a parsed location, opened through the one review URL
@@ -263,11 +258,12 @@ migrate db =
     Db.migrate db all
 
 
--- A refusal's reason is already a parsed `Reason`, so every decision that
--- reaches the store is well formed.
-insertDecision : Db -> String -> String -> Decision -> Task.Task Error Int
-insertDecision db uid bodyHash decision =
-    insertIfAbsent db uid bodyHash decision
+-- A decision is recorded only against an `Attested` pair, the proof that
+-- the reviewer was shown exactly those bytes; a refusal's reason is already a
+-- parsed `Reason`, so every decision that reaches the store is well formed.
+insertDecision : Db -> Attested -> Decision -> Task.Task Error Int
+insertDecision db attested decision =
+    insertIfAbsent db (Index.attestedUid attested) (Index.attestedHash attested) decision
 
 
 -- A duplicate (uid, body_hash) pair is a no-op: the first review wins and
@@ -358,121 +354,6 @@ findLatestForUid db uid =
                 |> Store.toMaybe db
 
 
--- One row of the drain cursor. `updatedAt` is a typed instant, bound as the
--- `SqlTime` role through `drainCodec`, never a bare `Int`.
-type alias DrainCursor =
-    { uid : String
-    , bodyHash : String
-    , updatedAt : Timestamp
-    }
-
-
-makeCursor : String -> String -> Timestamp -> DrainCursor
-makeCursor uid bodyHash updatedAt =
-    { uid = uid
-    , bodyHash = bodyHash
-    , updatedAt = updatedAt
-    }
-
-
--- Codec for the drain cursor. `updated_at` flows through `Codec.timestamp`, so
--- its shape is `CTime` and it binds in the time role, never as a bare `SqlInt`.
-drainCodec : Codec DrainCursor
-drainCodec =
-    Codec
-        { enc =
-            \row ->
-                Encode.object
-                    [ ( "uid", Encode.string row.uid )
-                    , ( "body_hash", Encode.string row.bodyHash )
-                    , ( "updated_at", Codec.toValue Codec.timestamp row.updatedAt )
-                    ]
-        , mkDec =
-            \_ ->
-                Config.map3 makeCursor
-                    (Config.field "uid" Config.string)
-                    (Config.field "body_hash" Config.string)
-                    (Config.field "updated_at" (Config.map Timestamp.fromUnixMillis Config.int))
-        , shp =
-            SRecord
-                [ ( "uid", CText )
-                , ( "body_hash", CText )
-                , ( "updated_at", CTime )
-                ]
-        }
-
-
--- The typed store for the drain cursor, keyed like the review table.
-drainStore : Result Error (Store DrainCursor)
-drainStore =
-    Store.fromCodec "drain_cursor" drainCodec
-        |> Result.map (\draft -> Store.public (Store.compositePrimaryKey2 .uid .bodyHash draft))
-
-
--- Bookkeeping for the drain loop. Re-draining the same pair refreshes its
--- `updated_at` instead of adding a row, so a re-queued unit reviewed twice
--- keeps a single cursor row. `updateWhere` never writes the key columns. When
--- the refresh matches no row the cursor is inserted through
--- `insertDrainCursor`.
-recordDrain : Db -> String -> String -> Task.Task Error Int
-recordDrain db uid bodyHash =
-    withDrainCursor uid bodyHash
-        (\store cursor ->
-            do
-                updated <- refreshCursor db store cursor
-                if updated == 0 then
-                    insertCursor db store cursor
-
-                else
-                    Task.succeed updated
-        )
-
-
--- The pair's cursor row inserted. An insert that loses a race to a concurrent
--- drain of the same pair hits the primary key; the pair's row then exists, so
--- the refresh is retried, and the insert's own error stands only when that
--- retry still matches no row. Cursor rows are never deleted, so a row the
--- retry matches is the one that won the race.
-insertDrainCursor : Db -> String -> String -> Task.Task Error Int
-insertDrainCursor db uid bodyHash =
-    withDrainCursor uid bodyHash (\store cursor -> insertCursor db store cursor)
-
-
-withDrainCursor : String -> String -> (Store DrainCursor -> DrainCursor -> Task.Task Error Int) -> Task.Task Error Int
-withDrainCursor uid bodyHash write =
-    case drainStore of
-        Err e ->
-            Task.fail e
-
-        Ok store ->
-            Time.unixMillis ()
-                |> Task.andThen (\now -> write store (makeCursor uid bodyHash now))
-
-
-insertCursor : Db -> Store DrainCursor -> DrainCursor -> Task.Task Error Int
-insertCursor db store cursor =
-    Store.insert db store cursor
-        |> Task.onError (\insertError -> retryRefresh db store cursor insertError)
-
-
--- The cursor row for `cursor`'s (uid, body_hash) pair given `cursor`'s
--- `updated_at`; the count of rows it matched.
-refreshCursor : Db -> Store DrainCursor -> DrainCursor -> Task.Task Error Int
-refreshCursor db store cursor =
-    Store.updateWhere db store (Store.and [ Store.eq .uid cursor.uid, Store.eq .bodyHash cursor.bodyHash ]) cursor
-
-
-retryRefresh : Db -> Store DrainCursor -> DrainCursor -> Error -> Task.Task Error Int
-retryRefresh db store cursor insertError =
-    do
-        updated <- refreshCursor db store cursor
-        if updated == 0 then
-            Task.fail insertError
-
-        else
-            Task.succeed updated
-
-
 countDecoder : Db.Decode.Decoder Int
 countDecoder =
     Db.Decode.succeed (\n -> n)
@@ -501,28 +382,21 @@ pairPageSize =
     200
 
 
-pairDecoder : Db.Decode.Decoder ( String, String )
-pairDecoder =
-    Db.Decode.succeed (\uid bodyHash -> ( uid, bodyHash ))
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
-        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
-
-
--- One page of decided (uid, body_hash) pairs in key order, strictly after
+-- One page of decided pairs in key order, strictly after
 -- `cursor` (from the first pair when Nothing), at most `pageSize` of them.
 -- Only the two key columns are read, so no reason is parsed; every value is
 -- a bound parameter. The caller passes a positive `pageSize`.
-decidedPairsAfter : Db -> Int -> Maybe ( String, String ) -> Task.Task Error (List ( String, String ))
+decidedPairsAfter : Db -> Int -> Maybe DecidedPair -> Task.Task Error (List DecidedPair)
 decidedPairsAfter db pageSize cursor =
-    case cursor of
+    case Maybe.map Index.decidedPairKey cursor of
         Nothing ->
-            Db.queryDecode db (pairColumns ++ pairOrder) [ SqlInt pageSize ] pairDecoder
+            Db.queryDecode db (pairColumns ++ pairOrder) [ SqlInt pageSize ] Index.decidedPairDecoder
 
         Just ( uid, bodyHash ) ->
             Db.queryDecode db
                 (pairColumns ++ " WHERE (uid, body_hash) > (?, ?)" ++ pairOrder)
                 [ SqlString uid, SqlString bodyHash, SqlInt pageSize ]
-                pairDecoder
+                Index.decidedPairDecoder
 
 
 pairColumns : String

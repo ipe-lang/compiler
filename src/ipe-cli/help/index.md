@@ -3,7 +3,6 @@
 - init
 - dev
 - release
-- exec
 
 ## Quality
 
@@ -31,6 +30,5 @@
 - capabilities
 - diff
 - fix
-- eject
 - upgrade
 - version

@@ -88,7 +88,7 @@ impl Builder<'_> {
                     // constraint solves, `param_var` adopts the declared param
                     // type, so completion at this span offers only candidates
                     // whose type unifies with the declared parameter.
-                    self.record_expected(a.span, param_var);
+                    self.record_expected(a.span, param_var)?;
                     arg_pairs.push((a.span, arg_var, param_var));
                 }
                 let ret = self.flex()?;
@@ -99,9 +99,9 @@ impl Builder<'_> {
                     fun_shape = self.structure(FlatType::Fun(*param_var, fun_shape))?;
                 }
                 // Order matters: callee-vs-shape first (see above).
-                self.eq(callee.span, callee_var, fun_shape);
+                self.eq(callee.span, callee_var, fun_shape)?;
                 for (arg_span, arg_var, param_var) in arg_pairs {
-                    self.eq(arg_span, arg_var, param_var);
+                    self.eq(arg_span, arg_var, param_var)?;
                 }
                 ret
             }
@@ -136,15 +136,15 @@ impl Builder<'_> {
                     let want_bool = self.bool_var()?;
                     // A condition expects `Bool`; a branch body expects the
                     // shared `if` result type.
-                    self.record_expected(cond.span, want_bool);
-                    self.eq(cond.span, cond_var, want_bool);
+                    self.record_expected(cond.span, want_bool)?;
+                    self.eq(cond.span, cond_var, want_bool)?;
                     let body_var = self.constrain_expr(local, body)?;
-                    self.record_expected(body.span, result);
-                    self.eq(body.span, body_var, result);
+                    self.record_expected(body.span, result)?;
+                    self.eq(body.span, body_var, result)?;
                 }
                 let else_var = self.constrain_expr(local, else_expr)?;
-                self.record_expected(else_expr.span, result);
-                self.eq(else_expr.span, else_var, result);
+                self.record_expected(else_expr.span, result)?;
+                self.eq(else_expr.span, else_var, result)?;
                 result
             }
             canon::Expr_::Tuple(elems) => {
@@ -167,7 +167,7 @@ impl Builder<'_> {
                 self.constrain_update(local, base, fields, span)?
             }
         };
-        self.regions.insert((self.current_home.clone(), span), var);
+        self.regions.insert((self.home()?.into_path(), span), var);
         Ok(var)
     }
 
@@ -191,7 +191,7 @@ impl Builder<'_> {
             // record-param's complete field set from its solved type (one path
             // shared with the typed-def sites).  Keyed by `(current_home, span)`
             // to prevent cross-module span collisions.
-            self.regions.insert((self.current_home.clone(), p.span), v);
+            self.regions.insert((self.home()?.into_path(), p.span), v);
             param_vars.push(v);
         }
         let mut arrow = self.constrain_expr(&lam_local, body)?;
@@ -256,7 +256,7 @@ impl Builder<'_> {
             field,
             result,
             span,
-            home: self.current_home.clone(),
+            home: self.home()?,
         });
         Ok(result)
     }
@@ -285,7 +285,7 @@ impl Builder<'_> {
             record: record_var,
             fields: field_vars,
             span,
-            home: self.current_home.clone(),
+            home: self.home()?,
         });
         Ok(record_var)
     }
@@ -306,8 +306,8 @@ impl Builder<'_> {
             self.constrain_pattern(&mut br_local, &br.pat, scrut_var)?;
             let body_var = self.constrain_expr(&br_local, &br.body)?;
             // Every arm body expects the shared `case` result type.
-            self.record_expected(br.body.span, result);
-            self.eq(br.body.span, body_var, result);
+            self.record_expected(br.body.span, result)?;
+            self.eq(br.body.span, body_var, result)?;
         }
         Ok(result)
     }

@@ -64,6 +64,8 @@ struct Comment {
     /// delimiters, with no trailing whitespace). A line comment keeps any
     /// interior spacing; a block comment keeps its full multi-line body.
     text: String,
+    /// The offset of the comment's first byte in its source.
+    start: usize,
     /// Where the comment attaches: the start offset of the first token after
     /// it that can begin a printed node, or `None` past the last token.
     ///
@@ -123,6 +125,7 @@ fn scan_trivia(src: &str) -> Option<Trivia> {
         .into_iter()
         .map(|(lo, hi)| Comment {
             text: src.get(lo..hi).unwrap_or_default().trim_end().to_owned(),
+            start: lo,
             anchor: anchor_after(&code, hi),
         })
         .collect();
@@ -614,6 +617,12 @@ struct Printer<'a> {
     /// trial render (to measure a layout) never consumes a comment its final
     /// render then lacks.
     claimed: Cell<Option<(usize, usize)>>,
+    /// The body offset of the lambda whose parameter comments the node being
+    /// printed has already claimed.
+    ///
+    /// Set and restored around each render, like `claimed`, so the outermost
+    /// claim of a lambda takes those comments once.
+    lambda_head: Cell<Option<usize>>,
 }
 
 impl<'a> Printer<'a> {
@@ -624,6 +633,7 @@ impl<'a> Printer<'a> {
             code: trivia.code.as_slice(),
             src,
             claimed: Cell::new(None),
+            lambda_head: Cell::new(None),
         }
     }
 
@@ -795,6 +805,27 @@ impl<'a> Printer<'a> {
         (comments, rendered)
     }
 
+    /// [`Self::claim`] for the expression `e`, which also owns the comments
+    /// among a lambda's parameters.
+    ///
+    /// Those print above the lambda, with the comments at its first token: a
+    /// second pass reads them there as the lambda's leading comments, so the
+    /// layout is a fixed point. The outermost claim of a lambda takes them.
+    fn claim_expr<T>(&self, e: &Expr, render: impl FnOnce() -> T) -> (Comments<'a>, T) {
+        let outer = self.lambda_head.get();
+        let head = lambda_head(e).filter(|&(_, hi)| outer != Some(hi));
+        if let Some((_, hi)) = head {
+            self.lambda_head.set(Some(hi));
+        }
+        let (mut comments, rendered) = self.claim(e.span.lo as usize, Self::closer_of(e), render);
+        self.lambda_head.set(outer);
+        if let Some((lo, hi)) = head {
+            comments.extend(self.anchored_in(lo, hi));
+            comments.sort_by_key(|c| c.start);
+        }
+        (comments, rendered)
+    }
+
     /// `body` preceded by `comments`, one per line, continuing at `indent`.
     fn with_comments<'c>(
         comments: impl IntoIterator<Item = &'c Comment>,
@@ -840,13 +871,70 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Render the import block, each import with the comments `owned_from` its
+    /// keyword gives it.
+    ///
+    /// elm-format sorts imports by module path and prints them directly under
+    /// the header (one blank line separates the header from the first import
+    /// only when imports exist). An import prints on one line, so every
+    /// comment it owns travels above it through the sort, except the comments
+    /// written directly above the FIRST import in the source, which describe
+    /// the module (or the whole import block) and stay above the block. That
+    /// block keeps the source's blank lines between its comments and before
+    /// the first import, so the comments of an import sorted to the front
+    /// print the same on every pass: the second pass reads them as part of the
+    /// block, with the same blank lines.
+    fn import_block<'c>(
+        &self,
+        out: &mut String,
+        imports: &[Import],
+        owned_from: impl Fn(usize) -> &'c [Comment],
+    ) {
+        if imports.is_empty() {
+            return;
+        }
+        let first_in_source = imports
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, imp)| imp.import_kw.lo)
+            .map(|(i, _)| i);
+        out.push('\n');
+        if let Some(first) = first_in_source.and_then(|i| imports.get(i)) {
+            let kw = first.import_kw.lo as usize;
+            let above = self.anchored(kw);
+            if !above.is_empty() {
+                self.push_comment_block(out, above);
+                if self.blank_line_before(kw) {
+                    out.push('\n');
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..imports.len()).collect();
+        order.sort_by_key(|&i| imports.get(i).map(|imp| self.dotted(&imp.name.value)));
+        for i in order {
+            let Some(imp) = imports.get(i) else { continue };
+            let kw = imp.import_kw.lo as usize;
+            let owned = owned_from(kw);
+            // The first import's comments above its keyword head the block.
+            let travels = if Some(i) == first_in_source {
+                owned.get(self.anchored(kw).len()..).unwrap_or_default()
+            } else {
+                owned
+            };
+            let line = self.import(imp);
+            push_comment_lines(out, unplaced(travels, &line));
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
     /// Render a whole module.
     fn module(&self, m: &Module) -> String {
         // Destructured field by field, with no `..`: a new kind of top-level
         // declaration is a build error here until it is printed, never a
         // silently dropped declaration.
         let Module {
-            module_kw,
+            module_kw: _,
             name,
             exposing,
             imports,
@@ -855,83 +943,74 @@ impl<'a> Printer<'a> {
             aliases,
             foreigns,
         } = m;
-        let mut out = String::new();
-
-        // Any comment before the module header — or inside it, since the header
-        // prints on its own fixed lines — prints first, on its own line(s).
-        // elm-format then separates the comment block from the header with
-        // exactly two blank lines, however the source spaced them.
-        let header_hi = exposing.span.hi.max(name.span.hi) as usize;
-        let pre_header = self.anchored_in(module_kw.lo as usize, header_hi);
-        if !pre_header.is_empty() {
-            push_comment_lines(&mut out, pre_header);
-            out.push_str("\n\n");
-        }
-
-        // module <Name> exposing (…)
-        out.push_str("module ");
-        out.push_str(&self.dotted(&name.value));
-        out.push_str(&self.module_exposing(exposing));
-        out.push('\n');
-
-        // Import block: elm-format sorts imports by module path and prints them
-        // directly under the header (one blank line separates the header from
-        // the first import only when imports exist). A comment above an import
-        // — or inside it, since an import prints on one line — travels with it
-        // through the sort, except the comments above the FIRST import in the
-        // source, which describe the module (or the whole import block) and
-        // stay above the block. A blank line between those comments and the
-        // block is kept exactly when the source had one, so the comments of an
-        // import sorted to the front print the same on every pass.
-        if !imports.is_empty() {
-            let first_in_source = imports
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, imp)| imp.import_kw.lo)
-                .map(|(i, _)| i);
-            out.push('\n');
-            if let Some(first) = first_in_source.and_then(|i| imports.get(i)) {
-                let above = self.anchored_in(first.import_kw.lo as usize, first.span.hi as usize);
-                if !above.is_empty() {
-                    push_comment_lines(&mut out, above);
-                    if self.blank_line_before(first.import_kw.lo as usize) {
-                        out.push('\n');
-                    }
-                }
-            }
-            let mut order: Vec<usize> = (0..imports.len()).collect();
-            order.sort_by_key(|&i| imports.get(i).map(|imp| self.dotted(&imp.name.value)));
-            for i in order {
-                let Some(imp) = imports.get(i) else { continue };
-                if Some(i) != first_in_source {
-                    let above = self.anchored_in(imp.import_kw.lo as usize, imp.span.hi as usize);
-                    push_comment_lines(&mut out, above);
-                }
-                out.push_str(&self.import(imp));
-                out.push('\n');
-            }
-        }
-
-        // Declarations in source order, each preceded by two blank lines
-        // (elm-format's top-level spacing). Unions / aliases / values /
-        // foreign declarations interleave by their span order.
+        // Every anchored comment has exactly one owner among the module's
+        // items: the header owns those anchored before the first import or
+        // declaration, an import those from its `import` keyword up to the next
+        // item, a declaration those from its first token up to the next one.
+        // An owner prints each comment its rendering did not place above that
+        // rendering (see `unplaced`), so no comment position the parser admits
+        // falls between owners and is lost.
         let mut decls: Vec<Decl<'_>> = Vec::new();
         decls.extend(unions.iter().map(Decl::Union));
         decls.extend(aliases.iter().map(Decl::Alias));
         decls.extend(values.iter().map(Decl::Value));
         decls.extend(foreigns.iter().map(Decl::Foreign));
         decls.sort_by_key(Decl::lo);
+        let mut starts: Vec<usize> = imports
+            .iter()
+            .map(|imp| imp.import_kw.lo as usize)
+            .chain(decls.iter().map(|d| self.decl_start(d)))
+            .collect();
+        starts.sort_unstable();
+        let owner_end = |lo: usize| {
+            let next = starts.partition_point(|&s| s <= lo);
+            starts.get(next).copied().unwrap_or(usize::MAX)
+        };
+        let owned_from = |lo: usize| self.anchored_in(lo, owner_end(lo));
+        let mut out = String::new();
 
+        // module <Name> exposing (…). A comment the header does not place
+        // (before `module`, inside the header line, above its first exposed
+        // item) prints first, on its own line(s); elm-format then separates the
+        // comment block from the header with exactly two blank lines, however
+        // the source spaced them.
+        let header = format!(
+            "module {}{}",
+            self.dotted(&name.value),
+            self.module_exposing(exposing)
+        );
+        let header_owned = self.anchored_in(0, starts.first().copied().unwrap_or(usize::MAX));
+        let above_header = unplaced(header_owned, &header);
+        if !above_header.is_empty() {
+            push_comment_lines(&mut out, above_header);
+            out.push_str("\n\n");
+        }
+        out.push_str(&header);
+        out.push('\n');
+
+        self.import_block(&mut out, imports, owned_from);
+
+        // Declarations in source order, each preceded by two blank lines
+        // (elm-format's top-level spacing). Unions / aliases / values /
+        // foreign declarations interleave by their span order.
         for decl in &decls {
             out.push_str("\n\n");
             // Leading comments: those anchored at the declaration's first
             // token, or at a head token before its name (`type`, `alias`, a
             // signature's name). Nothing depends on where the previous
             // declaration's span ends, which a desugared body underestimates.
+            // A comment the declaration owns but its rendering does not place
+            // follows them, so a second pass reads it as leading too.
             let lo = decl.lo() as usize;
             let start = self.decl_start(decl);
-            push_comment_lines(&mut out, self.anchored_in(start, lo.saturating_add(1)));
-            out.push_str(&self.decl(decl));
+            let leading = self.anchored_in(start, lo.saturating_add(1));
+            let mut item = String::new();
+            push_comment_lines(&mut item, leading);
+            let body = self.decl(decl, owner_end(start));
+            let missed = unplaced(owned_from(start), &format!("{item}{body}"));
+            push_comment_lines(&mut item, missed);
+            item.push_str(&body);
+            out.push_str(&item);
             out.push('\n');
         }
 
@@ -971,44 +1050,67 @@ impl<'a> Printer<'a> {
     /// GROUPING: exposed items that shared a source line stay on one line, so
     /// the `@docs`-section grouping survives a reformat. The grouping is
     /// recovered from each item's span line.
+    ///
+    /// A comment above a later exposed item, or above the closing `)`, prints
+    /// in place on its own line, and the commented item opens a new group; such
+    /// a clause is always multi-line. Every other comment of the header prints
+    /// above it (the header owner's [`unplaced`] rule).
     fn module_exposing(&self, e: &Located<Exposing>) -> String {
         let items = match &e.value {
             Exposing::All => return " exposing (..)".to_owned(),
             Exposing::List(items) => items,
         };
+        let above = |i: usize, it: &Located<Exposed>| {
+            if i == 0 {
+                &[][..]
+            } else {
+                self.anchored(it.span.lo as usize)
+            }
+        };
+        let closing = self.closing_comments(e.span);
+        let commented = !closing.is_empty()
+            || items
+                .iter()
+                .enumerate()
+                .any(|(i, it)| !above(i, it).is_empty());
         // The clause is multi-line iff its items do not all begin on the same
-        // source line (a lone `(` or `)` line does not make it multi-line).
-        let multiline = items
-            .first()
-            .zip(items.last())
-            .is_some_and(|(a, b)| self.line_of(a.span.lo) != self.line_of(b.span.lo));
+        // source line (a lone `(` or `)` line does not make it multi-line), or
+        // it carries a comment it places.
+        let multiline = commented
+            || items
+                .first()
+                .zip(items.last())
+                .is_some_and(|(a, b)| self.line_of(a.span.lo) != self.line_of(b.span.lo));
         if !multiline || items.is_empty() {
             return format!(" exposing {}", self.exposing(&e.value));
         }
-        // Group consecutive items that began on the same source line.
-        let mut groups: Vec<Vec<String>> = Vec::new();
+        // Group consecutive items that began on the same source line; a
+        // comment above an item ends the group before it.
+        let mut lines: Vec<String> = Vec::new();
+        let mut group: Vec<String> = Vec::new();
+        let mut groups = 0usize;
         let mut cur_line: Option<usize> = None;
-        for it in items {
+        for (i, it) in items.iter().enumerate() {
             let line = self.line_of(it.span.lo);
-            let rendered = self.exposed(&it.value);
-            if let (Some(g), true) = (groups.last_mut(), Some(line) == cur_line) {
-                g.push(rendered);
-                continue;
+            let comments = above(i, it);
+            if !comments.is_empty() || Some(line) != cur_line {
+                push_exposing_group(&mut lines, &mut group, &mut groups);
             }
+            lines.extend(comments.iter().map(|c| format!("    {}", c.text)));
             cur_line = Some(line);
-            groups.push(vec![rendered]);
+            group.push(self.exposed(&it.value));
         }
+        push_exposing_group(&mut lines, &mut group, &mut groups);
+        lines.extend(closing.iter().map(|c| format!("    {}", c.text)));
         let mut out = String::from(" exposing\n");
-        for (i, g) in groups.iter().enumerate() {
-            let lead = if i == 0 { "    ( " } else { "    , " };
-            let _ = writeln!(out, "{lead}{}", g.join(", "));
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
         }
         out.push_str("    )");
         out
     }
 
-    /// The 1-based source line containing byte offset `pos` (0 when no source is
-    /// threaded, as in the round-trip guard).
     /// Whether a blank line ends right before byte `pos` in the source: the
     /// whitespace directly before it holds two newlines.
     fn blank_line_before(&self, pos: usize) -> bool {
@@ -1024,6 +1126,21 @@ impl<'a> Printer<'a> {
             .is_some()
     }
 
+    /// Push `comments` one per line, keeping a blank line the source had
+    /// between two of them.
+    fn push_comment_block(&self, out: &mut String, comments: &[Comment]) {
+        for (i, c) in comments.iter().enumerate() {
+            if i > 0 && self.blank_line_before(c.start) {
+                out.push('\n');
+            }
+            out.push_str(&c.text);
+            out.push('\n');
+        }
+    }
+
+    /// The 0-based source line containing byte offset `pos`.
+    ///
+    /// It is 0 when no source is threaded, as in the round-trip guard.
     fn line_of(&self, pos: u32) -> usize {
         let Some(src) = self.src else { return 0 };
         let pos = (pos as usize).min(src.len());
@@ -1058,9 +1175,10 @@ impl<'a> Printer<'a> {
         s
     }
 
-    fn decl(&self, d: &Decl<'_>) -> String {
+    /// Render a declaration whose comments are those anchored before `owner_end`.
+    fn decl(&self, d: &Decl<'_>, owner_end: usize) -> String {
         match d {
-            Decl::Union(u) => self.union(u),
+            Decl::Union(u) => self.union(u, owner_end),
             Decl::Alias(a) => self.alias(&a.value),
             Decl::Value(v) => self.value(&v.value),
             Decl::Foreign(f) => self.foreign(&f.value),
@@ -1108,7 +1226,7 @@ impl<'a> Printer<'a> {
     /// `type Name vars = A | B c | …` — leading-pipe multiline when it does not
     /// fit, matching elm-format (each constructor on its own line, four-space
     /// indented, aligned `= …` / `| …`).
-    fn union(&self, u: &Located<Union>) -> String {
+    fn union(&self, u: &Located<Union>, owner_end: usize) -> String {
         let uv = &u.value;
         let vars = self.type_vars(&uv.vars);
         // elm-format ALWAYS breaks a union declaration onto multiple lines —
@@ -1121,10 +1239,16 @@ impl<'a> Printer<'a> {
         // line just before that constructor's `| Ctor` line, keeping the
         // author's grouping inside the type. A comment inside a constructor's
         // arguments travels above that constructor too, since a constructor
-        // prints on one line.
+        // prints on one line. A constructor's span is its name alone, so its
+        // comments run up to the next constructor, or for the last one to the
+        // end of the declaration's own comments.
         for (idx, c) in uv.ctors.iter().enumerate() {
             let lead = if idx == 0 { "=" } else { "|" };
-            for cm in self.type_comments(&c.value.args, c.span.lo as usize, c.span.hi as usize) {
+            let hi = uv
+                .ctors
+                .get(idx + 1)
+                .map_or(owner_end, |next| next.span.lo as usize);
+            for cm in self.type_comments(&c.value.args, c.span.lo as usize, hi) {
                 let _ = write!(s, "\n    {}", cm.text);
             }
             let _ = write!(s, "\n    {lead} {}", self.ctor(&c.value));
@@ -1560,9 +1684,7 @@ impl<'a> Printer<'a> {
     fn expr(&self, e: &Expr, indent: usize) -> String {
         #[cfg(test)]
         count_render_call();
-        let (comments, body) = self.claim(e.span.lo as usize, Self::closer_of(e), || {
-            self.expr_shape(e, indent)
-        });
+        let (comments, body) = self.claim_expr(e, || self.expr_shape(e, indent));
         Self::with_comments(comments, &body, indent)
     }
 
@@ -1797,9 +1919,7 @@ impl<'a> Printer<'a> {
     fn expr_atom(&self, e: &Expr, indent: usize) -> String {
         #[cfg(test)]
         count_render_call();
-        let (comments, body) = self.claim(e.span.lo as usize, Self::closer_of(e), || {
-            self.atom_shape(e, indent)
-        });
+        let (comments, body) = self.claim_expr(e, || self.atom_shape(e, indent));
         Self::with_comments(comments, &body, indent)
     }
 
@@ -1967,7 +2087,7 @@ impl<'a> Printer<'a> {
             })
             .collect();
         let right_operand = |operand: &Expr, is_last: bool, at: usize| {
-            self.claim(operand.span.lo as usize, Self::closer_of(operand), || {
+            self.claim_expr(operand, || {
                 if is_last {
                     self.binop_last_operand(operand, at)
                 } else {
@@ -2063,9 +2183,9 @@ impl<'a> Printer<'a> {
         span: ipe_diagnostics::Span,
     ) -> String {
         let ps: Vec<String> = params.iter().map(|p| self.pattern_atom(&p.value)).collect();
-        // A comment among the parameters prints above the lambda.
-        let inside = self.anchored_in(span.lo as usize + 1, body.span.lo as usize);
-        let head = Self::with_comments(inside, &format!("\\{} ->", ps.join(" ")), indent);
+        // A comment among the parameters prints above the lambda, through
+        // its `claim_expr`.
+        let head = format!("\\{} ->", ps.join(" "));
         // A block-form body (`let` / `case` / `if`) always drops to the next
         // line, indented one level: an inline `-> let …` would place the `let`
         // keyword mid-line, breaking its layout-sensitive block on re-parse.
@@ -2112,18 +2232,20 @@ impl<'a> Printer<'a> {
             // section comments inside a `case`. The blank line between arms is
             // always emitted; after a comment, another blank line keeps the
             // next arm visually separated.
+            // A comment inside the pattern prints above the arm too, in the
+            // same run, so a second pass reads it as one above the pattern.
             if i > 0 {
                 out.push('\n');
             }
-            for c in self.anchored(pat.span.lo as usize) {
+            let lo = pat.span.lo as usize;
+            let above = self.anchored(lo).iter();
+            let inside = self.anchored_in(lo + 1, body.span.lo as usize);
+            for c in above.chain(inside) {
                 let _ = write!(out, "\n{arm_pad}{}", c.text);
                 if i > 0 {
                     out.push('\n');
                 }
             }
-            // A comment inside the pattern prints directly above the arm.
-            let inside = self.anchored_in(pat.span.lo as usize + 1, body.span.lo as usize);
-            push_indented_comments(&mut out, inside, &arm_pad);
             let body_s = self.expr(body, indent + 2);
             let _ = write!(
                 out,
@@ -2143,12 +2265,6 @@ impl<'a> Printer<'a> {
             // line; the comments above a binding, attached to its binder,
             // replace that blank line.
             let above = self.anchored(b.pat.span.lo as usize);
-            if i > 0 && above.is_empty() {
-                out.push('\n');
-            }
-            for c in above {
-                let _ = write!(out, "\n{bind_pad}{}", c.text);
-            }
             // A `let` binder that destructures with a constructor pattern must
             // stay parenthesised — `(Decoder d) = …`. Without the parens the
             // re-parse reads `Decoder` as the (illegal, uppercase) binding name.
@@ -2163,11 +2279,14 @@ impl<'a> Printer<'a> {
                 body
             });
             // A comment inside the binder or among the parameters prints
-            // above the binding.
+            // above the binding too, in the same run, so a second pass reads
+            // it as one above the binder.
             let head_lo = b.pat.span.lo as usize + 1;
-            for c in self.anchored_in(head_lo, value.span.lo as usize) {
-                let _ = write!(out, "\n{bind_pad}{}", c.text);
+            let inside = self.anchored_in(head_lo, value.span.lo as usize);
+            if i > 0 && above.is_empty() && inside.is_empty() {
+                out.push('\n');
             }
+            push_indented_comments(&mut out, above.iter().chain(inside), &bind_pad);
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
             let val = self.expr(value, indent + 2);
@@ -2256,11 +2375,7 @@ impl<'a> Printer<'a> {
     fn elements(&self, elems: &[Expr], indent: usize) -> Vec<Item<'a>> {
         elems
             .iter()
-            .map(|e| {
-                self.claim(e.span.lo as usize, Self::closer_of(e), || {
-                    self.expr(e, indent)
-                })
-            })
+            .map(|e| self.claim_expr(e, || self.expr(e, indent)))
             .collect()
     }
 
@@ -2465,11 +2580,57 @@ type Item<'c> = (Comments<'c>, String);
 type Comments<'c> = Vec<&'c Comment>;
 
 /// Push each comment on its own line, ending each with a newline.
-fn push_comment_lines(out: &mut String, comments: &[Comment]) {
+fn push_comment_lines<'c>(out: &mut String, comments: impl IntoIterator<Item = &'c Comment>) {
     for c in comments {
         out.push_str(&c.text);
         out.push('\n');
     }
+}
+
+/// Close the exposed-item `group` as one line of a multi-line exposing clause:
+/// `( ` before the first group, `, ` before each later one.
+fn push_exposing_group(lines: &mut Vec<String>, group: &mut Vec<String>, groups: &mut usize) {
+    if group.is_empty() {
+        return;
+    }
+    let lead = if *groups == 0 { "( " } else { ", " };
+    lines.push(format!("    {lead}{}", group.join(", ")));
+    group.clear();
+    *groups += 1;
+}
+
+/// The comments of `owned` that `rendered` does not print, in source order.
+///
+/// `rendered` is one owner's printing; the comments it prints are matched by
+/// text, the multiset the comment guard compares. A rendering that does not
+/// lex places nothing here: the guard then refuses the whole output.
+fn unplaced<'c>(owned: &'c [Comment], rendered: &str) -> Vec<&'c Comment> {
+    if owned.is_empty() {
+        return Vec::new();
+    }
+    let Some(printed) = scan_trivia(rendered) else {
+        return Vec::new();
+    };
+    let mut printed = comment_multiset(&printed.comments);
+    let mut missing = Vec::new();
+    for c in owned {
+        match printed.binary_search(&c.text.as_str()) {
+            Ok(i) => {
+                printed.remove(i);
+            }
+            Err(_) => missing.push(c),
+        }
+    }
+    missing
+}
+
+/// The byte range of a lambda's parameters, from the first one to its body.
+fn lambda_head(e: &Expr) -> Option<(usize, usize)> {
+    let Expr_::Lambda(params, body) = &e.value else {
+        return None;
+    };
+    let lo = params.first().map_or(body.span.lo, |p| p.span.lo);
+    Some((lo as usize, body.span.lo as usize))
 }
 
 /// Push each comment on a fresh line at `pad`.

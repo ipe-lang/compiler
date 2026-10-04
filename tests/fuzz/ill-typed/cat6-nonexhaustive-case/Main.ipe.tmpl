@@ -1,0 +1,25 @@
+-- fuzz-hole arm
+--   base: Triangle -> "triangle"
+--   mutant:
+-- fuzz-expect IPE-T0010
+module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+type Shape
+    = Circle
+    | Square
+    | Triangle
+
+
+describeShape : Shape -> String
+describeShape s =
+    case s of
+        Circle -> "circle"
+        Square -> "square"
+        @arm@
+
+
+main =
+    Io.println (describeShape Circle ++ " " ++ describeShape Square ++ " " ++ describeShape Triangle)

@@ -1030,30 +1030,30 @@ fn url_is_cacheable(url: &str) -> bool {
     true
 }
 
+use crate::system::SQLITE_BUSY_TIMEOUT;
+
 /// Upper bound on pooled connections per database. Bounded by default so that
 /// arbitrary user code calling `Db.connect` can NEVER exhaust the database
 /// server's connection limit; raise via `IPE_DB_MAX_CONNECTIONS` for workloads
 /// that genuinely need more headroom.
-fn max_pool_connections() -> u32 {
-    crate::system::read_env_var("IPE_DB_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(16)
-}
+const DB_CONNECTIONS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_DB_MAX_CONNECTIONS",
+    16,
+    crate::system::ZeroCeiling::Refused,
+    "decimal connection count",
+);
 
 /// Upper bound on DISTINCT cached pools (one per URL). Without this, code that
 /// connects to many distinct URLs accumulates live pools forever (memory +
 /// connection-handle DoS). At the cap, a new URL is served by a freshly-built,
 /// UNCACHED pool — still fully functional, just rebuilt per connect for that URL.
 /// Env IPE_DB_MAX_POOLS; default 32 (far above the typical 1–2 DBs per app).
-fn max_db_pools() -> usize {
-    crate::system::read_env_var("IPE_DB_MAX_POOLS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(32)
-}
+const DB_POOLS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_DB_MAX_POOLS",
+    32,
+    crate::system::ZeroCeiling::Refused,
+    "decimal pool count",
+);
 
 // ─── Engine version floor (connect-time, fail closed) ─────────────────────────
 
@@ -1568,7 +1568,10 @@ impl DbUrl {
     pub fn parse(url: &str) -> Result<Self, DbConnectError> {
         match url_scheme(url) {
             None | Some("sqlite" | "file") => Ok(Self::Sqlite(SqliteUrl {
-                options: url.parse().map_err(|_| DbConnectError::InvalidUrl)?,
+                options: url
+                    .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                    .map_err(|_| DbConnectError::InvalidUrl)?
+                    .busy_timeout(SQLITE_BUSY_TIMEOUT),
                 shared_file: url_is_cacheable(url),
             })),
             Some("postgres" | "postgresql") => PostgresUrl::parse(url).map(Self::Postgres),
@@ -1868,25 +1871,26 @@ where
 }
 
 /// Build one configured pool. SQLite (file, not `:memory:`) gets WAL — concurrent
-/// readers alongside a single writer — plus a `busy_timeout` so lock contention
-/// WAITS (sound) instead of erroring with `SQLITE_BUSY`. Without WAL a shared pool
-/// serialises every statement on the rollback-journal lock (the contention that a
-/// naive cache-only change regressed). The PRAGMAs run only when the parsed URL
-/// selects a shared SQLite file, the same value that chose the driver's gate.
+/// readers alongside a single writer. Without WAL a shared pool serialises every
+/// statement on the rollback-journal lock. The PRAGMA runs only when the parsed
+/// URL selects a shared SQLite file, the same value that chose the driver's gate.
+/// Lock contention waits for [`SQLITE_BUSY_TIMEOUT`], which every connection
+/// carries from its connect options.
 async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E, Db> {
     let db_url = match DbUrl::parse(url) {
         Ok(db_url) => db_url,
         Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
     };
-    let pool: Db = match VettedPool::<DbDatabase>::connect(&db_url, max_pool_connections()).await {
+    let max_connections: u32 = match DB_CONNECTIONS_CEILING.read() {
+        Ok(cap) => cap,
+        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+    };
+    let pool: Db = match VettedPool::<DbDatabase>::connect(&db_url, max_connections).await {
         Ok(vetted) => vetted.into_pool(),
         Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
     };
     if db_url.is_shared_sqlite_file() {
         let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
-        let _ = sqlx::query("PRAGMA busy_timeout=5000;")
-            .execute(&pool)
-            .await;
     }
     ok_res(pool)
 }
@@ -1896,6 +1900,10 @@ async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E,
 /// concurrent miss that built a redundant pool loses the `entry` race and its
 /// extra pool drops (closes) — steady state keeps exactly one pool per URL.
 async fn connect_cached<E: Send + From<String> + 'static>(url: String) -> IpeResult<E, Db> {
+    let max_pools: usize = match DB_POOLS_CEILING.read() {
+        Ok(cap) => cap,
+        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+    };
     if url_is_cacheable(&url) {
         let g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.get(&url) {
@@ -1912,7 +1920,7 @@ async fn connect_cached<E: Send + From<String> + 'static>(url: String) -> IpeRes
                 }
                 // Bound the cache: at cap, return the freshly-built pool UNCACHED
                 // (functional; just not memoised) rather than growing without limit.
-                if g.len() >= max_db_pools() {
+                if g.len() >= max_pools {
                     return ok_res(pool);
                 }
                 ok_res(g.entry(url).or_insert(pool).clone())
@@ -3053,7 +3061,11 @@ pub fn db_with_transaction<E: Send + From<String> + 'static, A: Send + 'static>(
 /// constituent field type here (`String`, `i64`, `f64`, `bool`, `Vec<u8>`) is
 /// already `PartialEq`, so the derive below is total and structural — no
 /// hand-written impl needed.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Debug` prints the variant and never the bound value: a bind may carry a
+/// revealed secret or a client-supplied credential, and every type that holds a
+/// `SqlParam` (a fragment, a statement, a refusal) prints through this impl.
+#[derive(Clone, PartialEq)]
 pub enum SqlParam {
     /// `SqlString s` — binds as TEXT.
     Text(String),
@@ -3080,6 +3092,20 @@ pub enum SqlParam {
     /// type-mismatch error. Boxed to keep construction cheap (one variant,
     /// rarely on a hot loop) without inflating every other variant's size.
     Null(Box<SqlParam>),
+}
+
+impl std::fmt::Debug for SqlParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked = crate::redact::Redacted::new(());
+        match self {
+            Self::Text(_) => f.debug_tuple("Text").field(&masked).finish(),
+            Self::Int(_) => f.debug_tuple("Int").field(&masked).finish(),
+            Self::Float(_) => f.debug_tuple("Float").field(&masked).finish(),
+            Self::Bool(_) => f.debug_tuple("Bool").field(&masked).finish(),
+            Self::Bytes(_) => f.debug_tuple("Bytes").field(&masked).finish(),
+            Self::Null(witness) => f.debug_tuple("Null").field(witness).finish(),
+        }
+    }
 }
 
 // ── `From<T> for SqlParam` — primitive Ipê types ────────────────────────────
@@ -5416,6 +5442,30 @@ pub fn db_insert_fields_returning<E: Send + From<String> + 'static, A: Send + 's
 mod tests {
     use super::*;
 
+    #[test]
+    fn env_ceilings_honour_the_shared_contract() {
+        crate::system::assert_env_ceiling_contract(DB_CONNECTIONS_CEILING);
+        crate::system::assert_env_ceiling_contract(DB_POOLS_CEILING);
+    }
+
+    #[test]
+    fn sql_param_debug_prints_no_bound_value() {
+        let params = vec![
+            SqlParam::Text("Bearer S3CR3T".to_owned()),
+            SqlParam::Int(424_242),
+            SqlParam::Float(1.5),
+            SqlParam::Bool(true),
+            SqlParam::Bytes(b"T0K3N".to_vec()),
+            SqlParam::Null(Box::new(SqlParam::Text("PW0RD".to_owned()))),
+        ];
+        let shown = format!("{params:?}");
+        for planted in ["S3CR3T", "424242", "1.5", "true", "84, 48", "PW0RD"] {
+            assert!(!shown.contains(planted), "{planted} leaked: {shown}");
+        }
+        assert!(shown.contains("Text(<redacted>)"), "{shown}");
+        assert!(shown.contains("Null(Text(<redacted>))"), "{shown}");
+    }
+
     /// Every target `url` makes the driver dial, as [`PostgresUrl::parse`] reads them.
     fn postgres_dial_targets(url: &str) -> Result<Vec<DialTarget>, DbConnectError> {
         PostgresUrl::parse(url).map(|url| url.targets)
@@ -7230,16 +7280,17 @@ mod tests {
         // Fresh file every time.
         let _ = std::fs::remove_file(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("parse file sqlite url")
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(max_conns)
-            .connect(&url)
+            .connect_with(options)
             .await
             .expect("connect file sqlite");
         // WAL: concurrent readers alongside a single writer.
         let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
-        let _ = sqlx::query("PRAGMA busy_timeout=5000;")
-            .execute(&pool)
-            .await;
         sqlx::query("CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
             .execute(&pool).await.expect("create table");
         (pool, path)
@@ -9753,8 +9804,9 @@ mod tests {
     #[tokio::test]
     async fn ipe_db_url_shared_connection_sees_same_data() {
         use crate::system::{locked_remove_var, locked_set_var};
-        let tmp = format!("/tmp/ipe_aud07_shared_{}.db", std::process::id());
-        let url = format!("sqlite://{}?mode=rwc", tmp);
+        let tmp = crate::scratch_core::test_temp_root()
+            .join(format!("ipe_aud07_shared_{}.db", std::process::id()));
+        let url = format!("sqlite://{}?mode=rwc", tmp.display());
         locked_set_var("DATABASE_URL", &url);
         let resolved = crate::config::ipe_db_url();
         locked_remove_var("DATABASE_URL");
@@ -10495,9 +10547,11 @@ mod tests {
             return (Err(DbFailure::Io), None);
         };
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
+            })
+            .expect("spawn test thread");
         let relay = crate::ssrf::PinnedRelay::open(
             crate::ssrf::VettedAddr::assume_vetted_for_test(server),
             5432,
@@ -10760,6 +10814,68 @@ mod tests {
             };
             assert_eq!(refused, Some(expected.to_string()), "{url:?}");
         }
+    }
+
+    /// The busy timeout of the connection `conn` is running on, in milliseconds.
+    async fn busy_timeout_ms(conn: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+            .fetch_one(conn)
+            .await
+            .expect("read busy_timeout")
+    }
+
+    /// Every connection a file pool hands out at once carries the declared
+    /// busy timeout, not only the one a pool-level PRAGMA happened to reach.
+    #[tokio::test]
+    async fn every_pooled_sqlite_connection_carries_the_declared_busy_timeout() {
+        let path = crate::scratch_core::test_temp_root().join(format!(
+            "ipe_busy_timeout_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = match build_pool::<String>(&url).await {
+            IpeResult::Ok(pool) => Some(pool),
+            IpeResult::Err(_) => None,
+        }
+        .expect("build file pool");
+        let expected = i64::try_from(SQLITE_BUSY_TIMEOUT.as_millis()).expect("timeout fits i64");
+        let max_connections: u32 = DB_CONNECTIONS_CEILING
+            .read()
+            .expect("default connection ceiling");
+        let mut held = Vec::new();
+        for _ in 0..max_connections {
+            held.push(pool.acquire().await.expect("acquire pooled connection"));
+        }
+        assert_eq!(
+            held.len(),
+            usize::try_from(max_connections).expect("u32 fits usize")
+        );
+        for conn in &mut held {
+            assert_eq!(busy_timeout_ms(conn).await, expected);
+        }
+        drop(held);
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// The declared busy timeout is a finite, non-zero wait longer than the
+    /// driver's own 5 s default, so declaring it changes what a connection does.
+    #[test]
+    fn the_busy_timeout_is_finite_and_above_the_driver_default() {
+        let driver_default = sqlx::sqlite::SqliteConnectOptions::new();
+        let default_debug = format!("{driver_default:?}");
+        assert!(
+            default_debug.contains("busy_timeout: 5s"),
+            "{default_debug}"
+        );
+        assert!(SQLITE_BUSY_TIMEOUT > std::time::Duration::from_secs(5));
+        assert!(SQLITE_BUSY_TIMEOUT < std::time::Duration::from_secs(600));
     }
 
     /// A PostgreSQL refusal displays under the `db:` prefix.

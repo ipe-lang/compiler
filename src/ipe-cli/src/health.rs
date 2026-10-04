@@ -180,7 +180,10 @@ impl ConfigTarget {
 /// # Errors
 /// See [`cargo_config_path_from`].
 fn cargo_config_path() -> Result<PathBuf, CliError> {
-    cargo_config_path_from(ipe_env::var_os("CARGO_HOME"), crate::env_dir::home())
+    cargo_config_path_from(
+        ipe_env::var_os("CARGO_HOME"),
+        crate::env_dir::home().ok().as_ref(),
+    )
 }
 
 /// Resolve the Cargo config path from the raw `CARGO_HOME` value and the home.
@@ -192,7 +195,7 @@ fn cargo_config_path() -> Result<PathBuf, CliError> {
 /// [`CliError::Usage`] when `CARGO_HOME` is unset and no home resolves.
 fn cargo_config_path_from(
     cargo_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
+    home: Option<&crate::env_dir::HomeDir>,
 ) -> Result<PathBuf, CliError> {
     let cargo_home = crate::env_dir::tool_home_from("CARGO_HOME", cargo_home, home, ".cargo")?
         .ok_or_else(|| CliError::Usage(crate::text::msg::health_home_unknown()))?;
@@ -612,12 +615,29 @@ fn check_runtime() -> Check {
 /// A fast linker (`mold` preferred, then `lld`, then `ld.gold`).
 ///
 /// The check order:
+/// 0. The host's link driver is MSVC → not applicable, nothing to do.
 /// 1. Already configured in `~/.cargo/config.toml` → `Ok`, nothing to do.
 /// 2. A linker is on PATH AND passes a link probe → offer the `rustflags` fix.
 /// 3. A linker is on PATH but fails the probe → report found-but-rejected
 ///    (neutral; never offer a fix that would break the user's builds).
 /// 4. Nothing found → suggest installation.
 fn check_linker() -> Check {
+    // 0. MSVC links through `link.exe`, which has no `-fuse-ld=` concept.
+    //    Probing a PATH linker, or writing the `rustflags` edit, would offer a
+    //    fix the host linker silently ignores. The axis does not apply here.
+    if matches!(host_link_driver(), Some(LinkDriver::Msvc)) {
+        return Check {
+            group: Group::Linker,
+            id: "linker",
+            status: Status::Ok,
+            detail: "fast-linker selection does not apply: the MSVC link driver (link.exe) \
+                     ignores -fuse-ld="
+                .to_owned(),
+            suggestion: None,
+            fix: None,
+        };
+    }
+
     // 1. Already configured: the `rustflags` key for the host target is present
     //    in `~/.cargo/config.toml` and contains a `-fuse-ld=` flag.
     if linker_already_configured() {
@@ -760,14 +780,66 @@ fn probe_linker(name: &str) -> LinkerProbeResult {
     result
 }
 
-/// The `rustc -vV` release line, used as the cache invalidation key. `None`
-/// when `rustc` is not on PATH or its output cannot be parsed.
-fn rustc_version_string() -> Option<String> {
+/// The compiler's link driver — decides whether `-fuse-ld=<name>` has any
+/// effect on the host.
+enum LinkDriver {
+    /// `link.exe` (every `*-pc-windows-msvc` host) — ignores `-fuse-ld=`.
+    Msvc,
+    /// A `cc`-family front end (gnu/musl/mingw/Unix hosts) — honours it.
+    CcDriver,
+}
+
+/// Classify a `rustc -vV` host triple into its [`LinkDriver`].
+///
+/// Pure and host-independent — the triple string alone decides the driver, so
+/// this is testable on any CI host without ever spawning `rustc`.
+fn link_driver_for_host_triple(host: &str) -> LinkDriver {
+    if host.ends_with("-msvc") {
+        LinkDriver::Msvc
+    } else {
+        LinkDriver::CcDriver
+    }
+}
+
+/// Parse the `host:` line out of `rustc -vV`'s raw output text.
+///
+/// Pure: no subprocess, no environment lookup — just the line scan. The one
+/// parser both [`host_link_driver`] and [`host_target_triple`] read through,
+/// so "the host triple" has exactly one source wherever `rustc -vV`'s text is
+/// available, instead of two call sites each re-deriving it their own way.
+fn host_triple_from_rustc_vv(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| l.strip_prefix("host: "))
+}
+
+/// Ask the running toolchain for its host triple via `rustc -vV`. `None` when
+/// `rustc` is not on `PATH`, exits non-zero, or its output does not carry a
+/// parseable `host:` line.
+fn rustc_host_triple() -> Option<String> {
+    let text = rustc_vv_text()?;
+    host_triple_from_rustc_vv(&text).map(str::to_owned)
+}
+
+/// The running toolchain's `rustc -vV` text. `None` when `rustc` is not on
+/// `PATH`, exits non-zero, or prints non-UTF-8.
+fn rustc_vv_text() -> Option<String> {
     let out = Command::new("rustc").arg("-vV").output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8(out.stdout).ok()?;
+    String::from_utf8(out.stdout).ok()
+}
+
+/// The running toolchain's link driver, derived from its host triple. `None`
+/// when the triple cannot be determined — the fast-linker probe then runs
+/// exactly as it did before this check existed.
+fn host_link_driver() -> Option<LinkDriver> {
+    rustc_host_triple().map(|host| link_driver_for_host_triple(&host))
+}
+
+/// The `rustc -vV` release line, used as the cache invalidation key. `None`
+/// when `rustc` is not on PATH or its output cannot be parsed.
+fn rustc_version_string() -> Option<String> {
+    let text = rustc_vv_text()?;
     // The "release:" line uniquely identifies the toolchain version.
     text.lines()
         .find(|l| l.starts_with("release:"))
@@ -1124,11 +1196,32 @@ const LOW_DISK_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
 // ---- small probes ---------------------------------------------------------
 
 /// The host target triple as `rustc` names it, for a per-target `rustflags`
-/// key. Built from the compile-time `cfg` facts so it needs no `rustc` spawn.
-const fn host_target_triple() -> &'static str {
-    // A minimal mapping of the common host arch/OS pairs. An unmapped host
-    // falls back to a generic key that still parses (the linker edit is a
-    // convenience, not a correctness requirement).
+/// key.
+///
+/// Reads the real triple from `rustc -vV`'s `host:` line — through
+/// [`rustc_host_triple`], the same reader [`host_link_driver`] uses — so
+/// there is exactly one source for "the host triple" on this host, not a
+/// static per-arch/OS table that drifts from whatever `rustc` actually
+/// targets (a cross-compiled or multi-target toolchain's host is not always
+/// the triple a `cfg` guess would produce). Falls back to the compile-time
+/// [`cfg_host_triple_fallback`] when `rustc` is unreachable, and only then to
+/// the generic `"host"` key on an unmapped platform — the linker edit is a
+/// convenience, not a correctness requirement, so a best-effort key is still
+/// useful when the real triple cannot be read. Cached for the process's
+/// lifetime: the host triple cannot change between two calls in one run.
+fn host_target_triple() -> &'static str {
+    static TRIPLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TRIPLE
+        .get_or_init(|| {
+            rustc_host_triple().unwrap_or_else(|| cfg_host_triple_fallback().to_owned())
+        })
+        .as_str()
+}
+
+/// A compile-time per-arch/OS guess at the host triple, used only when
+/// `rustc -vV` cannot be read. An unmapped host falls back to the generic
+/// `"host"` key, which still parses as a TOML table key.
+const fn cfg_host_triple_fallback() -> &'static str {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
         "x86_64-unknown-linux-gnu"
@@ -1830,14 +1923,15 @@ mod tests {
             ConfigValue::StrList(vec!["-C".to_owned(), "link-arg=-fuse-ld=mold".to_owned()]);
 
         for raw in ["rel/cargo", "./cargo", "../cargo"] {
-            let got = cargo_config_path_from(Some(raw.into()), Some(home.path().to_path_buf()))
-                .and_then(|path| {
-                    apply_config_edit(
-                        &path,
-                        &["target", "x86_64-unknown-linux-gnu", "rustflags"],
-                        &value,
-                    )
-                });
+            let parsed = crate::env_dir::HomeDir::try_parse(Some(home.path().into()))
+                .expect("an absolute test home");
+            let got = cargo_config_path_from(Some(raw.into()), Some(&parsed)).and_then(|path| {
+                apply_config_edit(
+                    &path,
+                    &["target", "x86_64-unknown-linux-gnu", "rustflags"],
+                    &value,
+                )
+            });
             assert!(
                 matches!(got, Err(CliError::EnvDirNotAbsolute { var: "CARGO_HOME" })),
                 "relative CARGO_HOME `{raw}` must be refused"
@@ -1851,12 +1945,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn cargo_config_path_honours_an_absolute_cargo_home_and_defaults_when_unset_or_empty() {
-        let home = PathBuf::from("/home/u");
-        let got = cargo_config_path_from(Some("/opt/cargo".into()), Some(home.clone()));
+        let home = crate::env_dir::HomeDir::try_parse(Some("/home/u".into()))
+            .expect("an absolute test home");
+        let got = cargo_config_path_from(Some("/opt/cargo".into()), Some(&home));
         assert!(matches!(got, Ok(p) if p == std::path::Path::new("/opt/cargo/config.toml")));
         for raw in [None, Some("")] {
-            let got = cargo_config_path_from(raw.map(std::ffi::OsString::from), Some(home.clone()));
+            let got = cargo_config_path_from(raw.map(std::ffi::OsString::from), Some(&home));
             assert!(
                 matches!(&got, Ok(p) if p == &PathBuf::from("/home/u/.cargo/config.toml")),
                 "{raw:?}"
@@ -2101,13 +2197,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_env = "msvc"))]
     fn probe_rejected_linker_offers_no_fix() {
         // Simulate a probe rejection: a linker name that no toolchain has.
+        // `check_linker` never reaches this probe on MSVC (the driver check
+        // above short-circuits first), so the probe itself is exercised only
+        // where it is actually reachable in production.
         let result = run_link_probe("__ipe_test_nonexistent_linker__");
         assert!(
             matches!(result, LinkerProbeResult::Rejected),
             "a nonexistent linker must be rejected by the probe"
         );
+    }
+
+    #[test]
+    fn an_msvc_host_offers_no_fuse_ld_fix() {
+        assert!(matches!(
+            link_driver_for_host_triple("x86_64-pc-windows-msvc"),
+            LinkDriver::Msvc
+        ));
+        assert!(matches!(
+            link_driver_for_host_triple("aarch64-pc-windows-msvc"),
+            LinkDriver::Msvc
+        ));
+        assert!(matches!(
+            link_driver_for_host_triple("x86_64-pc-windows-gnu"),
+            LinkDriver::CcDriver
+        ));
+        assert!(matches!(
+            link_driver_for_host_triple("x86_64-unknown-linux-gnu"),
+            LinkDriver::CcDriver
+        ));
+        assert!(matches!(
+            link_driver_for_host_triple("aarch64-apple-darwin"),
+            LinkDriver::CcDriver
+        ));
+    }
+
+    #[test]
+    fn host_triple_parser_reads_msvc_line_and_refuses_missing() {
+        let vv = "rustc 1.80.0 (abcdef 2024-01-01)\n\
+                  binary: rustc\n\
+                  host: x86_64-pc-windows-msvc\n\
+                  release: 1.80.0\n";
+        assert_eq!(
+            host_triple_from_rustc_vv(vv),
+            Some("x86_64-pc-windows-msvc")
+        );
+        // No `host:` line at all — the parser refuses rather than guessing.
+        let no_host = "rustc 1.80.0 (abcdef 2024-01-01)\nrelease: 1.80.0\n";
+        assert_eq!(host_triple_from_rustc_vv(no_host), None);
+        assert_eq!(host_triple_from_rustc_vv(""), None);
     }
 
     #[test]

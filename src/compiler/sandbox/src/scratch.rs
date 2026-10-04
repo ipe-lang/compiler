@@ -47,6 +47,8 @@ mod scratch_host {
     #[must_use]
     pub fn profile_dir() -> Option<std::path::PathBuf> {
         crate::home::home_dir()
+            .ok()
+            .map(crate::home::HomeDir::into_path)
     }
 }
 

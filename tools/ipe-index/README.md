@@ -161,6 +161,24 @@ A full rebuild re-extracts the whole repo, so it takes tens of seconds on this
 repo; `update` re-extracts only what changed since the last run. Both run in
 one transaction: a failed run leaves the previous index and queue in place.
 
+**What the walk indexes:** every regular file git tracks, plus the untracked
+files `.gitignore` does not exclude, read from NUL-separated git listings
+(`git ls-files -z -s`, `git diff --raw -z`), so a newline in a name never
+splits it. The walk refuses, and names on stderr as `ipe-index: not indexing
+…`, any entry git records as a symbolic link (mode 120000) or a submodule
+(160000), an untracked nested repository, any name that is not UTF-8, and any
+path that is not a regular file on disk, checked without following links at the
+file and at every directory above it. Every read (indexing and `rename-symbol`)
+repeats that check, reads from the handle it opened only if it is the file the
+check saw, and stops at the 2 MB read ceiling. A file that becomes a link drops
+out of the index on the next `update`. A tracked `leak.rs -> /etc/passwd` never reaches the index or the
+review app:
+
+```bash
+ln -s /etc/passwd leak.rs && git add leak.rs
+tools/scripts/ipe-index index   # ipe-index: not indexing leak.rs: tracked as a symbolic link
+```
+
 ### The change queue (what the code-review app consumes)
 
 `index` and `update` record per-unit `new`/`modified`/`deleted` events in a
@@ -173,16 +191,38 @@ units it rebuilt against the units the queue was last reconciled with. A full
 unchanged keeps its row, or stays drained. Only the first `index` of an empty
 database queues every unit as `new`.
 
-A `file` unit covers its whole file, but its change key is the residual: the
-lines no other unit of the file covers (imports, attributes, top-level glue).
-An edit inside a function queues that function alone; an edit to a top-level
-line queues the file. A pending file row still follows the file's current body
-hash, so it stays drainable after a child edit.
+A `file` unit spans its whole file but reviews only its residual: the
+non-blank lines no other unit of the file covers (imports, attributes,
+top-level glue), each run of covered lines marked by one gap. An edit inside a
+function queues that function alone; an edit to a top-level line queues the
+file. A file whose units cover every non-blank line has no residual, so it gets
+no file unit and nothing of it is queued beyond its units.
+
+An index built before file units attested their residual is rebuilt in full by
+the next `update`. A pending file row is then re-pointed at its residual
+attestation, so it stays drainable. A file unit decided under its whole-file
+hash is open again: the decided pair names bytes the unit no longer attests.
 
 A `reviewed` table holds the code-review app's decided `(uid, body_hash)`
-pairs, so the app counts review progress with one SQL aggregate. The app is
-its sole writer; `index` keeps the table across a rebuild, as it keeps the
-queue.
+pairs, so the app counts review progress with one SQL aggregate. A
+`reviewed_stamp` table (one row) names the review-database state that copy
+reflects. The app is the sole writer of both; `index` keeps them across a
+rebuild, as it keeps the queue.
+
+The `open_units` view is the open backlog: every unit in `units` whose current
+`(uid, body_hash)` is not in `reviewed`. Membership comes from the units the
+working tree holds now, never from the queue: a unit that vanished is not
+listed, a unit that returns under new bytes is open, and a unit that returns
+under decided bytes stays decided. The queue only annotates a listed unit
+(`change`, `old_hash`, and `enqueued_at` as its order); a unit with no queue
+row for its current bytes is listed with a NULL `change` and `enqueued_at` 0,
+ahead of every queued unit. The view is re-created whenever a binary opens an
+index whose stored definition differs from its own.
+
+```bash
+sqlite3 .ipe-index/index.db \
+  "SELECT COUNT(*) FROM open_units; SELECT path, qualified, change FROM open_units ORDER BY enqueued_at, uid LIMIT 5"
+```
 
 ```bash
 ipe-index pending                 # queued unit changes as JSON lines
@@ -191,10 +231,12 @@ ipe-index pending --limit N       # cap the output
 ```
 
 Every unit's `body_hash` is `sha256:` plus the lowercase hex SHA-256 of the
-unit's whole-line view: lines `line_start..=line_end` of the file, split on
-`\n` with any `\r` kept, joined with `\n` (`src/extract/view.rs`). The
-code-review app re-derives that hash before it shows a unit, so the two sides
-share the vectors in `tests/view_hash_vectors.json`.
+text it reviews. For a `file` unit that is its residual (`residual_text` in
+`src/extract/mod.rs`); for every other unit it is the whole-line view: lines
+`line_start..=line_end` of the file, split on `\n` with any `\r` kept, joined
+with `\n` (`src/extract/view.rs`). The code-review app re-derives that hash
+before it shows a unit, so the two sides share the vectors in
+`tests/view_hash_vectors.json` and `tests/residual_vectors.json`.
 
 ### Rename planning (read-only)
 
@@ -216,7 +258,19 @@ never write. `<old>` for `rename-path` is the untagged repo-relative path
 - `--repo <tag:path>` — repeatable; override the indexed repo set. Default is
   `ipe:.`. A tag is non-empty and holds no `/` and no `:` (the tags a stored
   `tag:path` reads back as; pinned by `tests/repo_tag_vectors.json`), and each
-  tag is given once.
+  tag is given once. Each tag names one directory: roots are compared by
+  directory identity, not by spelling, so `a:.` with `b:./`, a `..` spelling,
+  or a symbolic link to a declared root is refused as a second tag for one
+  directory. The number of roots is capped by `max_repos` in
+  `tests/max_repos.json`, and more than one root needs a platform with
+  directory identity (Unix). Roots may nest: a file belongs only to the deepest declared root that contains it, so
+  an outer root's walk and `update` skip everything under an inner root, which
+  indexes those files under its own tag. A root that is a subdirectory of its
+  work tree is diffed relative to itself (`git diff --relative`). A declared
+  root replaced by another directory between parsing and the walk fails the
+  run. The index records the root set it was built under; any change to that
+  set makes `update` rebuild the whole index, and units whose owning root moved
+  are re-queued under their new tagged path (deleted under the old one).
 
 ---
 

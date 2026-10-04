@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! `ipe_watch` — the confined filesystem watcher + process supervisor that
-//! power `ipe watch`.
+//! power `ipe dev watch`.
 //!
 //! This crate is deliberately salsa-agnostic: it knows nothing about
-//! `ipe_db`, `IpeDatabase`, or the compile pipeline. It provides three
+//! `ipe_db`, `IpeDatabase`, or the compile pipeline. It provides
 //! independently-testable primitives that `crates/ipe/src/watch.rs` (the
 //! salsa-aware orchestrator) wires together:
 //!
@@ -18,10 +18,6 @@
 //!   INV-3 ("a failing rebuild never kills the running binary") and H15/H16
 //!   (`RespawnLastGood` recovery from the on-disk artifact when a fresh
 //!   binary fails its readiness probe).
-//! - [`signal`] (unix) — a safe "run this closure on SIGTERM" listener the
-//!   orchestrator's `run()` path (never `spawn()` — an in-process embedder's
-//!   SIGTERM disposition must not be touched) forwards into its shutdown
-//!   channel.
 //! - [`proxy`] — the DEV-ONLY blue-green front proxy: a persistent front that
 //!   holds the user's port while the app binary runs behind it on an internal
 //!   port, so a rebuild can cut traffic over to a freshly-ready binary without
@@ -33,7 +29,6 @@ pub mod coalesce;
 pub mod process;
 pub mod proxy;
 pub mod scope;
-pub mod signal;
 
 pub use coalesce::{Batch, DebounceConfig, coalesce_loop};
 pub use process::{
@@ -41,5 +36,3 @@ pub use process::{
 };
 pub use proxy::DevProxy;
 pub use scope::{MAX_WATCHED_FILES, ScopeError, WatchScope, WatchedPath};
-#[cfg(unix)]
-pub use signal::install_sigterm_forwarder;

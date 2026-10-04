@@ -31,7 +31,6 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::future::Future;
-use std::time::Duration;
 
 // ─── Tenant-prefix SQL enforcement ─────────────────────────────────────────
 //
@@ -976,10 +975,10 @@ async fn open_spill(db_path: &str) -> Option<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)
-        // Wait briefly on a WAL writer's lock instead of returning SQLITE_BUSY
-        // immediately (which degrades a transient lock into a spurious empty
-        // result). Bounded so a wedged writer can't block the task indefinitely.
-        .busy_timeout(Duration::from_secs(5));
+        // Wait on a WAL writer's lock instead of returning SQLITE_BUSY at once
+        // (a spurious empty result), bounded so a wedged writer cannot block the
+        // task indefinitely.
+        .busy_timeout(crate::system::SQLITE_BUSY_TIMEOUT);
     match SqlitePool::connect_with(opts).await {
         Ok(pool) => Some(pool),
         Err(e) => {

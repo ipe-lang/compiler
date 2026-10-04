@@ -50,8 +50,9 @@
 //! volume-prefixed, `..`-bearing, or NUL-bearing child, and re-checks that the
 //! cleaned join lies component-wise below the root (`/repo2/x` is not under
 //! `/repo`). On Windows it also refuses a child element holding a `:`, made
-//! only of dots and spaces, or naming a reserved DOS device, and re-scans the
-//! joined result for the last two independently of the child parse.
+//! only of dots and spaces, naming a reserved DOS device, or ending in a dot or
+//! a space, and re-scans the joined result for each of them independently of
+//! the child parse.
 //! [`path_absolute`] resolves a relative path against the working
 //! directory through the same join.
 //!
@@ -73,9 +74,11 @@ use super::{IpeError, IpeResult, IpeTask, ok_res};
 // the runtime seal stays target-specific. A sibling module (not an extern
 // crate) so it resolves both in the workspace AND when the runtime is vendored
 // as `mod ipe_runtime` into an emitted app.
+#[cfg(feature = "server")]
+use super::path_core::RelPath;
 use super::path_core::{
-    ElementClass, HOST, Regime, SealRefusal, Volume, clean_with, escapes_root, has_nul,
-    is_dos_device, is_sep, seal, volume_name_len,
+    ChildElement, ElementClass, ElementRefusal, HOST, Regime, SealRefusal, Volume, clean_with,
+    escapes_root, has_nul, is_dos_device, is_sep, seal, volume_name_len,
 };
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -226,7 +229,7 @@ impl OsOrigin {
 /// [`absolute_from`] is one of these; it becomes text only at the Ipê-facing
 /// boundary, through its one `Display`, as an `InvalidInput` [`IpeError`].
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum PathRefusal {
+pub(crate) enum PathRefusal {
     /// The seal refused `path`.
     Seal { path: String, why: SealRefusal },
     /// An OS text from `origin` is not valid UTF-8.
@@ -287,13 +290,16 @@ impl std::fmt::Display for PathRefusal {
 
 /// The `Ipe.Path` operation whose child join refused, named in the refusal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JoinOp {
+pub(crate) enum JoinOp {
     /// `Ipe.Path.under` joining its child beneath its root.
     Under,
     /// `Ipe.Path.absolute` joining a relative path beneath the working directory.
     Absolute,
     /// `Ipe.File.walk` joining an entry name beneath the directory it was read from.
     Walk,
+    /// A static-file mount joining a request path beneath its served directory.
+    #[cfg(feature = "server")]
+    Static,
 }
 
 impl JoinOp {
@@ -303,13 +309,15 @@ impl JoinOp {
             Self::Under => "Ipe.Path.under",
             Self::Absolute => "Ipe.Path.absolute",
             Self::Walk => "Ipe.File.walk",
+            #[cfg(feature = "server")]
+            Self::Static => "static file request",
         }
     }
 }
 
 /// Why `under` refused a child on its own, before any containment check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChildRefusal {
+pub(crate) enum ChildRefusal {
     /// The root or the child holds a NUL byte.
     Nul,
     /// The child names the root itself (empty or `.`).
@@ -531,14 +539,16 @@ fn first_element_has_colon(p: &str) -> bool {
         .is_some_and(|e| e.contains(&b':'))
 }
 
-/// Does the part of the Windows `joined` below `root` hold an element made only
-/// of dots and spaces?
+/// Does the part of the Windows `joined` below `root` hold an element Windows
+/// strips to another name?
 ///
-/// Windows strips trailing dots and spaces from every element, so such an
-/// element names `.` or `..` rather than a child of its own — a join ending in
-/// `\ ` resolves to the root itself: every non-empty [`ElementClass`] made
-/// only of dots and spaces (`.`, `..` and both disguises). Re-classifies the
-/// joined result itself, independent of the child parse run before the join.
+/// Windows strips trailing dots and spaces from every element, so an element
+/// made only of them names `.` or `..` rather than a child of its own — a join
+/// ending in `\ ` resolves to the root itself — and a name ending in one
+/// (`a.`) opens a sibling entry (`a`): every non-empty [`ElementClass`] made
+/// only of dots and spaces (`.`, `..` and both disguises) and the stripped
+/// tail. Re-classifies the joined result itself, independent of the child
+/// parse run before the join.
 fn has_stripped_element(root: &str, joined: &str) -> bool {
     ElementClass::windows_elements(below_root(root, joined)).any(|c| {
         matches!(
@@ -547,6 +557,7 @@ fn has_stripped_element(root: &str, joined: &str) -> bool {
                 | ElementClass::Parent
                 | ElementClass::DisguisedCurrent
                 | ElementClass::DisguisedParent
+                | ElementClass::StrippedTail
         )
     })
 }
@@ -572,90 +583,19 @@ fn has_colon_element(root: &str, joined: &str) -> bool {
     below_root(root, joined).as_bytes().contains(&b':')
 }
 
-/// Why a Windows child element can never be joined beneath a root.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ElementRefusal {
-    /// The `..` parent token.
-    Parent,
-    /// A `:` — a drive designator (`é:`, `1:`) or an alternate data stream
-    /// (`a:b`), either of which re-anchors or aliases the element.
-    Colon,
-    /// Only dots and spaces, other than the exact `.`/`..`: Windows strips
-    /// trailing dots and spaces, so it names `.` or `..` (`" "`, `". "`,
-    /// `".. "`, `"..."`).
-    DotSpaceRun,
-    /// A reserved DOS device name (`CON`, `nul.txt`, `COM1`): Win32 opens the
-    /// device, not a file beneath the root.
-    DosDevice,
-}
-
-impl ElementRefusal {
-    /// The refusal reason [`join_beneath`] reports.
-    const fn reason(self) -> &'static str {
-        match self {
-            Self::Parent => "contains a `..` element",
-            Self::Colon => "contains a `:` (a drive designator or an alternate data stream)",
-            Self::DotSpaceRun => {
-                "contains an element made only of dots and spaces (Windows strips it to `.` or `..`)"
-            }
-            Self::DosDevice => {
-                "contains a reserved Windows device name (`CON`, `NUL`, `COM1`, ...) that opens a device"
-            }
-        }
-    }
-}
-
-/// One element of a Windows child path, parsed once by [`ChildElement::parse`].
-///
-/// The child side of [`join_beneath`] reads every element through this parse,
-/// which refuses the forms Win32 resolves to something other than an entry of
-/// that name beneath the root: `..`, a `:` (a drive or a stream), a dot/space
-/// run (`.` or `..` once stripped), and a reserved DOS device. An accepted name
-/// may still alias a sibling name in the same directory (a stripped trailing
-/// `.` or space, an 8.3 short name); that alias stays beneath the root.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChildElement {
-    /// An empty element (a doubled separator), dropped by cleaning.
-    Empty,
-    /// The exact `.` token, dropped by cleaning.
-    Current,
-    /// A plain name that stays a name after Windows canonicalisation.
-    Name,
-}
-
-impl ChildElement {
-    /// Classify one raw element, or say why it may never be joined.
-    fn parse(e: &[u8]) -> Result<Self, ElementRefusal> {
-        match ElementClass::of(e) {
-            ElementClass::Empty => Ok(Self::Empty),
-            ElementClass::Current => Ok(Self::Current),
-            ElementClass::Name => Ok(Self::Name),
-            ElementClass::Parent => Err(ElementRefusal::Parent),
-            ElementClass::Colon => Err(ElementRefusal::Colon),
-            ElementClass::DisguisedParent | ElementClass::DisguisedCurrent => {
-                Err(ElementRefusal::DotSpaceRun)
-            }
-            ElementClass::DosDevice => Err(ElementRefusal::DosDevice),
-        }
-    }
-}
-
 /// Why `child` may not be joined beneath any root, judged on its RAW text.
 ///
 /// Runs before any cleaning, so a `..` element or a Windows dot/space disguise
 /// is refused even when cleaning would have folded it into an in-bounds form.
 fn raw_child_refusal(c: &str, regime: Regime) -> Option<ChildRefusal> {
-    let mut elements = c.as_bytes().split(|&b| is_sep(b, regime));
-    let element_refusal = if regime.is_windows() {
-        elements.find_map(|e| ChildElement::parse(e).err())
-    } else {
-        elements
-            .any(|e| ElementClass::of(e) == ElementClass::Parent)
-            .then_some(ElementRefusal::Parent)
-    };
-    element_refusal.map(ChildRefusal::Element).or_else(|| {
-        (is_rooted(c, regime) || volume_name_len(c, regime) > 0).then_some(ChildRefusal::Absolute)
-    })
+    c.as_bytes()
+        .split(|&b| is_sep(b, regime))
+        .find_map(|e| ChildElement::parse(e, regime).err())
+        .map(ChildRefusal::Element)
+        .or_else(|| {
+            (is_rooted(c, regime) || volume_name_len(c, regime) > 0)
+                .then_some(ChildRefusal::Absolute)
+        })
 }
 
 /// Why the CLEANED `child` may not be joined, re-checking the raw verdict.
@@ -676,6 +616,21 @@ fn clean_child_refusal(c: &str, regime: Regime) -> Option<ChildRefusal> {
 /// Split from [`path_under`] so the Windows refusals are proven on any host.
 fn under_with(r: &str, c: &str, regime: Regime) -> Result<String, PathRefusal> {
     join_beneath(JoinOp::Under, r, c, regime)
+}
+
+/// Join the parsed request path `rel` beneath the served directory `root`,
+/// under the regime `rel` was parsed under.
+///
+/// The post-join boundary of a static-file mount: `rel` already passed the
+/// per-element parse, and [`join_beneath`] re-runs the raw child scan, the
+/// cleaned re-check and the strictly-beneath scans on the joined text.
+///
+/// # Errors
+///
+/// The [`PathRefusal`] of the join, naming the static file request.
+#[cfg(feature = "server")]
+pub(crate) fn join_rel(root: &str, rel: &RelPath) -> Result<String, PathRefusal> {
+    join_beneath(JoinOp::Static, root, rel.as_str(), rel.regime())
 }
 
 /// Join `child` beneath `root` under a separator regime on behalf of `op`.
@@ -848,6 +803,32 @@ mod tests {
         }
     }
 
+    /// The HOST regime's own spelling of a Unix-slashed literal.
+    ///
+    /// Rewrites every `/` to the HOST separator, so an expected literal
+    /// matches `clean_with`'s own canonicalisation instead of hardcoding
+    /// Unix's `/` on every host.
+    fn host_sep(unix_spelled: &str) -> String {
+        if HOST.is_windows() {
+            unix_spelled.replace('/', "\\")
+        } else {
+            unix_spelled.to_string()
+        }
+    }
+
+    /// A HOST-absolute literal for `tail`.
+    ///
+    /// Unix roots it with `/`; Windows anchors it with a drive, since a bare
+    /// root with no volume is not self-anchored there — so no test embeds a
+    /// Unix-only `/abs` literal into a host-regime judgement.
+    fn host_abs(tail: &str) -> String {
+        if HOST.is_windows() {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
+
     // ── construction: the seal validates ────────────────────────────────────
 
     #[test]
@@ -857,24 +838,24 @@ mod tests {
 
     #[test]
     fn plain_relative_is_accepted() {
-        assert_eq!(path_to_string(mk("src/Main.ipe")), "src/Main.ipe");
+        assert_eq!(path_to_string(mk("src/Main.ipe")), host_sep("src/Main.ipe"));
     }
 
     #[test]
     fn repeated_separators_collapse() {
-        assert_eq!(path_to_string(mk("a//b///c")), "a/b/c");
+        assert_eq!(path_to_string(mk("a//b///c")), host_sep("a/b/c"));
     }
 
     #[test]
     fn interior_dotdot_that_stays_in_bounds_is_accepted() {
         // "a/b/../c" resolves to "a/c" — never climbs above the base.
-        assert_eq!(path_to_string(mk("a/b/../c")), "a/c");
+        assert_eq!(path_to_string(mk("a/b/../c")), host_sep("a/c"));
     }
 
     #[test]
     fn rooted_dotdot_cannot_escape_and_is_accepted() {
         // `Clean` stops `..` at the root, so a rooted path is always safe.
-        assert_eq!(path_to_string(mk("/a/../../b")), "/b");
+        assert_eq!(path_to_string(mk("/a/../../b")), host_sep("/b"));
     }
 
     // ── construction: the seal rejects ──────────────────────────────────────
@@ -923,12 +904,12 @@ mod tests {
 
     #[test]
     fn base_root() {
-        assert_eq!(path_base(mk("/")), "/");
+        assert_eq!(path_base(mk("/")), host_sep("/"));
     }
 
     #[test]
     fn dir_with_parent() {
-        assert_eq!(path_dir(mk("/foo/bar.txt")), "/foo");
+        assert_eq!(path_dir(mk("/foo/bar.txt")), host_sep("/foo"));
     }
 
     #[test]
@@ -953,7 +934,7 @@ mod tests {
 
     #[test]
     fn is_absolute_true() {
-        assert!(path_is_absolute(mk("/usr/bin")));
+        assert!(path_is_absolute(mk(&host_abs("usr/bin"))));
     }
 
     #[test]
@@ -1244,6 +1225,15 @@ mod tests {
     /// The Windows-regime join over UNSEALED strings (proven on any host).
     fn win_raw(root: &str, child: &str) -> Option<String> {
         under_with(root, child, Regime::Windows).ok()
+    }
+
+    /// Why the Windows-regime join refused `child` itself, or `None` when it
+    /// joined or refused only after the join.
+    fn win_child_refusal(root: &str, child: &str) -> Option<ChildRefusal> {
+        match under_with(root, child, Regime::Windows) {
+            Err(PathRefusal::Child { why, .. }) => Some(why),
+            _ => None,
+        }
     }
 
     #[cfg(not(windows))]
@@ -1601,13 +1591,17 @@ mod tests {
             "CON\u{131}N$",
             "con\u{131}n$",
             "CON\u{131}N$.txt",
+            "a\\COM1",
+            "LPT9.log",
+            "nul.txt",
         ] {
-            assert_eq!(win_raw(".", child), None, "root `.` joined {child:?}");
-            assert_eq!(
-                win_raw("C:\\uploads", child),
-                None,
-                "`C:\\uploads` joined {child:?}"
-            );
+            for root in [".", "C:\\uploads"] {
+                assert_eq!(
+                    win_child_refusal(root, child),
+                    Some(ChildRefusal::Element(ElementRefusal::DosDevice)),
+                    "{root:?} joined {child:?}"
+                );
+            }
         }
         for child in ["CONSOLE", "COM10", "nulx"] {
             assert_eq!(
@@ -1618,6 +1612,87 @@ mod tests {
         }
         // Device names are a Win32 namespace; the Unix regime joins them.
         assert_eq!(unix_raw("/repo", "CON").as_deref(), Some("/repo/CON"));
+    }
+
+    #[test]
+    fn win_under_refuses_a_stripped_tail_child() {
+        for child in ["a.", "a ", "d\\a.", "a.txt."] {
+            for root in [".", "C:\\uploads"] {
+                assert_eq!(
+                    win_child_refusal(root, child),
+                    Some(ChildRefusal::Element(ElementRefusal::StrippedTail)),
+                    "{root:?} joined {child:?}"
+                );
+            }
+        }
+        // The post-join scan refuses the stripped tail on its own.
+        assert!(!strictly_beneath(".", "a.", Regime::Windows));
+        assert!(!strictly_beneath(
+            "C:\\uploads",
+            "C:\\uploads\\d\\a ",
+            Regime::Windows
+        ));
+        assert!(strictly_beneath(
+            "C:\\uploads",
+            "C:\\uploads\\d\\a.b",
+            Regime::Windows
+        ));
+        // A trailing dot is a legal Unix name.
+        assert_eq!(unix_raw("/repo", "a.").as_deref(), Some("/repo/a."));
+    }
+
+    #[test]
+    fn walk_join_refuses_a_stripped_tail_entry_on_windows() {
+        assert_eq!(
+            join_beneath(JoinOp::Walk, "dir", "a.", Regime::Windows),
+            Err(PathRefusal::Child {
+                op: JoinOp::Walk,
+                child: "a.".to_string(),
+                why: ChildRefusal::Element(ElementRefusal::StrippedTail),
+            })
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn join_rel_joins_under_the_regime_the_path_was_parsed_under() {
+        let win = RelPath::from_segments(["a", "b.css"], Regime::Windows).expect("windows rel");
+        assert_eq!(
+            join_rel("C:\\site", &win).as_deref(),
+            Ok("C:\\site\\a\\b.css")
+        );
+        // A Unix name holding `\` stays one element under the Unix regime.
+        let unix = RelPath::from_segments(["a\\b"], Regime::Unix).expect("unix rel");
+        assert_eq!(
+            join_rel("/srv/site", &unix).as_deref(),
+            Ok("/srv/site/a\\b")
+        );
+    }
+
+    #[test]
+    fn child_parse_and_rel_path_agree() {
+        use super::super::path_core::{RelPath, RelPathRefusal};
+        for regime in [Regime::Unix, Regime::Windows] {
+            for e in corpus() {
+                if e.bytes().any(|b| is_sep(b, regime)) || has_nul(&e) {
+                    continue;
+                }
+                let parsed = ChildElement::parse(e.as_bytes(), regime);
+                let rel = RelPath::from_segments([e.as_str()], regime);
+                assert_eq!(
+                    rel.is_ok(),
+                    parsed == Ok(ChildElement::Name),
+                    "{e:?} under {regime:?}"
+                );
+                if let Err(why) = parsed {
+                    assert_eq!(
+                        rel,
+                        Err(RelPathRefusal::Element(why)),
+                        "{e:?} under {regime:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1639,7 +1714,8 @@ mod tests {
         ] {
             let class = ElementClass::of(e.as_bytes());
             assert_eq!(
-                ChildElement::parse(e.as_bytes()) == Err(ElementRefusal::DosDevice),
+                ChildElement::parse(e.as_bytes(), Regime::Windows)
+                    == Err(ElementRefusal::DosDevice),
                 class == ElementClass::DosDevice,
                 "{e:?}"
             );

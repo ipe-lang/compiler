@@ -38,7 +38,7 @@ columns =
     ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 grid-template-columns:

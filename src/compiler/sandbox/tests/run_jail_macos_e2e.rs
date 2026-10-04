@@ -3,7 +3,7 @@
 //!
 //! These are REAL jailed runs (they spawn `sandbox-exec`), so they are gated
 //! behind `IPE_E2E=1` and only compile on macOS. They drive the RUN jail through
-//! the SAME [`ipe_sandbox::build_jail::sbpl_from_profile`] the production
+//! the SAME [`ipe_sandbox::build_jail::checked_sbpl`] the production
 //! `exec_in_run_jail` macOS arm uses — there is ONE SBPL source, so what these
 //! assert is exactly what confines the shipped app at run time.
 //!
@@ -36,7 +36,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use ipe_sandbox::build_jail::{macos_scrubbed_env, sbpl_from_profile};
+use ipe_sandbox::build_jail::{checked_sbpl, macos_scrubbed_env};
 use ipe_sandbox::run_jail::SandboxProfile;
 
 fn which_sandbox_exec() -> Option<std::path::PathBuf> {
@@ -60,7 +60,10 @@ fn run_jailed_with_host(
     script: &str,
     host: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<i32> {
-    let sbpl = sbpl_from_profile(profile, scratch, scratch);
+    let canonical = ipe_sandbox::CanonicalPath::resolve(scratch).expect("scratch resolves");
+    let mounts = ipe_sandbox::JailMounts::of_invoker(canonical.clone(), canonical, vec![])
+        .expect("the scratch exposes no cargo home");
+    let sbpl = checked_sbpl(profile, &mounts).expect("no fixed read root exposes the cargo home");
     let sandbox_exec = which_sandbox_exec().expect("sandbox-exec present");
     let mut cmd = Command::new(sandbox_exec);
     cmd.arg("-p").arg(&sbpl).arg("sh").arg("-c").arg(script);
@@ -72,7 +75,7 @@ fn run_jailed_with_host(
 }
 
 /// The common case: scrub against the real process environment (what a user's
-/// `ipe run` inherits). The oracle reads through `ipe_env`, which matches the
+/// `ipe dev run` inherits). The oracle reads through `ipe_env`, which matches the
 /// launcher's crate-private passthrough for every name but a home variable; no
 /// profile in this file grants one, so the scrub is the launcher's.
 fn run_jailed(profile: &SandboxProfile, scratch: &Path, script: &str) -> Option<i32> {

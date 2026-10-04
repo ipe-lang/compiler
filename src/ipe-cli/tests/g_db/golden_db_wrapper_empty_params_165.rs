@@ -1,6 +1,6 @@
 //! `examples/17-ipemon`'s `cargo build` failure.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`
 //! with 6x E0277 (the trait bound `SqlParam: From<T1>` is not satisfied)
 //! and 3x E0283 (`type annotations needed` / `cannot infer type of the type
 //! parameter T declared on the struct Vec`) at every
@@ -99,7 +99,7 @@ fn db_wrapper_empty_params_165_ipec_accepts_and_emits_sql_param_bound() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for db_wrapper_empty_params_165: {:?}",
+        "ipe dev build must succeed for db_wrapper_empty_params_165: {:?}",
         built.err()
     );
 
@@ -140,7 +140,7 @@ fn db_wrapper_empty_params_165_ipec_accepts_and_emits_sql_param_bound() {
 /// prints the two rows read back through the empty-params wrapper call.
 /// Gated on `IPE_E2E=1` — a real `cargo build`, the only check that would
 /// have caught the original SEAL violation (9x rustc error on
-/// `examples/17-ipemon`, `ipe build` itself was clean).
+/// `examples/17-ipemon`, `ipe dev build` itself was clean).
 #[test]
 fn db_wrapper_empty_params_165_cargo_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -162,7 +162,7 @@ fn db_wrapper_empty_params_165_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for db_wrapper_empty_params_165: {:?}",
+        "ipe dev build must succeed for db_wrapper_empty_params_165: {:?}",
         built.err()
     );
 

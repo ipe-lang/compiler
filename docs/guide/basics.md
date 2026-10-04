@@ -63,7 +63,7 @@ render reading =
     String.padRight 8 ' ' reading.sensor ++ String.fromInt reading.celsius ++ " C"
 ```
 
-Running it (`ipe run`) clamps the two impossible readings to the band edges,
+Running it (`ipe dev run`) clamps the two impossible readings to the band edges,
 orders the rest, and prints the range:
 
 ```

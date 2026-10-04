@@ -120,8 +120,8 @@ const ALLOWED_DIALS: [AllowedDial; 5] = [
     },
     AllowedDial {
         file: "telemetry_spill.rs",
-        func: "enable_from_env",
-        dial: "SqlitePool::connect",
+        func: "open_spill_pool",
+        dial: "SqlitePool::connect_with",
         why: "opens the local SQLite spill file the runtime's own environment names",
     },
     AllowedDial {

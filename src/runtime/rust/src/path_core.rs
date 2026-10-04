@@ -434,6 +434,9 @@ pub enum ElementClass {
     Colon,
     /// A reserved Win32 DOS device name (see [`is_dos_device`]).
     DosDevice,
+    /// A name ending in a dot or a space (`a.`, `a `, `a.txt.`): Win32 strips
+    /// the tail, so the element opens a different entry (`a`, `a.txt`).
+    StrippedTail,
     /// Any other element.
     Name,
 }
@@ -457,6 +460,7 @@ impl ElementClass {
             }
             _ if e.contains(&b':') => Self::Colon,
             _ if is_dos_device(e) => Self::DosDevice,
+            [.., b'.' | b' '] => Self::StrippedTail,
             _ => Self::Name,
         }
     }
@@ -525,6 +529,195 @@ fn device_fold(stem: &[u8]) -> impl Iterator<Item = u8> + '_ {
         rest = tail;
         Some(unit)
     })
+}
+
+/// Why a child element can never be joined beneath a root.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementRefusal {
+    /// The `..` parent token.
+    Parent,
+    /// A `:` — a drive designator (`é:`, `1:`) or an alternate data stream
+    /// (`a:b`), either of which re-anchors or aliases the element.
+    Colon,
+    /// Only dots and spaces, other than the exact `.`/`..`: Windows strips
+    /// trailing dots and spaces, so it names `.` or `..` (`" "`, `". "`,
+    /// `".. "`, `"..."`).
+    DotSpaceRun,
+    /// A reserved DOS device name (`CON`, `nul.txt`, `COM1`): Win32 opens the
+    /// device, not a file beneath the root.
+    DosDevice,
+    /// A name ending in a dot or a space (`a.`, `a `): Win32 strips the tail and
+    /// opens another entry than the one named.
+    StrippedTail,
+}
+
+impl ElementRefusal {
+    /// The refusal reason a join reports after the child.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Parent => "contains a `..` element",
+            Self::Colon => "contains a `:` (a drive designator or an alternate data stream)",
+            Self::DotSpaceRun => {
+                "contains an element made only of dots and spaces (Windows strips it to `.` or `..`)"
+            }
+            Self::DosDevice => {
+                "contains a reserved Windows device name (`CON`, `NUL`, `COM1`, ...) that opens a device"
+            }
+            Self::StrippedTail => {
+                "contains an element ending in a dot or a space (Windows strips it to another name)"
+            }
+        }
+    }
+}
+
+/// One element of a child path, parsed once by [`ChildElement::parse`].
+///
+/// THE per-element verdict of every join beneath a root: `Path.under`,
+/// `Path.absolute`, `File.walk` and every static-file mount read each element
+/// through this parse. Under Windows it refuses the forms Win32 resolves to
+/// something other than an entry of that name beneath the root: `..`, a `:` (a
+/// drive or a stream), a dot/space run (`.` or `..` once stripped), a reserved
+/// DOS device, and a name whose trailing dot or space Win32 strips. Under Unix
+/// only `..` is refused; a device name, a `:`, a `\` or a trailing dot is a
+/// legal name there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChildElement {
+    /// An empty element (a doubled separator), dropped by cleaning.
+    Empty,
+    /// The exact `.` token, dropped by cleaning.
+    Current,
+    /// A plain name that stays that name after the regime's canonicalisation.
+    Name,
+}
+
+impl ChildElement {
+    /// Classify one raw element under `regime`, or say why it may never be
+    /// joined.
+    ///
+    /// # Errors
+    ///
+    /// The [`ElementRefusal`] naming the class of `e` the regime refuses.
+    pub fn parse(e: &[u8], regime: Regime) -> Result<Self, ElementRefusal> {
+        match regime {
+            Regime::Unix => match e {
+                b"" => Ok(Self::Empty),
+                b"." => Ok(Self::Current),
+                b".." => Err(ElementRefusal::Parent),
+                _ => Ok(Self::Name),
+            },
+            Regime::Windows => match ElementClass::of(e) {
+                ElementClass::Empty => Ok(Self::Empty),
+                ElementClass::Current => Ok(Self::Current),
+                ElementClass::Name => Ok(Self::Name),
+                ElementClass::Parent => Err(ElementRefusal::Parent),
+                ElementClass::Colon => Err(ElementRefusal::Colon),
+                ElementClass::DisguisedParent | ElementClass::DisguisedCurrent => {
+                    Err(ElementRefusal::DotSpaceRun)
+                }
+                ElementClass::DosDevice => Err(ElementRefusal::DosDevice),
+                ElementClass::StrippedTail => Err(ElementRefusal::StrippedTail),
+            },
+        }
+    }
+}
+
+/// Why a segment list is not a [`RelPath`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RelPathRefusal {
+    /// No segment at all: the list names the root itself.
+    Empty,
+    /// A segment holds a NUL byte.
+    Nul,
+    /// A segment holds a byte the regime reads as a separator (a decoded `%2F`
+    /// or `%5C`, or a raw `\` under Windows).
+    Separator,
+    /// A segment is empty or the exact `.`, so it names no entry.
+    NotAName,
+    /// A segment is an element the regime refuses to join.
+    Element(ElementRefusal),
+}
+
+/// A relative path whose every segment is a plain name under one regime.
+///
+/// Built only by [`RelPath::from_segments`], so holding one proves that no
+/// segment can climb, re-anchor, name a device or alias another entry under
+/// that regime. The text joins the segments with the regime's separator, and
+/// the path keeps the regime it was judged under, so a join can never re-read
+/// it under another.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RelPath {
+    /// The segments joined with the regime's separator; never empty.
+    text: String,
+    /// The byte offset where the last segment starts.
+    last_start: usize,
+    /// The regime every segment was judged under.
+    regime: Regime,
+}
+
+impl RelPath {
+    /// Parse `segs` (one entry name each, already decoded) under `regime`.
+    ///
+    /// Each segment is checked in order: a NUL byte, then a separator byte, then
+    /// the [`ChildElement::parse`] verdict, which must be a name.
+    ///
+    /// # Errors
+    ///
+    /// The [`RelPathRefusal`] of the first refused segment, or `Empty` for no
+    /// segment.
+    pub fn from_segments<'s>(
+        segs: impl IntoIterator<Item = &'s str>,
+        regime: Regime,
+    ) -> Result<Self, RelPathRefusal> {
+        let mut text = String::new();
+        let mut last_start = None;
+        for seg in segs {
+            let bytes = seg.as_bytes();
+            if has_nul(seg) {
+                return Err(RelPathRefusal::Nul);
+            }
+            if bytes.iter().any(|&b| is_sep(b, regime)) {
+                return Err(RelPathRefusal::Separator);
+            }
+            match ChildElement::parse(bytes, regime) {
+                Ok(ChildElement::Name) => {}
+                Ok(ChildElement::Empty | ChildElement::Current) => {
+                    return Err(RelPathRefusal::NotAName);
+                }
+                Err(why) => return Err(RelPathRefusal::Element(why)),
+            }
+            if last_start.is_some() {
+                text.push(char::from(regime.separator()));
+            }
+            last_start = Some(text.len());
+            text.push_str(seg);
+        }
+        last_start
+            .map(|last_start| Self {
+                text,
+                last_start,
+                regime,
+            })
+            .ok_or(RelPathRefusal::Empty)
+    }
+
+    /// The segments joined with the regime's separator.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The regime every segment was judged under.
+    #[must_use]
+    pub const fn regime(&self) -> Regime {
+        self.regime
+    }
+
+    /// The last segment (the entry's own name).
+    #[must_use]
+    pub fn last(&self) -> &str {
+        self.text.get(self.last_start..).unwrap_or("")
+    }
 }
 
 /// Does a CLEANED path climb above its root?
@@ -907,6 +1100,87 @@ mod tests {
         ] {
             assert_eq!(ElementClass::of(e.as_bytes()), want, "{e:?}");
         }
+    }
+
+    #[test]
+    fn element_class_names_the_stripped_tail() {
+        for (e, want) in [
+            ("a.", ElementClass::StrippedTail),
+            ("a ", ElementClass::StrippedTail),
+            ("a.txt.", ElementClass::StrippedTail),
+            ("CON.", ElementClass::DosDevice),
+            ("a.b", ElementClass::Name),
+        ] {
+            assert_eq!(ElementClass::of(e.as_bytes()), want, "{e:?}");
+        }
+    }
+
+    // ── RelPath: one typed relative path per regime ───────────────────────────
+
+    #[test]
+    fn rel_path_windows_regime_refuses_escaping_segments() {
+        let element = RelPathRefusal::Element;
+        let cases: [(&[&str], RelPathRefusal); 20] = [
+            (&["a\\..\\x"], RelPathRefusal::Separator),
+            (&["a\\COM1"], RelPathRefusal::Separator),
+            (&["a/b"], RelPathRefusal::Separator),
+            (&["C:x"], element(ElementRefusal::Colon)),
+            (&["x:stream"], element(ElementRefusal::Colon)),
+            (&["f.txt::$DATA"], element(ElementRefusal::Colon)),
+            (&["CON"], element(ElementRefusal::DosDevice)),
+            (&["nul.txt"], element(ElementRefusal::DosDevice)),
+            (&["LPT9.log"], element(ElementRefusal::DosDevice)),
+            (&["COM1"], element(ElementRefusal::DosDevice)),
+            (&[".. "], element(ElementRefusal::DotSpaceRun)),
+            (&["a."], element(ElementRefusal::StrippedTail)),
+            (&["a "], element(ElementRefusal::StrippedTail)),
+            (&["."], RelPathRefusal::NotAName),
+            (&[""], RelPathRefusal::NotAName),
+            (&[".."], element(ElementRefusal::Parent)),
+            (&["a\0"], RelPathRefusal::Nul),
+            (&[], RelPathRefusal::Empty),
+            // A refused segment after an accepted one still refuses the whole.
+            (&["ok", "CON"], element(ElementRefusal::DosDevice)),
+            (&["ok", ""], RelPathRefusal::NotAName),
+        ];
+        for (segs, want) in cases {
+            assert_eq!(
+                RelPath::from_segments(segs.iter().copied(), Regime::Windows),
+                Err(want),
+                "{segs:?}"
+            );
+        }
+        let ok = RelPath::from_segments(["a", "b.css"], Regime::Windows);
+        assert_eq!(ok.as_ref().map(RelPath::as_str), Ok("a\\b.css"));
+        assert_eq!(ok.as_ref().map(RelPath::last), Ok("b.css"));
+        assert_eq!(ok.as_ref().map(RelPath::regime), Ok(Regime::Windows));
+    }
+
+    #[test]
+    fn rel_path_unix_regime_accepts_legal_names() {
+        for seg in [
+            "a\\..\\x", "C:x", "x:stream", "CON", "nul.txt", "LPT9.log", ".. ", "a.",
+        ] {
+            let rel = RelPath::from_segments([seg], Regime::Unix);
+            assert_eq!(rel.as_ref().map(RelPath::as_str), Ok(seg), "{seg:?}");
+            assert_eq!(rel.as_ref().map(RelPath::last), Ok(seg), "{seg:?}");
+        }
+        for (seg, want) in [
+            ("..", RelPathRefusal::Element(ElementRefusal::Parent)),
+            (".", RelPathRefusal::NotAName),
+            ("", RelPathRefusal::NotAName),
+            ("a/b", RelPathRefusal::Separator),
+            ("a\0", RelPathRefusal::Nul),
+        ] {
+            assert_eq!(
+                RelPath::from_segments([seg], Regime::Unix),
+                Err(want),
+                "{seg:?}"
+            );
+        }
+        let ok = RelPath::from_segments(["a", "b.css"], Regime::Unix);
+        assert_eq!(ok.as_ref().map(RelPath::as_str), Ok("a/b.css"));
+        assert_eq!(ok.as_ref().map(RelPath::last), Ok("b.css"));
     }
 
     #[test]

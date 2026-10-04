@@ -38,7 +38,7 @@ fn fixtures() -> Vec<(&'static str, String)> {
         ),
         (
             "let_expr",
-            "module M exposing (f)\n\n\nf x =\n    let\n        y = x + 1\n    in\n    y\n".to_owned(),
+            "module M exposing (f)\n\n\nf x =\n    let\n        y =\n            x + 1\n    in\n    y\n".to_owned(),
         ),
         (
             "if_expr",
@@ -118,15 +118,14 @@ fn every_fixture_is_a_fixed_point() {
 /// formatting (a strict fixed point on canonical input).
 #[test]
 fn canonical_inputs_are_unchanged() {
-    for (name, src) in fixtures() {
-        // First canonicalise, then assert the canonical form is stable.
-        let canon = format_source(&src).unwrap();
-        assert_eq!(
-            format_source(&canon).unwrap(),
-            canon,
-            "{name}: canonical form is not stable"
-        );
-    }
+    let rewritten: Vec<String> = fixtures()
+        .into_iter()
+        .filter_map(|(name, src)| {
+            let out = format_source(&src).unwrap();
+            (out != src).then(|| format!("{name}: fmt rewrote an already-canonical fixture\n  in:  {src:?}\n  out: {out:?}"))
+        })
+        .collect();
+    assert!(rewritten.is_empty(), "{}", rewritten.join("\n"));
 }
 
 /// The elm-format-parity regression fixtures are already in canonical form, so
@@ -331,4 +330,45 @@ fn code_review_db_bare_run_formats() {
     // Idempotent: re-parsing and re-formatting the output is a fixed point.
     let out2 = format_source(&out).expect("second pass must also format");
     assert_eq!(out, out2, "do-block bare-run formatting is not idempotent");
+}
+
+/// `i64::MIN` spelled as a literal, in expression and pattern position,
+/// formats to source that re-parses, and a second pass changes nothing.
+#[test]
+fn int_min_literal_round_trips() {
+    let src = "module M exposing (smallest, classify)\n\n\n\
+               smallest : Int\nsmallest =\n    -9223372036854775808\n\n\n\
+               classify : Int -> Int\nclassify n =\n    case n of\n        \
+               -9223372036854775808 ->\n            1\n\n        \
+               _ ->\n            0\n";
+    let once = format_source(src).unwrap();
+    assert!(
+        once.contains("-9223372036854775808"),
+        "the literal survives formatting:\n{once}"
+    );
+    let twice = format_source(&once).unwrap();
+    assert_eq!(once, twice, "fmt(fmt(x)) != fmt(x)");
+}
+
+/// An out-of-range Int literal is refused with IPE-P0013, and `run_fmt` leaves
+/// the file untouched.
+#[test]
+fn int_literal_out_of_range_is_refused_unwritten() {
+    let src = "module M exposing (x)\n\nx =\n  9223372036854775808\n";
+    let refused = format_source(src);
+    assert!(
+        matches!(&refused, Err(fmt::FmtError::Parse { diag, .. }) if diag.code().as_str() == "IPE-P0013"),
+        "unnegated 2^63 must be refused with IPE-P0013: {refused:?}"
+    );
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_int_range");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    assert!(res.is_err(), "fmt accepted an out-of-range literal");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        src,
+        "a refused file must not be rewritten"
+    );
 }

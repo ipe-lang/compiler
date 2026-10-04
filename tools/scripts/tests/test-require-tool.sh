@@ -621,7 +621,7 @@ done
 ex_lib="$repo_root/tools/scripts/lib/examples.sh"
 ffi_ex="$fixture_dir/ffi-example"
 mkdir -p "$ffi_ex/src"
-printf 'module Main exposing (main)\n' > "$ffi_ex/src/Main.ipe"
+printf -- '-- classifier stub\n' > "$ffi_ex/src/Main.ipe"
 printf 'Package.rustDependencies []\n' > "$ffi_ex/package.ipe"
 rc=0
 bash -c "source '$ex_lib'; needs_ffi_install '$ffi_ex'" >/dev/null 2>&1 || rc=$?
@@ -635,10 +635,10 @@ check "needs_ffi_install: the rg error is the reported cause" \
 # ── examples.sh: an unreadable source file fails the shape scan closed ─────
 shape_ex="$fixture_dir/shape-example"
 mkdir -p "$shape_ex/src"
-printf 'module Main exposing (main)\nimport Ipe.Tea.Tui\n' > "$shape_ex/src/Main.ipe"
+printf 'import Ipe.Tea.Tui\n' > "$shape_ex/src/Main.ipe"
 got="$(bash -c "source '$ex_lib'; example_shape '$shape_ex'" 2>&1)"
 check "example_shape: a readable Tui source classifies as tui" "$got" tui
-printf 'module Hidden exposing (x)\n' > "$shape_ex/src/Hidden.ipe"
+printf -- '-- classifier stub\n' > "$shape_ex/src/Hidden.ipe"
 chmod 000 "$shape_ex/src/Hidden.ipe"
 rc=0
 out="$(bash -c "source '$ex_lib'; example_shape '$shape_ex'" 2>&1)" || rc=$?
@@ -663,7 +663,7 @@ check "first-party floor: the empty set is the reported cause" \
     "$(cause_of "$out" "enumerated zero examples")" named
 
 mkdir -p "$floor_repo/examples/shapes/cli/demo/src"
-printf 'module Main exposing (main)\n' > "$floor_repo/examples/shapes/cli/demo/src/Main.ipe"
+printf -- '-- classifier stub\n' > "$floor_repo/examples/shapes/cli/demo/src/Main.ipe"
 printf 'Package.name "demo"\n' > "$floor_repo/examples/shapes/cli/demo/package.ipe"
 out="$(run_floor "$fixture_dir/plain-home")"; rc=$?
 check "first-party floor: a one-example set whose check passes exits 0" "$rc" 0

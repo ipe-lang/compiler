@@ -1,0 +1,15 @@
+-- fuzz-slot n1 : Int 0 99
+-- fuzz-slot n2 : Int 0 99
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+main =
+    let
+        pair = ( @n1@, @n2@ )
+        a = fst pair
+        b = snd pair
+    in
+    Io.println (String.fromInt (a + b))

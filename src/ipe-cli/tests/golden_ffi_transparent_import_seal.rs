@@ -154,7 +154,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Default gate: `ipe build` exits 0 and the emitted crate carries the whole
+/// Default gate: `ipe dev build` exits 0 and the emitted crate carries the whole
 /// transparent surface — the app enum for the union, the foreign struct
 /// literal (record→struct), the foreign-enum match (union→enum and back),
 /// and wrappers typed at the REAL foreign types.

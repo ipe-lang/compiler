@@ -1,0 +1,20 @@
+[package]
+name = "ipe_fs_open"
+description = "Opening and reading files relative to held directory handles, never through a planted link"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+cap-primitives = "3.4.6"
+winapi-util = "0.1"
+
+[dev-dependencies]
+ipe-test-temp = { path = "../../../tools/test-temp" }
+
+[lints]
+workspace = true

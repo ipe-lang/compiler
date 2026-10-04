@@ -1,50 +1,550 @@
-module Lib.Links exposing (Link(..), label, linkKey, resolve)
+module Lib.Links exposing (Candidates, Hidden(..), Link(..), LinkSet, Reach(..), Reference(..), UnitName, assemble, candidates, hiddenNote, internal, label, linkCandidateCeiling, linkCeiling, linkKey, noLinks, references, resolveCandidates, sourceUrls)
 
+import Ipe.Char as Char
+import Ipe.Dict as Dict
 import Ipe.List as List
-import Ipe.Maybe as Maybe
 import Ipe.Set as Set
 import Ipe.String as String
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
--- A link found in a unit's source, resolved against the index's unit table.
--- Internal links jump to the /unit/<uid> page of the callee; external links
--- open their URL. Resolution is purely lexical: identifier tokens are matched
--- against the qualified names of every indexed unit. An internal link's
--- label is the matched token rendered once into `SafeText`; an external
--- link keeps its raw URL for the `href` check, and `label` renders it.
+-- A link a unit page shows. An internal link jumps to the /unit/<uid> page of
+-- its target, labelled with the target's qualified name rendered once into
+-- `SafeText`; an external link keeps its raw URL for the `href` check, and
+-- `label` renders it.
 type Link
     = Internal SafeText String
     | External String
 
 
--- Resolve the identifier tokens of a unit's source into links. The source's
--- own qualified name never links to itself; tokens that match no unit and are
--- not URLs produce nothing. The first occurrence of a link wins.
-resolve : String -> List ( String, String ) -> String -> List Link
-resolve selfQualified units source =
-    source
-        |> String.words
-        |> List.map (stripPunct >> linkFor selfQualified units)
-        |> List.filterMap identity
-        |> dedup
+-- An internal link to unit `uid`, labelled with its stored qualified name.
+internal : String -> String -> Link
+internal qualified uid =
+    Internal (SafeText.renderForeign qualified) uid
 
 
-linkFor : String -> List ( String, String ) -> String -> Maybe Link
-linkFor selfQualified units token =
-    if isUrl token then
-        Just (External token)
+-- How many links a page holds back. `Exactly n` counts links the page read
+-- and did not show; `AtLeast n` is that count when a lookup also stopped at
+-- its ceiling, so more links may exist than were read.
+type Hidden
+    = NoneHidden
+    | Exactly Int
+    | AtLeast Int
 
-    else if token == selfQualified then
-        Nothing
+
+-- The links a page shows and how many it holds back; built by `assemble`.
+type alias LinkSet =
+    { links : List Link
+    , hidden : Hidden
+    }
+
+
+-- Whether a bounded lookup read everything there was, or stopped at its
+-- ceiling with more possibly left unread.
+type Reach
+    = Complete
+    | Capped
+
+
+-- The most links a page shows.
+linkCeiling : Int
+linkCeiling =
+    100
+
+
+-- The most distinct qualified names one page looks up for its references.
+linkCandidateCeiling : Int
+linkCandidateCeiling =
+    256
+
+
+noLinks : LinkSet
+noLinks =
+    { links = [], hidden = NoneHidden }
+
+
+-- The one constructor of a `LinkSet`. Links come in one order — callgraph
+-- edges, then resolved references, then URLs — deduplicated by `linkKey`
+-- (the first occurrence wins) and cut at `linkCeiling`. The count held back is
+-- exact only when neither the callgraph read nor the candidate list stopped
+-- at its ceiling.
+assemble : { edges : Reach, candidates : Reach } -> List Link -> List Link -> List Link -> LinkSet
+assemble reach edges resolved urls =
+    let
+        kept =
+            dedup (List.concat [ edges, resolved, urls ])
+
+        cut =
+            List.length kept - linkCeiling
+    in
+    { links = List.take linkCeiling kept, hidden = hiddenOf reach cut }
+
+
+hiddenOf : { edges : Reach, candidates : Reach } -> Int -> Hidden
+hiddenOf reach cut =
+    case ( reach.edges, reach.candidates ) of
+        ( Complete, Complete ) ->
+            if cut > 0 then
+                Exactly cut
+
+            else
+                NoneHidden
+
+        ( Capped, _ ) ->
+            AtLeast (max 0 cut)
+
+        ( Complete, Capped ) ->
+            AtLeast (max 0 cut)
+
+
+-- The note a page shows after its links for what it holds back.
+hiddenNote : Hidden -> Maybe SafeText
+hiddenNote hidden =
+    case hidden of
+        NoneHidden ->
+            Nothing
+
+        Exactly n ->
+            Just (SafeText.literal ("+" ++ String.fromInt n ++ " more"))
+
+        AtLeast n ->
+            Just (SafeText.literal ("+" ++ String.fromInt n ++ " or more"))
+
+
+-- A name the shown source spells: a path of two or more segments, exactly as
+-- written, or one bare name.
+type Reference
+    = Path String
+    | Bare String
+
+
+-- A unit's stored identity, from which its own module is read.
+type alias UnitName =
+    { kind : String
+    , name : String
+    , qualified : String
+    }
+
+
+-- The references of a shown source, in source order, folded over the tokens
+-- the page displays, so a link always names a token the reader sees. A
+-- reference is a maximal chain of word tokens (identifiers and keywords)
+-- joined with no space by a path separator: `.` in Ipê, `::` in Rust. A
+-- chain that follows a separator (`x.0.len`, `(a).b`, `::std`, the `::new`
+-- after a turbofish) or a Rust `.` (`a.len`, `self.go`) is a member access and
+-- names nothing; neither does a lone keyword. A `::<` turbofish ends a chain;
+-- a `..` range does not start a member. Shell and unknown languages have no
+-- references.
+references : Lang -> String -> List Reference
+references lang source =
+    case lang of
+        Rust ->
+            referencesGo lang (Highlight.tokenize lang source) []
+
+        Ipe ->
+            referencesGo lang (Highlight.tokenize lang source) []
+
+        Shell ->
+            []
+
+        Unknown ->
+            []
+
+
+referencesGo : Lang -> List Token -> List Reference -> List Reference
+referencesGo lang tokens acc =
+    case tokens of
+        [] ->
+            List.reverse acc
+
+        tok :: rest ->
+            case wordOf tok of
+                Just word ->
+                    let
+                        chain =
+                            chainGo lang word.text 1 rest
+                    in
+                    referencesGo lang chain.after (consReference word.reserved chain acc)
+
+                Nothing ->
+                    case rangeAt tokens of
+                        Just afterDots ->
+                            referencesGo lang afterDots acc
+
+                        Nothing ->
+                            case separatorAt lang tokens of
+                                Just afterSep ->
+                                    referencesGo lang (skipChain lang afterSep.rest) acc
+
+                                Nothing ->
+                                    case memberAt lang tokens of
+                                        Just afterDot ->
+                                            referencesGo lang (skipChain lang afterDot) acc
+
+                                        Nothing ->
+                                            referencesGo lang rest acc
+
+
+type alias Chain =
+    { text : String
+    , segments : Int
+    , after : List Token
+    }
+
+
+consReference : Bool -> Chain -> List Reference -> List Reference
+consReference reserved chain acc =
+    if chain.segments > 1 then
+        Path chain.text :: acc
+
+    else if reserved then
+        acc
 
     else
-        case List.find (\( q, _ ) -> q == token) units of
-            Just ( _, uid ) ->
-                Just (Internal (SafeText.renderForeign token) uid)
+        Bare chain.text :: acc
+
+
+-- Extends a chain over every `separator word` pair that follows it.
+chainGo : Lang -> String -> Int -> List Token -> Chain
+chainGo lang text segments tokens =
+    case separatorAt lang tokens of
+        Just afterSep ->
+            case afterSep.rest of
+                next :: rest ->
+                    case wordOf next of
+                        Just word ->
+                            chainGo lang (text ++ afterSep.sep ++ word.text) (segments + 1) rest
+
+                        Nothing ->
+                            { text = text, segments = segments, after = tokens }
+
+                [] ->
+                    { text = text, segments = segments, after = tokens }
+
+        Nothing ->
+            { text = text, segments = segments, after = tokens }
+
+
+-- Drops the member-access chain at the head of `tokens`, the tokens after
+-- a separator.
+skipChain : Lang -> List Token -> List Token
+skipChain lang tokens =
+    case tokens of
+        next :: rest ->
+            case wordOf next of
+                Just word ->
+                    (chainGo lang word.text 1 rest).after
+
+                Nothing ->
+                    tokens
+
+        [] ->
+            []
+
+
+-- The path separator at the head of `tokens`, with the tokens after it:
+-- `.` in Ipê, `::` in Rust. The tokenizer emits punctuation one character per
+-- `Plain` token.
+separatorAt : Lang -> List Token -> Maybe { sep : String, rest : List Token }
+separatorAt lang tokens =
+    case tokens of
+        (Plain first) :: rest ->
+            if first == "." && lang == Ipe then
+                Just { sep = ".", rest = rest }
+
+            else if first == ":" && lang == Rust then
+                case rest of
+                    (Plain second) :: afterColons ->
+                        if second == ":" then
+                            Just { sep = "::", rest = afterColons }
+
+                        else
+                            Nothing
+
+                    _ ->
+                        Nothing
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+-- A Rust `.` at the head of `tokens` — a field or method access on the
+-- expression before it, never a path — with the tokens after it.
+memberAt : Lang -> List Token -> Maybe (List Token)
+memberAt lang tokens =
+    case tokens of
+        (Plain first) :: rest ->
+            if first == "." && lang == Rust then
+                Just rest
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+-- A `..` at the head of `tokens` (a Rust range, an Ipê `exposing (..)`), with
+-- the tokens after it: what follows it is no member.
+rangeAt : List Token -> Maybe (List Token)
+rangeAt tokens =
+    case tokens of
+        (Plain first) :: (Plain second) :: rest ->
+            if first == "." && second == "." then
+                Just rest
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+wordOf : Token -> Maybe { text : String, reserved : Bool }
+wordOf tok =
+    case tok of
+        Ident s ->
+            Just { text = s, reserved = False }
+
+        Keyword s ->
+            Just { text = s, reserved = True }
+
+        Str _ ->
+            Nothing
+
+        Comment _ ->
+            Nothing
+
+        Num _ ->
+            Nothing
+
+        Plain _ ->
+            Nothing
+
+
+-- The qualified names a page looks up for its references, under ipe-index's
+-- callee rule (`tools/ipe-index/src/extract/treesitter.rs`, pass 2): a path
+-- is looked up exactly, with a Rust `crate::` prefix rewritten to the unit's
+-- own crate; a bare name is looked up exactly, then in the unit's own module.
+-- `lookups` holds each distinct reference's alternatives in that order;
+-- `names` holds every distinct alternative, in first-occurrence order. The
+-- first reference whose alternatives would carry `names` past
+-- `linkCandidateCeiling` is not looked up, nor is any after it, and `reach`
+-- says so.
+type alias Candidates =
+    { lookups : List (List String)
+    , names : List String
+    , reach : Reach
+    }
+
+
+type alias CandidateAcc =
+    { lookups : List (List String)
+    , names : List String
+    , count : Int
+    }
+
+
+candidates : Lang -> UnitName -> List Reference -> Candidates
+candidates lang unit refs =
+    let
+        base =
+            moduleBase lang unit
+    in
+    candidatesGo (List.map (alternatives lang unit base) (distinctReferences refs)) Set.empty { lookups = [], names = [], count = 0 }
+
+
+candidatesGo : List (List String) -> Set String -> CandidateAcc -> Candidates
+candidatesGo pending seen acc =
+    case pending of
+        [] ->
+            { lookups = List.reverse acc.lookups, names = List.reverse acc.names, reach = Complete }
+
+        alts :: rest ->
+            let
+                fresh =
+                    distinctNew seen alts
+            in
+            if acc.count + List.length fresh > linkCandidateCeiling then
+                { lookups = List.reverse acc.lookups, names = List.reverse acc.names, reach = Capped }
+
+            else
+                candidatesGo rest
+                    (List.foldl Set.insert seen fresh)
+                    { lookups = alts :: acc.lookups
+                    , names = List.reverse fresh ++ acc.names
+                    , count = acc.count + List.length fresh
+                    }
+
+
+-- The names of `alts` not in `seen`, each once, in order.
+distinctNew : Set String -> List String -> List String
+distinctNew seen alts =
+    case alts of
+        [] ->
+            []
+
+        a :: rest ->
+            if Set.member a seen then
+                distinctNew seen rest
+
+            else
+                a :: distinctNew (Set.insert a seen) rest
+
+
+distinctReferences : List Reference -> List Reference
+distinctReferences refs =
+    distinctReferencesGo refs Set.empty []
+
+
+distinctReferencesGo : List Reference -> Set String -> List Reference -> List Reference
+distinctReferencesGo refs seen acc =
+    case refs of
+        [] ->
+            List.reverse acc
+
+        r :: rest ->
+            if Set.member (referenceKey r) seen then
+                distinctReferencesGo rest seen acc
+
+            else
+                distinctReferencesGo rest (Set.insert (referenceKey r) seen) (r :: acc)
+
+
+referenceKey : Reference -> String
+referenceKey ref =
+    case ref of
+        Path p ->
+            "p:" ++ p
+
+        Bare t ->
+            "b:" ++ t
+
+
+alternatives : Lang -> UnitName -> Maybe String -> Reference -> List String
+alternatives lang unit base ref =
+    case ref of
+        Path p ->
+            [ crateRewrite lang unit p ]
+
+        Bare t ->
+            case base of
+                Just b ->
+                    [ t, b ++ separator lang ++ t ]
+
+                Nothing ->
+                    [ t ]
+
+
+-- A Rust `crate::` path names the unit's own crate: the first segment of its
+-- qualified name, the crate root ipe-index roots every Rust module path at.
+crateRewrite : Lang -> UnitName -> String -> String
+crateRewrite lang unit path =
+    if lang == Rust && String.startsWith "crate::" path then
+        case List.head (String.split "::" unit.qualified) of
+            Just root ->
+                root ++ "::" ++ String.dropLeft 7 path
 
             Nothing ->
-                Nothing
+                path
+
+    else
+        path
+
+
+-- The separator ipe-index joins a module and a unit name with.
+separator : Lang -> String
+separator lang =
+    case lang of
+        Ipe ->
+            "."
+
+        Rust ->
+            "::"
+
+        Shell ->
+            "::"
+
+        Unknown ->
+            "::"
+
+
+-- The unit's own module: its qualified name without a trailing `#<digits>`
+-- duplicate ordinal, then without `separator ++ name` at its end. A file
+-- unit, or a qualified name without that suffix, has none.
+moduleBase : Lang -> UnitName -> Maybe String
+moduleBase lang unit =
+    let
+        qualified =
+            dropOrdinal unit.qualified
+
+        suffix =
+            separator lang ++ unit.name
+    in
+    if unit.kind == "file" || unit.name == "" then
+        Nothing
+
+    else if String.endsWith suffix qualified && String.length qualified > String.length suffix then
+        Just (String.dropRight (String.length suffix) qualified)
+
+    else
+        Nothing
+
+
+-- `q#<digits>` is `q`; any other name is itself.
+dropOrdinal : String -> String
+dropOrdinal qualified =
+    case List.reverse (String.split "#" qualified) of
+        digits :: first :: restRev ->
+            if digits /= "" && String.all Char.isDigit digits then
+                String.join "#" (List.reverse (first :: restRev))
+
+            else
+                qualified
+
+        _ ->
+            qualified
+
+
+-- The links of `lookups` given the `(qualified, uid)` rows the candidate
+-- query returned: each lookup links its first alternative that resolved.
+resolveCandidates : List (List String) -> List ( String, String ) -> List Link
+resolveCandidates lookups rows =
+    let
+        found =
+            Dict.fromList rows
+    in
+    List.filterMap (firstResolved found) lookups
+
+
+firstResolved : Dict String String -> List String -> Maybe Link
+firstResolved found alts =
+    case alts of
+        [] ->
+            Nothing
+
+        a :: rest ->
+            case Dict.get a found of
+                Just uid ->
+                    Just (internal a uid)
+
+                Nothing ->
+                    firstResolved found rest
+
+
+-- The http(s) URLs among the source's words, with the punctuation prose
+-- attaches (`(https://a.io/b),`) trimmed from both ends.
+sourceUrls : String -> List Link
+sourceUrls source =
+    source
+        |> String.words
+        |> List.map trimPunct
+        |> List.filter isUrl
+        |> List.map External
 
 
 isUrl : String -> Bool
@@ -52,10 +552,8 @@ isUrl token =
     String.startsWith "http://" token || String.startsWith "https://" token
 
 
--- Trailing/leading punctuation that lexers attach to identifiers: "foo();"
--- and "(foo)" must both resolve to foo.
-stripPunct : String -> String
-stripPunct token =
+trimPunct : String -> String
+trimPunct token =
     String.fromList (List.reverse (dropPunct (List.reverse (dropPunct (String.toList token)))))
 
 

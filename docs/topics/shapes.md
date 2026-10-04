@@ -120,11 +120,11 @@ mobile is `web solo <os>`).
 
 | runtime | host | command | rendered view |
 |---------|------|---------|---------------|
-| served | browser | `ipe run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
-| solo | browser | `ipe run` (wasm client) | ![web · solo · browser](../assets/shapes/web-solo-browser.png) |
-| served | desktop | `ipe release web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
-| solo | ios | `ipe release web solo ios` | same solo view, in a `WKWebView` ![web · solo · iOS](../assets/shapes/web-solo-browser.png) |
-| solo | android | `ipe release web solo android` | same solo view, in an Android `WebView` ![web · solo · Android](../assets/shapes/web-solo-browser.png) |
+| served | browser | `ipe dev run` | ![web · served · browser](../assets/shapes/web-served-browser.png) |
+| solo | browser | `ipe dev run` (wasm client) | ![web · solo · browser](../assets/shapes/web-solo-browser.png) |
+| served | desktop | `ipe release build web desktop` | same served view, in a WebKitGTK window ![web · served · desktop](../assets/shapes/web-served-browser.png) |
+| solo | ios | `ipe release build web solo ios` | same solo view, in a `WKWebView` ![web · solo · iOS](../assets/shapes/web-solo-browser.png) |
+| solo | android | `ipe release build web solo android` | same solo view, in an Android `WebView` ![web · solo · Android](../assets/shapes/web-solo-browser.png) |
 
 The last three rows reuse the browser capture on purpose: **every host renders
 the identical DOM** — desktop/iOS/Android only wrap it in a native shell — so the

@@ -896,7 +896,10 @@ fn github_curl_argv(method: &CurlMethod<'_>, url: &str, out_path: &Path) -> Vec<
     }
     args.extend(["-o".into(), out_path.as_os_str().to_owned()]);
     args.extend(["-w".into(), "%{http_code}".into()]);
-    args.extend(remote_ingest::curl_limit_args(budget.disk_bytes(), budget).map(OsString::from));
+    args.extend(
+        remote_ingest::curl_limit_args(remote_ingest::JSON_RESPONSE_MAX_BYTES, budget)
+            .map(OsString::from),
+    );
     args.push(url.into());
     args
 }
@@ -976,7 +979,11 @@ fn run_curl_on(
             RunError::Exceeded(refusal) => CurlRunError::Exceeded(refusal),
             other => CurlRunError::CouldNotRun(other),
         })?;
-    if let Some(refusal) = remote_ingest::curl_refusal(output.status, budget.disk_bytes(), budget) {
+    if let Some(refusal) = remote_ingest::curl_refusal(
+        output.status,
+        remote_ingest::JSON_RESPONSE_MAX_BYTES,
+        budget,
+    ) {
         return Err(CurlRunError::Exceeded(refusal));
     }
     if !output.status.success() {
@@ -984,7 +991,7 @@ fn run_curl_on(
     }
     let status_text = String::from_utf8_lossy(&output.stdout);
     let status = HttpStatus::parse(&status_text).map_err(CurlRunError::Status)?;
-    let body = read_body(&mut scratch, budget.disk_bytes())?;
+    let body = read_body(&mut scratch, remote_ingest::JSON_RESPONSE_MAX_BYTES)?;
     Ok(CurlOutcome::Reply { status, body })
 }
 
@@ -2234,7 +2241,7 @@ mod tests {
         let post_args = as_text(github_curl_argv(&CurlMethod::Post(body_str), url, tmp_path));
         // The response is held to the GitHub API budget by curl's own limits.
         let limits = crate::remote_ingest::curl_limit_args(
-            crate::remote_ingest::GITHUB_API.disk_bytes(),
+            crate::remote_ingest::JSON_RESPONSE_MAX_BYTES,
             &crate::remote_ingest::GITHUB_API,
         );
 

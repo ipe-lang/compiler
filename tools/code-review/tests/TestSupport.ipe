@@ -1,0 +1,811 @@
+module TestSupport exposing
+    ( tableExists
+    , countReviewRows
+    , expectErr
+    , refuse
+    , seedIndex
+    , writeFileText
+    , fixtureLibRs
+    , fixtureMainIpe
+    , viewA
+    , viewB
+    , viewTag
+    , shownTextOf
+    , shownOf
+    , langName
+    , unitViewTag
+    , PageEntry
+    , execIndex
+    , execIndexUnchecked
+    , Scratch
+    , freshScratch
+    , freshDir
+    , check
+    , checkReporting
+    , onFreshReview
+    , indexSchemaStatements
+    , execIndexSchema
+    , seedIndexDb
+    , insertUnitRows
+    , setIndexEnv
+    , loadFirstPage
+    , indexConn
+    , loadUnitNow
+    , decideNow
+    , checkUnits
+    , listSecond
+    , isUnitA
+    , isUnitB
+    , cleanupIndex
+    , removeFileIfAny
+    , codeText
+    , noHazard
+    , rendered
+    , renderedForeign
+    , describeText
+    , refusedFor
+    , migratedReviewAt
+    , tableNames
+    , tableRowCounts
+    , attestedFor
+    , openReadOnlyAt
+    , vectorsPath
+    , ipeIndexTestFile
+    , repoFile
+    , probeMessage
+    , probeNames
+    , maybeContains
+    )
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+
+
+tableExists : Db -> String -> Task.Task Error Bool
+tableExists db name =
+    Db.findWhere db
+        "sqlite_master"
+        (Sql.and
+            (Sql.eq (Sql.column "type") (Sql.string "table"))
+            (Sql.eq (Sql.column "name") (Sql.string name))
+        )
+        |> Task.map (\rows -> List.length rows == 1)
+
+
+countReviewRows : Db -> String -> String -> Task.Task Error Int
+countReviewRows db uid bodyHash =
+    Db.findWhere db
+        "review"
+        (Sql.and
+            (Sql.eq (Sql.column "uid") (Sql.string uid))
+            (Sql.eq (Sql.column "body_hash") (Sql.string bodyHash))
+        )
+        |> Task.map List.length
+
+
+expectErr : Task.Task Error Int -> Task.Task Error Bool
+expectErr t =
+    t
+        |> Task.map (\_ -> False)
+        |> Task.onError (\_ -> Task.succeed True)
+
+
+-- A refusal decision exists only with a parsed reason; a reason the test
+-- expects to be valid that `parseReason` refuses fails the run.
+refuse : String -> Task.Task Error Decision
+refuse text =
+    Task.fromResult (Result.map Refused (LibDb.parseReason text))
+
+
+seedIndex : String -> String -> Task.Task Error ()
+seedIndex indexDb repo =
+    Task.fromResult (Path.fromString (repo ++ "/src"))
+        |> Task.andThen File.mkdirAll
+        |> Task.andThen
+            (\_ ->
+                Task.map2
+                    (\_ _ -> ())
+                    (writeFileText (repo ++ "/src/Lib.rs") fixtureLibRs)
+                    (writeFileText (repo ++ "/src/Main.ipe") fixtureMainIpe)
+            )
+        |> Task.andThen (\_ -> seedIndexDb indexDb)
+        |> Task.andThen (\_ -> setIndexEnv indexDb repo)
+
+
+writeFileText : String -> String -> Task.Task Error ()
+writeFileText path text =
+    Task.fromResult (Path.fromString path)
+        |> Task.andThen (\p -> File.writeFile p text)
+
+
+fixtureLibRs : String
+fixtureLibRs =
+    "// fixture library\n\npub fn answer() -> i32 {\n    // the answer to everything\n    42\n}\n\npub fn other() -> i32 {\n    7\n}\n"
+
+
+fixtureMainIpe : String
+fixtureMainIpe =
+    "module Main exposing (main)\n\nmain = ()\n"
+
+
+-- Lines 3..6 of `fixtureLibRs`, the source unit `u-a` attests.
+viewA : String
+viewA =
+    "pub fn answer() -> i32 {\n    // the answer to everything\n    42\n}"
+
+
+-- Lines 1..2 of `fixtureMainIpe`, the source unit `u-b` attests.
+viewB : String
+viewB =
+    "module Main exposing (main)\n"
+
+
+-- A source view's state as one comparable word; `Unreadable` carries the
+-- rendered error so a test can check what it names.
+viewTag : Index.SourceView -> String
+viewTag view =
+    case view of
+        Shown _ ->
+            "shown"
+
+        Stale Drifted ->
+            "drifted"
+
+        Stale (RangeOutOfFile r) ->
+            "range " ++ String.fromInt r.lineCount
+
+        Stale UnverifiableHash ->
+            "unverifiable"
+
+        Unreadable e ->
+            "unreadable: " ++ Error.toString e
+
+
+shownTextOf : Index.SourceView -> Maybe String
+shownTextOf view =
+    case view of
+        Shown shown ->
+            Just (Index.shownText shown)
+
+        Stale _ ->
+            Nothing
+
+        Unreadable _ ->
+            Nothing
+
+
+shownOf : Index.SourceView -> Maybe Index.ShownSource
+shownOf view =
+    case view of
+        Shown shown ->
+            Just shown
+
+        Stale _ ->
+            Nothing
+
+        Unreadable _ ->
+            Nothing
+
+
+-- The ipe-index vectors' name for a highlight language.
+langName : Highlight.Lang -> String
+langName lang =
+    case lang of
+        Rust ->
+            "Rust"
+
+        Shell ->
+            "Shell"
+
+        Ipe ->
+            "Ipe"
+
+        Unknown ->
+            "Unknown"
+
+
+unitViewTag : String -> List PageEntry -> String
+unitViewTag uid units =
+    case List.find (\u -> u.uid == uid) units of
+        Just u ->
+            viewTag u.view
+
+        Nothing ->
+            "absent"
+
+
+-- Runs one statement against a seeded scratch index database.
+execIndex : String -> String -> List SqlValue -> Task.Task Error ()
+execIndex indexDb sql params =
+    do
+        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        Db.exec conn sql params
+        Task.succeed ()
+
+
+-- Like `execIndex`, with the schema's CHECK constraints off on the one
+-- connection the transaction holds: a tampered or foreign index can hold a `kind` or `facing` the
+-- real schema refuses, and the decode point must still render it safely.
+execIndexUnchecked : String -> String -> List SqlValue -> Task.Task Error ()
+execIndexUnchecked indexDb sql params =
+    do
+        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        Db.withTransaction conn
+            (\tx ->
+                do
+                    Db.exec tx "PRAGMA ignore_check_constraints = ON" []
+                    Db.exec tx sql params
+                    Task.succeed ()
+            )
+
+
+-- ── source attestation ──────────────────────────────────────────────────
+--
+-- A unit's source is shown only when its lines re-hash to the stored
+-- attestation; every other state withholds it, per unit, without failing the
+-- page.
+type alias Scratch =
+    { repo : String, indexDb : String, reviewDb : String }
+
+
+-- A directory `File.tempDir` creates for this one call, named after `name`.
+-- No two calls share a path, so no store a check opens can be one another
+-- check (or an earlier run) already wrote, and no connection the runtime
+-- keeps open for a path can serve a later check a file it has since removed.
+freshDir : String -> Task.Task Error String
+freshDir name =
+    File.tempDir (name ++ "-")
+
+
+-- The scratch paths of one check, under its own `freshDir`.
+freshScratch : String -> Task.Task Error Scratch
+freshScratch name =
+    freshDir name
+        |> Task.map (\base -> { repo = base ++ "/repo", indexDb = base ++ "/index.db", reviewDb = base ++ "/review.db" })
+
+
+-- A migrated review store of its own, under a `freshDir` named `name`, handed
+-- to `f`: no check reads a row another check wrote.
+onFreshReview : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
+onFreshReview name f =
+    freshDir name
+        |> Task.andThen (\base -> onReviewAt (base ++ "/review.db") f)
+
+
+onReviewAt : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
+onReviewAt reviewDb f =
+    do
+        db <- migratedReviewAt reviewDb
+        ok <- f db
+        removeFileIfAny reviewDb
+        removeFileIfAny (reviewDb ++ "-wal")
+        removeFileIfAny (reviewDb ++ "-shm")
+        Task.succeed ok
+
+
+-- One named check. A check whose task fails is reported by name with its
+-- error and counted as failed; the run goes on to every later check and still
+-- exits non-zero, so one error neither hides which check raised it nor
+-- drops the checks after it.
+check : String -> Task.Task Error Bool -> Task.Task Error ( String, Bool )
+check name task =
+    checkReporting Io.println name task
+
+
+-- `check` with the line naming a failed check's error sent to `report`.
+checkReporting : (String -> Task.Task Error ()) -> String -> Task.Task Error Bool -> Task.Task Error ( String, Bool )
+checkReporting report name task =
+    task
+        |> Task.map (\ok -> ( name, ok ))
+        |> Task.onError (\e -> report (checkErrorLine name e) |> Task.map (\_ -> ( name, False )))
+
+
+-- The error is foreign text (a database or OS message), so it reaches the
+-- terminal rendered, never raw.
+checkErrorLine : String -> Error -> String
+checkErrorLine name e =
+    "ERROR " ++ name ++ ": " ++ SafeText.toString (SafeText.renderForeign (Error.toString e))
+
+
+-- The real index schema, read verbatim from ipe-index's own fixture
+-- (`tools/ipe-index/tests/schema.sql`): a Rust test in that crate
+-- (`schema_fixture_matches_the_real_schema`) asserts the fixture byte-equal
+-- to the `SCHEMA` const `Store::open` runs. Seeding from a hand copy would
+-- let these tests pass against a schema the real index never creates.
+indexSchemaStatements : String -> Task.Task Error (List String)
+indexSchemaStatements cwd =
+    Task.fromResult (Path.fromString (ipeIndexTestFile cwd "schema.sql"))
+        |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 16))
+        |> Task.map
+            (\text ->
+                String.split ";" text
+                    |> List.map String.trim
+                    |> List.filter (\s -> s /= "")
+            )
+
+
+-- Runs every statement of the real schema, in file order, on one connection.
+execIndexSchema : Db -> List String -> Task.Task Error ()
+execIndexSchema conn statements =
+    List.foldl
+        (\stmt acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Db.exec conn stmt [])) acc)
+        (Task.succeed ())
+        statements
+
+
+seedIndexDb : String -> Task.Task Error ()
+seedIndexDb indexDb =
+    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+        |> Task.andThen
+            (\conn ->
+                System.cwd ()
+                    |> Task.andThen indexSchemaStatements
+                    |> Task.andThen (execIndexSchema conn)
+                    |> Task.andThen (\_ -> insertUnitRows conn)
+            )
+        |> Task.map (\_ -> ())
+
+
+insertUnitRows : Db -> Task.Task Error Int
+insertUnitRows conn =
+    Db.exec conn
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ SqlString "u-a"
+        , SqlString "ipe:src/Lib.rs"
+        , SqlString "fn"
+        , SqlString "answer"
+        , SqlString "Lib.answer"
+        , SqlInt 3
+        , SqlInt 6
+        , SqlString "internal"
+        , SqlString "purpose-A"
+        , SqlString (Index.attest viewA)
+        , SqlString "shaA"
+        ]
+        |> Task.andThen
+            (\_ ->
+                Db.exec conn
+                    "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                    [ SqlString "u-b"
+                    , SqlString "ipe:src/Main.ipe"
+                    , SqlString "module"
+                    , SqlString "Main"
+                    , SqlString "Main"
+                    , SqlInt 1
+                    , SqlInt 2
+                    , SqlString "user"
+                    , SqlNull (SqlString "")
+                    , SqlString (Index.attest viewB)
+                    , SqlString "shaB"
+                    ]
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.exec conn
+                    "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                    [ SqlString "u-del"
+                    , SqlString "ipe:src/Gone.ipe"
+                    , SqlString "module"
+                    , SqlString "Gone"
+                    , SqlString "Gone"
+                    , SqlInt 1
+                    , SqlInt 1
+                    , SqlString "user"
+                    , SqlNull (SqlString "")
+                    , SqlString "hashC"
+                    , SqlString "shaC"
+                    ]
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.exec conn
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ SqlString "u-a", SqlString "new", SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString "shaA", SqlInt 1 ]
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.exec conn
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ SqlString "u-b", SqlString "modified", SqlString "oldB", SqlString (Index.attest viewB), SqlString "shaB", SqlInt 2 ]
+            )
+        |> Task.andThen
+            (\_ ->
+                Db.exec conn
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ SqlString "u-del", SqlString "deleted", SqlString "hashC", SqlNull (SqlString ""), SqlString "shaC", SqlInt 3 ]
+            )
+
+
+setIndexEnv : String -> String -> Task.Task Error ()
+setIndexEnv indexDb repo =
+    System.setenv "IPE_INDEX_DB" indexDb
+        |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
+
+
+-- One first-page unit with its queue row's change and the view
+-- `Index.loadView` reads for it.
+type alias PageEntry =
+    { uid : String
+    , unit : Index.Unit
+    , queued : Index.QueuedChange
+    , view : Index.SourceView
+    }
+
+
+-- The first queue page's units, each with its view read afterwards the one
+-- way the app reads a selected unit's source, and the whole queue's count,
+-- all on one index connection.
+loadFirstPage : Task.Task Error { units : List PageEntry, total : Int }
+loadFirstPage =
+    do
+        settings <- Settings.indexSettings
+        conn <- Index.readConnection settings
+        rows <- Index.loadPendingPage conn Index.Start
+        entries <- Task.sequence (List.map (pageEntry conn settings.roots) rows)
+        total <- Index.countPending conn
+        Task.succeed { units = entries, total = total }
+
+
+-- The queued change comes from the page's queue row, the one place it
+-- exists; the unit and its view from `loadView`, as the selected card reads them.
+pageEntry : Db -> RootMap -> Index.PendingRow -> Task.Task Error PageEntry
+pageEntry conn roots row =
+    let
+        uid =
+            row.unit.uid
+    in
+    Index.loadView conn roots uid
+        |> Task.andThen
+            (\found ->
+                case found of
+                    Just loaded ->
+                        Task.succeed { uid = uid, unit = loaded.unit, queued = row.queued, view = loaded.view }
+
+                    Nothing ->
+                        Task.fail (Error.conflict ("queued unit " ++ uid ++ " has no view"))
+            )
+
+
+-- The index read connection from the current `IPE_INDEX_*` environment.
+indexConn : Task.Task Error Db
+indexConn =
+    Settings.indexSettings |> Task.andThen Index.readConnection
+
+
+-- The view of unit `uid` loaded from the index the current environment names.
+loadUnitNow : String -> Task.Task Error (Maybe Index.UnitView)
+loadUnitNow uid =
+    do
+        settings <- Settings.indexSettings
+        conn <- Index.readConnection settings
+        Index.loadView conn settings.roots uid
+
+
+-- A decision on unit `uid` made the one way the app makes it: through
+-- `Queue.decide` on the unit's loaded, shown source. A unit not shown fails
+-- the run.
+decideNow : Db -> String -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decideNow db uid decision =
+    loadUnitNow uid
+        |> Task.andThen
+            (\found ->
+                case Maybe.andThen (\loaded -> shownOf loaded.view) found of
+                    Just shown ->
+                        Queue.decide db shown decision
+
+                    Nothing ->
+                        Task.fail (Error.conflict ("unit " ++ uid ++ " is not shown"))
+            )
+
+
+checkUnits : Int -> List PageEntry -> Bool
+checkUnits total units =
+    if total /= 2 || List.length units /= 2 then
+        False
+
+    else
+        case List.head units of
+            Nothing ->
+                False
+
+            Just a ->
+                case listSecond units of
+                    Nothing ->
+                        False
+
+                    Just b ->
+                        isUnitA a && isUnitB b
+
+
+listSecond : List a -> Maybe a
+listSecond items =
+    case items of
+        _ :: rest ->
+            List.head rest
+
+        [] ->
+            Nothing
+
+
+isUnitA : PageEntry -> Bool
+isUnitA entry =
+    let
+        u =
+            entry.unit
+    in
+    u.uid
+        == "u-a"
+        && entry.queued.change
+        == "new"
+        && entry.queued.oldHash
+        == Nothing
+        && entry.queued.newHash
+        == Nothing
+        && SafeText.toString u.path
+        == "ipe:src/Lib.rs"
+        && SafeText.toString u.name
+        == "answer"
+        && SafeText.toString u.qualified
+        == "Lib.answer"
+        && SafeText.toString u.kind
+        == "fn"
+        && u.lineStart
+        == 3
+        && u.lineEnd
+        == 6
+        && SafeText.toString u.facing
+        == "internal"
+        && Maybe.map SafeText.toString u.purpose
+        == Just "purpose-A"
+        && Index.storedHash u.attested
+        == Index.attest viewA
+        && u.updatedSha
+        == "shaA"
+        && shownTextOf entry.view
+        == Just viewA
+
+
+isUnitB : PageEntry -> Bool
+isUnitB entry =
+    let
+        u =
+            entry.unit
+    in
+    u.uid
+        == "u-b"
+        && entry.queued.change
+        == "modified"
+        && entry.queued.newHash
+        == Just (Index.attest viewB)
+        && SafeText.toString u.path
+        == "ipe:src/Main.ipe"
+        && SafeText.toString u.kind
+        == "module"
+        && SafeText.toString u.facing
+        == "user"
+        && Maybe.map SafeText.toString u.purpose
+        == Nothing
+        && shownTextOf entry.view
+        == Just viewB
+
+
+cleanupIndex : String -> String -> Task.Task Error ()
+cleanupIndex indexDb repo =
+    Task.sequence
+        [ removeFileIfAny indexDb
+        , removeFileIfAny (indexDb ++ "-wal")
+        , removeFileIfAny (indexDb ++ "-shm")
+        , removeFileIfAny (repo ++ "/src/Lib.rs")
+        , removeFileIfAny (repo ++ "/src/Main.ipe")
+        ]
+        |> Task.map (\_ -> ())
+
+
+removeFileIfAny : String -> Task.Task Error ()
+removeFileIfAny path =
+    Task.fromResult (Path.fromString path)
+        |> Task.andThen File.remove
+        |> Task.onError (\_ -> Task.succeed ())
+
+
+-- One character as a string, by code point: the language has no `\u{}`
+-- string escape, so hazard characters are built from their decimal code.
+codeText : Int -> String
+codeText code =
+    String.fromChar (Char.fromCode code)
+
+
+noHazard : String -> Bool
+noHazard text =
+    not (String.any SafeText.isHazard text)
+
+
+rendered : String -> String
+rendered raw =
+    SafeText.toString (SafeText.render raw)
+
+
+renderedForeign : String -> String
+renderedForeign raw =
+    SafeText.toString (SafeText.renderForeign raw)
+
+
+describeText : PathError -> String
+describeText err =
+    SafeText.toString (RepoPath.describe err)
+
+
+-- A parse that failed, and failed for `reason` rather than an unrelated one.
+refusedFor : String -> Maybe String -> Bool
+refusedFor reason refusal =
+    case refusal of
+        Just message ->
+            String.contains reason message
+
+        Nothing ->
+            False
+
+
+-- The review database at a test file path, migrated through `LibDb.probe`,
+-- the app's one migrate, then opened.
+migratedReviewAt : String -> Task.Task Error Db
+migratedReviewAt path =
+    do
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
+        LibDb.probe loc
+        LibDb.openAt loc
+
+
+-- A database's table names, SQLite's own excluded, in name order.
+tableNames : Db -> Task.Task Error (List String)
+tableNames db =
+    Db.queryDecode db
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        []
+        (Db.Decode.succeed identity |> Db.Decode.required "name" (Db.Decode.string "name"))
+
+
+-- Every table of a database with its row count, in name order.
+tableRowCounts : Db -> Task.Task Error (List ( String, Int ))
+tableRowCounts db =
+    tableNames db
+        |> Task.andThen (\names -> Task.sequence (List.map (tableRowCount db) names))
+
+
+tableRowCount : Db -> String -> Task.Task Error ( String, Int )
+tableRowCount db name =
+    Db.queryDecode db
+        ("SELECT COUNT(*) AS total FROM \"" ++ name ++ "\"")
+        []
+        (Db.Decode.succeed identity |> Db.Decode.required "total" (Db.Decode.int "total"))
+        |> Task.map (\rows -> ( name, List.sum rows ))
+
+
+-- The `Attested` proof for fixture unit `uid`, built the one way the app
+-- builds it: the unit is loaded from a seeded scratch index, its shown
+-- source re-verified by `Index.reverify`, and the scratch index removed. A
+-- unit that is not shown fails the run.
+attestedFor : String -> String -> Task.Task Error Index.Attested
+attestedFor name uid =
+    freshScratch name |> Task.andThen (\at -> attestedIn at uid)
+
+
+attestedIn : Scratch -> String -> Task.Task Error Index.Attested
+attestedIn at uid =
+    do
+        seedIndex at.indexDb at.repo
+        found <- loadUnitNow uid
+        attested <- reverifyShown uid found
+        cleanupIndex at.indexDb at.repo
+        Task.succeed attested
+
+
+reverifyShown : String -> Maybe Index.UnitView -> Task.Task Error Index.Attested
+reverifyShown uid found =
+    case found of
+        Just loaded ->
+            case loaded.view of
+                Shown shown ->
+                    Index.reverify shown
+
+                Stale _ ->
+                    Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is stale"))
+
+                Unreadable _ ->
+                    Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is unreadable"))
+
+        Nothing ->
+            Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is not in the index"))
+
+
+-- A test file path opened read-only through the app's read URL builder, so
+-- every write on it fails without a key conflict.
+openReadOnlyAt : String -> Task.Task Error Db
+openReadOnlyAt path =
+    Settings.parseDbLocation "IPE_INDEX_DB" path
+        |> Task.andThen (\loc -> Db.open "sqlite" (Settings.indexReadUrl loc))
+
+
+-- The vectors file beside this package: `tools/ipe-index/tests`, reached from
+-- the `tools/code-review` working directory without a `..` segment.
+vectorsPath : String -> String
+vectorsPath cwd =
+    ipeIndexTestFile cwd "view_hash_vectors.json"
+
+
+-- A file in `tools/ipe-index/tests`, reached from the `tools/code-review`
+-- working directory without a `..` segment.
+ipeIndexTestFile : String -> String -> String
+ipeIndexTestFile cwd name =
+    let
+        segments =
+            String.split "/" cwd
+    in
+    String.join "/" (List.take (List.length segments - 1) segments) ++ "/ipe-index/tests/" ++ name
+
+
+-- A file at `rel` under the repository root, reached from the
+-- `tools/code-review` working directory without a `..` segment.
+repoFile : String -> String -> String
+repoFile cwd rel =
+    let
+        segments =
+            String.split "/" cwd
+    in
+    String.join "/" (List.take (List.length segments - 2) segments) ++ "/" ++ rel
+
+
+probeMessage : Task.Task Error () -> Task.Task Error (Maybe String)
+probeMessage task =
+    task
+        |> Task.map (\_ -> Nothing)
+        |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
+
+
+-- The probe refusal starts with the variable, names the file, and is clean.
+probeNames : String -> String -> Maybe String -> Bool
+probeNames var file message =
+    case message of
+        Just m ->
+            String.startsWith (var ++ ": cannot open ") m && String.contains file m && noHazard m
+
+        Nothing ->
+            False
+
+
+maybeContains : String -> Maybe String -> Bool
+maybeContains needle message =
+    case message of
+        Just m ->
+            String.contains needle m
+
+        Nothing ->
+            False

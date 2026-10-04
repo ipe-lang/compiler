@@ -331,13 +331,16 @@ pub fn resolve_and_remove(project_root: &Path, name: &str) -> Result<(), CliErro
 /// # Errors
 /// [`CliError::CacheHomeUnknown`] when neither names an absolute path.
 pub fn default_cache_base() -> Result<PathBuf, CliError> {
-    cache_base_from(ipe_env::var_os("XDG_CACHE_HOME"), crate::env_dir::home())
+    cache_base_from(
+        ipe_env::var_os("XDG_CACHE_HOME"),
+        crate::env_dir::home().ok().as_ref(),
+    )
 }
 
 /// Resolve the cache base from the raw `XDG_CACHE_HOME` value and the home.
 fn cache_base_from(
     xdg_cache_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
+    home: Option<&crate::env_dir::HomeDir>,
 ) -> Result<PathBuf, CliError> {
     crate::env_dir::ambient_home_from(xdg_cache_home, home, ".cache")
         .ok_or(CliError::CacheHomeUnknown)
@@ -2345,18 +2348,14 @@ mod tests {
             url: src.display().to_string(),
             rev: None,
         };
-        let budget = FetchBudget::for_test(
-            PACKAGE_SOURCE
-                .transfer()
-                .with_wall(std::time::Duration::from_millis(1)),
-            *PACKAGE_SOURCE.refs(),
-            *PACKAGE_SOURCE.tree(),
-        )
-        .expect("paired budget");
         let proj = temp_dir("slow-drip-over");
         scaffold_project(&proj);
         let manifest_before = std::fs::read(proj.join("package.ipe")).expect("manifest");
-        let result = resolve_escape_within(&proj, "lib", &dep, &budget);
+        crate::remote_ingest::spend_transfer_clock_for_test(
+            PACKAGE_SOURCE.transfer().wall().get() + std::time::Duration::from_secs(1),
+        );
+        let result = resolve_escape_within(&proj, "lib", &dep, &PACKAGE_SOURCE);
+        crate::remote_ingest::spend_transfer_clock_for_test(std::time::Duration::ZERO);
         assert!(
             matches!(
                 result,
@@ -2381,7 +2380,8 @@ mod tests {
         FetchBudget::for_test(
             PACKAGE_SOURCE
                 .transfer()
-                .with_disk_bytes(byte_budget(disk_bytes)),
+                .with_staged_bytes(byte_budget(disk_bytes))
+                .expect("a package fetch stages on disk"),
             *PACKAGE_SOURCE.refs(),
             TreeCeiling::for_test(tree, PACKAGE_TREE_MAX_ENTRIES, tree, PACKAGE_TREE_MAX_DEPTH)
                 .expect("paired tree ceiling"),
@@ -2841,21 +2841,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
     }
 
+    /// The home the parser makes of the raw value `raw`, when it accepts one.
+    fn parsed_home(raw: Option<&str>) -> Option<crate::env_dir::HomeDir> {
+        crate::env_dir::HomeDir::try_parse(raw.map(OsString::from)).ok()
+    }
+
     #[test]
+    #[cfg(not(windows))]
     fn cache_base_prefers_an_absolute_xdg_cache_home() {
         let base = cache_base_from(
             Some(OsString::from("/xdg/cache")),
-            Some(PathBuf::from("/home/u")),
+            parsed_home(Some("/home/u")).as_ref(),
         )
         .expect("absolute XDG_CACHE_HOME");
         assert_eq!(base, PathBuf::from("/xdg/cache"));
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn cache_base_falls_back_to_home_dot_cache() {
-        let base = cache_base_from(None, Some(PathBuf::from("/home/u"))).expect("absolute home");
+        let home = parsed_home(Some("/home/u"));
+        let base = cache_base_from(None, home.as_ref()).expect("absolute home");
         assert_eq!(base, PathBuf::from("/home/u/.cache"));
-        let base = cache_base_from(Some(OsString::from("rel")), Some(PathBuf::from("/home/u")))
+        let base = cache_base_from(Some(OsString::from("rel")), home.as_ref())
             .expect("relative XDG_CACHE_HOME is ignored");
         assert_eq!(base, PathBuf::from("/home/u/.cache"));
     }
@@ -2869,7 +2877,7 @@ mod tests {
             (Some(""), None),
             (Some("relative/xdg"), Some("")),
         ] {
-            let err = cache_base_from(xdg.map(OsString::from), home.map(PathBuf::from))
+            let err = cache_base_from(xdg.map(OsString::from), parsed_home(home).as_ref())
                 .expect_err("no absolute cache base must be refused");
             assert!(
                 matches!(err, CliError::CacheHomeUnknown),

@@ -30,6 +30,11 @@
 //! * [`ElementClass`] — the one per-element classifier under Windows filename
 //!   canonicalisation ([`ElementClass::of`], [`ElementClass::windows_elements`]),
 //!   read by the seal and the runtime child-join parse.
+//! * [`ChildElement`] — the one per-element join verdict under either regime
+//!   ([`ChildElement::parse`]), read by every join beneath a root.
+//! * [`RelPath`] — a relative path whose every segment that verdict admits as
+//!   a name, built only by [`RelPath::from_segments`]; a static-file mount
+//!   parses its request path into one before any join.
 
 // Splice in the ONE source of truth, which physically lives in the runtime's
 // source tree so it vendors with `mod ipe_runtime` into every emitted app.

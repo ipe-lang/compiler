@@ -178,3 +178,38 @@ fn a_benign_in_scratch_write_is_clean() {
     );
     assert!(outcome.is_clean());
 }
+
+// ── a grant covers the whole scratch subtree, not just its root ───────────────
+
+#[test]
+fn a_nested_write_then_reopen_in_the_granted_scratch_is_clean() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let scratch = scratch_dir("nested");
+    let nested = scratch.join("nested");
+    let file = nested.join("f.txt");
+    let nested_str = nested.to_string_lossy().replace('\'', "''");
+    let file_str = file.to_string_lossy().replace('\'', "''");
+    // Every entry the child creates must carry the container grant: a directory
+    // it makes must accept a file, and a file it wrote must reopen for append and
+    // read. A grant on the scratch root alone denies each step (exit 11).
+    let probe = format!(
+        "try {{ New-Item -ItemType Directory -Path '{nested_str}' -ErrorAction Stop | Out-Null; \
+         [IO.File]::WriteAllText('{file_str}', 'one'); \
+         [IO.File]::AppendAllText('{file_str}', 'two'); \
+         if ([IO.File]::ReadAllText('{file_str}') -ne 'onetwo') {{ exit 11 }}; exit 0 }} \
+         catch {{ exit 11 }}"
+    );
+    let outcome = run(
+        &probe_profile(false, FilesystemScope::Isolated),
+        &scratch,
+        &probe,
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_eq!(
+        outcome,
+        JailOutcome::Clean,
+        "a nested create, reopen and read inside the scratch must be Clean"
+    );
+}

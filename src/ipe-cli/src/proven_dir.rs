@@ -20,7 +20,6 @@
 //! both constructors refuse with [`ProvenDirError::Unsupported`] and no
 //! handle exists there to misuse.
 
-use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -57,33 +56,11 @@ const fn link_step(owner: u32, invoker: crate::owner_trust::Invoker, is_leaf: bo
     }
 }
 
-/// One plain path component: never empty, `.`, `..`, or holding a separator or NUL.
+/// One plain path component, the only name a [`ProvenDir`] entry operation takes.
 ///
-/// Every entry operation of a [`ProvenDir`] takes one, so an operation can
-/// name only an entry directly inside the proven directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntryName(OsString);
-
-impl EntryName {
-    /// The single component `name`, or `None` when it is not one.
-    #[must_use]
-    pub fn new(name: &OsStr) -> Option<Self> {
-        let bytes = name.as_encoded_bytes();
-        let plain = !bytes.is_empty()
-            && bytes != b"."
-            && bytes != b".."
-            && !bytes
-                .iter()
-                .any(|&b| b == 0 || std::path::is_separator(char::from(b)));
-        plain.then(|| Self(name.to_os_string()))
-    }
-
-    /// The name as an OS string.
-    #[must_use]
-    pub fn as_os_str(&self) -> &OsStr {
-        &self.0
-    }
-}
+/// It is the name every handle-relative open shares, so an operation can name
+/// only an entry directly inside the proven directory.
+pub use ipe_fs_open::EntryName;
 
 /// Why a directory was not proven, or an entry operation inside one failed.
 #[derive(Debug)]

@@ -24,7 +24,7 @@
 //! coercion — the synthesis does not recurse into nested tuples and stays
 //! IPE-L0115.
 //!
-//! Gate check (fast, always): `ipe build` succeeds — no IPE-L0115.
+//! Gate check (fast, always): `ipe dev build` succeeds — no IPE-L0115.
 //! Green check (`IPE_E2E=1`): the emitted Rust cargo-builds AND runs.
 //!
 //! ```text
@@ -80,7 +80,7 @@ fn refutable_var_scrutinee_cargo_builds_and_runs() {
     let built = ipe::build(&fixture_entry(), &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for i_tuple_refutable_var_scrutinee: {:?}",
+        "ipe dev build must succeed for i_tuple_refutable_var_scrutinee: {:?}",
         built.err()
     );
 

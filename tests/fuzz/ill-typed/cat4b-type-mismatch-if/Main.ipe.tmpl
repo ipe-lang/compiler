@@ -1,0 +1,15 @@
+-- fuzz-hole cond
+--   base: True
+--   mutant: @n1@
+-- fuzz-slot n1 : Int 1 9999
+-- fuzz-expect IPE-T0001
+module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+main =
+    let
+        result = if @cond@ then "yes" else "no"
+    in
+    Io.println result

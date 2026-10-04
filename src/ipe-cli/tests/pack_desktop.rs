@@ -1,4 +1,4 @@
-//! Desktop packaging (`ipe build|release web desktop`): the Linux tarball is
+//! Desktop packaging (`ipe dev build|release web desktop`): the Linux tarball is
 //! materialised end-to-end on this box from a real compiled binary, and the
 //! per-OS layout / macOS `Info.plist` content is asserted as pure data.
 //!
@@ -188,7 +188,7 @@ fn linux_bundle_is_materialised_end_to_end() {
 
     let out_dir = dir.join("out").join("rust");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out_dir, &runtime).expect("ipe build of the program");
+    ipe::build(&entry, &out_dir, &runtime).expect("ipe dev build of the program");
 
     let exe = PathBuf::from(
         e2e_support::build_rust_binary("pack_desktop_linux", &out_dir)
