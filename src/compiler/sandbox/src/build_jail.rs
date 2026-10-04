@@ -3972,8 +3972,11 @@ mod tests {
         let git = fixture.tree.join(".git");
         std::fs::create_dir_all(&git).expect("fixture git dir");
         let canonical = |path: &Path| CanonicalPath::resolve(path).expect("fixture path resolves");
-        let homes =
-            HomeMasks::resolve(Some(&fixture.user), Some(&fixture.cargo)).expect("fixture homes");
+        let homes = HomeMasks::resolve(
+            Ok(&crate::home::test_home(&fixture.user)),
+            Some(&crate::home::test_tool_home(&fixture.cargo)),
+        )
+        .expect("fixture homes");
         let mounts = crate::JailMounts::checked_against(
             canonical(&fixture.scratch),
             canonical(&fixture.tree),

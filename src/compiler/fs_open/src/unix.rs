@@ -191,10 +191,9 @@ impl Dir {
     pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
         match rustix::fs::readlinkat(&self.0, name.as_os_str(), Vec::new()) {
             Ok(target) => Ok(PathBuf::from(OsString::from_vec(target.into_bytes()))),
-            Err(errno) if errno == Errno::INVAL => Err(match self.kind_of(name)? {
-                None => OpenRefusal::Absent,
-                Some(kind) => OpenRefusal::NotRegular(kind),
-            }),
+            Err(errno) if errno == Errno::INVAL => Err(self
+                .kind_of(name)?
+                .map_or(OpenRefusal::Absent, OpenRefusal::NotRegular)),
             Err(errno) => Err(refusal(errno)),
         }
     }
