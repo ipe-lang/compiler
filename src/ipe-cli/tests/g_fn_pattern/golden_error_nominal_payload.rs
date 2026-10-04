@@ -45,7 +45,7 @@ fn error_nominal_payload_compiles() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for error_nominal_payload: {:?}",
+        "ipe dev build must succeed for error_nominal_payload: {:?}",
         built.err()
     );
 }
@@ -68,7 +68,7 @@ fn error_nominal_payload_runs_and_prints_expected_output() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for error_nominal_payload: {:?}",
+        "ipe dev build must succeed for error_nominal_payload: {:?}",
         built.err()
     );
 

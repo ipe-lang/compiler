@@ -52,7 +52,7 @@ main =
     Test.runMain [ suite ]
 ```
 
-Running it (`ipe run`) prints the summary and exits `0` because every assertion
+Running it (`ipe dev run`) prints the summary and exits `0` because every assertion
 passed:
 
 ```

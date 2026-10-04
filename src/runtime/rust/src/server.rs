@@ -1603,7 +1603,7 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             .layer(tower_http::timeout::TimeoutLayer::new(
                 std::time::Duration::from_secs(ceilings.request_timeout_secs),
             ));
-        // Port precedence: the supervisor's relocation var (`ipe watch` placing
+        // Port precedence: the supervisor's relocation var (`ipe dev watch` placing
         // the app behind its proxy) > `IPE_SERVER_PORT` (operator) > the port the
         // program passed to `Server.listen`. A malformed env layer falls through,
         // never to `0`.
@@ -2984,7 +2984,7 @@ mod tests {
         assert!(
             resolve(None, None)
                 .addr_in_use_message()
-                .contains("IPE_SERVER_PORT=8123 ipe run")
+                .contains("IPE_SERVER_PORT=8123 ipe dev run")
         );
         assert!(
             !resolve(Some("9100"), None)

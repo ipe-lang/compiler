@@ -1,6 +1,6 @@
-//! Wiring the runtime capability sandbox around `ipe run`'s final exec.
+//! Wiring the runtime capability sandbox around `ipe dev run`'s final exec.
 //!
-//! `ipe run` compiles, `cargo build`s, and then runs the emitted `ipe-app`
+//! `ipe dev run` compiles, `cargo build`s, and then runs the emitted `ipe-app`
 //! binary. This module inserts the jail between the build and the run for
 //! programs that reach opaque native code: it resolves the program's capability
 //! set (`inferred ∪ declared`), lowers it to a [`SandboxProfile`], establishes
@@ -26,7 +26,9 @@ use std::path::Path;
 
 use ipe_diagnostics::Diagnostic as SharedDiag;
 use ipe_ir::Capability;
-use ipe_sandbox::run_jail::{self, DatabaseAxis, RunJailDefect, SandboxProfile};
+use ipe_sandbox::run_jail::{
+    self, DatabaseAxis, FloorIntent, FloorRefusal, RunJailDefect, SandboxProfile,
+};
 
 use crate::CliError;
 use crate::project::ProjectManifest;
@@ -77,7 +79,7 @@ impl ResolvedCapabilities {
 /// Lower a database driver to the concrete axis the profile needs.
 ///
 /// Every project has a resolved driver (it defaults to `SQLite`), so this is
-/// total — there is no "unknown driver" path at `ipe run` (the fail-closed
+/// total — there is no "unknown driver" path at `ipe dev run` (the fail-closed
 /// [`DatabaseAxis::NotApplicable`] path exists for callers that genuinely cannot
 /// resolve one).
 #[must_use]
@@ -174,12 +176,7 @@ pub fn resolve_refusal(
         // Fail-closed: no jail here and no recorded consent. Route through the
         // shared typed renderer so F4413 gains the title-rule, snippet-less
         // band, help/remedy lines, and stable JSON schema.
-        let shared: SharedDiag = defect.clone().into();
-        return Err(CliError::Pipeline {
-            file: std::path::PathBuf::new(),
-            src: String::new(),
-            diag: Box::new(shared),
-        });
+        return Err(defect_error(defect.clone()));
     }
 
     // Recorded consent: warn loudly, in red, and proceed unconfined.
@@ -223,15 +220,53 @@ pub fn jail_and_exec(
     };
     match run_jail::exec_in_run_jail(&tools, profile, scoped_tmp, working_tree, app, app_args) {
         // `exec_in_run_jail` returns only on failure.
-        Err(defect) => {
-            let shared: SharedDiag = defect.into();
-            Err(CliError::Pipeline {
-                file: std::path::PathBuf::new(),
-                src: String::new(),
-                diag: Box::new(shared),
-            })
-        }
+        Err(defect) => Err(defect_error(defect)),
         Ok(never) => match never {},
+    }
+}
+
+/// Exec `app` inside the jail, with no unconfined fallback of any kind.
+///
+/// The release run path: the recorded-consent override ([`OVERRIDE_ENV`]) is
+/// never consulted, so a platform with no jail primitive refuses. On success
+/// this does not return (the process becomes the jailed app); the only value
+/// it can produce is the refusal, so a caller has no unjailed branch to take.
+#[must_use]
+pub fn exec_jailed(
+    profile: &SandboxProfile,
+    scoped_tmp: &Path,
+    working_tree: &Path,
+    app: &Path,
+    app_args: &[OsString],
+) -> CliError {
+    let wants_wall_clock = profile.limits.wall_secs.is_some();
+    let defect = match run_jail::probe_run_jail_tools(wants_wall_clock) {
+        Ok(tools) => {
+            match run_jail::exec_in_run_jail(
+                &tools,
+                profile,
+                scoped_tmp,
+                working_tree,
+                app,
+                app_args,
+            ) {
+                Err(defect) => defect,
+                Ok(never) => match never {},
+            }
+        }
+        Err(defect) => defect,
+    };
+    defect_error(defect)
+}
+
+/// The typed refusal a jail defect renders as, through the shared diagnostic
+/// renderer.
+fn defect_error(defect: RunJailDefect) -> CliError {
+    let shared: SharedDiag = defect.into();
+    CliError::Pipeline {
+        file: std::path::PathBuf::new(),
+        src: String::new(),
+        diag: Box::new(shared),
     }
 }
 
@@ -279,14 +314,17 @@ pub fn profile_axes(profile: &SandboxProfile) -> BTreeSet<Capability> {
 /// The Rust source of a `#[used]` static that embeds the capability floor into
 /// the emitted binary's `.rodata`.
 ///
-/// `ipe exec` scans this *passively off disk* (never by executing the binary) as
+/// `ipe release run` scans this *passively off disk* (never by executing the binary) as
 /// the authoritative floor a tampered `ipe.profile` cannot go below —
 /// [`ipe_sandbox::run_jail::scan_capfloor`] finds it by its
 /// [`ipe_sandbox::run_jail::CAPFLOOR_MARKER`] prefix. The floor lands in
 /// `.rodata` (referenced from `fn main`) so it survives linker GC and `strip`.
+///
+/// `intent` records which pipeline built the binary, so `ipe release run`
+/// can refuse a development build.
 #[must_use]
-pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
-    let mut line = profile.to_capfloor_line();
+pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> String {
+    let mut line = profile.to_capfloor_line(intent);
     // A trailing newline TERMINATES the floor line inside `.rodata`. `scan_capfloor`
     // reads from the marker to the first NUL or newline; without an explicit
     // terminator the scanner would run on into whatever bytes the linker places
@@ -310,13 +348,13 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
     // named section: an allocated section survives `strip` (the deploy artifact
     // builds release with `strip = true`), whereas a non-alloc custom section is
     // stripped away. `#[used]` + `#[no_mangle]` keep the linker from
-    // garbage-collecting the never-read static. `ipe exec` finds the floor by
+    // garbage-collecting the never-read static. `ipe release run` finds the floor by
     // scanning the binary for the unique `ipe-capfloor` marker — see
     // `ipe_sandbox::run_jail::scan_capfloor`.
     format!(
         "\n// The runtime capability FLOOR, embedded read-only in `.rodata` so a\n\
          // tampered ipe.profile cannot request less isolation than this binary was\n\
-         // built for. `ipe exec` scans this out of the binary WITHOUT running it.\n\
+         // built for. `ipe release run` scans this out of the binary WITHOUT running it.\n\
          // `.rodata` survives `strip`; a custom link-section would not.\n\
          #[used]\n\
          #[unsafe(no_mangle)]\n\
@@ -325,14 +363,26 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
     )
 }
 
+/// The floor intent a build of `intent` embeds: only a release build's floor
+/// lets `ipe release run` run the app.
+#[must_use]
+pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent {
+    match intent {
+        ipe_backend_rust::BuildIntent::Development => FloorIntent::Development,
+        ipe_backend_rust::BuildIntent::Release => FloorIntent::Release,
+    }
+}
+
 /// Write the deployable enforcement artifacts into an emitted native project.
 ///
 /// Two artifacts: the strictly-parsed `ipe.profile` next to the crate, and the
 /// capability-floor static appended to the emitted `src/main.rs` (embedded in
 /// the binary). The profile is a *convenience mirror* the launcher parses; the
 /// authoritative floor is the embedded static. A profile weaker than the floor
-/// is refused at launch (`ipe exec`), so tampering the mirror alone cannot
-/// under-isolate.
+/// is refused at launch (`ipe release run`), so tampering the mirror alone cannot
+/// under-isolate. The floor names `intent`, the pipeline about to build the
+/// crate: the artifacts are written before the build, so the binary carries
+/// exactly this floor.
 ///
 /// # Errors
 ///
@@ -341,6 +391,7 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
 pub fn write_build_artifacts(
     crate_dir: &crate::output_dir::OwnedDir,
     profile: &SandboxProfile,
+    intent: FloorIntent,
 ) -> Result<(), CliError> {
     // 1. The ipe.profile mirror.
     crate_dir
@@ -352,7 +403,7 @@ pub fn write_build_artifacts(
     //    so the linker genuinely retains the bytes (a mere `#[used]` is
     //    garbage-collected by an aggressive linker like `mold`, and `strip`
     //    removes the unreferenced data). The read keeps the bytes in `.rodata`,
-    //    where `strip` cannot touch them; `ipe exec` scans them out passively.
+    //    where `strip` cannot touch them; `ipe release run` scans them out passively.
     //    Idempotent: a re-build replaces any prior floor block + reference.
     let main_rs = crate_dir.path_to(Path::new("src").join("main.rs"))?;
     let existing = crate::io_bounded::read_to_string_capped(
@@ -361,7 +412,7 @@ pub fn write_build_artifacts(
     )?;
     let base = strip_capfloor_block(&existing);
     let referenced = inject_floor_reference(&base)?;
-    let with_floor = format!("{referenced}{}", capfloor_static_source(profile));
+    let with_floor = format!("{referenced}{}", capfloor_static_source(profile, intent));
     main_rs.write(with_floor.as_bytes())
 }
 
@@ -407,46 +458,60 @@ fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     Ok(out)
 }
 
-/// Whether a built artifact's binary carries an embedded capability floor — i.e.
-/// it was emitted for a native-bearing program (ADR 0004).
+/// A deployed release app read once and verified against its `ipe.profile`.
 ///
-/// `ipe build` embeds the floor (and writes an `ipe.profile`) only for a program
-/// that reaches `Rust.` code; a pure Ipê artifact carries neither and needs no
-/// jail. `ipe exec` reads this off disk *passively* (the binary is never
-/// executed) to decide whether to jail or run directly.
-///
-/// # Errors
-///
-/// [`CliError::Io`] when the binary cannot be read.
-pub fn artifact_is_native(binary_path: &Path) -> Result<bool, CliError> {
-    let binary = std::fs::read(binary_path).map_err(|e| CliError::Io {
-        path: binary_path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(run_jail::scan_capfloor(&binary).is_some())
+/// Holds the exact bytes the floor scan judged, so the jailed exec runs those
+/// bytes ([`exec_verified_jailed`]) rather than re-opening the path the scan
+/// read.
+pub struct VerifiedArtifact {
+    profile: SandboxProfile,
+    bytes: Vec<u8>,
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for VerifiedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedArtifact")
+            .field("profile", &self.profile)
+            .field("path", &self.path)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// Read and verify the deployed artifact's floor against its `ipe.profile`.
 ///
-/// Returns the profile to jail with. The authoritative floor is the binary's
-/// embedded `.rodata` capfloor line, scanned passively (the binary is never
-/// executed).
+/// The authoritative floor is the binary's embedded `.rodata` capfloor line,
+/// scanned passively (the binary is never executed) over bytes read once
+/// under [`crate::io_bounded::RELEASE_APP_READ_CAP`].
 ///
 /// # Errors
 ///
 /// [`CliError::Usage`] on a missing/tampered profile or a profile weaker
-/// than the embedded floor (both refuse-to-run).
+/// than the embedded floor (both refuse-to-run); [`CliError::FileTooLarge`]
+/// on a binary past the cap.
 pub fn load_and_verify_artifact(
     profile_path: &Path,
     binary_path: &Path,
-) -> Result<SandboxProfile, CliError> {
-    use ipe_sandbox::run_jail;
-
-    // Parse the profile mirror strictly (parse-fail ⇒ refuse).
-    let profile_text = crate::io_bounded::read_to_string_capped(
+) -> Result<VerifiedArtifact, CliError> {
+    verify_artifact_under(
         profile_path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )?;
+        binary_path,
+        crate::io_bounded::RELEASE_APP_READ_CAP,
+    )
+}
+
+/// [`load_and_verify_artifact`] with the binary read held under `binary_cap`
+/// bytes (a planted oversized binary is [`CliError::FileTooLarge`], never
+/// buffered whole).
+fn verify_artifact_under(
+    profile_path: &Path,
+    binary_path: &Path,
+    binary_cap: u64,
+) -> Result<VerifiedArtifact, CliError> {
+    // Parse the profile mirror strictly (parse-fail ⇒ refuse).
+    let profile_text =
+        crate::io_bounded::read_to_string_capped(profile_path, run_jail::PROFILE_READ_CAP)?;
     let profile = run_jail::parse_profile(&profile_text).map_err(|e| {
         CliError::Usage(crate::text::msg::run_profile_unparsable(
             &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
@@ -455,25 +520,83 @@ pub fn load_and_verify_artifact(
     })?;
 
     // Read the authoritative floor from the binary's embedded `.rodata` bytes
-    // (passively — the binary is NOT executed). A binary with no readable floor
-    // refuses.
-    let binary = std::fs::read(binary_path).map_err(|e| CliError::Io {
-        path: binary_path.to_path_buf(),
-        source: e,
-    })?;
-    let floor = run_jail::scan_capfloor(&binary).ok_or_else(|| {
-        CliError::Usage(crate::text::msg::run_floor_unreadable(
-            &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
-        ))
-    })?;
-
-    // The profile MUST isolate at least as much as the embedded floor.
-    if !profile.satisfies_capfloor(&floor) {
-        return Err(CliError::Usage(crate::text::Message::relay(
-            &RunJailDefect::ProfileWeakerThanFloor,
-        )));
+    // (passively — the binary is NOT executed). The floor must be readable,
+    // a release build's, and no narrower than the profile — the one check the
+    // release wrapper applies too.
+    let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
+    if let Err(refusal) = run_jail::verify_release_floor(&profile, &bytes) {
+        let code = RunJailDefect::ProfileWeakerThanFloor.code();
+        return Err(CliError::Usage(match refusal {
+            FloorRefusal::Unreadable => crate::text::msg::run_floor_unreadable(&code.as_str()),
+            FloorRefusal::NotRelease => crate::text::msg::run_floor_not_release(&code.as_str()),
+            FloorRefusal::ProfileWider => {
+                crate::text::Message::relay(&RunJailDefect::ProfileWeakerThanFloor)
+            }
+        }));
     }
-    Ok(profile)
+    Ok(VerifiedArtifact {
+        profile,
+        bytes,
+        path: binary_path.to_path_buf(),
+    })
+}
+
+/// Run a [`VerifiedArtifact`] inside the run jail. Returns only on failure.
+///
+/// Where the jail takes a sealed delivery (Linux, macOS) the app runs from
+/// the verified bytes themselves, so a file swapped in at the path after the
+/// scan is never what runs. Elsewhere the jail execs the path.
+#[must_use]
+pub fn exec_verified_jailed(
+    artifact: &VerifiedArtifact,
+    scoped_tmp: &Path,
+    working_tree: &Path,
+    app_args: &[OsString],
+) -> CliError {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        let wants_wall_clock = artifact.profile.limits.wall_secs.is_some();
+        let defect = match run_jail::probe_run_jail_tools(wants_wall_clock) {
+            Ok(tools) => match run_jail::write_sealed_app_memfd(&artifact.bytes) {
+                Ok(sealed) => match run_jail::exec_embedded_in_run_jail(
+                    &tools,
+                    &artifact.profile,
+                    scoped_tmp,
+                    working_tree,
+                    &sealed,
+                    app_args,
+                ) {
+                    Err(defect) => defect,
+                    Ok(never) => match never {},
+                },
+                Err(defect) => defect,
+            },
+            Err(defect) => defect,
+        };
+        defect_error(defect)
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )))]
+    {
+        exec_jailed(
+            &artifact.profile,
+            scoped_tmp,
+            working_tree,
+            &artifact.path,
+            app_args,
+        )
+    }
 }
 
 /// Build the sandbox-override warning string from a resolved palette.
@@ -623,13 +746,13 @@ mod tests {
             network: true,
             ..SandboxProfile::maximally_isolated()
         };
-        let src = capfloor_static_source(&p);
+        let src = capfloor_static_source(&p, FloorIntent::Release);
         // The floor LINE is encoded as byte values, not literal text — so assert
         // on the static shape and confirm the byte array decodes to the marker.
         assert!(src.contains("IPE_CAPABILITY_FLOOR"), "{src}");
         assert!(src.contains("#[used]"), "{src}");
         // The bytes are the exact `to_capfloor_line()` output.
-        let line = p.to_capfloor_line();
+        let line = p.to_capfloor_line(FloorIntent::Release);
         let first_byte = line.as_bytes().first().copied().unwrap_or(0).to_string();
         assert!(
             src.contains(&format!("[{first_byte}, ")),
@@ -644,10 +767,10 @@ mod tests {
             network: true,
             ..SandboxProfile::maximally_isolated()
         };
-        let src = capfloor_static_source(&p);
+        let src = capfloor_static_source(&p, FloorIntent::Release);
         // The emitted byte array is exactly `to_capfloor_line()` + a terminating
         // newline, so the last array element is the newline's byte value (10).
-        let line = p.to_capfloor_line();
+        let line = p.to_capfloor_line(FloorIntent::Release);
         let len = line.len() + 1;
         assert!(
             src.contains(&format!("[u8; {len}]")),
@@ -667,7 +790,7 @@ mod tests {
             network: false,
             ..SandboxProfile::maximally_isolated()
         };
-        let mut rodata = profile.to_capfloor_line().into_bytes();
+        let mut rodata = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
         rodata.push(b'\n'); // the emitter's terminator
         // Adjacent bytes an attacker-linked static could place next — including a
         // second, more-permissive floor marker. The terminator must stop the scan
@@ -679,8 +802,33 @@ mod tests {
         // The recovered floor is the strict legitimate one — the trailing permissive
         // bytes did not extend it into a wider grant.
         assert!(
-            !recovered.network,
+            !recovered.axes.network,
             "adjacent permissive bytes cannot raise the network ceiling"
+        );
+    }
+
+    #[test]
+    fn artifact_binary_read_is_capped_before_the_floor_scan() {
+        let dir = ScratchDir::new("ipe-verify-cap").expect("scratch dir");
+        let profile = SandboxProfile::maximally_isolated();
+        let profile_path = dir.path().join("ipe.profile");
+        std::fs::write(&profile_path, profile.to_profile_string()).expect("write profile");
+        let mut binary = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
+        binary.push(b'\n');
+        let binary_path = dir.path().join("ipe-app");
+        std::fs::write(&binary_path, &binary).expect("write binary");
+        let len = u64::try_from(binary.len()).expect("small length");
+
+        // At the cap the floor is read and verified.
+        assert!(
+            verify_artifact_under(&profile_path, &binary_path, len).is_ok(),
+            "a binary exactly at the cap verifies"
+        );
+        // One byte past the cap is refused before the binary is buffered whole.
+        let over = verify_artifact_under(&profile_path, &binary_path, len - 1);
+        assert!(
+            matches!(over, Err(CliError::FileTooLarge { .. })),
+            "a binary past the cap is FileTooLarge, got: {over:?}"
         );
     }
 
@@ -691,7 +839,10 @@ mod tests {
         let profile = SandboxProfile::maximally_isolated();
         // First injection: reference inside main + static appended.
         let referenced = inject_floor_reference(base).expect("anchor present");
-        let once = format!("{referenced}{}", capfloor_static_source(&profile));
+        let once = format!(
+            "{referenced}{}",
+            capfloor_static_source(&profile, FloorIntent::Release)
+        );
         assert!(once.contains("black_box(&IPE_CAPABILITY_FLOOR)"));
         // Re-emitting: strip then re-inject must not stack a second block.
         let stripped = strip_capfloor_block(&once);
@@ -700,7 +851,10 @@ mod tests {
             "strip removed the ref+static"
         );
         let re = inject_floor_reference(&stripped).expect("anchor present");
-        let twice = format!("{re}{}", capfloor_static_source(&profile));
+        let twice = format!(
+            "{re}{}",
+            capfloor_static_source(&profile, FloorIntent::Release)
+        );
         assert_eq!(
             twice.matches("static IPE_CAPABILITY_FLOOR").count(),
             1,

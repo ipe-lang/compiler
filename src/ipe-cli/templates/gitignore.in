@@ -1,4 +1,4 @@
-# ipe build output (the emitted Rust crate, binaries, release artifacts).
+# ipe dev build output (the emitted Rust crate, binaries, release artifacts).
 /out/
 /target/
 

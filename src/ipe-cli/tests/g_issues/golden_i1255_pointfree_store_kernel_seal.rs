@@ -11,7 +11,7 @@
 //! A point-free (`List.map (Store.eq .qty) xs`) or fully-unapplied reference
 //! (`eqBuilder = Store.eq`) routes AROUND the intercept — through
 //! `eta_expand_partial` or the first-class-value reify path — and would emit the
-//! raw placeholder call. Before the fix `ipe build` exited 0 and `cargo build`
+//! raw placeholder call. Before the fix `ipe dev build` exited 0 and `cargo build`
 //! failed E0425 (cannot find function `store_eq_col`), the accept-then-cargo
 //! hole `PRINCIPLES.md` forbids.
 //!

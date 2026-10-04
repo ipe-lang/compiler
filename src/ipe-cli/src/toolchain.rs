@@ -48,15 +48,15 @@ impl CargoBin {
 /// (build vs run vs test vs the browser bundle) rather than a generic one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolIntent {
-    /// `ipe build` — compile the program to a native artifact.
+    /// `ipe dev build` — compile the program to a native artifact.
     Build,
-    /// `ipe run` — compile and execute the program.
+    /// `ipe dev run` — compile and execute the program.
     Run,
-    /// `ipe build --target wasm` — compile and bundle the browser artifact.
+    /// `ipe dev build --target wasm` — compile and bundle the browser artifact.
     BundleWasm,
     /// `ipe verify` — compile and run the project's test entry.
     Test,
-    /// `ipe watch` — rebuild and re-run on every source change.
+    /// `ipe dev watch` — rebuild and re-run on every source change.
     Watch,
 }
 

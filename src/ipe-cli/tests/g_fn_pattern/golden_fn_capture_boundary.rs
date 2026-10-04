@@ -277,7 +277,11 @@ fn continuation_captures_build_and_run() {
         return;
     }
     let (built, out) = build("fn_capture_boundary_accepted_e2e", ACCEPTED);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
     let outcome = crate::support::build_and_run_emitted("fn_capture_boundary_accepted", &out);
     assert_eq!(
         outcome.exit_code,

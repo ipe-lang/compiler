@@ -9,7 +9,7 @@
 //! (drop the session, fresh `init`), never a panic.
 //!
 //! The same fingerprint keys a `--debugger` cli/worker session log
-//! ([`session_codec_arg`]): `ipe run --replay` refuses a log whose `Msg` tag
+//! ([`session_codec_arg`]): `ipe dev run --replay` refuses a log whose `Msg` tag
 //! differs from the running program's, never decoding it into the wrong shape.
 //!
 //! Canonicalisation rules (each with a regression test below):

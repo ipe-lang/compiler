@@ -293,14 +293,14 @@ fn top_level_unknown_command_rejected() {
 // --debugger flag: accepted by build/run, rejected by release
 // ===========================================================================
 
-/// `ipe build --debugger` parses and sets the flag.
+/// `ipe dev build --debugger` parses and sets the flag.
 #[test]
 fn build_debugger_flag_accepted() {
     let a = parse_build(&v(&["--debugger"])).expect("--debugger must parse");
     assert!(a.debugger, "--debugger must set the field");
 }
 
-/// `ipe build --debugger` composes with other flags.
+/// `ipe dev build --debugger` composes with other flags.
 #[test]
 fn build_debugger_flag_composes() {
     let a = parse_build(&v(&["Main.ipe", "--debugger", "--out", "o"]))
@@ -316,36 +316,36 @@ fn build_no_debugger_flag_is_false() {
     assert!(!a.debugger, "debugger must default to false");
 }
 
-/// `ipe run --debugger` parses and sets the flag.
+/// `ipe dev run --debugger` parses and sets the flag.
 #[test]
 fn run_debugger_flag_accepted() {
     let a = parse_run(&v(&["--debugger"])).expect("--debugger must parse");
     assert!(a.debugger, "--debugger must set the field");
 }
 
-/// Without `--debugger` on `ipe run`, the field is `false`.
+/// Without `--debugger` on `ipe dev run`, the field is `false`.
 #[test]
 fn run_no_debugger_flag_is_false() {
     let a = parse_run(&v(&[])).expect("empty must parse");
     assert!(!a.debugger, "debugger must default to false");
 }
 
-/// `ipe release --debugger` must be rejected (unknown flag on release).
+/// `ipe release build --debugger` must be rejected (unknown flag on release).
 #[test]
 fn release_debugger_flag_rejected() {
-    use ipe::cli_args::parse_release;
-    let result = parse_release(&v(&["--debugger"]));
+    use ipe::cli_args::parse_release_build;
+    let result = parse_release_build(&v(&["--debugger"]));
     assert!(
         result.is_err(),
-        "`ipe release --debugger` must be rejected as unknown flag, got: {result:?}"
+        "`ipe release build --debugger` must be rejected as unknown flag, got: {result:?}"
     );
 }
 
 // ===========================================================================
-// run --record — session recording lives on `ipe run`, not a top-level verb.
+// run --record — session recording lives on `ipe dev run`, not a top-level verb.
 // ===========================================================================
 
-/// `ipe run --record` parses, and a plain `ipe run` does not record.
+/// `ipe dev run --record` parses, and a plain `ipe dev run` does not record.
 #[test]
 fn run_record_flag_accepted() {
     let a = parse_run(&v(&["Main.ipe", "--record"])).expect("--record must parse");
@@ -354,7 +354,7 @@ fn run_record_flag_accepted() {
     assert_eq!(plain.session, SessionMode::Live, "a plain run is live");
 }
 
-/// `ipe run --replay` reads the default log; `--replay <log>` names one.
+/// `ipe dev run --replay` reads the default log; `--replay <log>` names one.
 #[test]
 fn run_replay_flag_accepted_with_optional_log() {
     let a = parse_run(&v(&["Main.ipe", "--replay"])).expect("--replay must parse");
@@ -407,7 +407,7 @@ fn run_record_takes_no_path() {
     );
 }
 
-/// `debugger` is not a top-level command (recording is `ipe run --record`).
+/// `debugger` is not a top-level command (recording is `ipe dev run --record`).
 #[test]
 fn debugger_is_not_a_top_level_command() {
     dispatch_rejects(&["debugger", "record", "Main.ipe"]);

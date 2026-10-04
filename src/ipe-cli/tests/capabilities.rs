@@ -530,10 +530,10 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
 
 /// The manifest-less single-file audit path (the `entry` alone, no `package.ipe`
 /// up-tree) must disclose `custom-element` for a constructed-but-unmounted
-/// `customElement` handle. This is the seam `ipe release … --capabilities` and the
-/// run-jail resolver consume via [`ipe::run_sandbox::resolve_for_run`]; routing it
-/// through the served-widget-aware inference keeps it consistent with `ipe
-/// capabilities` / `package audit`. The `customElement "js/counter.js"` literal
+/// `customElement` handle. This is the seam the run-jail resolver consumes via
+/// [`ipe::run_sandbox::resolve_for_run`]; routing it through the
+/// served-widget-aware inference keeps it consistent with `ipe capabilities` /
+/// `package audit`. The `customElement "js/counter.js"` literal
 /// resolves against the lone entry's own directory, so the JS sits beside it.
 #[test]
 fn a_manifest_less_single_file_handle_discloses_custom_element() -> TestResult {

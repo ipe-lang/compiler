@@ -1,6 +1,6 @@
 //! `examples/27-multi-session-chat`'s `cargo build`.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`
 //! with E0277 (`the trait bound T1: IpeRow is not satisfied`) at every
 //! `db_get_string("field".to_string(), &(payload))` call inside a function
 //! whose only generic is the wildcard `any` PARAM (example 27's
@@ -60,7 +60,7 @@ fn i177_ipec_accepts_and_bounds_fn_not_struct() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for db_get_iperow_bound: {:?}",
+        "ipe dev build must succeed for db_get_iperow_bound: {:?}",
         built.err()
     );
 
@@ -97,7 +97,7 @@ fn i177_ipec_accepts_and_bounds_fn_not_struct() {
 /// cargo-0 ∧ run-0: the emitted project actually compiles with `rustc` and
 /// prints the decoded record fields. Gated on `IPE_E2E=1` — a real
 /// `cargo build`, the only check that would have caught the original SEAL
-/// violation (E0277 on `examples/27-multi-session-chat`, `ipe build` clean).
+/// violation (E0277 on `examples/27-multi-session-chat`, `ipe dev build` clean).
 #[test]
 fn i177_cargo_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -114,7 +114,7 @@ fn i177_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for db_get_iperow_bound: {:?}",
+        "ipe dev build must succeed for db_get_iperow_bound: {:?}",
         built.err()
     );
 

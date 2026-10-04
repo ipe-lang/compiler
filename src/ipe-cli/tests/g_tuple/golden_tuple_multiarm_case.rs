@@ -19,7 +19,7 @@
 //! non-exhaustive tuple `case`; the fix is purely additive — a variable-scrutinee
 //! or record product `case` stays fail-closed as IPE-L0115 (the m3b1/m3b2 gates).
 //!
-//! Gate check (fast, always): `ipe build` succeeds — no IPE-L0115.
+//! Gate check (fast, always): `ipe dev build` succeeds — no IPE-L0115.
 //! Green check (`IPE_E2E=1`): the emitted Rust cargo-builds AND runs, proving the
 //! Seal (ipe-0 ⟹ cargo-0) for the new tuple-match codegen.
 //!
@@ -74,7 +74,7 @@ fn multi_arm_tuple_case_cargo_builds_and_runs() {
     let built = ipe::build(&fixture_entry(), &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for i_tuple_multiarm_case: {:?}",
+        "ipe dev build must succeed for i_tuple_multiarm_case: {:?}",
         built.err()
     );
 

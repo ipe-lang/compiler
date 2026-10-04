@@ -280,7 +280,7 @@ const IMPORT_CANDIDATES_KEY: &str = "importCandidates";
 ///
 /// `text` is the owning module's source. The message is the compiler's own
 /// snippet-free rendering ([`ipe_diagnostics::plain_message`]) — the wording
-/// cannot drift from `ipe build`'s. An import-required diagnostic carries its
+/// cannot drift from `ipe dev build`'s. An import-required diagnostic carries its
 /// typed candidate modules in `data`, so a quick-fix never parses the prose.
 #[must_use]
 pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_types::Diagnostic {

@@ -72,7 +72,7 @@ case Http.parseQuery "?q=red%20shoes&page=2" of
         "(refused)"
 ```
 
-Running it (`ipe run`) shows the two http(s) targets assembled into `POST`
+Running it (`ipe dev run`) shows the two http(s) targets assembled into `POST`
 requests, the two wrong-scheme targets rejected, the verbs parsed, and the
 decoded query value `red shoes`.
 

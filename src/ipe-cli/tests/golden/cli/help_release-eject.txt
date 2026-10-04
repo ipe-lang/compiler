@@ -3,9 +3,9 @@ exit: 0
 
   Ipê language - v<VERSION> - https://github.com/ipe-lang/compiler
 
-  Emit a self-contained Rust project with a tree-shaken runtime.
+  Emit a self-contained production Rust project with a tree-shaken runtime.
 
-  ipe eject [<path>]
+  ipe release eject [<path>]
 
   Arguments:
     A source file, a project directory, or a package.ipe. Defaults to the current project.

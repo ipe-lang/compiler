@@ -428,7 +428,7 @@ fn compile_and_build(test_name: &str) -> Result<PathBuf, BoxError> {
         ..ipe::BuildOptions::from_env()
     };
     ipe::build_with_options(&entry, &out_dir, &runtime, options)
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
     Ok(PathBuf::from(exe))

@@ -4,7 +4,7 @@ module Main exposing (main)
 --
 -- A served (SSR + SSE) counter with a hoisted style literal in the view, so the
 -- harness can flip an appearance-only value (`background-color`) to exercise the
--- `ipe watch` hot-swap path, and a logic value (the increment step) to exercise a
+-- `ipe dev watch` hot-swap path, and a logic value (the increment step) to exercise a
 -- full recompile.
 
 

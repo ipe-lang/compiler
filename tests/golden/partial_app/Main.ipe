@@ -18,7 +18,7 @@ import Ipe.Task as Task
 --   3. pipe partial: `100 |> add3 1 2` == `(add3 1 2) 100`, a named partial that
 --      eta-expands and is applied to the piped value.
 --
--- Go oracle (`ipe run`): prints `6`, `33`, `103`, exit 0.
+-- Go oracle (`ipe dev run`): prints `6`, `33`, `103`, exit 0.
 
 
 f : Int -> Int -> Int -> Int

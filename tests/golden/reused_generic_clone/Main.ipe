@@ -6,7 +6,7 @@ import Ipe.Io as Io
 
 -- Regression — a reused-by-value generic param clone gap (SEAL).
 --
--- Without the clone pass `ipe build` exits 0, but the emitted Rust fails
+-- Without the clone pass `ipe dev build` exits 0, but the emitted Rust fails
 -- `cargo build` with E0382 (`use of moved value: x`) in the body of a function
 -- whose only generic is used MORE THAN ONCE in a by-value consuming position.
 -- `dup x = """{{x}}{{x}}"""` emits `interpolate_to_string(x)` TWICE; without an

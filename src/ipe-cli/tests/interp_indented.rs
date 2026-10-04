@@ -10,7 +10,7 @@
 //! untouched by the strip (only leading whitespace is removed), so `{{tag}}` and
 //! `{{String.fromInt count}}` resolve to `o` and `54`.
 //!
-//! The compile check is a PURE ipe build (no cargo) and always runs. The run
+//! The compile check is a PURE ipe dev build (no cargo) and always runs. The run
 //! check is `IPE_E2E`-gated (builds + runs the emitted binary) and asserts the
 //! margin-stripped, interpolated output.
 

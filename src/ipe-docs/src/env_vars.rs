@@ -42,7 +42,7 @@ impl Class {
 /// The subsystem that reads the variable — used for grouping in the reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Subsystem {
-    /// `ipe build` / static-build pipeline.
+    /// `ipe dev build` / static-build pipeline.
     Build,
     /// Type solver and compiler internals.
     Compiler,
@@ -274,7 +274,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WATCH_BLUEGREEN",
         default: "unset (on)",
-        purpose: "Dev-loop blue-green swaps are ON by default: `ipe watch` holds the \
+        purpose: "Dev-loop blue-green swaps are ON by default: `ipe dev watch` holds the \
                   port behind a proxy and cuts over to the rebuilt binary without \
                   dropping the browser connection. Set to `0`/empty to force it off, \
                   or any other value to force it on; `IPE_WATCH_NO_BLUEGREEN` overrides \
@@ -284,9 +284,9 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_HOT_APPEARANCE",
-        default: "unset (on for `ipe watch`)",
+        default: "unset (on for `ipe dev watch`)",
         purpose: "Explicit control over dev-loop appearance hot-swap, which is ON \
-                  by default for `ipe watch`: an edit to a style literal is pushed \
+                  by default for `ipe dev watch`: an edit to a style literal is pushed \
                   to the browser without a rebuild. Set to `0` or empty to force it \
                   off; any other value forces it on. `IPE_WATCH_NO_HOT_APPEARANCE` \
                   takes precedence. Dev-only; no effect on a release build.",
@@ -297,7 +297,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WATCH_HOT_TOKEN",
         default: "unset",
         purpose: "Per-process control token for the dev-only appearance-hot-swap \
-                  endpoint. `ipe watch` sets it and sends it as `X-Ipe-Hot-Token`; a \
+                  endpoint. `ipe dev watch` sets it and sends it as `X-Ipe-Hot-Token`; a \
                   request whose token does not constant-time-match is refused. \
                   Dev-only; the endpoint is never mounted in a release build.",
         subsystem: Subsystem::Build,
@@ -308,7 +308,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "unset (blue-green on)",
         purpose: "Set to any non-empty value other than `0` to opt OUT of dev-loop \
                   blue-green swaps and restore the direct-bind, \
-                  kill-old-then-spawn-new `ipe watch` path (a rebuild briefly drops \
+                  kill-old-then-spawn-new `ipe dev watch` path (a rebuild briefly drops \
                   the browser connection). Overrides `IPE_WATCH_BLUEGREEN`. Dev-only; \
                   no effect on a release build.",
         subsystem: Subsystem::Build,
@@ -318,10 +318,10 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WATCH_NO_HOT_APPEARANCE",
         default: "unset (hot-swap on)",
         purpose: "Set to any non-empty value other than `0` to opt OUT of dev-loop \
-                  appearance hot-swap: `ipe watch` normally hot-swaps a style-literal \
+                  appearance hot-swap: `ipe dev watch` normally hot-swaps a style-literal \
                   edit into the running app without a rebuild. This restores the plain \
                   direct-literal emit, so an appearance edit triggers a full recompile. \
-                  Dev-only; no effect on `ipe build` or a release build.",
+                  Dev-only; no effect on `ipe dev build` or a release build.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },
@@ -329,22 +329,22 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WATCH_NO_INCREMENTAL",
         default: "unset (incremental on)",
         purpose: "Set to any non-empty value other than `0` to opt OUT of the \
-                  dev-loop incremental rebuild path: `ipe watch` normally builds the \
+                  dev-loop incremental rebuild path: `ipe dev watch` normally builds the \
                   emitted app with `CARGO_INCREMENTAL=1` and no rustc wrapper (so a \
                   machine-level sccache config cannot force non-incremental), which \
                   speeds the warm view/update-body edit loop and is \
                   behaviour-identical. This restores the machine's normal build \
-                  configuration for the watch rebuild. Dev-only; no effect on `ipe \
-                  build` or a release build.",
+                  configuration for the watch rebuild. Dev-only; no effect on \
+                  `ipe dev build` or `ipe release build`.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WATCH_TIMING",
         default: "unset (off)",
-        purpose: "Set to `1` or `true` to print a per-phase `ipe watch` rebuild \
+        purpose: "Set to `1` or `true` to print a per-phase `ipe dev watch` rebuild \
                   breakdown (emit, cargo, restart, reconnect) to stderr. Dev-loop \
-                  instrumentation; has no effect outside `ipe watch`.",
+                  instrumentation; has no effect outside `ipe dev watch`.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },
@@ -368,7 +368,7 @@ pub static ENV_VARS: &[EnvVar] = &[
                   every posture, dev included), `off` (console disabled), `app` (app \
                   callback; mounted but answers 501 on the Rust runtime). The posture \
                   picks the default only when the variable is unset or blank: a binary \
-                  from `ipe build`, `ipe run`, `ipe test` or `ipe watch` in development \
+                  from `ipe dev build`, `ipe dev run`, `ipe test` or `ipe dev watch` in development \
                   posture bound to loopback defaults open; every other binary, including \
                   every `ipe release` artifact, and every exposed bind default to \
                   `token`, so the console stays closed until a credential is set. Any other \
@@ -782,7 +782,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "TCP port an `Ipe.Http.Server` app listens on. A value outside \
                   `1..=65535` (empty, non-numeric, signed, `0`, or too large) is \
                   ignored and the port passed to `Server.listen` is used. Under \
-                  `ipe watch` the supervisor chooses the port, so this value has \
+                  `ipe dev watch` the supervisor chooses the port, so this value has \
                   no effect there.",
         subsystem: Subsystem::Http,
         class: Class::Tunable,
@@ -794,7 +794,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Deployment environment marker. Any non-empty value other than `dev`, \
                   `development`, or `local` activates production mode: SSRF guard on, \
                   console requires a token, Secure cookies, no dev banner. Unset, the \
-                  build decides: `ipe build`, `ipe run`, `ipe test` and `ipe watch` \
+                  build decides: `ipe dev build`, `ipe dev run`, `ipe test` and `ipe dev watch` \
                   binaries read as development, `ipe release` artifacts as production. \
                   An `ipe release` artifact is production whatever this says: a dev \
                   marker there opens no dev-only surface and logs one notice. Also \
@@ -882,7 +882,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_ALLOW_UNSANDBOXED",
         default: "unset (false)",
         purpose: "When `bwrap` confinement is unavailable, set to `1` to allow \
-                  `ipe run` to proceed unconfined instead of refusing. Widens the \
+                  `ipe dev run` to proceed unconfined instead of refusing. Widens the \
                   trust boundary. Never set in CI or production.",
         subsystem: Subsystem::Runtime,
         class: Class::SecurityTunable,
@@ -1052,7 +1052,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "8000",
         purpose: "TCP port an `Ipe.Web` app listens on. A value outside `1..=65535` \
                   (empty, non-numeric, signed, `0`, or too large) is ignored and \
-                  8000 is used. Under `ipe watch` the supervisor chooses the port, \
+                  8000 is used. Under `ipe dev watch` the supervisor chooses the port, \
                   so this value has no effect there.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
@@ -1069,7 +1069,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "unset (off)",
         purpose: "Set to `1`, `true`, `yes`, or `on` to force every returning session \
                   to a fresh `init`, bypassing the additive-superset checkpoint splice. \
-                  Injected by `ipe watch --reset-state`; never set in production. \
+                  Injected by `ipe dev watch --reset-state`; never set in production. \
                   Fail-closed: an absent or unrecognised value leaves the normal \
                   additive-preserve algorithm in place.",
         subsystem: Subsystem::Web,
@@ -1095,7 +1095,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_RETRY_FAST_WINDOW_MS",
         default: "3000",
         purpose: "Duration (ms) of the fast-retry window after a disconnect. Set to \
-                  `8000` automatically by `ipe watch` to accommodate server restart \
+                  `8000` automatically by `ipe dev watch` to accommodate server restart \
                   time.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
@@ -1145,7 +1145,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Session-store backend for the web server: `memory` (per-process, \
                   lost on restart), `file` (persisted to `IPE_WEB_STORE_PATH`, no \
                   database dependency), or `sqlite`/`postgres`/`redis` (persisted, \
-                  require the `db` or `redis_store` feature). `ipe watch` selects \
+                  require the `db` or `redis_store` feature). `ipe dev watch` selects \
                   `file` so a rebuild preserves live sessions even for a plain web \
                   app. A persisted session survives a restart or a rolling restart \
                   even across a purely-additive `Model` change (a new field added, \
@@ -1169,7 +1169,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_SWAP_TOAST",
         default: "unset (off)",
-        purpose: "Set by the `ipe watch` blue-green proxy on the app it supervises. \
+        purpose: "Set by the `ipe dev watch` blue-green proxy on the app it supervises. \
                   Tells the web client a reconnect is an expected rebuild cutover, so it \
                   greets it with a brief positive \"updated ✓\" toast instead of the \
                   \"Reconnecting…\" banner. Dev-only; a release build never sets it.",
@@ -1284,20 +1284,20 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TMP", // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
     "IPE_WINDOWS_E2E_ENV_CHILD", // Windows jail e2e: marks the env-seeded re-exec
-    // Dev-loop-internal listener relocation port — set by `ipe watch` and the
+    // Dev-loop-internal listener relocation port — set by `ipe dev watch` and the
     // dev console proxy on the child they spawn (never operator-set); it
     // outranks the operator port vars and is never inherited by `Process.*` children.
     "IPE_INTERNAL_LISTEN_PORT",
     // Dev-loop-internal control-channel port — allocated and injected by
-    // `ipe watch` into the spawned child (never operator-set), like the relocation
+    // `ipe dev watch` into the spawned child (never operator-set), like the relocation
     // port above. Present only in a dev-loop (web/debugger) build.
     "IPE_CONTROL_PORT",
-    // Dev-loop-internal record-log destination — set by `ipe run --record` on
+    // Dev-loop-internal record-log destination — set by `ipe dev run --record` on
     // the executed child (the log always lands in the ipe-owned output root; the
     // operator never sets this var directly). Read by the recorder dump; present
     // only in a `debugger` build.
     "IPE_DEBUGGER_RECORD",
-    // Dev-loop-internal replay-log path — set by `ipe run --replay` on the
+    // Dev-loop-internal replay-log path — set by `ipe dev run --replay` on the
     // executed child (never operator-set). Read by the cli/worker loop, which
     // replays the named typed log instead of running; present only in a
     // `debugger` build.

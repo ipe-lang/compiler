@@ -12,5 +12,5 @@ that shows `do` notation and concurrent fan-out with `Task.parallel`:
 so you can see exactly what the block desugars to.
 
 ```sh
-ipe run src/Main.ipe
+ipe dev run src/Main.ipe
 ```

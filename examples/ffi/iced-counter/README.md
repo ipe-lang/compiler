@@ -96,14 +96,14 @@ CI. These remaining gaps are filed to the FFI backlog (see the PR body).
 
 The workflow below is the standard define-surface flow (as used by
 `bevy-game`). It is shown for reference: `ipe install` emits the
-`_bindings.rs` shown above, but `ipe build` currently stops at the forwarder gap
+`_bindings.rs` shown above, but `ipe dev build` currently stops at the forwarder gap
 documented above — the emitted definitions compile, but `Main.ipe` cannot yet
 drive the Iced loop. The definitions' cargo-build against real Iced was proven
 directly by the spike (a real `iced::Sandbox` around the verbatim emitter
-output), not by the `ipe build` path.
+output), not by the `ipe dev build` path.
 
 ```
 cd examples/ffi/iced-counter
 ipe install --yes --allow-build-scripts   # sandboxed; writes .ipe/cache/ffi/rust (gitignored)
-ipe build                                 # blocked at the forwarder gap (see above)
+ipe dev build                             # blocked at the forwarder gap (see above)
 ```

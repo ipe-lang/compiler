@@ -1,7 +1,7 @@
 -- | Ipe.Debug — development-only escape hatches.
 --
 -- Every member of this module is rejected by `ipe release` (IPE-L0140).
--- Use `ipe build` or `ipe run` during development.
+-- Use `ipe dev build` or `ipe dev run` during development.
 --
 -- ## `log`
 --

@@ -58,7 +58,7 @@ describe raw =
             raw ++ "  ->  REJECTED (traversal or NUL)"
 ```
 
-Running it (`ipe run`) accepts the clean paths, reads their components, and
+Running it (`ipe dev run`) accepts the clean paths, reads their components, and
 rejects the `..` escape:
 
 ```

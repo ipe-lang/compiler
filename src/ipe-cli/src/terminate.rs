@@ -3,7 +3,7 @@
 //! Every termination request first ends every remote transfer
 //! ([`crate::remote_ingest::end_transfers`]), so no process a transfer started
 //! outlives the CLI. The first request then runs the shutdown subscribers (the
-//! orderly teardown of `ipe watch`); with none subscribed, and on every later
+//! orderly teardown of `ipe dev watch`); with none subscribed, and on every later
 //! request, the CLI ends by the signal's default action. A teardown that hangs
 //! is therefore ended by a second request.
 //!

@@ -23,8 +23,8 @@ at the top and follow the links; each page assumes only the ones before it.
   shared build target, and dev-profile flags; what `ipe health` configures and
   how to apply each step manually.
 - [Delivering an app](delivery.md) — shape vs delivery, then packaging a `Web`
-  app into a desktop bundle (`ipe release web desktop`) and a mobile
-  system-webview shell (`ipe release web solo ios|android`) through the one
+  app into a desktop bundle (`ipe release build web desktop`) and a mobile
+  system-webview shell (`ipe release build web solo ios|android`) through the one
   delivery grammar.
 - [Publishing a package](publishing.md) — turn a library into a package other
   developers can `ipe add`: how the curated registry works, the one-time

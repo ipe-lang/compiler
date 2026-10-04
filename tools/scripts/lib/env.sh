@@ -97,5 +97,5 @@ unset _exe
 # the sweep is independent of the invocation CWD; callers may override. The tree
 # is the `ipe-runtime-rust` crate's source root — the `.rs` module files sit
 # directly under it (no nested `ipe_runtime`/`ipe_runtime` subdir); a wrong path
-# here makes `ipe build` mis-vendor the runtime and the emitted crate cargo-fails.
+# here makes `ipe dev build` mis-vendor the runtime and the emitted crate cargo-fails.
 export IPE_RUNTIME_DIR="${IPE_RUNTIME_DIR:-$REPO/src/runtime/rust/src}"
