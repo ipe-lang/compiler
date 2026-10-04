@@ -370,11 +370,11 @@ startupReadsAdmittedOnly =
         sources <-
             Task.sequence
                 (List.map
-                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, codeText text )))
+                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
                     (moduleFiles topNames libNames)
                 )
         settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
-        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map codeText
+        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
         Task.succeed
             (layoutAdmits topNames libNames
                 && List.length sources >= 12
@@ -419,8 +419,8 @@ readLibSource file =
 
 -- The source with every whole-line comment dropped, so prose naming a
 -- reader is never counted as a call.
-codeText : String -> String
-codeText source =
+withoutCommentLines : String -> String
+withoutCommentLines source =
     String.join "\n" (List.filter (\line -> not (String.startsWith "--" (String.trimStart line))) (String.lines source))
 
 
@@ -502,7 +502,7 @@ startupScanRefusesEvasions =
         sources <-
             Task.sequence
                 (List.map
-                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, codeText text )))
+                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
                     (moduleFiles topNames libNames)
                 )
         Task.succeed
