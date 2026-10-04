@@ -188,7 +188,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
         let name = item.trait_.as_ref().map_or_else(
             || type_name(&item.self_ty),
-            |(_, path, _)| {
+            |(path, _)| {
                 format!(
                     "<{} as {}>",
                     type_name(&item.self_ty),
