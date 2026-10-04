@@ -297,13 +297,22 @@ impl EnvDuration {
         Err(self.ceiling.refusal(shown, defect))
     }
 
+    /// The raw lookup of this duration's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// As [`EnvCeiling::lookup`].
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        self.ceiling.lookup()
+    }
+
     /// Reads and parses this duration from the live environment (overlay first).
     ///
     /// # Errors
     ///
     /// Returns the [`Self::parse`] refusal for a present, malformed value.
     pub fn read(self) -> Result<u64, EnvCeilingRefusal> {
-        self.parse(read_env_var(self.ceiling.name))
+        self.parse(self.lookup())
     }
 }
 
