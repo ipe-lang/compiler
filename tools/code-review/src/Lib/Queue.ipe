@@ -1,4 +1,4 @@
-module Lib.Queue exposing (HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, UnitPageState(..), decide, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, nextTicket, loadUnitView, pageHeaderText, queueStatusText, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, sourceStatusText, stateFromResult, unitPageFromResult, unitPageStatusText)
+module Lib.Queue exposing (HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), clearView, decidableSource, decide, drainThenLoad, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, stateFromResult, unitPageFromResult, unitPageStatusText, viewArrived)
 
 import Ipe.Db as Db
 import Ipe.Error as Error
@@ -10,8 +10,9 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp exposing (Timestamp)
 import Lib.Db as LibDb exposing (HistoryCursor(..))
 import Lib.Format as Format
--- `Index.Unit` names `Highlight.Lang`, and an imported alias resolves its
--- qualified names in this module.
+-- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
+-- `Links.LinkSet`, and an imported alias resolves its qualified names in this
+-- module.
 import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Links as Links
@@ -24,6 +25,7 @@ import Lib.Settings as Settings
 -- edited the code after the review, so the unit must be reviewed again.
 type alias QueuedUnit =
     { unit : Index.Unit
+    , queued : Index.QueuedChange
     , changed : Maybe LibDb.ReviewRow
     }
 
@@ -55,14 +57,15 @@ type alias Progress =
     }
 
 
--- The progress of the index, with the `reviewed` copy checked fresh first:
--- when its row count differs from the review database's decision count (a
--- decision whose drain failed, a replaced index file, a deleted review row),
--- the copy is rebuilt once and the row read again. It never loops.
-currentProgress : Db.Db -> Task.Task Error Progress
-currentProgress db =
+-- The progress of the index, read on the index connection `conn`, with the
+-- `reviewed` copy checked fresh first: when its row count differs from the
+-- decision count of the review database `db` (a decision whose drain failed,
+-- a replaced index file, a deleted review row), the copy is rebuilt once and
+-- the row read again. It never loops.
+currentProgress : Db.Db -> Db.Db -> Task.Task Error Progress
+currentProgress conn db =
     do
-        first <- Index.loadProgress
+        first <- Index.loadProgress conn
         decisions <- LibDb.countDecisions db
         if first.mirrored == decisions then
             Task.succeed (progressFrom first)
@@ -70,7 +73,7 @@ currentProgress db =
         else
             do
                 resyncReviewed db
-                second <- Index.loadProgress
+                second <- Index.loadProgress conn
                 Task.succeed (progressFrom second)
 
 
@@ -128,7 +131,7 @@ resyncReviewedWithin bound db =
 type alias RefillState =
     { pagesRead : Int
     , copied : Int
-    , cursor : Maybe ( String, String )
+    , cursor : Maybe Index.DecidedPair
     }
 
 
@@ -159,7 +162,7 @@ refillStep bound db conn state =
         else
             do
                 pairs
-                    |> List.map (\( uid, hash ) -> Index.drainPair conn uid hash)
+                    |> List.map (Index.drainDecided conn)
                     |> Task.sequence
                 let
                     copied =
@@ -304,7 +307,8 @@ loadHistoryPage cursor =
     do
         db <- LibDb.open
         page <- LibDb.historyPage db LibDb.historyPageSize cursor
-        conn <- Index.openRead
+        settings <- Settings.indexSettings
+        conn <- Index.readConnection settings
         rows <- Task.sequence (List.map (historyRow conn) page.rows)
         Task.succeed { rows = rows, at = cursor, next = page.next }
 
@@ -325,44 +329,254 @@ historyRow conn row =
 
 
 -- The one way a decision is recorded: only a shown source can be decided,
--- and only after `Index.reverify` re-proves it, so the hash written is the
--- hash of the bytes the reviewer saw. A stale or unreadable unit is refused
--- before any I/O.
-decide : Db.Db -> Index.Unit -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
-decide db unit decision =
-    case unit.view of
-        Shown shown ->
-            do
-                attested <- Index.reverify shown
-                n <- LibDb.insertDecision db (Index.attestedUid attested) (Index.attestedHash attested) decision
-                Task.succeed ( attested, n )
-
-        Stale _ ->
-            Task.fail notDecidable
-
-        Unreadable _ ->
-            Task.fail notDecidable
+-- since only a verified view holds a `ShownSource`, and only after
+-- `Index.reverify` re-proves it, so the hash written is the hash of the
+-- bytes the reviewer saw.
+decide : Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decide db shown decision =
+    do
+        attested <- Index.reverify shown
+        n <- LibDb.insertDecision db attested decision
+        Task.succeed ( attested, n )
 
 
-notDecidable : Error
-notDecidable =
-    Error.conflict "this unit's source is not verified, so it cannot be decided"
+-- The selected queue card's source: nothing selected, one read in flight
+-- (with the unit wanted once it returns, when the selection moved during the
+-- read), the loaded view, no unit with the read's uid, or a failed read. At
+-- most one read is in flight: a selection made during a read only records
+-- `wanted`, and a response for any uid but the in-flight one is dropped.
+-- `fresh` is False once the queue page reloaded or cleared during the read,
+-- so its result predates the page and never settles the view: the in-flight
+-- unit selected again is read afresh, and with nothing wanted the result is
+-- dropped.
+type SelectedView
+    = NoneSelected
+    | ViewLoading { uid : String, wanted : Maybe String, fresh : Bool }
+    | ViewShown Index.UnitView
+    | ViewMissing String
+    | ViewFailed String Error
 
 
--- The unit page: loading, the unit with its links, no such unit, or a failed
--- load. A missing unit is its own state, never shown as still loading.
+-- `uid` selected, with the uid to read next, if any. During a read only the
+-- wanted unit is recorded; the shown unit selected again reads nothing.
+selectView : String -> SelectedView -> ( SelectedView, Maybe String )
+selectView uid state =
+    case state of
+        ViewLoading loading ->
+            ( ViewLoading { uid = loading.uid, wanted = wantedAfter loading.uid loading.fresh uid, fresh = loading.fresh }, Nothing )
+
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                ( state, Nothing )
+
+            else
+                startView uid
+
+        NoneSelected ->
+            startView uid
+
+        ViewMissing _ ->
+            startView uid
+
+        ViewFailed _ _ ->
+            startView uid
+
+
+-- `uid` selected after the queue page reloaded, so its view is read afresh
+-- even when it is the one shown; during a read it is read once that read
+-- returns.
+reloadView : String -> SelectedView -> ( SelectedView, Maybe String )
+reloadView uid state =
+    case state of
+        ViewLoading loading ->
+            ( ViewLoading { uid = loading.uid, wanted = Just uid, fresh = False }, Nothing )
+
+        ViewShown _ ->
+            startView uid
+
+        NoneSelected ->
+            startView uid
+
+        ViewMissing _ ->
+            startView uid
+
+        ViewFailed _ _ ->
+            startView uid
+
+
+-- No unit to select. A read in flight stays recorded, with nothing wanted
+-- after it, so no second read can start beside it, and its result is
+-- dropped when it returns.
+clearView : SelectedView -> SelectedView
+clearView state =
+    case state of
+        ViewLoading loading ->
+            ViewLoading { uid = loading.uid, wanted = Nothing, fresh = False }
+
+        ViewShown _ ->
+            NoneSelected
+
+        NoneSelected ->
+            NoneSelected
+
+        ViewMissing _ ->
+            NoneSelected
+
+        ViewFailed _ _ ->
+            NoneSelected
+
+
+-- The read of `uid` returned with `result`: when another unit was selected
+-- meanwhile its read starts, otherwise the result settles the view. A
+-- response for any uid but the in-flight one changes nothing.
+viewArrived : String -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe String )
+viewArrived uid result state =
+    case state of
+        ViewLoading loading ->
+            if loading.uid /= uid then
+                ( state, Nothing )
+
+            else
+                case loading.wanted of
+                    Just next ->
+                        startView next
+
+                    Nothing ->
+                        if loading.fresh then
+                            ( settledView uid result, Nothing )
+
+                        else
+                            ( NoneSelected, Nothing )
+
+        ViewShown _ ->
+            ( state, Nothing )
+
+        NoneSelected ->
+            ( state, Nothing )
+
+        ViewMissing _ ->
+            ( state, Nothing )
+
+        ViewFailed _ _ ->
+            ( state, Nothing )
+
+
+startView : String -> ( SelectedView, Maybe String )
+startView uid =
+    ( ViewLoading { uid = uid, wanted = Nothing, fresh = True }, Just uid )
+
+
+-- The unit wanted after the in-flight read of `inFlight` when `uid` is
+-- selected: nothing when the in-flight unit is selected again and its read
+-- is fresh; a read that predates the page reads that unit again.
+wantedAfter : String -> Bool -> String -> Maybe String
+wantedAfter inFlight fresh uid =
+    if inFlight == uid && fresh then
+        Nothing
+
+    else
+        Just uid
+
+
+settledView : String -> Result Error (Maybe Index.UnitView) -> SelectedView
+settledView uid result =
+    case result of
+        Ok (Just loaded) ->
+            ViewShown loaded
+
+        Ok Nothing ->
+            ViewMissing uid
+
+        Err e ->
+            ViewFailed uid e
+
+
+-- The loaded view of the selected unit `uid`; Nothing while it loads, when
+-- its read failed or found no unit, or when the view is another unit's.
+selectedViewOf : String -> SelectedView -> Maybe Index.UnitView
+selectedViewOf uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Just shown
+
+            else
+                Nothing
+
+        ViewLoading _ ->
+            Nothing
+
+        NoneSelected ->
+            Nothing
+
+        ViewMissing _ ->
+            Nothing
+
+        ViewFailed _ _ ->
+            Nothing
+
+
+-- The one source a decision on `uid` may be made on: the selected unit's
+-- verified view. Nothing for a withheld view, a view not loaded, or another
+-- unit's view, so nothing else can reach `decide`.
+decidableSource : String -> SelectedView -> Maybe Index.ShownSource
+decidableSource uid state =
+    case selectedViewOf uid state of
+        Just loaded ->
+            case loaded.view of
+                Shown shown ->
+                    Just shown
+
+                Stale _ ->
+                    Nothing
+
+                Unreadable _ ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The one-line text in place of the selected unit's source while it has no
+-- loaded view; Nothing once the view of `uid` is loaded.
+selectedViewStatusText : String -> SelectedView -> Maybe String
+selectedViewStatusText uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Nothing
+
+            else
+                Just "Loading source…"
+
+        ViewLoading _ ->
+            Just "Loading source…"
+
+        NoneSelected ->
+            Just "Loading source…"
+
+        ViewMissing _ ->
+            Just "This unit is no longer in the index."
+
+        ViewFailed _ e ->
+            Just ("Source load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+
+
+-- The unit page: loading, the unit with its source and links, no such unit,
+-- or a failed load. A missing unit is its own state, never shown as still
+-- loading.
 type UnitPageState
     = UnitLoading
-    | UnitLoaded Index.Unit (List Links.Link)
+    | UnitLoaded Index.UnitView
     | UnitNotFound
     | UnitFailed Error
 
 
-unitPageFromResult : Result Error (Maybe ( Index.Unit, List Links.Link )) -> UnitPageState
+unitPageFromResult : Result Error (Maybe Index.UnitView) -> UnitPageState
 unitPageFromResult result =
     case result of
-        Ok (Just ( unit, links )) ->
-            UnitLoaded unit links
+        Ok (Just loaded) ->
+            UnitLoaded loaded
 
         Ok Nothing ->
             UnitNotFound
@@ -385,7 +599,7 @@ unitPageStatusText state =
         UnitFailed e ->
             Just ("Unit load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
 
-        UnitLoaded _ _ ->
+        UnitLoaded _ ->
             Nothing
 
 
@@ -410,48 +624,16 @@ sourceStatusText view =
             Just ("Source unreadable: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
 
 
--- The unit page loads the unit by uid (decided units have no change_queue
--- row, so the page queries units directly) and resolves every identifier
--- token of its verified source against the index's qualified names. Nothing
--- when no unit has this uid.
-loadUnitView : String -> Task.Task Error (Maybe ( Index.Unit, List Links.Link ))
+-- One unit's view by uid through `Index.loadView`, the one source read the
+-- unit page and the selected queue card share (decided units have no
+-- change_queue row, so it queries units directly), on one connection from
+-- one settings resolution. Nothing when no unit has this uid.
+loadUnitView : String -> Task.Task Error (Maybe Index.UnitView)
 loadUnitView uid =
     do
-        mb <- Index.loadUnitByUid uid
-        case mb of
-            Just unit ->
-                do
-                    qs <- Index.qualifiedUids
-                    Task.succeed (Just ( unit, linksFor unit qs ))
-
-            Nothing ->
-                Task.succeed Nothing
-
-
--- Jump links come only from verified source; a withheld view links nothing.
--- The unit's own name, which never links, is its raw qualified name from the
--- same table the links resolve against (`unit.qualified` is display text).
-linksFor : Index.Unit -> List ( String, String ) -> List Links.Link
-linksFor unit qs =
-    case unit.view of
-        Shown shown ->
-            Links.resolve (ownQualified unit.uid qs) qs (Index.shownText shown)
-
-        Stale _ ->
-            []
-
-        Unreadable _ ->
-            []
-
-
-ownQualified : String -> List ( String, String ) -> String
-ownQualified uid qs =
-    case List.find (\( _, u ) -> u == uid) qs of
-        Just ( q, _ ) ->
-            q
-
-        Nothing ->
-            ""
+        settings <- Settings.indexSettings
+        conn <- Index.readConnection settings
+        Index.loadView conn settings.roots uid
 
 
 stateFromResult : Result Error QueuePage -> QueueState
@@ -516,17 +698,19 @@ pageHeaderText page =
 -- The page also carries the whole-queue count, the database size and the
 -- review progress. Progress is read first, so a rebuild of the `reviewed`
 -- copy that drains an undrained decided pair is already reflected in the
--- page's rows and count.
+-- page's rows and count. The index settings are resolved once and every
+-- index read runs on the one read connection opened from them.
 loadPage : Index.Cursor -> Task.Task Error QueuePage
 loadPage cursor =
     do
         settings <- Settings.indexSettings
+        conn <- Index.readConnection settings
         db <- LibDb.open
-        progress <- currentProgress db
-        rows <- Index.loadPendingPage cursor
-        total <- Index.countPending
-        bytes <- Index.dbBytes
-        units <- classify db (List.map (\r -> r.unit) rows)
+        progress <- currentProgress conn db
+        rows <- Index.loadPendingPage conn cursor
+        total <- Index.countPending conn
+        bytes <- Index.dbBytes conn
+        units <- classify db rows
         Task.succeed
             { units = units
             , total = total
@@ -535,6 +719,14 @@ loadPage cursor =
             , next = nextCursor rows
             , progress = progress
             }
+
+
+-- A decided unit drained from the index queue, then the queue page at
+-- `cursor` reloaded. The drain writes the index alone: the review database
+-- already holds the decision, so nothing is written to it here.
+drainThenLoad : Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
+drainThenLoad attested cursor =
+    Index.drainUnit attested |> Task.andThen (\_ -> loadPage cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.
@@ -550,16 +742,20 @@ nextCursor rows =
             |> Maybe.map (\r -> Index.After { enqueuedAt = r.enqueuedAt, uid = r.unit.uid })
 
 
-classify : Db.Db -> List Index.Unit -> Task.Task Error (List QueuedUnit)
-classify db units =
-    units
+classify : Db.Db -> List Index.PendingRow -> Task.Task Error (List QueuedUnit)
+classify db rows =
+    rows
         |> List.map (classifyUnit db)
         |> Task.sequence
         |> Task.map prioritize
 
 
-classifyUnit : Db.Db -> Index.Unit -> Task.Task Error (Maybe QueuedUnit)
-classifyUnit db unit =
+classifyUnit : Db.Db -> Index.PendingRow -> Task.Task Error (Maybe QueuedUnit)
+classifyUnit db row =
+    let
+        unit =
+            row.unit
+    in
     do
         decided <- LibDb.findDecision db unit.uid (Index.storedHash unit.attested)
         case decided of
@@ -569,7 +765,7 @@ classifyUnit db unit =
             Nothing ->
                 do
                     old <- LibDb.findLatestForUid db unit.uid
-                    Task.succeed (Just { unit = unit, changed = old })
+                    Task.succeed (Just { unit = unit, queued = row.queued, changed = old })
 
 
 prioritize : List (Maybe QueuedUnit) -> List QueuedUnit
