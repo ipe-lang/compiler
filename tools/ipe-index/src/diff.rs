@@ -102,6 +102,11 @@ pub enum DiffRefusal {
     /// quoted file name, a name the `--raw -z` listing does not hold, a
     /// non-positive or overflowing line number, or a hunk that ends early.
     UnparsedHeader { header: String },
+    /// The patch does not hold one `diff --git` section per entry of the
+    /// `--raw -z` listing, so some changed file may have no hunks in it.
+    SectionsDisagree { listed: usize, patched: usize },
+    /// A file the `--raw -z` listing names has no section in the patch.
+    MissingSection { path: String },
 }
 
 impl std::fmt::Display for DiffRefusal {
@@ -111,6 +116,15 @@ impl std::fmt::Display for DiffRefusal {
                 f,
                 "the diff holds a header that is not understood, so its hunks are not trusted: {}",
                 crate::walk::shown(header)
+            ),
+            Self::SectionsDisagree { listed, patched } => write!(
+                f,
+                "the diff lists {listed} changed entries but its patch holds {patched} file sections, so its hunks are not trusted"
+            ),
+            Self::MissingSection { path } => write!(
+                f,
+                "the diff lists {} as changed but its patch holds no section for it, so its hunks are not trusted",
+                crate::walk::shown(path)
             ),
         }
     }
@@ -124,6 +138,29 @@ fn unparsed(header: &str) -> DiffRefusal {
     }
 }
 
+/// What the `--raw -z` listing of a diff predicts its patch holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Listed {
+    /// Every indexable path the listing names.
+    paths: BTreeSet<String>,
+    /// The `diff --git` sections the patch must hold.
+    sections: usize,
+}
+
+/// Options that pin the patch to the shape [`parse_patch`] reads, whatever the
+/// user's git configuration: no external diff driver or text conversion
+/// rewrites it, every name carries the `a/`/`b/` prefix, a submodule is one
+/// `diff --git` section, and no context line joins two hunks.
+const PATCH_SHAPE: [&str; 7] = [
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--submodule=short",
+    "--inter-hunk-context=0",
+    "--no-color",
+];
+
 /// The changed line ranges of each file in a git range, from
 /// `git diff --unified=0`. Returns `(relpath, [(start, end)])` covering the
 /// NEW-side lines a hunk touches, with `relpath` relative to `root` — the
@@ -134,9 +171,22 @@ fn unparsed(header: &str) -> DiffRefusal {
 /// `range` is validated the same way `walk::changed`'s since-ref is: no leading
 /// `-` (option smuggling) and only ref-safe bytes, so a crafted range can't
 /// inject git options. The files come from the `--raw -z` listing, which never
-/// quotes a name; a hunk of a file that listing does not hold, or whose header
-/// is quoted, refuses the whole diff rather than dropping its hunks.
+/// quotes a name, and the patch must agree with it both ways: one section per
+/// listed entry, one for every listed file, and no hunk of a file it does not
+/// list. A patch that disagrees, or holds a quoted header, refuses the whole
+/// diff rather than dropping its hunks.
 pub fn changed_line_ranges(root: &DeclaredRoot, range: &str) -> anyhow::Result<Vec<FileHunks>> {
+    ranges_through(root, range, |args| {
+        crate::walk::git_stdout(root.root_str(), args)
+    })
+}
+
+/// [`changed_line_ranges`], running each git command through `git`.
+fn ranges_through(
+    root: &DeclaredRoot,
+    range: &str,
+    git: impl Fn(&[&str]) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<FileHunks>> {
     use anyhow::bail;
     if range.is_empty()
         || range.starts_with('-')
@@ -147,57 +197,57 @@ pub fn changed_line_ranges(root: &DeclaredRoot, range: &str) -> anyhow::Result<V
         bail!("refusing unsafe git range: {range:?}");
     }
     crate::walk::verify_root(root)?;
-    let repo = root.root_str();
     // `--` ends the revisions: an unresolvable range is an error, never a pathspec.
-    let raw = crate::walk::git_stdout(
-        repo,
-        &[
-            "diff",
-            "--raw",
-            "-z",
-            "--no-renames",
-            "--relative",
-            range,
-            "--",
-        ],
-    )?;
+    let raw = git(&[
+        "diff",
+        "--raw",
+        "-z",
+        "--no-renames",
+        "--relative",
+        "--no-ext-diff",
+        "--no-textconv",
+        range,
+        "--",
+    ])?;
     let listed = listed_paths(&raw)?;
-    let patch = crate::walk::git_stdout(
-        repo,
-        &[
-            "diff",
-            "--unified=0",
-            "--no-color",
-            "--no-renames",
-            "--relative",
-            range,
-            "--",
-        ],
-    )?;
+    let mut args = vec!["diff", "--unified=0", "--no-renames", "--relative"];
+    args.extend(PATCH_SHAPE);
+    args.extend([range, "--"]);
+    let patch = git(args.as_slice())?;
     Ok(parse_patch(&patch, &listed)?.into_iter().collect())
 }
 
-/// Every path the `--raw -z` listing of a diff names.
-fn listed_paths(raw: &[u8]) -> anyhow::Result<BTreeSet<String>> {
+/// Every indexable path the `--raw -z` listing of a diff names, and the
+/// sections its patch must hold.
+fn listed_paths(raw: &[u8]) -> anyhow::Result<Listed> {
     use crate::walk::Change;
-    Ok(crate::walk::parse_diff(raw)?
+    let listing = crate::walk::parse_diff_listing(raw)?;
+    let paths = listing
+        .changes
         .into_iter()
         .filter_map(|change| match change {
             Change::Upsert(path) | Change::Delete(path) => Some(path),
             Change::Refused(_) => None,
         })
-        .collect())
+        .collect();
+    Ok(Listed {
+        paths,
+        sections: listing.patch_sections,
+    })
 }
 
 /// The hunks of a `--unified=0 --relative` patch, by file.
 ///
 /// A hunk is consumed by its own line counts, so a changed line whose text
-/// reads like a header (`+++ x`) is never taken for one.
+/// reads like a header (`+++ x`) is never taken for one. The patch must hold
+/// exactly the sections `listed` predicts and one for each of its paths.
 fn parse_patch(
     patch: &[u8],
-    listed: &BTreeSet<String>,
+    listed: &Listed,
 ) -> Result<BTreeMap<String, Vec<(i64, i64)>>, DiffRefusal> {
     let mut per_file: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+    let mut sectioned: BTreeSet<&str> = BTreeSet::new();
+    let mut sections: usize = 0;
     let mut current: Option<String> = None;
     let mut owed: u64 = 0;
     for line in patch.split(|&b| b == b'\n') {
@@ -209,8 +259,16 @@ fn parse_patch(
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix(b"+++ ") {
-            current = new_side_path(rest, listed)?;
+        if let Some(names) = line.strip_prefix(b"diff --git ") {
+            sections = sections.saturating_add(1);
+            current = None;
+            if let Some(path) = section_path(names)
+                && let Some(known) = listed.paths.get(path)
+            {
+                sectioned.insert(known.as_str());
+            }
+        } else if let Some(rest) = line.strip_prefix(b"+++ ") {
+            current = new_side_path(rest, &listed.paths)?;
         } else if let Some(range_text) = line.strip_prefix(b"@@ ") {
             let text = String::from_utf8_lossy(range_text);
             let hunk = parse_hunk(&text)?;
@@ -235,7 +293,32 @@ fn parse_patch(
     if owed > 0 {
         return Err(unparsed("a hunk that ends before its lines do"));
     }
+    if sections != listed.sections {
+        return Err(DiffRefusal::SectionsDisagree {
+            listed: listed.sections,
+            patched: sections,
+        });
+    }
+    if let Some(path) = listed
+        .paths
+        .iter()
+        .find(|path| !sectioned.contains(path.as_str()))
+    {
+        return Err(DiffRefusal::MissingSection { path: path.clone() });
+    }
     Ok(per_file)
+}
+
+/// The one path of a `diff --git a/<path> b/<path>` header, which names the
+/// same path twice under `--no-renames`; `None` for any other shape, such as
+/// a quoted name.
+fn section_path(names: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(names).ok()?;
+    let rest = text.strip_prefix("a/")?;
+    // `rest` is `<path> b/<path>`: the path is the first half before ` b/`.
+    let half = rest.len().checked_sub(3)?.checked_div(2)?;
+    let (path, tail) = (rest.get(..half)?, rest.get(half..)?);
+    (tail.strip_prefix(" b/")? == path).then_some(path)
 }
 
 /// The path a `+++ ` header names, or `None` for `+++ /dev/null` and a path
@@ -457,10 +540,9 @@ mod tests {
     fn hunk_end_overflow_is_refused() {
         assert!(parse_hunk("-1 +9223372036854775807,2 @@").is_err());
         assert!(parse_hunk("-1 +4294967296 @@").is_err());
-        let listed: BTreeSet<String> = ["a.rs".to_string()].into();
-        let patch = b"+++ b/a.rs\n@@ -1 +4294967295,2 @@\n-x\n+y\n+z\n";
+        let patch = b"diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -1 +4294967295,2 @@\n-x\n+y\n+z\n";
         assert_eq!(
-            parse_patch(patch, &listed),
+            one_file(patch, &["a.rs"]),
             Err(unparsed("-1 +4294967295,2 @@"))
         );
     }
@@ -469,7 +551,10 @@ mod tests {
         patch: &[u8],
         names: &[&str],
     ) -> Result<Vec<(String, Vec<(i64, i64)>)>, DiffRefusal> {
-        let listed: BTreeSet<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let listed = Listed {
+            paths: names.iter().map(|n| (*n).to_string()).collect(),
+            sections: names.len(),
+        };
         parse_patch(patch, &listed).map(|m| m.into_iter().collect())
     }
 
@@ -487,7 +572,7 @@ diff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-ol
     // A changed line whose text reads like a file header belongs to its hunk.
     #[test]
     fn a_changed_line_that_looks_like_a_header_is_not_one() {
-        let patch = b"+++ b/a.rs\n@@ -1 +1 @@\n-old\n+++ b/evil.rs\n";
+        let patch = b"diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+++ b/evil.rs\n";
         assert_eq!(
             one_file(patch, &["a.rs"]),
             Ok(vec![("a.rs".to_string(), vec![(1, 1)])])
@@ -496,15 +581,19 @@ diff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-ol
 
     #[test]
     fn a_header_the_raw_listing_does_not_hold_is_refused() {
-        let patch = b"+++ b/other.rs\n@@ -1 +1 @@\n-a\n+b\n";
-        assert!(one_file(patch, &["a.rs"]).is_err());
-        assert!(one_file(b"+++ b/a.rs\n@@ -1 +1 @@\n-a\n", &["a.rs"]).is_err());
+        let patch = b"diff --git a/other.rs b/other.rs\n+++ b/other.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(one_file(patch, &["a.rs"]), Err(unparsed("b/other.rs")));
+        let short = b"diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n";
+        assert_eq!(
+            one_file(short, &["a.rs"]),
+            Err(unparsed("a hunk that ends before its lines do"))
+        );
     }
 
     // Git ends a header whose name holds a space with a TAB.
     #[test]
     fn a_name_with_a_space_keeps_its_hunks() {
-        let patch = b"+++ b/a b.rs\t\n@@ -1 +1 @@\n-a\n+b\n";
+        let patch = b"diff --git a/a b.rs b/a b.rs\n+++ b/a b.rs\t\n@@ -1 +1 @@\n-a\n+b\n";
         assert_eq!(
             one_file(patch, &["a b.rs"]),
             Ok(vec![("a b.rs".to_string(), vec![(1, 1)])])
@@ -513,8 +602,129 @@ diff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-ol
 
     #[test]
     fn a_quoted_header_is_refused() {
-        let patch = b"+++ \"b/a\\tb.rs\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let patch =
+            b"diff --git \"a/a\\tb.rs\" \"b/a\\tb.rs\"\n+++ \"b/a\\tb.rs\"\n@@ -1 +1 @@\n-a\n+b\n";
         assert!(one_file(patch, &["a\tb.rs"]).is_err());
+    }
+
+    // An external diff tool prints no `diff --git` section: the change the
+    // listing names is refused, never read as having no hunks.
+    #[test]
+    fn a_patch_with_fewer_sections_than_listed_is_refused() {
+        for patch in [&b"external tool text\n"[..], b""] {
+            assert_eq!(
+                one_file(patch, &["a.rs"]),
+                Err(DiffRefusal::SectionsDisagree {
+                    listed: 1,
+                    patched: 0
+                })
+            );
+        }
+        let twice = b"diff --git a/a.rs b/a.rs\ndiff --git a/a.rs b/a.rs\n";
+        assert_eq!(
+            one_file(twice, &["a.rs"]),
+            Err(DiffRefusal::SectionsDisagree {
+                listed: 1,
+                patched: 2
+            })
+        );
+    }
+
+    // The counts agree, but the section is another file's.
+    #[test]
+    fn a_listed_file_without_its_own_section_is_refused() {
+        assert_eq!(
+            one_file(b"diff --git a/b.rs b/b.rs\n", &["a.rs"]),
+            Err(DiffRefusal::MissingSection {
+                path: "a.rs".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_section_header_names_one_path_twice() {
+        assert_eq!(section_path(b"a/x.rs b/x.rs"), Some("x.rs"));
+        assert_eq!(section_path(b"a/a b.rs b/a b.rs"), Some("a b.rs"));
+        for other in [
+            &b"x.rs x.rs"[..],
+            b"a/x.rs b/y.rs",
+            b"c/x.rs i/x.rs",
+            b"\"a/x\\tb\" \"b/x\\tb\"",
+            b"a/",
+            b"a/\xff b/\xff",
+        ] {
+            assert_eq!(section_path(other), None, "{other:?}");
+        }
+    }
+
+    /// A repository whose `a.rs` changes on lines 2 and 9 in `HEAD`.
+    #[cfg(unix)]
+    fn two_line_change(name: &str) -> crate::walk::fixture::Fixture {
+        let fx = crate::walk::fixture::Fixture::new(name);
+        let lines =
+            |two: &str, nine: &str| format!("l1\n{two}\nl3\nl4\nl5\nl6\nl7\nl8\n{nine}\nl10\n");
+        fx.write("a.rs", &lines("l2", "l9"));
+        fx.commit("one");
+        fx.write("a.rs", &lines("x2", "x9"));
+        fx.commit("two");
+        fx
+    }
+
+    // Each setting reshapes git's default patch: an external tool or a text
+    // conversion that prints nothing, no `a/`/`b/` prefixes, context lines
+    // joining the two hunks. The pinned options read the same ranges anyway.
+    #[cfg(unix)]
+    #[test]
+    fn a_users_diff_configuration_does_not_reshape_the_patch() {
+        use crate::walk::fixture::{root_of, set};
+        let fx = two_line_change("diff-config");
+        fx.write(".gitattributes", "*.rs diff=blank\n");
+        for (key, value) in [
+            ("diff.external", "true"),
+            ("diff.blank.textconv", "true"),
+            ("diff.noprefix", "true"),
+            ("diff.mnemonicPrefix", "true"),
+            ("diff.interHunkContext", "10"),
+            ("diff.submodule", "log"),
+        ] {
+            fx.git(&["config", key, value]);
+        }
+        let roots = set(&[("ipe", fx.root())]);
+        let hunks = changed_line_ranges(root_of(&roots, "ipe"), "HEAD~1..HEAD").unwrap();
+        assert_eq!(hunks, vec![("a.rs".to_string(), vec![(2, 2), (9, 9)])]);
+    }
+
+    // `GIT_EXTERNAL_DIFF` set where git runs is not trusted to be cleared.
+    #[cfg(unix)]
+    #[test]
+    fn an_external_diff_in_the_environment_does_not_empty_the_patch() {
+        use crate::walk::fixture::{root_of, set};
+        use crate::walk::{MAX_GIT_STDOUT_BYTES, git_command, run_git};
+        let fx = two_line_change("diff-ext-env");
+        let roots = set(&[("ipe", fx.root())]);
+        let root = root_of(&roots, "ipe");
+        let hunks = ranges_through(root, "HEAD~1..HEAD", |args| {
+            let mut cmd = git_command(root.root_str());
+            cmd.args(args).env("GIT_EXTERNAL_DIFF", "true");
+            run_git(&mut cmd, root.root_str(), args, MAX_GIT_STDOUT_BYTES)
+        })
+        .unwrap();
+        assert_eq!(hunks, vec![("a.rs".to_string(), vec![(2, 2), (9, 9)])]);
+    }
+
+    // A file that becomes a link is one listing entry but two patch sections,
+    // a deletion and a creation.
+    #[cfg(unix)]
+    #[test]
+    fn a_type_change_is_two_sections() {
+        use crate::walk::fixture::{root_of, set};
+        let fx = two_line_change("diff-type-change");
+        std::fs::remove_file(fx.path("a.rs")).unwrap();
+        std::os::unix::fs::symlink("other.rs", fx.path("a.rs")).unwrap();
+        fx.commit("three");
+        let roots = set(&[("ipe", fx.root())]);
+        let hunks = changed_line_ranges(root_of(&roots, "ipe"), "HEAD~1..HEAD").unwrap();
+        assert_eq!(hunks, vec![("a.rs".to_string(), vec![(1, 1)])]);
     }
 
     // A file whose name git quotes in a patch header is still a changed file:

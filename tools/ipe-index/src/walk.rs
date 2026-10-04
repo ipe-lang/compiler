@@ -14,12 +14,12 @@
 
 use crate::model::{Lang, RepoTag, Role, lang_of, role_of};
 use crate::repo_set::DeclaredRoot;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use std::fmt::{self, Write as _};
 use std::fs::File;
-use std::io::{self, Read as _};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MB cap (anti-OOM)
 
@@ -517,23 +517,121 @@ pub(crate) fn git_command(repo: &str) -> Command {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIFF_OPTS")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null());
     cmd
 }
 
+/// The most bytes one git command may print on stdout; past it the run is refused.
+pub(crate) const MAX_GIT_STDOUT_BYTES: u64 = 256 << 20;
+
+/// The most bytes of git's stderr kept for an error message; the rest is drained.
+const MAX_GIT_STDERR_BYTES: u64 = 64 << 10;
+
+/// Git printed more on stdout than [`MAX_GIT_STDOUT_BYTES`]; none of it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitOutputTooLarge {
+    pub limit: u64,
+}
+
+impl fmt::Display for GitOutputTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "git printed more than the {}-byte output ceiling",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for GitOutputTooLarge {}
+
 /// Runs `git <args>` in `repo`; a failed run is an error, never empty output.
 pub(crate) fn git_stdout(repo: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let out = git_command(repo).args(args).output()?;
-    if !out.status.success() {
+    run_git(
+        git_command(repo).args(args),
+        repo,
+        args,
+        MAX_GIT_STDOUT_BYTES,
+    )
+}
+
+/// Runs `cmd`, the git command `args` in `repo`, reading at most `limit`
+/// bytes of its stdout.
+///
+/// A run that prints more is stopped and refused with [`GitOutputTooLarge`];
+/// a failed run is an error naming git's stderr, of which at most
+/// [`MAX_GIT_STDERR_BYTES`] are kept.
+pub(crate) fn run_git(cmd: &mut Command, repo: &str, args: &[&str], limit: u64) -> Result<Vec<u8>> {
+    let label = args.first().copied().unwrap_or_default();
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let read = read_child(&mut child, limit);
+    if !matches!(read, Ok((Ok(_), _))) {
+        // The output is not read to its end, so git is not left blocked on it.
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let (stdout, stderr) = read?;
+    let stdout = stdout.with_context(|| format!("git {label} in {}", shown(repo)))?;
+    if !status.success() {
         bail!(
-            "git {} failed in {}: {}",
-            args.first().copied().unwrap_or_default(),
+            "git {label} failed in {}: {}",
             shown(repo),
-            shown(String::from_utf8_lossy(&out.stderr).trim())
+            shown(String::from_utf8_lossy(&stderr).trim())
         );
     }
-    Ok(out.stdout)
+    Ok(stdout)
+}
+
+/// The capped stdout and the kept stderr of a spawned git.
+///
+/// Stderr is drained on its own thread while stdout is read, so neither pipe
+/// filling up can block git on the other.
+fn read_child(
+    child: &mut Child,
+    limit: u64,
+) -> Result<(Result<Vec<u8>, GitOutputTooLarge>, Vec<u8>)> {
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        bail!("git was spawned without its output pipes");
+    };
+    std::thread::scope(|scope| -> Result<_> {
+        let drain = std::thread::Builder::new()
+            .name("git-stderr".to_string())
+            .spawn_scoped(scope, move || drain_capped(stderr, MAX_GIT_STDERR_BYTES))?;
+        let out = read_capped(stdout, limit);
+        if !matches!(out, Ok(Ok(_))) {
+            // Stops git before waiting for its stderr to end.
+            let _ = child.kill();
+        }
+        let err = drain
+            .join()
+            .map_err(|_| anyhow::anyhow!("the reader of git's stderr stopped"))??;
+        Ok((out?, err))
+    })
+}
+
+/// At most `limit` bytes of `reader`; one byte more is [`GitOutputTooLarge`].
+fn read_capped(reader: impl Read, limit: u64) -> io::Result<Result<Vec<u8>, GitOutputTooLarge>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok(if read > limit {
+        Err(GitOutputTooLarge { limit })
+    } else {
+        Ok(bytes)
+    })
+}
+
+/// The first `keep` bytes of `reader`, which is then read to its end unkept.
+fn drain_capped(mut reader: impl Read, keep: u64) -> io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    (&mut reader).take(keep).read_to_end(&mut kept)?;
+    io::copy(&mut reader, &mut io::sink())?;
+    Ok(kept)
 }
 
 /// Reports each refusal on stderr; the refused entry is not indexed.
@@ -664,9 +762,26 @@ pub enum Change {
 /// Each change is a `:<old> <new> <osha> <nsha> <status>` record followed by
 /// one `<name>` record; renames and copies never appear (`--no-renames`).
 pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
+    parse_diff_listing(out).map(|listing| listing.changes)
+}
+
+/// A parsed `git diff --raw -z --no-renames`, with the patch it predicts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffListing {
+    pub changes: Vec<Change>,
+    /// The `diff --git` sections the same diff as a patch holds: one per
+    /// record — refused, not indexable, binary, mode-only or empty alike —
+    /// and two for a type change (`T`), which a patch shows as the deletion
+    /// of the old entry and the creation of the new one.
+    pub patch_sections: usize,
+}
+
+/// [`parse_diff`], also counting the patch sections the listing predicts.
+pub fn parse_diff_listing(out: &[u8]) -> Result<DiffListing, WalkError> {
     let listing = Listing::Diff;
     let mut recs = records(out, listing)?.into_iter().enumerate();
     let mut changes = Vec::new();
+    let mut patch_sections: usize = 0;
     while let Some((record, header)) = recs.next() {
         let malformed = WalkError::MalformedRecord { listing, record };
         let Some(header) = header.strip_prefix(b":") else {
@@ -686,9 +801,10 @@ pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
         let Some(new) = Mode::parse(new) else {
             return Err(malformed);
         };
-        let deleted = match status {
-            b"D" => true,
-            b"A" | b"M" | b"T" => false,
+        let (deleted, sections) = match status {
+            b"D" => (true, 1),
+            b"A" | b"M" => (false, 1),
+            b"T" => (false, 2),
             _ => return Err(malformed),
         };
         let Some((_, name)) = recs.next() else {
@@ -697,6 +813,7 @@ pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
         if name.is_empty() {
             return Err(malformed);
         }
+        patch_sections = patch_sections.saturating_add(sections);
         let path = match path_of(name) {
             Err(refusal) => {
                 changes.push(Change::Refused(refusal));
@@ -717,7 +834,10 @@ pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
             }
         }
     }
-    Ok(changes)
+    Ok(DiffListing {
+        changes,
+        patch_sections,
+    })
 }
 
 /// Changed/added + deleted paths between `since` sha and HEAD (for incremental update).
@@ -1640,5 +1760,42 @@ mod tests {
         assert_eq!(sorted(ups), Vec::<String>::new());
         assert_eq!(dels, ["l.rs"]);
         assert_eq!(refused, [link("l.rs")]);
+    }
+
+    // Every record predicts its patch sections, the ones the index refuses or
+    // never reads included; a type change is a deletion and a creation.
+    #[test]
+    fn a_diff_listing_counts_every_patch_section() {
+        let out = b":100644 100644 aaa bbb M\0a.rs\0\
+                    :100644 120000 aaa bbb T\0leak.rs\0\
+                    :000000 100644 000 bbb A\0target/skip.rs\0\
+                    :000000 100644 000 bbb A\0\xfe.rs\0\
+                    :100644 000000 aaa 000 D\0gone.rs\0";
+        let listing = parse_diff_listing(out).unwrap();
+        assert_eq!(listing.patch_sections, 6);
+        assert_eq!(listing.changes, parse_diff(out).unwrap());
+    }
+
+    #[test]
+    fn output_one_byte_past_the_ceiling_is_refused() {
+        assert_eq!(read_capped(&b"abc"[..], 3).unwrap(), Ok(b"abc".to_vec()));
+        assert_eq!(
+            read_capped(&b"abcd"[..], 3).unwrap(),
+            Err(GitOutputTooLarge { limit: 3 })
+        );
+        assert_eq!(drain_capped(&b"abcdef"[..], 2).unwrap(), b"ab".to_vec());
+    }
+
+    // A git run that prints past its ceiling is stopped and refused.
+    #[test]
+    fn a_git_run_past_its_ceiling_is_refused() {
+        let args = ["--version"];
+        let err = run_git(git_command(".").args(args), ".", &args, 3).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<GitOutputTooLarge>(),
+            Some(&GitOutputTooLarge { limit: 3 })
+        );
+        let out = run_git(git_command(".").args(args), ".", &args, 4096).unwrap();
+        assert!(out.starts_with(b"git version"));
     }
 }
