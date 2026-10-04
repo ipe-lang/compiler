@@ -871,7 +871,9 @@ pub fn project_module_types(solved: &ipe_types::SolvedTypes, home: &[Symbol]) ->
 ///
 /// Keeps each `(home, _)` entry of all nine fields and each warning owned by
 /// `home`, so the slice is the module's whole share of the program: nothing
-/// dropped, nothing filled in.
+/// dropped, nothing filled in. Entries of other homes are not this module's
+/// share: a scoped solve's `env` also holds the dep schemes it was seeded
+/// with, which each dep's own slice serves.
 #[must_use]
 pub fn module_slice(solved: &ipe_types::SolvedTypes, home: &[Symbol]) -> ipe_types::SolvedTypes {
     let ipe_types::SolvedTypes {

@@ -425,7 +425,7 @@ fn open_interface_falls_back_to_the_joint_solve() {
 // Red-edit resilience
 // ---------------------------------------------------------------------------
 
-/// A red edit in one module no longer blanks an unrelated module's types:
+/// A red edit in one module does not blank an unrelated module's types:
 /// the unrelated module's scoped solve stands on its own, while the red
 /// module surfaces the whole-program diagnostic verbatim.
 #[test]
@@ -491,6 +491,38 @@ fn slice_with_vars(home: &[Symbol], vars: u32) -> ipe_db::ModuleSlice {
     (home.to_vec(), Arc::new(canonical))
 }
 
+/// A canonical slice holding no keys and one redundant-branch warning owned by
+/// `owner`.
+fn slice_with_warning_of(owner: &[Symbol]) -> ipe_types::CanonicalTypes {
+    let warning = ipe_types::HomedWarning::new(
+        ipe_diagnostics::Diagnostic::Type {
+            span: ipe_diagnostics::Span::DUMMY,
+            msg: ipe_diagnostics::TypeError::RedundantCaseBranch {
+                constructor: "Red".into(),
+            },
+        },
+        owner,
+    )
+    .expect("a redundant branch is a homed warning");
+    let solved = ipe_types::SolvedTypes {
+        env: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        expected: BTreeMap::new(),
+        bounds: BTreeMap::new(),
+        warnings: vec![warning],
+        poly_var_map: BTreeMap::new(),
+        untyped_type_params: BTreeMap::new(),
+        msg_defaulted_vars: BTreeMap::new(),
+        signature_wildcards: BTreeMap::new(),
+    };
+    ipe_types::canonicalize(
+        solved,
+        ipe_types::VarScope::PerHome,
+        ipe_types::VarCeiling::SOLVER,
+    )
+    .expect("a variable-free slice fits the solver space")
+}
+
 /// A ceiling of `n` variable ids.
 fn ceiling(n: u32) -> ipe_types::VarCeiling {
     ipe_types::VarCeiling::at_most(NonZeroU32::new(n).expect("a non-zero ceiling"))
@@ -547,11 +579,30 @@ fn assembly_refuses_an_incomplete_or_conflicting_cover() {
         Some(FallbackReason::AssemblyConflict),
         "two slices for one home must refuse the assembly"
     );
+    // Two key-free slices of one home share no key, so only the home check
+    // can refuse them.
+    let a_empty = slice_with_vars(&a, 0);
+    assert_eq!(
+        ipe_db::assemble_scoped(
+            &[a_empty.clone(), a_empty],
+            &BTreeSet::from([a.clone()]),
+            solver
+        )
+        .err(),
+        Some(FallbackReason::AssemblyConflict),
+        "two key-free slices for one home must refuse the assembly"
+    );
     let misfiled = (b.clone(), Arc::clone(&a_slice.1));
     assert_eq!(
-        ipe_db::assemble_scoped(&[misfiled], &BTreeSet::from([b]), solver).err(),
+        ipe_db::assemble_scoped(&[misfiled], &BTreeSet::from([b.clone()]), solver).err(),
         Some(FallbackReason::AssemblyConflict),
         "a slice holding another home's keys must refuse the assembly"
+    );
+    let misfiled_warning = (a.clone(), Arc::new(slice_with_warning_of(&b)));
+    assert_eq!(
+        ipe_db::assemble_scoped(&[misfiled_warning], &BTreeSet::from([a.clone()]), solver).err(),
+        Some(FallbackReason::AssemblyConflict),
+        "a slice holding another home's warning must refuse the assembly"
     );
     assert!(
         ipe_db::assemble_scoped(&[a_slice], &BTreeSet::from([a]), solver).is_ok(),
