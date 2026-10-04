@@ -7,6 +7,7 @@ use super::{
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
+use ipe_intern::rust_str_lit;
 
 /// The clone-rewritten container argument of a call whose runtime takes its
 /// arguments reversed ([`Callee::evaluates_args_reversed`], the single source of
@@ -4011,6 +4012,7 @@ pub fn emit_ui_plan(
                     detail: format!("{k:?} is not a fully-classified Html event kernel"),
                 });
             };
+            let name_lit = rust_str_lit(name);
             let [payload_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::HtmlEvent",
@@ -4037,14 +4039,14 @@ pub fn emit_ui_plan(
             };
             let call = match shape {
                 ipe_ir::HtmlEventShape::Msg => {
-                    format!("ipe_runtime::html::html_on_msg_({name:?}.to_owned(), {payload_s})")
+                    format!("ipe_runtime::html::html_on_msg_({name_lit}.to_owned(), {payload_s})")
                 }
                 ipe_ir::HtmlEventShape::String => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_string_({name:?}.to_owned(), \
+                    "ipe_runtime::html::html_on_string_({name_lit}.to_owned(), \
                      ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
                 )),
                 ipe_ir::HtmlEventShape::Bool => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_bool_({name:?}.to_owned(), \
+                    "ipe_runtime::html::html_on_bool_({name_lit}.to_owned(), \
                      ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
                 )),
                 // `html_on_raw_`'s own signature requires
@@ -4121,10 +4123,10 @@ pub fn emit_ui_plan(
                 // (`F: Fn(T) -> M + Send + Sync + 'static`) requires.
                 ipe_ir::HtmlEventShape::Raw => match on_form {
                     ipe_ir::OnFormKind::FixedValue => format!(
-                        "ipe_runtime::html::html_on_raw_fixed_({name:?}.to_owned(), {payload_s})"
+                        "ipe_runtime::html::html_on_raw_fixed_({name_lit}.to_owned(), {payload_s})"
                     ),
                     ipe_ir::OnFormKind::Decoder => wrap_hoisted(format!(
-                        "ipe_runtime::html::html_on_raw_({name:?}.to_owned(), move |_x| ({peeled_payload_src})(_x))"
+                        "ipe_runtime::html::html_on_raw_({name_lit}.to_owned(), move |_x| ({peeled_payload_src})(_x))"
                     )),
                     ipe_ir::OnFormKind::NotForm => {
                         return Err(Diagnostic::CompilerBug {

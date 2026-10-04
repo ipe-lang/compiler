@@ -120,7 +120,7 @@ fn a_qualified_imported_alias_compiles_without_the_definers_imports() {
 }
 
 #[test]
-fn naming_the_definers_private_import_directly_is_still_an_unknown_module() {
+fn naming_the_definers_private_import_directly_demands_its_import() {
     let (result, _) = canonicalise_chain(&[
         HIGHLIGHT,
         INDEX,
@@ -133,11 +133,11 @@ fn naming_the_definers_private_import_directly_is_still_an_unknown_module() {
         matches!(
             &result,
             Err(Diagnostic::Name {
-                msg: NameError::UnknownModule { qualifier, .. },
+                msg: NameError::ImportRequired { qualifier, candidates },
                 ..
-            }) if &**qualifier == "Highlight"
+            }) if &**qualifier == "Highlight" && **candidates == [Box::<str>::from("Lib.Highlight")]
         ),
-        "a module the importer never imported stays IPE-N0004, got {result:?}"
+        "a known module the importer never imported is IPE-N0034, got {result:?}"
     );
 }
 
@@ -221,11 +221,11 @@ fn an_alias_body_naming_a_module_its_definer_never_imports_is_refused_at_the_dec
         matches!(
             &result,
             Err(Diagnostic::Name {
-                msg: NameError::UnknownModule { qualifier, .. },
+                msg: NameError::ImportRequired { qualifier, candidates },
                 ..
-            }) if &**qualifier == "Highlight"
+            }) if &**qualifier == "Highlight" && **candidates == [Box::<str>::from("Lib.Highlight")]
         ),
-        "the definer's own unresolvable alias body is IPE-N0004, got {result:?}"
+        "the definer's own alias body naming an unimported module is IPE-N0034, got {result:?}"
     );
 }
 

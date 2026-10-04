@@ -364,15 +364,22 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         }
     }
 
-    // Known-module universe for the IPE-N0020 did-you-mean list. Strings
-    // only: interning module paths here (before their own canonicalize runs)
-    // would perturb the build-wide symbol numbering the byte-identity SEAL
-    // pins.
-    let known_modules: BTreeSet<Box<str>> = root
-        .files(db)
-        .keys()
-        .map(|path| path.join(".").into_boxed_str())
-        .collect();
+    // The importable-module catalog: project files plus compiled-source stdlib
+    // modules (the kernel paths are seeded by the catalog itself). Read only on
+    // diagnostic paths (IPE-N0020 did-you-mean, IPE-N0034 for an unbound
+    // qualifier). Strings only: interning module paths here (before their own
+    // canonicalize runs) would perturb the build-wide symbol numbering the
+    // byte-identity SEAL pins.
+    let catalog = ipe_canon::ModuleCatalog::new(
+        root.files(db)
+            .keys()
+            .map(|path| path.join(".").into_boxed_str())
+            .chain(
+                ipe_stdlib::COMPILED_STD_MODULES
+                    .iter()
+                    .map(|module| Box::<str>::from(module.dotted)),
+            ),
+    );
     let origin = file.origin(db);
 
     // One lock scope covers expected-path interning + canonicalisation — the
@@ -397,7 +404,7 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         &parsed,
         &expected_path,
         &deps,
-        &known_modules,
+        &catalog,
         *origin,
         &mut interner,
     )?;

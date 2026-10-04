@@ -50,7 +50,7 @@
 use std::borrow::Cow;
 
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
-use ipe_intern::{Interner, Symbol};
+use ipe_intern::{Interner, Symbol, rust_str_lit};
 use ipe_ir::{BinOp, Callee, Expr, IrType, KernelFn, MAX_IR_RENDER_DEPTH, ModPath};
 
 use crate::EmitCtx;
@@ -400,7 +400,7 @@ pub fn build_doc(
         // the SEAL carries `"…".to_string()` adjacently, identical to the string
         // emitter's bytes.
         Expr::Str(s) => Ok(Doc::method_chain(
-            Doc::owned(format!("{s:?}")),
+            Doc::owned(rust_str_lit(s)),
             Doc::text(".to_string()"),
         )),
 
