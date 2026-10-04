@@ -13279,15 +13279,18 @@ impl<'a> Lowerer<'a> {
     /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
     ///
     /// The part's type is the solved region type at `ty_span`, on its storage
-    /// carriers. A span with no recorded region type leaves the alias to the
-    /// existing gates.
+    /// carriers. A binding alias at a span with no recorded region type has no
+    /// part to classify, so it is refused as a compiler bug, never accepted.
     fn refuse_nonclone_alias_part(&self, inner: &Pat, ty_span: Span, span: Span) -> DResult<()> {
         if !clone_class::pat_binds_any_name(inner) {
             return Ok(());
         }
-        let Some(ty) = self.region_ty(ty_span) else {
-            return Ok(());
-        };
+        let ty = self.region_ty(ty_span).ok_or_else(|| {
+            bug(
+                "ipe_lower::refuse_nonclone_alias_part",
+                "no inferred type for an alias part",
+            )
+        })?;
         let part = normalize_record_fun_carriers(self.ir_type_from_ty_json(ty, ty_span)?);
         alias_rebuild_refusal(self.clone_env(), inner, &part, span)
     }
@@ -32800,35 +32803,70 @@ mod tests {
         ));
 
         // The list-`case` ownership decision and the emitter's generic-aware
-        // authority agree: a slice element copies out exactly when its carrier
-        // is `Clone` under the emitted bound.
+        // authority agree exactly on every non-FFI type: a slice element moves
+        // out of an owned view exactly when its carrier is not `Clone` under
+        // the emitted bound. A generic or row-generic leaf at any depth carries
+        // that bound, so a composite over one copies out of the borrow.
         let generic = IrType::Generic(Symbol::from_raw(8));
-        let mut owned_samples = samples;
-        owned_samples.push(generic.clone());
-        for ty in &owned_samples {
+        let row = IrType::RowGeneric(Symbol::from_raw(9));
+        let bounded_samples = [
+            generic.clone(),
+            row.clone(),
+            IrType::Tuple(vec![generic.clone(), IrType::Int]),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+            IrType::List(Box::new(generic)),
+        ];
+        for ty in &bounded_samples {
+            assert_eq!(
+                slice_ownership(env, ty),
+                SliceOwnership::BorrowClone,
+                "a generic-bounded element must copy out: {ty:?}"
+            );
+        }
+        for ty in samples.iter().chain(&bounded_samples) {
             assert_eq!(
                 slice_ownership(env, ty) == SliceOwnership::OwnedMove,
                 !carrier_is_clone_bounded(ty, &payloads),
                 "slice_ownership / carrier_is_clone_bounded drift on {ty:?}"
             );
         }
-        assert_eq!(slice_ownership(env, &generic), SliceOwnership::BorrowClone);
         assert_eq!(slice_ownership(env, &fun), SliceOwnership::OwnedMove);
         assert_eq!(
             slice_ownership(env, &IrType::Task(Box::new(IrType::Int))),
             SliceOwnership::OwnedMove
         );
-        // A composite over a type parameter is the one conservative direction:
-        // `clone_class` floors it to `NonClone`, so its elements move out of the
-        // owned view although a copy-out would also resolve. A move never needs
-        // `Clone`, so this direction cannot break the emitted build; the reverse
-        // (copy-out over a carrier that is not `Clone`) must never occur.
-        let generic_pair = IrType::Tuple(vec![generic, IrType::Int]);
-        assert!(carrier_is_clone_bounded(&generic_pair, &payloads));
-        assert_eq!(
-            slice_ownership(env, &generic_pair),
-            SliceOwnership::OwnedMove
-        );
+
+        // `carrier_is_clone_bounded` is not FFI-aware: it calls an opaque
+        // `Rust.*` handle `Clone`. The list-`case` decision gives such a handle
+        // no `Clone` fact, bare or nested, so its elements move.
+        let mut ffi_interner = Interner::new();
+        let ffi_home = ModPath(vec![
+            ffi_interner.intern("Rust").expect("intern"),
+            ffi_interner.intern("Bevy_ecs").expect("intern"),
+        ]);
+        let handle = IrType::Enum {
+            home: ffi_home,
+            name: ffi_interner.intern("World").expect("intern"),
+            args: Vec::new(),
+        };
+        let ffi_env = CloneEnv {
+            interner: &ffi_interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        for ty in [
+            handle.clone(),
+            IrType::Tuple(vec![handle.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(handle)),
+        ] {
+            assert!(carrier_is_clone_bounded(&ty, &payloads));
+            assert_eq!(
+                slice_ownership(ffi_env, &ty),
+                SliceOwnership::OwnedMove,
+                "an opaque FFI handle element must move out: {ty:?}"
+            );
+        }
     }
 
     /// SEAL: an FFI foreign opaque handle (`Rust.*`-homed `Enum`) is a real
@@ -37143,6 +37181,30 @@ mod tests {
         }
     }
 
+    /// A composite over a row witness carries the emitted `Clone` bound, so its elements copy out.
+    #[test]
+    fn row_generic_composite_elements_copy_out() {
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::slice_ownership;
+
+        let mut fx = OwnFixture::new();
+        let r = fx.sym("r");
+        let env = fx.env();
+        let row = IrType::RowGeneric(r);
+        for elem in [
+            row.clone(),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+        ] {
+            assert_eq!(
+                slice_ownership(env, &elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
     /// A second use of a `List (Task ..)` moved by a list `case` is refused with IPE-L0135.
     #[test]
     fn owned_list_case_reuse_fails_closed() {
@@ -37156,7 +37218,7 @@ mod tests {
         let x = fx.sym("x");
         let r = fx.sym("r");
         let env = fx.env();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
         let case = cons_case(ts, x, r, SliceOwnership::OwnedMove);
         let reused = Expr::Tuple(vec![case.clone(), Expr::Var(ts)]);
@@ -37186,7 +37248,7 @@ mod tests {
         let tasks = fx.sym("tasks");
         let x = fx.sym("x");
         let env = fx.env();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
         let record = IrType::Record(BTreeMap::from([(tasks, list_task.clone())]));
         let field = || Expr::Access {
@@ -37232,7 +37294,7 @@ mod tests {
         let h = fx.sym("h");
         let r = fx.sym("r");
         let env = fx.env();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let handles = IrType::List(Box::new(IrType::Enum {
             home: ModPath(vec![rust, bevy]),
             name: entity,
@@ -37261,7 +37323,7 @@ mod tests {
         let ts = fx.sym("ts");
         let x = fx.sym("x");
         let r = fx.sym("r");
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let noncl = BTreeSet::from([ts]);
         let refused = rewrite_captured_clones(
             &BTreeSet::new(),
@@ -37289,7 +37351,7 @@ mod tests {
         let just = fx.sym("Just");
         let t = fx.sym("t");
         let m = fx.sym("m");
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let just_t = Pat::Ctor {
             home: ModPath(vec![maybe]),
             ty: maybe,
@@ -37318,7 +37380,7 @@ mod tests {
 
         let mut fx = OwnFixture::new();
         let x = fx.sym("x");
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let slice = |own, prefix: Vec<Pat>| Pat::Slice {
             prefix,
             rest: None,
@@ -37357,7 +37419,7 @@ mod tests {
         use super::{nested_cons_ownership_refusal, slice_ownership, unsupported};
 
         let fx = OwnFixture::new();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let own = slice_ownership(fx.env(), &IrType::Task(Box::new(IrType::Int)));
         assert_eq!(
             nested_cons_ownership_refusal(own, span),
@@ -37381,8 +37443,11 @@ mod tests {
         let a = fx.sym("a");
         let b = fx.sym("b");
         let g = fx.sym("g");
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
         let env = fx.env();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let task = IrType::Task(Box::new(IrType::Int));
         let pair = Pat::Tuple(vec![Pat::Var(a), Pat::Var(b)]);
         let nonclone = IrType::Tuple(vec![task, IrType::Int]);
@@ -37403,6 +37468,58 @@ mod tests {
             alias_rebuild_refusal(env, &Pat::Var(a), &IrType::Generic(g), span),
             Ok(())
         );
+        // A composite over a row witness carries the emitted `Clone` bound.
+        let row_part = IrType::Tuple(vec![IrType::RowGeneric(g), IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &row_part, span), Ok(()));
+        // An opaque FFI handle nested in the part has no `Clone` fact.
+        let handle = IrType::Enum {
+            home: ipe_ir::ModPath(vec![rust, bevy]),
+            name: entity,
+            args: Vec::new(),
+        };
+        let ffi_part = IrType::Tuple(vec![handle, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &ffi_part, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A binding alias whose part has no recorded region type is refused as a compiler bug.
+    #[test]
+    fn alias_part_without_region_type_is_a_compiler_bug() {
+        use ipe_diagnostics::Diagnostic;
+        use ipe_ir::Pat;
+
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let main = interner.intern("Main").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![main],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let unrecorded = Span::new(17, 23);
+        let refused = lowerer.refuse_nonclone_alias_part(&Pat::Var(x), unrecorded, unrecorded);
+        assert!(
+            matches!(
+                refused,
+                Err(Diagnostic::CompilerBug {
+                    where_: "ipe_lower::refuse_nonclone_alias_part",
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // An inner that binds nothing takes no part and needs no type.
+        assert_eq!(
+            lowerer.refuse_nonclone_alias_part(&Pat::Wildcard, unrecorded, unrecorded),
+            Ok(())
+        );
     }
 
     /// A borrowed list `case` over `List Int` leaves the list owned, so a later reuse stays accepted.
@@ -37417,7 +37534,7 @@ mod tests {
         let x = fx.sym("x");
         let r = fx.sym("r");
         let env = fx.env();
-        let span = Span::DUMMY;
+        let span = Span::new(17, 23);
         let list_int = IrType::List(Box::new(IrType::Int));
         let own = slice_ownership(env, &IrType::Int);
         assert_eq!(own, SliceOwnership::BorrowClone);

@@ -456,19 +456,32 @@ fn clone_class_named_composite<'a>(
     }
 }
 
+/// Is a value of `ty` non-`Clone` under the bound every emitted generic carries?
+///
+/// A [`IrType::Generic`] or [`IrType::RowGeneric`] leaf counts as `Clone` at
+/// every depth: the emitter stamps a `Clone` bound on every type parameter and
+/// row witness ([`ipe_ir::carrier_is_clone_bounded`]). An opaque `Rust.*` FFI
+/// handle anywhere in the value counts as non-`Clone`: its `Clone`-ness is the
+/// foreign crate's, and the emitter gives it no `Clone` impl to call.
+pub(super) fn bounded_nonclone(env: CloneEnv<'_>, ty: &IrType) -> bool {
+    !ipe_ir::carrier_is_clone_bounded(ty, env.payloads)
+        || ipe_ir::ir_type_holds(ty, env.payloads, &|t| is_opaque_ffi_handle(env, t))
+}
+
+/// Is `t` itself an opaque `Rust.*` FFI handle?
+fn is_opaque_ffi_handle(env: CloneEnv<'_>, t: &IrType) -> bool {
+    matches!(t, IrType::Enum { home, name, .. } if enum_is_opaque_ffi_handle(env, home, *name))
+}
+
 /// How a list pattern over elements of type `elem` takes its binders.
 ///
-/// A bare generic or row-generic element copies out of the borrow: the emitter
-/// stamps a `Clone` bound on every type parameter and row witness. Any other
-/// element follows its [`clone_class`]: a `NonClone` element moves out of an
-/// owned view, a `Copy` or `Clone` element copies out of the borrow.
+/// An element non-`Clone` under the emitted generic bound ([`bounded_nonclone`])
+/// moves out of an owned view; every other element copies out of the borrow.
 pub(super) fn slice_ownership(env: CloneEnv<'_>, elem: &IrType) -> SliceOwnership {
-    if matches!(elem, IrType::Generic(_) | IrType::RowGeneric(_)) {
-        return SliceOwnership::BorrowClone;
-    }
-    match clone_class(env, elem) {
-        CloneClass::NonClone => SliceOwnership::OwnedMove,
-        CloneClass::CopyLeaf | CloneClass::CloneOk => SliceOwnership::BorrowClone,
+    if bounded_nonclone(env, elem) {
+        SliceOwnership::OwnedMove
+    } else {
+        SliceOwnership::BorrowClone
     }
 }
 
@@ -491,21 +504,18 @@ pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
 ///
 /// The alias and the inner binders would each own the same part, and a
 /// non-`Clone` part has no copy to give one of them. An inner that binds
-/// nothing takes no part, and a bare generic or row-generic part carries the
-/// emitted `Clone` bound, so both are accepted.
+/// nothing takes no part, and a part `Clone` under the emitted generic bound
+/// ([`bounded_nonclone`]) copies, so both are accepted.
 pub(super) fn alias_rebuild_refusal(
     env: CloneEnv<'_>,
     inner: &Pat,
     part: &IrType,
     span: Span,
 ) -> DResult<()> {
-    if !pat_binds_any_name(inner) || matches!(part, IrType::Generic(_) | IrType::RowGeneric(_)) {
-        return Ok(());
+    if pat_binds_any_name(inner) && bounded_nonclone(env, part) {
+        return Err(super::unsupported(span, Feature::NonCloneValueReuse));
     }
-    match clone_class(env, part) {
-        CloneClass::NonClone => Err(super::unsupported(span, Feature::NonCloneValueReuse)),
-        CloneClass::CopyLeaf | CloneClass::CloneOk => Ok(()),
-    }
+    Ok(())
 }
 
 /// Refuse (IPE-L0135) an element alias in an owned-move list pattern whose inner binds a name.
