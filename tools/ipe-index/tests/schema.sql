@@ -60,3 +60,19 @@ CREATE TABLE IF NOT EXISTS repos (
   prefix TEXT,
   CHECK ((outer IS NULL) = (prefix IS NULL))
 );
+CREATE TABLE IF NOT EXISTS reviewed_stamp (
+  one  INTEGER PRIMARY KEY CHECK (one = 1),
+  head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
+);
+DROP VIEW IF EXISTS open_units;
+CREATE VIEW open_units AS
+  SELECT u.uid, u.path, u.kind, u.name, u.qualified, u.line_start, u.line_end,
+         u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang,
+         q.change, q.old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at
+  FROM units u
+  LEFT JOIN files f ON f.path = u.path
+  LEFT JOIN change_queue q
+         ON q.uid = u.uid AND q.new_hash = u.body_hash
+        AND q.change IN ('new', 'modified')
+  WHERE NOT EXISTS (SELECT 1 FROM reviewed r
+                    WHERE r.uid = u.uid AND r.body_hash = u.body_hash);

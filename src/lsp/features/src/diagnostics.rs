@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_db::{Db as _, ImportResolution, IpeDatabase, SourceRoot};
-use ipe_diagnostics::{Diagnostic, Severity, Span};
+use ipe_diagnostics::{Diagnostic, NameError, Severity, Span};
 use ipe_intern::Symbol;
 use lsp_types::{DiagnosticSeverity, NumberOrString};
 
@@ -273,11 +273,15 @@ fn home_for_span(linked: &ipe_canon::ast::Module, span: Span) -> Option<Vec<Symb
     best.map(|(_, _, home)| home.to_vec())
 }
 
+/// The `data` key carrying an IPE-N0034 diagnostic's importable modules.
+const IMPORT_CANDIDATES_KEY: &str = "importCandidates";
+
 /// Map one compiler diagnostic to its LSP form.
 ///
 /// `text` is the owning module's source. The message is the compiler's own
 /// snippet-free rendering ([`ipe_diagnostics::plain_message`]) — the wording
-/// cannot drift from `ipe dev build`'s.
+/// cannot drift from `ipe dev build`'s. An import-required diagnostic carries its
+/// typed candidate modules in `data`, so a quick-fix never parses the prose.
 #[must_use]
 pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_types::Diagnostic {
     let span = diag.primary_span();
@@ -299,8 +303,71 @@ pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_
         message: ipe_diagnostics::plain_message(diag, text),
         related_information: None,
         tags: None,
-        data: None,
+        data: import_candidates_data(diag),
     }
+}
+
+/// The `data` payload of an import-required diagnostic: its candidate modules.
+fn import_candidates_data(diag: &Diagnostic) -> Option<serde_json::Value> {
+    let Diagnostic::Name {
+        msg: NameError::ImportRequired { candidates, .. },
+        ..
+    } = diag
+    else {
+        return None;
+    };
+    let modules: Vec<&str> = candidates.iter().map(|m| &**m).collect();
+    Some(serde_json::json!({ IMPORT_CANDIDATES_KEY: modules }))
+}
+
+/// The most import actions one diagnostic's `data` can produce.
+pub(crate) const MAX_IMPORT_CANDIDATES: usize = 64;
+
+/// The candidate modules an LSP diagnostic's `data` carries, in order; empty
+/// when it carries none.
+///
+/// The client echoes `data` back, so it is untrusted input bound for the
+/// document text. The list is taken whole or not at all: it must be at most
+/// [`MAX_IMPORT_CANDIDATES`] entries, each a dotted module path (each segment
+/// an uppercase-initial identifier), strictly ascending (the producer's sorted,
+/// deduplicated order). Any other shape — a newline, a space, a backtick, a
+/// control or bidi character, a duplicate, a non-string — yields no
+/// candidates, so a partly-dropped list can never shrink an ambiguous
+/// qualifier to one "preferred" import.
+#[must_use]
+pub fn import_candidates(diag: &lsp_types::Diagnostic) -> Vec<String> {
+    let Some(entries) = diag
+        .data
+        .as_ref()
+        .and_then(|d| d.get(IMPORT_CANDIDATES_KEY))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    if entries.len() > MAX_IMPORT_CANDIDATES {
+        return Vec::new();
+    }
+    let modules: Option<Vec<&str>> = entries
+        .iter()
+        .map(|m| m.as_str().filter(|m| is_module_path(m)))
+        .collect();
+    match modules {
+        Some(modules) if modules.windows(2).all(|pair| pair.first() < pair.last()) => {
+            modules.into_iter().map(str::to_owned).collect()
+        }
+        Some(_) | None => Vec::new(),
+    }
+}
+
+/// `true` when `text` is `Seg(.Seg)*`, each segment an ASCII uppercase letter
+/// then ASCII letters, digits or `_` (the parser's module-name grammar, so no
+/// homoglyph of a real module survives).
+fn is_module_path(text: &str) -> bool {
+    text.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Run the linter over the project's user modules and return each finding as an

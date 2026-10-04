@@ -215,9 +215,10 @@ pub(super) fn force_shared_capture_clones(sym: Symbol, expr: Expr) -> Expr {
             head: Box::new(force_shared_capture_clones(sym, *head)),
             tail: Box::new(force_shared_capture_clones(sym, *tail)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(force_shared_capture_clones(sym, *list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(force_shared_capture_clones(sym, *list)),
