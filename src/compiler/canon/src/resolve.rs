@@ -6,9 +6,9 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, Candidates, CmdSubShapeMismatch, CodecAutoRejection, DResult, Diagnostic,
-    EditTarget, Located, ModulePlacementReason, ModulePlacementRejection, NameError, ParseError,
-    SealRejection, SortedNames, Span, TypeError,
+    AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
+    DResult, Diagnostic, EditTarget, Located, ModulePlacementReason, ModulePlacementRejection,
+    NameError, ParseError, SealRejection, SortedNames, Span, TypeError,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
@@ -879,7 +879,7 @@ type QualifiedAliases = BTreeMap<Symbol, crate::ExportedAlias>;
 /// The immutable context threaded through [`canonicalise_type`]. Bundling the
 /// read-only references keeps the recursive call under clippy's argument-count
 /// ceiling while leaving the per-call mutable state (`free_vars`, `visited`,
-/// `subst`) explicit at each call site.
+/// `params`) explicit at each call site.
 struct TypeCtx<'a> {
     /// The module environment; a bare type name resolves through its
     /// [`ModuleScope`] type namespace.
@@ -3097,6 +3097,14 @@ fn canonicalise_with_env(
     // annotation and expanded in place at every use site by `canonicalise_type`;
     // an imported one arrives canonical from its defining module. Either way no
     // later stage ever sees an alias.
+    let slots = alias_param_slots(
+        m.aliases
+            .iter()
+            .map(|a| a.value.vars.len())
+            .max()
+            .unwrap_or(0),
+        interner,
+    )?;
     for a in &m.aliases {
         let alias_name = a.value.name.value;
         let alias_span = a.value.name.span;
@@ -3104,7 +3112,7 @@ fn canonicalise_with_env(
         // alias shadowing a built-in would be silently overridden too.
         reject_reserved_builtin_type(alias_name, alias_span, origin, interner)?;
         let body = AliasBody::Local {
-            params: a.value.vars.iter().map(|v| v.value).collect(),
+            params: alias_params(&a.value, &slots),
             body: a.value.body.value.clone(),
         };
         let origin = declared(
@@ -3119,6 +3127,7 @@ fn canonicalise_with_env(
     // importer receives through `ModuleExports::aliases`.
     let own_aliases = resolve_own_aliases(
         m,
+        &slots,
         env,
         qualifier_paths,
         qualified_aliases,
@@ -3266,26 +3275,27 @@ fn canonicalise_with_env(
 /// resolution of source names against the importer's imports. An alias whose
 /// body names something this module cannot see is refused here, at its
 /// declaration, whether or not any module uses it.
+///
+/// # Errors
+/// Any refusal the body's canonicalisation raises, and
+/// [`Diagnostic::CompilerBug`] when a resolved body mentions a variable that is
+/// neither one of its slots nor a variable it leaves free.
 #[allow(clippy::too_many_arguments)] // the resolution context `canonicalise_type` reads
 fn resolve_own_aliases(
     m: &src::Module,
+    slots: &[Symbol],
     env: &Env,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
-    interner: &mut Interner,
+    interner: &Interner,
     ui_wildcard_msg: Symbol,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
-    let max_params = m
-        .aliases
-        .iter()
-        .map(|a| a.value.vars.len())
-        .max()
-        .unwrap_or(0);
-    let slots = alias_param_slots(max_params, interner)?;
-    let interner: &Interner = interner;
     let mut resolved = BTreeMap::new();
     for a in &m.aliases {
         let decl = &a.value;
+        // The same pairing the scope registered, so the exported body and every
+        // local use site name the same slot symbols.
+        let params = alias_params(decl, slots);
         let ctx = TypeCtx {
             env,
             qualifier_paths,
@@ -3294,13 +3304,7 @@ fn resolve_own_aliases(
             ui_wildcard_msg,
             ann_span: decl.body.span,
         };
-        let param_slots: Vec<Symbol> = slots.iter().copied().take(decl.vars.len()).collect();
-        let subst: BTreeMap<Symbol, canon::Type> = decl
-            .vars
-            .iter()
-            .map(|v| v.value)
-            .zip(param_slots.iter().copied().map(canon::Type::Var))
-            .collect();
+        let param_slots: Vec<Symbol> = params.iter().map(|&(_, slot)| slot).collect();
         let mut free_vars = BTreeSet::new();
         // Seeded with the alias itself, exactly as a use-site expansion pushes
         // it, so a self-reference stops rather than recursing.
@@ -3309,12 +3313,17 @@ fn resolve_own_aliases(
         let body = canonicalise_type(
             &decl.body.value,
             &ctx,
-            &subst,
+            &ParamSlots::new(&params),
             &mut free_vars,
             &mut visited,
             &mut budget,
             0,
         )?;
+        // The check walks the finished body, which the canonicalisation above
+        // already bounded by the node ceiling, so it gets a ceiling of its own
+        // rather than halving the one the body may use.
+        let mut check_budget = TYPE_EXPANSION_NODE_LIMIT;
+        refuse_unbound_alias_body_vars(&body, &param_slots, &free_vars, &ctx, &mut check_budget)?;
         resolved.insert(
             decl.name.value,
             crate::ExportedAlias {
@@ -3329,6 +3338,64 @@ fn resolve_own_aliases(
     Ok(resolved)
 }
 
+/// Check that every variable a resolved alias body mentions is one of its slots or left free.
+///
+/// Each `Var` and each open record's row must be a parameter slot, a variable
+/// the body leaves free (quantified at a use site), or the `any` wildcard. A
+/// body holding any other variable would carry a name no use site binds, so it
+/// fails closed here, at the declaration. The walk uses an explicit stack and
+/// spends one node of `budget` per body node.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] on a variable outside that set;
+/// [`NameError::TypeExpansionTooDeep`] when the walk exhausts the budget.
+fn refuse_unbound_alias_body_vars(
+    body: &canon::Type,
+    param_slots: &[Symbol],
+    free_vars: &BTreeSet<Symbol>,
+    ctx: &TypeCtx,
+    budget: &mut u32,
+) -> DResult<()> {
+    let bound =
+        |v: &Symbol| param_slots.contains(v) || free_vars.contains(v) || *v == ctx.ui_wildcard_msg;
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        spend_budget_node(ctx, budget)?;
+        let var = match node {
+            canon::Type::Var(v) => Some(v),
+            canon::Type::RecordOpen(row, fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                Some(row)
+            }
+            canon::Type::Record(fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                None
+            }
+            canon::Type::Lambda(a, b) => {
+                pending.push(a);
+                pending.push(b);
+                None
+            }
+            canon::Type::Con { args, .. } | canon::Type::Tuple(args) => {
+                pending.extend(args);
+                None
+            }
+            canon::Type::Unit => None,
+        };
+        if let Some(v) = var.filter(|v| !bound(v)) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::resolve_own_aliases::body_closed",
+                detail: format!(
+                    "the resolved alias body mentions `{}`, which is neither a parameter nor a \
+                     free variable",
+                    ctx.interner.resolve(*v).unwrap_or("?")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The placeholder variables standing for an exported alias's parameters, by position.
 ///
 /// Each name contains spaces, which no source type variable can spell, so a
@@ -3341,19 +3408,64 @@ fn alias_param_slots(count: usize, interner: &mut Interner) -> DResult<Vec<Symbo
     Ok(slots)
 }
 
-/// Expand an imported alias at a use site by substituting `args` for its parameter slots.
+/// Pair each of `decl`'s type parameters, in source order, with its slot.
 ///
-/// The body is already canonical in its defining module, so this is a pure
-/// structural substitution: no name is resolved against the importer's scope.
-/// Every node spends from the same `budget` and `depth` ceilings as a source
-/// expansion, so a body that grows across a chain of modules stays bounded.
+/// The one pairing both the scope entry and [`resolve_own_aliases`] use, so a
+/// local use site and the exported body rename a parameter to the same slot.
+/// `slots` holds at least as many slots as the module's widest alias declares.
+fn alias_params(decl: &src::TypeAlias, slots: &[Symbol]) -> Vec<(Symbol, Symbol)> {
+    decl.vars
+        .iter()
+        .map(|v| v.value)
+        .zip(slots.iter().copied())
+        .collect()
+}
+
+/// The slot each in-scope alias parameter is renamed to while its body is canonicalised.
+///
+/// [`canonicalise_type`] only renames: a parameter becomes `Var(slot)`, in
+/// value and row position alike, and [`instantiate_alias`] is the one walker
+/// that replaces a slot with an argument. The map's codomain is a symbol, never
+/// a type, so no source walk can substitute half of an alias's positions.
+struct ParamSlots(BTreeMap<Symbol, Symbol>);
+
+impl ParamSlots {
+    /// No parameters in scope: every type variable is free.
+    const fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The parameters of one alias, each paired with its slot.
+    fn new(params: &[(Symbol, Symbol)]) -> Self {
+        Self(params.iter().copied().collect())
+    }
+
+    /// The slot `param` is renamed to, when it is a parameter in scope.
+    fn slot(&self, param: Symbol) -> Option<Symbol> {
+        self.0.get(&param).copied()
+    }
+}
+
+/// Expand an alias at a use site by substituting `args` for its parameter slots.
+///
+/// `body` is canonical with its parameters already renamed to their slots: an
+/// imported alias's exported body, or a local alias's body renamed at this use
+/// site. This is the one walker that substitutes an alias argument, and every
+/// variable-carrying arm (`Var` and an open record's row) consults `args`. The
+/// substitution is simultaneous and an argument is copied without being
+/// walked, so an argument that itself holds a slot (an enclosing alias's
+/// parameter, mid-rename) is never substituted again. Every node spends from
+/// the same `budget` and `depth` ceilings as a source expansion, so a body
+/// that grows across a chain of modules stays bounded.
 ///
 /// # Errors
 /// [`NameError::TypeExpansionTooDeep`] when the expansion exceeds the depth or
-/// node ceiling.
-fn instantiate_imported_alias(
+/// node ceiling; [`NameError::AliasRowArgument`] when a row argument is not a
+/// record or repeats one of the alias's labels.
+fn instantiate_alias(
+    alias: Symbol,
     body: &canon::Type,
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3361,19 +3473,23 @@ fn instantiate_imported_alias(
     spend_expansion_node(ctx, budget, depth)?;
     let next = depth.saturating_add(1);
     Ok(match body {
-        canon::Type::Var(v) => match slots.get(v) {
+        canon::Type::Var(v) => match args.get(v) {
             Some(arg) => copy_substituted_arg(arg, ctx, budget)?,
             None => canon::Type::Var(*v),
         },
         canon::Type::Unit => canon::Type::Unit,
         canon::Type::Lambda(a, b) => canon::Type::Lambda(
-            Box::new(instantiate_imported_alias(a, slots, ctx, budget, next)?),
-            Box::new(instantiate_imported_alias(b, slots, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, a, args, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, b, args, ctx, budget, next)?),
         ),
-        canon::Type::Con { home, name, args } => {
-            let mut can_args = Vec::with_capacity(args.len());
-            for a in args {
-                can_args.push(instantiate_imported_alias(a, slots, ctx, budget, next)?);
+        canon::Type::Con {
+            home,
+            name,
+            args: con_args,
+        } => {
+            let mut can_args = Vec::with_capacity(con_args.len());
+            for a in con_args {
+                can_args.push(instantiate_alias(alias, a, args, ctx, budget, next)?);
             }
             canon::Type::Con {
                 home: home.clone(),
@@ -3384,25 +3500,28 @@ fn instantiate_imported_alias(
         canon::Type::Tuple(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(instantiate_imported_alias(e, slots, ctx, budget, next)?);
+                can_elems.push(instantiate_alias(alias, e, args, ctx, budget, next)?);
             }
             canon::Type::Tuple(can_elems)
         }
         canon::Type::Record(fields) => {
-            canon::Type::Record(instantiate_fields(fields, slots, ctx, budget, next)?)
+            canon::Type::Record(instantiate_fields(alias, fields, args, ctx, budget, next)?)
         }
-        // The row variable is kept as declared, matching a source expansion,
-        // which never substitutes an open record's row variable.
         canon::Type::RecordOpen(row, fields) => {
-            canon::Type::RecordOpen(*row, instantiate_fields(fields, slots, ctx, budget, next)?)
+            let own = instantiate_fields(alias, fields, args, ctx, budget, next)?;
+            match args.get(row) {
+                None => canon::Type::RecordOpen(*row, own),
+                Some(arg) => extend_row(alias, copy_substituted_arg(arg, ctx, budget)?, own, ctx)?,
+            }
         }
     })
 }
 
 /// Substitute parameter slots through each field type of a record body.
 fn instantiate_fields(
+    alias: Symbol,
     fields: &[(Symbol, canon::Type)],
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3411,10 +3530,85 @@ fn instantiate_fields(
     for (name, ty) in fields {
         out.push((
             *name,
-            instantiate_imported_alias(ty, slots, ctx, budget, depth)?,
+            instantiate_alias(alias, ty, args, ctx, budget, depth)?,
         ));
     }
     Ok(out)
+}
+
+/// Fill an alias's open-record row with its argument, extending the argument by `own`.
+///
+/// A type variable stays the row; a closed or open record contributes its
+/// fields ahead of the alias's own. Anything else has no fields to extend.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] when `arg` is not a record or a type
+/// variable, or shares a label with `own`.
+fn extend_row(
+    alias: Symbol,
+    arg: canon::Type,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<canon::Type> {
+    match arg {
+        canon::Type::Var(row) => Ok(canon::Type::RecordOpen(row, own)),
+        canon::Type::Record(fields) => Ok(canon::Type::Record(join_row_fields(
+            alias, fields, own, ctx,
+        )?)),
+        canon::Type::RecordOpen(row, fields) => Ok(canon::Type::RecordOpen(
+            row,
+            join_row_fields(alias, fields, own, ctx)?,
+        )),
+        found @ (canon::Type::Unit
+        | canon::Type::Tuple(_)
+        | canon::Type::Lambda(..)
+        | canon::Type::Con { .. }) => Err(alias_row_refusal(
+            alias,
+            AliasRowFault::NotARecord {
+                found: canon_type_display(&found, ctx.interner),
+            },
+            ctx,
+        )?),
+    }
+}
+
+/// The row argument's fields followed by the alias's own, refusing a shared label.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] ([`AliasRowFault::FieldClash`]) when a
+/// label of `own` is already in `arg`.
+fn join_row_fields(
+    alias: Symbol,
+    mut arg: Vec<(Symbol, canon::Type)>,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<Vec<(Symbol, canon::Type)>> {
+    let arg_labels: BTreeSet<Symbol> = arg.iter().map(|(label, _)| *label).collect();
+    if let Some((label, _)) = own.iter().find(|(label, _)| arg_labels.contains(label)) {
+        return Err(alias_row_refusal(
+            alias,
+            AliasRowFault::FieldClash {
+                field: name_str(ctx.interner, *label)?,
+            },
+            ctx,
+        )?);
+    }
+    arg.extend(own);
+    Ok(arg)
+}
+
+/// The IPE-N0053 refusal of `alias`'s row argument, at the enclosing annotation.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when `alias` is not interned.
+fn alias_row_refusal(alias: Symbol, fault: AliasRowFault, ctx: &TypeCtx) -> DResult<Diagnostic> {
+    Ok(Diagnostic::Name {
+        span: ctx.ann_span,
+        msg: NameError::AliasRowArgument {
+            alias: name_str(ctx.interner, alias)?,
+            fault,
+        },
+    })
 }
 
 /// Does any `import` name an `Ipe.<M>.Unsafe` submodule?
@@ -3735,7 +3929,10 @@ fn witness_record_fields(
         }
         _ => return Ok(None),
     };
-    let subst = BTreeMap::new();
+    // The fields are canonicalised one by one, not through the `TRecord` arm,
+    // so the label check that arm makes is made here too.
+    refuse_duplicate_record_labels(src_fields, interner)?;
+    let no_params = ParamSlots::empty();
     let mut free_set = BTreeSet::new();
     let mut visited = seed;
     let mut can_fields = Vec::with_capacity(src_fields.len());
@@ -3744,7 +3941,7 @@ fn witness_record_fields(
         let cty = canonicalise_type(
             fty,
             &ctx,
-            &subst,
+            &no_params,
             &mut free_set,
             &mut visited,
             &mut budget,
@@ -4398,7 +4595,7 @@ fn synthesize_record_alias_ctors(
         }
 
         // Canonicalise every field type ONCE, in declared (source) order. The
-        // alias's own params fall through to `Type::Var` (empty `subst`), so a
+        // alias's own params fall through to `Type::Var` (no parameters in scope), so a
         // param used in a field generalises and a phantom param drops out. The
         // alias name is pre-seeded into `visited` so a self-referential field
         // (`{ next : List T }`) expands exactly as `x : T` would — the ctor's
@@ -4411,7 +4608,7 @@ fn synthesize_record_alias_ctors(
             ui_wildcard_msg,
             ann_span: a.value.body.span,
         };
-        let subst = BTreeMap::new();
+        let no_params = ParamSlots::empty();
         let mut free_set = BTreeSet::new();
         let mut visited = vec![alias_name];
         let mut can_fields: Vec<(Symbol, canon::Type)> = Vec::with_capacity(fields.len());
@@ -4420,7 +4617,7 @@ fn synthesize_record_alias_ctors(
             let cty = canonicalise_type(
                 fty,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_set,
                 &mut visited,
                 &mut budget,
@@ -5100,19 +5297,19 @@ fn canonicalise_union(
         };
         let mut args = Vec::with_capacity(c.value.args.len());
         for a in &c.value.args {
-            // A constructor field type is canonicalised under an empty
-            // substitution: each free type variable it mentions is one of the
+            // A constructor field type is canonicalised with no alias
+            // parameters in scope: each free type variable it mentions is one of the
             // union's `vars` and resolves to a `Type::Var`. The `free_vars` set is
             // local (the union's quantification, not a binding's), so it is
             // discarded — the declared `vars` are the authoritative parameter list.
             let mut free_vars = BTreeSet::new();
             let mut visited = Vec::new();
-            let subst = BTreeMap::new();
+            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             args.push(canonicalise_type(
                 a,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -5192,12 +5389,12 @@ fn canonicalise_value(
                 ui_wildcard_msg,
                 ann_span: ann.span,
             };
-            let subst = BTreeMap::new();
+            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             let ty = canonicalise_type(
                 &ann.value,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -6422,7 +6619,7 @@ fn resolve_op_func(op: Symbol, interner: &mut Interner) -> DResult<Symbol> {
 enum ResolvedAlias<'a> {
     /// Declared in this module: its source body expands in this module's scope.
     Local {
-        params: &'a [Symbol],
+        params: &'a [(Symbol, Symbol)],
         body: &'a src::TypeAnnotation,
     },
     /// Exported by a dependency, its body already canonical.
@@ -6666,6 +6863,34 @@ fn copy_substituted_arg(
     Ok(arg.clone())
 }
 
+/// Refuse a record type that repeats a label, at the repeated label (IPE-N0010).
+///
+/// A canonical record type has unique labels; checking at the source arms that
+/// build one keeps a later `BTreeMap` collect of its fields from silently
+/// dropping a label.
+///
+/// # Errors
+/// [`NameError::DuplicateValue`] on the second occurrence of a label.
+fn refuse_duplicate_record_labels(
+    fields: &[(Located<Symbol>, src::TypeAnnotation)],
+    interner: &Interner,
+) -> DResult<()> {
+    let mut seen: BTreeMap<Symbol, Span> = BTreeMap::new();
+    for (label, _) in fields {
+        if let Some(&first) = seen.get(&label.value) {
+            return Err(Diagnostic::Name {
+                span: label.span,
+                msg: NameError::DuplicateValue {
+                    name: name_str(interner, label.value)?,
+                    first,
+                },
+            });
+        }
+        seen.insert(label.value, label.span);
+    }
+    Ok(())
+}
+
 /// The `qualified_aliases` key a type reference `qualifier.name` expands
 /// through, if any.
 ///
@@ -6699,9 +6924,11 @@ fn alias_lookup_key(
 /// body, with the use site's type arguments substituted for the alias's declared
 /// parameters, so no later stage observes the alias name.
 ///
-/// `subst` maps an in-scope alias parameter to the (already canonicalised) type
-/// argument bound to it; a `TVar` found in `subst` resolves to that type instead
-/// of remaining free. `visited` carries the chain of aliases currently being
+/// `params` renames each in-scope alias parameter to its slot, in value and
+/// open-record row position alike; a variable not in `params` is free. The
+/// arguments are substituted for the slots afterwards by [`instantiate_alias`],
+/// the one walker that substitutes, so this walk never copies an argument.
+/// `visited` carries the chain of aliases currently being
 /// expanded along this path — a name already in the chain is a recursive alias,
 /// whose expansion stops (the name is left as an opaque constructor) rather than
 /// recursing forever (soundness over completeness: a cyclic alias is exotic, but
@@ -6711,12 +6938,15 @@ fn alias_lookup_key(
 /// [`Diagnostic::Name`] ([`NameError::AliasArity`]) when an alias is applied to a
 /// number of type arguments that differs from its declared parameter count; the
 /// span is the enclosing annotation (the type AST carries no inner spans).
+/// [`NameError::DuplicateValue`] when a record type repeats a label, at the
+/// repeated label; [`NameError::AliasRowArgument`] when an alias's row argument
+/// cannot extend its record.
 /// [`Diagnostic::CompilerBug`] if a name symbol is not interned.
 #[allow(clippy::too_many_lines)] // exhaustive type-annotation walker
 fn canonicalise_type(
     t: &src::TypeAnnotation,
     ctx: &TypeCtx,
-    subst: &BTreeMap<Symbol, canon::Type>,
+    params: &ParamSlots,
     free_vars: &mut BTreeSet<Symbol>,
     visited: &mut Vec<Symbol>,
     budget: &mut u32,
@@ -6728,7 +6958,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 a,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -6737,7 +6967,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 b,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -6745,17 +6975,13 @@ fn canonicalise_type(
             )?),
         )),
         src::TypeAnnotation::TVar(v) => {
-            // A variable bound to an alias argument resolves to that argument; its
-            // own free variables were recorded when the argument was canonicalised
-            // at the use site, so it does not re-enter `free_vars` here. An unbound
+            // An alias parameter is renamed to its slot and never enters
+            // `free_vars`: the use site's argument replaces it. Any other
             // variable is genuinely free and is quantified by the binding.
-            subst.get(v).map_or_else(
-                || {
-                    free_vars.insert(*v);
-                    Ok(canon::Type::Var(*v))
-                },
-                |arg| copy_substituted_arg(arg, ctx, budget),
-            )
+            Ok(canon::Type::Var(params.slot(*v).unwrap_or_else(|| {
+                free_vars.insert(*v);
+                *v
+            })))
         }
         src::TypeAnnotation::TUnit => Ok(canon::Type::Unit),
         src::TypeAnnotation::TTuple(elems) => {
@@ -6764,7 +6990,7 @@ fn canonicalise_type(
                 can_elems.push(canonicalise_type(
                     e,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -6774,10 +7000,12 @@ fn canonicalise_type(
             Ok(canon::Type::Tuple(can_elems))
         }
         src::TypeAnnotation::TRecord(fields) => {
-            // Each field type is canonicalised under the current substitution, so
-            // a field variable bound by an enclosing alias argument resolves to it
-            // and an unbound one is collected into `free_vars` (quantified by the
-            // binding) — exactly the [`TVar`] handling above, applied per field.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            // Each field type is canonicalised with the same parameters in
+            // scope, so a field variable that is an alias parameter is renamed
+            // to its slot and any other is collected into `free_vars`
+            // (quantified by the binding) — exactly the [`TVar`] handling above,
+            // applied per field.
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -6785,7 +7013,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -6796,15 +7024,16 @@ fn canonicalise_type(
             Ok(canon::Type::Record(can_fields))
         }
         src::TypeAnnotation::TRecordOpen(row_var, fields) => {
-            // The row variable names the open tail; like any unbound annotation
-            // variable it is quantified by the binding, so it is collected into
-            // `free_vars` (unless an enclosing alias argument already bound it,
-            // in which case the substitution resolves it). Each constrained
-            // field type is canonicalised exactly as in the closed `TRecord`
-            // arm above.
-            if !subst.contains_key(row_var) {
+            // The row variable names the open tail. An alias parameter is
+            // renamed to its slot, exactly as in the `TVar` arm, so the use
+            // site's argument fills the row; any other row variable is free and
+            // quantified by the binding. Each constrained field type is
+            // canonicalised exactly as in the closed `TRecord` arm above.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            let row = params.slot(*row_var).unwrap_or_else(|| {
                 free_vars.insert(*row_var);
-            }
+                *row_var
+            });
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -6812,7 +7041,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -6820,7 +7049,7 @@ fn canonicalise_type(
                     )?,
                 ));
             }
-            Ok(canon::Type::RecordOpen(*row_var, can_fields))
+            Ok(canon::Type::RecordOpen(row, can_fields))
         }
         src::TypeAnnotation::TType(qualifier, segments, args) => {
             let name = segments.last().copied().unwrap_or_else(|| {
@@ -6881,8 +7110,8 @@ fn canonicalise_type(
             // The engine tag is read syntactically here (never routed through
             // type-home resolution); any tag outside the closed set has no view
             // denotation and is rejected fail-closed as an unresolved type name.
-            // Only the `msg` argument is a real type, canonicalised under the
-            // current substitution.
+            // Only the `msg` argument is a real type, canonicalised with the
+            // current parameters in scope.
             if qualifier_str.is_empty()
                 && ctx.interner.resolve(name) == Some("View")
                 && args.len() == 2
@@ -6912,13 +7141,13 @@ fn canonicalise_type(
                         });
                     }
                 }
-                // The message argument is canonicalised under the current
-                // substitution exactly as any use-site argument; the engine tag
+                // The message argument is canonicalised with the current
+                // parameters in scope exactly as any use-site argument; the engine tag
                 // becomes a nullary `Con` carrying the interned engine name.
                 let msg = canonicalise_type(
                     msg_ann,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -6984,7 +7213,7 @@ fn canonicalise_type(
                     Some(msg_ann) => canonicalise_type(
                         msg_ann,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -7005,15 +7234,15 @@ fn canonicalise_type(
                     ],
                 });
             }
-            // Type arguments are canonicalised under the current substitution
-            // (they appear at the use site) regardless of whether `name` is an
+            // Type arguments are canonicalised with the current parameters in
+            // scope (they appear at the use site) regardless of whether `name` is an
             // alias or an ordinary constructor.
             let mut can_args = Vec::with_capacity(args.len());
             for a in args {
                 can_args.push(canonicalise_type(
                     a,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -7063,26 +7292,45 @@ fn canonicalise_type(
                         })
                     };
                     return match alias {
-                        // A local alias: its declared parameters are bound to the
-                        // canonicalised arguments and the source body is
-                        // canonicalised under that fresh substitution, in this
-                        // module's own scope.
-                        ResolvedAlias::Local { params, body } => {
-                            check_arity(params.len())?;
-                            let body_subst: BTreeMap<Symbol, canon::Type> =
-                                params.iter().copied().zip(can_args).collect();
+                        // A local alias: its source body is canonicalised in this
+                        // module's own scope with its parameters renamed to their
+                        // slots, then the arguments are substituted for the slots
+                        // by the same walker an imported alias expands through.
+                        ResolvedAlias::Local {
+                            params: alias_params,
+                            body,
+                        } => {
+                            check_arity(alias_params.len())?;
                             visited.push(alias_key);
-                            let expanded = canonicalise_type(
+                            let slotted = canonicalise_type(
                                 body,
                                 ctx,
-                                &body_subst,
+                                &ParamSlots::new(alias_params),
                                 free_vars,
                                 visited,
                                 budget,
                                 depth.saturating_add(1),
                             );
                             visited.pop();
-                            expanded
+                            // With no parameters there is nothing to substitute:
+                            // the renamed body is the expansion, and walking it
+                            // again would charge its nodes to the ceiling twice.
+                            if alias_params.is_empty() {
+                                return slotted;
+                            }
+                            let args: BTreeMap<Symbol, canon::Type> = alias_params
+                                .iter()
+                                .map(|&(_, slot)| slot)
+                                .zip(can_args)
+                                .collect();
+                            instantiate_alias(
+                                alias_key,
+                                &slotted?,
+                                &args,
+                                ctx,
+                                budget,
+                                depth.saturating_add(1),
+                            )
                         }
                         // An imported alias: its body is already canonical in the
                         // defining module's scope, so the arguments are
@@ -7091,11 +7339,12 @@ fn canonicalise_type(
                         ResolvedAlias::Imported(exported) => {
                             check_arity(exported.param_slots.len())?;
                             free_vars.extend(exported.free_vars.iter().copied());
-                            let slots: BTreeMap<Symbol, canon::Type> =
+                            let args: BTreeMap<Symbol, canon::Type> =
                                 exported.param_slots.iter().copied().zip(can_args).collect();
-                            instantiate_imported_alias(
+                            instantiate_alias(
+                                alias_key,
                                 &exported.body,
-                                &slots,
+                                &args,
                                 ctx,
                                 budget,
                                 depth.saturating_add(1),
@@ -7626,12 +7875,12 @@ fn detect_custom_element_constructor(
         ui_wildcard_msg,
         ann_span: ann.span,
     };
-    let subst = BTreeMap::new();
+    let no_params = ParamSlots::empty();
     let mut budget = TYPE_EXPANSION_NODE_LIMIT;
     let ty = canonicalise_type(
         &ann.value,
         &ctx,
-        &subst,
+        &no_params,
         &mut free_vars,
         &mut visited,
         &mut budget,

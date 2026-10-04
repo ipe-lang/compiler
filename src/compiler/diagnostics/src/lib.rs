@@ -19,13 +19,13 @@ pub mod terminal;
 // reachable through this re-export.
 pub use code::*;
 pub use diagnostic::{
-    AliasExpansionKind, AppShape, Applicability, Candidates, CaseDefect, CmdSubShapeMismatch,
-    CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic, EditTarget, Expected,
-    ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS,
-    HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect,
-    InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf, ModulePlacementReason,
-    ModulePlacementRejection, NameError, ParseError, RoutePatternDefect, RustNameFoldKind,
-    SandboxError, SealRejection, SortedNames, SpanRole, StoreEqAccessorDefect,
+    AliasExpansionKind, AliasRowFault, AppShape, Applicability, Candidates, CaseDefect,
+    CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic,
+    EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
+    HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
+    IfDefect, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
+    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, RoutePatternDefect,
+    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StoreEqAccessorDefect,
     StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
     WildcardDependence,
 };
