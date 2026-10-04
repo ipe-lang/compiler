@@ -1,5 +1,8 @@
 module Main exposing (main)
 
+import DbTests
+import HarnessTests
+import IndexTests
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
@@ -13,9 +16,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,16 +33,12 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import HarnessTests
-import DbTests
-import ViewTests
-import IndexTests
-import QueueTests
 import LinksTests
-import SafeTextTests
+import QueueTests
 import RepoPathTests
+import SafeTextTests
 import SettingsTests
+import ViewTests
 
 
 -- Every test module must contribute at least one check: an empty list from

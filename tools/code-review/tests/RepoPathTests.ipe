@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,55 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -89,7 +41,6 @@ import TestSupport exposing
 traversalPathsRejected : Task.Task Error Bool
 traversalPathsRejected =
     freshDir "ipe-index-b3-traversal" |> Task.andThen traversalPathsRejectedIn
-
 
 
 traversalPathsRejectedIn : String -> Task.Task Error Bool
@@ -111,7 +62,6 @@ traversalPathsRejectedIn base =
                     && String.contains "ipe:a/../../escape" tag
             )
         |> Task.andThen (\ok -> removeFileIfAny (base ++ "/index.db") |> Task.map (\_ -> ok))
-
 
 
 seedTraversalDb : String -> Task.Task Error ()
@@ -151,14 +101,11 @@ seedTraversalDb base =
         |> Task.map (\_ -> ())
 
 
-
 -- ── typed root and stored-path join ──────────────────────────────────────────
 --
 -- `RepoPath.resolve` refuses every stored path that is not a relative path
 -- strictly below the root, and `parseRoot` accepts a working-directory-relative
 -- root (leading `..` included) while refusing a blank or non-directory one.
-
-
 refusalName : PathError -> String
 refusalName err =
     case err of
@@ -181,7 +128,6 @@ refusalName err =
             "duplicate-tag"
 
 
-
 refusedAs : String -> Result PathError Path.Path -> Bool
 refusedAs expected result =
     case result of
@@ -190,7 +136,6 @@ refusedAs expected result =
 
         Err err ->
             refusalName err == expected
-
 
 
 -- A refusal whose caller-facing message carries `fragment` from the
@@ -205,7 +150,6 @@ refusalNames fragment result =
             String.contains fragment (SafeText.toString (RepoPath.describe err))
 
 
-
 refused : Result PathError Path.Path -> Bool
 refused result =
     case result of
@@ -216,7 +160,6 @@ refused result =
             True
 
 
-
 resolvesTo : String -> Result PathError Path.Path -> Bool
 resolvesTo expected result =
     case result of
@@ -225,7 +168,6 @@ resolvesTo expected result =
 
         Err _ ->
             False
-
 
 
 -- The absolute path `abs` spelled relative to the working directory, climbing
@@ -243,7 +185,6 @@ relativeFromCwd abs =
             )
 
 
-
 -- A root map binding each `( tag, root )`, failing the task on a refusal.
 mapOf : List ( String, Root ) -> Task.Task Error RootMap
 mapOf bindings =
@@ -253,7 +194,6 @@ mapOf bindings =
         |> Result.andThen RepoPath.rootMap
         |> Result.mapError RepoPath.toError
         |> Task.fromResult
-
 
 
 storedPathRefusals : Task.Task Error Bool
@@ -293,7 +233,6 @@ storedPathRefusals =
             )
 
 
-
 -- A root spelled relative to the working directory, climbing with `..`,
 -- resolves to the same absolute directory, and stored paths join under it.
 relativeRootAccepted : Task.Task Error Bool
@@ -319,7 +258,6 @@ relativeRootAccepted =
             )
 
 
-
 -- A map binding only `ipe` refuses a stored path under any other tag rather
 -- than reading it from the one root it has.
 unknownTagRefused : Task.Task Error Bool
@@ -335,7 +273,6 @@ unknownTagRefused =
             )
 
 
-
 -- A directory `File.tempDir` makes unique to this call, holding the two
 -- subdirectories `a` and `b`, so concurrent runs never share roots.
 freshRootBase : Task.Task Error String
@@ -345,7 +282,6 @@ freshRootBase =
         Task.fromResult (Path.fromString (base ++ "/a")) |> Task.andThen File.mkdirAll
         Task.fromResult (Path.fromString (base ++ "/b")) |> Task.andThen File.mkdirAll
         Task.succeed base
-
 
 
 -- Each tag joins under its own root: with `ipe` bound to A and `other` to B,
@@ -375,7 +311,6 @@ tagSelectsItsRoot =
             )
 
 
-
 -- The tag grammar is the subset of ipe-index's `split_tag` that reads a
 -- stored path back as tagged: `split_tag` takes a `:` as the separator only
 -- before the first `/`.
@@ -401,7 +336,6 @@ tagGrammarMatchesWriter =
             )
 
 
-
 -- One row of ipe-index's tag vectors: a raw tag and the writer's refusal
 -- (`Empty`, `Slash`, `Colon`), or `Nothing` for a tag it accepts.
 type alias TagVector =
@@ -409,7 +343,6 @@ type alias TagVector =
     , raw : String
     , refusal : Maybe String
     }
-
 
 
 -- `parseTag` accepts exactly the tags ipe-index's writer accepts, on every
@@ -426,14 +359,13 @@ tagGrammarMatchesVectors =
         Task.succeed (List.length vectors >= 9 && List.all tagVectorHolds vectors)
 
 
-
 tagVectorDecoder : Decode.Decoder TagVector
 tagVectorDecoder =
-    Decode.map3 (\name raw refusal -> { name = name, raw = raw, refusal = refusal })
+    Decode.map3
+        (\name raw refusal -> { name = name, raw = raw, refusal = refusal })
         (Decode.field "name" Decode.string)
         (Decode.field "raw" Decode.string)
         (Decode.field "refusal" (Decode.nullable Decode.string))
-
 
 
 tagVectorHolds : TagVector -> Bool
@@ -446,7 +378,6 @@ tagVectorHolds v =
             tagRefused v.raw
 
 
-
 -- `parseTag` refuses `raw` as `MissingTag`.
 tagRefused : String -> Bool
 tagRefused raw =
@@ -456,7 +387,6 @@ tagRefused raw =
 
         Err err ->
             refusalName err == "missing-tag"
-
 
 
 -- A root map is never empty and never binds a tag twice.
@@ -474,7 +404,6 @@ rootMapRefusals =
             )
 
 
-
 mapRefusedAs : String -> Result PathError RootMap -> Bool
 mapRefusedAs expected result =
     case result of
@@ -483,7 +412,6 @@ mapRefusedAs expected result =
 
         Err err ->
             refusalName err == expected
-
 
 
 -- A stored path carrying a terminal escape, a CR, an LF or a bidi override
@@ -512,13 +440,11 @@ describeEscapesStoredPath =
         ]
 
 
-
 rootRefusalMessage : String -> Task.Task Error (Maybe String)
 rootRefusalMessage raw =
     RepoPath.parseRoot raw
         |> Task.map (\_ -> Nothing)
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
-
 
 
 -- An `IPE_INDEX_ROOT` value carrying a terminal escape, refused as a missing
@@ -541,7 +467,6 @@ rootRefusalEscapesEnv =
                 _ ->
                     False
             )
-
 
 
 -- The same refusal with every foreign field replaced: the `case` names every
@@ -569,7 +494,6 @@ withForeign stored e err =
             DuplicateTag stored
 
 
-
 allPathErrors : List PathError
 allPathErrors =
     let
@@ -577,7 +501,6 @@ allPathErrors =
             Error.unexpected ""
     in
     [ MissingTag "", UnknownTag "", InvalidRelative "" e, NotUnderRoot "" e, NoRoots, DuplicateTag "" ]
-
 
 
 -- Every `PathError`, fed a hazard-bearing stored path and a hazard-bearing
@@ -608,9 +531,11 @@ diagnosticsNeverRaw =
         cwdRoot <- RepoPath.parseRoot cwd
         roots <- mapOf [ ( "ipe", cwdRoot ) ]
         Task.succeed
-            (List.length allPathErrors == 6
+            (List.length allPathErrors
+                == 6
                 && List.all (\err -> clean (withForeign hazards nested err)) allPathErrors
-                && List.all (resolvedClean roots)
+                && List.all
+                    (resolvedClean roots)
                     [ hazards
                     , "other:" ++ hazards
                     , "ipe:" ++ hazards ++ codeText 0
@@ -621,7 +546,6 @@ diagnosticsNeverRaw =
             )
 
 
-
 rootRefused : String -> String -> Task.Task Error Bool
 rootRefused raw reason =
     RepoPath.parseRoot raw
@@ -630,12 +554,10 @@ rootRefused raw reason =
         |> Task.map (refusedFor reason)
 
 
-
 -- Blank, missing, and non-directory roots stop at the parse.
 badRootsRefused : Task.Task Error Bool
 badRootsRefused =
     freshDir "ipe-review-root-refusals" |> Task.andThen badRootsRefusedIn
-
 
 
 badRootsRefusedIn : String -> Task.Task Error Bool
@@ -652,13 +574,11 @@ badRootsRefusedIn base =
         Task.succeed (blank && spaces && missing && notDir)
 
 
-
 -- The index bridge with `IPE_INDEX_ROOT` given relative to the working
 -- directory: the queue loads and every source slice reads from under the root.
 relativeRootLoadsQueue : Task.Task Error Bool
 relativeRootLoadsQueue =
     freshDir "ipe-index-relative-root" |> Task.andThen relativeRootLoadsQueueIn
-
 
 
 relativeRootLoadsQueueIn : String -> Task.Task Error Bool

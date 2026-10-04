@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,55 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , checkReporting
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, checkReporting, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- One fixture name asked for twice yields two directories, and the second
@@ -99,7 +51,6 @@ reseededNameGetsFreshStore =
         Task.succeed (first.indexDb /= second.indexDb && checkUnits r.total r.units)
 
 
-
 -- A check whose task fails is counted as failed under its own name, the line
 -- reported for it names the check and carries its error, and the check after
 -- it still runs; the error's control bytes reach the line rendered, never raw.
@@ -108,7 +59,6 @@ erroringCheckNamedAndCounted : Task.Task Error Bool
 erroringCheckNamedAndCounted =
     freshDir "ipe-review-check-report"
         |> Task.andThen (\base -> erroringCheckReportedTo (base ++ "/report.txt"))
-
 
 
 erroringCheckReportedTo : String -> Task.Task Error Bool
@@ -126,14 +76,12 @@ erroringCheckReportedTo out =
             )
 
 
-
 -- An erroring check and a passing one after it, each reporting to `out`.
 reportedProbes : String -> List (Task.Task Error ( String, Bool ))
 reportedProbes out =
     [ checkReporting (writeFileText out) "the erroring probe" (Task.fail (Error.unexpected ("probe-boom" ++ codeText 27)))
     , checkReporting (writeFileText out) "the probe after it" (Task.succeed True)
     ]
-
 
 
 checks : Task.Task Error (List ( String, Bool ))
