@@ -1315,10 +1315,13 @@ pub(super) fn eject_options() -> BuildOptions {
 ///
 /// ## Security boundary
 ///
-/// The jail enforcement is the SAME code path as `ipe release run` — both call into
-/// `ipe_sandbox::run_jail::{scan_capfloor, satisfies_capfloor, exec_in_run_jail}`.
-/// There is no second jail implementation; any future change to the jail
-/// mechanism automatically applies to both paths.
+/// The wrapper this builds is the one jail launcher for a native-bearing
+/// release: it verifies its profile against the floor in its app through
+/// `ipe_sandbox::run_jail::verify_release_floor` and jails the app through
+/// `ipe_sandbox::run_jail`. `ipe release run` executes the wrapper this
+/// pipeline just built and never a release layout found on disk, so there is
+/// no second jail implementation and no CLI path that trusts an on-disk
+/// profile.
 ///
 /// # Errors
 ///
@@ -3034,45 +3037,94 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 }
 
 /// `ipe release run [<path>] [--out] [--runtime] [--target] [-- <args>...]`
-/// — produce the release artifact, then run exactly the artifact the pipeline
-/// returned, jailed.
+/// — build the release artifact from source, then run exactly the artifact
+/// that build returned, jailed.
 ///
 /// Every run is confined: the embed-mode wrapper jails itself by
-/// construction, and a bundle or a pure-native binary runs through
-/// [`run_sandbox::exec_jailed`], which has no unconfined fallback. A `<path>`
-/// naming a built artifact directory (one holding `ipe-wrapper`) runs that
-/// artifact as built: a bundle's profile is strictly parsed and verified
-/// against the floor embedded in its app before the jailed exec.
+/// construction, and a pure-native binary runs through
+/// [`run_sandbox::exec_jailed`], which has no unconfined fallback. Every grant
+/// a run uses is built in this invocation from this invocation's consent: a
+/// `<path>` naming a release layout found on disk ([`prebuilt_artifact_dir`])
+/// is refused before anything in it is opened, read or executed, because its
+/// grant would be attested only by its own files.
 ///
 /// # Errors
 ///
+/// [`CliError::PrebuiltArtifactRefused`] for a release layout on disk;
 /// [`CliError::NoRunForm`] for a target with no run form; every
-/// [`release_pipeline`] error; an incomplete or unverifiable artifact
-/// directory; a jail refusal.
+/// [`release_pipeline`] error; a jail refusal.
 pub fn run_release_run(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_release_run(rest)?;
-    let output = match prebuilt_artifact_dir(args.build.entry.as_deref()) {
-        Some(dir) if args.build_flags => {
-            return Err(CliError::Usage(text::msg::release_run_artifact_flags(
-                &dir.display(),
-            )));
-        }
-        Some(dir) => prebuilt_artifact(dir)?,
-        None => release_pipeline(&args.build, ReleasePurpose::Run)?,
-    };
+    if let Some(dir) = prebuilt_artifact_dir(args.build.entry.as_deref()) {
+        return Err(prebuilt_refusal(dir));
+    }
+    let output = release_pipeline(&args.build, ReleasePurpose::Run)?;
     let app_args: Vec<std::ffi::OsString> =
         args.app_args.iter().map(std::ffi::OsString::from).collect();
     run_release_output(output, &app_args)
 }
 
-/// The built artifact directory `entry` names: a directory holding the
-/// `ipe-wrapper` a native-bearing release lays out. A directory carrying a
-/// project manifest is a project, never an artifact, whatever else it holds.
+/// The release layout `entry` names: a directory with no proven project
+/// manifest where any release file name, or any manifest name, is not
+/// provably absent.
+///
+/// Only the native-bearing branch of [`release_pipeline`] lays out these
+/// names, so such a directory is a native-bearing artifact or a forgery of
+/// one. The verdict reads directory-entry metadata only (a final link is not
+/// followed) and nothing after it, so no check-then-use window exists. An
+/// entry that is not a directory is a source path for the pipeline.
 fn prebuilt_artifact_dir(entry: Option<&str>) -> Option<&Path> {
     let dir = Path::new(entry?);
-    let present = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
-    let project = present(package_manifest::PACKAGE_IPE) || present(project::IPE_TOML);
-    (!project && present(RELEASE_WRAPPER)).then_some(dir)
+    let is_dir = std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir());
+    let stat = |name: &str| std::fs::symlink_metadata(dir.join(name)).map(drop);
+    (is_dir && is_release_layout(stat)).then_some(dir)
+}
+
+/// Whether a directory whose entries `stat` looks up is a release layout.
+///
+/// A manifest proves a project only when its entry is present. Every other
+/// name refuses unless its lookup fails with `NotFound`: a lookup that fails
+/// any other way cannot prove the name absent, so it counts as present.
+fn is_release_layout(stat: impl Fn(&str) -> std::io::Result<()>) -> bool {
+    let proof = |name: &str| EntryProof::of(&stat(name));
+    let manifests = [package_manifest::PACKAGE_IPE, project::IPE_TOML].map(proof);
+    let layout = [RELEASE_WRAPPER, RELEASE_APP, RELEASE_PROFILE].map(proof);
+    let project = manifests.contains(&EntryProof::Present);
+    !project
+        && manifests
+            .iter()
+            .chain(&layout)
+            .any(|entry| *entry != EntryProof::Absent)
+}
+
+/// What one directory-entry lookup proves about the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryProof {
+    /// The lookup found the entry.
+    Present,
+    /// The lookup failed with `NotFound`.
+    Absent,
+    /// The lookup failed another way: the entry is neither proven present
+    /// nor proven absent.
+    Unprovable,
+}
+
+impl EntryProof {
+    /// The proof one lookup's result carries.
+    fn of(lookup: &std::io::Result<()>) -> Self {
+        match lookup {
+            Ok(()) => Self::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Unprovable,
+        }
+    }
+}
+
+/// The refusal of a release layout at `dir`, naming the directory as typed.
+fn prebuilt_refusal(dir: &Path) -> CliError {
+    CliError::PrebuiltArtifactRefused {
+        dir: TerminalSafe::sanitize(&dir.to_string_lossy()),
+    }
 }
 
 /// The wrapper's file name inside a release artifact directory.
@@ -3082,36 +3134,14 @@ const RELEASE_APP: &str = "ipe-app";
 /// The jail profile's file name inside a release bundle.
 const RELEASE_PROFILE: &str = "ipe.profile";
 
-/// Classify a built artifact directory: a bundle when it carries an app and
-/// a profile. A lone wrapper (an embed-mode build) refuses: its app and
-/// profile are inside the wrapper, so nothing outside it can be verified, and
-/// a file named `ipe-wrapper` is never executed on trust.
-fn prebuilt_artifact(dir: &Path) -> Result<ReleaseOutput, CliError> {
-    let present = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
-    let (app, profile) = (present(RELEASE_APP), present(RELEASE_PROFILE));
-    match (app, profile) {
-        (false, false) => Err(CliError::Usage(
-            text::msg::release_run_wrapper_unverifiable(&dir.display()),
-        )),
-        (true, true) => Ok(ReleaseOutput::Bundle(dir.to_path_buf())),
-        (true, false) | (false, true) => {
-            let missing = if app { RELEASE_PROFILE } else { RELEASE_APP };
-            Err(CliError::Usage(text::msg::release_run_bundle_incomplete(
-                &dir.display(),
-                &missing,
-            )))
-        }
-    }
-}
-
 /// Run a release artifact, confined, with `app_args`.
 ///
 /// The embed-mode wrapper the pipeline just built is executed with the app
 /// arguments behind its `--`: it verifies its embedded profile against its
-/// embedded floor and jails itself, failing closed. A bundle's app is read
-/// once, verified against its profile, and those verified bytes run jailed; a
-/// pure-native binary is jailed under the profile its consented capabilities
-/// lower to.
+/// embedded floor and jails itself, failing closed. A pure-native binary is
+/// jailed under the profile its consented capabilities lower to. A bundle is
+/// refused like a release layout on disk: its profile is a file the run would
+/// trust on sight.
 fn run_release_output(
     output: ReleaseOutput,
     app_args: &[std::ffi::OsString],
@@ -3131,19 +3161,7 @@ fn run_release_output(
             })
         }
         ReleaseOutput::Embedded(wrapper) => exec_program(&wrapper, &wrapper_argv(app_args)),
-        ReleaseOutput::Bundle(dir) => {
-            let verified = run_sandbox::load_and_verify_artifact(
-                &dir.join(RELEASE_PROFILE),
-                &dir.join(RELEASE_APP),
-            )?;
-            let tmp = run_sandbox::make_scoped_tmp()?;
-            Err(run_sandbox::exec_verified_jailed(
-                &verified,
-                tmp.path(),
-                &working_tree()?,
-                app_args,
-            ))
-        }
+        ReleaseOutput::Bundle(dir) => Err(prebuilt_refusal(&dir)),
         ReleaseOutput::PureNative { binary, profile } => {
             let tmp = run_sandbox::make_scoped_tmp()?;
             Err(run_sandbox::exec_jailed(
@@ -4520,7 +4538,10 @@ mod held_crate_tests {
 
 #[cfg(test)]
 mod help_on_misuse_tests {
-    use super::{RELEASE_WRAPPER, prebuilt_artifact_dir, with_help_on_misuse, wrapper_argv};
+    use super::{
+        RELEASE_APP, RELEASE_PROFILE, RELEASE_WRAPPER, is_release_layout, prebuilt_artifact_dir,
+        with_help_on_misuse, wrapper_argv,
+    };
     use crate::CliError;
     use crate::ffi::FfiPrepError;
     use crate::verb::Verb;
@@ -4540,9 +4561,6 @@ mod help_on_misuse_tests {
         );
     }
 
-    /// A directory with a project manifest is a project, never an artifact:
-    /// a planted wrapper beside `package.ipe` or `ipe.toml` is not what
-    /// `release run` runs. The same directory without a manifest is one.
     /// The crate name joins onto a target dir as one plain component; a
     /// traversal, a separator, an unquoted or misplaced name, an oversized or
     /// an absent manifest is refused, never replaced by a default name that
@@ -4595,27 +4613,139 @@ mod help_on_misuse_tests {
         );
     }
 
+    /// Every nonempty subset of the three release file names.
+    fn release_name_subsets() -> Vec<Vec<&'static str>> {
+        let names = [RELEASE_WRAPPER, RELEASE_APP, RELEASE_PROFILE];
+        (1u8..8)
+            .map(|mask| {
+                names
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & (1 << bit) != 0)
+                    .map(|(_, name)| *name)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A directory with a project manifest is a project, never an artifact:
+    /// a planted release file beside `package.ipe` or `ipe.toml` is not what
+    /// `release run` refuses. Without a manifest, any one of the three
+    /// release names makes the directory a release layout; an empty
+    /// directory and a file entry are not one.
     #[test]
     fn a_project_dir_is_never_a_prebuilt_artifact() {
         let tmp = ipe_test_temp::temp_root()
             .join(format!("ipec-prebuilt-project-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create dir");
-        std::fs::write(tmp.join(RELEASE_WRAPPER), b"").expect("write wrapper");
         let dir = tmp.to_string_lossy().into_owned();
-        let bare = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
-        std::fs::write(tmp.join(package_manifest::PACKAGE_IPE), b"").expect("write manifest");
-        let with_package = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
-        std::fs::remove_file(tmp.join(package_manifest::PACKAGE_IPE)).expect("remove manifest");
-        std::fs::write(tmp.join(project::IPE_TOML), b"").expect("write legacy manifest");
-        let with_toml = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
+        let detected = || prebuilt_artifact_dir(Some(dir.as_str())).is_some();
+        let empty = detected();
+        let mut verdicts = Vec::new();
+        for subset in release_name_subsets() {
+            for name in &subset {
+                std::fs::write(tmp.join(name), b"").expect("write release file");
+            }
+            let bare = detected();
+            std::fs::write(tmp.join(package_manifest::PACKAGE_IPE), b"").expect("write manifest");
+            let with_package = detected();
+            std::fs::remove_file(tmp.join(package_manifest::PACKAGE_IPE)).expect("remove manifest");
+            std::fs::write(tmp.join(project::IPE_TOML), b"").expect("write legacy manifest");
+            let with_toml = detected();
+            std::fs::remove_file(tmp.join(project::IPE_TOML)).expect("remove legacy manifest");
+            for name in &subset {
+                std::fs::remove_file(tmp.join(name)).expect("remove release file");
+            }
+            verdicts.push((subset, bare, with_package, with_toml));
+        }
+        let file_entry = tmp.join("Main.ipe");
+        std::fs::write(&file_entry, b"").expect("write source file");
+        let file = prebuilt_artifact_dir(Some(&file_entry.to_string_lossy())).is_some();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!empty, "an empty dir is not a release layout");
+        assert!(!file, "a file entry is a source path, not a release layout");
+        for (subset, bare, with_package, with_toml) in verdicts {
+            assert!(bare, "{subset:?} with no manifest is a release layout");
+            assert!(!with_package, "{subset:?} beside package.ipe is a project");
+            assert!(!with_toml, "{subset:?} beside ipe.toml is a project");
+        }
+    }
+
+    /// A lookup that fails other than `NotFound` cannot prove a name absent,
+    /// so it counts as present: a release name, or a manifest that cannot be
+    /// proven, refuses. A manifest proves a project only when it is found.
+    #[test]
+    fn an_unprovable_entry_is_a_release_layout() {
+        use std::io::{Error, ErrorKind};
+        let lookup = |failing: &'static str, kind: ErrorKind| {
+            move |name: &str| -> std::io::Result<()> {
+                if name == failing {
+                    Err(Error::from(kind))
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            }
+        };
+        assert!(
+            !is_release_layout(|_: &str| Err(Error::from(ErrorKind::NotFound))),
+            "every name provably absent is no release layout"
+        );
+        for name in [
+            RELEASE_WRAPPER,
+            RELEASE_APP,
+            RELEASE_PROFILE,
+            package_manifest::PACKAGE_IPE,
+            project::IPE_TOML,
+        ] {
+            for kind in [
+                ErrorKind::PermissionDenied,
+                ErrorKind::NotADirectory,
+                ErrorKind::Other,
+            ] {
+                assert!(
+                    is_release_layout(lookup(name, kind)),
+                    "{name} failing with {kind:?} must count as present"
+                );
+            }
+        }
+        let project_with_unprovable_app = |name: &str| -> std::io::Result<()> {
+            if name == package_manifest::PACKAGE_IPE {
+                Ok(())
+            } else {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            }
+        };
+        assert!(
+            !is_release_layout(project_with_unprovable_app),
+            "a found manifest makes the dir a project"
+        );
+    }
+
+    /// An unsearchable directory is a release layout: its entries' lookups
+    /// fail with `PermissionDenied`, which proves nothing absent.
+    ///
+    /// Where the host does not enforce the mode (a superuser), the lookup
+    /// finds nothing to deny and the directory is provably empty;
+    /// `an_unprovable_entry_is_a_release_layout` pins the verdict there.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsearchable_dir_is_a_release_layout() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = ipe_test_temp::temp_root()
+            .join(format!("ipec-prebuilt-unsearchable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create dir");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o000)).expect("chmod dir");
+        let probe = std::fs::symlink_metadata(tmp.join(RELEASE_APP));
+        let enforced = matches!(&probe, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied);
+        let detected = prebuilt_artifact_dir(Some(&tmp.to_string_lossy())).is_some();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
-            bare,
-            "a wrapper-bearing dir with no manifest is an artifact dir"
+            detected || !enforced,
+            "an unsearchable dir must be refused, not read as empty: {probe:?}"
         );
-        assert!(!with_package, "a dir with package.ipe is a project");
-        assert!(!with_toml, "a dir with ipe.toml is a project");
     }
 
     /// Every app argument reaches the embed-mode app, wrapper flags and a

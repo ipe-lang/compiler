@@ -26,9 +26,7 @@ use std::path::Path;
 
 use ipe_diagnostics::Diagnostic as SharedDiag;
 use ipe_ir::Capability;
-use ipe_sandbox::run_jail::{
-    self, DatabaseAxis, FloorIntent, FloorRefusal, RunJailDefect, SandboxProfile,
-};
+use ipe_sandbox::run_jail::{self, DatabaseAxis, FloorIntent, RunJailDefect, SandboxProfile};
 
 use crate::CliError;
 use crate::project::ProjectManifest;
@@ -286,41 +284,16 @@ pub fn make_scoped_tmp() -> Result<ScratchDir, CliError> {
     ScratchDir::new("ipe-run").map_err(|source| CliError::ScratchUnavailable { source })
 }
 
-/// Reconstruct the capability axes a profile grants, as a `Capability` set.
-///
-/// This is the input to the override/refusal policy for a deployed artifact
-/// (which has no source to re-infer from). `database` is not reconstructed: it
-/// was already lowered to `network`/`filesystem` when the profile was built, so
-/// the axes here are the concrete OS-enforced ones.
-#[must_use]
-pub fn profile_axes(profile: &SandboxProfile) -> BTreeSet<Capability> {
-    use ipe_sandbox::run_jail::FilesystemScope;
-    let mut set = BTreeSet::new();
-    if profile.network {
-        set.insert(Capability::Network);
-    }
-    if matches!(profile.filesystem, FilesystemScope::WorkingTreeReadWrite) {
-        set.insert(Capability::Filesystem);
-    }
-    if profile.subprocess {
-        set.insert(Capability::Subprocess);
-    }
-    if !profile.env_allowlist.is_empty() {
-        set.insert(Capability::Env);
-    }
-    set
-}
-
 /// The Rust source of a `#[used]` static that embeds the capability floor into
 /// the emitted binary's `.rodata`.
 ///
-/// `ipe release run` scans this *passively off disk* (never by executing the binary) as
+/// The release wrapper scans this *passively* (never by executing the binary) as
 /// the authoritative floor a tampered `ipe.profile` cannot go below —
 /// [`ipe_sandbox::run_jail::scan_capfloor`] finds it by its
 /// [`ipe_sandbox::run_jail::CAPFLOOR_MARKER`] prefix. The floor lands in
 /// `.rodata` (referenced from `fn main`) so it survives linker GC and `strip`.
 ///
-/// `intent` records which pipeline built the binary, so `ipe release run`
+/// `intent` records which pipeline built the binary, so the release wrapper
 /// can refuse a development build.
 #[must_use]
 pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> String {
@@ -348,13 +321,13 @@ pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> 
     // named section: an allocated section survives `strip` (the deploy artifact
     // builds release with `strip = true`), whereas a non-alloc custom section is
     // stripped away. `#[used]` + `#[no_mangle]` keep the linker from
-    // garbage-collecting the never-read static. `ipe release run` finds the floor by
-    // scanning the binary for the unique `ipe-capfloor` marker — see
+    // garbage-collecting the never-read static. The release wrapper finds the floor
+    // by scanning the binary for the unique `ipe-capfloor` marker — see
     // `ipe_sandbox::run_jail::scan_capfloor`.
     format!(
         "\n// The runtime capability FLOOR, embedded read-only in `.rodata` so a\n\
          // tampered ipe.profile cannot request less isolation than this binary was\n\
-         // built for. `ipe release run` scans this out of the binary WITHOUT running it.\n\
+         // built for. The release wrapper scans this out of the binary WITHOUT running it.\n\
          // `.rodata` survives `strip`; a custom link-section would not.\n\
          #[used]\n\
          #[unsafe(no_mangle)]\n\
@@ -364,7 +337,7 @@ pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> 
 }
 
 /// The floor intent a build of `intent` embeds: only a release build's floor
-/// lets `ipe release run` run the app.
+/// lets the release wrapper run the app.
 #[must_use]
 pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent {
     match intent {
@@ -379,7 +352,7 @@ pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent 
 /// capability-floor static appended to the emitted `src/main.rs` (embedded in
 /// the binary). The profile is a *convenience mirror* the launcher parses; the
 /// authoritative floor is the embedded static. A profile weaker than the floor
-/// is refused at launch (`ipe release run`), so tampering the mirror alone cannot
+/// is refused at launch (by the release wrapper), so tampering the mirror alone cannot
 /// under-isolate. The floor names `intent`, the pipeline about to build the
 /// crate: the artifacts are written before the build, so the binary carries
 /// exactly this floor.
@@ -403,7 +376,7 @@ pub fn write_build_artifacts(
     //    so the linker genuinely retains the bytes (a mere `#[used]` is
     //    garbage-collected by an aggressive linker like `mold`, and `strip`
     //    removes the unreferenced data). The read keeps the bytes in `.rodata`,
-    //    where `strip` cannot touch them; `ipe release run` scans them out passively.
+    //    where `strip` cannot touch them; the release wrapper scans them out passively.
     //    Idempotent: a re-build replaces any prior floor block + reference.
     let main_rs = crate_dir.path_to(Path::new("src").join("main.rs"))?;
     let existing = crate::io_bounded::read_to_string_capped(
@@ -456,147 +429,6 @@ fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     out.push_str(FLOOR_REFERENCE);
     out.push_str(&src[insert_at..]);
     Ok(out)
-}
-
-/// A deployed release app read once and verified against its `ipe.profile`.
-///
-/// Holds the exact bytes the floor scan judged, so the jailed exec runs those
-/// bytes ([`exec_verified_jailed`]) rather than re-opening the path the scan
-/// read.
-pub struct VerifiedArtifact {
-    profile: SandboxProfile,
-    bytes: Vec<u8>,
-    path: std::path::PathBuf,
-}
-
-impl std::fmt::Debug for VerifiedArtifact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerifiedArtifact")
-            .field("profile", &self.profile)
-            .field("path", &self.path)
-            .field("len", &self.bytes.len())
-            .finish()
-    }
-}
-
-/// Read and verify the deployed artifact's floor against its `ipe.profile`.
-///
-/// The authoritative floor is the binary's embedded `.rodata` capfloor line,
-/// scanned passively (the binary is never executed) over bytes read once
-/// under [`crate::io_bounded::RELEASE_APP_READ_CAP`].
-///
-/// # Errors
-///
-/// [`CliError::Usage`] on a missing/tampered profile or a profile weaker
-/// than the embedded floor (both refuse-to-run); [`CliError::FileTooLarge`]
-/// on a binary past the cap.
-pub fn load_and_verify_artifact(
-    profile_path: &Path,
-    binary_path: &Path,
-) -> Result<VerifiedArtifact, CliError> {
-    verify_artifact_under(
-        profile_path,
-        binary_path,
-        crate::io_bounded::RELEASE_APP_READ_CAP,
-    )
-}
-
-/// [`load_and_verify_artifact`] with the binary read held under `binary_cap`
-/// bytes (a planted oversized binary is [`CliError::FileTooLarge`], never
-/// buffered whole).
-fn verify_artifact_under(
-    profile_path: &Path,
-    binary_path: &Path,
-    binary_cap: u64,
-) -> Result<VerifiedArtifact, CliError> {
-    // Parse the profile mirror strictly (parse-fail ⇒ refuse).
-    let profile_text =
-        crate::io_bounded::read_to_string_capped(profile_path, run_jail::PROFILE_READ_CAP)?;
-    let profile = run_jail::parse_profile(&profile_text).map_err(|e| {
-        CliError::Usage(crate::text::msg::run_profile_unparsable(
-            &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
-            &e,
-        ))
-    })?;
-
-    // Read the authoritative floor from the binary's embedded `.rodata` bytes
-    // (passively — the binary is NOT executed). The floor must be readable,
-    // a release build's, and no narrower than the profile — the one check the
-    // release wrapper applies too.
-    let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
-    if let Err(refusal) = run_jail::verify_release_floor(&profile, &bytes) {
-        let code = RunJailDefect::ProfileWeakerThanFloor.code();
-        return Err(CliError::Usage(match refusal {
-            FloorRefusal::Unreadable => crate::text::msg::run_floor_unreadable(&code.as_str()),
-            FloorRefusal::NotRelease => crate::text::msg::run_floor_not_release(&code.as_str()),
-            FloorRefusal::ProfileWider => {
-                crate::text::Message::relay(&RunJailDefect::ProfileWeakerThanFloor)
-            }
-        }));
-    }
-    Ok(VerifiedArtifact {
-        profile,
-        bytes,
-        path: binary_path.to_path_buf(),
-    })
-}
-
-/// Run a [`VerifiedArtifact`] inside the run jail. Returns only on failure.
-///
-/// Where the jail takes a sealed delivery (Linux, macOS) the app runs from
-/// the verified bytes themselves, so a file swapped in at the path after the
-/// scan is never what runs. Elsewhere the jail execs the path.
-#[must_use]
-pub fn exec_verified_jailed(
-    artifact: &VerifiedArtifact,
-    scoped_tmp: &Path,
-    working_tree: &Path,
-    app_args: &[OsString],
-) -> CliError {
-    #[cfg(any(
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ),
-        target_os = "macos"
-    ))]
-    {
-        let wants_wall_clock = artifact.profile.limits.wall_secs.is_some();
-        let defect = match run_jail::probe_run_jail_tools(wants_wall_clock) {
-            Ok(tools) => match run_jail::write_sealed_app_memfd(&artifact.bytes) {
-                Ok(sealed) => match run_jail::exec_embedded_in_run_jail(
-                    &tools,
-                    &artifact.profile,
-                    scoped_tmp,
-                    working_tree,
-                    &sealed,
-                    app_args,
-                ) {
-                    Err(defect) => defect,
-                    Ok(never) => match never {},
-                },
-                Err(defect) => defect,
-            },
-            Err(defect) => defect,
-        };
-        defect_error(defect)
-    }
-    #[cfg(not(any(
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ),
-        target_os = "macos"
-    )))]
-    {
-        exec_jailed(
-            &artifact.profile,
-            scoped_tmp,
-            working_tree,
-            &artifact.path,
-            app_args,
-        )
-    }
 }
 
 /// Build the sandbox-override warning string from a resolved palette.
@@ -808,31 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_binary_read_is_capped_before_the_floor_scan() {
-        let dir = ScratchDir::new("ipe-verify-cap").expect("scratch dir");
-        let profile = SandboxProfile::maximally_isolated();
-        let profile_path = dir.path().join("ipe.profile");
-        std::fs::write(&profile_path, profile.to_profile_string()).expect("write profile");
-        let mut binary = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
-        binary.push(b'\n');
-        let binary_path = dir.path().join("ipe-app");
-        std::fs::write(&binary_path, &binary).expect("write binary");
-        let len = u64::try_from(binary.len()).expect("small length");
-
-        // At the cap the floor is read and verified.
-        assert!(
-            verify_artifact_under(&profile_path, &binary_path, len).is_ok(),
-            "a binary exactly at the cap verifies"
-        );
-        // One byte past the cap is refused before the binary is buffered whole.
-        let over = verify_artifact_under(&profile_path, &binary_path, len - 1);
-        assert!(
-            matches!(over, Err(CliError::FileTooLarge { .. })),
-            "a binary past the cap is FileTooLarge, got: {over:?}"
-        );
-    }
-
-    #[test]
     fn inject_floor_reference_is_idempotent_under_strip_and_reinject() {
         // A minimal emitted-main shape.
         let base = "fn ipe_main() {}\n\nfn main() {\n    run();\n}\n";
@@ -908,22 +715,5 @@ mod tests {
             w.contains(crate::style::Palette::COLOR.reset),
             "colour warning must reset attributes: {w:?}"
         );
-    }
-
-    #[test]
-    fn profile_axes_reconstructs_the_granted_set() {
-        use ipe_sandbox::run_jail::FilesystemScope;
-        let p = SandboxProfile {
-            network: true,
-            filesystem: FilesystemScope::WorkingTreeReadWrite,
-            subprocess: false,
-            env_allowlist: vec!["X".to_owned()],
-            limits: ipe_sandbox::run_jail::RunResourceLimits::default(),
-        };
-        let axes = profile_axes(&p);
-        assert!(axes.contains(&Capability::Network));
-        assert!(axes.contains(&Capability::Filesystem));
-        assert!(axes.contains(&Capability::Env));
-        assert!(!axes.contains(&Capability::Subprocess));
     }
 }

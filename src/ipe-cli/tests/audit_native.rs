@@ -1173,7 +1173,8 @@ mod real_jail {
     //
     // Each exercise spawns the real `ipe` binary, plants a secret under the
     // invoker's home (outside the project, readable unjailed), and asserts the
-    // program run by `ipe release run` started but could not read it.
+    // program `ipe release run` built and ran started but could not read it. A
+    // release layout found on disk is never run.
 
     /// The secret every `release run` exercise plants outside the project.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1218,11 +1219,12 @@ mod real_jail {
     }
 
     /// Lay out a release bundle whose app is a shell script carrying the
-    /// embedded floor for `caps`, beside the matching `ipe.profile`.
+    /// embedded floor for `caps`, beside the matching `ipe.profile`: a layout
+    /// that passes every check a bundle can make of itself.
     ///
-    /// The app prints `started`, prints the file named by its second argument
-    /// when given (a working-tree read), then tries to print the file named by
-    /// its first argument and reports `LEAKED` when that read succeeds.
+    /// The wrapper exits 97. The app prints `started`, prints the file named
+    /// by its second argument when given, then tries to print the file named
+    /// by its first argument and reports `LEAKED` when that read succeeds.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn floor_bundle(base: &std::path::Path, caps: &[Capability]) -> (PathBuf, SandboxProfile) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1253,6 +1255,55 @@ mod real_jail {
         );
         std::fs::write(dir.join("ipe.profile"), profile.to_profile_string()).expect("profile");
         (dir, profile)
+    }
+
+    /// Write a `Rust.Csum`-crossing package under `base` declaring `declares`
+    /// whose `Main.ipe` runs `body` after printing `started` and the
+    /// native checksum of `"abc"` (`checksum 294`), returning the package root.
+    ///
+    /// The emitted crate pins the bound crate as a registry version; a cargo
+    /// config at `base` patches that pin to the local fixture crate, so the
+    /// release build `ipe release run` performs resolves it offline. It
+    /// changes where `csum` comes from, never what the emitted code says.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn write_release_native_package(
+        base: &std::path::Path,
+        declares: &str,
+        imports: &str,
+        body: &str,
+    ) -> PathBuf {
+        let pkg = write_native_crossing_package(base, declares);
+        std::fs::write(
+            pkg.join("src").join("Main.ipe"),
+            format!(
+                "module Main exposing (main)\n\n\
+                 import Ipe.Io as Io\n\
+                 import Ipe.String as String\n\
+                 import Rust.Csum as Csum\n\
+                 {imports}\n\n\
+                 checksumLine =\n\
+                 \x20   case Csum.checksum \"abc\" of\n\
+                 \x20       Ok n -> \"checksum \" ++ String.fromInt n\n\
+                 \x20       Err _ -> \"checksum err\"\n\n\n\
+                 main =\n\
+                 \x20   do\n\
+                 \x20       Io.println \"started\"\n\
+                 \x20       Io.println checksumLine\n\
+                 {body}"
+            ),
+        )
+        .expect("Main.ipe");
+        let cargo_config = base.join(".cargo");
+        std::fs::create_dir_all(&cargo_config).expect("cargo config dir");
+        std::fs::write(
+            cargo_config.join("config.toml"),
+            format!(
+                "[patch.crates-io]\ncsum = {{ path = {:?} }}\n",
+                base.join("csum").display().to_string()
+            ),
+        )
+        .expect("cargo config");
+        pkg
     }
 
     /// A pure-native program run by `ipe release run` is jailed.
@@ -1317,12 +1368,14 @@ mod real_jail {
         );
     }
 
-    /// A built artifact directory runs verified and jailed.
+    /// A release layout on disk is refused before anything in it runs.
     ///
-    /// A directory holding no verifiable bundle refuses before anything runs.
+    /// The forged bundle passes every check it can make of itself, and its
+    /// wrapper exits 97: a run of it would show `started` or that code. With
+    /// its profile removed, the partial layout refuses the same way.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn release_run_accepts_artifact_dir() {
+    fn release_run_refuses_artifact_dir() {
         if e2e_tools().is_none() {
             return;
         }
@@ -1331,30 +1384,37 @@ mod real_jail {
         let (dir, _) = floor_bundle(&base, &[]);
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
-        let (ok, stdout, stderr) = release_run(
-            &work,
-            &[
-                dir.clone().into_os_string(),
-                "--".into(),
-                secret.into_os_string(),
-            ],
-        );
-        assert!(
-            ok && stdout.contains("started"),
-            "a verified bundle runs:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            !stdout.contains(&token) && !stdout.contains("LEAKED"),
-            "a bundle run from its directory is jailed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-
+        let refused = |args: &[std::ffi::OsString]| {
+            let mut cmd = std::process::Command::new(super::support::ipe_bin());
+            cmd.arg("release").arg("run").args(args).current_dir(&work);
+            let out = super::run_child(cmd).expect("run ipe release run");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let full = refused(&[
+            dir.clone().into_os_string(),
+            "--".into(),
+            secret.into_os_string(),
+        ]);
         std::fs::remove_file(dir.join("ipe.profile")).expect("drop the profile");
-        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let partial = refused(&[dir.clone().into_os_string()]);
         let _ = std::fs::remove_dir_all(&base);
-        assert!(
-            !ok && !stdout.contains("started") && stderr.contains("ipe.profile"),
-            "a bundle with no profile refuses before running:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        let shown = dir.display().to_string();
+        for (what, (code, stdout, stderr)) in [("full", full), ("partial", partial)] {
+            assert!(
+                code.is_some_and(|c| c != 0 && c != 97)
+                    && !stdout.contains("started")
+                    && !stdout.contains(&token),
+                "a {what} release layout never runs:\ncode {code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("holds a prebuilt release") && stderr.contains(&shown),
+                "a {what} release layout is refused by name:\nstderr:\n{stderr}"
+            );
+        }
     }
 
     /// Every regular file beneath `dir` whose bytes carry the capability-floor marker.
@@ -1381,29 +1441,43 @@ mod real_jail {
 
     /// The app `ipe release run` delivers into the jail leaves no copy on the host.
     ///
-    /// The run's scratch dir lands in the `TMPDIR` the test names (the app
-    /// reports it), yet no file carrying the app's floor is left beneath it.
+    /// A native-bearing package runs through the single-binary wrapper the
+    /// run just built. The run's scratch dir lands in the `TMPDIR` the test
+    /// names (the app reports it), yet no file carrying the app's floor is
+    /// left beneath it.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn release_run_leaves_no_app_copy_in_tmp() {
         if e2e_tools().is_none() {
             return;
         }
+        let _runtime = e2e_support::require_runtime();
         let base = non_tmp_base("release-run-no-copy");
-        let (dir, _) = floor_bundle(&base, &[]);
-        let work = base.join("work");
+        let pkg = write_release_native_package(
+            &base,
+            "NativeFfi, Env",
+            "import Ipe.System as System",
+            "\x20       Io.println (\"tmpdir=\" ++ System.getenvOr \"TMPDIR\" \"\")\n",
+        );
         let tmpdir = base.join("tmp");
-        std::fs::create_dir_all(&work).expect("work dir");
         std::fs::create_dir_all(&tmpdir).expect("tmp dir");
         let tmpdir = std::fs::canonicalize(&tmpdir).expect("canonical tmp dir");
-        let (ok, stdout, stderr) =
-            release_run_with_tmpdir(&work, &[dir.into_os_string()], Some(&tmpdir));
+        let (ok, stdout, stderr) = release_run_with_tmpdir(
+            &pkg,
+            &[
+                pkg.join("package.ipe").into_os_string(),
+                "--out".into(),
+                base.join("out").into_os_string(),
+            ],
+            Some(&tmpdir),
+        );
         let left = floor_bearing_files(&tmpdir);
         let _ = std::fs::remove_dir_all(&base);
         assert!(
             ok && stdout.contains("started")
+                && stdout.contains("checksum 294")
                 && stdout.contains(&format!("tmpdir={}", tmpdir.display())),
-            "the app runs with its scratch dir under the named TMPDIR (control):\n\
+            "the native app runs with its scratch dir under the named TMPDIR (control):\n\
              stdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
@@ -1412,104 +1486,57 @@ mod real_jail {
         );
     }
 
-    /// A floor-bearing app run by `ipe release run` is jailed to its grants.
+    /// A native-bearing package run by `ipe release run` is jailed to its grants.
     ///
-    /// Its granted working tree is readable; a path outside it is not.
+    /// It runs through the single-binary wrapper the run just built: its
+    /// granted working tree is readable; a path outside it is not.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn release_run_native_bearing_is_jailed() {
         if e2e_tools().is_none() {
             return;
         }
+        let _runtime = e2e_support::require_runtime();
         let base = non_tmp_base("release-run-native");
         let (secret, token) = plant_secret(&base);
-        let (dir, _) = floor_bundle(&base, &[Capability::Filesystem]);
-        let work = base.join("work");
-        std::fs::create_dir_all(&work).expect("work dir");
-        let inside = work.join("inside.txt");
+        let pkg_root = base.join("pkg");
+        let inside = pkg_root.join("inside.txt");
+        let body = format!(
+            "\x20       inside <- Task.fromResult (Path.fromString {:?})\n\
+             \x20       granted <- File.readFile inside\n\
+             \x20       Io.println granted\n\
+             \x20       secret <- Task.fromResult (Path.fromString {:?})\n\
+             \x20       contents <- File.readFile secret\n\
+             \x20       Io.println (\"LEAKED \" ++ contents)\n",
+            inside.display().to_string(),
+            secret.display().to_string()
+        );
+        let pkg = write_release_native_package(
+            &base,
+            "NativeFfi, Filesystem",
+            "import Ipe.File as File\nimport Ipe.Path as Path\nimport Ipe.Task as Task",
+            &body,
+        );
         std::fs::write(&inside, "granted-working-tree-read").expect("inside file");
-        let (ok, stdout, stderr) = release_run(
-            &work,
+        let (_, stdout, stderr) = release_run(
+            &pkg,
             &[
-                dir.into_os_string(),
-                "--".into(),
-                secret.into_os_string(),
-                inside.into_os_string(),
+                pkg.join("package.ipe").into_os_string(),
+                "--out".into(),
+                base.join("out").into_os_string(),
             ],
         );
         let _ = std::fs::remove_dir_all(&base);
         assert!(
-            ok && stdout.contains("started") && stdout.contains("granted-working-tree-read"),
-            "the granted working tree is readable (control):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            stdout.contains("started")
+                && stdout.contains("checksum 294")
+                && stdout.contains("granted-working-tree-read"),
+            "the native app runs and its granted working tree is readable (control):\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            !stdout.contains(&token) && !stdout.contains("LEAKED"),
+            !stdout.contains(&token) && !stdout.contains("LEAKED") && !stderr.contains(&token),
             "nothing outside the grant is readable:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-
-    /// `ipe release run` executes the artifact it verified, never a stand-in.
-    ///
-    /// A profile tampered to grant more than the app's embedded floor, or an
-    /// app whose floor was stripped, refuses before anything runs.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[test]
-    fn release_run_runs_returned_artifact() {
-        if e2e_tools().is_none() {
-            return;
-        }
-        let base = non_tmp_base("release-run-tamper");
-        let (dir, _) = floor_bundle(&base, &[]);
-        let work = base.join("work");
-        std::fs::create_dir_all(&work).expect("work dir");
-        let (granted, _) = floor_bundle(&base.join("granted"), &[Capability::Network]);
-        std::fs::copy(granted.join("ipe.profile"), dir.join("ipe.profile"))
-            .expect("tamper the profile");
-        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        assert!(
-            !ok && !stdout.contains("started"),
-            "a profile granting more than the floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-
-        let (dir, _) = floor_bundle(&base.join("stripped"), &[]);
-        std::fs::write(dir.join("ipe-app"), "#!/bin/sh\necho started\n").expect("strip the floor");
-        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(
-            !ok && !stdout.contains("started"),
-            "an app with no embedded floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
-
-    /// `ipe release run` refuses an app a development build produced, naming
-    /// the release build that would make it runnable.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[test]
-    fn release_run_refuses_a_development_build() {
-        if e2e_tools().is_none() {
-            return;
-        }
-        let base = non_tmp_base("release-run-dev-build");
-        let (dir, profile) = floor_bundle(&base, &[]);
-        let work = base.join("work");
-        std::fs::create_dir_all(&work).expect("work dir");
-        std::fs::write(
-            dir.join("ipe-app"),
-            format!(
-                "#!/bin/sh\n# {}\necho started\n",
-                profile.to_capfloor_line(ipe_sandbox::run_jail::FloorIntent::Development)
-            ),
-        )
-        .expect("a development build's app");
-        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(
-            !ok && !stdout.contains("started"),
-            "a development build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("ipe release build"),
-            "the refusal names the remedy:\nstderr:\n{stderr}"
         );
     }
 }

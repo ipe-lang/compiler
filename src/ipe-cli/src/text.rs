@@ -1475,12 +1475,6 @@ messages! {
     publish_fresh_refused(name) = "publish-fresh-refused";
     /// The emitted `fn main` anchor is absent from the build.
     run_main_anchor_absent = "run-main-anchor-absent";
-    /// A jail profile does not parse.
-    run_profile_unparsable(code, detail) = "run-profile-unparsable";
-    /// A binary carries no readable capability floor.
-    run_floor_unreadable(code) = "run-floor-unreadable";
-    /// A binary's capability floor was embedded by a development build.
-    run_floor_not_release(code) = "run-floor-not-release";
     /// A declared program entry outside `Main` is not yet buildable.
     build_entry_not_main(module) = "build-entry-not-main";
     /// `ipe pack` is retired.
@@ -1515,12 +1509,8 @@ messages! {
     cli_no_run_form(target) = "cli-no-run-form";
     /// The `ipe release build` form a no-run-form target builds with.
     cli_no_run_form_hint(form) = "cli-no-run-form-hint";
-    /// `ipe release run <dir>` given a directory and build arguments together.
-    release_run_artifact_flags(dir) = "release-run-artifact-flags";
-    /// `ipe release run <dir>` found a bundle missing one of its three files.
-    release_run_bundle_incomplete(dir, missing) = "release-run-bundle-incomplete";
-    /// `ipe release run <dir>` found a lone wrapper with no app and profile to verify.
-    release_run_wrapper_unverifiable(dir) = "release-run-wrapper-unverifiable";
+    /// `ipe release run` was pointed at a prebuilt release layout.
+    release_run_prebuilt_refused(dir: &crate::style::TerminalSafe) = "release-run-prebuilt-refused";
     /// `wasm-bindgen` failed while bundling a `--target wasm` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.

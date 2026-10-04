@@ -221,7 +221,7 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
-        "release_run_accepts_artifact_dir",
+        "release_run_refuses_artifact_dir",
         JAIL_ABSENT,
     ),
     (
@@ -232,16 +232,6 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     (
         "src/ipe-cli/tests/audit_native.rs",
         "release_run_native_bearing_is_jailed",
-        JAIL_ABSENT,
-    ),
-    (
-        "src/ipe-cli/tests/audit_native.rs",
-        "release_run_runs_returned_artifact",
-        JAIL_ABSENT,
-    ),
-    (
-        "src/ipe-cli/tests/audit_native.rs",
-        "release_run_refuses_a_development_build",
         JAIL_ABSENT,
     ),
     (

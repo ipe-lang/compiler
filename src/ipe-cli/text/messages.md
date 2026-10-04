@@ -1871,18 +1871,6 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ipe dev build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
 
-## run-profile-unparsable
-
-{code}: {detail} — refusing to run (a profile that does not parse is not honored)
-
-## run-floor-unreadable
-
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
-
-## run-floor-not-release
-
-{code}: the app was built by `ipe dev build`, not `ipe release build` — `ipe release run` runs only a release build: rebuild it with `ipe release build`
-
 ## build-entry-not-main
 
 program entry module `{module}` is not yet buildable — a declared `programs` entry outside module `Main` type-checks (`ipe type-check`) but native emission still assumes a `Main` entry. Name the entry file `Main.ipe`, or track the multi-program emit follow-up
@@ -1951,17 +1939,9 @@ the wrapper member's package is not {package}
 
 = help: build it with `ipe release build {form}`
 
-## release-run-artifact-flags
+## release-run-prebuilt-refused
 
-ipe release run: {dir} is a built artifact directory; it runs as built and takes no build arguments
-
-## release-run-bundle-incomplete
-
-ipe release run: the bundle at {dir} has no {missing}; a bundle runs only with its wrapper, app and profile together
-
-## release-run-wrapper-unverifiable
-
-ipe release run: {dir} holds a wrapper with no app and profile beside it, so there is nothing to verify; ipe release run runs a bundle directory or a project
+{dir} holds a prebuilt release; `ipe release run` runs only what it builds from source in the same invocation — run `ipe release run <project>`, or run the deployed bundle through its own `./ipe-wrapper`
 
 ## wasm-bindgen-failed
 

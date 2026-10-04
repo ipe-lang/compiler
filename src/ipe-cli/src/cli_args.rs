@@ -1242,9 +1242,6 @@ impl NoRunTarget {
 pub struct ReleaseRunArgs {
     /// The release build the run executes: embed mode, no inspection flag.
     pub build: ReleaseArgs,
-    /// Whether any build-selecting argument (`--out`, `--runtime`, `--target`,
-    /// a delivery word) was written; a prebuilt artifact directory takes none.
-    pub build_flags: bool,
     /// Arguments after `--`, forwarded verbatim to the program.
     pub app_args: Vec<String>,
 }
@@ -1317,7 +1314,6 @@ pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
         });
     }
 
-    let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
     let target = ReleaseTarget::from_target(target)?;
 
     Ok(ReleaseRunArgs {
@@ -1331,7 +1327,6 @@ pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
             emit_permissions: None,
             format: OutputFormat::Human,
         },
-        build_flags,
         app_args,
     })
 }

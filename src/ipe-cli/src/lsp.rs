@@ -125,6 +125,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::UnknownGroupSub { .. }
         | CliError::GroupRequired { .. }
         | CliError::NoRunForm { .. }
+        | CliError::PrebuiltArtifactRefused { .. }
         | CliError::WrapperSourceRefused(_)
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }

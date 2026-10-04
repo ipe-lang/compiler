@@ -291,6 +291,14 @@ pub enum CliError {
         /// The target with no run form.
         target: crate::cli_args::NoRunTarget,
     },
+    /// `ipe release run` refuses a release layout found on disk: its
+    /// capability grant is attested only by its own files.
+    ///
+    /// Nothing in the directory was opened, read or executed.
+    PrebuiltArtifactRefused {
+        /// The directory the user named.
+        dir: TerminalSafe,
+    },
     /// A native-bearing release refused the `ipe_wrapper` source it builds.
     ///
     /// Nothing was built: the wrapper builds only from the verified compiler
@@ -664,6 +672,7 @@ impl CliError {
             Self::UnknownGroupSub { .. } => "unknown-group-sub",
             Self::GroupRequired { .. } => "group-required",
             Self::NoRunForm { .. } => "no-run-form",
+            Self::PrebuiltArtifactRefused { .. } => "prebuilt-artifact-refused",
             Self::WrapperSourceRefused(_) => "wrapper-source-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
@@ -749,6 +758,7 @@ impl CliError {
             | Self::UnknownGroupSub { .. }
             | Self::GroupRequired { .. }
             | Self::NoRunForm { .. }
+            | Self::PrebuiltArtifactRefused { .. }
             | Self::WrapperSourceRefused(_)
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
@@ -799,6 +809,7 @@ impl CliError {
                 | Self::UnknownGroupSub { .. }
                 | Self::GroupRequired { .. }
                 | Self::NoRunForm { .. }
+                | Self::PrebuiltArtifactRefused { .. }
                 | Self::DocCoverage(_)
                 | Self::DocExamplesFailed(_)
                 | Self::VerifyFailed { .. }
@@ -987,6 +998,9 @@ impl std::fmt::Display for CliError {
                     &target.build_form(),
                 )))
             }
+            Self::PrebuiltArtifactRefused { dir } => f.write_str(&crate::style::gutter(
+                &text::release_run_prebuilt_refused(dir),
+            )),
             Self::WrapperSourceRefused(refusal) => f.write_str(&text::cli_wrapper_source_refused(
                 &refusal.root.display(),
                 &refusal.defect,
@@ -1481,6 +1495,15 @@ mod tests {
             "capability-mismatch"
         );
         assert_eq!(CliError::HealthCritical.machine_kind(), "health-critical");
+        let prebuilt = CliError::PrebuiltArtifactRefused {
+            dir: TerminalSafe::sanitize("bundle\u{1b}[31m"),
+        };
+        assert_eq!(prebuilt.machine_kind(), "prebuilt-artifact-refused");
+        assert_eq!(prebuilt.fault(), crate::screen::Fault::User);
+        assert!(prebuilt.renders_own_screen());
+        let shown = prebuilt.to_string();
+        assert!(shown.contains("bundle"), "{shown:?}");
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
     }
 
     /// A scratch failure renders only the error kind: neither the temp root

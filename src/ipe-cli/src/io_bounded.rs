@@ -58,13 +58,6 @@ pub const SESSION_TRACE_READ_CAP: u64 = 16 * 1024 * 1024;
 /// index entries, OAuth tokens, Cargo profile fragments, etc.).
 pub const SMALL_FILE_READ_CAP: u64 = 1024 * 1024;
 
-/// Maximum bytes for a deployed release app binary (`ipe-app`, or a prebuilt
-/// `ipe-wrapper` carrying an embedded app) scanned for its capability floor.
-///
-/// 512 MiB is far above any statically-linked app while refusing a planted
-/// device node or multi-GiB file before it is buffered whole.
-pub const RELEASE_APP_READ_CAP: u64 = ipe_sandbox::run_jail::APP_READ_CAP;
-
 // ── Regular-file open ─────────────────────────────────────────────────────────
 
 /// Why a path was refused before any of it was read.

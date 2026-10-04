@@ -5655,7 +5655,7 @@ fn release_run_wasm_refuses() {
     );
     let parsed = cli_args::parse_release_run(&["--".to_owned(), "--target".to_owned()]);
     assert!(
-        matches!(&parsed, Ok(args) if args.app_args == ["--target"] && !args.build_flags),
+        matches!(&parsed, Ok(args) if args.app_args == ["--target"]),
         "a `--target` after `--` belongs to the program: {parsed:?}"
     );
 }
@@ -5683,73 +5683,116 @@ fn release_run_host_bundle_refuses() {
     }
 }
 
-/// Assert `result` is a `release run` usage refusal whose reason contains `needle`.
-fn assert_release_run_refusal(result: &Result<(), CliError>, needle: &str, what: &str) {
+/// Assert `result` is the `release run` refusal of the release layout at `dir`.
+fn assert_prebuilt_refused(result: &Result<(), CliError>, dir: &str, what: &str) {
     assert!(
         matches!(
             result,
-            Err(CliError::CommandUsage { command, reason })
-                if *command == Verb::RELEASE_RUN.name() && reason.as_str().contains(needle)
+            Err(CliError::PrebuiltArtifactRefused { dir: shown }) if shown.as_str() == dir
         ),
         "{what}: {result:?}"
     );
 }
 
-/// An artifact directory runs as built: a build option beside it refuses.
-///
-/// A bundle missing its profile refuses naming it, before anything runs.
-#[test]
-fn release_run_artifact_dir_refuses_build_flags_and_partial_bundles() {
+/// A fresh, empty fixture directory under the out-of-checkout temp root.
+fn release_layout_fixture(tag: &str) -> std::path::PathBuf {
     let tmp = ipe_test_temp::temp_root()
-        .join(format!("ipec-release-run-artifact-{}", std::process::id()));
+        .join(format!("ipec-release-layout-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create artifact dir");
-    fs::write(tmp.join("ipe-wrapper"), b"").expect("write wrapper");
-    fs::write(tmp.join("ipe-app"), b"").expect("write app");
-    let dir = tmp.to_string_lossy().into_owned();
-    let with_flag = run_argv(&["release", "run", &dir, "--out", "x"]);
-    let partial = run_argv(&["release", "run", &dir]);
-    let _ = fs::remove_dir_all(&tmp);
-    assert_release_run_refusal(
-        &with_flag,
-        &dir,
-        "an artifact directory takes no build option",
+    fs::create_dir_all(&tmp).expect("create fixture dir");
+    tmp
+}
+
+/// A forged bundle never runs: its profile matches the floor its app
+/// carries, so it would pass every check the bundle can make of itself, yet
+/// `release run` refuses it before anything in it is opened.
+///
+/// The planted app and wrapper write a marker when run; the marker must stay
+/// absent. With the app at mode `000` the verdict is the same refusal, never
+/// an I/O error, so nothing in the directory was read.
+#[cfg(unix)]
+#[test]
+fn release_run_refuses_a_forged_bundle_without_reading_it() {
+    use ipe_sandbox::run_jail::{FloorIntent, SandboxProfile};
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = release_layout_fixture("forged");
+    let marker = tmp.join("ran");
+    let profile = SandboxProfile::maximally_isolated();
+    let script = format!(
+        "#!/bin/sh\n# {}\ntouch '{}'\nexit 0\n",
+        profile.to_capfloor_line(FloorIntent::Release),
+        marker.display()
     );
-    assert_release_run_refusal(
-        &partial,
-        "ipe.profile",
-        "a bundle without its profile refuses naming it",
+    for name in ["ipe-wrapper", "ipe-app"] {
+        let path = tmp.join(name);
+        fs::write(&path, &script).expect("write planted executable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod executable");
+    }
+    fs::write(tmp.join("ipe.profile"), profile.to_profile_string()).expect("write profile");
+    let dir = tmp.to_string_lossy().into_owned();
+    let readable = run_argv(&["release", "run", &dir]);
+    fs::set_permissions(tmp.join("ipe-app"), fs::Permissions::from_mode(0o000)).expect("chmod app");
+    let unreadable = run_argv(&["release", "run", &dir]);
+    let ran = marker.exists();
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(!ran, "a planted bundle must never be executed");
+    assert_prebuilt_refused(&readable, &dir, "a forged bundle refuses");
+    assert_prebuilt_refused(
+        &unreadable,
+        &dir,
+        "an unreadable app refuses the same way, before any read",
     );
 }
 
-/// A directory holding only an `ipe-wrapper` is never executed: nothing
-/// outside the wrapper can be verified, so the run refuses before any exec.
-///
-/// The planted wrapper writes a marker when run; the marker must stay absent.
+/// Each nonempty subset of the release file names is a release layout, and
+/// so is a dangling link standing for one; a build option beside a full
+/// bundle does not change the verdict, which precedes every build argument.
+#[test]
+fn release_run_refuses_every_release_layout() {
+    let names = ["ipe-wrapper", "ipe-app", "ipe.profile"];
+    for mask in 1u8..8 {
+        let tmp = release_layout_fixture(&format!("subset-{mask}"));
+        let present: Vec<&str> = names
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, name)| *name)
+            .collect();
+        for name in &present {
+            fs::write(tmp.join(name), b"").expect("write release file");
+        }
+        let dir = tmp.to_string_lossy().into_owned();
+        let result = run_argv(&["release", "run", &dir]);
+        let _ = fs::remove_dir_all(&tmp);
+        assert_prebuilt_refused(&result, &dir, &format!("{present:?} is a release layout"));
+    }
+
+    let tmp = release_layout_fixture("full-with-out");
+    for name in names {
+        fs::write(tmp.join(name), b"").expect("write release file");
+    }
+    let dir = tmp.to_string_lossy().into_owned();
+    let out = tmp.join("x").to_string_lossy().into_owned();
+    let with_out = run_argv(&["release", "run", &dir, "--out", &out]);
+    let _ = fs::remove_dir_all(&tmp);
+    assert_prebuilt_refused(
+        &with_out,
+        &dir,
+        "a build option beside a bundle refuses the same",
+    );
+}
+
+/// A dangling link named `ipe-app` is a release layout: the verdict reads
+/// the entry, never the file it names.
 #[cfg(unix)]
 #[test]
-fn release_run_refuses_a_lone_wrapper_without_running_it() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let tmp = ipe_test_temp::temp_root().join(format!(
-        "ipec-release-run-lone-wrapper-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create artifact dir");
-    let marker = tmp.join("ran");
-    let wrapper = tmp.join("ipe-wrapper");
-    fs::write(
-        &wrapper,
-        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
-    )
-    .expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+fn release_run_refuses_a_dangling_release_link() {
+    let tmp = release_layout_fixture("dangling");
+    std::os::unix::fs::symlink(tmp.join("absent"), tmp.join("ipe-app")).expect("plant link");
     let dir = tmp.to_string_lossy().into_owned();
     let result = run_argv(&["release", "run", &dir]);
-    let ran = marker.exists();
     let _ = fs::remove_dir_all(&tmp);
-    assert!(!ran, "a lone planted wrapper must never be executed");
-    assert_release_run_refusal(&result, &dir, "a lone wrapper refuses naming its directory");
+    assert_prebuilt_refused(&result, &dir, "a dangling ipe-app link is a release layout");
 }
 
 /// The wrapper source is the build-time workspace, never a planted ancestor.

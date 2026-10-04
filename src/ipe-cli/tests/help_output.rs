@@ -281,7 +281,7 @@ fn release_run_intercepts_its_own_help() {
 
     // `ipe release run --help` must be intercepted as a help request: it prints
     // the command page to stdout and exits 0, rather than treating `--help` as
-    // an artifact directory.
+    // a path.
     let r = run(&["release", "run", "--help"]);
     assert!(r.ok, "`ipe release run --help` must exit 0");
     assert!(
