@@ -1902,6 +1902,35 @@ mod tests {
         );
     }
 
+    /// An `ipe dev` build embeds no floor: the release reader refuses it as
+    /// unreadable, whatever profile it is offered.
+    #[test]
+    fn verify_release_floor_refuses_a_floorless_binary() {
+        let floorless: &[u8] = b"\x7fELF\x02\x01\x01\0fn main() {}\0";
+        for profile in [
+            SandboxProfile::maximally_isolated(),
+            SandboxProfile {
+                network: true,
+                ..SandboxProfile::maximally_isolated()
+            },
+        ] {
+            assert_eq!(
+                verify_release_floor(&profile, floorless),
+                Err(FloorRefusal::Unreadable)
+            );
+            assert_eq!(
+                verify_release_floor(&profile, b""),
+                Err(FloorRefusal::Unreadable)
+            );
+        }
+        assert!(
+            FloorRefusal::Unreadable
+                .to_string()
+                .contains("embeds no readable capability floor"),
+            "the refusal names why"
+        );
+    }
+
     #[test]
     fn parse_capfloor_refuses_an_unreadable_floor() {
         assert!(parse_capfloor("garbage").is_err());

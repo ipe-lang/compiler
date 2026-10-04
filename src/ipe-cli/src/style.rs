@@ -265,25 +265,6 @@ pub fn use_color(stream: &impl IsTerminal) -> bool {
     stream.is_terminal() && ipe_env::var_os("NO_COLOR").is_none()
 }
 
-/// Build the sandbox-override warning line for stderr.
-///
-/// Returns a guttered, framed string ready to pass to `eprint!`. Bold-red when
-/// `p` is the colour palette; plain text when it is the plain palette (i.e.
-/// when stderr is not a terminal or `NO_COLOR` is set). The message text and
-/// interpolated values are owned by the caller; this function only applies the
-/// palette and layout.
-#[must_use]
-pub fn sandbox_override_warning(p: &Palette, override_env: &str, axes: &str) -> String {
-    frame(&gutter(&format!(
-        "{bold}{red}warning: {override_env}=1 — running native Rust code ({axes}) WITHOUT a \
-         capability jail. Its effects are NOT proven safe and it runs with your full authority. \
-         Install a jail primitive to confine it; never set this in CI.{reset}",
-        bold = p.bold,
-        red = p.red,
-        reset = p.reset,
-    )))
-}
-
 /// Build the shadowed-abbreviation warning line for stderr.
 ///
 /// A `{git=}` escape's requested abbreviated hex ref was shadowed by a

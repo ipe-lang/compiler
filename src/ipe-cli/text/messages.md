@@ -1979,9 +1979,9 @@ ipe dev run {flag}: {name} has no recordable session — recording and replay ca
 
 ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
-## session-jailed
+## session-ffi-unproven
 
-ipe dev run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed — its replay is not proven deterministic
 
 ## session-flags-exclusive
 

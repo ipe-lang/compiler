@@ -1,6 +1,5 @@
 The command-line flags several `ipe` commands share, described once. A command page lists one with `- @<flag>`.
 
-- `[--accept-risks]` — accept every disclosed .Unsafe escape-hatch import and proceed without prompting
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing

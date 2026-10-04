@@ -1,11 +1,10 @@
-//! Wiring the runtime capability sandbox around `ipe dev run`'s final exec.
+//! The runtime capability sandbox around the release run.
 //!
-//! `ipe dev run` compiles, `cargo build`s, and then runs the emitted `ipe-app`
-//! binary. This module inserts the jail between the build and the run for
-//! programs that reach opaque native code: it resolves the program's capability
-//! set (`inferred ∪ declared`), lowers it to a [`SandboxProfile`], establishes
-//! the OS jail, and execs the app inside it. An undeclared effect the app
-//! attempts fails at the OS boundary; a declared one works.
+//! `ipe release` resolves the program's capability set (`inferred ∪ declared`),
+//! lowers it to a [`SandboxProfile`], embeds that floor into the binary it
+//! builds, and `ipe release run` execs the app inside the OS jail. An
+//! undeclared effect the app attempts fails at the OS boundary; a declared one
+//! works. `ipe dev` reaches none of this: it checks no capabilities.
 //!
 //! The jail is **scoped to native-bearing programs** (ADR 0004). Pure Ipê is
 //! structurally bounded to its inferred capabilities — an unreachable effect is
@@ -14,11 +13,8 @@
 //! effects inference cannot prove, and only that program is jailed. See
 //! [`is_native_bearing`].
 //!
-//! Where a native-bearing program runs on a platform with no jail primitive, the
-//! jail cannot be established. That is fail-closed by default — the run refuses —
-//! but [`OVERRIDE_ENV`] is the recorded-consent escape: with it set, the run
-//! proceeds unconfined after a loud warning (ADR 0004 "best-effort with
-//! consent"). Pure programs never take this path.
+//! A platform with no jail primitive refuses a native-bearing release run: there
+//! is no unconfined fallback.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -33,15 +29,6 @@ use ipe_sandbox::run_jail::{
 use crate::CliError;
 use crate::project::ProjectManifest;
 use crate::scratch::ScratchDir;
-
-/// The narrow, run-jail-specific unsandboxed override — the recorded consent
-/// that lets a native-bearing program run on a platform with no jail primitive.
-///
-/// DISTINCT from the FFI-compile override (`IPE_FFI_ALLOW_UNSANDBOXED`). Only a
-/// native-bearing program can ever reach the jail (ADR 0004); when its platform
-/// has no jail, this flag downgrades the fail-closed refusal to a loud warning
-/// and proceeds unconfined. Unset, the run refuses. Never set it in CI.
-pub const OVERRIDE_ENV: &str = "IPE_ALLOW_UNSANDBOXED";
 
 /// Whether a program is *native-bearing*: it crosses into opaque `Rust.` FFI
 /// code, so its true effect set cannot be proven from Ipê inference and an OS
@@ -127,108 +114,9 @@ pub fn build_profile(
         })
 }
 
-/// Whether the resolved override env var is set to exactly `"1"` (mirroring the
-/// build jail's strict `== "1"`, never a loose `is_some`).
-#[must_use]
-pub fn override_requested() -> bool {
-    ipe_env::var_os(OVERRIDE_ENV).is_some_and(|v| v == "1")
-}
-
-/// Decide what to do when the jail cannot be established for a native-bearing
-/// `union`.
-///
-/// Only native-bearing programs are jailed (ADR 0004), so this path is always
-/// opaque native code on a platform with no jail primitive.
-///
-/// Fail-closed by default: without recorded consent ([`OVERRIDE_ENV`]) the run
-/// refuses. With consent it prints a loud warning naming the axes that will run
-/// unconfined and returns `Ok(true)` to proceed. There is no unconfined run of
-/// native code without that explicit, recorded consent.
-///
-/// # Errors
-///
-/// [`CliError::Usage`] carrying the refusal (`IPE-F4413`) when consent is
-/// absent.
-pub fn resolve_refusal(
-    defect: &RunJailDefect,
-    union: &BTreeSet<Capability>,
-) -> Result<bool, CliError> {
-    // The axes that would run with the user's full authority (clock/random carry
-    // no OS control, `unsafe` is a provenance label with no isolation surface, and
-    // `custom-element` / `js-port` are browser-side disclosures the SERVER jail
-    // never governs, so none of them is part of the jail-authority warning).
-    let names: Vec<&str> = union
-        .iter()
-        .filter(|c| {
-            !matches!(
-                c,
-                Capability::Clock
-                    | Capability::Random
-                    | Capability::Unsafe
-                    | Capability::CustomElement
-                    | Capability::JsPort(_)
-            )
-        })
-        .map(|c| c.as_str())
-        .collect();
-
-    if !override_requested() {
-        // Fail-closed: no jail here and no recorded consent. Route through the
-        // shared typed renderer so F4413 gains the title-rule, snippet-less
-        // band, help/remedy lines, and stable JSON schema.
-        return Err(defect_error(defect.clone()));
-    }
-
-    // Recorded consent: warn loudly, in red, and proceed unconfined.
-    // Route through the style palette so the warning honours use_color / NO_COLOR
-    // and never leaks ANSI escapes into piped or redirected stderr.
-    let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
-    let warning = override_warning(screen.palette(), &names.join(", "));
-    screen.guttered(&warning).emit();
-    Ok(true)
-}
-
-/// Establish the jail and exec `app` inside it, or apply the fail-closed
-/// refusal / recorded-consent policy.
-///
-/// Callers invoke this only for native-bearing programs (ADR 0004). On success
-/// (jail established) this **does not return** — it replaces the current process
-/// with the jailed app. When the platform has no jail primitive and recorded
-/// consent ([`OVERRIDE_ENV`]) is present, it returns `Ok(())` and the caller
-/// performs the ordinary unjailed exec.
-///
-/// # Errors
-///
-/// [`CliError::Usage`] on any fail-closed refusal.
-pub fn jail_and_exec(
-    profile: &SandboxProfile,
-    union: &BTreeSet<Capability>,
-    scoped_tmp: &Path,
-    working_tree: &Path,
-    app: &Path,
-    app_args: &[OsString],
-) -> Result<(), CliError> {
-    let wants_wall_clock = profile.limits.wall_secs.is_some();
-    let tools = match run_jail::probe_run_jail_tools(wants_wall_clock) {
-        Ok(t) => t,
-        Err(defect) => {
-            // The jail primitive is unavailable / platform unsupported: apply
-            // the consent-or-refuse policy. If recorded consent lets the program
-            // through, fall back to an unjailed run.
-            return resolve_refusal(&defect, union).map(|_proceed_unconfined| ());
-        }
-    };
-    match run_jail::exec_in_run_jail(&tools, profile, scoped_tmp, working_tree, app, app_args) {
-        // `exec_in_run_jail` returns only on failure.
-        Err(defect) => Err(defect_error(defect)),
-        Ok(never) => match never {},
-    }
-}
-
 /// Exec `app` inside the jail, with no unconfined fallback of any kind.
 ///
-/// The release run path: the recorded-consent override ([`OVERRIDE_ENV`]) is
-/// never consulted, so a platform with no jail primitive refuses. On success
+/// The release run path: a platform with no jail primitive refuses. On success
 /// this does not return (the process becomes the jailed app); the only value
 /// it can produce is the refusal, so a caller has no unjailed branch to take.
 #[must_use]
@@ -286,31 +174,6 @@ pub fn make_scoped_tmp() -> Result<ScratchDir, CliError> {
     ScratchDir::new("ipe-run").map_err(|source| CliError::ScratchUnavailable { source })
 }
 
-/// Reconstruct the capability axes a profile grants, as a `Capability` set.
-///
-/// This is the input to the override/refusal policy for a deployed artifact
-/// (which has no source to re-infer from). `database` is not reconstructed: it
-/// was already lowered to `network`/`filesystem` when the profile was built, so
-/// the axes here are the concrete OS-enforced ones.
-#[must_use]
-pub fn profile_axes(profile: &SandboxProfile) -> BTreeSet<Capability> {
-    use ipe_sandbox::run_jail::FilesystemScope;
-    let mut set = BTreeSet::new();
-    if profile.network {
-        set.insert(Capability::Network);
-    }
-    if matches!(profile.filesystem, FilesystemScope::WorkingTreeReadWrite) {
-        set.insert(Capability::Filesystem);
-    }
-    if profile.subprocess {
-        set.insert(Capability::Subprocess);
-    }
-    if !profile.env_allowlist.is_empty() {
-        set.insert(Capability::Env);
-    }
-    set
-}
-
 /// The Rust source of a `#[used]` static that embeds the capability floor into
 /// the emitted binary's `.rodata`.
 ///
@@ -363,16 +226,6 @@ pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> 
     )
 }
 
-/// The floor intent a build of `intent` embeds: only a release build's floor
-/// lets `ipe release run` run the app.
-#[must_use]
-pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent {
-    match intent {
-        ipe_backend_rust::BuildIntent::Development => FloorIntent::Development,
-        ipe_backend_rust::BuildIntent::Release => FloorIntent::Release,
-    }
-}
-
 /// Write the deployable enforcement artifacts into an emitted native project.
 ///
 /// Two artifacts: the strictly-parsed `ipe.profile` next to the crate, and the
@@ -380,9 +233,9 @@ pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent 
 /// the binary). The profile is a *convenience mirror* the launcher parses; the
 /// authoritative floor is the embedded static. A profile weaker than the floor
 /// is refused at launch (`ipe release run`), so tampering the mirror alone cannot
-/// under-isolate. The floor names `intent`, the pipeline about to build the
-/// crate: the artifacts are written before the build, so the binary carries
-/// exactly this floor.
+/// under-isolate. Only the release pipeline writes these artifacts, so the floor
+/// is always a release floor; they are written before the build, so the binary
+/// carries exactly this floor.
 ///
 /// # Errors
 ///
@@ -391,7 +244,6 @@ pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent 
 pub fn write_build_artifacts(
     crate_dir: &crate::output_dir::OwnedDir,
     profile: &SandboxProfile,
-    intent: FloorIntent,
 ) -> Result<(), CliError> {
     // 1. The ipe.profile mirror.
     crate_dir
@@ -412,7 +264,10 @@ pub fn write_build_artifacts(
     )?;
     let base = strip_capfloor_block(&existing);
     let referenced = inject_floor_reference(&base)?;
-    let with_floor = format!("{referenced}{}", capfloor_static_source(profile, intent));
+    let with_floor = format!(
+        "{referenced}{}",
+        capfloor_static_source(profile, FloorIntent::Release)
+    );
     main_rs.write(with_floor.as_bytes())
 }
 
@@ -599,16 +454,6 @@ pub fn exec_verified_jailed(
     }
 }
 
-/// Build the sandbox-override warning string from a resolved palette.
-///
-/// Separating construction from emission makes the colour-gating contract
-/// testable: callers drive this with `Palette::COLOR` or `Palette::PLAIN` and
-/// assert on the presence or absence of ANSI escapes without touching a real
-/// terminal.
-fn override_warning(p: &crate::style::Palette, axes: &str) -> String {
-    crate::style::sandbox_override_warning(p, OVERRIDE_ENV, axes)
-}
-
 /// Resolve the inferred and declared capability sets for a run, given the
 /// project manifest (if any) and the resolved entry file used for single-file
 /// inference.
@@ -706,26 +551,6 @@ mod tests {
         let p = build_profile(&c, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
         assert!(p.network);
         assert!(p.subprocess);
-    }
-
-    #[test]
-    fn refusal_without_consent_carries_the_code_and_remediation() {
-        let defect = RunJailDefect::PrimitiveUnavailable {
-            missing: vec!["bwrap"],
-        };
-        // A native-bearing union — the only kind that reaches this path.
-        let union: BTreeSet<Capability> =
-            BTreeSet::from([Capability::NativeFfi, Capability::Network]);
-        // No consent env set in this test process.
-        let r = resolve_refusal(&defect, &union);
-        assert!(r.is_err());
-        let msg = format!("{}", r.unwrap_err());
-        assert!(msg.contains("IPE-F4413"), "carries the defect code: {msg}");
-        assert!(
-            msg.contains(OVERRIDE_ENV),
-            "names the consent escape: {msg}"
-        );
-        assert!(msg.contains("native"), "explains the native reason: {msg}");
     }
 
     #[test]
@@ -870,60 +695,5 @@ mod tests {
     #[test]
     fn inject_floor_reference_refuses_a_missing_main_anchor() {
         assert!(inject_floor_reference("fn not_main() {}\n").is_err());
-    }
-
-    #[test]
-    fn override_warning_plain_palette_has_no_ansi() {
-        let w = override_warning(&crate::style::Palette::PLAIN, "network, filesystem");
-        assert!(
-            !w.contains('\x1b'),
-            "plain palette must produce no ANSI escapes: {w:?}"
-        );
-        assert!(
-            w.contains(OVERRIDE_ENV),
-            "warning must name the override env var: {w:?}"
-        );
-        assert!(
-            w.contains("network, filesystem"),
-            "warning must list the axes: {w:?}"
-        );
-    }
-
-    #[test]
-    fn override_warning_colour_palette_has_red_and_bold() {
-        let w = override_warning(&crate::style::Palette::COLOR, "network");
-        assert!(
-            w.contains('\x1b'),
-            "colour palette must include ANSI escapes: {w:?}"
-        );
-        assert!(
-            w.contains(crate::style::Palette::COLOR.red),
-            "colour warning must be red: {w:?}"
-        );
-        assert!(
-            w.contains(crate::style::Palette::COLOR.bold),
-            "colour warning must be bold: {w:?}"
-        );
-        assert!(
-            w.contains(crate::style::Palette::COLOR.reset),
-            "colour warning must reset attributes: {w:?}"
-        );
-    }
-
-    #[test]
-    fn profile_axes_reconstructs_the_granted_set() {
-        use ipe_sandbox::run_jail::FilesystemScope;
-        let p = SandboxProfile {
-            network: true,
-            filesystem: FilesystemScope::WorkingTreeReadWrite,
-            subprocess: false,
-            env_allowlist: vec!["X".to_owned()],
-            limits: ipe_sandbox::run_jail::RunResourceLimits::default(),
-        };
-        let axes = profile_axes(&p);
-        assert!(axes.contains(&Capability::Network));
-        assert!(axes.contains(&Capability::Filesystem));
-        assert!(axes.contains(&Capability::Env));
-        assert!(!axes.contains(&Capability::Subprocess));
     }
 }

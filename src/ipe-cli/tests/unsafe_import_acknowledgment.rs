@@ -75,7 +75,6 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
     let mut stderr = Vec::new();
     let err = unsafe_ack::gate(
         &inferred,
-        /* accept_risks_flag */ false,
         /* manifest_accept */ &BTreeSet::new(),
         &via,
         /* interactive */ false,
@@ -91,7 +90,7 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
         msg.contains("cross-site scripting"),
         "names the risk: {msg}"
     );
-    assert!(msg.contains("--accept-risks"), "offers the flag: {msg}");
+    assert!(!msg.contains("--accept-risks"), "offers no flag: {msg}");
     assert!(
         msg.contains("[capabilities]"),
         "offers the manifest token: {msg}"
@@ -110,33 +109,9 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// The `--accept-risks` flag pre-accepts the same program silently.
-#[test]
-fn accept_risks_flag_proceeds_clean() -> Result<(), Box<dyn Error>> {
-    let dir = scratch_project("flag", UNSAFE_MAIN)?;
-    let inferred = ipe::infer_package_capabilities(&dir.join("package.ipe"))?;
-    let via = unsafe_ack::unsafe_modules_in_sources([UNSAFE_MAIN]);
-
-    let mut stdin = Cursor::new(Vec::new());
-    let mut stderr = Vec::new();
-    unsafe_ack::gate(
-        &inferred,
-        /* accept_risks_flag */ true,
-        &BTreeSet::new(),
-        &via,
-        /* interactive */ false,
-        &mut stdin,
-        &mut stderr,
-    )
-    .expect("--accept-risks proceeds");
-    assert!(stderr.is_empty(), "a pre-accepted build is silent");
-
-    let _ = fs::remove_dir_all(&dir);
-    Ok(())
-}
-
 /// A `Package.accepts [ Capability.unsafe ]` manifest stage parses into the
-/// typed accept set and pre-accepts durably, so CI needs no flag.
+/// typed accept set and pre-accepts durably — the one way a headless build
+/// proceeds.
 #[test]
 fn manifest_accept_token_parses_and_proceeds() -> Result<(), Box<dyn Error>> {
     let dir = scratch_project("manifest", UNSAFE_MAIN)?;
@@ -162,7 +137,6 @@ fn manifest_accept_token_parses_and_proceeds() -> Result<(), Box<dyn Error>> {
     let mut stderr = Vec::new();
     unsafe_ack::gate(
         &inferred,
-        /* accept_risks_flag */ false,
         &manifest.capabilities_accept,
         &via,
         /* interactive */ false,
@@ -192,7 +166,6 @@ fn safe_program_is_unaffected() -> Result<(), Box<dyn Error>> {
     let mut stderr = Vec::new();
     unsafe_ack::gate(
         &inferred,
-        false,
         &BTreeSet::new(),
         &[],
         false,

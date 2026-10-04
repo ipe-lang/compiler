@@ -1178,9 +1178,12 @@ Deliberate omissions, not gaps to close.
 
 ```bash
 ipe init [name]                    # new project
-# The dev inner loop lives under `ipe dev {build,run,watch}` (dev posture:
-# Debug.* on, unsigned, hot-reload). `ipe release build|run|eject` is the
-# distinct shipping posture (optimised, Debug.* rejected, native code jailed)
+# The dev inner loop lives under `ipe dev {build,run,watch}`. `ipe dev` runs
+# your program with your full user permissions and checks no capabilities.
+# Run external packages only through `ipe release`, which infers
+# capabilities, asks for consent and runs native code jailed.
+# `ipe release build|run|eject` is the distinct shipping posture (optimised,
+# Debug.* rejected, native code jailed)
 # — there is no `watch` under release, so hot-reloading a shipping build is
 # not expressible. A `build` / `run` with no group in front is refused: the
 # group names the posture.

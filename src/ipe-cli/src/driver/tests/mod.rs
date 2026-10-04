@@ -4249,45 +4249,22 @@ fn session_is_admitted_for_a_native_cli_or_worker_app() {
     }
 }
 
-// A native-bearing program runs jailed, where the log is unreachable: refused
-// whether the crossing is inferred or only declared, and a pure program passes.
+// A program that can link Rust FFI is refused a session — its replay is not
+// proven deterministic — while a program with no FFI records and replays.
 #[test]
-fn session_is_refused_for_a_native_bearing_program() {
-    use crate::run_sandbox::ResolvedCapabilities;
-    use ipe_ir::Capability;
-    use std::collections::BTreeSet;
-    let native: BTreeSet<Capability> = std::iter::once(Capability::NativeFfi).collect();
-    let raw: BTreeSet<Capability> = std::iter::once(Capability::FfiRaw).collect();
-    let bearing = [
-        ResolvedCapabilities {
-            inferred: native.clone(),
-            declared: BTreeSet::new(),
-        },
-        ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: native,
-        },
-        ResolvedCapabilities {
-            inferred: raw,
-            declared: BTreeSet::new(),
-        },
-    ];
+fn session_record_refuses_ffi_program() {
+    use crate::ffi::FfiPresence;
     for flag in ["--record", "--replay"] {
-        for resolved in &bearing {
-            let result = gate_session_capabilities(flag, resolved);
-            assert!(
-                matches!(&result, Err(CliError::Usage(msg)) if msg.contains("native-bearing")),
-                "{flag} on a native-bearing program must be refused, got: {result:?}"
-            );
-        }
-        let pure = ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: BTreeSet::new(),
-        };
-        let result = gate_session_capabilities(flag, &pure);
+        let result = gate_session_ffi(flag, FfiPresence::Present);
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains(flag) && msg.contains("Rust FFI")),
+            "{flag} on an FFI program must be refused, got: {result:?}"
+        );
+        let result = gate_session_ffi(flag, FfiPresence::Absent);
         assert!(
             result.is_ok(),
-            "{flag} on a pure program must pass: {result:?}"
+            "{flag} on a program with no FFI must pass: {result:?}"
         );
     }
 }

@@ -76,6 +76,28 @@ pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliErr
     load_located_catalog(blame_path).map(|(catalog, _)| catalog)
 }
 
+/// Whether a build can link Rust FFI: an installed crate catalog makes its
+/// `Rust.*` interfaces reachable from the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiPresence {
+    /// No crate is installed; the program links no foreign code.
+    Absent,
+    /// At least one crate is installed for the build.
+    Present,
+}
+
+/// The [`FfiPresence`] of the build rooted at (or blamed on) `blame_path`.
+///
+/// # Errors
+/// As [`load_catalog_for`].
+pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> {
+    Ok(if load_catalog_for(blame_path)?.is_empty() {
+        FfiPresence::Absent
+    } else {
+        FfiPresence::Present
+    })
+}
+
 /// The catalog for `blame_path` with the path of the cache it was read from
 /// (empty when no cache exists), from one discovery walk.
 ///

@@ -1529,8 +1529,8 @@ messages! {
     session_no_recordable(flag, name) = "session-no-recordable";
     /// `ipe dev run --record`/`--replay` with `--target wasi`.
     session_native_only(flag) = "session-native-only";
-    /// `ipe dev run --record`/`--replay` on a native-bearing program.
-    session_jailed(flag) = "session-jailed";
+    /// `ipe dev run --record`/`--replay` on a program that can link Rust FFI.
+    session_ffi_unproven(flag) = "session-ffi-unproven";
     /// `ipe dev run --record` with `--replay`.
     session_flags_exclusive(first, second) = "session-flags-exclusive";
     /// `ipe dev run --replay` with no recorded log or trace in the output root.
