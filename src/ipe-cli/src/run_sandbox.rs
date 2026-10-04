@@ -174,12 +174,7 @@ pub fn resolve_refusal(
         // Fail-closed: no jail here and no recorded consent. Route through the
         // shared typed renderer so F4413 gains the title-rule, snippet-less
         // band, help/remedy lines, and stable JSON schema.
-        let shared: SharedDiag = defect.clone().into();
-        return Err(CliError::Pipeline {
-            file: std::path::PathBuf::new(),
-            src: String::new(),
-            diag: Box::new(shared),
-        });
+        return Err(defect_error(defect.clone()));
     }
 
     // Recorded consent: warn loudly, in red, and proceed unconfined.
@@ -223,15 +218,53 @@ pub fn jail_and_exec(
     };
     match run_jail::exec_in_run_jail(&tools, profile, scoped_tmp, working_tree, app, app_args) {
         // `exec_in_run_jail` returns only on failure.
-        Err(defect) => {
-            let shared: SharedDiag = defect.into();
-            Err(CliError::Pipeline {
-                file: std::path::PathBuf::new(),
-                src: String::new(),
-                diag: Box::new(shared),
-            })
-        }
+        Err(defect) => Err(defect_error(defect)),
         Ok(never) => match never {},
+    }
+}
+
+/// Exec `app` inside the jail, with no unconfined fallback of any kind.
+///
+/// The release run path: the recorded-consent override ([`OVERRIDE_ENV`]) is
+/// never consulted, so a platform with no jail primitive refuses. On success
+/// this does not return (the process becomes the jailed app); the only value
+/// it can produce is the refusal, so a caller has no unjailed branch to take.
+#[must_use]
+pub fn exec_jailed(
+    profile: &SandboxProfile,
+    scoped_tmp: &Path,
+    working_tree: &Path,
+    app: &Path,
+    app_args: &[OsString],
+) -> CliError {
+    let wants_wall_clock = profile.limits.wall_secs.is_some();
+    let defect = match run_jail::probe_run_jail_tools(wants_wall_clock) {
+        Ok(tools) => {
+            match run_jail::exec_in_run_jail(
+                &tools,
+                profile,
+                scoped_tmp,
+                working_tree,
+                app,
+                app_args,
+            ) {
+                Err(defect) => defect,
+                Ok(never) => match never {},
+            }
+        }
+        Err(defect) => defect,
+    };
+    defect_error(defect)
+}
+
+/// The typed refusal a jail defect renders as, through the shared diagnostic
+/// renderer.
+fn defect_error(defect: RunJailDefect) -> CliError {
+    let shared: SharedDiag = defect.into();
+    CliError::Pipeline {
+        file: std::path::PathBuf::new(),
+        src: String::new(),
+        diag: Box::new(shared),
     }
 }
 
@@ -405,25 +438,6 @@ fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     out.push_str(FLOOR_REFERENCE);
     out.push_str(&src[insert_at..]);
     Ok(out)
-}
-
-/// Whether a built artifact's binary carries an embedded capability floor — i.e.
-/// it was emitted for a native-bearing program (ADR 0004).
-///
-/// `ipe build` embeds the floor (and writes an `ipe.profile`) only for a program
-/// that reaches `Rust.` code; a pure Ipê artifact carries neither and needs no
-/// jail. `ipe exec` reads this off disk *passively* (the binary is never
-/// executed) to decide whether to jail or run directly.
-///
-/// # Errors
-///
-/// [`CliError::Io`] when the binary cannot be read.
-pub fn artifact_is_native(binary_path: &Path) -> Result<bool, CliError> {
-    let binary = std::fs::read(binary_path).map_err(|e| CliError::Io {
-        path: binary_path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(run_jail::scan_capfloor(&binary).is_some())
 }
 
 /// Read and verify the deployed artifact's floor against its `ipe.profile`.

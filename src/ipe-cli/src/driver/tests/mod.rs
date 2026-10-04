@@ -5463,3 +5463,226 @@ fn release_build_wasm_produces_artifact() {
         CompileTarget::Native
     );
 }
+
+// ── `release run` and `release eject` ───────────────────────────────────────
+
+/// `release run` compiles under the release posture, so `Debug.*` is refused.
+///
+/// IPE-L0140 fires in the compile, before any cargo step.
+#[test]
+fn release_run_gates_debug() {
+    assert_eq!(ReleasePurpose::Run.verb(), Verb::RELEASE_RUN);
+    let result = compile_debug_log_as(ReleasePurpose::Run.verb(), "release-run");
+    assert!(
+        matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        "a release run refuses Debug.log with IPE-L0140: {result:?}"
+    );
+}
+
+/// `release eject` refuses `Debug.*` before a project is written.
+#[test]
+fn release_eject_gates_debug() {
+    let tmp =
+        ipe_test_temp::temp_root().join(format!("ipec-release-eject-debug-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(tmp.join("src")).expect("create project dir");
+    fs::write(
+        tmp.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"eject-debug\" }\n",
+    )
+    .expect("write package.ipe");
+    fs::write(tmp.join("src").join("Main.ipe"), DEBUG_LOG_MAIN).expect("write Main.ipe");
+    let out = tmp.join("ejected");
+    let package = tmp.join("package.ipe").to_string_lossy().into_owned();
+    let out_arg = out.to_string_lossy().into_owned();
+    let result = run_argv(&["release", "eject", &package, "--out", &out_arg]);
+    let written = out.join("Cargo.toml").exists() || out.join("src").join("main.rs").exists();
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        "a release eject refuses Debug.log with IPE-L0140: {result:?}"
+    );
+    assert!(!written, "a refused eject writes no project");
+}
+
+/// Assert `ipe <args>` refuses with [`CliError::NoRunForm`] for `target`.
+///
+/// The refusal is the user's to fix and its hint names the build form.
+fn assert_no_run_form(args: &[&str], target: cli_args::NoRunTarget) {
+    let result = run_argv(args);
+    assert!(
+        matches!(&result, Err(CliError::NoRunForm { target: t }) if *t == target),
+        "`ipe {}` must refuse with no run form for {target:?}: {result:?}",
+        args.join(" ")
+    );
+    let Err(err) = result else {
+        return;
+    };
+    assert!(
+        matches!(err.fault(), crate::screen::Fault::User),
+        "a no-run-form refusal is the user's to fix: {err:?}"
+    );
+    let screen = err.to_string();
+    let hint = format!("ipe {} {}", Verb::RELEASE_BUILD, target.build_form());
+    assert!(
+        screen.contains(&hint),
+        "the refusal must hint `{hint}`: {screen}"
+    );
+}
+
+/// `release run --target wasm` has no run form.
+///
+/// A `--target` after `--` is the program's argument, not a refusal.
+#[test]
+fn release_run_wasm_refuses() {
+    assert_no_run_form(
+        &["release", "run", "--target", "wasm"],
+        cli_args::NoRunTarget::Wasm,
+    );
+    let parsed = cli_args::parse_release_run(&["--".to_owned(), "--target".to_owned()]);
+    assert!(
+        matches!(&parsed, Ok(args) if args.app_args == ["--target"] && !args.build_flags),
+        "a `--target` after `--` belongs to the program: {parsed:?}"
+    );
+}
+
+/// A host or solo delivery has no run form under `release run`.
+#[test]
+fn release_run_host_bundle_refuses() {
+    use cli_args::NoRunTarget;
+    for (args, target) in [
+        (
+            &["release", "run", "web", "desktop"][..],
+            NoRunTarget::Desktop,
+        ),
+        (
+            &["release", "run", "web", "solo", "ios"][..],
+            NoRunTarget::Ios,
+        ),
+        (
+            &["release", "run", "web", "solo", "android"][..],
+            NoRunTarget::Android,
+        ),
+        (&["release", "run", "web", "solo"][..], NoRunTarget::Solo),
+    ] {
+        assert_no_run_form(args, target);
+    }
+}
+
+/// An artifact directory runs as built: a build option beside it refuses.
+///
+/// A bundle missing its profile refuses naming it, before anything runs.
+#[test]
+fn release_run_artifact_dir_refuses_build_flags_and_partial_bundles() {
+    let tmp = ipe_test_temp::temp_root()
+        .join(format!("ipec-release-run-artifact-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("create artifact dir");
+    fs::write(tmp.join("ipe-wrapper"), b"").expect("write wrapper");
+    fs::write(tmp.join("ipe-app"), b"").expect("write app");
+    let dir = tmp.to_string_lossy().into_owned();
+    let with_flag = run_argv(&["release", "run", &dir, "--out", "x"]);
+    let partial = run_argv(&["release", "run", &dir]);
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        matches!(&with_flag, Err(CliError::Usage(reason)) if reason.to_string().contains(&dir)),
+        "an artifact directory takes no build option: {with_flag:?}"
+    );
+    assert!(
+        matches!(&partial, Err(CliError::Usage(reason)) if reason.to_string().contains("ipe.profile")),
+        "a bundle without its profile refuses naming it: {partial:?}"
+    );
+}
+
+/// The wrapper source is the build-time workspace, never a planted ancestor.
+///
+/// The root is fixed by this crate's compile-time path, and a candidate tree
+/// is admitted only as the workspace declaring the wrapper package: a planted
+/// `Cargo.toml` that is not that workspace refuses with the failed check.
+#[test]
+fn wrapper_source_ignores_planted_ancestor() {
+    use crate::wrapper_source::{WrapperSource, WrapperSourceDefect};
+    const COMMANDS: &str = include_str!("../commands.rs");
+
+    let expected = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2);
+    assert_eq!(WrapperSource::build_root(), expected);
+
+    let body = COMMANDS
+        .find("\npub fn release_pipeline(")
+        .and_then(|start| COMMANDS.get(start + 1..))
+        .map(|rest| {
+            rest.find("\npub fn ")
+                .and_then(|end| rest.get(..end))
+                .unwrap_or(rest)
+        });
+    assert!(body.is_some(), "release_pipeline is defined");
+    let Some(body) = body else { return };
+    assert!(body.contains("WrapperSource::resolve()"));
+    for forbidden in ["current_dir", "ancestors", "resolve_at"] {
+        assert!(
+            !body.contains(forbidden),
+            "the release pipeline must not derive the wrapper source from `{forbidden}`"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let base = ipe_test_temp::temp_root()
+            .canonicalize()
+            .expect("canonical temp dir")
+            .join(format!("ipec-wrapper-source-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let member = base.join("src").join("ipe-wrapper");
+        fs::create_dir_all(&member).expect("create member dir");
+        let member_manifest = |name: &str| {
+            fs::write(
+                member.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            )
+            .expect("write member manifest");
+        };
+        let root_manifest = |text: &str| {
+            fs::write(base.join("Cargo.toml"), text).expect("write root manifest");
+        };
+        member_manifest("ipe_wrapper");
+        fs::write(base.join("Cargo.lock"), "version = 4\n").expect("write lock");
+
+        root_manifest("# [workspace]\n[package]\nname = \"planted\"\n");
+        let planted = WrapperSource::resolve_at(&base);
+        assert!(
+            matches!(&planted, Err(r) if matches!(r.defect, WrapperSourceDefect::NotAWorkspace)),
+            "a manifest with no workspace table is no wrapper source: {planted:?}"
+        );
+
+        root_manifest("[workspace]\nmembers = [\"src/app\"]\n");
+        let undeclared = WrapperSource::resolve_at(&base);
+        assert!(
+            matches!(&undeclared, Err(r) if matches!(r.defect, WrapperSourceDefect::MemberUndeclared)),
+            "a workspace not declaring the wrapper is no wrapper source: {undeclared:?}"
+        );
+
+        root_manifest("[workspace]\nmembers = [\"src/ipe-wrapper\"]\n");
+        member_manifest("evil_wrapper");
+        let renamed = WrapperSource::resolve_at(&base);
+        assert!(
+            matches!(&renamed, Err(r) if matches!(r.defect, WrapperSourceDefect::PackageMismatch)),
+            "a member that is not the wrapper package is refused: {renamed:?}"
+        );
+
+        member_manifest("ipe_wrapper");
+        fs::remove_file(base.join("Cargo.lock")).expect("remove lock");
+        let unlocked = WrapperSource::resolve_at(&base);
+        assert!(
+            matches!(&unlocked, Err(r) if matches!(r.defect, WrapperSourceDefect::Unproven(_))),
+            "a workspace with no committed lock is refused: {unlocked:?}"
+        );
+
+        fs::write(base.join("Cargo.lock"), "version = 4\n").expect("write lock");
+        let admitted = WrapperSource::resolve_at(&base);
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            matches!(&admitted, Ok(source) if source.root() == base),
+            "the complete wrapper workspace is admitted (control): {admitted:?}"
+        );
+    }
+}

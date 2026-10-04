@@ -1485,8 +1485,32 @@ messages! {
     release_binary_missing(path) = "release-binary-missing";
     /// `ipe release` found no app binary after a successful `cargo build`.
     release_app_binary_missing(path) = "release-app-binary-missing";
-    /// `ipe release` could not locate the workspace root.
-    release_workspace_root_unknown = "release-workspace-root-unknown";
+    /// A native-bearing release refused the `ipe_wrapper` source it builds.
+    cli_wrapper_source_refused(root, reason) = "cli-wrapper-source-refused";
+    /// The wrapper source's build-time crate path has no workspace root.
+    wrapper_source_no_build_root = "wrapper-source-no-build-root";
+    /// The host cannot prove the wrapper source's ownership.
+    wrapper_source_unsupported = "wrapper-source-unsupported";
+    /// A wrapper source path is absent or not owner-trusted.
+    wrapper_source_unproven(path) = "wrapper-source-unproven";
+    /// A wrapper source manifest could not be read within the cap.
+    wrapper_source_unreadable(path) = "wrapper-source-unreadable";
+    /// A wrapper source manifest is not valid TOML.
+    wrapper_source_unparsable(path) = "wrapper-source-unparsable";
+    /// The wrapper source's root manifest has no `[workspace]` table.
+    wrapper_source_not_workspace = "wrapper-source-not-workspace";
+    /// The wrapper source's workspace does not list the wrapper member.
+    wrapper_source_member_undeclared(member) = "wrapper-source-member-undeclared";
+    /// The wrapper source's member manifest names another package.
+    wrapper_source_package_mismatch(package) = "wrapper-source-package-mismatch";
+    /// `ipe release run` was given a target with no run form.
+    cli_no_run_form(target) = "cli-no-run-form";
+    /// The `ipe release build` form a no-run-form target builds with.
+    cli_no_run_form_hint(form) = "cli-no-run-form-hint";
+    /// `ipe release run <dir>` given a directory and build arguments together.
+    release_run_artifact_flags(dir) = "release-run-artifact-flags";
+    /// `ipe release run <dir>` found a bundle missing one of its three files.
+    release_run_bundle_incomplete(dir, missing) = "release-run-bundle-incomplete";
     /// `wasm-bindgen` failed while bundling a `--target wasm` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.
@@ -1505,12 +1529,6 @@ messages! {
     replay_log_missing(path) = "replay-log-missing";
     /// A run program exited non-zero.
     program_exited(program, code) = "program-exited";
-    /// `ipe exec` found no artifact directory.
-    exec_no_artifact_dir(dir) = "exec-no-artifact-dir";
-    /// `ipe exec` found no built binary.
-    exec_no_binary(path) = "exec-no-binary";
-    /// `ipe exec` found a floor-carrying binary without its jail profile.
-    exec_profile_missing(path) = "exec-profile-missing";
     /// `cargo metadata` failed.
     cargo_metadata_failed(dir, detail) = "cargo-metadata-failed";
     /// `cargo metadata` emitted malformed JSON.

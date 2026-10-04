@@ -283,6 +283,19 @@ pub enum CliError {
         /// form; empty when there were none.
         tail: TerminalSafe,
     },
+    /// `ipe release run` was given a target whose artifact has no run form.
+    ///
+    /// [`fmt::Display`] names the target, then hints the `ipe release build`
+    /// form that produces its artifact.
+    NoRunForm {
+        /// The target with no run form.
+        target: crate::cli_args::NoRunTarget,
+    },
+    /// A native-bearing release refused the `ipe_wrapper` source it builds.
+    ///
+    /// Nothing was built: the wrapper builds only from the verified compiler
+    /// workspace this binary was compiled from.
+    WrapperSourceRefused(Box<crate::wrapper_source::WrapperSourceRefusal>),
     /// A stage of `ipe verify` failed. Carries the stage name and the stage's
     /// own already-rendered report. Like [`Self::DocCoverage`], this is a
     /// legitimate gate result — the `verify` invocation was valid and the
@@ -650,6 +663,8 @@ impl CliError {
             Self::CommandUsage { .. } => "command-usage",
             Self::UnknownGroupSub { .. } => "unknown-group-sub",
             Self::GroupRequired { .. } => "group-required",
+            Self::NoRunForm { .. } => "no-run-form",
+            Self::WrapperSourceRefused(_) => "wrapper-source-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
@@ -733,6 +748,8 @@ impl CliError {
             | Self::CommandUsage { .. }
             | Self::UnknownGroupSub { .. }
             | Self::GroupRequired { .. }
+            | Self::NoRunForm { .. }
+            | Self::WrapperSourceRefused(_)
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
@@ -781,6 +798,7 @@ impl CliError {
                 | Self::CommandUsage { .. }
                 | Self::UnknownGroupSub { .. }
                 | Self::GroupRequired { .. }
+                | Self::NoRunForm { .. }
                 | Self::DocCoverage(_)
                 | Self::DocExamplesFailed(_)
                 | Self::VerifyFailed { .. }
@@ -960,6 +978,19 @@ impl std::fmt::Display for CliError {
                 }
                 Ok(())
             }
+            Self::NoRunForm { target } => {
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form(
+                    &target.word(),
+                )))?;
+                writeln!(f)?;
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form_hint(
+                    &target.build_form(),
+                )))
+            }
+            Self::WrapperSourceRefused(refusal) => f.write_str(&text::cli_wrapper_source_refused(
+                &refusal.root.display(),
+                &refusal.defect,
+            )),
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;
                 f.write_str(report.as_str().trim_end_matches('\n'))

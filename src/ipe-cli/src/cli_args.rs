@@ -1182,6 +1182,160 @@ pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
     })
 }
 
+/// A release target that produces an artifact with no form `ipe release run`
+/// can execute: a browser bundle or a distributable host bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRunTarget {
+    /// `--target wasm` (or a manifest/`IPE_TARGET` resolution to it): a
+    /// browser bundle.
+    Wasm,
+    /// `web solo`: the self-contained browser client.
+    Solo,
+    /// `web desktop`: a per-OS desktop bundle.
+    Desktop,
+    /// `web solo ios`: an iOS project.
+    Ios,
+    /// `web solo android`: an Android project.
+    Android,
+}
+
+impl NoRunTarget {
+    /// The target with no run form a delivery host selects, or `None` for the
+    /// served/default host.
+    #[must_use]
+    pub const fn from_host(host: crate::delivery::Host) -> Option<Self> {
+        match host {
+            crate::delivery::Host::Default => None,
+            crate::delivery::Host::Desktop => Some(Self::Desktop),
+            crate::delivery::Host::Ios => Some(Self::Ios),
+            crate::delivery::Host::Android => Some(Self::Android),
+        }
+    }
+
+    /// The word naming the target in the refusal.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Wasm => "wasm",
+            Self::Solo => "web solo",
+            Self::Desktop => "desktop",
+            Self::Ios => "ios",
+            Self::Android => "android",
+        }
+    }
+
+    /// The `ipe release build` arguments that produce this target's artifact.
+    #[must_use]
+    pub const fn build_form(self) -> &'static str {
+        match self {
+            Self::Wasm => "--target wasm",
+            Self::Solo => "web solo",
+            Self::Desktop => "web desktop",
+            Self::Ios => "web solo ios",
+            Self::Android => "web solo android",
+        }
+    }
+}
+
+/// Fully-parsed `ipe release run` arguments.
+#[derive(Debug)]
+pub struct ReleaseRunArgs {
+    /// The release build the run executes: embed mode, no inspection flag.
+    pub build: ReleaseArgs,
+    /// Whether any build-selecting argument (`--out`, `--runtime`, `--target`,
+    /// a delivery word) was written; a prebuilt artifact directory takes none.
+    pub build_flags: bool,
+    /// Arguments after `--`, forwarded verbatim to the program.
+    pub app_args: Vec<String>,
+}
+
+/// Parse `ipe release run`'s argument tail.
+///
+/// Accepts `[<path>] [--out <dir>] [--runtime <dir>] [--target <triple>]
+/// [-- <args>...]`. A target with no run form — `--target wasm`, `web solo`, a
+/// desktop or mobile host — is refused here with [`CliError::NoRunForm`],
+/// before any build.
+///
+/// # Errors
+///
+/// [`CliError::NoRunForm`] for a target with no run form; [`CliError::Usage`]
+/// naming any other misuse.
+pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
+    const LABEL: &str = Verb::RELEASE_RUN.name();
+    let (ipe_args, app_args): (&[String], Vec<String>) =
+        rest.iter().position(|a| a == "--").map_or_else(
+            || (rest, Vec::new()),
+            |pos| {
+                let (before, after_incl) = rest.split_at(pos);
+                (before, after_incl.get(1..).unwrap_or(&[]).to_vec())
+            },
+        );
+
+    let mut it = ipe_args.iter().peekable();
+    let entry = take_leading_entry_path(&mut it);
+    let words = take_delivery_words(&mut it);
+    let delivery = take_delivery_positionals(&words, LABEL)?;
+
+    let mut out: Option<String> = None;
+    let mut runtime: Option<String> = None;
+    let mut target: Option<TargetTriple> = None;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--out" => set_once(
+                &mut out,
+                take_value(&mut it, "--out", LABEL)?,
+                "--out",
+                LABEL,
+            )?,
+            "--runtime" => set_once(
+                &mut runtime,
+                take_value(&mut it, "--runtime", LABEL)?,
+                "--runtime",
+                LABEL,
+            )?,
+            "--target" => {
+                let parsed = parse_target(&take_value(&mut it, "--target", LABEL)?)?;
+                set_once(&mut target, parsed, "--target", LABEL)?;
+            }
+            other => {
+                return Err(usage_unknown_flag(LABEL, other));
+            }
+        }
+    }
+
+    if target == Some(TargetTriple::BrowserWasm) {
+        return Err(CliError::NoRunForm {
+            target: NoRunTarget::Wasm,
+        });
+    }
+    if let Some(no_run) = NoRunTarget::from_host(delivery.tokens.host) {
+        return Err(CliError::NoRunForm { target: no_run });
+    }
+    if delivery.tokens.runtime == Some(crate::delivery::Runtime::Solo) {
+        return Err(CliError::NoRunForm {
+            target: NoRunTarget::Solo,
+        });
+    }
+
+    let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
+    let target = ReleaseTarget::from_target(target)?;
+
+    Ok(ReleaseRunArgs {
+        build: ReleaseArgs {
+            entry,
+            delivery,
+            out,
+            runtime,
+            target,
+            mode: ReleaseMode::Embed,
+            emit_permissions: None,
+            format: OutputFormat::Human,
+        },
+        build_flags,
+        app_args,
+    })
+}
+
 /// Fully-parsed `ipe watch` arguments.
 pub struct WatchArgs {
     /// The positional entry (`None` → project-aware default).

@@ -1899,9 +1899,57 @@ ipe release: expected binary at {path} — cargo build succeeded but binary is m
 
 ipe release: expected app binary at {path} — cargo build succeeded but binary is missing
 
-## release-workspace-root-unknown
+## cli-wrapper-source-refused
 
-ipe release: cannot locate workspace root (no Cargo.toml with [workspace] found in any parent directory)
+ipe release: the jail wrapper source at {root} is not verified: {reason}. A native-bearing release builds its wrapper only from the compiler source tree this `ipe` was built from; build `ipe` from its source checkout to release a native-bearing app
+
+## wrapper-source-no-build-root
+
+the build-time crate path has no workspace root above it
+
+## wrapper-source-unsupported
+
+this host cannot prove directory ownership
+
+## wrapper-source-unproven
+
+{path} is absent or not owner-trusted
+
+## wrapper-source-unreadable
+
+{path} could not be read as UTF-8 within the manifest size cap
+
+## wrapper-source-unparsable
+
+{path} is not valid TOML
+
+## wrapper-source-not-workspace
+
+its Cargo.toml has no [workspace] table
+
+## wrapper-source-member-undeclared
+
+the workspace members do not include {member}
+
+## wrapper-source-package-mismatch
+
+the wrapper member's package is not {package}
+
+## cli-no-run-form
+
+`ipe release run` runs a native program; the {target} target has no run form
+
+## cli-no-run-form-hint
+
+= help: build it with `ipe release build {form}`
+
+## release-run-artifact-flags
+
+ipe release run: {dir} is a built artifact directory; it runs as built and takes no build arguments
+
+## release-run-bundle-incomplete
+
+ipe release run: the bundle at {dir} has no {missing}; a bundle runs only with its wrapper, app and profile together
 
 ## wasm-bindgen-failed
 
@@ -1938,18 +1986,6 @@ ipe run --replay: no session log at {path} — record one with `ipe run --record
 ## program-exited
 
 {program} exited with code {code}
-
-## exec-no-artifact-dir
-
-ipe exec: no artifact directory at {dir}
-
-## exec-no-binary
-
-ipe exec: no built binary at {path} — run `ipe build` first
-
-## exec-profile-missing
-
-ipe exec: {path} embeds a capability floor but carries no ipe.profile — the artifact is incomplete or tampered; refusing to run native code without its jail profile
 
 ## cargo-metadata-failed
 
