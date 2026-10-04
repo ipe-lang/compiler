@@ -129,7 +129,7 @@ class ClassifyTest(unittest.TestCase):
                 self.assertTrue(result["wasm"])
 
     def test_sanitize_covers_its_crates_beyond_emit(self) -> None:
-        for path in ("src/compiler/canon/src/lib.rs", "src/compiler/ffi/src/lib.rs", "src/ffi-bindgen-macro/src/lib.rs"):
+        for path in ("src/compiler/canon/src/lib.rs", "src/compiler/ffi/src/lib.rs", "src/compiler/fs_open/src/lib.rs", "src/ffi-bindgen-macro/src/lib.rs"):
             with self.subTest(path=path):
                 result = self.classify({path: "x\n"})
                 self.assertTrue(result["sanitize"])

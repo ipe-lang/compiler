@@ -94,6 +94,23 @@ place that performs it, so purity holds everywhere else.
 
 [principles]: ../../PRINCIPLES.md
 
+## Writing the working tree under the jail
+
+A program granted the filesystem capability runs with its working tree
+writable, except the version-control metadata in it: `.git`, `.hg`, `.jj`, and
+`_darcs` stay read-only, as does the git directory a `.git` file points to when
+it lies in a writable path. Your version-control tools run code that metadata
+names (hooks, filters, configured commands), so a jailed program that could
+write it could run code outside the jail the next time you commit. The program
+still reads the repository, so `git status` and friends work inside it.
+
+On Windows and FreeBSD the jail cannot yet keep that metadata read-only, so it
+refuses to run a granted program from a tree that holds it: run without the
+filesystem grant, or from a tree without version-control metadata. A
+repository nested deeper in the tree, or metadata the program creates while it
+runs, is not covered on every platform; review a tree a program wrote before
+running your version-control tools over it.
+
 ## Configuration
 
 `IPE_FILE_READ_MAX` sets the per-call byte ceiling of `File.readFile`, and

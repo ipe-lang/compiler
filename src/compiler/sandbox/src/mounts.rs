@@ -21,6 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::home::{HomeDir, HomeRefusal, RelativeToolHome, ToolHome};
+use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WritableTree};
 
 /// Directories masked in every jail, whoever the invoker is.
 const STATIC_MASKS: [&str; 3] = ["/home", "/root", "/tmp"];
@@ -54,6 +55,38 @@ pub enum JailPathError {
         /// The cargo home it would expose.
         cargo_home: PathBuf,
     },
+    /// A version-control entry in a writable working tree is a symlink, fifo,
+    /// socket, device, or a form its tool never writes, so no carve can be
+    /// proved to cover what the host executes from it.
+    VcsEntryUnexpectedKind {
+        /// The tool the entry belongs to.
+        kind: VcsKind,
+        /// The entry.
+        path: PathBuf,
+    },
+    /// A version-control pointer file in a writable working tree cannot be
+    /// followed to the metadata it names.
+    VcsPointerUnreadable {
+        /// The tool the pointer belongs to.
+        kind: VcsKind,
+        /// The pointer file.
+        path: PathBuf,
+        /// Why it cannot be followed.
+        reason: PointerFault,
+    },
+    /// A version-control entry changed between the carve and its use.
+    VcsEntryChanged {
+        /// The entry that changed.
+        path: PathBuf,
+    },
+    /// The jail arm cannot mount version-control metadata read-only under a
+    /// writable working tree, so it refuses the tree.
+    VcsMetadataUncarvable {
+        /// The arm that refuses.
+        arm: JailArm,
+        /// The first metadata path the tree holds.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for JailPathError {
@@ -82,6 +115,32 @@ impl fmt::Display for JailPathError {
                  path may sit at or above it; refusing to build the jail",
                 bind.display(),
                 cargo_home.display()
+            ),
+            Self::VcsEntryUnexpectedKind { kind, path } => write!(
+                f,
+                "the {kind} entry {} in the writable working tree is not a form {kind} \
+                 writes (a symlink, fifo, socket, or device), so it cannot be kept \
+                 read-only; refusing to build the jail",
+                path.display()
+            ),
+            Self::VcsPointerUnreadable { kind, path, reason } => write!(
+                f,
+                "the {kind} pointer file {} in the writable working tree {reason}; \
+                 refusing to build the jail",
+                path.display()
+            ),
+            Self::VcsEntryChanged { path } => write!(
+                f,
+                "the version-control entry {} changed after the jail checked it; \
+                 refusing to build the jail",
+                path.display()
+            ),
+            Self::VcsMetadataUncarvable { arm, path } => write!(
+                f,
+                "the {arm} jail cannot keep the version-control metadata {} read-only \
+                 under a writable working tree: run without the filesystem grant, or \
+                 from a tree without version-control metadata; refusing to build the jail",
+                path.display()
             ),
         }
     }
@@ -261,27 +320,41 @@ pub enum Bind<'a> {
     ReadOnly(&'a CanonicalPath),
     /// `--bind`: visible and writable.
     ReadWrite(&'a CanonicalPath),
+    /// `--bind` of a working tree, with its version-control carve bound
+    /// read-only over it.
+    WorkingTree(&'a WritableTree),
 }
 
 impl<'a> Bind<'a> {
-    const fn path(self) -> &'a CanonicalPath {
+    /// The path the bind exposes.
+    #[must_use]
+    pub const fn path(self) -> &'a CanonicalPath {
         match self {
             Self::ReadOnly(path) | Self::ReadWrite(path) => path,
+            Self::WorkingTree(tree) => tree.tree(),
         }
     }
 
-    /// The narrower of two binds of one path: read-only when either is.
+    /// The narrower of two binds of one path: read-only when either is, and a
+    /// working tree over a plain read-write bind so its carve is kept.
     const fn narrowed(self, other: Self) -> Self {
-        match other {
-            Self::ReadOnly(_) => other,
-            Self::ReadWrite(_) => self,
+        match (self, other) {
+            (_, Self::ReadOnly(_)) | (Self::ReadWrite(_), Self::WorkingTree(_)) => other,
+            (Self::ReadOnly(_) | Self::WorkingTree(_), _)
+            | (Self::ReadWrite(_), Self::ReadWrite(_)) => self,
         }
+    }
+
+    /// Whether the bind exposes its path writable.
+    #[must_use]
+    pub const fn is_writable(self) -> bool {
+        matches!(self, Self::ReadWrite(_) | Self::WorkingTree(_))
     }
 
     const fn flag(self) -> &'static str {
         match self {
             Self::ReadOnly(_) => "--ro-bind",
-            Self::ReadWrite(_) => "--bind",
+            Self::ReadWrite(_) | Self::WorkingTree(_) => "--bind",
         }
     }
 }
@@ -317,6 +390,12 @@ pub enum MountStep<'a> {
 /// that mask, which hides what the bind would have exposed there. Binds keep
 /// their relative order within one mask; a path bound twice appears once, at
 /// its first position, read-only when any of its binds is.
+///
+/// Each carve path of a [`Bind::WorkingTree`] is bound read-only right after
+/// the last writable bind that contains it, so no writable bind re-exposes it
+/// and every later mask that contains it still hides it: the carve is the last
+/// word over each carved path. A carve no writable bind contains is already
+/// read-only or hidden, and adds no step.
 #[must_use]
 pub fn mount_plan<'a>(homes: &HomeMasks, binds: &[Bind<'a>]) -> Vec<MountStep<'a>> {
     let mut masks: Vec<PathBuf> = STATIC_MASKS
@@ -366,7 +445,47 @@ pub fn mount_plan<'a>(homes: &HomeMasks, binds: &[Bind<'a>]) -> Vec<MountStep<'a
         plan.push(MountStep::Mask(mask));
         plan.extend(binds_of(Some(index)));
     }
-    plan
+    with_carves(plan, &unique)
+}
+
+/// `plan` with each working-tree carve of `binds` bound read-only right after
+/// the last writable step that contains it or lies inside it, so no writable
+/// bind, not even one nested in a carved path, lands after its carve.
+fn with_carves<'a>(plan: Vec<MountStep<'a>>, binds: &[Bind<'a>]) -> Vec<MountStep<'a>> {
+    let carves: Vec<&'a CanonicalPath> = binds
+        .iter()
+        .filter_map(|bind| match bind {
+            Bind::WorkingTree(tree) => Some(tree.carve().paths()),
+            Bind::ReadOnly(_) | Bind::ReadWrite(_) => None,
+        })
+        .flatten()
+        .collect();
+    if carves.is_empty() {
+        return plan;
+    }
+    let anchors: Vec<Option<usize>> = carves
+        .iter()
+        .map(|carve| {
+            plan.iter().rposition(|step| {
+                matches!(step, MountStep::Bind(bind)
+                    if bind.is_writable()
+                        && (carve.as_path().starts_with(bind.path().as_path())
+                            || bind.path().as_path().starts_with(carve.as_path())))
+            })
+        })
+        .collect();
+    let mut out: Vec<MountStep<'a>> = Vec::with_capacity(plan.len() + carves.len());
+    for (index, step) in plan.into_iter().enumerate() {
+        out.push(step);
+        out.extend(
+            carves
+                .iter()
+                .zip(&anchors)
+                .filter(|(_, anchor)| **anchor == Some(index))
+                .map(|(carve, _)| MountStep::Bind(Bind::ReadOnly(carve))),
+        );
+    }
+    out
 }
 
 /// Whether a jail binds its working tree.
@@ -392,14 +511,15 @@ impl WorkingTree {
 /// The bind set a jail over `mounts` exposes through its masks.
 ///
 /// The read-only binds, the scratch read-write, and the working tree
-/// read-write only when `working_tree` is [`WorkingTree::ReadWrite`]. Every
+/// read-write, its version-control carve read-only, only when `working_tree`
+/// is [`WorkingTree::ReadWrite`]. Every
 /// jail built from a [`crate::JailMounts`] binds exactly this set.
 #[must_use]
 pub fn jail_binds(mounts: &crate::JailMounts, working_tree: WorkingTree) -> Vec<Bind<'_>> {
     let mut binds: Vec<Bind<'_>> = mounts.read_only().iter().map(Bind::ReadOnly).collect();
     binds.push(Bind::ReadWrite(mounts.scoped_tmp()));
     if working_tree == WorkingTree::ReadWrite {
-        binds.push(Bind::ReadWrite(mounts.working_tree()));
+        binds.push(Bind::WorkingTree(mounts.writable_tree()));
     }
     binds
 }
@@ -882,5 +1002,183 @@ mod tests {
             .map(str::to_owned),
         );
         assert_eq!(argv, expected);
+    }
+
+    /// What a path is inside a jail after the rendered `argv` mounts.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        /// No step covers it: the read-only root shows it.
+        Root,
+        /// A mask hides it.
+        Hidden,
+        /// A read-only bind exposes it.
+        ReadOnly,
+        /// A writable bind exposes it.
+        ReadWrite,
+    }
+
+    /// Test oracle: the mode of `path` after replaying `argv` in order, the last
+    /// covering step winning.
+    fn effective_mode(argv: &[String], path: &Path) -> Mode {
+        let mut mode = Mode::Root;
+        let mut ops = argv.iter().map(String::as_str);
+        while let Some(op) = ops.next() {
+            let (step, target) = match op {
+                "--tmpfs" => (Mode::Hidden, ops.next()),
+                "--ro-bind" => (Mode::ReadOnly, ops.nth(1)),
+                "--bind" => (Mode::ReadWrite, ops.nth(1)),
+                _ => continue,
+            };
+            if target.is_some_and(|target| path.starts_with(target)) {
+                mode = step;
+            }
+        }
+        mode
+    }
+
+    #[test]
+    fn a_read_write_tree_binds_its_git_dir_read_only_after_the_tree() {
+        let scratch = CanonicalPath::assumed("/srv/scratch");
+        let tree = WritableTree::assumed(
+            CanonicalPath::assumed("/srv/tree"),
+            vec![CanonicalPath::assumed("/srv/tree/.git")],
+        );
+        let argv = rendered(
+            &HomeMasks::unmasked(),
+            &[Bind::ReadWrite(&scratch), Bind::WorkingTree(&tree)],
+        );
+        let bind = position(&argv, &["--bind", "/srv/tree", "/srv/tree"]);
+        let carve = position(&argv, &["--ro-bind", "/srv/tree/.git", "/srv/tree/.git"]);
+        assert!(
+            matches!((bind, carve), (Some(bind), Some(carve)) if bind < carve),
+            "{argv:?}"
+        );
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/tree/.git/hooks/pre-commit")),
+            Mode::ReadOnly
+        );
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/tree/src/main.rs")),
+            Mode::ReadWrite,
+            "the rest of the tree stays writable"
+        );
+    }
+
+    #[test]
+    fn a_working_tree_bound_twice_keeps_its_carve() {
+        let path = CanonicalPath::assumed("/srv/tree");
+        let tree =
+            WritableTree::assumed(path.clone(), vec![CanonicalPath::assumed("/srv/tree/.git")]);
+        for binds in [
+            [Bind::ReadWrite(&path), Bind::WorkingTree(&tree)],
+            [Bind::WorkingTree(&tree), Bind::ReadWrite(&path)],
+        ] {
+            let argv = rendered(&HomeMasks::unmasked(), &binds);
+            assert_eq!(
+                effective_mode(&argv, Path::new("/srv/tree/.git/config")),
+                Mode::ReadOnly,
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_masked_home_tree_keeps_its_carve_hidden() {
+        let user = "/srv/u";
+        let homes = assumed_homes(user, "/srv/u/.cargo");
+        let scratch = CanonicalPath::assumed("/srv/scratch");
+        let tree = WritableTree::assumed(
+            CanonicalPath::assumed(user),
+            vec![CanonicalPath::assumed("/srv/u/.git")],
+        );
+        let argv = rendered(
+            &homes,
+            &[Bind::ReadWrite(&scratch), Bind::WorkingTree(&tree)],
+        );
+        let carve = position(&argv, &["--ro-bind", "/srv/u/.git", "/srv/u/.git"]);
+        let mask = position(&argv, &["--tmpfs", user]);
+        assert!(
+            matches!((carve, mask), (Some(carve), Some(mask)) if carve < mask),
+            "the carve precedes the home mask that hides it: {argv:?}"
+        );
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/u/.git/hooks")),
+            Mode::Hidden
+        );
+    }
+
+    #[test]
+    fn the_carve_is_the_last_word_over_each_carved_path() {
+        let user = "/srv/u";
+        let scratch = CanonicalPath::assumed("/srv/scratch");
+        let layouts: [(&str, HomeMasks, &str, Vec<&str>); 3] = [
+            (
+                "the tree is the scratch",
+                HomeMasks::unmasked(),
+                "/srv/scratch",
+                vec!["/srv/scratch/.git", "/srv/scratch/.hg"],
+            ),
+            (
+                "the tree lies under a masked home",
+                assumed_homes(user, "/srv/u/.cargo"),
+                "/srv/u/proj",
+                vec!["/srv/u/proj/.git", "/srv/u/proj/_darcs"],
+            ),
+            (
+                "a gitfile names a gitdir in the scratch",
+                HomeMasks::unmasked(),
+                "/srv/tree",
+                vec![
+                    "/srv/tree/.git",
+                    "/srv/scratch/gd",
+                    "/srv/scratch/gd/common",
+                ],
+            ),
+        ];
+        for (layout, homes, tree, carve) in layouts {
+            let tree = WritableTree::assumed(
+                CanonicalPath::assumed(tree),
+                carve
+                    .iter()
+                    .map(|path| CanonicalPath::assumed(path))
+                    .collect(),
+            );
+            let argv = rendered(
+                &homes,
+                &[Bind::ReadWrite(&scratch), Bind::WorkingTree(&tree)],
+            );
+            for path in &carve {
+                let inside = Path::new(path).join("hooks");
+                let mode = effective_mode(&argv, &inside);
+                assert!(
+                    matches!(mode, Mode::ReadOnly | Mode::Hidden),
+                    "{layout}: {path} ends {mode:?}: {argv:?}"
+                );
+            }
+            assert_eq!(bind_after_covered_mask(&argv), None, "{layout}: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_writable_bind_nested_in_a_carve_never_lands_after_it() {
+        let tree = WritableTree::assumed(
+            CanonicalPath::assumed("/srv/tree"),
+            vec![CanonicalPath::assumed("/srv/tree/.git")],
+        );
+        let nested = CanonicalPath::assumed("/srv/tree/.git/scratch");
+        let argv = rendered(
+            &HomeMasks::unmasked(),
+            &[Bind::WorkingTree(&tree), Bind::ReadWrite(&nested)],
+        );
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/tree/.git/scratch/hooks")),
+            Mode::ReadOnly,
+            "a writable bind inside a carve is covered by the carve: {argv:?}"
+        );
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/tree/.git/config")),
+            Mode::ReadOnly,
+            "{argv:?}"
+        );
     }
 }
