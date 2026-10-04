@@ -2289,7 +2289,7 @@ impl<'a> DevMarkedCrate<'a> {
 
 /// The internal-bug error for a cargo step handed a crate whose written floor
 /// is not the one the step's build needs.
-pub(crate) fn floor_mismatch_bug(where_: &'static str, detail: String) -> CliError {
+pub fn floor_mismatch_bug(where_: &'static str, detail: String) -> CliError {
     CliError::Pipeline {
         file: PathBuf::from("src/main.rs"),
         src: String::new(),
