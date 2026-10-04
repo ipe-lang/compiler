@@ -163,7 +163,7 @@ fn project_root() -> Result<PathBuf, CliError> {
 /// [`CliError::Io`] on a stat or remove failure.
 fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String>, CliError> {
     use crate::output_dir::OutputRefusal;
-    use crate::output_dir::held::{EntryKind, HeldDir, level_held};
+    use crate::output_dir::held::{EntryKind, HeldDir, OwnedNow, level_held};
     let name = generated.name;
     let candidate = root.join(name);
     let Some(root_dir) = HeldDir::open_following(root)? else {
@@ -181,8 +181,10 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
     level_held(dir.path());
     match generated.proof {
         Proof::Marker => {
-            if !dir.has_marker()? {
-                return Err(OutputRefusal::NotIpeOwned(candidate).into());
+            match dir.owned_now()? {
+                OwnedNow::Owned => {}
+                OwnedNow::Claiming => return Err(OutputRefusal::ClaimInFlight(candidate).into()),
+                OwnedNow::Unowned => return Err(OutputRefusal::NotIpeOwned(candidate).into()),
             }
             root_dir.remove_proven(os_name, dir)?;
             Ok(vec![format!("{name}/")])
@@ -307,6 +309,34 @@ mod tests {
             real_root.join("out").join("thesis.tex").is_file(),
             "user file kept"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marked `out/` whose claim is still in flight is refused and kept.
+    #[test]
+    fn clean_refuses_a_claim_in_flight() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe_clean_claiming_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("make root");
+        let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
+        let out = real_root.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        std::fs::write(out.join("keep.txt"), "kept").expect("output file");
+        std::fs::write(out.join(crate::output_dir::CLAIM_FILE), b"").expect("claim in flight");
+
+        let result = remove_generated_dir(&real_root, OUT);
+        assert!(
+            matches!(
+                result,
+                Err(CliError::OutputRefused(
+                    crate::output_dir::OutputRefusal::ClaimInFlight(_)
+                ))
+            ),
+            "a claim in flight must be refused, got: {result:?}"
+        );
+        assert!(out.join("keep.txt").is_file(), "the output is kept");
 
         let _ = std::fs::remove_dir_all(&root);
     }

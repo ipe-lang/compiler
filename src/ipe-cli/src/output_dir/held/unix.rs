@@ -16,6 +16,16 @@ fn new_file_flags() -> OFlags {
     OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+/// Flags for exclusively creating the claim file, which is read and locked as well as written.
+fn new_claim_flags() -> OFlags {
+    OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// Flags for opening an existing claim file, never through a link, a FIFO, or a terminal.
+fn claim_flags() -> OFlags {
+    OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC
+}
+
 /// Permission bits a new file is created with, before the umask.
 fn file_mode() -> Mode {
     Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH
@@ -44,6 +54,29 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
         file_mode(),
     )?;
     Ok(File::from(fd))
+}
+
+/// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.
+pub fn create_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let fd = rustix::fs::openat(
+        dir.handle(),
+        name.as_os_str(),
+        new_claim_flags(),
+        file_mode(),
+    )?;
+    Ok(File::from(fd))
+}
+
+/// Open the existing claim file `name` in `dir` to read, write, and lock, never following a link.
+pub fn open_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let fd = rustix::fs::openat(dir.handle(), name.as_os_str(), claim_flags(), Mode::empty())?;
+    Ok(File::from(fd))
+}
+
+/// Whether `error` reports a claim name another claimant is deleting; never on Unix.
+#[must_use]
+pub const fn is_claim_pending(_error: &io::Error) -> bool {
+    false
 }
 
 /// Rename the entry `from` over the entry `to`, both in `dir`.

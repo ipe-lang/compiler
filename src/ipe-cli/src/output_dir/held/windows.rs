@@ -56,6 +56,8 @@ const ERROR_REPARSE_POINT_ENCOUNTERED: i32 = 4395;
 const ERROR_SHARING_VIOLATION: i32 = 32;
 /// `ERROR_LOCK_VIOLATION`: another process has locked a region of the file.
 const ERROR_LOCK_VIOLATION: i32 = 33;
+/// `ERROR_ACCESS_DENIED`: also the answer for an open of a name pending deletion.
+const ERROR_ACCESS_DENIED: i32 = 5;
 /// The name prefix of a pin sentinel; entries carrying it are never listed.
 const PIN_PREFIX: &str = ".ipe-pin-";
 /// How many sentinel names a pin tries before giving up.
@@ -212,6 +214,41 @@ pub fn create_new(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
         .create_new(true)
         .custom_flags(OPEN_REPARSE_POINT);
     open_at(dir, name, &options)
+}
+
+/// Options opening the claim file to read, write, and lock, sharing every access and never following a reparse point.
+///
+/// Delete sharing lets the holder unlink the name while another claimant
+/// still has it open.
+fn claim_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .share_mode(SHARE_ALL)
+        .custom_flags(OPEN_REPARSE_POINT);
+    options
+}
+
+/// Exclusively create the claim file `name` in `dir`, open to read, write, and lock.
+pub fn create_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    let mut options = claim_options();
+    options.create_new(true);
+    open_at(dir, name, &options)
+}
+
+/// Open the existing claim file `name` in `dir` to read, write, and lock, never through a reparse point.
+pub fn open_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
+    open_at(dir, name, &claim_options())
+}
+
+/// Whether `error` reports a claim name another claimant is deleting.
+///
+/// An open of a name pending deletion answers access denied until its last
+/// handle closes; the claim then retries.
+#[must_use]
+pub fn is_claim_pending(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
 }
 
 /// Rename the entry `from` over the entry `to`, both in `dir`.

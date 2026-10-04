@@ -782,15 +782,13 @@ impl CacheSite {
 
     /// The bytes of entry `file_name` under `epoch`, read through no symlink.
     ///
-    /// An in-output entry is read only from a marked, non-symlink output dir;
+    /// An in-output entry is read only from an output dir ipe owns now, never through a link;
     /// every level below it (and below an explicit root) is lstat'd, and a
     /// symlink anywhere is a miss.
     fn read(&self, epoch: &str, file_name: &str) -> Option<Vec<u8>> {
         match self {
             Self::InOutput { out_dir, salt } => {
-                let meta = fs::symlink_metadata(out_dir).ok()?;
-                let owned =
-                    meta.is_dir() && crate::output_dir::has_marker(out_dir).unwrap_or(false);
+                let owned = crate::output_dir::owned_at(out_dir).unwrap_or(false);
                 if !owned {
                     return None;
                 }
@@ -2132,6 +2130,48 @@ mod tests {
         };
         assert!(try_load(&site, "epoch", "key").is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An in-output read misses while a claim is in flight and when the marker is a hard link.
+    #[test]
+    fn cache_read_misses_on_a_linked_marker_and_on_a_claim_in_flight() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe-cache-claiming-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("make root");
+        let base = fs::canonicalize(&root).expect("canonicalize root");
+        let out = base.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        let entry = out
+            .join(CACHE_DIR_NAME)
+            .join("salt")
+            .join("epoch")
+            .join("raw.txt");
+        fs::create_dir_all(entry.parent().expect("entry dir")).expect("make entry dir");
+        fs::write(&entry, "hit").expect("plant entry");
+        let site = CacheSite::InOutput {
+            out_dir: out.clone(),
+            salt: "salt".to_owned(),
+        };
+        assert_eq!(site.read("epoch", "raw.txt").as_deref(), Some(&b"hit"[..]));
+
+        let claim = out.join(crate::output_dir::CLAIM_FILE);
+        fs::write(&claim, b"").expect("claim in flight");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a claim in flight is a miss"
+        );
+        fs::remove_file(&claim).expect("drop the claim");
+
+        let marker = out.join(crate::output_dir::OWNERSHIP_MARKER);
+        let aside = base.join("marker-aside");
+        fs::rename(&marker, &aside).expect("move the marker aside");
+        fs::hard_link(&aside, &marker).expect("link the marker back");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a hard-linked marker is a miss"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     // -----------------------------------------------------------------

@@ -105,6 +105,33 @@ fn id_of(meta: &std::fs::Metadata) -> FileId {
     }
 }
 
+/// The identity a no-follow `stat` carries.
+///
+/// `dev_t` is signed on some Unixes; a negative device number names no
+/// object this crate compares, so it is refused.
+fn id_of_stat(stat: &rustix::fs::Stat) -> Result<FileId, OpenRefusal> {
+    let widen =
+        |raw: i128| u64::try_from(raw).map_err(|_| OpenRefusal::Io(io::ErrorKind::InvalidData));
+    Ok(FileId {
+        dev: widen(i128::from(stat.st_dev))?,
+        ino: widen(i128::from(stat.st_ino))?,
+    })
+}
+
+/// The identity of the object `file` holds.
+pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
+    file.metadata()
+        .map(|meta| id_of(&meta))
+        .map_err(|e| refusal_of(&e))
+}
+
+/// How many directory entries name the object `file` holds.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    file.metadata()
+        .map(|meta| meta.nlink())
+        .map_err(|e| refusal_of(&e))
+}
+
 /// The kind and length of the object `file` holds, read from that handle.
 pub fn kind_and_len(file: &File) -> Result<(FileKind, u64), OpenRefusal> {
     let meta = file.metadata().map_err(|e| refusal_of(&e))?;
@@ -172,6 +199,15 @@ impl Dir {
             Ok(stat) => Ok(Some(kind_of_stat_type(FileType::from_raw_mode(
                 stat.st_mode,
             )))),
+            Err(errno) if errno == Errno::NOENT => Ok(None),
+            Err(errno) => Err(refusal(errno)),
+        }
+    }
+
+    /// The identity of the entry `name`, read without following a link; `None` when absent.
+    pub fn entry_id(&self, name: &EntryName) -> Result<Option<FileId>, OpenRefusal> {
+        match rustix::fs::statat(&self.0, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => id_of_stat(&stat).map(Some),
             Err(errno) if errno == Errno::NOENT => Ok(None),
             Err(errno) => Err(refusal(errno)),
         }

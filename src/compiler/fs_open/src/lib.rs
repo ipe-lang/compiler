@@ -211,6 +211,25 @@ impl FileId {
     pub fn of_path(path: &Path) -> Result<Self, OpenRefusal> {
         sys::id_of_path(path)
     }
+
+    /// The identity of the object the open `file` holds.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn of_file(file: &File) -> Result<Self, OpenRefusal> {
+        sys::id_of_file(file)
+    }
+}
+
+/// How many directory entries name the object the open `file` holds.
+///
+/// A file reached by a reserved name is believed only when this is one: a
+/// hard link planted at the name shares its object with another entry.
+///
+/// # Errors
+/// The refusal of a handle that cannot be stat'd.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    sys::link_count(file)
 }
 
 /// An open directory handle every entry act is relative to.
@@ -289,6 +308,15 @@ impl HeldDir {
     /// The refusal of a failure other than absence.
     pub fn kind_of(&self, name: &EntryName) -> Result<Option<FileKind>, OpenRefusal> {
         self.dir.kind_of(name)
+    }
+
+    /// The identity of the entry `name`, read without following a link; `None` when absent.
+    ///
+    /// # Errors
+    /// The refusal of a failure other than absence; on Windows
+    /// [`OpenRefusal::Denied`] for an entry pending deletion.
+    pub fn entry_id(&self, name: &EntryName) -> Result<Option<FileId>, OpenRefusal> {
+        self.dir.entry_id(name)
     }
 
     /// Every entry of this directory and its kind, `.` and `..` excluded.
@@ -390,6 +418,12 @@ impl RegularFile {
             (FileKind::Symlink, _) => Err(OpenRefusal::Link),
             (kind, _) => Err(OpenRefusal::NotRegular(kind)),
         }
+    }
+
+    /// The proven handle, for an identity read or a bounded read this type does not provide.
+    #[must_use]
+    pub const fn handle(&self) -> &File {
+        &self.file
     }
 
     /// The length the proof saw; the file may have changed since.

@@ -152,6 +152,17 @@ fn id_of(file: &File) -> Result<FileId, OpenRefusal> {
     })
 }
 
+/// The identity of the object `file` holds.
+pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
+    id_of(file)
+}
+
+/// How many directory entries name the object `file` holds.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    let info = winapi_util::file::information(file).map_err(|e| refusal_of(&e))?;
+    Ok(info.number_of_links())
+}
+
 /// The identity of the object looking `path` up now reaches, following links.
 pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -236,6 +247,17 @@ impl Dir {
     pub fn kind_of(&self, name: &EntryName) -> Result<Option<FileKind>, OpenRefusal> {
         match self.open_at(name, &stat_options()) {
             Ok(file) => kind_and_len(&file).map(|(kind, _)| Some(kind)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(refusal_of(&e)),
+        }
+    }
+
+    /// The identity of the entry `name`, read without following a reparse point; `None` when absent.
+    ///
+    /// An entry pending deletion answers [`OpenRefusal::Denied`].
+    pub fn entry_id(&self, name: &EntryName) -> Result<Option<FileId>, OpenRefusal> {
+        match self.open_at(name, &stat_options()) {
+            Ok(file) => id_of(&file).map(Some),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(refusal_of(&e)),
         }
