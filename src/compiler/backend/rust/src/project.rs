@@ -1852,18 +1852,9 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         // Empty (nothing pushed) when the program has no row annotation.
         file.push(&emit_row_witnesses(ctx, program)?);
 
-        // boundary-projection impl blocks.  When the program uses Db QUERY
-        // kernels, the lowerer injected synthetic `SqlValue` / `SqlField`
-        // enums, and the Db call sites project Ipê ADT values to the runtime's
-        // concrete `SqlParam` / `Option<SqlParam>`. Keyed on the injected enum's
-        // PRESENCE, not on `uses_db`: a program that only NAMES a `db`-gated type
-        // (`Dsn` / `Connection`) forces the `db` feature (for `dsn.rs` /
-        // `external_conn.rs`) through the type-closure fold without injecting a
-        // `SqlValue` enum, so there is no projection to emit — gating on
-        // `uses_db` would then reference an enum that does not exist.
-        if ctx.sqlvalue_rust_name.is_some() {
-            file.push(&emit_db_projection_impls(ctx)?);
-        }
+        // Boundary-projection impls from the injected `SqlValue` / `SqlField`
+        // enums to the runtime's `SqlParam`; empty when none was injected.
+        file.push(&emit_db_projection_impls(ctx)?);
 
         // Fixed kernel-wrapper prelude (IpeError, IpeTask<A>, Decoder<T>, …)
         // plus the TEA aliases and Auth wrappers the program reaches.
@@ -3546,9 +3537,7 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     }
     // Per-field witness traits + impls for any row-polymorphic function.
     file.push(&emit_row_witnesses(ctx, program)?);
-    if ctx.uses_db {
-        file.push(&emit_db_projection_impls(ctx)?);
-    }
+    file.push(&emit_db_projection_impls(ctx)?);
 
     file.push(&prelude_section(ctx)?);
     file.push(&epilogue_for_target(ctx)?);
@@ -5576,30 +5565,33 @@ fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
 /// variants is 1-to-1.  Only the enum's Rust *type name* (e.g. `MainSqlValue`)
 /// varies per program (depends on the module name prefix).
 ///
+/// The one gate for both emit paths: the impls exist exactly when the lowerer
+/// injected the `SqlValue` / `SqlField` enums. `uses_db` alone is not the key —
+/// a program that only NAMES a `db`-gated type (`Dsn` / `Connection`) forces
+/// the `db` feature through the type-closure fold without injecting either
+/// enum, and then there is no projection to emit.
+///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] when `ctx.uses_db` is `true` but the
-/// Rust names were not computed — an internal invariant violation (the detection
-/// in `EmitCtx::build` and the injection in `Lowerer::run` must agree).
+/// Returns [`Diagnostic::CompilerBug`] when exactly one of the two enums was
+/// injected — the lowerer injects them together, so a lone one is an internal
+/// invariant violation.
 fn emit_db_projection_impls(ctx: &EmitCtx) -> DResult<String> {
-    let sv = ctx
-        .sqlvalue_rust_name
-        .as_deref()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::emit_db_projection_impls",
-            detail: "uses_db is true but sqlvalue_rust_name is None — \
-                 SqlValue was not injected into enum_names"
-                .to_owned(),
-        })?;
-    let sf = ctx
-        .sqlfield_rust_name
-        .as_deref()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::emit_db_projection_impls",
-            detail: "uses_db is true but sqlfield_rust_name is None — \
-                 SqlField was not injected into enum_names"
-                .to_owned(),
-        })?;
+    let (sv, sf) = match (
+        ctx.sqlvalue_rust_name.as_deref(),
+        ctx.sqlfield_rust_name.as_deref(),
+    ) {
+        (None, None) => return Ok(String::new()),
+        (Some(sv), Some(sf)) => (sv, sf),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::project::emit_db_projection_impls",
+                detail: "exactly one of the SqlValue / SqlField enums was injected \
+                         into enum_names; the lowerer injects them together"
+                    .to_owned(),
+            });
+        }
+    };
 
     // `SqlTime` stores a Unix-millisecond timestamp as `i64` — maps to
     // `SqlParam::Int`.  `SqlDecimal` carries a native `Decimal`, rendered to a

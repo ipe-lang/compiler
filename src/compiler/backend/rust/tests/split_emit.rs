@@ -287,3 +287,33 @@ fn emit_spine_carries_sqlvalue_sqlfield_before_record_structs_for_db() -> DResul
     );
     Ok(())
 }
+
+/// A split program that only NAMES a `db`-gated type (a `Dsn` parameter, no Db
+/// kernel, so no injected `SqlValue` / `SqlField`) turns `uses_db` on through
+/// the type-closure fold. The spine must still emit, with no projection impls:
+/// both emit paths share the one injected-enum gate, so the split path cannot
+/// reach for an enum that was never injected.
+#[test]
+fn emit_spine_of_a_program_naming_only_a_db_type_has_no_projection() -> DResult<()> {
+    let mut interner = Interner::new();
+    let (mut program, lib_home, _main_home) = build_two_module(&mut interner)?;
+    let dsn_param = interner.intern("dsn")?;
+    let takes_dsn = interner.intern("takesDsn")?;
+    let mut func = int_func(2, takes_dsn, lib_home);
+    func.params = vec![(dsn_param, IrType::Dsn)];
+    program
+        .modules
+        .first_mut()
+        .expect("build_two_module returns one module")
+        .funcs
+        .push(func);
+    let backend = RustBackend::new(&interner);
+
+    let spine = backend.emit_spine(&program)?;
+    assert!(
+        !spine.contains("into_sql_param"),
+        "no SqlValue was injected, so no projection impl may be emitted, got:\n{spine}"
+    );
+    backend.emit(&program)?;
+    Ok(())
+}
