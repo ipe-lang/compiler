@@ -623,11 +623,12 @@ where
     /// Reads chunks until the upstream ends, the registry cancels, or the idle ceiling passes.
     ///
     /// Every wait is a biased `select!` with the cancel signal first, so a
-    /// cancelled drain neither reads nor starts another chunk. The cancel arm is
-    /// polled outside the cooperative budget, so a spent budget can never make it
-    /// report pending while the read behind it is ready. Each chunk spends one
-    /// unit of budget, so a drain over an always-ready upstream still yields to
-    /// the scheduler, which is what lets a close reach it at all. A cancel during
+    /// cancelled drain neither reads nor starts another chunk. `select!` checks
+    /// the cooperative budget before it polls any arm, so a ready cancel is
+    /// always seen before the read behind it; polling the cancel arm outside the
+    /// budget is defence in depth. Each chunk spends one unit of budget, so a
+    /// drain over an always-ready upstream still yields to the scheduler, which
+    /// is what lets a close reach it at all. A cancel during
     /// a step drops the stream and the permit at once, then lets the step finish:
     /// the connection is released, the caller's effect is never torn. Every arm
     /// is irrefutable and unconditional, so no `select!` can find all arms disabled.
@@ -1348,18 +1349,16 @@ mod tests {
 
     /// Runs of the always-ready scenario: an unbiased read wait picks the read
     /// with probability one half on each `CloseAt::Step` run, so all of them
-    /// passing by luck is 2^-64. Every run spends cooperative budget without
-    /// yielding, and the runs together spend more than one task poll grants, so
-    /// some read wait meets a spent budget.
+    /// passing by luck is 2^-64.
     const ALWAYS_READY_RUNS: usize = 64;
 
     #[tokio::test(start_paused = true)]
-    async fn close_inside_the_body_reads_no_further_chunk_past_a_spent_budget() {
+    async fn close_inside_the_body_reads_no_further_chunk() {
         drain_closing_in_the_body(ticking(), CloseAt::Call).await;
         drain_closing_in_the_body(ticking(), CloseAt::Step).await;
         // With a chunk always ready, only the cancel arm's priority stops the
         // next read: both arms are ready together at every wait, and the
-        // cancel arm must win it whatever budget the task has left.
+        // cancel arm must win it.
         for _ in 0..ALWAYS_READY_RUNS {
             drain_closing_in_the_body(always_ready(), CloseAt::Call).await;
             drain_closing_in_the_body(always_ready(), CloseAt::Step).await;
@@ -1386,6 +1385,10 @@ mod tests {
         ));
         // The drain runs first; this task gets the thread back only when it yields.
         tokio::task::yield_now().await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the drain ran before the close"
+        );
         assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
         assert!(matches!(drain.await, Ok(IpeResult::Ok(()))));
         assert!(calls.load(Ordering::SeqCst) < UNYIELDING_CHUNKS);
