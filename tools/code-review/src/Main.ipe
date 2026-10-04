@@ -36,10 +36,12 @@ type Page
     | UnitPage String
 
 
--- `queueCursor` is where the shown queue page starts; a reload after a
--- decision re-reads that page only.
+-- `settings` is the index configuration parsed once at startup; every request
+-- reads it and none reads the environment. `queueCursor` is where the shown
+-- queue page starts; a reload after a decision re-reads that page only.
 type alias Model =
-    { page : Page
+    { settings : Settings.IndexSettings
+    , page : Page
     , queueState : Queue.QueueState
     , queueCursor : Index.Cursor
     , refusingUid : Maybe String
@@ -59,9 +61,10 @@ type alias Model =
 -- The session's first model. It loads nothing: the route entry that follows
 -- `init` on every new session (`onNavigate`) loads the page's data, so the
 -- route table is the one place a URL maps to a page.
-init : Web.WebReq -> ( Model, Cmd Msg )
-init _req =
-    ( { page = QueuePage
+init : Settings.IndexSettings -> Web.WebReq -> ( Model, Cmd Msg )
+init settings _req =
+    ( { settings = settings
+      , page = QueuePage
       , queueState = Loading
       , queueCursor = Index.Start
       , refusingUid = Nothing
@@ -111,7 +114,7 @@ loadQueue cursor model =
             Queue.nextTicket model.queueLoad
     in
     ( { model | queueCursor = cursor, queueLoad = load }
-    , Cmd.perform (Queue.loadPage cursor) (PendingLoaded load)
+    , Cmd.perform (Queue.loadPage model.settings cursor) (PendingLoaded load)
     )
 
 
@@ -147,7 +150,7 @@ loadHistory cursor model =
             Queue.nextTicket model.historyLoad
     in
     ( { model | history = HistoryLoading, historyLoad = load }
-    , Cmd.perform (Queue.loadHistoryPage cursor) (HistoryPageLoaded load)
+    , Cmd.perform (Queue.loadHistoryPage model.settings cursor) (HistoryPageLoaded load)
     )
 
 
@@ -159,7 +162,7 @@ loadUnit uid model =
             Queue.nextTicket model.unitLoad
     in
     ( { model | unitPage = UnitLoading, unitLoad = load }
-    , Cmd.perform (Queue.loadUnitView uid) (UnitViewLoaded load)
+    , Cmd.perform (Queue.loadUnitView model.settings uid) (UnitViewLoaded load)
     )
 
 
@@ -300,14 +303,14 @@ selectAt i model =
 -- A selected-view transition, with the one read it starts, if any.
 viewStep : ( Queue.SelectedView, Maybe String ) -> Model -> ( Model, Cmd Msg )
 viewStep ( state, next ) model =
-    ( { model | selectedView = state }, loadViewCmd next )
+    ( { model | selectedView = state }, loadViewCmd model.settings next )
 
 
-loadViewCmd : Maybe String -> Cmd Msg
-loadViewCmd next =
+loadViewCmd : Settings.IndexSettings -> Maybe String -> Cmd Msg
+loadViewCmd settings next =
     case next of
         Just uid ->
-            Cmd.perform (Queue.loadUnitView uid) (SelectedViewLoaded uid)
+            Cmd.perform (Queue.loadUnitView settings uid) (SelectedViewLoaded uid)
 
         Nothing ->
             Cmd.none
@@ -408,13 +411,18 @@ decisionTask model uid decision =
         Just _ ->
             case Queue.decidableSource uid model.selectedView of
                 Just shown ->
-                    LibDb.open |> Task.andThen (\db -> Queue.decide db shown decision)
+                    decideOn model.settings shown decision
 
                 Nothing ->
                     Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
 
         Nothing ->
             Task.fail (Error.conflict "unit is no longer in the queue")
+
+
+decideOn : Settings.IndexSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decideOn settings shown decision =
+    LibDb.open |> Task.andThen (\db -> Queue.decide settings db shown decision)
 
 
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the
@@ -424,7 +432,7 @@ decisionTask model uid decision =
 -- retries.
 drainAndReload : Model -> Index.Attested -> Queue.LoadTicket -> Cmd Msg
 drainAndReload model attested load =
-    Cmd.perform (Queue.drainThenLoad attested model.queueCursor) (PendingLoaded load)
+    Cmd.perform (Queue.drainThenLoad model.settings attested model.queueCursor) (PendingLoaded load)
 
 
 header : Model -> Ui.Element Msg
@@ -1246,10 +1254,12 @@ subscriptions model =
     Sub.none
 
 
-reviewApp : Web.WebApp
-reviewApp =
+-- The app over the index `settings` parsed at startup, the one value every
+-- request reads.
+reviewApp : Settings.IndexSettings -> Web.WebApp
+reviewApp settings =
     Web.embed
-        { init = init
+        { init = init settings
         , update = update
         , view = view
         , subscriptions = subscriptions
@@ -1283,9 +1293,10 @@ requireEnv key fix =
 -- the working directory. Then the index's `reviewed` copy is rebuilt from
 -- the review database once, so progress starts exact even after an edit the
 -- per-load count check cannot see. Any failure stops startup with a message
--- naming the variable and one fix.
-requireSettings : Task Error ()
-requireSettings =
+-- naming the variable and one fix. Returns the index settings, the one value
+-- the app serves from.
+requireSettings : String -> String -> Task Error Settings.IndexSettings
+requireSettings rawDb rawRoot =
     Task.onError
         (\e ->
             do
@@ -1293,20 +1304,20 @@ requireSettings =
                 System.exit 1
         )
         (do
-            index <- Settings.indexSettings
+            index <- Settings.parseIndexSettings rawDb rawRoot
             Index.probe index
             review <- Settings.reviewDb
             LibDb.probe review
             db <- LibDb.openAt review
-            Queue.resyncReviewed db
-            Task.succeed ()
+            Queue.resyncReviewed index db
+            Task.succeed index
         )
 
 
 main : Task Error ()
 main =
     do
-        requireEnv "IPE_INDEX_DB" "Set it to the path or sqlite:// URL of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
-        requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
-        requireSettings
-        Server.listen 8000 [ Server.mountApp "/" reviewApp ]
+        rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the path or sqlite:// URL of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
+        rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
+        settings <- requireSettings rawDb rawRoot
+        Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]

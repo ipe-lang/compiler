@@ -56,6 +56,7 @@ import TestSupport exposing
     , seedIndexDb
     , insertUnitRows
     , setIndexEnv
+    , envSettings
     , loadFirstPage
     , checkUnits
     , listSecond
@@ -306,7 +307,7 @@ relativeRootAccepted =
         dotRoot <- RepoPath.parseRoot "."
         System.setenv "IPE_INDEX_DB" (cwd ++ "/unused-index.db")
         System.setenv "IPE_INDEX_ROOT" rel
-        settings <- Settings.indexSettings
+        settings <- envSettings
         Task.succeed
             (Path.toString (RepoPath.rootPath root)
                 == Path.toString cwdPath

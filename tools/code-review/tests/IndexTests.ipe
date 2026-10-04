@@ -29,7 +29,6 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
-import Lib.Settings as Settings
 
 import TestSupport exposing
     ( tableExists
@@ -56,6 +55,7 @@ import TestSupport exposing
     , seedIndexDb
     , insertUnitRows
     , setIndexEnv
+    , envSettings
     , loadFirstPage
     , indexConn
     , loadUnitNow
@@ -388,7 +388,7 @@ pageReadsNoSource =
         removeFileIfAny (at.repo ++ "/src/Main.ipe")
         conn <- indexConn
         rows <- Index.loadPendingPage conn Index.Start
-        settings <- Settings.indexSettings
+        settings <- envSettings
         found <- Index.loadView conn settings.roots "u-b"
         cleanupIndex at.indexDb at.repo
         Task.succeed
@@ -436,7 +436,7 @@ probeRefusesIndexWithoutFiles =
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
         execIndex at.indexDb "DROP TABLE files" []
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         cleanupIndex at.indexDb at.repo
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 

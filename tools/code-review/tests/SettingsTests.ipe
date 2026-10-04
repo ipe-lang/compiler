@@ -56,6 +56,7 @@ import TestSupport exposing
     , seedIndexDb
     , insertUnitRows
     , setIndexEnv
+    , envSettings
     , loadFirstPage
     , checkUnits
     , listSecond
@@ -107,7 +108,7 @@ dbRefusalNamesOnlyVariable =
 settingsRefusal : String -> Task.Task Error (Maybe String)
 settingsRefusal indexDb =
     System.setenv "IPE_INDEX_DB" indexDb
-        |> Task.andThen (\_ -> Settings.indexSettings)
+        |> Task.andThen (\_ -> envSettings)
         |> Task.map (\_ -> Nothing)
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
 
@@ -254,7 +255,7 @@ probesNameTheirVariable =
         at <- freshScratch "ipe-index-probe"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        good <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        good <- probeMessage (envSettings |> Task.andThen Index.probe)
         missing <- missingIndexProbed at
         notIndex <- foreignDbProbed at
         review <- reviewProbed at
@@ -274,7 +275,7 @@ missingIndexProbed at =
     do
         removeFileIfAny missingDb
         System.setenv "IPE_INDEX_DB" missingDb
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
         Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
 
@@ -291,7 +292,7 @@ foreignDbProbed at =
         conn <- Db.open "sqlite" ("sqlite://" ++ otherDb ++ "?mode=rwc")
         Db.exec conn "CREATE TABLE IF NOT EXISTS other (x INTEGER)" []
         System.setenv "IPE_INDEX_DB" otherDb
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         removeFileIfAny otherDb
         Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
 
@@ -346,6 +347,59 @@ dbRefusalsStateOneFix =
             )
 
 
+-- The index environment is read at startup alone. `Settings` exports the
+-- parser of the two raw values (`parseIndexSettings`) and no function that
+-- reads the environment, and no module under `src/Lib` reads an `IPE_INDEX_*`
+-- variable, so a request has no way to resolve settings of its own. Red if the
+-- export list regains an environment reader, if a library module reads
+-- `IPE_INDEX_DB` or `IPE_INDEX_ROOT`, or if the library directory is empty.
+libraryNeverReadsIndexEnvironment : Task.Task Error Bool
+libraryNeverReadsIndexEnvironment =
+    do
+        cwd <- System.cwd ()
+        libDir <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib"))
+        names <- File.readDir libDir
+        sources <- Task.sequence (List.map (\name -> readLibSource (cwd ++ "/src/Lib/" ++ name)) (List.filter (String.endsWith ".ipe") names))
+        settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
+        Task.succeed
+            (List.length sources >= 8
+                && List.all (\text -> not (readsIndexEnvironment text)) sources
+                && settingsExports settings
+            )
+
+
+
+readLibSource : String -> Task.Task Error String
+readLibSource file =
+    Task.fromResult (Path.fromString file)
+        |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 256))
+
+
+
+readsIndexEnvironment : String -> Bool
+readsIndexEnvironment text =
+    String.contains "getenv \"IPE_INDEX_" text || String.contains "getenvOr \"IPE_INDEX_" text
+
+
+
+-- True when the module header exports `parseIndexSettings` and not the bare
+-- `indexSettings`.
+settingsExports : String -> Bool
+settingsExports source =
+    case List.head (String.lines source) of
+        Just header ->
+            let
+                names =
+                    List.map (\part -> String.replace ")" "" (String.trim part)) (String.split "," header)
+            in
+            List.any (\name -> name == "parseIndexSettings") names
+                && not (List.any (\name -> name == "indexSettings") names)
+
+        Nothing ->
+            False
+
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -355,4 +409,5 @@ checks =
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
+        , check "no library module reads the index environment" libraryNeverReadsIndexEnvironment
         ]
