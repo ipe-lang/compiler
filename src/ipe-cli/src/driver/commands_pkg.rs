@@ -137,7 +137,7 @@ impl BundleHost {
 /// A [`pack::desktop::DesktopRefusal`] / [`pack::mobile::MobileRefusal`] wrapped
 /// as [`CliError::Usage`] when the app's shape/target does not fit the host;
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
-pub(crate) fn bundle_delivery(
+pub fn bundle_delivery(
     host: BundleHost,
     finish: NativeFinish<'_>,
     path: Option<&str>,
@@ -545,7 +545,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub(crate) fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
+pub fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.

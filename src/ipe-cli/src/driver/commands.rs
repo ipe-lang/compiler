@@ -933,7 +933,7 @@ pub struct NativeBuild {
 /// no profile, so every release reader refuses it. A release build lowers its
 /// consented capabilities to the floor it embeds, so a release floor exists
 /// only behind a [`ConsentedCapabilities`] witness.
-pub(crate) enum NativeFinish<'a> {
+pub enum NativeFinish<'a> {
     /// `ipe dev`: the development marker, no profile, a debug build.
     Dev,
     /// `ipe release`: the consented capabilities' profile and release floor are
@@ -948,7 +948,7 @@ pub(crate) enum NativeFinish<'a> {
 
 /// The cargo build of an emitted native crate in its [`NativeFinish`]
 /// posture: the one path every dev and release native build takes.
-pub(crate) struct FlooredBuild<'a> {
+pub struct FlooredBuild<'a> {
     /// The resolved `cargo`.
     pub(crate) cargo: &'a toolchain::CargoBin,
     /// The emitted crate, both floored and built.
