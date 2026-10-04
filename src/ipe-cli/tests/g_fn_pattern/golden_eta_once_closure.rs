@@ -374,3 +374,117 @@ fn admitted_once_source_lambdas_build_and_run() {
         outcome.stdout
     );
 }
+
+/// A decoder destructure's thunk builds a closure over a function param.
+///
+/// The thunk is `Fn` (called once per read), so building the inner closure
+/// would move a `Box<dyn Fn>` param out of it; the param's binder site
+/// promotes it to the `Arc` carrier instead, so it is cloned and accepted.
+const THUNK_PROMOTED: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.String
+import Ipe.Task as Task
+
+
+shout : String -> String
+shout s =
+    s ++ "!"
+
+
+decodeWith : (String -> String) -> String -> String
+decodeWith f raw =
+    let
+        ( d, n ) =
+            ( JsonDec.map (\s -> f s ++ ".") JsonDec.string, 1 )
+    in
+    case ( JsonDec.decodeString d raw, JsonDec.decodeString d raw ) of
+        ( Ok a, Ok b ) ->
+            a ++ b ++ String.fromInt n
+
+        _ ->
+            "err"
+
+
+main : Task Error ()
+main =
+    Io.println (decodeWith shout "\"hi\"")
+"#;
+
+/// The line [`THUNK_PROMOTED`] prints.
+const THUNK_PROMOTED_STDOUT: &str = "hi!.hi!.1\n";
+
+/// The same thunk over a destructure-bound function: no carrier can promote it.
+const THUNK_DESTRUCTURED: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.String
+import Ipe.Task as Task
+
+
+shout : String -> String
+shout s =
+    s ++ "!"
+
+
+decodeWith : ( String -> String, Int ) -> String -> String
+decodeWith ( g, _ ) raw =
+    let
+        ( d, n ) =
+            ( JsonDec.map (\s -> g s ++ ".") JsonDec.string, 1 )
+    in
+    case ( JsonDec.decodeString d raw, JsonDec.decodeString d raw ) of
+        ( Ok a, Ok b ) ->
+            a ++ b ++ String.fromInt n
+
+        _ ->
+            "err"
+
+
+main : Task Error ()
+main =
+    Io.println (decodeWith ( shout, 0 ) "\"hi\"")
+"#;
+
+/// A destructure thunk building a closure over a destructure-bound function is refused.
+#[test]
+fn destructure_thunk_moving_a_bound_function_is_refused_at_the_capture() {
+    assert_source_refused_at_capture("eta_once_thunk_destructured", THUNK_DESTRUCTURED, "g s ++");
+}
+
+/// A destructure thunk over a promotable function param passes ipe.
+#[test]
+fn destructure_thunk_over_a_function_param_passes_ipe() {
+    let (built, _) = build_source("eta_once_thunk_promoted", THUNK_PROMOTED);
+    assert!(
+        built.is_ok(),
+        "a promotable function param captured by a destructure thunk must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for the promoted thunk capture: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn destructure_thunk_over_a_function_param_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("eta_once_thunk_promoted_e2e", THUNK_PROMOTED);
+    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("eta_once_thunk_promoted", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the promoted thunk capture must build and exit 0 (no E0507); stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains(THUNK_PROMOTED_STDOUT),
+        "must decode through the promoted param twice; got: {:?}",
+        outcome.stdout
+    );
+}

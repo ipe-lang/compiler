@@ -15111,9 +15111,9 @@ impl<'a> Lowerer<'a> {
             // its needed default pin. Centralised here so no `lower_def` branch
             // can silently miss it.
             func.body = clear_let_bound_task_fail_pins(func.body);
-            // Every `FnOnce`-only eta closure must sit where it is called at
-            // most once; checked on the final body so no later rewrite can move
-            // one into a position that calls it again.
+            // Every `FnOnce`-only closure (eta-rebuilt or source) must sit
+            // where it is called at most once; checked on the final body so no
+            // later rewrite can move one into a position that calls it again.
             crate::once_check::check_once_closures(&func.body)
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());

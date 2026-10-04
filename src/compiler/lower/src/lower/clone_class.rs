@@ -764,11 +764,11 @@ pub(super) fn rewrite_captured_clones(
         // fire, so `Var(f)` inside the inner body triggers L0126 — correctly
         // preventing a `FnOnce` closure from being boxed as `Box<dyn Fn>`.
         //
-        // The companion case — lambdas in ARGUMENT position such as
-        // `task_and_then(task, \ts -> insertRow db ts)` — is handled one level
-        // up in the `Apply` arm: arg-position lambdas receive an empty
-        // `noncl_set` before entering this arm, so `inner_noncl` below is
-        // already empty and no spurious L0126 is emitted.
+        // A lambda in ARGUMENT position (`Task.andThen (\ts -> insertRow db
+        // ts) task`) keeps the full `noncl_set` too: building it inside a
+        // `Recallable` closure moves each such capture out of that closure,
+        // so a recording walk makes the outer closure once-only and a
+        // refusing walk fails closed at the capture.
         Expr::Lambda { params, ret, body } => {
             let param_names: BTreeSet<Symbol> = params.iter().map(|(s, _)| *s).collect();
             let inner_clone: BTreeSet<Symbol> = clone_set
