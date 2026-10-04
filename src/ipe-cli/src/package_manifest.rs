@@ -86,6 +86,25 @@ const SCHEMA_MODULE: &str = "Ipe.Package";
 /// shape or a failed field validation; [`CliError::Usage`] if the source root
 /// directory does not exist.
 pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
+    let text = crate::io_bounded::read_to_string_capped(
+        manifest_path,
+        crate::io_bounded::MANIFEST_READ_CAP,
+    )?;
+    parse_package_manifest_source(&text, manifest_path)
+}
+
+/// Parse the text of the `package.ipe` at `manifest_path`, already read.
+///
+/// The project root is the parent of `manifest_path`. This is
+/// [`parse_package_manifest`] minus the file read, so a caller that holds the
+/// manifest's bytes judges them rather than a second read of the path.
+///
+/// # Errors
+/// As [`parse_package_manifest`], minus the file-read error.
+pub fn parse_package_manifest_source(
+    text: &str,
+    manifest_path: &Path,
+) -> Result<ProjectManifest, CliError> {
     // A bare `package.ipe` has an EMPTY parent (`Some("")`), not `None`; both an
     // empty and an absent parent mean the current directory. An empty root never
     // canonicalises, so normalise it to `.` before path containment.
@@ -93,11 +112,7 @@ pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, C
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
-    read_package_manifest(&text, &root, manifest_path)
+    read_package_manifest(text, &root, manifest_path)
 }
 
 /// The total core: `&str -> Result<ProjectManifest, CliError>`, given the
@@ -2985,5 +3000,22 @@ mod tests {
         );
         let m = reparsed.expect("re-parses");
         assert_eq!(m.dependencies.len(), 1);
+    }
+
+    /// Parsing the text of a manifest equals reading it from the path, and a malformed text is refused.
+    #[test]
+    fn parse_package_manifest_source_equals_the_path_reader() {
+        let root = fresh_project("source_equals_path");
+        let text = "module Package exposing (package)\n\npackage =\n    { name = \"same\" }\n";
+        let path = root.join(PACKAGE_IPE);
+        std::fs::write(&path, text).expect("write package.ipe");
+        let from_path = parse_package_manifest(&path).expect("path reader");
+        let from_text = parse_package_manifest_source(text, &path).expect("text reader");
+        let refused = parse_package_manifest_source("package = 1 +", &path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(from_path.name, from_text.name);
+        assert_eq!(from_path.root, from_text.root);
+        assert_eq!(from_path.src_root, from_text.src_root);
+        assert!(matches!(refused, Err(CliError::Pipeline { .. })));
     }
 }

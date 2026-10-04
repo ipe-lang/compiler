@@ -26,7 +26,7 @@ use crate::package_name::PackageName;
 use crate::published_version::PublishedVersion;
 
 /// The lockfile's filename at a project root.
-const LOCKFILE_NAME: &str = "ipe.lock";
+pub const LOCKFILE_NAME: &str = "ipe.lock";
 
 /// Why `ipe.lock` cannot record or admit a dependency.
 ///
@@ -289,7 +289,15 @@ impl Lockfile {
             }
             Err(e) => return Err(e),
         };
-        parse(&text)
+        Self::from_text(&text)
+    }
+
+    /// Parse the text of an `ipe.lock` already read, sorted by name.
+    ///
+    /// # Errors
+    /// As [`Lockfile::read`], minus the file-read error.
+    pub fn from_text(text: &str) -> Result<Self, CliError> {
+        parse(text)
     }
 
     /// Write the lockfile to `project_root/ipe.lock`, packages sorted by name.
@@ -941,5 +949,27 @@ mod tests {
         assert!(!msg.contains('\x1b'), "{msg:?}");
         assert!(!msg.contains("[2J\n"), "{msg:?}");
         assert!(msg.contains("\\u{1b}[2J\\n"), "{msg:?}");
+    }
+
+    /// Parsing text already read yields exactly what reading the file at the path yields.
+    #[test]
+    fn from_text_equals_read_of_the_same_text() {
+        let text = one_package(
+            "mylib",
+            "1.0.0",
+            "https://example.invalid/mylib",
+            FIXTURE_SHA,
+            "kind = \"index\"\n",
+        );
+        let read = read_text("from-text-eq", &text).expect("read");
+        let parsed = Lockfile::from_text(&text).expect("from_text");
+        assert_eq!(read, parsed);
+    }
+
+    /// Malformed text is refused by `from_text` as `read` refuses it.
+    #[test]
+    fn from_text_refuses_a_package_missing_its_fields() {
+        let refused = Lockfile::from_text("[[package]]\nname = \"mylib\"\n");
+        assert!(matches!(refused, Err(CliError::LockRefused(_))));
     }
 }
