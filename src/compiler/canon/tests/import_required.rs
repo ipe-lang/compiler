@@ -11,8 +11,9 @@ use ipe_intern::{Interner, Symbol};
 const UTIL: &str = "module Lib.Util exposing (..)\n\nf : Int -> Int\nf n =\n    n\n";
 
 /// Canonicalise `sources` in order against `catalog`, each seeing the exports
-/// of every module before it; the last module's error, if any.
-fn last_error(sources: &[&str], catalog: &[&str]) -> Option<Diagnostic> {
+/// of every module before it; the last module's error. A source set that
+/// canonicalises cleanly fails the calling test.
+fn last_error(sources: &[&str], catalog: &[&str]) -> Diagnostic {
     let catalog = ModuleCatalog::new(catalog.iter().map(|m| Box::<str>::from(*m)));
     let mut interner = Interner::new();
     let mut deps: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
@@ -42,7 +43,7 @@ fn last_error(sources: &[&str], catalog: &[&str]) -> Option<Diagnostic> {
             }
         }
     }
-    last
+    last.unwrap_or_else(|| panic!("expected a canonicalisation error, got none"))
 }
 
 /// The candidates of an IPE-N0034 diagnostic, or `None` for any other.
@@ -72,10 +73,6 @@ fn unimported_compiled_std_qualifier_is_n0034() {
     let src =
         "module Main exposing (main)\n\nmain : List Int\nmain =\n    List.map identity [ 1 ]\n";
     let diag = last_error(&[src], &["Ipe.List"]);
-    assert!(diag.is_some(), "expected an import-required diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
     assert_eq!(import_candidates(&diag), Some(vec!["Ipe.List"]), "{diag:?}");
 }
@@ -84,10 +81,6 @@ fn unimported_compiled_std_qualifier_is_n0034() {
 fn unimported_compiled_std_type_is_n0034() {
     let src = "module Main exposing (x)\n\nx : Dict.Dict String Int -> Int\nx d =\n    1\n";
     let diag = last_error(&[src], &["Ipe.Dict"]);
-    assert!(diag.is_some(), "expected an import-required diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
     assert!(
         import_candidates(&diag).is_some_and(|c| c.contains(&"Ipe.Dict")),
@@ -99,10 +92,6 @@ fn unimported_compiled_std_type_is_n0034() {
 fn unimported_project_module_is_n0034() {
     let src = "module Main exposing (main)\n\nmain : Int\nmain =\n    Util.f 1\n";
     let diag = last_error(&[src], &["Main", "Util"]);
-    assert!(diag.is_some(), "expected an import-required diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
     assert_eq!(import_candidates(&diag), Some(vec!["Util"]), "{diag:?}");
 }
@@ -111,10 +100,6 @@ fn unimported_project_module_is_n0034() {
 fn two_catalog_modules_same_last_segment_list_both() {
     let src = "module Main exposing (main)\n\nmain : Int\nmain =\n    Util.f 1\n";
     let diag = last_error(&[src], &["Main", "Lib.Util", "App.Util"]);
-    assert!(diag.is_some(), "expected an import-required diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
     assert_eq!(
         import_candidates(&diag),
@@ -130,21 +115,8 @@ fn gated_unimported_qualifier_never_suggested() {
     for (expr, absent) in [("Hosts.name", "Host"), ("Lsit.map identity [ 1 ]", "List")] {
         let src = format!("module Main exposing (main)\n\nmain =\n    {expr}\n");
         let diag = last_error(&[src.as_str()], &["Main", "Ipe.List"]);
-        assert!(
-            diag.is_some(),
-            "expected an unknown-module diagnostic for {expr}"
-        );
-        let Some(diag) = diag else {
-            return;
-        };
-        let names = unknown_module_suggestions(&diag);
-        assert!(
-            names.is_some(),
-            "expected IPE-N0004 for {expr}, got {diag:?}"
-        );
-        let Some(names) = names else {
-            return;
-        };
+        let names = unknown_module_suggestions(&diag)
+            .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
         assert!(!names.contains(&absent), "{expr}: {names:?}");
         assert!(!names.contains(&"Host"), "{expr}: {names:?}");
     }
@@ -157,15 +129,8 @@ fn imported_qualifier_still_suggested() {
     let src =
         "module Main exposing (main)\n\nimport Lib.Util\n\nmain : Int\nmain =\n    Utli.f 1\n";
     let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
-    assert!(diag.is_some(), "expected an unknown-module diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
-    let names = unknown_module_suggestions(&diag);
-    assert!(names.is_some(), "expected IPE-N0004, got {diag:?}");
-    let Some(names) = names else {
-        return;
-    };
+    let names = unknown_module_suggestions(&diag)
+        .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
     assert!(names.contains(&"Util"), "{names:?}");
 }
 
@@ -187,16 +152,9 @@ fn aliased_module_spelled_by_name_points_at_the_alias() {
     let src =
         "module Main exposing (main)\n\nimport Lib.Util as U\n\nmain : Int\nmain =\n    Util.f 1\n";
     let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
-    assert!(diag.is_some(), "expected an unknown-module diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
-    let candidates = unknown_module_candidates(&diag);
-    assert!(candidates.is_some(), "{diag:?}");
-    let Some(candidates) = candidates else {
-        return;
-    };
+    let candidates = unknown_module_candidates(&diag)
+        .unwrap_or_else(|| panic!("expected an unknown-module diagnostic, got {diag:?}"));
     assert_eq!(&*candidates.names, &[Box::<str>::from("U")], "{diag:?}");
     let lo = u32::try_from(src.find("Util.f").unwrap_or(0)).unwrap_or(0);
     let token = ipe_diagnostics::Span::new(lo, lo.saturating_add(6));
@@ -213,10 +171,6 @@ fn aliased_module_spelled_by_name_points_at_the_alias() {
 fn aliased_kernel_module_spelled_by_name_points_at_the_alias() {
     let src = "module Main exposing (main)\n\nimport Ipe.Crypto as C\n\nmain =\n    Crypto.sha256 \"x\"\n";
     let diag = last_error(&[src], &["Main"]);
-    assert!(diag.is_some(), "expected an unknown-module diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
     assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
     assert_eq!(
         unknown_module_suggestions(&diag),
@@ -231,14 +185,7 @@ fn aliased_kernel_module_spelled_by_name_points_at_the_alias() {
 fn gated_unimported_kernel_qualifier_never_suggested() {
     let src = "module Main exposing (main)\n\nmain =\n    Crpyto.sha256 \"x\"\n";
     let diag = last_error(&[src], &["Main"]);
-    assert!(diag.is_some(), "expected an unknown-module diagnostic");
-    let Some(diag) = diag else {
-        return;
-    };
-    let names = unknown_module_suggestions(&diag);
-    assert!(names.is_some(), "expected IPE-N0004, got {diag:?}");
-    let Some(names) = names else {
-        return;
-    };
+    let names = unknown_module_suggestions(&diag)
+        .unwrap_or_else(|| panic!("expected IPE-N0004, got {diag:?}"));
     assert!(!names.contains(&"Crypto"), "{names:?}");
 }
