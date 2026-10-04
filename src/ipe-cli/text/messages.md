@@ -1981,7 +1981,7 @@ ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
 ## session-ffi-unproven
 
-ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed — its replay is not proven deterministic
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed, since its replay is not proven deterministic — run it without {flag}
 
 ## session-flags-exclusive
 

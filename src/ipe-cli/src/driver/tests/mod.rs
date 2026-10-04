@@ -4250,7 +4250,8 @@ fn session_is_admitted_for_a_native_cli_or_worker_app() {
 }
 
 // A program that can link Rust FFI is refused a session — its replay is not
-// proven deterministic — while a program with no FFI records and replays.
+// proven deterministic — and told to run without the flag, while a program
+// with no FFI records and replays.
 #[test]
 fn session_record_refuses_ffi_program() {
     use crate::ffi::FfiPresence;
@@ -4258,8 +4259,9 @@ fn session_record_refuses_ffi_program() {
         let result = gate_session_ffi(flag, FfiPresence::Present);
         assert!(
             matches!(&result, Err(CliError::Usage(msg))
-                if msg.contains(flag) && msg.contains("Rust FFI")),
-            "{flag} on an FFI program must be refused, got: {result:?}"
+                if msg.contains("Rust FFI")
+                    && msg.contains(&format!("run it without {flag}"))),
+            "{flag} on an FFI program must be refused with its remedy, got: {result:?}"
         );
         let result = gate_session_ffi(flag, FfiPresence::Absent);
         assert!(
