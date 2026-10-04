@@ -283,8 +283,15 @@ pub(crate) struct VettingResolver<R> {
 #[cfg(not(target_arch = "wasm32"))]
 impl VettingResolver<SystemResolver> {
     /// The system resolver under [`dns_timeout`].
-    pub(crate) fn system() -> Self {
-        Self::new(std::sync::Arc::new(SystemResolver), dns_timeout())
+    ///
+    /// # Errors
+    ///
+    /// [`SsrfRefusal::Deadline`] when the deadline setting is unusable.
+    pub(crate) fn system() -> Result<Self, SsrfRefusal> {
+        Ok(Self::new(
+            std::sync::Arc::new(SystemResolver),
+            dns_timeout()?,
+        ))
     }
 }
 
@@ -351,7 +358,7 @@ pub(crate) async fn ssrf_apply(
         url,
         redirects,
         DialPolicy::from_env(),
-        VettingResolver::system(),
+        VettingResolver::system().map_err(UrlRefusal::Host)?,
     )
     .await
 }
@@ -457,7 +464,10 @@ async fn do_request<E: From<String> + Send + 'static>(
     }
 
     let builder = reqwest::Client::builder();
-    let gate = VettingResolver::system();
+    let gate = match VettingResolver::system() {
+        Ok(gate) => gate,
+        Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
+    };
     let mut builder = match ssrf_apply_with(builder, &req.url, req.redirects, policy, gate).await {
         Ok(b) => b,
         Err(refusal) => return IpeResult::Err(format!("http: {refusal}").into()),
@@ -1173,6 +1183,19 @@ mod tests {
         use std::time::Duration;
 
         const DEADLINE: Duration = Duration::from_secs(5);
+
+        /// The system resolver refuses to be built under an unusable deadline.
+        #[test]
+        fn the_system_resolver_refuses_a_malformed_dns_deadline() {
+            crate::system::locked_set_var("IPE_HTTP_DNS_TIMEOUT_MS", "5s");
+            let refused = VettingResolver::system().err();
+            crate::system::locked_remove_var("IPE_HTTP_DNS_TIMEOUT_MS");
+            assert!(
+                matches!(refused, Some(SsrfRefusal::Deadline(_))),
+                "a malformed deadline must refuse the resolver"
+            );
+        }
+
         const PRIVATE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
         fn gate<R: HostResolver + Send + 'static>(resolver: R) -> VettingResolver<R> {

@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,56 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , langName
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
 isKeyword : String -> Token -> Bool
@@ -104,7 +55,6 @@ isKeyword kw tok =
             False
 
 
-
 isIdent : String -> Token -> Bool
 isIdent s tok =
     case tok of
@@ -125,7 +75,6 @@ isIdent s tok =
 
         Plain _ ->
             False
-
 
 
 isNum : String -> Token -> Bool
@@ -150,7 +99,6 @@ isNum s tok =
             False
 
 
-
 isStr : String -> Token -> Bool
 isStr s tok =
     case tok of
@@ -171,7 +119,6 @@ isStr s tok =
 
         Plain _ ->
             False
-
 
 
 isComment : String -> Token -> Bool
@@ -196,7 +143,6 @@ isComment s tok =
             False
 
 
-
 isPlain : String -> Token -> Bool
 isPlain s tok =
     case tok of
@@ -219,7 +165,6 @@ isPlain s tok =
             False
 
 
-
 isShell : Lang -> Bool
 isShell lang =
     case lang of
@@ -234,7 +179,6 @@ isShell lang =
 
         Unknown ->
             False
-
 
 
 isUnknown : Lang -> Bool
@@ -253,7 +197,6 @@ isUnknown lang =
             False
 
 
-
 -- The language every stored `files.lang` value highlights as agrees with
 -- ipe-index's language vectors, row by row. Red if the vectors file is
 -- absent or empty, or if `langFor` maps a stored value differently.
@@ -261,7 +204,6 @@ type alias LangVector =
     { stored : String
     , highlight : String
     }
-
 
 
 langVectorsHold : Task.Task Error Bool
@@ -274,14 +216,12 @@ langVectorsHold =
         Task.succeed (not (List.isEmpty vectors) && List.all (\v -> langName (Highlight.langFor v.stored) == v.highlight) vectors)
 
 
-
 langVectorDecoder : Decode.Decoder LangVector
 langVectorDecoder =
     Decode.map2
         (\stored highlight -> { stored = stored, highlight = highlight })
         (Decode.field "stored" Decode.string)
         (Decode.field "highlight" Decode.string)
-
 
 
 -- A token's raw text, unrendered.
@@ -307,14 +247,12 @@ rawText tok =
             t
 
 
-
 -- Tokenizing loses and reorders nothing: the tokens' texts, in order, are
 -- the source. Red if a closed block comment is rebuilt reversed, or if
 -- `/*/` is taken for a closed comment.
 reassembles : Lang -> String -> Bool
 reassembles lang src =
     String.concat (List.map rawText (Highlight.tokenize lang src)) == src
-
 
 
 -- A one-mebibyte single-line source, the largest a shown unit's line can
@@ -339,7 +277,6 @@ largeTokenTokenizes =
             "/*" ++ String.repeat 1048572 "x" ++ "*/"
     in
     String.length src == 1048576 && Highlight.tokenize Highlight.Rust src == [ Comment src ]
-
 
 
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r

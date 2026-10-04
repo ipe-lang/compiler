@@ -440,8 +440,8 @@ fn name_prose(msg: &NameError) -> String {
         NameError::UnknownModule { qualifier, .. } => {
             format!("I can't find a module called `{qualifier}`.")
         }
-        NameError::StdlibImportRequired { qualifier, .. } => {
-            format!("`{qualifier}` is a standard-library module you haven't imported yet.")
+        NameError::ImportRequired { qualifier, .. } => {
+            format!("`{qualifier}` names a module you haven't imported yet.")
         }
         NameError::NoSuchMember { module, member, .. } => {
             format!("`{module}` doesn't have anything called `{member}`.")
@@ -605,6 +605,16 @@ fn name_prose(msg: &NameError) -> String {
             "`{field}` is not a `{entry}` config field — terminal input arrives through \
              `subscriptions`, like every other event."
         ),
+        NameError::AliasRowArgument { alias, fault } => match fault {
+            crate::diagnostic::AliasRowFault::NotARecord { found } => format!(
+                "`{alias}` extends its row argument with its own fields, but {found} is not a \
+                 record."
+            ),
+            crate::diagnostic::AliasRowFault::FieldClash { field } => format!(
+                "`{alias}` already has a `{field}` field, so its row argument cannot add \
+                 another one."
+            ),
+        },
         NameError::Unknown => "Something is off with a name in this code.".to_string(),
     }
 }
@@ -1449,12 +1459,10 @@ fn name_label(msg: &NameError) -> Option<String> {
         NameError::TypeNotFound { .. } => Some("I don't know this type".to_string()),
         NameError::ConstructorNotFound { .. } => Some("I don't know this constructor".to_string()),
         NameError::UnknownModule { qualifier, .. } => Some(format!("unknown module `{qualifier}`")),
-        NameError::StdlibImportRequired {
+        NameError::ImportRequired {
             qualifier,
-            import_path,
-        } => Some(format!(
-            "`{qualifier}` is a standard-library module; add `import {import_path}` to use it"
-        )),
+            candidates,
+        } => Some(import_required_label(qualifier, candidates)),
         NameError::NoSuchMember { module, member, .. } => {
             Some(format!("`{module}` has no member `{member}`"))
         }
@@ -1702,7 +1710,32 @@ fn name_label(msg: &NameError) -> Option<String> {
             "remove `{field}` from the config and subscribe instead: \
              `import {sub_module} as Sub`, then `subscriptions _ = Sub.{field} {field}`"
         )),
+        NameError::AliasRowArgument { alias, fault } => Some(match fault {
+            crate::diagnostic::AliasRowFault::NotARecord { .. } => format!(
+                "pass `{alias}` a record (`{alias} {{ age : Int }}`) or a type variable \
+                 (`{alias} r`)"
+            ),
+            crate::diagnostic::AliasRowFault::FieldClash { field } => {
+                format!("remove `{field}` from the argument; `{alias}` already supplies it")
+            }
+        }),
         NameError::RustNameFold { .. } | NameError::Unknown => None,
+    }
+}
+
+/// The IPE-N0034 label: the import to add, or every import that would bind it.
+fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
+    match candidates {
+        [] => format!("`{qualifier}` names a module you haven't imported"),
+        [only] => format!("`{qualifier}` is the module `{only}`; add `import {only}` to use it"),
+        many => {
+            let imports = many
+                .iter()
+                .map(|module| format!("`import {module}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("`{qualifier}` names more than one module; add one of: {imports}")
+        }
     }
 }
 
@@ -2197,17 +2230,18 @@ fn help_text(line: &HelpLine) -> Option<String> {
     }
 }
 
-/// Render a suggestion as a `help: replace ... with ...` line, reading the old
-/// text from `source` over the suggestion's span. Falls back to the source-free
-/// wording when the span is empty or out of range.
+/// Render a suggestion as a `help: replace ... with ...` line.
+///
+/// The edit is spelled out only when `source` holds exactly `s.replaces` over
+/// the suggestion's span; any other text there (a stale or mismatched source)
+/// renders the source-free did-you-mean, never a claim about the wrong text.
 fn suggestion_text(s: &Suggestion, source: &str) -> String {
-    let lo = floor_boundary(source, s.span.lo as usize);
-    let hi = floor_boundary(source, s.span.hi as usize).max(lo);
-    let original = slice(source, lo, hi);
-    if original.is_empty() {
-        format!("help: replace with `{}`", s.replacement)
+    let lo = s.span.lo as usize;
+    let hi = s.span.hi as usize;
+    if !s.replaces.is_empty() && source.get(lo..hi) == Some(&*s.replaces) {
+        format!("help: replace `{}` with `{}`", s.replaces, s.replacement)
     } else {
-        format!("help: replace `{original}` with `{}`", s.replacement)
+        did_you_mean_footer(&[&*s.replacement])
     }
 }
 
@@ -2717,7 +2751,9 @@ fn ty_fun_lhs(t: &TyDoc) -> String {
 mod tests {
     use super::*;
     use crate::code::{IPE_I0001, IPE_N0001, IPE_P0050, IPE_T0001};
-    use crate::diagnostic::{Diagnostic, Expected, ExpectedSet, ParseError, SortedNames};
+    use crate::diagnostic::{
+        Candidates, Diagnostic, EditTarget, Expected, ExpectedSet, ParseError, SortedNames,
+    };
 
     /// A bidi override or zero-width character named in a diagnostic is shown
     /// by its code point, never raw where it would reorder or hide the line.
@@ -2977,7 +3013,7 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into(), "list".into()]),
+                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
             },
         };
         let out = render(&d, "n.ipe", "lenght\n");
@@ -3127,7 +3163,7 @@ mod tests {
             span: Span::new(8, 11), // `foo` after the tab.
             msg: NameError::ValueNotFound {
                 name: "foo".into(),
-                suggestions: Box::new([]),
+                suggestions: Candidates::default(),
             },
         };
         let out = render(&d, "t.ipe", tab_src);
@@ -3146,7 +3182,7 @@ mod tests {
             span: Span::new(16, 17), // the `x`.
             msg: NameError::ValueNotFound {
                 name: "x".into(),
-                suggestions: Box::new([]),
+                suggestions: Candidates::default(),
             },
         };
         let outw = render(&dw, "w.ipe", wide_src);
@@ -3170,7 +3206,10 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into()]),
+                suggestions: Candidates::at(
+                    EditTarget::whole(Span::new(0, 6), "lenght"),
+                    Box::new(["length".into()]),
+                ),
             },
         };
         let out = render(&d, "n.ipe", src);
@@ -3180,6 +3219,32 @@ mod tests {
         );
         // Re-render is byte-identical (deterministic).
         assert_eq!(out, render(&d, "n.ipe", src));
+    }
+
+    /// A suggestion whose span holds other text than it `replaces` never claims
+    /// an edit: it renders the plain did-you-mean.
+    #[test]
+    fn mismatched_replaces_renders_did_you_mean_not_an_edit() {
+        let src = "Lsit.map f\n";
+        let d = Diagnostic::Name {
+            span: Span::new(0, 8),
+            msg: NameError::UnknownModule {
+                qualifier: "Lsit".into(),
+                suggestions: Candidates::at(
+                    EditTarget::whole(Span::new(0, 8), "Lsit.mpa"),
+                    Box::new(["List".into()]),
+                ),
+            },
+        };
+        let out = render(&d, "n.ipe", src);
+        assert!(
+            !out.contains("replace `"),
+            "mismatched region must not render an edit:\n{out}"
+        );
+        assert!(
+            out.contains("did you mean `List`?"),
+            "mismatched region falls back to did-you-mean:\n{out}"
+        );
     }
 
     #[test]
@@ -3192,7 +3257,11 @@ mod tests {
             span: Span::new(7, 11),
             msg: NameError::ModuleNotFound {
                 name: "Fooo".into(),
-                suggestions: Box::new(["Foo".into(), "Food".into(), "Fool".into()]),
+                suggestions: Candidates::hints(Box::new([
+                    "Foo".into(),
+                    "Food".into(),
+                    "Fool".into(),
+                ])),
             },
         };
         let out = render(&d, "n.ipe", src);
@@ -3227,7 +3296,7 @@ mod tests {
             span: Span::DUMMY,
             msg: NameError::ModuleNotFound {
                 name: "Foo".into(),
-                suggestions: Box::new(["Food".into(), "Fool".into()]),
+                suggestions: Candidates::hints(Box::new(["Food".into(), "Fool".into()])),
             },
         };
         // Craft a genuine single-DidYouMean via `help()` directly: a two-plus

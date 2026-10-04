@@ -12,9 +12,9 @@
 //! - `IPE-N0023` (module declaration name does not match its path on disk):
 //!   "Rename module declaration to `Expected.Name`" — rewrites the `module X`
 //!   token on line 0 to the path-expected name carried by the diagnostic message.
-//! - `IPE-N0034` (standard-library module used without importing it): "Add
-//!   import `Ipe.X`" — insert the named `import Ipe.X` line into the module's
-//!   import block, alphabetically among the existing imports.
+//! - `IPE-N0034` (a known module used without importing it): "Add import
+//!   `M`" for each module the diagnostic names — insert the `import M` line
+//!   into the module's import block, alphabetically among the existing imports.
 //! - `IPE-N0035` (a shape-scoped `Cmd` / `Sub` imported from the wrong shape):
 //!   "Change import to `Ipe.Tea.<Shape>.Cmd`" — repoint the offending import to
 //!   the app's own shape, in place, leaving the `as Alias` binding untouched.
@@ -137,15 +137,14 @@ pub fn code_actions(
                 }
             }
             "IPE-N0034" => {
-                // Standard-library module used without importing it — insert the
-                // named `import Ipe.X` line. The diagnostic names the exact module
-                // to add (`add `import Ipe.X` to use it`); we insert it in the
-                // module's import block, sorted among the existing imports.
-                if let Some(action) =
-                    add_import_action(view, module, uri, diag, text, encoding, version)
-                {
-                    actions.push(CodeActionOrCommand::CodeAction(action));
-                }
+                // A known module used without importing it — one action per
+                // module the diagnostic's typed `importCandidates` names, each
+                // inserting its `import M` line sorted among the existing imports.
+                actions.extend(
+                    add_import_actions(view, module, uri, diag, text, encoding, version)
+                        .into_iter()
+                        .map(CodeActionOrCommand::CodeAction),
+                );
             }
             "IPE-N0035" => {
                 // A shape-scoped `Cmd` / `Sub` imported from the wrong shape —
@@ -284,18 +283,17 @@ fn add_type_annotation_action(
     })
 }
 
-/// Quick-fix that inserts the `import Ipe.X` line named by an IPE-N0034
-/// diagnostic into the module's import block.
+/// Quick-fixes that insert an `import M` line for each module an IPE-N0034
+/// diagnostic names.
 ///
-/// The module to add is read from the diagnostic message, which the compiler
-/// renders as `… add `import Ipe.X` to use it`: the exact `import` clause is
-/// backtick-quoted, so we lift the module path out of that clause verbatim
-/// rather than reconstructing it. The line is inserted alphabetically among the
-/// existing `import` lines (import order is not significant to the compiler, so
-/// a sorted position is both valid and predictable); with no existing imports
-/// it goes just below the `module … exposing (…)` header, separated by a blank
-/// line to match first-party formatting.
-fn add_import_action(
+/// The modules come from the diagnostic's typed `importCandidates` payload
+/// (set by [`crate::diagnostics::to_lsp`]), never from its prose. Each line is
+/// inserted alphabetically among the existing `import` lines (import order is
+/// not significant to the compiler, so a sorted position is both valid and
+/// predictable); with no existing imports it goes just below the
+/// `module … exposing (…)` header, separated by a blank line to match
+/// first-party formatting. A sole candidate is the preferred fix.
+fn add_import_actions(
     view: DbView<'_>,
     module: &[String],
     uri: &Url,
@@ -303,9 +301,48 @@ fn add_import_action(
     text: &str,
     encoding: PositionEncoding,
     version: Option<i32>,
-) -> Option<CodeAction> {
-    let import_module = import_module_from_message(&diag.message)?;
+) -> Vec<CodeAction> {
+    let candidates = crate::diagnostics::import_candidates(diag);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let Some(block) = import_block(view, module, text, encoding) else {
+        return Vec::new();
+    };
+    let preferred = candidates.len() == 1;
+    candidates
+        .iter()
+        .filter_map(|import_module| {
+            let edit = block.insert(import_module, text, encoding)?;
+            Some(CodeAction {
+                title: format!("Add import {import_module}"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diag.clone()]),
+                edit: Some(single_edit(uri, version, edit)),
+                command: None,
+                is_preferred: Some(preferred),
+                disabled: None,
+                data: None,
+            })
+        })
+        .collect()
+}
 
+/// A module's existing imports and where an import-less block would begin.
+struct ImportBlock {
+    /// Each import as (dotted path, byte offset of its line start).
+    imports: Vec<(String, usize)>,
+    /// The last byte of the header's `exposing (...)` clause.
+    header_end: usize,
+}
+
+/// The import block of `module`'s current parse.
+fn import_block(
+    view: DbView<'_>,
+    module: &[String],
+    text: &str,
+    encoding: PositionEncoding,
+) -> Option<ImportBlock> {
     let DbView { db, root, .. } = view;
     let files = root.files(db);
     let &file = files.get(module)?;
@@ -333,14 +370,50 @@ fn add_import_action(
     // import-less module's new import block begins.
     let header_end = parsed.exposing.span.hi as usize;
     drop(interner);
+    Some(ImportBlock {
+        imports,
+        header_end,
+    })
+}
 
-    // Do not offer the action if the import already exists (the diagnostic
-    // would be stale) — a duplicate insert never fixes anything.
-    if imports.iter().any(|(path, _)| *path == import_module) {
-        return None;
+impl ImportBlock {
+    /// The edit inserting `import import_module`, or `None` when it is already
+    /// imported (the diagnostic is stale and a duplicate never fixes anything).
+    fn insert(
+        &self,
+        import_module: &str,
+        text: &str,
+        encoding: PositionEncoding,
+    ) -> Option<TextEdit> {
+        let Self {
+            imports,
+            header_end,
+        } = self;
+        if imports.iter().any(|(path, _)| path == import_module) {
+            return None;
+        }
+        let (insert_byte, new_text) =
+            import_insertion(imports, *header_end, import_module, text, encoding);
+        let insert_pos = offset_to_position(text, insert_byte, encoding);
+        Some(TextEdit {
+            range: Range {
+                start: insert_pos,
+                end: insert_pos,
+            },
+            new_text,
+        })
     }
+}
 
-    let (insert_byte, new_text) = if imports.is_empty() {
+/// Where `import import_module` goes in `imports`, and the text to insert.
+fn import_insertion(
+    imports: &[(String, usize)],
+    header_end: usize,
+    import_module: &str,
+    text: &str,
+    encoding: PositionEncoding,
+) -> (usize, String) {
+    if imports.is_empty() {
         // No imports yet: open the block just after the header, one blank line
         // down, matching the `module …\n\n\nimport …` first-party convention.
         let after_header_line = offset_to_position(text, header_end, encoding).line as usize;
@@ -348,7 +421,7 @@ fn add_import_action(
         (line_end, format!("\nimport {import_module}\n"))
     } else if let Some((_, start)) = imports
         .iter()
-        .find(|(path, _)| path.as_str() > import_module.as_str())
+        .find(|(path, _)| path.as_str() > import_module)
     {
         // Insert before the first existing import that sorts after the new one.
         (*start, format!("import {import_module}\n"))
@@ -358,26 +431,7 @@ fn add_import_action(
         let last_line = offset_to_position(text, last_line_start, encoding).line as usize;
         let (_, line_end) = line_byte_range(text, last_line);
         (line_end, format!("import {import_module}\n"))
-    };
-
-    let insert_pos = offset_to_position(text, insert_byte, encoding);
-    let edit = TextEdit {
-        range: Range {
-            start: insert_pos,
-            end: insert_pos,
-        },
-        new_text,
-    };
-    Some(CodeAction {
-        title: format!("Add import {import_module}"),
-        kind: Some(CodeActionKind::QUICKFIX),
-        diagnostics: Some(vec![diag.clone()]),
-        edit: Some(single_edit(uri, version, edit)),
-        command: None,
-        is_preferred: Some(true),
-        disabled: None,
-        data: None,
-    })
+    }
 }
 
 /// Quick-fix that repoints an offending `Ipe.Tea.<WrongShape>.{Cmd,Sub}` import
@@ -803,25 +857,6 @@ fn shape_paths_from_message(message: &str) -> Option<(String, String)> {
     Some((wrong, correct))
 }
 
-/// Lift the `Ipe.X` module path out of an IPE-N0034 message.
-///
-/// The message ends with `add `import Ipe.X` to use it`. We take the content of
-/// the backtick pair whose contents begin with `import `, then strip that
-/// keyword — yielding the dotted module path (`Ipe.X`) verbatim. Returns `None`
-/// if the message does not carry a backtick-quoted `import` clause, so a
-/// reworded or unrelated diagnostic simply produces no action.
-fn import_module_from_message(message: &str) -> Option<String> {
-    for clause in message.split('`') {
-        if let Some(rest) = clause.strip_prefix("import ") {
-            let module = rest.trim();
-            if !module.is_empty() {
-                return Some(module.to_owned());
-            }
-        }
-    }
-    None
-}
-
 /// Returns `(start_byte, end_byte)` for `line` (0-based), where `end_byte`
 /// points just past the trailing `\n` (or to `text.len()` on the last line).
 fn line_byte_range(text: &str, line: usize) -> (usize, usize) {
@@ -1057,6 +1092,126 @@ mod tests {
         assert!(
             matches!(&edit.changes, Some(m) if !m.is_empty()),
             "{edit:?}"
+        );
+    }
+
+    /// An IPE-N0034 diagnostic offers one "Add import" action per typed
+    /// candidate, none preferred when several match; a diagnostic without the
+    /// typed payload offers none, whatever its prose says.
+    #[test]
+    fn add_import_action_offers_each_candidate() {
+        let db = IpeDatabase::new();
+        let src = "module Main exposing (main)\n\nimport Ipe.List\n\nmain =\n    Utils.f 1\n";
+        let entry = file(&db, &["Main"], src);
+        let root = root_of(&db, &[(&["Main"], entry)]);
+        let uri = Url::from_file_path("/fake/Main.ipe").unwrap();
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 6,
+                character: 0,
+            },
+        };
+        let mut typed = diag_at(5, "IPE-N0034");
+        typed.data = Some(serde_json::json!({ "importCandidates": ["App.Utils", "Lib.Utils"] }));
+        let mut prose_only = diag_at(5, "IPE-N0034");
+        prose_only.message = "add `import Lib.Utils` to use it".to_owned();
+        let run = |diag: Diagnostic| {
+            code_actions(
+                DbView {
+                    db: &db,
+                    root,
+                    entry,
+                },
+                &["Main".to_owned()],
+                Document {
+                    uri: &uri,
+                    text: src,
+                    version: None,
+                },
+                range,
+                &[diag],
+                PositionEncoding::Utf16,
+            )
+        };
+        let actions = run(typed);
+        let titles: Vec<(&str, Option<bool>)> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => Some((a.title.as_str(), a.is_preferred)),
+                CodeActionOrCommand::Command(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("Add import App.Utils", Some(false)),
+                ("Add import Lib.Utils", Some(false)),
+            ]
+        );
+        assert!(
+            run(prose_only).is_empty(),
+            "prose never drives an import fix"
+        );
+    }
+
+    /// The candidates `data` decodes to.
+    fn decoded(data: &serde_json::Value) -> Vec<String> {
+        let mut diag = diag_at(5, "IPE-N0034");
+        diag.data = Some(serde_json::json!({ "importCandidates": data }));
+        crate::diagnostics::import_candidates(&diag)
+    }
+
+    /// The client echoes `data` back: an entry that is not a dotted module path
+    /// (a newline smuggling a second line, a space, a lowercase segment, an
+    /// empty segment, a bidi override, a Cyrillic homoglyph, a non-string)
+    /// never becomes an inserted import — and it voids the whole list, so a
+    /// valid sibling is never left standing as the sole, preferred fix.
+    #[test]
+    fn add_import_action_refuses_a_non_module_candidate() {
+        for bad in [
+            serde_json::json!("Lib.Utils\nmain = evil"),
+            serde_json::json!("Lib Utils"),
+            serde_json::json!("lib.Utils"),
+            serde_json::json!("Lib..Utils"),
+            serde_json::json!(""),
+            serde_json::json!("Lib.\u{202e}Utils"),
+            serde_json::json!("Lib.\u{0423}tils"),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                decoded(&serde_json::json!([bad.clone(), "Lib.Utils"])),
+                Vec::<String>::new(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            decoded(&serde_json::json!(["App.Utils", "Lib.Utils"])),
+            ["App.Utils".to_owned(), "Lib.Utils".to_owned()]
+        );
+    }
+
+    /// A list out of the producer's strictly ascending order (reordered or
+    /// duplicated) or over the cap is refused whole; the cap itself passes.
+    #[test]
+    fn add_import_candidates_are_all_or_none() {
+        assert_eq!(
+            decoded(&serde_json::json!(["Lib.Utils", "App.Utils"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            decoded(&serde_json::json!(["Lib.Utils", "Lib.Utils"])),
+            Vec::<String>::new()
+        );
+        let names = |n: usize| -> Vec<String> { (0..n).map(|i| format!("M{i:03}")).collect() };
+        let cap = crate::diagnostics::MAX_IMPORT_CANDIDATES;
+        assert_eq!(decoded(&serde_json::json!(names(cap))), names(cap));
+        assert_eq!(
+            decoded(&serde_json::json!(names(cap + 1))),
+            Vec::<String>::new()
         );
     }
 }

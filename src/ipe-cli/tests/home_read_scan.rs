@@ -76,7 +76,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/dom/form.rs", 1),
     ("src/runtime/rust/src/email.rs", 1),
     ("src/runtime/rust/src/http_client.rs", 2),
-    ("src/runtime/rust/src/http_stream.rs", 2),
+    ("src/runtime/rust/src/http_stream.rs", 1),
     ("src/runtime/rust/src/scratch_core.rs", 2),
     ("src/runtime/rust/src/server.rs", 2),
     ("src/runtime/rust/src/ssrf.rs", 1),
@@ -1284,8 +1284,8 @@ mod lexical {
         },
         Allowed {
             file: "src/runtime/rust/src/system.rs",
-            func: "read",
-            reason: "reads an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
+            func: "lookup",
+            reason: "the one raw reader of an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
         },
     ];
 

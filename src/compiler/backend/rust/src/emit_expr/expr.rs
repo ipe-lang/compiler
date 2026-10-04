@@ -12,6 +12,7 @@ use super::{
     swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
+use ipe_intern::rust_char_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
 /// Depth-tracked recursion behind [`emit_expr`]. `depth` is the IR-nesting level
@@ -50,19 +51,20 @@ pub fn emit_expr_at(
         // integer; see [`float_literal`].
         Expr::Float(f) => Ok(float_literal(*f)),
         // A string literal renders as an owned `String` (Ipê `String` is Rust
-        // `String`, never `&str`). The `{:?}` Debug form produces a valid Rust
-        // string literal with deterministic escaping.
-        Expr::Str(s) => Ok(format!("{s:?}.to_string()")),
+        // `String`, never `&str`). `rust_str_lit` renders a valid Rust string
+        // literal with every lexer hazard escaped.
+        Expr::Str(s) => Ok(format!("{}.to_string()", rust_str_lit(s))),
         // The reserved `CustomElement.fromFile` constructor value: a widget handle built
         // from its generated content-addressed tag. The tag was minted at
         // lowering from the sealed, in-project JS path (never raw user input);
         // `js_path` is retained on the node for the WP5 serving stage but is not
         // part of the handle's runtime representation here.
         Expr::CustomElementRef { tag, js_path: _ } => Ok(format!(
-            "ipe_runtime::ui::widget::custom_element_({tag:?}.to_string())"
+            "ipe_runtime::ui::widget::custom_element_({}.to_string())",
+            rust_str_lit(tag)
         )),
         // A character literal renders as a Rust `char`. The carried text is a
-        // single character (lexer invariant); `{:?}` escapes it deterministically.
+        // single character (lexer invariant); `rust_char_lit` escapes it.
         // A malformed (non-single-char) value fails closed as a `CompilerBug`:
         // a string-literal fallback in `char` position is NOT a safe total
         // fallback — it emits Rust that `cargo` rejects (E0308), the exact
@@ -70,7 +72,7 @@ pub fn emit_expr_at(
         Expr::Char(c) => {
             let mut chars = c.chars();
             match (chars.next(), chars.next()) {
-                (Some(ch), None) => Ok(format!("{ch:?}")),
+                (Some(ch), None) => Ok(rust_char_lit(ch)),
                 _ => Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_expr_at(Expr::Char)",
                     detail: format!(
