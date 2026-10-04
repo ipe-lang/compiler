@@ -349,9 +349,9 @@ fn exec_sealed_after_verify(
 /// Scan `app_bytes` for the embedded capability floor, verify `profile`
 /// satisfies it, and exec the app at `app_path` inside the jail.
 ///
-/// Bundle mode only: the app is a sibling file on disk. Embed mode uses
-/// [`exec_sealed_after_verify`], which verifies and delivers from a sealed
-/// descriptor instead of a host path.
+/// Bundle mode on a platform with no sealed delivery only: the app is a
+/// sibling file on disk. Elsewhere `exec_sealed_after_verify` verifies and
+/// delivers from a sealed descriptor instead of a host path.
 ///
 /// Fail-closed on:
 /// - no capfloor marker found in `app_bytes` (missing floor → refuse)
