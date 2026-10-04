@@ -5,7 +5,7 @@
 //! them, so a program importing the crate still builds against its other
 //! bindings.
 //!
-//! The default gate proves `ipe build` exits 0 and the interface names neither
+//! The default gate proves `ipe dev build` exits 0 and the interface names neither
 //! binding. The `IPE_E2E=1` gate proves THE SEAL end to end: the emitted crate
 //! builds against a real foreign crate that defines all three functions, and
 //! runs.
@@ -108,7 +108,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Default gate: the keyword-named and non-ASCII-typed bindings are skipped,
-/// so `ipe build` exits 0 and the forwarder module names neither.
+/// so `ipe dev build` exits 0 and the forwarder module names neither.
 #[test]
 fn unlexable_foreign_names_are_skipped_and_the_import_builds() {
     let runtime = e2e_support::require_runtime().into_path_buf();
