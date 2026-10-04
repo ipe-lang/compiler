@@ -612,6 +612,7 @@ fn the_admitted_sites_alone_pass() {
     }
 }
 
+#[allow(clippy::expect_used)] // a sample that does not parse is a broken test input
 fn assert_every_sample_is_refused(refused: &[(&str, &str)]) {
     for (rel, sample) in refused {
         let (drift, refusals) =
