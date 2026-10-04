@@ -1,5 +1,6 @@
 use crate::diff::{Change, QueueOp, Snapshot, UnitState};
 use crate::model::{Kind, Unit};
+use crate::repo_set::{MAX_REPOS, RecordedRoot};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -8,7 +9,9 @@ pub struct Store {
 }
 
 /// The index schema: `units`/`links`/`callgraph`/`change_queue` are the review
-/// backbone. All `CREATE … IF NOT EXISTS` so an old DB gains missing tables on
+/// backbone; `repos` is the root set the index was built under (a root nested
+/// in another records that root's tag and its prefix there, both or neither).
+/// All `CREATE … IF NOT EXISTS` so an old DB gains missing tables on
 /// open; `index` drops and recreates every table except `change_queue` and
 /// `reviewed`. `change_queue` rows only the queue reconciliation
 /// (`diff::reconcile`) and the review app's drain ever change. `reviewed` is
@@ -72,9 +75,17 @@ CREATE TABLE IF NOT EXISTS reviewed (
   body_hash TEXT NOT NULL,
   PRIMARY KEY (uid, body_hash)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS repos (
+  tag    TEXT PRIMARY KEY,
+  outer  TEXT,
+  prefix TEXT,
+  CHECK ((outer IS NULL) = (prefix IS NULL))
+);
 ";
 
-/// Current schema version: v6 rows are the v5 format, extracted only from
+/// Current schema version: v7 is v6 plus the `repos` root set the rows were
+/// indexed under; a v6 index records none, so its owner of each path is
+/// unknown. v6 rows are the v5 format, extracted only from
 /// regular files named by their exact bytes; v5 rows may hold the units of a
 /// tracked symbolic link's target, a submodule path, or a lossily decoded name,
 /// which an incremental `update` would keep for every unchanged path. v5 `file`
@@ -85,7 +96,7 @@ CREATE TABLE IF NOT EXISTS reviewed (
 /// stamps it only on a DB with no units yet, so a stamp always describes the
 /// rows beside it; a DB holding rows of another version keeps its stamp until
 /// `index` rebuilds it.
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 
 /// Stable unit id: blake3 of `path|kind|qualified`. Content-stable across
 /// re-indexes; a rename of the symbol or path changes the id by design.
@@ -257,6 +268,52 @@ impl Store {
             .query_row("SELECT v FROM meta WHERE k=?", [k], |r| r.get(0))
             .ok())
     }
+    /// Records the root set this index is built under, replacing any earlier one.
+    pub fn record_repos(&self, roots: &[RecordedRoot]) -> Result<()> {
+        self.conn.execute("DELETE FROM repos", [])?;
+        for root in roots {
+            let (outer, prefix) = match &root.nesting {
+                Some((outer, prefix)) => (Some(outer.as_str()), Some(prefix.as_str())),
+                None => (None, None),
+            };
+            self.conn.execute(
+                "INSERT INTO repos (tag, outer, prefix) VALUES (?,?,?)",
+                rusqlite::params![root.tag, outer, prefix],
+            )?;
+        }
+        Ok(())
+    }
+    /// The root set this index was built under, sorted by tag.
+    ///
+    /// At most one row past [`MAX_REPOS`] is read: a longer set already
+    /// differs from any set a run may declare.
+    pub fn recorded_repos(&self) -> Result<Vec<RecordedRoot>> {
+        let limit = i64::try_from(MAX_REPOS.saturating_add(1))?;
+        let mut st = self
+            .conn
+            .prepare("SELECT tag, outer, prefix FROM repos ORDER BY tag LIMIT ?")?;
+        let rows = st.query_map([limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut roots = Vec::new();
+        for row in rows {
+            let (tag, outer, prefix) = row?;
+            let nesting = match (outer, prefix) {
+                (None, None) => None,
+                (Some(outer), Some(prefix)) => Some((outer, prefix)),
+                (Some(_), None) | (None, Some(_)) => bail!(
+                    "ipe-index: the recorded root `{}` has only half of its nesting",
+                    crate::walk::shown(&tag)
+                ),
+            };
+            roots.push(RecordedRoot { tag, nesting });
+        }
+        Ok(roots)
+    }
     pub fn count(&self, table: &str) -> Result<i64> {
         // Defense-in-depth: map table names to static SQL literals instead of formatting.
         // This ensures no caller value (even allowlisted) is interpolated into the SQL string.
@@ -339,7 +396,7 @@ impl Store {
             "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS symbols; \
              DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS units; \
              DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS callgraph; \
-             DELETE FROM meta;",
+             DROP TABLE IF EXISTS repos; DELETE FROM meta;",
         )?;
         self.conn.execute_batch(SCHEMA)?;
         self.set_meta("schema_version", SCHEMA_VERSION)
@@ -496,18 +553,18 @@ mod tests {
     }
 
     // A DB stamped with the previous version is not current, so `update`
-    // refuses to run incrementally over it, and the full rebuild stamps it 6.
+    // refuses to run incrementally over it, and the full rebuild stamps it 7.
     #[test]
-    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_6() {
-        assert_eq!(SCHEMA_VERSION, "6");
+    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_7() {
+        assert_eq!(SCHEMA_VERSION, "7");
         let s = Store::open(":memory:").unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
-        s.set_meta("schema_version", "5").unwrap();
+        s.set_meta("schema_version", "6").unwrap();
         ensure_schema_version(&s.conn).unwrap();
         assert!(!s.schema_is_current().unwrap());
         s.reset_index().unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("6"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("7"));
         assert!(s.schema_is_current().unwrap());
     }
 
@@ -610,6 +667,35 @@ mod tests {
             .unwrap();
         s.reset_index().unwrap();
         assert_eq!(reviewed_rows(&s.conn), 1);
+    }
+
+    // A root row with an outer tag but no prefix (or the reverse) cannot be
+    // stored, so a recorded nesting is always whole.
+    #[test]
+    fn half_repos_row_rejected_by_schema() {
+        let s = Store::open(":memory:").unwrap();
+        for half in [
+            "INSERT INTO repos VALUES ('in', 'out', NULL)",
+            "INSERT INTO repos VALUES ('in', NULL, 'inner')",
+        ] {
+            assert!(s.conn.execute(half, []).is_err(), "{half}");
+        }
+        let set = [
+            RecordedRoot {
+                tag: "out".to_string(),
+                nesting: None,
+            },
+            RecordedRoot {
+                tag: "in".to_string(),
+                nesting: Some(("out".to_string(), "inner".to_string())),
+            },
+        ];
+        s.record_repos(&set).unwrap();
+        let mut want = set.to_vec();
+        want.sort();
+        assert_eq!(s.recorded_repos().unwrap(), want);
+        s.reset_index().unwrap();
+        assert_eq!(s.recorded_repos().unwrap(), Vec::new());
     }
 
     #[test]

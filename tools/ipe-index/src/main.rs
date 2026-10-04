@@ -6,6 +6,7 @@ mod extract;
 mod model;
 mod pipeline;
 mod query;
+mod repo_set;
 mod static_re;
 mod store;
 mod walk;
@@ -168,9 +169,13 @@ enum Cmd {
 }
 
 /// The text of an admitted file, or `None` (reported when worth a line) when
-/// [`walk::read_indexed`] refuses it.
-fn read_capped(repo: &str, rel: &str) -> Option<String> {
-    walk::read_indexed(std::path::Path::new(repo), rel)
+/// [`walk::read_owned`] refuses it.
+fn read_capped(
+    repo: &repo_set::DeclaredRoot,
+    rel: &str,
+    claimed: &[&repo_set::DeclaredRoot],
+) -> Option<String> {
+    walk::read_owned(repo.root(), rel, claimed)
         .inspect_err(|refusal| {
             if refusal.is_reported() {
                 eprintln!("ipe-index: not reading {}: {refusal}", walk::shown(rel));
@@ -184,17 +189,10 @@ pub fn default_repos() -> Vec<String> {
     vec!["ipe:.".to_string()]
 }
 
-/// One `--repo tag:path` entry: the tag every stored path of the repo carries
-/// and the directory its sources are read from.
-struct RepoSpec {
-    tag: model::RepoTag,
-    root: String,
-}
-
 /// Parse a `tag:path` repo spec. The tag is load-bearing (path-prefix
 /// disambiguation + role classification), so it must be a `RepoTag`: a tag
 /// `split_tag` cannot read back would store every path as untagged.
-fn parse_repo(spec: &str) -> Result<RepoSpec> {
+fn parse_repo(spec: &str) -> Result<model::RepoSpec> {
     let bad = |why: &dyn std::fmt::Display| {
         anyhow::anyhow!("bad --repo spec {spec:?}: {why}; expected tag:path (e.g. ipe:.)")
     };
@@ -203,26 +201,20 @@ fn parse_repo(spec: &str) -> Result<RepoSpec> {
     if root.is_empty() {
         return Err(bad(&"the path is empty"));
     }
-    Ok(RepoSpec {
+    Ok(model::RepoSpec {
         tag,
         root: root.to_string(),
     })
 }
 
-/// Parse the whole repo set: at least one spec, each tag bound once.
-fn parse_repos(specs: &[String]) -> Result<Vec<RepoSpec>> {
-    let mut repos: Vec<RepoSpec> = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let repo = parse_repo(spec)?;
-        if repos.iter().any(|r| r.tag == repo.tag) {
-            anyhow::bail!("--repo tag {:?} is given twice", repo.tag.as_str());
-        }
-        repos.push(repo);
-    }
-    if repos.is_empty() {
-        anyhow::bail!("no --repo to index");
-    }
-    Ok(repos)
+/// Parse the whole repo set: each spec, then one directory identity per tag
+/// (see [`repo_set::RepoSet::parse`]).
+fn parse_repos(specs: &[String]) -> Result<repo_set::RepoSet> {
+    let specs = specs
+        .iter()
+        .map(|spec| parse_repo(spec))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(repo_set::RepoSet::parse(&specs)?)
 }
 
 /// Store one file's rows (file, symbols, units, stage and coverage edges)
@@ -306,7 +298,11 @@ fn rebuild(
 }
 
 fn cmd_index(repo_specs: &[String], db: &str) -> Result<()> {
-    let repos = parse_repos(repo_specs)?;
+    index_set(&parse_repos(repo_specs)?, db)
+}
+
+/// A full index of the parsed root set, which the index records beside its rows.
+fn index_set(repos: &repo_set::RepoSet, db: &str) -> Result<()> {
     if let Some(parent) = std::path::Path::new(db).parent()
         && !parent.as_os_str().is_empty()
     {
@@ -315,30 +311,32 @@ fn cmd_index(repo_specs: &[String], db: &str) -> Result<()> {
     let store = store::Store::open(db)?;
     let mut total_files = 0usize;
     rebuild(&store, |store| {
+        store.record_repos(&repos.recorded())?;
         let mut shas = HashMap::new();
-        for repo in &repos {
-            let files = walk::tracked(&repo.root)?;
-            let sha = head_sha_or_empty(&repo.root);
+        for repo in repos.iter() {
+            let claimed = repos.claimed_in(repo);
+            let files = walk::tracked(repo, &claimed)?;
+            let sha = head_sha_or_empty(repo.root_str());
             for f in &files {
-                let Some(src) = read_capped(&repo.root, &f.path) else {
+                let Some(src) = read_capped(repo, &f.path, &claimed) else {
                     continue;
                 };
                 // Store every path prefixed with the repo tag so multiple repos
                 // never collide (each has Cargo.toml, README.md, scripts/*, tools/*).
-                ingest_file(store, &repo.tag.tagged(&f.path), f.lang, &src, &sha)?;
+                ingest_file(store, &repo.tag().tagged(&f.path), f.lang, &src, &sha)?;
             }
             // Per-repo HEAD sha so an incremental `update` can diff each.
             if !sha.is_empty() {
-                store.set_meta(&repo.tag.last_sha_key(), &sha)?;
+                store.set_meta(&repo.tag().last_sha_key(), &sha)?;
             }
-            shas.insert(repo.tag.as_str().to_string(), sha);
+            shas.insert(repo.tag().as_str().to_string(), sha);
             total_files += files.len();
         }
         Ok(shas)
     })?;
     eprintln!(
         "ipe-index: indexed {total_files} files across {} repo(s)",
-        repos.len()
+        repos.iter().len()
     );
     Ok(())
 }
@@ -352,41 +350,43 @@ fn head_sha_or_empty(root: &str) -> String {
 
 /// Incremental refresh: for each repo, diff `last_sha:<tag>..HEAD`, re-extract
 /// only the changed files. Falls back to a full `index` when the DB is absent,
-/// its rows are of another schema version, or a repo has no recorded sha.
+/// its rows are of another schema version or root set, or a repo has no
+/// recorded sha.
 fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
-    if !std::path::Path::new(db).exists() {
-        return cmd_index(repo_specs, db);
-    }
     let repos = parse_repos(repo_specs)?;
+    if !std::path::Path::new(db).exists() {
+        return index_set(&repos, db);
+    }
     let store = store::Store::open(db)?;
     if needs_full_index(&store, &repos)? {
         drop(store);
-        return cmd_index(repo_specs, db);
+        return index_set(&repos, db);
     }
     store.begin()?;
     let mut changed_count = 0usize;
-    for repo in &repos {
+    for repo in repos.iter() {
         let since = store
-            .get_meta(&repo.tag.last_sha_key())?
+            .get_meta(&repo.tag().last_sha_key())?
             .unwrap_or_default();
-        let sha = head_sha_or_empty(&repo.root);
-        let shas = HashMap::from([(repo.tag.as_str().to_string(), sha.clone())]);
-        let (ups, dels) = walk::changed(&repo.root, &since)?;
+        let sha = head_sha_or_empty(repo.root_str());
+        let shas = HashMap::from([(repo.tag().as_str().to_string(), sha.clone())]);
+        let claimed = repos.claimed_in(repo);
+        let (ups, dels) = walk::changed(repo, &since, &claimed)?;
         // One timestamp per repo so the run's events order stably
         // (enqueued_at is a tiebreaker in `pending`'s ORDER BY).
         let now = diff::now_millis();
         for d in &dels {
-            let tagged = repo.tag.tagged(d);
+            let tagged = repo.tag().tagged(d);
             let before = store.snapshot_path(&tagged)?;
             store.drop_file(&tagged)?;
             reconcile_queue(&store, &before, &diff::Snapshot::new(), &shas, now)?;
         }
         for f in &ups {
-            let tagged = repo.tag.tagged(&f.path);
+            let tagged = repo.tag().tagged(&f.path);
             let before = store.snapshot_path(&tagged)?;
             // An oversized/unreadable file keeps no units, so its old units
             // reconcile as deleted.
-            let src = read_capped(&repo.root, &f.path);
+            let src = read_capped(repo, &f.path, &claimed);
             store.drop_file(&tagged)?;
             if let Some(src) = src {
                 ingest_file(&store, &tagged, f.lang, &src, &sha)?;
@@ -395,7 +395,7 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
             reconcile_queue(&store, &before, &after, &shas, now)?;
         }
         if !sha.is_empty() {
-            store.set_meta(&repo.tag.last_sha_key(), &sha)?;
+            store.set_meta(&repo.tag().last_sha_key(), &sha)?;
         }
         changed_count += ups.len() + dels.len();
     }
@@ -403,19 +403,21 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
     store.commit()?;
     eprintln!(
         "ipe-index: updated {changed_count} changed path(s) across {} repo(s)",
-        repos.len()
+        repos.iter().len()
     );
     Ok(())
 }
 
 /// An incremental `update` can only diff a DB whose rows are in the current
-/// format and that records a sha for every repo; anything else is rebuilt.
-fn needs_full_index(store: &store::Store, repos: &[RepoSpec]) -> Result<bool> {
-    if !store.schema_is_current()? {
+/// format, that was built under this exact root set, and that records a sha
+/// for every repo; anything else is rebuilt. A changed root set moves the
+/// owner of some paths, and only a rebuild drops the old owner's rows.
+fn needs_full_index(store: &store::Store, repos: &repo_set::RepoSet) -> Result<bool> {
+    if !store.schema_is_current()? || store.recorded_repos()? != repos.recorded() {
         return Ok(true);
     }
-    for repo in repos {
-        if store.get_meta(&repo.tag.last_sha_key())?.is_none() {
+    for repo in repos.iter() {
+        if store.get_meta(&repo.tag().last_sha_key())?.is_none() {
             return Ok(true);
         }
     }
@@ -461,15 +463,17 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn repos() -> Vec<RepoSpec> {
+    fn repos() -> repo_set::RepoSet {
         parse_repos(&default_repos()).unwrap()
     }
 
     #[test]
     fn current_db_with_shas_updates_incrementally() {
         let s = store::Store::open(":memory:").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
         s.set_meta("last_sha:ipe", "abc").unwrap();
-        assert!(!needs_full_index(&s, &repos()).unwrap());
+        assert!(!needs_full_index(&s, &set).unwrap());
     }
 
     #[test]
@@ -754,6 +758,62 @@ mod tests {
         );
         assert_eq!(body_of(&s, &file), residual);
         assert!(s.schema_is_current().unwrap());
+    }
+
+    /// The stored file paths of the index at `db`, sorted.
+    #[cfg(unix)]
+    fn stored_files(db: &str) -> Vec<String> {
+        let s = store::Store::open(db).unwrap();
+        let mut st = s
+            .conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
+        st.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    // A root declared inside another owns its files: they are stored under its
+    // tag alone, never under the outer tag too.
+    #[cfg(unix)]
+    #[test]
+    fn nested_root_files_owned_by_inner_only() {
+        let fx = walk::fixture::Fixture::new("index-nested");
+        fx.write("top.rs", "fn t() {}\n");
+        fx.write("inner/x.rs", "fn x() {}\n");
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        let specs = [
+            format!("out:{}", fx.root()),
+            format!("in:{}", fx.path("inner")),
+        ];
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(stored_files(&db), ["in:x.rs", "out:top.rs"]);
+    }
+
+    // Any change to the root set rebuilds the index, so the rows of a path's
+    // previous owner never survive beside its new owner's (or its absence).
+    #[cfg(unix)]
+    #[test]
+    fn root_set_change_forces_full_index() {
+        let fx = walk::fixture::Fixture::new("index-root-set");
+        fx.write("top.rs", "fn t() {}\n");
+        fx.write("inner/x.rs", "fn x() {}\n");
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        let out = format!("out:{}", fx.root());
+        let both = [out.clone(), format!("in:{}", fx.path("inner"))];
+        cmd_index(std::slice::from_ref(&out), &db).unwrap();
+        assert_eq!(stored_files(&db), ["out:inner/x.rs", "out:top.rs"]);
+        {
+            let s = store::Store::open(&db).unwrap();
+            assert!(needs_full_index(&s, &parse_repos(&both).unwrap()).unwrap());
+        }
+        cmd_update(&both, &db).unwrap();
+        assert_eq!(stored_files(&db), ["in:x.rs", "out:top.rs"]);
+        cmd_update(std::slice::from_ref(&out), &db).unwrap();
+        assert_eq!(stored_files(&db), ["out:inner/x.rs", "out:top.rs"]);
     }
 
     // A rebuild that fails part-way leaves the previous index and queue.

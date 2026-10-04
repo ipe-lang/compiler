@@ -134,6 +134,15 @@ impl RepoTag {
     }
 }
 
+/// One `--repo tag:path` entry as given: the tag every stored path of the repo
+/// carries and the directory spelling its sources are read from, before
+/// [`crate::repo_set::RepoSet::parse`] resolves it to a directory identity.
+#[derive(Debug, Clone)]
+pub struct RepoSpec {
+    pub tag: RepoTag,
+    pub root: String,
+}
+
 /// Split a repo-tagged path (`"ipe:crates/foo.rs"`) into `(tag, relpath)`.
 /// Untagged paths (no `:` before the first `/`) return `("", path)`.
 pub fn split_tag(path: &str) -> (&str, &str) {
