@@ -5650,6 +5650,61 @@ mod tests {
         assert_eq!(scan_git(&f), Ok(()));
         git_config(&f, &urls(MAX_URL_VALUES.saturating_add(1)));
         assert_eq!(fault(&scan_git(&f)), Some(ConfigFault::UrlValues));
+        let rewritten = format!(
+            "[url \"https://h/\"]\n\tinsteadOf = ab:\n{}",
+            urls(MAX_URL_VALUES)
+        );
+        git_config(&f, &rewritten);
+        assert_eq!(fault(&scan_git(&f)), Some(ConfigFault::UrlValues));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hg_scheme_chain_tries_bounded() {
+        let f = fixture("hgtries");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        let levels = [
+            ("https", "ssh"),
+            ("ssh", "git"),
+            ("git", "ftp"),
+            ("ftp", "ftps"),
+            ("ftps", "http"),
+            ("http", "git+ssh"),
+            ("git+ssh", "ssh+git"),
+        ];
+        let mut text = String::from("[schemes]\n");
+        for (name, next) in levels {
+            text.push_str(&format!("{name} = {next}://h/\n").repeat(18));
+        }
+        write(&dot_hg.join("hgrc"), &text);
+        assert_eq!(
+            fault(&scan_with(&f, &roots, ConfigLimits::DEFAULT)),
+            Some(ConfigFault::Rewrites)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hg_scheme_form_too_long_refused() {
+        let f = fixture("hglong");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        let long = "a".repeat(MAX_PATH_BYTES);
+        write(
+            &dot_hg.join("hgrc"),
+            &format!("[schemes]\nssh = https://h/{long}/\n[paths]\ndefault = ssh://x/r\n"),
+        );
+        assert_eq!(
+            unprovable(&scan_with(&f, &roots, ConfigLimits::DEFAULT)),
+            Some(Unprovable::TooLong)
+        );
     }
 
     #[test]
