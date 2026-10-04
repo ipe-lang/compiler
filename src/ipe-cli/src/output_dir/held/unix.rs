@@ -31,6 +31,15 @@ fn file_mode() -> Mode {
     Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH
 }
 
+/// Permission bits the claim file is created with: its owner's only.
+///
+/// Whoever can open the claim file can hold its lock, and a lock needs only
+/// read access: a claim file another user can open lets that user keep every
+/// claim on the directory waiting.
+fn claim_mode() -> Mode {
+    Mode::RUSR | Mode::WUSR
+}
+
 /// Permission bits a new directory is created with, before the umask.
 fn dir_mode() -> Mode {
     Mode::RWXU | Mode::RWXG | Mode::RWXO
@@ -62,7 +71,7 @@ pub fn create_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
         dir.handle(),
         name.as_os_str(),
         new_claim_flags(),
-        file_mode(),
+        claim_mode(),
     )?;
     Ok(File::from(fd))
 }
@@ -73,9 +82,9 @@ pub fn open_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// Whether `error` reports a claim name another claimant is deleting; never on Unix.
+/// Whether `error`, met opening the claim name of a directory, reports a name another claimant is deleting; never on Unix.
 #[must_use]
-pub const fn is_claim_pending(_error: &io::Error) -> bool {
+pub const fn is_claim_pending(_dir: &HeldDir, _name: &EntryName, _error: &io::Error) -> bool {
     false
 }
 

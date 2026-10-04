@@ -58,7 +58,7 @@ const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 /// `ERROR_ACCESS_DENIED`: also the answer for an open of a name pending deletion.
 const ERROR_ACCESS_DENIED: i32 = 5;
-/// The name prefix of a pin sentinel; entries carrying it are never listed.
+/// The name prefix of a pin sentinel; only a held sentinel carrying it is hidden from a listing.
 const PIN_PREFIX: &str = ".ipe-pin-";
 /// How many sentinel names a pin tries before giving up.
 const PIN_ATTEMPTS: u32 = 8;
@@ -129,10 +129,54 @@ fn delete_options() -> OpenOptions {
     options
 }
 
-/// Whether `name` is a pin sentinel, which a listing never shows.
-fn is_pin_name(name: &OsStr) -> bool {
+/// Whether `name` carries the pin sentinel prefix.
+///
+/// The prefix alone proves nothing: anyone who can write the directory can
+/// create such a name. [`is_held_pin`] decides.
+fn has_pin_prefix(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(PIN_PREFIX))
+}
+
+/// Whether the entry `name` of `dir` is a pin sentinel some pin holds now, which a listing never shows.
+///
+/// A held sentinel shares no write access, so an open of it for writing
+/// fails with a sharing violation; a sentinel whose pin just let go is
+/// pending deletion or gone. Any other entry carrying the prefix (a file
+/// someone created under that name) opens, or fails some other way, and is
+/// listed like any entry.
+fn is_held_pin(dir: &HeldDir, name: &OsStr) -> bool {
+    if !has_pin_prefix(name) {
+        return false;
+    }
+    let Some(entry) = EntryName::new(name) else {
+        return false;
+    };
+    let mut probe = OpenOptions::new();
+    probe
+        .write(true)
+        .share_mode(SHARE_ALL)
+        .custom_flags(OPEN_REPARSE_POINT);
+    match open_at(dir, &entry, &probe) {
+        Ok(_) => false,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => true,
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => is_delete_pending(dir, &entry),
+        Err(_) => false,
+    }
+}
+
+/// Whether the entry `name` of `dir` is pending deletion, or already gone.
+///
+/// An open of a name pending deletion answers access denied until its last
+/// handle closes, and a stat of it answers the same; an entry whose stat
+/// succeeds is there, so an access-denied open of it was a real denial.
+fn is_delete_pending(dir: &HeldDir, name: &EntryName) -> bool {
+    match attributes(dir, name) {
+        Ok(None) => true,
+        Err(e) => e.raw_os_error() == Some(ERROR_ACCESS_DENIED),
+        Ok(Some(_)) => false,
+    }
 }
 
 /// Open the entry `name` of `dir` relative to its handle.
@@ -242,13 +286,15 @@ pub fn open_claim(dir: &HeldDir, name: &EntryName) -> io::Result<File> {
     open_at(dir, name, &claim_options())
 }
 
-/// Whether `error` reports a claim name another claimant is deleting.
+/// Whether `error`, met opening the claim name `name` of `dir`, reports a name another claimant is deleting.
 ///
 /// An open of a name pending deletion answers access denied until its last
-/// handle closes; the claim then retries.
+/// handle closes; the claim then retries. Access denied on a claim file that
+/// is still there (a file another user owns, or an access list that refuses
+/// this user) is a real denial, never a retry.
 #[must_use]
-pub fn is_claim_pending(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+pub fn is_claim_pending(dir: &HeldDir, name: &EntryName, error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED) && is_delete_pending(dir, name)
 }
 
 /// Rename the entry `from` over the entry `to`, both in `dir`.
@@ -309,19 +355,21 @@ fn remove_directory(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
     std::fs::remove_dir(path)
 }
 
-/// The names of the entries of `dir`, pin sentinels excluded.
+/// The names of the entries of `dir`, held pin sentinels excluded.
 ///
 /// The listing handle is opened under a pin; once open it enumerates the
-/// directory object it holds.
+/// directory object it holds. Only a sentinel a pin holds when the entry is
+/// read is excluded ([`is_held_pin`]); any other entry, whatever its name, is
+/// listed.
 pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
     let entries = {
         let _pin = pin(dir)?;
         std::fs::read_dir(dir.real_path())?
     };
-    Ok(entries.filter_map(|entry| match entry {
+    Ok(entries.filter_map(move |entry| match entry {
         Ok(entry) => {
             let name = entry.file_name();
-            (!is_pin_name(&name)).then_some(Ok(name))
+            (!is_held_pin(dir, &name)).then_some(Ok(name))
         }
         Err(e) => Some(Err(e)),
     }))
@@ -351,9 +399,27 @@ mod tests {
     }
 
     #[test]
-    fn pin_sentinels_are_hidden_from_listings() {
-        assert!(is_pin_name(OsStr::new(".ipe-pin-12-3")));
-        assert!(!is_pin_name(OsStr::new(".ipe-output")));
+    fn only_a_held_pin_sentinel_is_hidden_from_listings() {
+        assert!(has_pin_prefix(OsStr::new(".ipe-pin-12-3")));
+        assert!(!has_pin_prefix(OsStr::new(".ipe-output")));
+        let dir = scratch("pin_named");
+        std::fs::write(dir.as_path().join(".ipe-pin-user"), b"user").unwrap();
+        let held = held(dir.as_path());
+        let _pin = pin(&held).unwrap();
+        let listed: Vec<_> = names(&held).unwrap().map(Result::unwrap).collect();
+        assert_eq!(listed, vec![OsString::from(".ipe-pin-user")]);
+    }
+
+    #[test]
+    fn access_denied_on_a_present_claim_name_is_a_denial() {
+        let dir = scratch("claim_denied");
+        std::fs::write(dir.as_path().join("present"), b"").unwrap();
+        let held = held(dir.as_path());
+        let denied = io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+        assert!(!is_claim_pending(&held, &name("present"), &denied));
+        assert!(is_claim_pending(&held, &name("absent"), &denied));
+        let other = io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION);
+        assert!(!is_claim_pending(&held, &name("absent"), &other));
     }
 
     #[test]

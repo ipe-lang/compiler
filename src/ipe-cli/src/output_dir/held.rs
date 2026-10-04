@@ -95,6 +95,13 @@ pub enum OwnedNow {
 #[derive(Debug)]
 pub struct Claimed(());
 
+/// The claim file this claimant opened, held as the raw handle its lock needs.
+///
+/// Built only by [`HeldDir::lock_claim`], after the handle is proven to hold a
+/// regular file; the handle never leaves this module.
+#[derive(Debug)]
+struct ClaimFile(File);
+
 /// Where a claim stands, read from the length of its locked claim file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimPhase {
@@ -237,6 +244,14 @@ fn refused(path: &Path, refusal: OpenRefusal) -> CliError {
         | OpenRefusal::NotUtf8
         | OpenRefusal::Io(_) => act_err(path, refusal.into_io()),
     }
+}
+
+/// Whether `head`, the first bytes of a marker, opens with the whole [`MARKER_HEADER`] line.
+///
+/// The header must end its line: `ipe-output v10` is another header.
+fn is_marker_head(head: &[u8]) -> bool {
+    head.strip_prefix(MARKER_HEADER.as_bytes())
+        .is_some_and(|rest| rest.first() == Some(&b'\n'))
 }
 
 impl HeldDir {
@@ -395,17 +410,17 @@ impl HeldDir {
             }
             Err(refusal) => return Err(refused(&path, refusal)),
         };
-        if ipe_fs_open::link_count(marker.handle()).map_err(|refusal| refused(&path, refusal))? != 1
+        if marker
+            .link_count()
+            .map_err(|refusal| refused(&path, refusal))?
+            != 1
         {
             return Ok(MarkerState::NotGenuine);
         }
-        let mut head = Vec::new();
-        marker
-            .handle()
-            .take(MARKER_READ_CAP)
-            .read_to_end(&mut head)
-            .map_err(|e| act_err(&path, e))?;
-        Ok(if head.starts_with(MARKER_HEADER.as_bytes()) {
+        let head = marker
+            .read_head(MARKER_READ_CAP)
+            .map_err(|refusal| refused(&path, refusal))?;
+        Ok(if is_marker_head(&head) {
             MarkerState::Genuine(marker)
         } else {
             MarkerState::NotGenuine
@@ -430,11 +445,30 @@ impl HeldDir {
             return Ok(OwnedNow::Claiming);
         }
         let name = self.entry(OsStr::new(OWNERSHIP_MARKER))?;
-        Ok(if self.still_named(&name, marker.handle())? {
+        let held = self.marker_id(&marker)?;
+        Ok(if self.still_named(&name, held)? {
             OwnedNow::Owned
         } else {
             OwnedNow::Unowned
         })
+    }
+
+    /// The identity of the held `marker`, read from its own handle.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the handle cannot be stat'd.
+    fn marker_id(&self, marker: &RegularFile) -> Result<FileId, CliError> {
+        marker
+            .id()
+            .map_err(|refusal| refused(&self.path.join(OWNERSHIP_MARKER), refusal))
+    }
+
+    /// The identity of the held claim file, read from its own handle.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the handle cannot be stat'd.
+    fn claim_id(&self, claim: &ClaimFile) -> Result<FileId, CliError> {
+        FileId::of_file(&claim.0).map_err(|refusal| refused(&self.path.join(CLAIM_FILE), refusal))
     }
 
     /// Whether anything is at the claim name.
@@ -443,7 +477,7 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`CliError::Io`] on a failure other than absence.
-    fn claim_present(&self) -> Result<bool, CliError> {
+    pub fn claim_present(&self) -> Result<bool, CliError> {
         let name = self.entry(OsStr::new(CLAIM_FILE))?;
         match self.dir.kind_of(&name) {
             Ok(found) => Ok(found.is_some()),
@@ -452,15 +486,15 @@ impl HeldDir {
         }
     }
 
-    /// Whether the entry `name` still names the object `file` holds.
+    /// Whether the entry `name` still names the object whose identity `held` is.
     ///
+    /// `held` is read from the handle the caller holds, never from the name.
     /// A name another process is deleting (Windows) no longer names it.
     ///
     /// # Errors
-    /// [`CliError::Io`] when either side cannot be stat'd.
-    fn still_named(&self, name: &EntryName, file: &File) -> Result<bool, CliError> {
+    /// [`CliError::Io`] when the entry cannot be stat'd.
+    fn still_named(&self, name: &EntryName, held: FileId) -> Result<bool, CliError> {
         let path = self.path.join(name.as_os_str());
-        let held = FileId::of_file(file).map_err(|refusal| refused(&path, refusal))?;
         match self.dir.entry_id(name) {
             Ok(found) => Ok(found == Some(held)),
             Err(OpenRefusal::Denied) => Ok(false),
@@ -468,14 +502,14 @@ impl HeldDir {
         }
     }
 
-    /// Unlink the entry `name` only while it still names the object `file` holds.
+    /// Unlink the entry `name` only while it still names the object whose identity `held` is.
     ///
     /// `false` when it names something else, which is left in place.
     ///
     /// # Errors
     /// [`CliError::Io`] on a filesystem failure.
-    fn unlink_ours(&self, name: &EntryName, file: &File) -> Result<bool, CliError> {
-        if !self.still_named(name, file)? {
+    fn unlink_ours(&self, name: &EntryName, held: FileId) -> Result<bool, CliError> {
+        if !self.still_named(name, held)? {
             return Ok(false);
         }
         match sys::unlink(&self.dir, name) {
@@ -585,16 +619,35 @@ impl HeldDir {
                 continue;
             };
             claim_reached(ClaimPoint::AfterLock, &self.path);
-            if !self.still_named(&name, claim.handle())? {
+            let held = self.claim_id(&claim)?;
+            if !self.still_named(&name, held)? {
                 continue;
             }
-            return self.claim_locked(&name, &claim);
+            return self.claim_locked(&name, &claim, held);
         }
         Err(OutputRefusal::ClaimBusy {
             dir: self.path.clone(),
             waited: CLAIM_POLL.saturating_mul(MAX_CLAIM_POLLS),
         }
         .into())
+    }
+
+    /// Give back a directory this run just claimed: unlink its marker while it is still ours.
+    ///
+    /// For a claim whose caller refuses the directory after the claim
+    /// committed; the directory is left as an unmarked user directory.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] on a filesystem failure.
+    pub fn unclaim(&self, claimed: Claimed) -> Result<(), CliError> {
+        let Claimed(()) = claimed;
+        let MarkerState::Genuine(marker) = self.genuine_marker()? else {
+            return Ok(());
+        };
+        let name = self.entry(OsStr::new(OWNERSHIP_MARKER))?;
+        let held = self.marker_id(&marker)?;
+        self.unlink_ours(&name, held)?;
+        Ok(())
     }
 
     /// Create or open the claim file `name` and take its exclusive lock.
@@ -606,7 +659,7 @@ impl HeldDir {
     /// [`OutputRefusal::NotIpeOwned`] for anything but a regular file at the
     /// name; [`OutputRefusal::ClaimLockUnavailable`] when the lock is refused
     /// for another reason; [`CliError::Io`] on a filesystem failure.
-    fn lock_claim(&self, name: &EntryName) -> Result<Option<RegularFile>, CliError> {
+    fn lock_claim(&self, name: &EntryName) -> Result<Option<ClaimFile>, CliError> {
         let path = self.path.join(CLAIM_FILE);
         let file = match sys::create_claim(&self.dir, name) {
             Ok(file) => file,
@@ -615,7 +668,9 @@ impl HeldDir {
                     Ok(file) => file,
                     Err(e) => {
                         self.refuse_a_foreign_claim_name(name)?;
-                        if e.kind() == io::ErrorKind::NotFound || sys::is_claim_pending(&e) {
+                        if e.kind() == io::ErrorKind::NotFound
+                            || sys::is_claim_pending(&self.dir, name, &e)
+                        {
                             return Ok(None);
                         }
                         return Err(act_err(&path, e));
@@ -624,20 +679,25 @@ impl HeldDir {
             }
             Err(e) => {
                 self.refuse_a_foreign_claim_name(name)?;
-                if sys::is_claim_pending(&e) {
+                if sys::is_claim_pending(&self.dir, name, &e) {
                     return Ok(None);
                 }
                 return Err(act_err(&path, e));
             }
         };
-        let claim = match RegularFile::prove(file) {
-            Ok(claim) => claim,
-            Err(OpenRefusal::Link | OpenRefusal::NotRegular(_)) => {
-                return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into());
-            }
+        let claim = match ipe_fs_open::kind_of_file(&file) {
+            Ok(FileKind::Regular) => ClaimFile(file),
+            Ok(
+                FileKind::Dir
+                | FileKind::Symlink
+                | FileKind::Fifo
+                | FileKind::Socket
+                | FileKind::Device
+                | FileKind::Other,
+            ) => return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into()),
             Err(refusal) => return Err(refused(&path, refusal)),
         };
-        match claim.handle().try_lock() {
+        match claim.0.try_lock() {
             Ok(()) => Ok(Some(claim)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(OutputRefusal::ClaimLockUnavailable {
@@ -662,33 +722,38 @@ impl HeldDir {
         }
     }
 
-    /// Decide the claim whose file `claim`, linked at `name`, this claimant holds locked.
+    /// Decide the claim whose file `claim`, linked at `name` with identity `held`, this claimant holds locked.
     ///
     /// # Errors
     /// As [`HeldDir::claim`].
-    fn claim_locked(&self, name: &EntryName, claim: &RegularFile) -> Result<Claimed, CliError> {
+    fn claim_locked(
+        &self,
+        name: &EntryName,
+        claim: &ClaimFile,
+        held: FileId,
+    ) -> Result<Claimed, CliError> {
         let Some(phase) = self.claim_phase(claim)? else {
             return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into());
         };
         match (phase, self.genuine_marker()?) {
             (ClaimPhase::Pending, MarkerState::NotGenuine) => {
-                self.unlink_ours(name, claim.handle())?;
+                self.unlink_ours(name, held)?;
                 Err(OutputRefusal::NotIpeOwned(self.path.clone()).into())
             }
             (ClaimPhase::Finalizing, MarkerState::NotGenuine) => {
-                self.unlink_ours(name, claim.handle())?;
-                Err(OutputRefusal::ClaimInterrupted(self.path.clone()).into())
+                self.unlink_ours(name, held)?;
+                Err(OutputRefusal::ClaimMarkerUnfinished(self.path.clone()).into())
             }
-            (ClaimPhase::Pending, MarkerState::Genuine(_)) => self.commit(name, claim),
+            (ClaimPhase::Pending, MarkerState::Genuine(_)) => self.commit(name, held),
             (ClaimPhase::Finalizing, MarkerState::Genuine(_)) => {
                 if self.has_foreign_entry()? {
                     Err(OutputRefusal::ClaimInterrupted(self.path.clone()).into())
                 } else {
-                    self.commit(name, claim)
+                    self.commit(name, held)
                 }
             }
             (ClaimPhase::Pending | ClaimPhase::Finalizing, MarkerState::Absent) => {
-                self.publish(name, claim)
+                self.publish(name, claim, held)
             }
         }
     }
@@ -700,9 +765,9 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`CliError::Io`] when the file cannot be stat'd or read.
-    fn claim_phase(&self, claim: &RegularFile) -> Result<Option<ClaimPhase>, CliError> {
+    fn claim_phase(&self, claim: &ClaimFile) -> Result<Option<ClaimPhase>, CliError> {
         let path = self.path.join(CLAIM_FILE);
-        let mut handle: &File = claim.handle();
+        let mut handle: &File = &claim.0;
         if ipe_fs_open::link_count(handle).map_err(|refusal| refused(&path, refusal))? != 1 {
             return Ok(None);
         }
@@ -725,26 +790,33 @@ impl HeldDir {
     ///
     /// # Errors
     /// As [`HeldDir::claim`].
-    fn publish(&self, name: &EntryName, claim: &RegularFile) -> Result<Claimed, CliError> {
+    fn publish(
+        &self,
+        name: &EntryName,
+        claim: &ClaimFile,
+        held: FileId,
+    ) -> Result<Claimed, CliError> {
         if self.has_foreign_entry()? {
-            self.unlink_ours(name, claim.handle())?;
+            self.unlink_ours(name, held)?;
             return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into());
         }
         claim_reached(ClaimPoint::AfterPreCheck, &self.path);
         self.mark_finalizing(claim)?;
         let Some(marker) = self.publish_marker()? else {
-            self.unlink_ours(name, claim.handle())?;
+            self.unlink_ours(name, held)?;
             return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into());
         };
         claim_reached(ClaimPoint::AfterPublish, &self.path);
         if self.has_foreign_entry()? {
             let marker_name = self.entry(OsStr::new(OWNERSHIP_MARKER))?;
-            self.unlink_ours(&marker_name, &marker)?;
-            self.unlink_ours(name, claim.handle())?;
+            let marker_id = FileId::of_file(&marker)
+                .map_err(|refusal| refused(&self.path.join(OWNERSHIP_MARKER), refusal))?;
+            self.unlink_ours(&marker_name, marker_id)?;
+            self.unlink_ours(name, held)?;
             return Err(OutputRefusal::NotIpeOwned(self.path.clone()).into());
         }
         claim_reached(ClaimPoint::BeforeCommit, &self.path);
-        let committed = self.commit(name, claim);
+        let committed = self.commit(name, held);
         drop(marker);
         committed
     }
@@ -756,8 +828,8 @@ impl HeldDir {
     ///
     /// # Errors
     /// [`CliError::Io`] on a write failure.
-    fn mark_finalizing(&self, claim: &RegularFile) -> Result<(), CliError> {
-        let mut handle: &File = claim.handle();
+    fn mark_finalizing(&self, claim: &ClaimFile) -> Result<(), CliError> {
+        let mut handle: &File = &claim.0;
         handle
             .seek(SeekFrom::Start(0))
             .and_then(|_| handle.write_all(&[FINALIZING]))
@@ -785,21 +857,31 @@ impl HeldDir {
         {
             Ok(()) => Ok(Some(marker)),
             Err(e) => {
-                let _ = self.unlink_ours(&name, &marker);
+                if let Ok(held) = FileId::of_file(&marker) {
+                    let _ = self.unlink_ours(&name, held);
+                }
                 Err(act_err(&path, e))
             }
         }
     }
 
-    /// Commit the claim: unlink the claim file this claimant holds locked at `name`.
+    /// Commit the claim: unlink the claim file, of identity `held`, this claimant holds locked at `name`.
     ///
-    /// The lock is released when the caller drops `claim`.
+    /// The lock is released when the caller drops the claim file. A claim
+    /// name that no longer names the held claim file means the claim file was
+    /// removed or replaced under the lock, so another claimant may be
+    /// deciding the directory: the claim is refused as in flight, never
+    /// granted.
     ///
     /// # Errors
-    /// [`CliError::Io`] on a filesystem failure.
-    fn commit(&self, name: &EntryName, claim: &RegularFile) -> Result<Claimed, CliError> {
-        self.unlink_ours(name, claim.handle())?;
-        Ok(Claimed(()))
+    /// [`OutputRefusal::ClaimInFlight`] when the claim name no longer names
+    /// the held claim file; [`CliError::Io`] on a filesystem failure.
+    fn commit(&self, name: &EntryName, held: FileId) -> Result<Claimed, CliError> {
+        if self.unlink_ours(name, held)? {
+            Ok(Claimed(()))
+        } else {
+            Err(OutputRefusal::ClaimInFlight(self.path.clone()).into())
+        }
     }
 
     /// Replace the file `name` with the result of `fill`, atomically.
@@ -1709,14 +1791,16 @@ mod tests {
             let claimants: Vec<_> = (0..2_u32)
                 .map(|n| {
                     let (dir, barrier) = (dir.clone(), std::sync::Arc::clone(&barrier));
-                    std::thread::spawn(move || {
-                        let held = held_at(&dir);
-                        barrier.wait();
-                        let claimed = held.claim().map(|_| ()).map_err(|e| format!("{e:?}"));
-                        std::fs::write(dir.join(format!("out{n}.txt")), "built")
-                            .expect("write output");
-                        claimed
-                    })
+                    std::thread::Builder::new()
+                        .spawn(move || {
+                            let held = held_at(&dir);
+                            barrier.wait();
+                            let claimed = held.claim().map(|_| ()).map_err(|e| format!("{e:?}"));
+                            std::fs::write(dir.join(format!("out{n}.txt")), "built")
+                                .expect("write output");
+                            claimed
+                        })
+                        .expect("spawn test thread")
                 })
                 .collect();
             for claimant in claimants {
@@ -1816,27 +1900,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A claim whose locked claim file was unlinked and recreated re-evaluates, never publishing on the old file.
+    /// A claim whose locked claim file was unlinked and recreated locks again, never deciding on the old file.
+    ///
+    /// The locks are counted: a claim that went on under the unlinked file
+    /// would lock once, and its commit would find the name taken by another
+    /// file.
     #[cfg(unix)]
     #[test]
     fn a_claim_on_an_unlinked_inode_reevaluates() {
         let dir = scratch("claim_unlinked");
         let claim = dir.join(CLAIM_FILE);
-        let old = Rc::new(Cell::new(None));
-        let published_under = Rc::new(Cell::new(None));
-        let (old_seen, published_seen) = (Rc::clone(&old), Rc::clone(&published_under));
-        let mut swapped = false;
+        let locks = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&locks);
         let at = claim.clone();
         set_claim_hook(Some(Box::new(move |point, _path: &Path| match point {
-            ClaimPoint::AfterLock if !swapped => {
-                swapped = true;
-                old_seen.set(FileId::of_path(&at).ok());
-                std::fs::remove_file(&at).expect("unlink locked claim");
-                std::fs::write(&at, b"").expect("recreate claim");
+            ClaimPoint::AfterLock => {
+                counted.set(counted.get().saturating_add(1));
+                if counted.get() == 1 {
+                    std::fs::remove_file(&at).expect("unlink locked claim");
+                    std::fs::write(&at, b"").expect("recreate claim");
+                }
             }
-            ClaimPoint::AfterPublish => published_seen.set(FileId::of_path(&at).ok()),
-            ClaimPoint::AfterLock
-            | ClaimPoint::AfterPreCheck
+            ClaimPoint::AfterPreCheck
+            | ClaimPoint::AfterPublish
             | ClaimPoint::BeforeCommit
             | ClaimPoint::Busy
             | ClaimPoint::MarkerRead => {}
@@ -1844,13 +1930,106 @@ mod tests {
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
         assert!(claimed.is_ok(), "claimed, got {claimed:?}");
-        assert!(old.get().is_some(), "the first lock was taken");
-        assert!(published_under.get().is_some(), "a publish ran");
-        assert_ne!(
-            published_under.get(),
-            old.get(),
-            "the publish ran under the recreated claim file"
+        assert_eq!(locks.get(), 2, "the recreated claim file was locked again");
+        assert!(
+            !claim.exists(),
+            "the claim committed on the live claim name"
         );
+        let owned = held_at(&dir).owned_now();
+        assert!(matches!(owned, Ok(OwnedNow::Owned)), "got {owned:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A claim whose claim file is removed before it commits is refused in flight, never granted.
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_file_removed_before_commit_is_in_flight() {
+        let dir = scratch("claim_removed_before_commit");
+        let at = dir.join(CLAIM_FILE);
+        at_claim_point(ClaimPoint::BeforeCommit, move || {
+            std::fs::remove_file(&at).expect("remove claim file");
+        });
+        let claimed = held_at(&dir).claim();
+        set_claim_hook(None);
+        assert!(
+            matches!(
+                claimed,
+                Err(CliError::OutputRefused(OutputRefusal::ClaimInFlight(_)))
+            ),
+            "refused in flight, got {claimed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The claim file is created readable and writable by its owner only, so no other user can hold its lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_file_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("claim_mode");
+        let mode = Rc::new(Cell::new(None));
+        let (seen, at) = (Rc::clone(&mode), dir.join(CLAIM_FILE));
+        at_claim_point(ClaimPoint::AfterPublish, move || {
+            let meta = std::fs::symlink_metadata(&at).expect("claim file");
+            seen.set(Some(meta.permissions().mode()));
+        });
+        let claimed = held_at(&dir).claim();
+        set_claim_hook(None);
+        assert!(claimed.is_ok(), "claimed, got {claimed:?}");
+        let mode = mode.get().expect("the claim file was seen");
+        assert_eq!(mode & 0o077, 0, "group and others get nothing: {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A busy refusal names the claim file and how to clear it.
+    #[test]
+    fn a_busy_refusal_names_the_claim_file() {
+        let shown = OutputRefusal::ClaimBusy {
+            dir: PathBuf::from("out"),
+            waited: CLAIM_POLL,
+        }
+        .to_string();
+        assert!(shown.contains(CLAIM_FILE), "{shown}");
+        assert!(shown.contains("delete"), "{shown}");
+    }
+
+    /// A marker is genuine only when its header ends its line.
+    #[test]
+    fn a_marker_header_must_end_its_line() {
+        assert!(is_marker_head(MARKER_TEXT.as_bytes()));
+        assert!(is_marker_head(format!("{MARKER_HEADER}\n").as_bytes()));
+        assert!(!is_marker_head(format!("{MARKER_HEADER}0\n").as_bytes()));
+        assert!(!is_marker_head(MARKER_HEADER.as_bytes()));
+        assert!(!is_marker_head(b""));
+        let dir = scratch("marker_header_line");
+        std::fs::write(dir.join(OWNERSHIP_MARKER), format!("{MARKER_HEADER}0\n"))
+            .expect("lookalike marker");
+        let owned = held_at(&dir).owned_now();
+        assert!(
+            !matches!(owned, Ok(OwnedNow::Owned)),
+            "another header is not ipe's, got {owned:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Giving back a fresh claim unlinks its marker and leaves no claim file.
+    #[test]
+    fn an_unclaim_unlinks_the_marker() {
+        let dir = scratch("unclaim");
+        let held = held_at(&dir);
+        let claimed = held.claim().expect("claim");
+        assert!(
+            dir.join(OWNERSHIP_MARKER).is_file(),
+            "the marker is published"
+        );
+        held.unclaim(claimed).expect("unclaim");
+        assert!(
+            !dir.join(OWNERSHIP_MARKER).exists(),
+            "the marker is unlinked"
+        );
+        assert!(!dir.join(CLAIM_FILE).exists(), "no claim file is left");
+        let owned = held_at(&dir).owned_now();
+        assert!(matches!(owned, Ok(OwnedNow::Unowned)), "got {owned:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1883,6 +2062,21 @@ mod tests {
         for kept in [CLAIM_FILE, OWNERSHIP_MARKER, "user.txt"] {
             assert!(dir.join(kept).is_file(), "{kept} is kept");
         }
+
+        let dir = crashed("unfinished_marker", false, false);
+        std::fs::write(dir.join(OWNERSHIP_MARKER), MARKER_HEADER).expect("half marker");
+        let claimed = held_at(&dir).claim();
+        assert!(
+            matches!(
+                claimed,
+                Err(CliError::OutputRefused(
+                    OutputRefusal::ClaimMarkerUnfinished(_)
+                ))
+            ),
+            "unfinished, got {claimed:?}"
+        );
+        assert!(!dir.join(CLAIM_FILE).exists(), "the claim file is unlinked");
+        assert!(dir.join(OWNERSHIP_MARKER).is_file(), "the marker is kept");
 
         let dir = crashed("marker_only", true, false);
         let claimed = held_at(&dir).claim();

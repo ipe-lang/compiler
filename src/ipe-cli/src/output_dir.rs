@@ -115,7 +115,11 @@ const MARKER_TEXT: &str = "ipe-output v1\n\
 /// Bytes read from a marker to check its header.
 ///
 /// The marker is tiny, so the read is bounded regardless of what sits there.
-const MARKER_READ_CAP: u64 = 64;
+const MARKER_READ_CAP: ipe_fs_open::ByteCap =
+    ipe_fs_open::ByteCap::from_nonzero(match std::num::NonZeroU64::new(64) {
+        Some(cap) => cap,
+        None => std::num::NonZeroU64::MIN,
+    });
 
 /// Why a location was refused as ipe output.
 #[derive(Debug)]
@@ -160,6 +164,16 @@ pub enum OutputRefusal {
         /// The refused output path.
         out: PathBuf,
         /// The ipe-owned tree that contains it.
+        owner: PathBuf,
+    },
+    /// A directory handed over to the user would sit inside a directory an ipe claim is turning into ipe's.
+    ///
+    /// Only a claim file is there, no marker yet: the claim may still publish
+    /// one, making the tree ipe's.
+    InsideClaim {
+        /// The refused output path.
+        out: PathBuf,
+        /// The directory holding the claim file.
         owner: PathBuf,
     },
     /// A `..` of the path does not climb out of an existing directory that is not a link.
@@ -229,6 +243,10 @@ pub enum OutputRefusal {
     ///
     /// Both the marker and the claim file are kept for the user to inspect.
     ClaimInterrupted(PathBuf),
+    /// A claim that crashed while publishing its marker left one ipe cannot read as genuine.
+    ///
+    /// Its claim file is gone; only the marker name is left for the user to inspect.
+    ClaimMarkerUnfinished(PathBuf),
     /// A claim is running on the directory, or a crashed one awaits takeover.
     ClaimInFlight(PathBuf),
 }
@@ -250,6 +268,9 @@ impl std::fmt::Display for OutputRefusal {
             Self::InsideIpeOwned { out, owner } => {
                 text::output_inside_ipe_owned(&out.display(), &owner.display())
             }
+            Self::InsideClaim { out, owner } => {
+                text::output_inside_claim(&out.display(), &owner.display(), &CLAIM_FILE)
+            }
             Self::InsideReservedDir {
                 out,
                 reserved: ReservedName::Vcs,
@@ -270,13 +291,16 @@ impl std::fmt::Display for OutputRefusal {
             Self::ReparsePoint(p) => text::output_reparse_point(&p.display()),
             Self::InUse(p) => text::output_in_use(&p.display()),
             Self::ClaimBusy { dir, waited } => {
-                text::output_claim_busy(&dir.display(), &waited.as_secs())
+                text::output_claim_busy(&dir.display(), &waited.as_secs(), &CLAIM_FILE)
             }
             Self::ClaimLockUnavailable { dir, kind } => {
                 text::output_claim_lock_unavailable(&dir.display(), kind)
             }
             Self::ClaimInterrupted(p) => {
                 text::output_claim_interrupted(&p.display(), &OWNERSHIP_MARKER, &CLAIM_FILE)
+            }
+            Self::ClaimMarkerUnfinished(p) => {
+                text::output_claim_marker_unfinished(&p.display(), &OWNERSHIP_MARKER)
             }
             Self::ClaimInFlight(p) => text::output_claim_in_flight(&p.display()),
         };
@@ -1292,37 +1316,65 @@ impl HandoverRoot {
     pub fn claim(&self) -> Result<HandoverDir, CliError> {
         let checked = check_disjoint(self.path.as_path(), &self.project)?;
         check_outside_default_output(&self.raw, &checked, &self.project)?;
-        let anchor = checked.anchor;
-        check_no_marked_ancestor_held(&self.raw, &anchor)?;
+        let anchor = &checked.anchor;
+        check_no_marked_ancestor_held(&self.raw, anchor)?;
         held::level_held(anchor.dir.path());
-        let dir = match anchor.tail.split_last() {
-            None => anchor.dir,
+        let mut between: Vec<held::HeldDir> = Vec::new();
+        let leaf = match anchor.tail.split_last() {
+            None => None,
             Some((last, above)) => {
-                let mut dir = anchor.dir;
                 for name in above {
-                    dir = dir.create_child(name)?.0;
-                    held::level_held(dir.path());
-                    if ipe_territory(&dir)? {
-                        return Err(OutputRefusal::InsideIpeOwned {
-                            out: self.raw.clone(),
-                            owner: dir.path().to_path_buf(),
-                        }
-                        .into());
+                    let next = between.last().unwrap_or(&anchor.dir).create_child(name)?.0;
+                    held::level_held(next.path());
+                    if let Some(territory) = ipe_territory(&next)? {
+                        return Err(territory_refusal(&self.raw, next.path(), territory));
                     }
+                    between.push(next);
                 }
-                let (dir, _) = dir.create_child(last)?;
-                held::level_held(dir.path());
-                dir
+                let (leaf, _) = between.last().unwrap_or(&anchor.dir).create_child(last)?;
+                held::level_held(leaf.path());
+                Some(leaf)
             }
         };
+        let dir = leaf.as_ref().unwrap_or(&anchor.dir);
         if !dir.is_empty()? {
             return Err(OutputRefusal::NotFresh(self.raw.clone()).into());
         }
-        let _: held::Claimed = dir.claim()?;
+        let claimed = dir.claim()?;
+        if let Err(refusal) = self.check_still_outside(anchor, &between) {
+            dir.unclaim(claimed)?;
+            return Err(refusal);
+        }
+        let id = dir.id()?;
         Ok(HandoverDir(OwnedDir {
             path: checked.absolute.into_path_buf(),
-            id: dir.id()?,
+            id,
         }))
+    }
+
+    /// Prove again, after the destination's claim committed, that no level above it became ipe's.
+    ///
+    /// A claim on an ancestor that ran between the first proof and this claim
+    /// would leave the handed-over directory inside an ipe-owned tree; the
+    /// held anchor, its ancestors, and every level `between` it and the
+    /// destination are read again through their handles.
+    ///
+    /// # Errors
+    /// As [`check_no_marked_ancestor_held`], and
+    /// [`OutputRefusal::InsideIpeOwned`] or [`OutputRefusal::InsideClaim`]
+    /// for a created level that became ipe territory.
+    fn check_still_outside(
+        &self,
+        anchor: &Anchor,
+        between: &[held::HeldDir],
+    ) -> Result<(), CliError> {
+        check_no_marked_ancestor_held(&self.raw, anchor)?;
+        for level in between {
+            if let Some(territory) = ipe_territory(level)? {
+                return Err(territory_refusal(&self.raw, level.path(), territory));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1382,12 +1434,34 @@ fn check_fresh(raw: &Path, path: &Path) -> Result<(), CliError> {
     }
 }
 
+/// Why nothing handed to the user may sit in a held directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Territory {
+    /// It carries a genuine marker: it is ipe's, or a claim on it decides.
+    Owned,
+    /// Only a claim file is there: a claim may still publish a marker.
+    Claim,
+}
+
 /// Whether the held `dir` is ipe's or being claimed, so nothing handed to the user may sit in it.
-fn ipe_territory(dir: &held::HeldDir) -> Result<bool, CliError> {
-    Ok(matches!(
-        dir.owned_now()?,
-        held::OwnedNow::Owned | held::OwnedNow::Claiming
-    ))
+///
+/// A claim file alone counts: the claim holding it may publish its marker
+/// at any moment, and a crashed one is finished by the next claim.
+fn ipe_territory(dir: &held::HeldDir) -> Result<Option<Territory>, CliError> {
+    match dir.owned_now()? {
+        held::OwnedNow::Owned | held::OwnedNow::Claiming => Ok(Some(Territory::Owned)),
+        held::OwnedNow::Unowned => Ok(dir.claim_present()?.then_some(Territory::Claim)),
+    }
+}
+
+/// The refusal of the handover destination `out` sitting in the held `owner`, which is ipe `territory`.
+fn territory_refusal(out: &Path, owner: &Path, territory: Territory) -> CliError {
+    let (out, owner) = (out.to_path_buf(), owner.to_path_buf());
+    match territory {
+        Territory::Owned => OutputRefusal::InsideIpeOwned { out, owner },
+        Territory::Claim => OutputRefusal::InsideClaim { out, owner },
+    }
+    .into()
 }
 
 /// Refuse a handover destination inside the project's default output root.
@@ -1442,23 +1516,18 @@ fn check_no_reserved_component(raw: &Path, resolved: &Path) -> Result<(), CliErr
 /// refused with [`OutputRefusal::Replaced`]. Bounded by the anchor's component
 /// count.
 fn check_no_marked_ancestor_held(raw: &Path, anchor: &Anchor) -> Result<(), CliError> {
-    let marked = |owner: &Path| -> CliError {
-        OutputRefusal::InsideIpeOwned {
-            out: raw.to_path_buf(),
-            owner: owner.to_path_buf(),
-        }
-        .into()
-    };
-    if !anchor.tail.is_empty() && ipe_territory(&anchor.dir)? {
-        return Err(marked(&anchor.real));
+    if !anchor.tail.is_empty()
+        && let Some(territory) = ipe_territory(&anchor.dir)?
+    {
+        return Err(territory_refusal(raw, &anchor.real, territory));
     }
     let mut level = anchor.dir.parent()?;
     for owner in anchor.real.ancestors().skip(1) {
         let Some(dir) = level else {
             return Err(OutputRefusal::Replaced(raw.to_path_buf()).into());
         };
-        if ipe_territory(&dir)? {
-            return Err(marked(owner));
+        if let Some(territory) = ipe_territory(&dir)? {
+            return Err(territory_refusal(raw, owner, territory));
         }
         level = dir.parent()?;
     }
@@ -2591,6 +2660,9 @@ mod tests {
     }
 
     /// A level `claim_in` creates is claimed under the claim lock, so a second claimant never unmarks it.
+    ///
+    /// The first claimant holds its lock until the second has met it busy,
+    /// so the second always contends with the claim in progress.
     #[test]
     fn a_created_level_is_claimed_under_the_lock() {
         let base = scratch("created_level_lock");
@@ -2606,12 +2678,24 @@ mod tests {
             if point == held::ClaimPoint::AfterLock && !fired {
                 fired = true;
                 let other = other.clone();
-                *spawned.borrow_mut() = Some(std::thread::spawn(move || {
-                    held::HeldDir::open(&other)
-                        .map_err(|e| format!("{e:?}"))
-                        .and_then(|dir| dir.ok_or_else(|| "level vanished".to_owned()))
-                        .and_then(|dir| dir.claim().map(|_| ()).map_err(|e| format!("{e:?}")))
-                }));
+                let (busy, met_busy) = std::sync::mpsc::channel::<()>();
+                let thread = std::thread::Builder::new()
+                    .spawn(move || {
+                        held::set_claim_hook(Some(Box::new(move |point, _path: &Path| {
+                            if point == held::ClaimPoint::Busy {
+                                let _ = busy.send(());
+                            }
+                        })));
+                        held::HeldDir::open(&other)
+                            .map_err(|e| format!("{e:?}"))
+                            .and_then(|dir| dir.ok_or_else(|| "level vanished".to_owned()))
+                            .and_then(|dir| dir.claim().map(|_| ()).map_err(|e| format!("{e:?}")))
+                    })
+                    .expect("spawn test thread");
+                met_busy
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("the second claimant meets the held lock");
+                *spawned.borrow_mut() = Some(thread);
             }
         })));
         let claimed = claim_in(&parent, std::ffi::OsStr::new("level"));
@@ -3043,6 +3127,86 @@ mod tests {
         // is still accepted.
         let sibling = proj.root.join("ejected").join("other");
         assert!(OutputRoot::fresh(&sibling.to_string_lossy(), &proj).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An ancestor holding only a claim file is ipe territory: a handover under it is refused.
+    #[test]
+    fn a_claim_file_alone_on_an_ancestor_refuses_a_handover() {
+        let base = scratch("claim_only_ancestor");
+        let proj = project(&base);
+        let ancestor = base.join("claiming");
+        std::fs::create_dir(&ancestor).expect("make ancestor");
+        std::fs::write(ancestor.join(CLAIM_FILE), b"").expect("claim file alone");
+        let inside = ancestor.join("app");
+        let result = OutputRoot::fresh(&inside.to_string_lossy(), &proj);
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::InsideClaim { .. })),
+            "fresh refuses under a claim file, got {result:?}"
+        );
+        let shown = refused(&result)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            shown.contains(CLAIM_FILE),
+            "the refusal names the claim file: {shown}"
+        );
+        std::fs::remove_file(ancestor.join(CLAIM_FILE)).expect("clear claim file");
+
+        let fresh = OutputRoot::fresh(&inside.to_string_lossy(), &proj).expect("fresh target");
+        std::fs::write(ancestor.join(CLAIM_FILE), b"").expect("claim file after fresh");
+        let result = fresh.claim();
+        assert!(
+            matches!(refused(&result), Some(OutputRefusal::InsideClaim { .. })),
+            "the claim refuses under a claim file, got {result:?}"
+        );
+        assert!(!inside.exists(), "a refused handover writes nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An ancestor becoming ipe's while the destination is being claimed refuses the handover and gives the destination back.
+    #[test]
+    fn an_ancestor_claimed_during_the_handover_claim_unwinds_it() {
+        let base = scratch("ancestor_during_claim");
+        let proj = project(&base);
+        let plants: [(&str, fn(&Path)); 2] = [
+            ("marked", |dir: &Path| {
+                std::fs::write(dir.join(OWNERSHIP_MARKER), MARKER_TEXT).expect("plant marker");
+            }),
+            ("claiming", |dir: &Path| {
+                std::fs::write(dir.join(CLAIM_FILE), b"").expect("plant claim file");
+            }),
+        ];
+        for (tag, plant) in plants {
+            let ancestor = base.join(tag);
+            std::fs::create_dir(&ancestor).expect("make ancestor");
+            let inside = ancestor.join("app");
+            let fresh = OutputRoot::fresh(&inside.to_string_lossy(), &proj).expect("fresh target");
+            let mut plant_once = Some((plant, ancestor.clone()));
+            super::held::set_level_hook(Some(Box::new(move |held: &Path| {
+                if held.file_name() == Some(std::ffi::OsStr::new("app"))
+                    && let Some((plant, ancestor)) = plant_once.take()
+                {
+                    plant(&ancestor);
+                }
+            })));
+            let result = fresh.claim();
+            super::held::set_level_hook(None);
+            let expected = match refused(&result) {
+                Some(OutputRefusal::InsideIpeOwned { .. }) => tag == "marked",
+                Some(OutputRefusal::InsideClaim { .. }) => tag == "claiming",
+                _ => false,
+            };
+            assert!(expected, "{tag}: refused, got {result:?}");
+            assert!(
+                !inside.join(OWNERSHIP_MARKER).exists(),
+                "{tag}: the destination is given back unmarked"
+            );
+            assert!(
+                !inside.join(CLAIM_FILE).exists(),
+                "{tag}: no claim file is left on the destination"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

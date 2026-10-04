@@ -5,8 +5,10 @@
 //! is the one place that creates, reads, renames, or unlinks the ownership
 //! marker and the claim file, through a held directory and the claim protocol.
 //! This ratchet lexes every non-test item of the `ipe` crate's `src/` and
-//! holds each mention of [`NAMES`] (as an identifier or as its exact string
-//! value) outside that owner to [`ALLOWED`], by `(file, fn, breach, count)`.
+//! holds each mention of [`NAMES`] (as an identifier, or as its exact value
+//! spelled by a string, byte string, or C string literal or joined by a
+//! `concat!` of literals) outside that owner to [`ALLOWED`], by
+//! `(file, fn, breach, count)`.
 //! It also refuses a definition of a retired path-based ownership check, and a
 //! `pub` claim step in the owner, so the protocol cannot be bypassed from a
 //! sibling module. An entry whose count no longer matches is drift and fails.
@@ -76,8 +78,8 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
         1,
     ),
     ("output_dir.rs", "<file>", Breach::Literal("CLAIM_FILE"), 1),
-    ("output_dir.rs", "fmt", Breach::Name("OWNERSHIP_MARKER"), 2),
-    ("output_dir.rs", "fmt", Breach::Name("CLAIM_FILE"), 1),
+    ("output_dir.rs", "fmt", Breach::Name("OWNERSHIP_MARKER"), 3),
+    ("output_dir.rs", "fmt", Breach::Name("CLAIM_FILE"), 3),
     (
         "output_dir.rs",
         "tolerated_entry",
@@ -98,15 +100,50 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
     ),
 ];
 
-/// The value of a string literal token, `None` for any other token.
-fn str_value(tok: &TokenTree) -> Option<String> {
+/// The text a literal token spells, `None` for any other token.
+///
+/// A string, a byte string, and a C string all spell the name they carry
+/// (a byte or C string that is not UTF-8 spells none); a character or a
+/// number spells what `concat!` would join for it.
+fn literal_text(tok: &TokenTree) -> Option<String> {
     let TokenTree::Literal(lit) = tok else {
         return None;
     };
     match syn::parse2::<syn::Lit>(TokenStream::from(TokenTree::Literal(lit.clone()))) {
         Ok(syn::Lit::Str(s)) => Some(s.value()),
-        _ => None,
+        Ok(syn::Lit::ByteStr(b)) => String::from_utf8(b.value()).ok(),
+        Ok(syn::Lit::CStr(c)) => c.value().into_string().ok(),
+        Ok(syn::Lit::Char(c)) => Some(c.value().to_string()),
+        Ok(syn::Lit::Int(i)) => Some(i.base10_digits().to_owned()),
+        Ok(syn::Lit::Float(f)) => Some(f.base10_digits().to_owned()),
+        Ok(_) | Err(_) => None,
     }
+}
+
+/// The text a `concat!` over `args` joins, `None` when a piece is not a literal.
+///
+/// Each comma-separated piece is a literal, `true`/`false`, or a nested
+/// `concat!`; any other piece (a macro variable, `env!`) has no text a lexer
+/// can know.
+fn concat_text(args: &proc_macro2::Group) -> Option<String> {
+    let toks: Vec<TokenTree> = args.stream().into_iter().collect();
+    let mut joined = String::new();
+    for piece in toks.split(|t| is_punct(Some(t), ',')) {
+        match piece {
+            [] => {}
+            [lit @ TokenTree::Literal(_)] => joined.push_str(&literal_text(lit)?),
+            [TokenTree::Ident(id)] if id == "true" || id == "false" => {
+                joined.push_str(&id.to_string());
+            }
+            [TokenTree::Ident(id), bang, TokenTree::Group(inner)]
+                if id == "concat" && is_punct(Some(bang), '!') =>
+            {
+                joined.push_str(&concat_text(inner)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(joined)
 }
 
 /// Whether `tok` is the punctuation `ch`.
@@ -173,7 +210,22 @@ impl Scan<'_> {
             if matches!(tok, TokenTree::Ident(id) if id == name) {
                 self.hit(func, Breach::Name(name));
             }
-            if str_value(tok).as_deref() == Some(value) {
+            if literal_text(tok).as_deref() == Some(value) {
+                self.hit(func, Breach::Literal(name));
+            }
+        }
+    }
+
+    /// Count a `concat!` over `args` that joins to a reserved value outside the owner.
+    fn concat_reach(&mut self, args: &proc_macro2::Group, func: &str) {
+        if self.owner {
+            return;
+        }
+        let Some(joined) = concat_text(args) else {
+            return;
+        };
+        for (name, value) in NAMES {
+            if joined == value {
                 self.hit(func, Breach::Literal(name));
             }
         }
@@ -238,6 +290,13 @@ impl Scan<'_> {
                     i = k.saturating_add(1);
                     continue;
                 }
+            }
+            if !test_gated
+                && matches!(tok, TokenTree::Ident(id) if id == "concat")
+                && is_punct(toks.get(i.saturating_add(1)), '!')
+                && let Some(TokenTree::Group(args)) = toks.get(i.saturating_add(2))
+            {
+                self.concat_reach(args, func);
             }
             if let TokenTree::Group(g) = tok {
                 let brace = g.delimiter() == Delimiter::Brace;
@@ -369,7 +428,7 @@ fn synthetic(file: &str, src: &str) -> Result<Vec<(String, Breach, usize)>, Stri
 /// Each reach outside the owner, a retired check, and a public claim step go red.
 #[test]
 fn each_planted_reach_is_refused() -> Result<(), String> {
-    let cases: [(&str, &str, Breach); 7] = [
+    let cases: [(&str, &str, Breach); 11] = [
         (
             "build.rs",
             "fn mark(d: &Path) { std::fs::write(d.join(crate::output_dir::OWNERSHIP_MARKER), b\"\"); }",
@@ -389,6 +448,26 @@ fn each_planted_reach_is_refused() -> Result<(), String> {
             "output_dir.rs",
             "fn sneak(d: &Path) { let _ = d.join(\".ipe-output.claim\"); }",
             Breach::Literal("CLAIM_FILE"),
+        ),
+        (
+            "cache.rs",
+            "fn owned(d: &Path) -> bool { d.join(std::str::from_utf8(b\".ipe-output\").unwrap_or_default()).is_file() }",
+            Breach::Literal("OWNERSHIP_MARKER"),
+        ),
+        (
+            "clean.rs",
+            "fn sneak() -> &'static CStr { c\".ipe-output.claim\" }",
+            Breach::Literal("CLAIM_FILE"),
+        ),
+        (
+            "clean.rs",
+            "fn sneak(d: &Path) { let _ = d.join(concat!(\".ipe-\", \"output\", \".claim\")); }",
+            Breach::Literal("CLAIM_FILE"),
+        ),
+        (
+            "cache.rs",
+            "fn owned(d: &Path) -> bool { d.join(concat!(\".ipe-\", concat!(\"out\", \"put\"),)).is_file() }",
+            Breach::Literal("OWNERSHIP_MARKER"),
         ),
         (
             "output_dir/held.rs",
@@ -438,6 +517,10 @@ fn the_owner_tests_and_docs_are_not_reaches() -> Result<(), String> {
             "#[cfg(test)]\nmod tests { fn t() { let _ = crate::output_dir::CLAIM_FILE; } }",
         ),
         ("cache.rs", "#[test]\nfn t() { let _ = \".ipe-output\"; }"),
+        (
+            "text.rs",
+            "fn m() { let _ = concat!(\".ipe-\", \"out\"); let _ = concat!(\"ipe\", $tail); }",
+        ),
         (
             "cache.rs",
             "/// Reads only from a dir holding an [`OWNERSHIP_MARKER`].\nfn read() {}",

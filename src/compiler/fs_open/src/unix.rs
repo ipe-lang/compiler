@@ -97,18 +97,12 @@ fn kind_of_type(file_type: std::fs::FileType) -> FileKind {
     }
 }
 
-/// The identity carried by `meta`.
-fn id_of(meta: &std::fs::Metadata) -> FileId {
-    FileId {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    }
-}
-
-/// The identity a no-follow `stat` carries.
+/// The identity a `stat` carries, the one place a Unix [`FileId`] is built.
 ///
-/// `dev_t` is signed on some Unixes; a negative device number names no
-/// object this crate compares, so it is refused.
+/// Every identity read (a handle, a path, a no-follow entry) goes through
+/// this one representation, so two reads of one object always compare
+/// equal. `dev_t` is signed on some Unixes; a negative device number names
+/// no object this crate compares, so it is refused.
 fn id_of_stat(stat: &rustix::fs::Stat) -> Result<FileId, OpenRefusal> {
     let widen =
         |raw: i128| u64::try_from(raw).map_err(|_| OpenRefusal::Io(io::ErrorKind::InvalidData));
@@ -120,9 +114,9 @@ fn id_of_stat(stat: &rustix::fs::Stat) -> Result<FileId, OpenRefusal> {
 
 /// The identity of the object `file` holds.
 pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
-    file.metadata()
-        .map(|meta| id_of(&meta))
-        .map_err(|e| refusal_of(&e))
+    rustix::fs::fstat(file)
+        .map_err(refusal)
+        .and_then(|stat| id_of_stat(&stat))
 }
 
 /// How many directory entries name the object `file` holds.
@@ -140,9 +134,9 @@ pub fn kind_and_len(file: &File) -> Result<(FileKind, u64), OpenRefusal> {
 
 /// The identity of the object looking `path` up now reaches, following links.
 pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
-    std::fs::metadata(path)
-        .map(|meta| id_of(&meta))
-        .map_err(|e| refusal_of(&e))
+    rustix::fs::stat(path)
+        .map_err(refusal)
+        .and_then(|stat| id_of_stat(&stat))
 }
 
 /// Open the path the invoking user named, following links, without blocking.
@@ -236,10 +230,7 @@ impl Dir {
 
     /// The identity of this directory.
     pub fn id(&self) -> Result<FileId, OpenRefusal> {
-        self.0
-            .metadata()
-            .map(|meta| id_of(&meta))
-            .map_err(|e| refusal_of(&e))
+        id_of_file(&self.0)
     }
 
     /// The held descriptor.

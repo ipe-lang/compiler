@@ -232,6 +232,17 @@ pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
     sys::link_count(file)
 }
 
+/// What the open `file` holds, read from that handle.
+///
+/// For a handle a caller must keep as a [`File`] (one it locks, for
+/// instance) and so cannot hand to [`RegularFile::prove`].
+///
+/// # Errors
+/// The refusal of a handle that cannot be stat'd.
+pub fn kind_of_file(file: &File) -> Result<FileKind, OpenRefusal> {
+    sys::kind_and_len(file).map(|(kind, _)| kind)
+}
+
 /// An open directory handle every entry act is relative to.
 #[derive(Debug)]
 pub struct HeldDir {
@@ -420,10 +431,20 @@ impl RegularFile {
         }
     }
 
-    /// The proven handle, for an identity read or a bounded read this type does not provide.
-    #[must_use]
-    pub const fn handle(&self) -> &File {
-        &self.file
+    /// The identity of the object this handle holds.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn id(&self) -> Result<FileId, OpenRefusal> {
+        sys::id_of_file(&self.file)
+    }
+
+    /// How many directory entries name the object this handle holds.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn link_count(&self) -> Result<u64, OpenRefusal> {
+        sys::link_count(&self.file)
     }
 
     /// The length the proof saw; the file may have changed since.
@@ -475,8 +496,19 @@ impl RegularFile {
     /// # Errors
     /// [`OpenRefusal::Io`] on a read failure.
     pub fn read_prefix(self, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
+        self.read_head(cap)
+    }
+
+    /// At most the next `cap` bytes, keeping the handle for an identity re-read.
+    ///
+    /// Read from where the handle stands: from the start on a fresh proof.
+    /// A longer file is not refused.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::Io`] on a read failure.
+    pub fn read_head(&self, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
         let mut head = Vec::new();
-        self.file
+        (&self.file)
             .take(cap.get())
             .read_to_end(&mut head)
             .map_err(|e| OpenRefusal::Io(e.kind()))?;

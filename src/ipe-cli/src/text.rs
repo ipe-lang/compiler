@@ -1585,6 +1585,8 @@ messages! {
     output_unresolved_sources(path) = "output-unresolved-sources";
     /// A user-bound output inside a tree ipe owns.
     output_inside_ipe_owned(out, owner) = "output-inside-ipe-owned";
+    /// A user-bound output inside a directory an ipe claim is turning into ipe's.
+    output_inside_claim(out, owner, claim) = "output-inside-claim";
     /// An output inside a `.git` directory.
     output_inside_vcs(out) = "output-inside-vcs";
     /// An output inside an ipe cache namespace.
@@ -1608,11 +1610,13 @@ messages! {
     /// An entry another program holds open, so ipe cannot remove or replace it.
     output_in_use(path) = "output-in-use";
     /// An output directory another ipe run is still claiming past the wait bound.
-    output_claim_busy(path, waited) = "output-claim-busy";
+    output_claim_busy(path, waited, claim) = "output-claim-busy";
     /// An output directory on a filesystem that refused the claim's file lock.
     output_claim_lock_unavailable(path, kind) = "output-claim-lock-unavailable";
     /// An unfinished claim with foreign entries beside its marker.
     output_claim_interrupted(path, marker, claim) = "output-claim-interrupted";
+    /// A crashed claim that left a marker ipe cannot read as genuine.
+    output_claim_marker_unfinished(path, marker) = "output-claim-marker-unfinished";
     /// An output directory a claim is running on, or a crashed claim left.
     output_claim_in_flight(path) = "output-claim-in-flight";
     /// A GitHub login with nothing before its optional `[bot]` suffix.

@@ -3313,6 +3313,7 @@ dependencies = [
  "cap-primitives",
  "ipe-test-temp",
  "rustix 0.38.44",
+ "syn 3.0.6",
  "winapi-util",
 ]
 

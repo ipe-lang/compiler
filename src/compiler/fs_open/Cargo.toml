@@ -15,6 +15,9 @@ winapi-util = "0.1"
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../../tools/test-temp" }
+# The public-surface scan reads this crate's own syntax tree. The version and
+# features the workspace already builds, so no new package compiles.
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lints]
 workspace = true
