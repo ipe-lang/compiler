@@ -7,6 +7,7 @@ use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path,
     ffi, fs, project, render, runtime_embed, text,
 };
+use ipe_backend_rust::rust_str_lit;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -1949,11 +1950,12 @@ pub fn compile_prepared(
 /// The registration is a single `ipe_runtime::web::widget_assets::register(&[…])`
 /// call spliced in right after `install_panic_classifier();` in the generated
 /// `main()` — the first line of the entry point, before any task runs. Each
-/// `(tag, content)` is rendered as a Rust string-literal pair; the content is
-/// emitted as a raw string literal with a hash fence wide enough to clear any run
-/// of `#` in the file, so arbitrary JS (including embedded `"` / `#`) is a valid
-/// literal and no author byte can break out of the string into code (the content
-/// is DATA in the emitted program, exactly as it is data in the browser).
+/// `(tag, content)` is rendered as a Rust string-literal pair through the
+/// backend's one literal owner, `rust_str_lit`, which escapes every scalar the
+/// literal grammar cannot carry raw (`"`, `\`, a lone CR, a bidi override), so
+/// arbitrary JS is a valid literal rustc accepts and no author byte can break
+/// out of the string into code (the content is DATA in the emitted program,
+/// exactly as it is data in the browser).
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `src/main.rs` is absent
@@ -1985,9 +1987,9 @@ pub fn inject_widget_registration(
     let mut entries = String::new();
     for (tag, content) in manifest {
         entries.push_str("        (");
-        entries.push_str(&rust_str_literal(tag));
+        entries.push_str(&rust_str_lit(tag));
         entries.push_str(", ");
-        entries.push_str(&rust_raw_str_literal(content));
+        entries.push_str(&rust_str_lit(content));
         entries.push_str("),\n");
     }
     let call = format!("\n    ipe_runtime::web::widget_assets::register(&[\n{entries}    ]);\n");
@@ -2102,36 +2104,6 @@ pub fn inject_wasm_widget_bundle(
     };
     index.insert_str(pos, &scripts);
     Ok(())
-}
-
-/// Render `s` as a double-quoted Rust string literal.
-///
-/// Rust's own `Debug` grammar escapes every character a literal cannot carry
-/// raw, bidi overrides included.
-pub fn rust_str_literal(s: &str) -> String {
-    format!("{s:?}")
-}
-
-/// Render `s` as a Rust RAW string literal `r#"…"#` with a hash fence wide enough
-/// to clear any `"#` run inside `s`, so arbitrary content (author JS with quotes
-/// and hashes) is emitted verbatim as data — it can never terminate the literal
-/// early and spill into code.
-pub fn rust_raw_str_literal(s: &str) -> String {
-    // The fence must be longer than the longest run of `#` that immediately
-    // follows a `"` in the content (that is the only sequence that could close a
-    // raw literal). Computing the max `#`-run overall is a safe over-approximation.
-    let mut max_hashes = 0usize;
-    let mut run = 0usize;
-    for ch in s.chars() {
-        if ch == '#' {
-            run += 1;
-            max_hashes = max_hashes.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    let fence = "#".repeat(max_hashes + 1);
-    format!("r{fence}\"{s}\"{fence}")
 }
 
 /// Write an emitted project to `target`, vendoring the runtime module tree
@@ -2308,7 +2280,41 @@ pub fn build_emit_manifest(
     for (rel, contents) in &emitted.files {
         manifest.insert(PathBuf::from(rel.as_str()), contents.clone());
     }
+    refuse_unlexable_rust(&manifest)?;
     Ok(manifest)
+}
+
+/// Refuse a manifest whose `.rs` text holds a character the Rust lexer refuses raw.
+///
+/// The scan covers the FINAL manifest — vendored runtime, backend emit, post-emit
+/// injections and a cache-deserialized project alike — so no text reaches
+/// `cargo` that would make it fail a program `ipe` accepted. The detail names the
+/// file, byte offset and code point through the hazard's own rendering, never the
+/// raw character.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying [`Diagnostic::CompilerBug`] on the first hit.
+fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), CliError> {
+    let hit = manifest
+        .iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        })
+        .find_map(|(path, text)| ipe_intern::find_lexer_hazard(text).map(|hazard| (path, hazard)));
+    hit.map_or(Ok(()), |(path, hazard)| {
+        let shown = path.to_string_lossy();
+        Err(CliError::Pipeline {
+            file: path.clone(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::CompilerBug {
+                where_: ipe_intern::EMIT_LEXABLE,
+                detail: format!(
+                    "emitted {shown:?} holds {hazard}, which the Rust lexer refuses raw"
+                ),
+            }),
+        })
+    })
 }
 
 /// Vendor only the runtime source files the emitted `mod.rs` reaches.
@@ -2668,7 +2674,7 @@ pub fn build_project_into(
         &canonical_project_dir(manifest_path),
     );
     let options = BuildOptions {
-        wasm_public_env: manifest.wasm.public_env.clone(),
+        wasm_public_env: manifest.wasm.public_env.to_names(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,
@@ -2746,9 +2752,100 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A widget's JS reaches the emitted `main.rs` with every bidi override and
+    /// lone CR escaped, since rustc refuses either raw inside any string literal.
     #[test]
-    fn rust_str_literal_escapes_quotes_backslashes_and_bidi_overrides() {
-        assert_eq!(rust_str_literal("a\u{202E}\"b\\"), r#""a\u{202e}\"b\\""#);
+    fn widget_registration_escapes_bidi_and_lone_cr_in_content() {
+        let mut files = BTreeMap::new();
+        let rel = ipe_backend::RelPath::new("src/main.rs").expect("valid rel path");
+        files.insert(
+            rel,
+            "fn main() {\n    install_panic_classifier();\n}\n".to_owned(),
+        );
+        let mut emitted = ipe_backend::EmittedProject {
+            files,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        };
+        let manifest = BTreeMap::from([(
+            "x-w\u{202E}".to_owned(),
+            "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
+        )]);
+        assert!(inject_widget_registration(&mut emitted, &manifest).is_ok());
+        let main = emitted.files.get("src/main.rs").map_or("", String::as_str);
+        assert!(
+            !main.contains(['\u{202E}', '\u{2066}', '\r']),
+            "a raw bidi override or lone CR reached the emitted literal: {main}"
+        );
+        assert!(
+            main.contains(
+                r###"("x-w\u{202e}", "/* \u{202e}evil\u{2066} */ a\rb \"#\"## c\\d"),"###
+            ),
+            "the widget pair is not the Debug-escaped literal pair: {main}"
+        );
+    }
+
+    /// An emitted project for the manifest: a vendored `mod.rs` that declares
+    /// no runtime module, so the scan sees only `files` and reads no disk.
+    fn vendored_project(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
+        let mut map = BTreeMap::new();
+        for (path, body) in files.iter().chain(&[("src/ipe_runtime/mod.rs", "")]) {
+            let rel = ipe_backend::RelPath::new(*path).expect("valid rel path");
+            map.insert(rel, (*body).to_owned());
+        }
+        ipe_backend::EmittedProject {
+            files: map,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        }
+    }
+
+    /// The manifest refuses `.rs` text holding a raw bidi control or a bare CR,
+    /// past every renderer, and names the hazard without echoing it.
+    #[test]
+    fn manifest_refuses_a_raw_lexer_hazard() {
+        let missing = Path::new("/nonexistent-runtime-dir");
+        for (path, body) in [
+            ("src/main.rs", "fn main() { let _ = \"a\u{202E}b\"; }\n"),
+            ("src/ipe_runtime/x.rs", "// a\rb\n"),
+            ("src/ipe_mods/upper.RS", "// a\u{2066}b\n"),
+        ] {
+            let refused = build_emit_manifest(&vendored_project(&[(path, body)]), missing, true);
+            assert!(
+                matches!(&refused, Err(CliError::Pipeline { .. })),
+                "a raw hazard in {path} passed the manifest"
+            );
+            let Err(CliError::Pipeline { file, diag, .. }) = refused else {
+                return;
+            };
+            assert_eq!(file, PathBuf::from(path));
+            assert!(
+                matches!(
+                    &*diag,
+                    Diagnostic::CompilerBug {
+                        where_: ipe_intern::EMIT_LEXABLE,
+                        ..
+                    }
+                ),
+                "not the lexability refusal: {diag:?}"
+            );
+            let Diagnostic::CompilerBug { detail, .. } = *diag else {
+                return;
+            };
+            assert!(
+                !detail.contains(['\u{202E}', '\r']),
+                "the refusal echoed the raw hazard: {detail:?}"
+            );
+        }
+        for (path, body) in [
+            ("src/main.rs", "fn main() {}\r\n// \u{200E}\u{FEFF} é 𝄞\r\n"),
+            ("www/index.html", "<p>\u{202E}\r</p>"),
+        ] {
+            assert!(
+                build_emit_manifest(&vendored_project(&[(path, body)]), missing, true).is_ok(),
+                "lexable or non-Rust text in {path} was refused"
+            );
+        }
     }
 
     /// A build whose caller states no intent is a release build.

@@ -47,11 +47,10 @@ indexSettings =
         rawRoot <- System.getenv "IPE_INDEX_ROOT"
         db <- parseDbLocation "IPE_INDEX_DB" rawDb
         root <- RepoPath.parseRoot rawRoot
-        roots <-
-            ipeTag
-                |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
-                |> Result.mapError RepoPath.toError
-                |> Task.fromResult
+        roots <- ipeTag
+            |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
+            |> Result.mapError RepoPath.toError
+            |> Task.fromResult
         Task.succeed { db = db, roots = roots }
 
 

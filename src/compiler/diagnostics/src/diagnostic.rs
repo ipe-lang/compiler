@@ -25,13 +25,13 @@ use crate::code::{
     IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
     IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
     IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
-    IPE_N0051, IPE_N0052, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012,
-    IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021,
-    IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062,
-    IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070,
-    IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012,
-    IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020,
-    IPE_T0021, Severity,
+    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
+    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
+    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
+    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
+    IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011,
+    IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019,
+    IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
 use crate::terminal::TerminalSafe;
@@ -446,38 +446,40 @@ pub enum NameError {
     /// A bare value name resolves to nothing. [IPE-N0001]
     ValueNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A type name is undefined. [IPE-N0002]
     TypeNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A constructor is undefined/misspelled. [IPE-N0003]
     ConstructorNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A qualifier names no module/import alias. [IPE-N0004]
     UnknownModule {
         qualifier: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
-    /// A KNOWN Tier-C stdlib qualifier is used without importing its module
-    /// (ADR 0001): `String.join` with no `import Ipe.String`. Distinct from
-    /// [`Self::UnknownModule`] (a genuinely unknown qualifier): here the module
-    /// exists and the fix is deterministic — add the named import. `qualifier` is
-    /// the short-name at the use site; `import_path` is the exact
-    /// `import` line to add (e.g. `Ipe.String`). [IPE-N0034]
-    StdlibImportRequired {
+    /// A qualifier names a known module the importing module never imported.
+    ///
+    /// `String.join` with no `import Ipe.String`, or `Util.f` with no
+    /// `import Util`. Distinct from [`Self::UnknownModule`] (a genuinely unknown
+    /// qualifier): here the module exists and the fix is to add its import.
+    /// `qualifier` is the spelling at the use site; `candidates` holds every
+    /// importable module whose bare import binds that spelling, sorted and
+    /// deduplicated (never empty). [IPE-N0034]
+    ImportRequired {
         qualifier: Box<str>,
-        import_path: Box<str>,
+        candidates: Box<[Box<str>]>,
     },
     /// The qualifier resolves but the member is absent. [IPE-N0005]
     NoSuchMember {
         module: Box<str>,
         member: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// Two top-level values share a name; `first` is the earlier span. [IPE-N0010]
     DuplicateValue { name: Box<str>, first: Span },
@@ -497,7 +499,7 @@ pub enum NameError {
     /// `suggestions` lists close matches by Levenshtein distance. [IPE-N0020]
     ModuleNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// The import graph for the project contains a cycle; `path` lists the
     /// module names in cycle order (last element imports the first). [IPE-N0021]
@@ -507,7 +509,7 @@ pub enum NameError {
     NameNotExposed {
         module: Box<str>,
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// The `module` declaration at the top of a `.ipe` file does not match the
     /// path I derived from the file's location under `source_root`. [IPE-N0023]
@@ -806,6 +808,24 @@ pub enum NameError {
         field: Box<str>,
         sub_module: Box<str>,
     },
+    /// A row-parameter argument of a type alias cannot extend the alias's record.
+    ///
+    /// `alias` is the alias applied (`Named` for `type alias Named r = { r |
+    /// name : String }`) and `fault` says why its row argument is refused.
+    /// [IPE-N0053]
+    AliasRowArgument {
+        alias: Box<str>,
+        fault: AliasRowFault,
+    },
+}
+
+/// Why a [`NameError::AliasRowArgument`] refuses a row-parameter argument.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AliasRowFault {
+    /// The argument is not a record or a type variable; `found` names it.
+    NotARecord { found: Box<str> },
+    /// The argument's record already has the alias's own label `field`.
+    FieldClash { field: Box<str> },
 }
 
 /// How a [`NameError::GenericAppEntry`] refusal relates the entry to its
@@ -2089,17 +2109,100 @@ pub enum Applicability {
 
 /// A typed, span-scoped source edit the compiler proposes as a fix.
 ///
-/// The span is the region to replace; `replacement` is the literal text to write
-/// there. Only [`Applicability::MachineApplicable`] suggestions are auto-applied;
-/// the others are shown but require explicit per-edit confirmation.
+/// The span is the region to replace; `replaces` is the text the producer
+/// expects to find there and `replacement` the literal text to write over it.
+/// An applier must refuse the edit when the source at `span` is not exactly
+/// `replaces`. Only [`Applicability::MachineApplicable`] suggestions are
+/// auto-applied; the others are shown but require explicit per-edit
+/// confirmation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Suggestion {
     /// The source region the edit replaces.
     pub span: Span,
+    /// The source text the edit expects to find at `span`.
+    pub replaces: Box<str>,
     /// The literal text to substitute for the region.
     pub replacement: Box<str>,
     /// How safe the edit is to apply automatically.
     pub applicability: Applicability,
+}
+
+/// A source region paired with the exact text a producer proved sits there.
+///
+/// The fields are private: a target is only built by [`Self::whole`],
+/// [`Self::prefix`] or [`Self::suffix`], which refuse a region whose width is
+/// not the text's length or that leaves its token. A machine-applicable edit
+/// therefore never inherits a wider diagnostic span, and an applier re-checks
+/// the expected text against the source before writing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EditTarget {
+    span: Span,
+    replaces: Box<str>,
+}
+
+impl EditTarget {
+    /// The whole of `token`, which must be exactly `text` wide.
+    #[must_use]
+    pub fn whole(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        (token.hi.checked_sub(token.lo)? == width && width > 0).then(|| Self {
+            span: token,
+            replaces: text.into(),
+        })
+    }
+
+    /// The leading `text` of `token` (a qualifier of a qualified name).
+    #[must_use]
+    pub fn prefix(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        let hi = token.lo.checked_add(width)?;
+        (width > 0 && hi <= token.hi).then(|| Self {
+            span: Span::new(token.lo, hi),
+            replaces: text.into(),
+        })
+    }
+
+    /// The trailing `text` of `token` (the member of a qualified name).
+    #[must_use]
+    pub fn suffix(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        let lo = token.hi.checked_sub(width)?;
+        (width > 0 && lo >= token.lo).then(|| Self {
+            span: Span::new(lo, token.hi),
+            replaces: text.into(),
+        })
+    }
+}
+
+/// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
+///
+/// `region` is `None` when the producer cannot prove the exact sub-span the
+/// replacement would overwrite (a type annotation carries one span for the
+/// whole annotation); such candidates only ever render as "did you mean"
+/// lines, never as an applicable edit.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Candidates {
+    /// The region a sole candidate replaces, when provable.
+    pub region: Option<EditTarget>,
+    /// The candidate names, best first.
+    pub names: Box<[Box<str>]>,
+}
+
+impl Candidates {
+    /// Candidates with a proven (or absent) replace region.
+    #[must_use]
+    pub const fn at(region: Option<EditTarget>, names: Box<[Box<str>]>) -> Self {
+        Self { region, names }
+    }
+
+    /// Candidates that are hints only: no region, so never machine-applicable.
+    #[must_use]
+    pub const fn hints(names: Box<[Box<str>]>) -> Self {
+        Self {
+            region: None,
+            names,
+        }
+    }
 }
 
 /// One line of help under a diagnostic. Names are carried as owned `Box<str>`;
@@ -2232,7 +2335,7 @@ impl Diagnostic {
     pub fn help(&self) -> Vec<HelpLine> {
         match self {
             Self::Parse { msg, .. } => parse_help(msg),
-            Self::Name { msg, span } => name_help(msg, *span),
+            Self::Name { msg, .. } => name_help(msg),
             Self::Type { msg, .. } => type_help(msg),
             Self::Lower { msg, .. } => lower_help(msg),
             Self::Ffi { msg } => ffi_help(msg),
@@ -2386,7 +2489,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::TypeNotFound { .. } => IPE_N0002,
         NameError::ConstructorNotFound { .. } => IPE_N0003,
         NameError::UnknownModule { .. } => IPE_N0004,
-        NameError::StdlibImportRequired { .. } => IPE_N0034,
+        NameError::ImportRequired { .. } => IPE_N0034,
         NameError::NoSuchMember { .. } => IPE_N0005,
         NameError::DuplicateValue { .. } => IPE_N0010,
         NameError::DuplicateConstructor { .. } => IPE_N0011,
@@ -2423,6 +2526,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::ScriptImportsShapeView { .. } => IPE_N0050,
         NameError::GenericAppEntry { .. } | NameError::UnpinnedAppEntry { .. } => IPE_N0051,
         NameError::InputFieldIsSubscription { .. } => IPE_N0052,
+        NameError::AliasRowArgument { .. } => IPE_N0053,
     })
 }
 
@@ -2585,7 +2689,7 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
     }
 }
 
-fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
+fn name_help(msg: &NameError) -> Vec<HelpLine> {
     match msg {
         NameError::ValueNotFound { suggestions, .. }
         | NameError::TypeNotFound { suggestions, .. }
@@ -2593,7 +2697,7 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::UnknownModule { suggestions, .. }
         | NameError::NoSuchMember { suggestions, .. }
         | NameError::ModuleNotFound { suggestions, .. }
-        | NameError::NameNotExposed { suggestions, .. } => did_you_mean(suggestions, span),
+        | NameError::NameNotExposed { suggestions, .. } => did_you_mean(suggestions),
         NameError::DuplicateValue { first, .. }
         | NameError::DuplicateConstructor { first, .. }
         | NameError::DuplicateType { first, .. }
@@ -2639,7 +2743,7 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::ServerModuleReachableFromWasmClient { .. }
         | NameError::TypeExpansionTooDeep { .. }
         | NameError::ProgramImportsTeaShape { .. }
-        | NameError::StdlibImportRequired { .. }
+        | NameError::ImportRequired { .. }
         | NameError::RemovedSurface { .. }
         | NameError::AssertedCallMalformed { .. }
         | NameError::BoundarySealIllegal { .. }
@@ -2654,6 +2758,7 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::GenericAppEntry { .. }
         | NameError::UnpinnedAppEntry { .. }
         | NameError::InputFieldIsSubscription { .. }
+        | NameError::AliasRowArgument { .. }
         | NameError::WebInitPolyArg => Vec::new(), // no span-based help
     }
 }
@@ -3322,19 +3427,22 @@ fn consent_help(msg: &ConsentError) -> Vec<HelpLine> {
 
 // --- did_you_mean ------------------------------------------------------------
 
-/// Turns already-sorted suggestion names into help lines. A single candidate is
-/// confident enough to offer as a [`Applicability::MachineApplicable`]
-/// suggestion over `span` (the misspelled name's region); two or more stay
-/// non-committal "did you mean" lines. The producer is responsible for the
-/// stable `(Levenshtein, name)` ordering.
-fn did_you_mean(suggestions: &[Box<str>], span: Span) -> Vec<HelpLine> {
-    match suggestions {
-        [only] => vec![HelpLine::Suggest(Suggestion {
-            span,
+/// Turns already-sorted candidates into help lines.
+///
+/// A single candidate with a proven [`EditTarget`] is confident enough to offer
+/// as a [`Applicability::MachineApplicable`] suggestion over exactly that
+/// region; any other shape (several candidates, or no provable region) stays a
+/// non-committal "did you mean" line per name. The producer is responsible for
+/// the stable `(Levenshtein, name)` ordering.
+fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
+    match (&*candidates.names, &candidates.region) {
+        ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
+            span: target.span,
+            replaces: target.replaces.clone(),
             replacement: only.clone(),
             applicability: Applicability::MachineApplicable,
         })],
-        many => many
+        (many, _) => many
             .iter()
             .map(|s| HelpLine::DidYouMean(s.clone()))
             .collect(),

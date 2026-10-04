@@ -1,10 +1,10 @@
 use super::{
     BinOp, Callee, DResult, Diagnostic, Expr, GenericScope, IrType, KernelClass, KernelFn,
     LowerError, MAX_EMIT_DEPTH, Match, ModPath, Span, Symbol, callee_name, clone_targets_in_expr,
-    combine_guards, emit_apply, emit_arm_head, emit_binding_stmts, emit_config_ctor_call,
-    emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value, emit_html_template,
-    emit_http_builder_call, emit_http_call, emit_json_decoder_call, emit_lambda,
-    emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
+    combine_guards, elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts,
+    emit_config_ctor_call, emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value,
+    emit_html_template, emit_http_builder_call, emit_http_call, emit_json_decoder_call,
+    emit_lambda, emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_loop_call, emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template,
     emit_update, float_literal, free_vars, indent_of, infix, inlined_let_body, int_literal,
@@ -12,6 +12,7 @@ use super::{
     swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
+use ipe_intern::rust_char_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
 /// Depth-tracked recursion behind [`emit_expr`]. `depth` is the IR-nesting level
@@ -50,19 +51,20 @@ pub fn emit_expr_at(
         // integer; see [`float_literal`].
         Expr::Float(f) => Ok(float_literal(*f)),
         // A string literal renders as an owned `String` (Ipê `String` is Rust
-        // `String`, never `&str`). The `{:?}` Debug form produces a valid Rust
-        // string literal with deterministic escaping.
-        Expr::Str(s) => Ok(format!("{s:?}.to_string()")),
+        // `String`, never `&str`). `rust_str_lit` renders a valid Rust string
+        // literal with every lexer hazard escaped.
+        Expr::Str(s) => Ok(format!("{}.to_string()", rust_str_lit(s))),
         // The reserved `CustomElement.fromFile` constructor value: a widget handle built
         // from its generated content-addressed tag. The tag was minted at
         // lowering from the sealed, in-project JS path (never raw user input);
         // `js_path` is retained on the node for the WP5 serving stage but is not
         // part of the handle's runtime representation here.
         Expr::CustomElementRef { tag, js_path: _ } => Ok(format!(
-            "ipe_runtime::ui::widget::custom_element_({tag:?}.to_string())"
+            "ipe_runtime::ui::widget::custom_element_({}.to_string())",
+            rust_str_lit(tag)
         )),
         // A character literal renders as a Rust `char`. The carried text is a
-        // single character (lexer invariant); `{:?}` escapes it deterministically.
+        // single character (lexer invariant); `rust_char_lit` escapes it.
         // A malformed (non-single-char) value fails closed as a `CompilerBug`:
         // a string-literal fallback in `char` position is NOT a safe total
         // fallback — it emits Rust that `cargo` rejects (E0308), the exact
@@ -70,7 +72,7 @@ pub fn emit_expr_at(
         Expr::Char(c) => {
             let mut chars = c.chars();
             match (chars.next(), chars.next()) {
-                (Some(ch), None) => Ok(format!("{ch:?}")),
+                (Some(ch), None) => Ok(rust_char_lit(ch)),
                 _ => Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_expr_at(Expr::Char)",
                     detail: format!(
@@ -632,11 +634,15 @@ pub fn emit_expr_at(
             let t = emit_expr_at(ctx, tail, indent, child, generics)?;
             Ok(format!("ipe_runtime::list::ipe_list_cons({h}, {t})"))
         }
-        Expr::ListIndexClone { list, index } => {
+        Expr::ListIndexClone { list, index, elem } => {
             // Clone the element at a constant index — the arm guard already
             // proved `list.len() > index`, so the Rust index is in
             // bounds by construction. `.clone()` keeps the list intact for the
-            // sibling tail binder.
+            // sibling tail binder; the lowerer builds this node only over a
+            // `Clone` element and refuses a nested cons over any other
+            // (IPE-L0116), and `elem_clone_proof` re-checks the element
+            // against the emitted `Clone` facts before any text is written.
+            elem_clone_proof(ctx, elem)?;
             let l = emit_expr_at(ctx, list, indent, child, generics)?;
             Ok(format!("({l})[{index}].clone()"))
         }

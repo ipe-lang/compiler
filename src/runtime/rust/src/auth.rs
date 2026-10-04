@@ -162,20 +162,23 @@ pub fn auth_sign_token<E: From<String>>(
     let exp = now.checked_add(expiry_seconds).unwrap_or(i64::MAX);
     let iat = now;
     // The absolute lifetime cap: iat + max_lifetime. A caller that already
-    // carries a `cap` claim (re-issue scenario) keeps its original value —
-    // only a fresh token (no `cap` in the supplied claims) gets the cap stamped.
-    // This guarantees cap is immutable across re-issues: the re-issuer supplies
-    // the original cap back in the claims map and this block leaves it alone.
-    let max_lifetime_secs = crate::app_config::resolve_auth_max_lifetime();
-    let cap_from_claims = claims.get("cap").and_then(|s| s.parse::<i64>().ok());
-    let cap: i64 = match cap_from_claims {
-        Some(existing) => existing,
-        None => {
-            // Fresh token: stamp the cap at iat + max_lifetime.
-            let ml = i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX);
-            iat.checked_add(ml).unwrap_or(i64::MAX)
-        }
+    // carries a `cap` claim (re-issue scenario) keeps its original value, which
+    // is never past the fresh cap — only a fresh token (no `cap` in the supplied
+    // claims) gets the cap stamped. A re-issue therefore never extends the
+    // absolute lifetime.
+    let max_lifetime_secs = match crate::app_config::resolve_auth_max_lifetime() {
+        Ok(secs) => secs,
+        // A malformed lifetime mints no token: the cap would be an unknown bound.
+        Err(refusal) => return IpeResult::Err(format!("auth.signToken: {refusal}").into()),
     };
+    // A fresh token's cap is iat + max_lifetime. A carried cap was stamped at an
+    // earlier iat, so it never exceeds that; a larger carried value (a claims
+    // map built from untrusted input) is clamped, never honoured.
+    let fresh_cap = iat.saturating_add(i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX));
+    let cap: i64 = claims
+        .get("cap")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(fresh_cap, |carried| carried.min(fresh_cap));
     // Per-session id for session-scoped revocation. A re-issue that already
     // carries a `jti` keeps it verbatim (like `cap` and `iat`) — only a fresh
     // token (no `jti` in the supplied claims) gets a new random id minted here.
@@ -1030,6 +1033,29 @@ mod tests {
         assert_eq!(
             original_cap, reissued_cap,
             "cap must be identical on the re-issued token — it is immutable"
+        );
+    }
+
+    #[test]
+    fn a_carried_cap_past_the_max_lifetime_is_clamped() {
+        let before = now_unix();
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), "u-cap".to_string());
+        claims.insert("cap".to_string(), i64::MAX.to_string());
+        let token: String = match auth_sign_token::<String>(SECRET.to_string(), claims, 3600) {
+            IpeResult::Ok(t) => t,
+            IpeResult::Err(e) => panic!("mint: {e}"),
+        };
+        let after = now_unix();
+        let payload = crate::jwt::decode_payload(&token).expect("payload");
+        let cap = crate::jwt::numeric_date(&payload, "cap").expect("cap");
+        let lifetime = i64::try_from(
+            crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
+        )
+        .expect("the default lifetime fits i64");
+        assert!(
+            (before + lifetime..=after + lifetime).contains(&cap),
+            "a carried cap never extends past iat + max lifetime, got {cap}"
         );
     }
 

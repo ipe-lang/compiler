@@ -6,7 +6,7 @@
 //! `ipeStringifyEnumImpl`). The byte target is golden `main.rs` lines 31–43.
 
 use ipe_diagnostics::{DResult, Diagnostic};
-use ipe_intern::Symbol;
+use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
 use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, ir_type_is_derivable};
 
 use std::collections::BTreeSet;
@@ -922,7 +922,8 @@ fn emit_enum_variant_lines_and_arms(
         if variant.fields.is_empty() {
             variant_lines.push(format!("    {vn},"));
             show_arms.push(format!(
-                "            {name}::{vn} => \"{display}\".to_string(),"
+                "            {name}::{vn} => {}.to_string(),",
+                rust_str_lit(&display)
             ));
         } else {
             // Payload variant: render each field type (boxing a direct self-edge),
@@ -966,7 +967,12 @@ fn emit_enum_variant_lines_and_arms(
             // indent 12; `render_stringify_enum_arm` lays the `format!` tail out in
             // `rustfmt`'s inline / block-wrap / delimiter-break tiers.
             let arm_head = format!("            {name}::{vn}({}) => ", binders.join(", "));
-            let fmt_literal = format!("\"{display} {placeholders}\"");
+            // The display text renders through the format-string renderer (its
+            // braces doubled); the `{}` placeholders then go in before the
+            // closing quote the renderer always ends with.
+            let mut fmt_literal = rust_fmt_str_lit(&format!("{display} "));
+            let closing_quote = fmt_literal.len().saturating_sub(1);
+            fmt_literal.insert_str(closing_quote, &placeholders);
             show_arms.push(render_stringify_enum_arm(
                 &arm_head,
                 &fmt_literal,
