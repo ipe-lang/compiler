@@ -40,7 +40,7 @@ describe width =
         ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 viewport width -> device class:

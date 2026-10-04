@@ -60,7 +60,7 @@ revoke mask flags =
     Bitwise.and flags (Bitwise.complement mask)
 ```
 
-Running it (`ipe run`) shows a set built up and then narrowed:
+Running it (`ipe dev run`) shows a set built up and then narrowed:
 
 ```
 read|write   -> read write -

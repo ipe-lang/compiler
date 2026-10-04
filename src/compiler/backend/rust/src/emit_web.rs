@@ -608,7 +608,7 @@ fn emit_single_page_web_leaf(
         )
     };
     // The additive-`Msg`-variant hot-swap descriptor: an inert emitted const the
-    // `ipe watch` classifier scans to diff the `Msg` variant surface. Empty (no
+    // `ipe dev watch` classifier scans to diff the `Msg` variant surface. Empty (no
     // emit change) unless the `hot_appearance` dev gate is on, so a release emit is
     // byte-identical.
     let msg_set_item = msg_set_descriptor_item(ctx, update_e);
@@ -995,7 +995,7 @@ fn schema_tag_const(ctx: &EmitCtx, view_e: &Expr) -> DResult<String> {
 /// under the `hot_appearance` dev gate. Returns the empty string with the flag off
 /// (the default, and every production build), so a release emit is byte-identical
 /// whether or not this is called — the descriptor is a dev-loop artefact the
-/// `ipe watch` classifier scans out of the emitted text to diff the `Msg` variant
+/// `ipe dev watch` classifier scans out of the emitted text to diff the `Msg` variant
 /// surface, never anything the running program reads.
 ///
 /// The emitted form is a `const IPE_WEB_MSG_SET: &str = "<descriptor JSON>";`. The
@@ -3217,7 +3217,7 @@ mod hot_appearance_tests {
 
     /// With the flag OFF a static `Ipe.Html` subtree emits inline (the direct
     /// `html_node_` / `html_text_node_` tree), never a template read — release /
-    /// `ipe build` output is unperturbed.
+    /// `ipe dev build` output is unperturbed.
     #[test]
     fn flag_off_static_subtree_emits_inline() -> DResult<()> {
         let mut interner = Interner::new();

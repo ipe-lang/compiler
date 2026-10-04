@@ -159,7 +159,7 @@ pub fn emit_machine(stream: Stream, text: &str) {
 /// progress-bar redraw — with [`style::RELAY_INDENT`] before it reaches the
 /// terminal.
 ///
-/// This is the single routine both `ipe build`'s and `ipe watch`'s cargo relay
+/// This is the single routine both `ipe dev build`'s and `ipe dev watch`'s cargo relay
 /// loops call on every chunk `read_progress_chunk` hands them, so the relayed
 /// Cargo diagnostics and progress bar sit one column off the edge instead of
 /// flush against it — one shared indent for the one shared relay pattern,
@@ -723,7 +723,7 @@ mod tests {
             matches!(
                 err,
                 Some(CliError::CommandUsage {
-                    command: "verify",
+                    command: crate::verb::CommandName::Command("verify"),
                     ..
                 })
             ),
@@ -736,9 +736,9 @@ mod tests {
     #[test]
     fn a_manifest_value_cannot_inject_escapes_into_the_help_screen() {
         let err = crate::driver::with_help_on_misuse(
-            "build",
+            crate::verb::Verb::DEV_BUILD,
             Err(CliError::Usage(crate::text::msg::command_refusal(
-                &"build",
+                &crate::verb::Verb::DEV_BUILD,
                 &format!("unknown manifest value `{HOSTILE}`"),
             ))),
         )
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn machine_json_escapes_the_sanitised_message_exactly_once() {
         let err = CliError::Usage(crate::text::msg::command_refusal(
-            &"build",
+            &crate::verb::Verb::DEV_BUILD,
             &format!("bad value `a\"b\\c` {HOSTILE}"),
         ));
         let line = crate::machine_output::machine_error(
@@ -809,11 +809,11 @@ mod tests {
             });
         assert_eq!(
             message.as_deref(),
-            Some("ipe build: bad value `a\"b\\c` foo")
+            Some("ipe dev build: bad value `a\"b\\c` foo")
         );
     }
 
-    /// `indent_relay_chunk` is the single routine `ipe build` and `ipe watch`
+    /// `indent_relay_chunk` is the single routine `ipe dev build` and `ipe dev watch`
     /// both call on every relayed cargo stderr chunk. Pin its two terminator
     /// shapes (`\n`-ended lines and `\r`-ended progress-bar redraws) plus the
     /// blank-line exemption, so neither relay site can drift back to "no

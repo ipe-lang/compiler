@@ -24,8 +24,8 @@
 //! three `Ty::Var`-vs-`current_poly_tvars` sites, answers a tagged raw by
 //! exact lookup and an untagged raw (an annotation symbol) with no generic.
 //!
-//! Expected: ipe build succeeds; the emitted `main_with_error_reporting` is
-//! generic over `T1` throughout (no `JsonVal`); cargo build + run confirm
+//! Post-fix: ipe dev build succeeds; the emitted `main_with_error_reporting`
+//! is generic over `T1` throughout (no `JsonVal`); cargo build + run confirm
 //! BOTH the success path (untouched result) and Task.onError's fallback path
 //! (original error is replaced by the "ref <token>" wrapper) at runtime.
 //!
@@ -33,7 +33,7 @@
 //! # gate check always (no IPE_E2E needed):
 //! cargo test -p ipe --test golden_i164_poly_task_on_error_nested
 //!
-//! # full E2E (ipe build + cargo build + run):
+//! # full E2E (ipe dev build + cargo build + run):
 //! IPE_E2E=1 cargo test -p ipe --test golden_i164_poly_task_on_error_nested
 //! ```
 
@@ -59,7 +59,7 @@ fn poly_task_on_error_nested_green() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for poly_task_on_error_nested: {:?}",
+        "ipe dev build must succeed for poly_task_on_error_nested: {:?}",
         built.err()
     );
 
@@ -70,7 +70,7 @@ fn poly_task_on_error_nested_green() {
     // Collect all emitted Rust; compiled-source stdlib imports split user code
     // into src/ipe_mods/ipe_mod_main.rs alongside src/main.rs.
     let mut main_rs = std::fs::read_to_string(out.join("src").join("main.rs"))
-        .expect("emitted main.rs must exist after a successful ipe build");
+        .expect("emitted main.rs must exist after a successful ipe dev build");
     let mod_main = out.join("src").join("ipe_mods").join("ipe_mod_main.rs");
     if let Ok(extra) = std::fs::read_to_string(&mod_main) {
         main_rs.push_str(&extra);

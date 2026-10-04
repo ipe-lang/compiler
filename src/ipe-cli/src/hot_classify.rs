@@ -1,4 +1,4 @@
-//! The `ipe watch` appearance-hot-swap classifier.
+//! The `ipe dev watch` appearance-hot-swap classifier.
 //!
 //! On a source edit under `IPE_WATCH_HOT_APPEARANCE`, the watch loop already has
 //! the just-produced emit and the previous one. This module decides, from those

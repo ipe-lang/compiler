@@ -34,7 +34,7 @@ fn runtime() -> PathBuf {
     e2e_support::require_runtime().into_path_buf()
 }
 
-/// Emit-only: `ipe build` of the opacity fixture must succeed.
+/// Emit-only: `ipe dev build` of the opacity fixture must succeed.
 #[test]
 fn css_opacity_refinement_emits() {
     let dir = fixture_dir();
@@ -46,7 +46,7 @@ fn css_opacity_refinement_emits() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_opacity_refinement: {:?}",
+        "ipe dev build must succeed for css_opacity_refinement: {:?}",
         built.err()
     );
 }
@@ -68,7 +68,7 @@ fn css_opacity_refinement_e2e_output_matches_expected() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_opacity_refinement E2E: {:?}",
+        "ipe dev build must succeed for css_opacity_refinement E2E: {:?}",
         built.err()
     );
 

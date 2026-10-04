@@ -274,7 +274,7 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
 /// A dependency-light persistent store: a `mem_cache` of live handles (same
 /// process, owns the driver) PLUS a single on-disk JSON map (`sid → framed
 /// checkpoint blob`) so a checkpoint survives a process swap WITHOUT pulling in
-/// sqlx/redis. This is what makes `ipe watch`'s blue-green Model handoff work
+/// sqlx/redis. This is what makes `ipe dev watch`'s blue-green Model handoff work
 /// for a plain `Web.tea` — such an app reaches no DB kernel, so the emitted
 /// crate carries no `db` feature and the sqlite store compiles out; this store
 /// rides the `web` feature every web build already has (`base64` + `bincode` +
@@ -1253,7 +1253,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreBackend {
     Memory,
-    /// The sqlx-free on-disk checkpoint map (the `ipe watch` dev-handoff store).
+    /// The sqlx-free on-disk checkpoint map (the `ipe dev watch` dev-handoff store).
     File,
     Sqlite,
     Postgres,
@@ -1281,7 +1281,7 @@ impl StoreBackend {
     /// (or losing state) is the failure mode this closes. An unrecognised value
     /// falls back to `memory` (the historical default for a typo / unset).
     ///
-    /// Dev (`ipe watch`) is unaffected: it sets `IPE_WEB_STORE=file` explicitly,
+    /// Dev (`ipe dev watch`) is unaffected: it sets `IPE_WEB_STORE=file` explicitly,
     /// which every web build honours; it never asks for `sqlite`.
     fn parse(kind: &str) -> Result<StoreBackend, StoreConfigError> {
         match kind {
@@ -2681,7 +2681,7 @@ mod tests {
         }))
     }
 
-    /// File store (the `ipe watch` dev-handoff path): a checkpoint written by
+    /// File store (the `ipe dev watch` dev-handoff path): a checkpoint written by
     /// the OLD two-field Model is restored under the NEW three-field Model
     /// across a rebuild — old state (count/name) preserved, the new `scroll`
     /// filled from `init`. This is state PRESERVED across an additive Model

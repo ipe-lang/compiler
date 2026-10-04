@@ -16,7 +16,7 @@ Every `World.*` call in `src/Main.ipe` is a generated binding.
 ipe install --yes --allow-build-scripts
 
 # 2. Build + run.
-ipe run .
+ipe dev run .
 ```
 
 Observed output:

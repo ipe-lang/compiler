@@ -66,7 +66,7 @@ toPath raw =
     Task.fromResult (Path.fromString raw)
 ```
 
-Running it (`ipe run`) prints the session (the temp path varies per run):
+Running it (`ipe dev run`) prints the session (the temp path varies per run):
 
 ```
 scratch dir: /tmp/scratchpad<unique>

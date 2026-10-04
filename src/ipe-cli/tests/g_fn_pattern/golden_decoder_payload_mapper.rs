@@ -62,7 +62,7 @@ fn i198_ipec_accepts_and_renders_send_only_fnonce_param() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for decoder_payload_mapper: {:?}",
+        "ipe dev build must succeed for decoder_payload_mapper: {:?}",
         built.err()
     );
 
@@ -108,7 +108,7 @@ fn i198_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for decoder_payload_mapper: {:?}",
+        "ipe dev build must succeed for decoder_payload_mapper: {:?}",
         built.err()
     );
 

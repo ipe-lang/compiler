@@ -697,7 +697,7 @@ fn build_index() -> Result<Index, CliError> {
     }
 
     // Commands: sourced from the COMMANDS registry so the index never drifts.
-    let commands: Vec<CommandInfo> = crate::help::command_names()
+    let commands: Vec<CommandInfo> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             crate::help::command_doc_markdown(name).map(|help| CommandInfo { name, help })
@@ -771,7 +771,7 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
     // list reads `<command>  <summary>` in an aligned table); the body is the
     // command's full help rendered as Markdown from the same registry, so the
     // HTML command page mirrors `ipe <command> --help`.
-    let cli_sources: Vec<BundleSource> = crate::help::command_names()
+    let cli_sources: Vec<BundleSource> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             let summary = crate::help::command_summary(name)?;
@@ -3195,7 +3195,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
     out
 }
 
-/// The `CARGO_TARGET_DIR` an `ipe run` child spawned by the doc-example gate
+/// The `CARGO_TARGET_DIR` an `ipe dev run` child spawned by the doc-example gate
 /// should inherit so its build links against the warm shared dependency target.
 ///
 /// Resolution mirrors the E2E harness's fail-safe: an absolute
@@ -3204,7 +3204,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
 /// so a bare local run stays hermetic). A non-absolute shared value fails safe
 /// to the ambient value rather than pinning a relative target.
 ///
-/// This translation lives in the doc-gate test path only — production `ipe run`
+/// This translation lives in the doc-gate test path only — production `ipe dev run`
 /// never reads `IPE_ORACLE_SHARED_TARGET`; it honours an inherited
 /// `CARGO_TARGET_DIR`, which is exactly what this sets on the child.
 fn child_shared_target_dir() -> Option<std::ffi::OsString> {
@@ -3228,7 +3228,7 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
 /// Run the compiled example at `snippet_path` and assert its output matches the
 /// `-->` annotated results (one per line, in order).
 ///
-/// Spawns the current binary as `ipe run <snippet_path>` and compares stdout
+/// Spawns the current binary as `ipe dev run <snippet_path>` and compares stdout
 /// against the expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
@@ -3238,15 +3238,16 @@ fn run_example_and_check(
 ) -> Result<(), String> {
     use std::process::Command;
 
-    // Locate this binary (we re-invoke ourselves as `ipe run`).
+    // Locate this binary (we re-invoke ourselves as `ipe dev run`).
     let ipe_bin = std::env::current_exe()
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
     let mut cmd = Command::new(&ipe_bin);
-    cmd.arg("run").arg(snippet_path);
-    // Forward the warm shared target into the `ipe run` child's CARGO_TARGET_DIR.
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
+        .arg(snippet_path);
+    // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
-    // `ipe run` never reads; without this translation the child cold-builds the
+    // `ipe dev run` never reads; without this translation the child cold-builds the
     // whole runtime tree per example. Absent it (a bare local run) the child
     // inherits the ambient env unchanged.
     if let Some(target) = child_shared_target_dir() {
@@ -3262,11 +3263,13 @@ fn run_example_and_check(
     }
     let out = cmd
         .output()
-        .map_err(|e| format!("{label}: ipe run failed to spawn: {e}"))?;
+        .map_err(|e| format!("{label}: ipe dev run failed to spawn: {e}"))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{label}: ipe run exited non-zero\n       {stderr}"));
+        return Err(format!(
+            "{label}: ipe dev run exited non-zero\n       {stderr}"
+        ));
     }
 
     let actual = String::from_utf8_lossy(&out.stdout);
@@ -6264,8 +6267,9 @@ mod tests {
     /// terminal help omits.
     #[test]
     fn html_command_page_mirrors_command_help_ssot() {
-        let command = "build";
-        let markdown = crate::help::command_doc_markdown(command).expect("build has help");
+        let verb = crate::verb::Verb::DEV_BUILD;
+        let command = verb.help_key();
+        let markdown = crate::help::command_doc_markdown(command).expect("dev build has help");
         let entry = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
@@ -6276,10 +6280,12 @@ mod tests {
         let html = render_entry_page(crate::doc_bundle::DocKind::Cli, &entry, "");
 
         // Every option flag and its description from the SSOT appears on the page.
+        let mut seen = false;
         for spec in crate::help::all_command_specs() {
-            if spec.name != command {
+            if spec.name != verb.name() {
                 continue;
             }
+            seen = true;
             for opt in &spec.options {
                 assert!(
                     html.contains(&html::escape(opt.flag)),
@@ -6288,8 +6294,9 @@ mod tests {
                 );
             }
         }
+        assert!(seen, "no command spec is named {verb}");
         // The synopsis and the Arguments/Options headings are present.
-        assert!(html.contains("ipe build"), "synopsis present: {html}");
+        assert!(html.contains("ipe dev build"), "synopsis present: {html}");
         assert!(html.contains("Arguments"), "arguments section present");
         assert!(html.contains("Options"), "options section present");
         // No raw Markdown leaks through the renderer.
@@ -7384,7 +7391,7 @@ withBaseMs = something
         let bundle = build_doc_bundle(&docs_root).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
-        for name in crate::help::command_names() {
+        for name in crate::help::documented_command_keys() {
             let Some(md) = crate::help::command_doc_markdown(name) else {
                 continue;
             };

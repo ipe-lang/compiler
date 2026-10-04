@@ -15,6 +15,7 @@
 
 use crate::build_plan::{AllocatorChoice, StaticRequestLayer};
 use crate::delivery::{DeliveryError, DeliveryTokens, Shape, TargetTriple};
+use crate::verb::Verb;
 use crate::{CliError, text};
 pub use ipe_backend_rust::static_build::StaticTriple;
 
@@ -40,7 +41,7 @@ pub struct DeliveryPositionals {
 ///
 /// A leading token that is a shape word (`web`/`tui`/`cli`/`worker`/`script`) is
 /// the cross-check shape; any other leading token belongs to the tail (a
-/// runtime/host/target), so a bare `ipe build solo` and a bare `ipe build web`
+/// runtime/host/target), so a bare `ipe dev build solo` and a bare `ipe dev build web`
 /// both parse. `server` is NOT a shape word — a server is a `script` — so a
 /// leading `server` reads as an entry path, never a shape. The tail is parsed
 /// by [`DeliveryTokens::parse`].
@@ -329,12 +330,13 @@ fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str, command: &str) -> Res
     Ok(())
 }
 
-/// Select `ipe run`'s session mode, refusing a second `--record` / `--replay`.
+/// Select `ipe dev run`'s session mode, refusing a second `--record` / `--replay`.
 fn set_session(slot: &mut SessionMode, mode: SessionMode) -> Result<(), CliError> {
+    const LABEL: &str = Verb::DEV_RUN.name();
     if let Some(first) = slot.flag() {
         let second = mode.flag().unwrap_or(first);
         return Err(CliError::Usage(if first == second {
-            text::msg::flag_repeated(&"run", &first)
+            text::msg::flag_repeated(&LABEL, &first)
         } else {
             text::msg::session_flags_exclusive(&first, &second)
         }));
@@ -359,7 +361,7 @@ fn take_value(
 }
 
 /// Take the leading positional entry, if any: the first token, but ONLY when it
-/// is not a flag. A leading `--flag` (e.g. `ipe build --emit-ir`) leaves the
+/// is not a flag. A leading `--flag` (e.g. `ipe dev build --emit-ir`) leaves the
 /// entry unset — so the flag is parsed as a flag rather than silently swallowed
 /// as a bogus entry path — and the caller falls back to its project-aware
 /// default. Advances `it` past the entry only when one is taken.
@@ -375,7 +377,7 @@ fn take_leading_entry(
 /// `true` when `token` is a delivery word — a shape (`web`/`tui`/…), the `solo`
 /// runtime, the never-written `served`, or a host (`desktop`/`ios`/`android`).
 /// Used to tell a leading entry-path positional from a leading delivery word so
-/// `ipe build web` (a delivery) and `ipe build src/Main.ipe` (an entry) both
+/// `ipe dev build web` (a delivery) and `ipe dev build src/Main.ipe` (an entry) both
 /// parse. A target triple is deliberately excluded: a leading bare triple with
 /// no preceding shape word is meaningless, so it stays an entry-path candidate
 /// and the delivery parse rejects it in tail position if it slips through.
@@ -399,8 +401,8 @@ fn shadowing_note(word: &str, exists: impl FnOnce(&str) -> bool) -> Option<Strin
 }
 
 /// Take the leading positional entry only when it is a genuine entry path — not
-/// a delivery word. `ipe build web desktop` leaves the entry unset (the project
-/// default) and hands `web desktop` to the delivery parse; `ipe build
+/// a delivery word. `ipe dev build web desktop` leaves the entry unset (the project
+/// default) and hands `web desktop` to the delivery parse; `ipe dev build
 /// src/Main.ipe web` consumes the path, then hands `web` to delivery.
 ///
 /// When a skipped leading delivery word also names a path on disk it prints a
@@ -575,7 +577,7 @@ impl WasmKind {
     }
 }
 
-/// The compilation surface `ipe build` produces — dump the lowered IR, or emit
+/// The compilation surface `ipe dev build` produces — dump the lowered IR, or emit
 /// a native/wasm project.
 ///
 /// Making this an enum is what forbids `--emit-ir --out X` / `--emit-ir
@@ -603,7 +605,7 @@ pub enum BuildMode {
     },
 }
 
-/// Fully-parsed `ipe build` arguments.
+/// Fully-parsed `ipe dev build` arguments.
 // Four independent one-of-two CLI switches (`fix`, `accept_risks`, `debugger`,
 // `quiet`) each maps naturally to a bool; a two-variant enum or state machine
 // would obscure their independence rather than clarify it.
@@ -631,11 +633,6 @@ pub struct BuildArgs {
     pub debugger: bool,
     /// The emit surface (IR dump vs project emit).
     pub mode: BuildMode,
-    /// `--emit-permissions <ios|macos|android>` — read-only inspection: print the
-    /// OS-permission declarations the app's accepted web capabilities derive on
-    /// the given platform, and build nothing. The raw platform word, validated at
-    /// execution against the closed `ios|macos|android` set.
-    pub emit_permissions: Option<String>,
     /// `--json` — emit each diagnostic as a stable JSON object instead of the
     /// human-readable, decorated layout.
     pub format: OutputFormat,
@@ -643,7 +640,7 @@ pub struct BuildArgs {
     pub quiet: bool,
 }
 
-/// Parse `ipe build`'s argument tail.
+/// Parse `ipe dev build`'s argument tail.
 ///
 /// Rejects, at this single boundary: `--emit-ir` combined with any
 /// emit-affecting flag (`--out` / `--static` / `--target` / `--allocator` /
@@ -655,9 +652,10 @@ pub struct BuildArgs {
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
 #[allow(clippy::too_many_lines)] // one linear flag loop + the emit-compose rejection gate
 pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
+    const LABEL: &str = Verb::DEV_BUILD.name();
     let mut it = rest.iter().peekable();
     let entry = take_leading_entry_path(&mut it);
-    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), "build")?;
+    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), LABEL)?;
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
@@ -666,34 +664,27 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
     let mut accept_risks = false;
     let mut debugger = false;
     let mut quiet = false;
-    let mut emit_permissions: Option<String> = None;
     let mut static_flags = StaticFlags::default();
     let mut format: Option<OutputFormat> = None;
     while let Some(flag) = it.next() {
-        if static_flags.consume(flag, &mut it, "build")? {
+        if static_flags.consume(flag, &mut it, LABEL)? {
             continue;
         }
-        if consume_format_flag(&mut format, flag, "build")? {
+        if consume_format_flag(&mut format, flag, LABEL)? {
             continue;
         }
         match flag.as_str() {
             "--out" => set_once(
                 &mut out,
-                take_value(&mut it, "--out", "build")?,
+                take_value(&mut it, "--out", LABEL)?,
                 "--out",
-                "build",
+                LABEL,
             )?,
             "--runtime" => set_once(
                 &mut runtime,
-                take_value(&mut it, "--runtime", "build")?,
+                take_value(&mut it, "--runtime", LABEL)?,
                 "--runtime",
-                "build",
-            )?,
-            "--emit-permissions" => set_once(
-                &mut emit_permissions,
-                take_value(&mut it, "--emit-permissions", "build")?,
-                "--emit-permissions",
-                "build",
+                LABEL,
             )?,
             "--emit-ir" => emit_ir = true,
             "--fix" => fix = true,
@@ -701,7 +692,7 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
             "--debugger" => debugger = true,
             "-q" | "--quiet" => quiet = true,
             other => {
-                return Err(usage_unknown_flag("build", other));
+                return Err(usage_unknown_flag(LABEL, other));
             }
         }
     }
@@ -762,13 +753,12 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
         accept_risks,
         debugger,
         mode,
-        emit_permissions,
         format: format.unwrap_or_default(),
         quiet,
     })
 }
 
-/// What `ipe run` does with a cli/worker app's TEA session.
+/// What `ipe dev run` does with a cli/worker app's TEA session.
 ///
 /// One value, so a run that both records and replays is unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -804,7 +794,7 @@ impl SessionMode {
     }
 }
 
-/// Fully-parsed `ipe run` arguments.
+/// Fully-parsed `ipe dev run` arguments.
 pub struct RunArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -818,13 +808,13 @@ pub struct RunArgs {
     /// The native static-request layer.
     pub static_layer: StaticRequestLayer,
     /// The WASM compilation target selected on the CLI. `Client` (`--target
-    /// wasm`, the browser bundle) has no executable form under `ipe run` and is
-    /// refused at parse; `Wasi` (`--target wasi`) routes `ipe run` to the
+    /// wasm`, the browser bundle) has no executable form under `ipe dev run` and is
+    /// refused at parse; `Wasi` (`--target wasi`) routes `ipe dev run` to the
     /// embedded-wasmtime execution path; `None` is the ordinary native run.
     pub wasm: WasmKind,
     /// `--accept-risks` — take responsibility for every disclosed `.Unsafe`
     /// escape-hatch import and proceed without the acknowledgment prompt. Same
-    /// one-off consent as `ipe build --accept-risks`.
+    /// one-off consent as `ipe dev build --accept-risks`.
     pub accept_risks: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the emitted runtime loop. Absent from `ipe release` so the debugger can
@@ -848,10 +838,10 @@ pub struct RunArgs {
     pub quiet: bool,
 }
 
-/// Parse `ipe run`'s argument tail.
+/// Parse `ipe dev run`'s argument tail.
 ///
 /// Splits on the first `--`: everything before is `ipe`-owned, everything after
-/// is forwarded to the emitted binary untouched. `ipe run` builds and executes a
+/// is forwarded to the emitted binary untouched. `ipe dev run` builds and executes a
 /// process: a native binary, or — under `--target wasi` — the emitted
 /// `wasm32-wasip1` module in an embedded wasmtime engine. `--target wasm` (the
 /// browser bundle, which has no executable form) is rejected here rather than
@@ -861,6 +851,7 @@ pub struct RunArgs {
 /// # Errors
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
 pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
+    const LABEL: &str = Verb::DEV_RUN.name();
     let dash_dash = rest.iter().position(|a| a == "--");
     // `pos` is a valid index; `pos + 1 <= rest.len()` (a trailing `--` gives an
     // empty tail), so both splits are in bounds without an indexing panic.
@@ -874,7 +865,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
 
     let mut it = ipe_args.iter().peekable();
     let entry = take_leading_entry_path(&mut it);
-    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), "run")?;
+    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), LABEL)?;
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
@@ -885,24 +876,24 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     let mut static_flags = StaticFlags::default();
     let mut format: Option<OutputFormat> = None;
     while let Some(flag) = it.next() {
-        if static_flags.consume(flag, &mut it, "run")? {
+        if static_flags.consume(flag, &mut it, LABEL)? {
             continue;
         }
-        if consume_format_flag(&mut format, flag, "run")? {
+        if consume_format_flag(&mut format, flag, LABEL)? {
             continue;
         }
         match flag.as_str() {
             "--out" => set_once(
                 &mut out,
-                take_value(&mut it, "--out", "run")?,
+                take_value(&mut it, "--out", LABEL)?,
                 "--out",
-                "run",
+                LABEL,
             )?,
             "--runtime" => set_once(
                 &mut runtime,
-                take_value(&mut it, "--runtime", "run")?,
+                take_value(&mut it, "--runtime", LABEL)?,
                 "--runtime",
-                "run",
+                LABEL,
             )?,
             "--accept-risks" => accept_risks = true,
             "--debugger" => debugger = true,
@@ -915,7 +906,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
             }
             "-q" | "--quiet" => quiet = true,
             other => {
-                return Err(usage_unknown_flag("run", other));
+                return Err(usage_unknown_flag(LABEL, other));
             }
         }
     }
@@ -924,7 +915,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     // static-link triple; classify it before `static_flags.layer()` consumes
     // the flags. `--target wasi` runs the emitted module under embedded
     // wasmtime, so it composes with none of the native static-link flags — the
-    // same non-composition `ipe build` enforces (they lower to a native triple
+    // same non-composition `ipe dev build` enforces (they lower to a native triple
     // that a wasm target has no use for).
     let wasm = wasm_kind_of(static_flags.target);
     match wasm {
@@ -966,7 +957,7 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
     })
 }
 
-/// Fully-parsed `ipe eject` arguments.
+/// Fully-parsed `ipe release eject` arguments.
 pub struct EjectArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -977,10 +968,10 @@ pub struct EjectArgs {
     pub runtime: Option<String>,
 }
 
-/// Parse `ipe eject`'s argument tail.
+/// Parse `ipe release eject`'s argument tail.
 ///
 /// `--out <dir>` is required: eject writes a whole standalone project, so there
-/// is no sensible in-place default the way a throwaway `ipe build` artifact has —
+/// is no sensible in-place default the way a throwaway `ipe dev build` artifact has —
 /// the destination must be named. Each value flag is rejected on a second
 /// occurrence.
 ///
@@ -988,6 +979,7 @@ pub struct EjectArgs {
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem,
 /// including a missing `--out`.
 pub fn parse_eject(rest: &[String]) -> Result<EjectArgs, CliError> {
+    const LABEL: &str = Verb::RELEASE_EJECT.name();
     let mut it = rest.iter().peekable();
     let entry = take_leading_entry(&mut it);
 
@@ -997,18 +989,18 @@ pub fn parse_eject(rest: &[String]) -> Result<EjectArgs, CliError> {
         match flag.as_str() {
             "--out" => set_once(
                 &mut out,
-                take_value(&mut it, "--out", "eject")?,
+                take_value(&mut it, "--out", LABEL)?,
                 "--out",
-                "eject",
+                LABEL,
             )?,
             "--runtime" => set_once(
                 &mut runtime,
-                take_value(&mut it, "--runtime", "eject")?,
+                take_value(&mut it, "--runtime", LABEL)?,
                 "--runtime",
-                "eject",
+                LABEL,
             )?,
             other => {
-                return Err(usage_unknown_flag("eject", other));
+                return Err(usage_unknown_flag(LABEL, other));
             }
         }
     }
@@ -1090,30 +1082,30 @@ pub struct ReleaseArgs {
     /// How to package a native-bearing artifact (embed mode by default; unused
     /// for pure-native and wasm targets).
     pub mode: ReleaseMode,
-    /// `--capabilities` / `--show-profile` — inspect the inferred capability
-    /// model without building or writing anything.
-    pub capabilities_only: bool,
     /// `--emit-permissions <ios|macos|android>` — read-only inspection: print the
     /// OS-permission declarations the app's accepted web capabilities derive on
     /// the given platform, and build nothing. The raw platform word, validated at
     /// execution against the closed `ios|macos|android` set.
     pub emit_permissions: Option<String>,
-    /// Output format for the `--capabilities` inspection.
+    /// `--plain` / `--json` — the layout of a refusal the build reports.
     pub format: OutputFormat,
 }
 
-/// Parse `ipe release`'s argument tail.
+/// Parse `ipe release build`'s argument tail.
 ///
 /// `--out` is optional. `--target` accepts either a musl-static triple or the
-/// literal `wasm`. Each value flag is rejected on a second occurrence.
+/// literal `wasm`. `--static` is accepted on a native target, which a release
+/// always links statically, and refused with `--target wasm`. Each value flag
+/// is rejected on a second occurrence.
 ///
 /// # Errors
 ///
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
-pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
+pub fn parse_release_build(rest: &[String]) -> Result<ReleaseArgs, CliError> {
+    const LABEL: &str = Verb::RELEASE_BUILD.name();
     let mut it = rest.iter().peekable();
     let entry = take_leading_entry_path(&mut it);
-    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), "release")?;
+    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), LABEL)?;
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
@@ -1122,40 +1114,40 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
     let mut emit_permissions: Option<String> = None;
     let mut saw_embed = false;
     let mut saw_bundle = false;
-    let mut capabilities_only = false;
+    let mut saw_static = false;
 
     while let Some(flag) = it.next() {
-        if consume_format_flag(&mut format, flag, "release")? {
+        if consume_format_flag(&mut format, flag, LABEL)? {
             continue;
         }
         match flag.as_str() {
             "--out" => set_once(
                 &mut out,
-                take_value(&mut it, "--out", "release")?,
+                take_value(&mut it, "--out", LABEL)?,
                 "--out",
-                "release",
+                LABEL,
             )?,
             "--runtime" => set_once(
                 &mut runtime,
-                take_value(&mut it, "--runtime", "release")?,
+                take_value(&mut it, "--runtime", LABEL)?,
                 "--runtime",
-                "release",
+                LABEL,
             )?,
             "--target" => {
-                let parsed = parse_target(&take_value(&mut it, "--target", "release")?)?;
-                set_once(&mut target, parsed, "--target", "release")?;
+                let parsed = parse_target(&take_value(&mut it, "--target", LABEL)?)?;
+                set_once(&mut target, parsed, "--target", LABEL)?;
             }
             "--emit-permissions" => set_once(
                 &mut emit_permissions,
-                take_value(&mut it, "--emit-permissions", "release")?,
+                take_value(&mut it, "--emit-permissions", LABEL)?,
                 "--emit-permissions",
-                "release",
+                LABEL,
             )?,
             "--embed" => saw_embed = true,
             "--bundle" => saw_bundle = true,
-            "--capabilities" | "--show-profile" => capabilities_only = true,
+            "--static" => saw_static = true,
             other => {
-                return Err(usage_unknown_flag("release", other));
+                return Err(usage_unknown_flag(LABEL, other));
             }
         }
     }
@@ -1170,6 +1162,12 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
         ReleaseMode::Embed
     };
 
+    if saw_static && target == Some(TargetTriple::BrowserWasm) {
+        return Err(CliError::Usage(text::msg::static_flags_with_wasm(
+            &WasmKind::Client.word(),
+        )));
+    }
+
     let target = ReleaseTarget::from_target(target)?;
 
     Ok(ReleaseArgs {
@@ -1179,13 +1177,166 @@ pub fn parse_release(rest: &[String]) -> Result<ReleaseArgs, CliError> {
         runtime,
         target,
         mode,
-        capabilities_only,
         emit_permissions,
         format: format.unwrap_or_default(),
     })
 }
 
-/// Fully-parsed `ipe watch` arguments.
+/// A release target that produces an artifact with no form `ipe release run`
+/// can execute: a browser bundle or a distributable host bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRunTarget {
+    /// `--target wasm` (or a manifest/`IPE_TARGET` resolution to it): a
+    /// browser bundle.
+    Wasm,
+    /// `web solo`: the self-contained browser client.
+    Solo,
+    /// `web desktop`: a per-OS desktop bundle.
+    Desktop,
+    /// `web solo ios`: an iOS project.
+    Ios,
+    /// `web solo android`: an Android project.
+    Android,
+}
+
+impl NoRunTarget {
+    /// The target with no run form a delivery host selects, or `None` for the
+    /// served/default host.
+    #[must_use]
+    pub const fn from_host(host: crate::delivery::Host) -> Option<Self> {
+        match host {
+            crate::delivery::Host::Default => None,
+            crate::delivery::Host::Desktop => Some(Self::Desktop),
+            crate::delivery::Host::Ios => Some(Self::Ios),
+            crate::delivery::Host::Android => Some(Self::Android),
+        }
+    }
+
+    /// The word naming the target in the refusal.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Wasm => "wasm",
+            Self::Solo => "web solo",
+            Self::Desktop => "desktop",
+            Self::Ios => "ios",
+            Self::Android => "android",
+        }
+    }
+
+    /// The `ipe release build` arguments that produce this target's artifact.
+    #[must_use]
+    pub const fn build_form(self) -> &'static str {
+        match self {
+            Self::Wasm => "--target wasm",
+            Self::Solo => "web solo",
+            Self::Desktop => "web desktop",
+            Self::Ios => "web solo ios",
+            Self::Android => "web solo android",
+        }
+    }
+}
+
+/// Fully-parsed `ipe release run` arguments.
+#[derive(Debug)]
+pub struct ReleaseRunArgs {
+    /// The release build the run executes: embed mode, no inspection flag.
+    pub build: ReleaseArgs,
+    /// Whether any build-selecting argument (`--out`, `--runtime`, `--target`,
+    /// a delivery word) was written; a prebuilt artifact directory takes none.
+    pub build_flags: bool,
+    /// Arguments after `--`, forwarded verbatim to the program.
+    pub app_args: Vec<String>,
+}
+
+/// Parse `ipe release run`'s argument tail.
+///
+/// Accepts `[<path>] [--out <dir>] [--runtime <dir>] [--target <triple>]
+/// [-- <args>...]`. A target with no run form — `--target wasm`, `web solo`, a
+/// desktop or mobile host — is refused here with [`CliError::NoRunForm`],
+/// before any build.
+///
+/// # Errors
+///
+/// [`CliError::NoRunForm`] for a target with no run form; [`CliError::Usage`]
+/// naming any other misuse.
+pub fn parse_release_run(rest: &[String]) -> Result<ReleaseRunArgs, CliError> {
+    const LABEL: &str = Verb::RELEASE_RUN.name();
+    let (ipe_args, app_args): (&[String], Vec<String>) =
+        rest.iter().position(|a| a == "--").map_or_else(
+            || (rest, Vec::new()),
+            |pos| {
+                let (before, after_incl) = rest.split_at(pos);
+                (before, after_incl.get(1..).unwrap_or(&[]).to_vec())
+            },
+        );
+
+    let mut it = ipe_args.iter().peekable();
+    let entry = take_leading_entry_path(&mut it);
+    let words = take_delivery_words(&mut it);
+    let delivery = take_delivery_positionals(&words, LABEL)?;
+
+    let mut out: Option<String> = None;
+    let mut runtime: Option<String> = None;
+    let mut target: Option<TargetTriple> = None;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--out" => set_once(
+                &mut out,
+                take_value(&mut it, "--out", LABEL)?,
+                "--out",
+                LABEL,
+            )?,
+            "--runtime" => set_once(
+                &mut runtime,
+                take_value(&mut it, "--runtime", LABEL)?,
+                "--runtime",
+                LABEL,
+            )?,
+            "--target" => {
+                let parsed = parse_target(&take_value(&mut it, "--target", LABEL)?)?;
+                set_once(&mut target, parsed, "--target", LABEL)?;
+            }
+            other => {
+                return Err(usage_unknown_flag(LABEL, other));
+            }
+        }
+    }
+
+    if target == Some(TargetTriple::BrowserWasm) {
+        return Err(CliError::NoRunForm {
+            target: NoRunTarget::Wasm,
+        });
+    }
+    if let Some(no_run) = NoRunTarget::from_host(delivery.tokens.host) {
+        return Err(CliError::NoRunForm { target: no_run });
+    }
+    if delivery.tokens.runtime == Some(crate::delivery::Runtime::Solo) {
+        return Err(CliError::NoRunForm {
+            target: NoRunTarget::Solo,
+        });
+    }
+
+    let build_flags = !words.is_empty() || out.is_some() || runtime.is_some() || target.is_some();
+    let target = ReleaseTarget::from_target(target)?;
+
+    Ok(ReleaseRunArgs {
+        build: ReleaseArgs {
+            entry,
+            delivery,
+            out,
+            runtime,
+            target,
+            mode: ReleaseMode::Embed,
+            emit_permissions: None,
+            format: OutputFormat::Human,
+        },
+        build_flags,
+        app_args,
+    })
+}
+
+/// Fully-parsed `ipe dev watch` arguments.
 pub struct WatchArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -1206,20 +1357,21 @@ pub struct WatchArgs {
     pub reset_state: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the rebuilt runtime loop, exposing the in-app debugger overlay. Off by
-    /// default (the recorder adds runtime weight); the same opt-in `ipe run` and
-    /// `ipe build` offer.
+    /// default (the recorder adds runtime weight); the same opt-in `ipe dev run` and
+    /// `ipe dev build` offer.
     pub debugger: bool,
 }
 
-/// Parse `ipe watch`'s argument tail. `--port` is parsed into a `u16` at this
+/// Parse `ipe dev watch`'s argument tail. `--port` is parsed into a `u16` at this
 /// boundary, and each value flag is rejected on a second occurrence.
 ///
 /// # Errors
 /// [`CliError::Usage`] / [`CliError::Usage`] naming the exact problem.
 pub fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
+    const LABEL: &str = Verb::DEV_WATCH.name();
     let mut it = rest.iter().peekable();
     let entry = take_leading_entry_path(&mut it);
-    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), "watch")?;
+    let delivery = take_delivery_positionals(&take_delivery_words(&mut it), LABEL)?;
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
@@ -1231,25 +1383,25 @@ pub fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
         match flag.as_str() {
             "--out" => set_once(
                 &mut out,
-                take_value(&mut it, "--out", "watch")?,
+                take_value(&mut it, "--out", LABEL)?,
                 "--out",
-                "watch",
+                LABEL,
             )?,
             "--runtime" => set_once(
                 &mut runtime,
-                take_value(&mut it, "--runtime", "watch")?,
+                take_value(&mut it, "--runtime", LABEL)?,
                 "--runtime",
-                "watch",
+                LABEL,
             )?,
             "--port" => {
-                let raw = take_value(&mut it, "--port", "watch")?;
-                set_once(&mut port, parse_port(&raw, "watch")?, "--port", "watch")?;
+                let raw = take_value(&mut it, "--port", LABEL)?;
+                set_once(&mut port, parse_port(&raw, LABEL)?, "--port", LABEL)?;
             }
             "-q" | "--quiet" => quiet = true,
             "--reset-state" => reset_state = true,
             "--debugger" => debugger = true,
             other => {
-                return Err(usage_unknown_flag("watch", other));
+                return Err(usage_unknown_flag(LABEL, other));
             }
         }
     }
@@ -1509,7 +1661,7 @@ mod tests {
 
     #[test]
     fn build_leading_shape_word_is_delivery_not_entry() {
-        // `ipe build web` is a delivery shape cross-check, not an entry file.
+        // `ipe dev build web` is a delivery shape cross-check, not an entry file.
         let a = parse_build(&s(&["web"])).expect("web");
         assert!(a.entry.is_none());
         assert_eq!(a.delivery.stated_shape, Some(Shape::Web));
@@ -1765,7 +1917,7 @@ mod tests {
                 "build {value}"
             );
             let run = parse_run(&s(&["--target", value]));
-            let release = parse_release(&s(&["--target", value]));
+            let release = parse_release_build(&s(&["--target", value]));
             match value {
                 "wasm" => assert!(
                     matches!(&run, Err(e) if e.to_string().contains("no native artifact")),
@@ -1787,7 +1939,7 @@ mod tests {
             for got in [
                 parse_build(&s(&["--target", value])).map(|_| ()),
                 parse_run(&s(&["--target", value])).map(|_| ()),
-                parse_release(&s(&["--target", value])).map(|_| ()),
+                parse_release_build(&s(&["--target", value])).map(|_| ()),
             ] {
                 assert_eq!(got.map_err(|e| e.to_string()), expected, "{value}");
             }
@@ -1804,7 +1956,7 @@ mod tests {
 
     #[test]
     fn run_wasi_target_is_accepted_and_captured() {
-        // `ipe run --target wasi` now EXECUTES the emitted `wasm32-wasip1` module
+        // `ipe dev run --target wasi` now EXECUTES the emitted `wasm32-wasip1` module
         // under embedded wasmtime, so the flag is accepted at parse and captured
         // as the WASI compilation target (routed to the wasmtime path downstream).
         let a = parse_run(&s(&["--target", "wasi"])).expect("wasi accepted");
@@ -1814,7 +1966,7 @@ mod tests {
     #[test]
     fn run_wasi_does_not_compose_with_static_flags() {
         // `--target wasi` is a wasm axis; the native static-link flags do not
-        // apply to it — the same non-composition `ipe build --target wasi` enforces.
+        // apply to it — the same non-composition `ipe dev build --target wasi` enforces.
         assert!(parse_run(&s(&["--target", "wasi", "--static"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--allocator", "dlmalloc"])).is_err());
         assert!(parse_run(&s(&["--target", "wasi", "--cfree"])).is_err());
@@ -2076,8 +2228,8 @@ mod tests {
     fn misuse_helpers_have_one_phrasing() {
         // Always backticked, always the `ipe <command>:` prefix.
         assert_eq!(
-            usage_unknown_flag("build", "--nope").to_string(),
-            "ipe build: unknown flag `--nope`"
+            usage_unknown_flag(Verb::DEV_BUILD.name(), "--nope").to_string(),
+            "ipe dev build: unknown flag `--nope`"
         );
         assert_eq!(
             usage_unknown_subcommand("rust", "bogus", "add, remove, or install").to_string(),
@@ -2179,66 +2331,99 @@ mod tests {
 
     #[test]
     fn release_defaults_to_embed_mode() {
-        let a = parse_release(&[]).expect("empty release");
+        let a = parse_release_build(&[]).expect("empty release");
         assert_eq!(a.mode, ReleaseMode::Embed);
-        assert!(!a.capabilities_only);
         assert_eq!(a.format, OutputFormat::Human);
     }
 
     #[test]
     fn release_embed_flag_is_default_mode() {
-        let a = parse_release(&s(&["--embed"])).expect("--embed");
+        let a = parse_release_build(&s(&["--embed"])).expect("--embed");
         assert_eq!(a.mode, ReleaseMode::Embed);
     }
 
     #[test]
     fn release_bundle_flag_selects_bundle_mode() {
-        let a = parse_release(&s(&["--bundle"])).expect("--bundle");
+        let a = parse_release_build(&s(&["--bundle"])).expect("--bundle");
         assert_eq!(a.mode, ReleaseMode::Bundle);
     }
 
     #[test]
     fn release_embed_and_bundle_together_rejected() {
         assert!(matches!(
-            parse_release(&s(&["--embed", "--bundle"])),
+            parse_release_build(&s(&["--embed", "--bundle"])),
             Err(CliError::Usage(_))
         ));
-        assert!(parse_release(&s(&["--bundle", "--embed"])).is_err());
+        assert!(parse_release_build(&s(&["--bundle", "--embed"])).is_err());
+    }
+
+    /// `--capabilities` / `--show-profile` are unknown flags of `release
+    /// build`: `ipe capabilities` is the one inspection form.
+    #[test]
+    fn release_build_capabilities_flags_are_unknown() {
+        for flag in ["--capabilities", "--show-profile"] {
+            let err = parse_release_build(&s(&[flag]));
+            assert!(
+                matches!(&err, Err(CliError::Usage(m))
+                    if *m == format!("ipe release build: unknown flag `{flag}`")),
+                "{flag}: {err:?}"
+            );
+        }
     }
 
     #[test]
-    fn release_capabilities_flag_sets_dry_inspect() {
-        let a = parse_release(&s(&["--capabilities"])).expect("--capabilities");
-        assert!(a.capabilities_only);
-    }
-
-    #[test]
-    fn release_show_profile_is_capabilities_alias() {
-        let a = parse_release(&s(&["--show-profile"])).expect("--show-profile");
-        assert!(a.capabilities_only);
-    }
-
-    #[test]
-    fn release_capabilities_takes_output_format() {
-        let a = parse_release(&s(&["--capabilities", "--json"])).expect("--capabilities --json");
-        assert!(a.capabilities_only);
+    fn release_takes_output_format() {
+        let a = parse_release_build(&s(&["--json"])).expect("--json");
         assert_eq!(a.format, OutputFormat::Json);
+    }
+
+    /// `--static` is accepted on a native release (already static) and refused
+    /// with `--target wasm`.
+    #[test]
+    fn release_static_composes_with_native_only() {
+        let a = parse_release_build(&s(&["--static"])).expect("--static");
+        assert!(matches!(a.target, ReleaseTarget::Native(_)));
+        assert!(
+            parse_release_build(&s(&["--static", "--target", "aarch64-unknown-linux-musl"]))
+                .is_ok()
+        );
+        assert!(matches!(
+            parse_release_build(&s(&["--static", "--target", "wasm"])),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_release_build(&s(&["--target", "wasm", "--static"])),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    /// `--emit-permissions` belongs to `release build` only.
+    #[test]
+    fn dev_build_emit_permissions_is_unknown_flag() {
+        let err = parse_build(&s(&["--emit-permissions", "ios"]));
+        assert!(
+            matches!(&err, Err(CliError::Usage(m))
+                if m == "ipe dev build: unknown flag `--emit-permissions`"),
+            "{err:?}"
+        );
+        let a = parse_release_build(&s(&["--emit-permissions", "ios"])).expect("release build");
+        assert_eq!(a.emit_permissions.as_deref(), Some("ios"));
     }
 
     #[test]
     fn release_plain_and_json_together_rejected() {
-        assert!(parse_release(&s(&["--plain", "--json"])).is_err());
+        assert!(parse_release_build(&s(&["--plain", "--json"])).is_err());
     }
 
     #[test]
     fn release_wasm_target_accepted() {
-        let a = parse_release(&s(&["--target", "wasm"])).expect("--target wasm");
+        let a = parse_release_build(&s(&["--target", "wasm"])).expect("--target wasm");
         assert_eq!(a.target, ReleaseTarget::Wasm);
     }
 
     #[test]
     fn release_target_none_defaults_to_native_x86_64() {
-        let a = parse_release(&[]).expect("empty release");
+        let a = parse_release_build(&[]).expect("empty release");
         assert_eq!(
             a.target,
             ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
@@ -2247,7 +2432,7 @@ mod tests {
 
     #[test]
     fn release_target_valid_triple_accepted() {
-        let a = parse_release(&s(&["--target", "aarch64-unknown-linux-musl"]))
+        let a = parse_release_build(&s(&["--target", "aarch64-unknown-linux-musl"]))
             .expect("--target aarch64");
         assert_eq!(
             a.target,
@@ -2257,7 +2442,7 @@ mod tests {
 
     #[test]
     fn release_target_invalid_triple_rejected() {
-        let err = parse_release(&s(&["--target", "wasm32-unknown-bogus"]));
+        let err = parse_release_build(&s(&["--target", "wasm32-unknown-bogus"]));
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("unsupported target"), "got: {msg}");
@@ -2265,37 +2450,38 @@ mod tests {
 
     #[test]
     fn release_unknown_flag_rejected() {
-        assert!(parse_release(&s(&["--optimize"])).is_err());
-        assert!(parse_release(&s(&["--bogus"])).is_err());
+        assert!(parse_release_build(&s(&["--optimize"])).is_err());
+        assert!(parse_release_build(&s(&["--bogus"])).is_err());
     }
 
     #[test]
     fn release_out_default_is_none() {
         // No `--out` → `args.out` is None; `run_release` maps None to "release/".
-        let a = parse_release(&[]).expect("empty release");
+        let a = parse_release_build(&[]).expect("empty release");
         assert!(a.out.is_none());
     }
 
     #[test]
     fn release_out_flag_accepted() {
-        let a = parse_release(&s(&["--out", "dist"])).expect("--out dist");
+        let a = parse_release_build(&s(&["--out", "dist"])).expect("--out dist");
         assert_eq!(a.out.as_deref(), Some("dist"));
     }
 
     #[test]
     fn release_out_flag_accepts_absolute_path() {
-        let a = parse_release(&s(&["--out", "/tmp/my-release"])).expect("--out /tmp/…");
+        let a = parse_release_build(&s(&["--out", "/tmp/my-release"])).expect("--out /tmp/…");
         assert_eq!(a.out.as_deref(), Some("/tmp/my-release"));
     }
 
     #[test]
     fn release_out_flag_missing_value_rejected() {
-        assert!(parse_release(&s(&["--out"])).is_err());
+        assert!(parse_release_build(&s(&["--out"])).is_err());
     }
 
     #[test]
     fn release_out_flag_combined_with_target() {
-        let a = parse_release(&s(&["--out", "dist", "--target", "wasm"])).expect("--out + wasm");
+        let a =
+            parse_release_build(&s(&["--out", "dist", "--target", "wasm"])).expect("--out + wasm");
         assert_eq!(a.out.as_deref(), Some("dist"));
         assert_eq!(a.target, ReleaseTarget::Wasm);
     }

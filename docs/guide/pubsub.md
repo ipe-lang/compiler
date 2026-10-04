@@ -62,7 +62,7 @@ update msg model =
             ( model, Cmd.none )
 ```
 
-Building it (`ipe build`) compiles the app; serving it, a click broadcasts on the
+Building it (`ipe dev build`) compiles the app; serving it, a click broadcasts on the
 topic and the resolved subscriber count lands back in the model.
 
 ## The why

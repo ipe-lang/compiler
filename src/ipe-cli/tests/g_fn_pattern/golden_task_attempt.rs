@@ -35,7 +35,7 @@ fn task_attempt_ipec_cargo_and_run_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for task_attempt: {:?}",
+        "ipe dev build must succeed for task_attempt: {:?}",
         built.err()
     );
 

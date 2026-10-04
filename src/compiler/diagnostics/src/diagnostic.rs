@@ -3001,7 +3001,7 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::DevOnlyKernelInProduction { kernel } => vec![HelpLine::Note(
             format!(
                 "`{kernel}` is a development-only debugging tool. Remove it before \
-                 releasing, or switch to `ipe build` / `ipe run` for development. \
+                 releasing, or switch to `ipe dev build` / `ipe dev run` for development. \
                  To log in production, use `Io.eprintln` or `Log.info`."
             )
             .into_boxed_str(),

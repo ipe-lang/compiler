@@ -63,7 +63,7 @@ roundingContrast =
         ++ ", half-up " ++ Decimal.toString (Decimal.roundHalfUp 0 half)
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 0.1 + 0.2 = 0.3 (exact, not 0.3000…04)

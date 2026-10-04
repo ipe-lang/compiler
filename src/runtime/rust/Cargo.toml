@@ -519,7 +519,7 @@ widget-assets = ["crypto-core", "encoding"]
 full = ["async", "json", "jwt", "url", "db", "db-postgres", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /
 # import). NOT in `full` and NOT implied by `wasm-client` — the debugger is a
-# build-mode opt-in (`ipe build/run --debugger`), never a default. `ipe release`
+# build-mode opt-in (`ipe dev build/run --debugger`), never a default. `ipe release`
 # refuses `--debugger`, so this feature is always absent from production artifacts.
 # Implies `json` (the seal-codec export/import path) and `serde` (the Msg
 # seal-legality gate). Also implies `async` (which enables `tokio`) so the `tea`
@@ -540,7 +540,7 @@ full = ["async", "json", "jwt", "url", "db", "db-postgres", "redis_store", "cryp
 # control socket.
 # The dev-loop control WIRE + its loopback accept-loop when a tokio runtime is
 # already present. The `ControlFrame` codec + the `transport` primitives (bind
-# addr, constant-time token check, env reads) are always available; `ipe watch`
+# addr, constant-time token check, env reads) are always available; `ipe dev watch`
 # (the parent sender) links THIS ALONE to build/parse frames over its own std
 # sockets, reusing the ONE wire definition (SSOT) without pulling tokio/async
 # into the CLI. The `control::server` accept-loop is gated
@@ -550,14 +550,14 @@ full = ["async", "json", "jwt", "url", "db", "db-postgres", "redis_store", "cryp
 # dev-loop child (`tui` ⇒ `tokio`), or `web`/`debugger` (which also imply
 # `control-wire`). The weak form is load-bearing: it keeps a bare `control-wire`
 # link (the tokio-free CLI) from activating the optional `tokio` dep, so the
-# parent still pulls no async runtime, while a default `ipe watch` tui child —
+# parent still pulls no async runtime, while a default `ipe dev watch` tui child —
 # which selects `control-wire` alongside `tui` — compiles the accept-loop to
 # mount the appearance hot-swap socket. Implies `json` (the codec's serde_json
 # body) + `crypto-core` (the `is_authorized` constant-time compare); `json` pulls
 # `serde` (the frame derives).
 control-wire = ["json", "serde", "crypto-core", "tokio?/net", "tokio?/io-util"]
 debugger = ["control-wire", "async", "tokio/net", "tokio/io-util"]
-# The dev-loop build intent (`ipe build` / `ipe run` / `ipe test` / `ipe watch`).
+# The dev-loop build intent (`ipe dev build` / `ipe dev run` / `ipe test` / `ipe dev watch`).
 # With it on, an absent `ENV` / `IPE_ENV` reads as development and the operator
 # console may default open, on a loopback bind only. NOT in `full` and implied by
 # nothing: a binary built without it resolves every absent posture to

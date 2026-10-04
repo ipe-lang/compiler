@@ -11,7 +11,7 @@
 //!     { author = Db.getString "author" r }   -- row arg `r`, an alias of `payload`
 //! ```
 //!
-//! → `ipe build` exit 0, but the emitted `main_decode_row<T1: Clone>` (NO
+//! → `ipe dev build` exit 0, but the emitted `main_decode_row<T1: Clone>` (NO
 //! `IpeRow`) fails `cargo build` with E0277. The BASE commit's old body-TEXT
 //! scan happened to bound it (the alias still renders as
 //! `db_get_string(_, &r)`), so the structural rewrite REGRESSED this case — a
@@ -61,7 +61,7 @@ fn assert_ipec_bounds_fn_not_struct(fixture: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {fixture}: {:?}",
+        "ipe dev build must succeed for {fixture}: {:?}",
         built.err()
     );
 
@@ -106,7 +106,7 @@ fn assert_cargo_builds_and_runs(fixture: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {fixture}: {:?}",
+        "ipe dev build must succeed for {fixture}: {:?}",
         built.err()
     );
 

@@ -69,7 +69,7 @@
 //!   match → `[]`). Output:
 //!   `"apple:fruit:5\nmissing\napple:fruit:5,banana:fruit:3\nempty"`.
 //!   Golden-E2E coverage for `DbFindOneByField`/`DbFindManyByField` through a
-//!   real `ipe build` + `cargo build` + run, not just direct runtime source
+//!   real `ipe dev build` + `cargo build` + run, not just direct runtime source
 //!   inspection.
 //! * `db_decode_money` — `Db.Decode.money "amount"` inside a
 //!   `Db.queryDecode` pipeline decodes the `"CODE AMOUNT"` TEXT column
@@ -411,7 +411,7 @@ fn db_store_local_derived_forwarder() {
 /// SEAL regression: a generic HOF (`Result.map`) applied to a callee whose
 /// return type is a CROSS-MODULE concrete stdlib type (`Ipe.Db.Store.Store`).
 /// Before the fix the `Result.map` type variable erased to `JsonVal` in emitted
-/// Rust — `ipe build` accepted, then the emitted crate failed `cargo build`
+/// Rust — `ipe dev build` accepted, then the emitted crate failed `cargo build`
 /// with `E0308` (expected `IpeResult<_, IpeDbStoreStore>`, found
 /// `IpeResult<_, serde_json::Value>`). The concrete `Store` now threads through
 /// the HOF's instantiated slot for BOTH the point-free
@@ -643,7 +643,7 @@ fn db_poly_params_e2e() {
 /// `"apple:fruit:5\nmissing\napple:fruit:5,banana:fruit:3\nempty"`.
 ///
 /// Golden-E2E coverage for `DbFindOneByField`/`DbFindManyByField` through a
-/// real `ipe build` + `cargo build` + run, not just direct runtime source
+/// real `ipe dev build` + `cargo build` + run, not just direct runtime source
 /// inspection + the internal exhaustiveness test.
 ///
 /// Sanctioned divergence: Ipê emits Rust+sqlx; oracle is Ipê's own output.

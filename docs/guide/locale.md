@@ -71,7 +71,7 @@ main =
         Io.println (showInvalid "!!invalid!!")
 ```
 
-Running it (`ipe run`) confirms the Turkish and English paths diverge exactly
+Running it (`ipe dev run`) confirms the Turkish and English paths diverge exactly
 where they should, and the invalid tag is a `Nothing`:
 
 ```

@@ -1,6 +1,6 @@
 //! A generic-typed callback boxed as `+ 'static`.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build` with
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build` with
 //! E0310 ("the parameter type `T1` may not live long enough") at the
 //! `Box::new(pair_to_attr)` that a `List.map pairToAttr attrs` call emits. The
 //! mapper `pairToAttr` is generic over `msg` (its result is `Attribute msg`), so
@@ -55,7 +55,7 @@ fn i190_ipec_accepts_and_bounds_fn_static() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for static_bound: {:?}",
+        "ipe dev build must succeed for static_bound: {:?}",
         built.err()
     );
 
@@ -89,7 +89,7 @@ fn i190_ipec_accepts_and_bounds_fn_static() {
 
 /// cargo-0 ∧ run-0: the emitted project actually compiles with `rustc` and
 /// renders the `<link>`. Gated on `IPE_E2E=1` — the only check that would have
-/// caught the original SEAL violation (E0310, `ipe build` clean).
+/// caught the original SEAL violation (E0310, `ipe dev build` clean).
 #[test]
 fn i190_cargo_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -106,7 +106,7 @@ fn i190_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for static_bound: {:?}",
+        "ipe dev build must succeed for static_bound: {:?}",
         built.err()
     );
 

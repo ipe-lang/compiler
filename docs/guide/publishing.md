@@ -125,7 +125,7 @@ Write your code under `src/`, keep each public module in `exposedModules`, and
 verify it builds and its tests pass before you publish:
 
 ```sh
-ipe build
+ipe dev build
 ipe test
 ```
 
@@ -234,7 +234,7 @@ import Mypackage
 ```
 
 ```sh
-ipe build
+ipe dev build
 ```
 
 ## Troubleshooting

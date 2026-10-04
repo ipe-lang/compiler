@@ -1,7 +1,7 @@
 //! SEAL fixture for the `[rust.define.enum]` type-definition + per-variant
 //! constructors.
 //!
-//! The keystone invariant is `ipe build ⇒ cargo build ⇒ the type is usable`.
+//! The keystone invariant is `ipe dev build ⇒ cargo build ⇒ the type is usable`.
 //! This fixture proves the emitted `enum` definition + variant constructors are
 //! not just well-shaped text but real, compilable Rust: Ipê DEFINES a nominal
 //! Rust `enum` (a sum of unit / tuple-payload variants over owned carriers, with

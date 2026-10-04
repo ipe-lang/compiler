@@ -9,7 +9,7 @@
 //! inside the [`ipe_sandbox`] bubblewrap jail; the server never `cargo`-builds or
 //! execs user-derived code outside it.
 //!
-//! The compile step (`ipe build`) is distinct: it runs the project's own trusted
+//! The compile step (`ipe dev build`) is distinct: it runs the project's own trusted
 //! compiler over the source text — deterministic codegen, not execution of the
 //! user's program — so it stays a plain, timeout-bounded subprocess. Only the
 //! two steps that run attacker-controlled code (build, run) are jailed.

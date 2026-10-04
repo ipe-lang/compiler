@@ -39,7 +39,7 @@ fn ui_input_and_describe_ipec_and_cargo_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for stdui_input: {:?}",
+        "ipe dev build must succeed for stdui_input: {:?}",
         built.err()
     );
 

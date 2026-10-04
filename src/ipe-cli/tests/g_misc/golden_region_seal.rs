@@ -38,7 +38,7 @@ fn region_all_members_ipec_and_cargo_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for region_seal: {:?}",
+        "ipe dev build must succeed for region_seal: {:?}",
         built.err()
     );
 

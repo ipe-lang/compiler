@@ -106,7 +106,7 @@ fn render_group(out: &mut String, group: &GroupSpec) {
     out.push_str(crate::text::verbs_label());
     out.push_str("\n\n");
     for &verb in &group.members {
-        let _ = writeln!(out, "- `ipe {} {verb}`", group.name);
+        let _ = writeln!(out, "- `ipe {verb}`");
     }
     out.push('\n');
 }
@@ -120,9 +120,9 @@ fn render_groups_appendix(out: &mut String, commands: &[CommandSpec], groups: &[
     }
     out.push_str("## Command groups\n\n");
     out.push_str(
-        "A group is invoked as `ipe <group> <verb>`; each verb is an ordinary \
-         command dispatched and described from the one registry, so a grouped \
-         verb and a bare one cannot drift.\n\n",
+        "A group is invoked as `ipe <group> <verb>`; the group fixes the \
+         verb's build posture, and each verb is dispatched and described from \
+         the one registry.\n\n",
     );
     for group in groups {
         let _ = writeln!(out, "### `ipe {}` verbs\n", group.name);
