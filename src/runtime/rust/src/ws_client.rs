@@ -85,13 +85,21 @@ enum WsEvent {
 
 /// Ipe.WebSocket.WebSocketCfg — built in Ipê (defaultCfg + with*).
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WsClientCfg {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub timeout: i64,
     pub pingInterval: i64,
 }
+
+// The headers (`Authorization`) and URL (a token in the query) can carry a
+// credential; the Ipê record fixes the field types, so the masking lives in
+// `Debug`.
+crate::redact::redacting_debug!(WsClientCfg {
+    shown: [timeout, pingInterval],
+    masked: [url, headers],
+});
 
 #[cfg(not(target_arch = "wasm32"))]
 enum WsCmd {
@@ -861,6 +869,20 @@ mod tests {
     #[test]
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(WS_MESSAGE_CEILING);
+    }
+
+    #[test]
+    fn cfg_debug_prints_neither_url_nor_headers() {
+        let cfg = WsClientCfg {
+            url: "wss://live.example/socket?token=URLT0K".to_owned(),
+            headers: vec![("Authorization".to_owned(), "Bearer H34D3R".to_owned())],
+            timeout: 10,
+            pingInterval: 5,
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("URLT0K"), "{shown}");
+        assert!(!shown.contains("H34D3R"), "{shown}");
+        assert!(shown.contains("pingInterval: 5"), "{shown}");
     }
 
     /// Every connect failure shows the URL only as scheme, host, and port,

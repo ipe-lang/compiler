@@ -19,6 +19,18 @@ const _STD: () = {
     let _ = ::std::env::home_dir;
     #[expect(clippy::disallowed_methods)]
     let _ = ::std::string::String::from_utf8_lossy;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::thread::spawn::<fn(), ()>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::thread::Scope::spawn::<fn(), ()>;
+};
+
+#[cfg(feature = "tokio")]
+const _TOKIO: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::spawn_blocking::<fn(), ()>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::runtime::Handle::spawn_blocking::<fn(), ()>;
 };
 
 #[cfg(feature = "encoding")]

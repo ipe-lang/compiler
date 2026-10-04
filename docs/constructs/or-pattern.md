@@ -53,7 +53,7 @@ When an or-pattern arm binds a variable, every alternative in the arm must
 bind the same variable at the same type. The compiler rejects mismatched
 bindings (IPE-T0019):
 
-```ipe ipe:error
+```ipe ipe:error IPE-T0019
 type Expr
     = Lit Int
     | Neg Int

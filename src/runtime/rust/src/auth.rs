@@ -162,20 +162,23 @@ pub fn auth_sign_token<E: From<String>>(
     let exp = now.checked_add(expiry_seconds).unwrap_or(i64::MAX);
     let iat = now;
     // The absolute lifetime cap: iat + max_lifetime. A caller that already
-    // carries a `cap` claim (re-issue scenario) keeps its original value —
-    // only a fresh token (no `cap` in the supplied claims) gets the cap stamped.
-    // This guarantees cap is immutable across re-issues: the re-issuer supplies
-    // the original cap back in the claims map and this block leaves it alone.
-    let max_lifetime_secs = crate::app_config::resolve_auth_max_lifetime();
-    let cap_from_claims = claims.get("cap").and_then(|s| s.parse::<i64>().ok());
-    let cap: i64 = match cap_from_claims {
-        Some(existing) => existing,
-        None => {
-            // Fresh token: stamp the cap at iat + max_lifetime.
-            let ml = i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX);
-            iat.checked_add(ml).unwrap_or(i64::MAX)
-        }
+    // carries a `cap` claim (re-issue scenario) keeps its original value, which
+    // is never past the fresh cap — only a fresh token (no `cap` in the supplied
+    // claims) gets the cap stamped. A re-issue therefore never extends the
+    // absolute lifetime.
+    let max_lifetime_secs = match crate::app_config::resolve_auth_max_lifetime() {
+        Ok(secs) => secs,
+        // A malformed lifetime mints no token: the cap would be an unknown bound.
+        Err(refusal) => return IpeResult::Err(format!("auth.signToken: {refusal}").into()),
     };
+    // A fresh token's cap is iat + max_lifetime. A carried cap was stamped at an
+    // earlier iat, so it never exceeds that; a larger carried value (a claims
+    // map built from untrusted input) is clamped, never honoured.
+    let fresh_cap = iat.saturating_add(i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX));
+    let cap: i64 = claims
+        .get("cap")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(fresh_cap, |carried| carried.min(fresh_cap));
     // Per-session id for session-scoped revocation. A re-issue that already
     // carries a `jti` keeps it verbatim (like `cap` and `iat`) — only a fresh
     // token (no `jti` in the supplied claims) gets a new random id minted here.
@@ -345,7 +348,7 @@ pub fn auth_verify_token<E: From<String>>(
 /// token) the re-issue path structurally cannot accept a forged or caller-inflated
 /// cap, nor a replaced session id.
 #[cfg(feature = "jwt")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReissueContext {
     /// Original issue timestamp (immutable across all re-issues).
     pub iat: i64,
@@ -356,6 +359,14 @@ pub struct ReissueContext {
     /// Per-session id (immutable across all re-issues; used for session-scoped revocation).
     pub jti: String,
 }
+
+// The subject identifies the caller and the jti names the session, so `Debug`
+// masks both, as it masks a `Principal`'s identity.
+#[cfg(feature = "jwt")]
+crate::redact::redacting_debug!(ReissueContext {
+    shown: [iat, cap],
+    masked: [subject, jti],
+});
 
 /// Parse a `ReissueContext` from a signature-verified claims map (the output of
 /// `auth_verify_token`). Returns `None` when any required field is missing or
@@ -480,7 +491,7 @@ async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, 
 #[cfg(feature = "db")]
 /// Ipê `register : Db -> String -> String -> Task Error Int`.
 /// Creates a new user. Returns the new user id.
-pub fn auth_register<E: Send + From<String> + 'static>(
+pub fn auth_register<E: Send + From<String> + crate::FromUnavailable + 'static>(
     conn: Db,
     email: String,
     password: String,
@@ -500,18 +511,19 @@ pub fn auth_register<E: Send + From<String> + 'static>(
         // bcrypt is CPU-bound and BLOCKING (~250 ms at cost 12). Running it on a
         // tokio worker thread starves the async runtime (every concurrent register
         // ties up a core worker). Offload to the blocking pool.
-        let hash =
-            match tokio::task::spawn_blocking(move || auth_hash_password::<E>(password)).await {
-                Ok(IpeResult::Ok(h)) => h,
-                Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
-                Err(_) => {
-                    return IpeResult::Err(
-                        "auth.register: password-hash task failed"
-                            .to_string()
-                            .into(),
-                    );
-                }
-            };
+        let hashed = crate::threads::join_blocking("auth.register", move || {
+            auth_hash_password::<E>(password)
+        })
+        .await;
+        let hash = match hashed {
+            Ok(IpeResult::Ok(h)) => h,
+            Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
+            Err(failure) => {
+                return IpeResult::Err(
+                    failure.into_error("auth.register: password-hash task failed"),
+                );
+            }
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -542,7 +554,7 @@ pub fn auth_register<E: Send + From<String> + 'static>(
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
 /// generic "invalid credentials" error.
-pub fn auth_login<E: Send + From<String> + 'static>(
+pub fn auth_login<E: Send + From<String> + crate::FromUnavailable + 'static>(
     conn: Db,
     email: String,
     password: String,
@@ -570,27 +582,40 @@ pub fn auth_login<E: Send + From<String> + 'static>(
                 };
                 let hash: String = row.try_get(1).unwrap_or_default();
                 // bcrypt::verify is CPU-bound + blocking → blocking pool (see register).
-                let ok = tokio::task::spawn_blocking(move || {
+                // A refused thread is `Unavailable` on both email paths alike; a
+                // panicked verify fails closed as invalid credentials.
+                let verified = crate::threads::join_blocking("auth.login", move || {
                     bcrypt::verify(&password, &hash).unwrap_or(false)
                 })
-                .await
-                .unwrap_or(false);
-                if ok {
-                    IpeResult::Ok(id)
-                } else {
-                    IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                .await;
+                match verified {
+                    Ok(true) => IpeResult::Ok(id),
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(false) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
                 }
             }
             Ok(None) => {
                 // TIMING: perform an equal-cost bcrypt verify against a fixed
                 // cost-12 hash so the unknown-email path does the same hashing
                 // work as the known-email path — removing the email-enumeration
-                // timing oracle. The result is discarded.
-                let _ = tokio::task::spawn_blocking(move || {
+                // timing oracle. The verify result is discarded; a refused
+                // thread is `Unavailable`, as on the known-email path.
+                let verified = crate::threads::join_blocking("auth.login", move || {
                     bcrypt::verify(&password, dummy_bcrypt_hash())
                 })
                 .await;
-                IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                match verified {
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(_) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
+                }
             }
             Err(e) => IpeResult::Err(format!("auth.login: {}", e).into()),
         }
@@ -1012,6 +1037,29 @@ mod tests {
     }
 
     #[test]
+    fn a_carried_cap_past_the_max_lifetime_is_clamped() {
+        let before = now_unix();
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), "u-cap".to_string());
+        claims.insert("cap".to_string(), i64::MAX.to_string());
+        let token: String = match auth_sign_token::<String>(SECRET.to_string(), claims, 3600) {
+            IpeResult::Ok(t) => t,
+            IpeResult::Err(e) => panic!("mint: {e}"),
+        };
+        let after = now_unix();
+        let payload = crate::jwt::decode_payload(&token).expect("payload");
+        let cap = crate::jwt::numeric_date(&payload, "cap").expect("cap");
+        let lifetime = i64::try_from(
+            crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
+        )
+        .expect("the default lifetime fits i64");
+        assert!(
+            (before + lifetime..=after + lifetime).contains(&cap),
+            "a carried cap never extends past iat + max lifetime, got {cap}"
+        );
+    }
+
+    #[test]
     fn tampered_cap_fails_signature_verification() {
         // Build a valid token, then construct a forged token with a manipulated
         // `cap` in the payload but the ORIGINAL signature. jsonwebtoken must
@@ -1103,6 +1151,20 @@ mod tests {
     }
 
     // ── Sliding re-issue (P2) ─────────────────────────────────────────────────
+
+    #[test]
+    fn reissue_context_debug_prints_neither_subject_nor_jti() {
+        let ctx = crate::auth::ReissueContext {
+            iat: 1,
+            cap: 2,
+            subject: "user-S3CR3T".to_owned(),
+            jti: "J71T0K3N".to_owned(),
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("J71T0K3N"), "{shown}");
+        assert!(shown.contains("cap: 2"), "{shown}");
+    }
 
     /// Build a ReissueContext directly from a signed+verified token.
     fn reissue_ctx_from_token(token: &str) -> crate::auth::ReissueContext {

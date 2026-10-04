@@ -502,7 +502,7 @@ fn spawn_server(
     // so the server never blocks on a full pipe; it ends when the guard kills
     // the server and the pipe closes.
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
         let mut signalled = false;
@@ -521,7 +521,7 @@ fn spawn_server(
         if !signalled {
             let _ = tx.send(false);
         }
-    });
+    })?;
     match rx.recv_timeout(READY_TIMEOUT) {
         Ok(true) => Ok(guard),
         Ok(false) => Err(format!("{test_name}: server exited before it was ready").into()),

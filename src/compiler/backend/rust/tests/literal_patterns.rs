@@ -276,6 +276,250 @@ fn str_literal_subpattern_renders_and_escapes() -> DResult<()> {
     Ok(())
 }
 
+/// `main = Io.println (String.fromInt (<FuncId 0> arg))`, as `FuncId(1)`.
+fn main_prints_func0(main: Symbol, arg: Expr) -> Func {
+    let call = |callee, args| Expr::Call {
+        callee,
+        args,
+        pin: CallPin::None,
+        on_form: OnFormKind::NotForm,
+    };
+    Func {
+        id: FuncId::from_raw(1),
+        name: main,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![],
+        ret: IrType::Task(Box::new(IrType::Unit)),
+        body: call(
+            Callee::Kernel(KernelFn::IoPrintln),
+            vec![call(
+                Callee::Kernel(KernelFn::StringFromInt),
+                vec![call(Callee::Func(FuncId::from_raw(0)), vec![arg])],
+            )],
+        ),
+    }
+}
+
+/// A one-module `Main` program over `types` and `funcs`, entry `FuncId(1)`,
+/// with every runtime feature flag off.
+fn main_module_program(main_mod: Symbol, types: Vec<TypeDef>, funcs: Vec<Func>) -> Program {
+    Program {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        modules: vec![Module {
+            name: ModPath(vec![main_mod]),
+            types,
+            funcs,
+            entry: Some(FuncId::from_raw(1)),
+            records: vec![],
+            uses_tea: false,
+            uses_server: false,
+            uses_http: false,
+            uses_config: false,
+            uses_compression: false,
+            uses_csv: false,
+            uses_cache: false,
+            uses_encoding: false,
+            uses_regex: false,
+            uses_uuid: false,
+            uses_random: false,
+            uses_log: false,
+            uses_decimal: false,
+            uses_char_category: false,
+            uses_crypto_core: false,
+            uses_secret: false,
+            uses_json: false,
+            uses_crypto: false,
+            uses_jwt: false,
+            uses_url: false,
+            uses_ui: false,
+            uses_web: false,
+            uses_tui: false,
+            uses_console: false,
+            uses_webview: false,
+            uses_css: false,
+            uses_auth: false,
+            uses_principal: false,
+            uses_websocket: false,
+            uses_email: false,
+            uses_locale: false,
+            uses_time: false,
+            uses_env_public: false,
+            uses_debug: false,
+            uses_ffi: false,
+            uses_async_runtime: false,
+        }],
+    }
+}
+
+/// A bare (non-constructor) flat match discriminating on `i64::MIN`.
+///
+/// `f w = case w of -9223372036854775808 -> -9223372036854775808 ; _ -> 0`,
+/// a bare (non-constructor) flat match. Proves `Pat::Int(i64::MIN)` — rendered
+/// through `int_pattern`, unsuffixed — discriminates correctly against an
+/// `i64::MIN` scrutinee.
+fn bare_int_min_program(interner: &mut Interner) -> DResult<Program> {
+    let main_mod = interner.intern("Main")?;
+    let f = interner.intern("f")?;
+    let main = interner.intern("main")?;
+    let w = interner.intern("w")?;
+
+    let arms = vec![
+        Arm {
+            pat: Pat::Int(i64::MIN),
+            body: Expr::Int(i64::MIN),
+            guard: None,
+        },
+        Arm {
+            pat: Pat::Wildcard,
+            body: Expr::Int(0),
+            guard: None,
+        },
+    ];
+    let f_fn = Func {
+        id: FuncId::from_raw(0),
+        name: f,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(w, IrType::Int)],
+        ret: IrType::Int,
+        body: Expr::Match(ipe_ir::Match::new_flat(Expr::Var(w), arms)?),
+    };
+
+    // main = Io.println (String.fromInt (f -9223372036854775808))
+    let main_fn = main_prints_func0(main, Expr::Int(i64::MIN));
+
+    Ok(main_module_program(main_mod, vec![], vec![f_fn, main_fn]))
+}
+
+/// A constructor sub-pattern matching `i64::MIN` inside `Just`.
+///
+/// `type MaybeInt = Just Int | Nothing`; `g w = case w of Just
+/// -9223372036854775808 -> -9223372036854775808 ; Just _ -> 0 ; Nothing -> -1`.
+/// Proves `Pat::Int(i64::MIN)` discriminates correctly as a constructor
+/// sub-pattern (`Just n`'s match-ergonomics binding), not only bare.
+fn maybe_int_min_program(interner: &mut Interner) -> DResult<Program> {
+    let main_mod = interner.intern("Main")?;
+    let maybe_int = interner.intern("MaybeInt")?;
+    let just = interner.intern("Just")?;
+    let nothing = interner.intern("Nothing")?;
+    let g = interner.intern("g")?;
+    let main = interner.intern("main")?;
+    let w = interner.intern("w")?;
+
+    let def = EnumDef {
+        name: maybe_int,
+        type_params: vec![],
+        variants: vec![
+            Variant {
+                name: just,
+                fields: vec![IrType::Int],
+            },
+            Variant {
+                name: nothing,
+                fields: vec![],
+            },
+        ],
+        home: ModPath(vec![]),
+    };
+
+    let arms = vec![
+        Arm {
+            pat: Pat::Ctor {
+                home: ModPath(vec![]),
+                ty: maybe_int,
+                variant: just,
+                args: vec![Pat::Int(i64::MIN)],
+            },
+            body: Expr::Int(i64::MIN),
+            guard: None,
+        },
+        Arm {
+            pat: Pat::Ctor {
+                home: ModPath(vec![]),
+                ty: maybe_int,
+                variant: just,
+                args: vec![Pat::Wildcard],
+            },
+            body: Expr::Int(0),
+            guard: None,
+        },
+        Arm {
+            pat: Pat::Ctor {
+                home: ModPath(vec![]),
+                ty: maybe_int,
+                variant: nothing,
+                args: vec![],
+            },
+            body: Expr::Int(-1),
+            guard: None,
+        },
+    ];
+    let g_fn = Func {
+        id: FuncId::from_raw(0),
+        name: g,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(
+            w,
+            IrType::Enum {
+                home: ModPath(vec![]),
+                name: maybe_int,
+                args: vec![],
+            },
+        )],
+        ret: IrType::Int,
+        body: Expr::Match(ipe_ir::Match::new(Expr::Var(w), arms, &[just, nothing])?),
+    };
+
+    // main = Io.println (String.fromInt (g (Just -9223372036854775808)))
+    let main_fn = main_prints_func0(
+        main,
+        Expr::Ctor {
+            home: ModPath(vec![]),
+            ty: maybe_int,
+            variant: just,
+            args: vec![Expr::Int(i64::MIN)],
+        },
+    );
+
+    Ok(main_module_program(
+        main_mod,
+        vec![TypeDef::Enum(def)],
+        vec![g_fn, main_fn],
+    ))
+}
+
+/// `Pat::Int(i64::MIN)` discriminates correctly bare and ctor-nested.
+///
+/// It works both as a bare scrutinee match and nested as a constructor
+/// sub-pattern (`Just (-9223372036854775808)`) — the match-ergonomics shape a
+/// source `case` with a negated-literal arm takes. Gated on `IPE_E2E=1`.
+#[test]
+fn int_min_pattern_e2e() -> DResult<()> {
+    let mut bare = Interner::new();
+    let bare_prog = bare_int_min_program(&mut bare)?;
+    build_and_assert(
+        &bare,
+        &bare_prog,
+        "ipe_int_min_bare_pattern_e2e",
+        "-9223372036854775808\n",
+    )?;
+
+    let mut wrapped = Interner::new();
+    let wrapped_prog = maybe_int_min_program(&mut wrapped)?;
+    build_and_assert(
+        &wrapped,
+        &wrapped_prog,
+        "ipe_int_min_maybe_pattern_e2e",
+        "-9223372036854775808\n",
+    )
+}
+
 /// The `Wrap` alias program: `f w = case w of MkWrap (x as y) -> y`. The `x as y`
 /// alias renders `y @ x` and the whole match stays exhaustive (a binder matches
 /// anything), so the emitted crate builds and runs.

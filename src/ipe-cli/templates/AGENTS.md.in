@@ -33,6 +33,8 @@ main =
 `|>` `<|` pipelines | `::` cons | `\x -> x + 1` lambdas | `let…in`
 | `case…of` (exhaustiveness checked) | `{ record | field = value }`
 update | `module M exposing (..)` | `import M as Alias exposing (func)`.
+An open import's (`exposing (..)`) clash with another name is reported only
+where the name is used bare, never at the import itself.
 
 **Multiline strings** — triple-quoted, `{{expr}}` interpolation:
 
@@ -1101,7 +1103,7 @@ package =
             { mode = Solo                       -- Solo | Hydrate
             , entry = "src/Client.ipe"          -- client entry file (defaults to the build's own entry)
             , mount = "#app"                    -- solo mount selector
-            , publicEnv = [ "API_BASE_URL" ]    -- default-deny allowlist; rejects IPE_*/secret-pattern names
+            , publicEnv = [ "API_BASE_URL" ]    -- default-deny allowlist; rejects IPE_*/secret/temp-root/home names
             , optLevel = "z"
             }
     }
@@ -1118,7 +1120,10 @@ absent `wasm` field (or `wasm = Off`) keeps the native default.
 `PASSWORD`/`PASSWD`/`CREDENTIAL`/`AUTH`/`APIKEY` — plus `DATABASE_URL` and the
 `IPE_*` namespace) enforced at manifest PARSE time — listing `SESSION_TOKEN`
 (or any denylisted pattern) in `publicEnv` is a build error, never a silently
-dropped entry and never a runtime-only refusal. `System.getenv` stays a
+dropped entry and never a runtime-only refusal. The temp-root and home
+variables (`TMPDIR`/`TMP`/`TEMP`/`HOME`/`USERPROFILE`/`HOMEDRIVE`/`HOMEPATH`,
+any case), a name outside ASCII letters/digits/`_` (or starting with a digit),
+and a repeated name are refused the same way. `System.getenv` stays a
 DOES-NOT-exist-for-wasm kernel regardless (Layer 1) — public build-time
 config is a distinct, narrower surface, not a `getenv` backdoor.
 

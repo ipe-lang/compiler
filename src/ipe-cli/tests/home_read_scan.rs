@@ -57,19 +57,20 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// Pinned per site, not per file: a new allow in a listed file changes its
 /// count and fails the scan like an allow anywhere else. The sites are the
 /// [`ENV_ALLOW_FILES`] readers (`ipe_env`'s `var`/`var_os`/`vars_os`, the
-/// sandbox home reader, the jail passthrough); the dev-only temp-root test
-/// reader; and in the runtime crate, which has its own `clippy.toml`, the build
+/// sandbox home reader, the jail passthrough); the sandbox's thread-spawn ban
+/// proofs; the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
-/// crate-private accessor, the lenient-decoder ban proofs, and the audited
-/// lossy-UTF-8 sites that render bytes already refused or never parsed.
+/// crate-private accessor, the ban proofs, the one blocking-pool start, and the
+/// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/env/src/lib.rs", 3),
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
+    ("src/compiler/sandbox/src/clippy_paths_resolve.rs", 2),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
-    ("src/runtime/rust/src/clippy_paths_resolve.rs", 10),
+    ("src/runtime/rust/src/clippy_paths_resolve.rs", 14),
     ("src/runtime/rust/src/core.rs", 1),
     ("src/runtime/rust/src/csv.rs", 1),
     ("src/runtime/rust/src/dom/form.rs", 1),
@@ -81,6 +82,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/ssrf.rs", 1),
     ("src/runtime/rust/src/system.rs", 9),
     ("src/runtime/rust/src/terminal_access.rs", 1),
+    ("src/runtime/rust/src/threads.rs", 1),
     ("src/runtime/rust/src/tui/key.rs", 1),
     ("src/runtime/rust/src/url.rs", 1),
     ("src/runtime/rust/tests/debug_behavior.rs", 1),
@@ -108,10 +110,12 @@ const JAIL_ENV_FN: &str = "granted_env";
 const RAW_PASSTHROUGH_PATHS: &[&str] = &["host_env::granted", "host_env::{", "host_env::*"];
 
 /// The files that may name the shared home-name constants: their one source
-/// (`home_core`), the two home accessors, and the two hosts of the shared
-/// scratch core's Windows scratch-root check.
+/// (`home_core`), the two home accessors, the agreement table both accessors'
+/// tests `include!`, and the two hosts of the shared scratch core's Windows
+/// scratch-root check.
 const HOME_VAR_FILES: &[&str] = &[
     "src/runtime/rust/src/home_core.rs",
+    "src/runtime/rust/tests/data/home_cases.rs",
     "src/compiler/sandbox/src/home.rs",
     "src/runtime/rust/src/system.rs",
     "src/compiler/sandbox/src/scratch.rs",
@@ -1280,8 +1284,8 @@ mod lexical {
         },
         Allowed {
             file: "src/runtime/rust/src/system.rs",
-            func: "read",
-            reason: "reads an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
+            func: "lookup",
+            reason: "the one raw reader of an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
         },
     ];
 

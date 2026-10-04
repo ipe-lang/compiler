@@ -42,6 +42,8 @@ mod golden_cmd_sub_map;
 mod golden_core_stdlib;
 #[path = "g_misc/golden_cross_module_attr_field_access.rs"]
 mod golden_cross_module_attr_field_access;
+#[path = "g_misc/golden_cross_module_attr_field_mismatch.rs"]
+mod golden_cross_module_attr_field_mismatch;
 #[path = "g_misc/golden_cross_module_attr_lowering.rs"]
 mod golden_cross_module_attr_lowering;
 #[path = "g_misc/golden_cross_module_type_res.rs"]
@@ -70,6 +72,8 @@ mod golden_http_statuscode_imagesrc_seal;
 mod golden_if_expr;
 #[path = "g_misc/golden_l0105_refutable_gates.rs"]
 mod golden_l0105_refutable_gates;
+#[path = "g_misc/golden_lambda_field_access_seal.rs"]
+mod golden_lambda_field_access_seal;
 #[path = "g_misc/golden_lazy_emit_seal.rs"]
 mod golden_lazy_emit_seal;
 #[path = "g_misc/golden_local_type_shadows_dep.rs"]

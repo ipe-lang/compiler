@@ -18,6 +18,7 @@
 mod capabilities;
 mod const_fold;
 pub use const_fold::fold_program;
+pub use emit_expr::rust_str_lit;
 mod crate_specs;
 mod doc;
 mod emit_console;
@@ -33,6 +34,7 @@ mod emit_ui_template;
 mod emit_web;
 mod emit_webview;
 mod emit_worker;
+mod layout_sweep;
 mod naming;
 mod preamble;
 mod project;
@@ -72,6 +74,7 @@ use ipe_ir::{
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
+pub use layout_sweep::{BodyLayoutBudget, LAYOUT_FUEL, body_layout_budgets};
 pub use preamble::{epilogue, preamble};
 
 /// Which `ipe` verb family an emit serves.
@@ -1767,19 +1770,40 @@ fn refuse_unclassified_enum(
 /// semantics under the emitted `impl<Tn: Clone> Clone`, which bounds every
 /// type parameter and so makes a bare type variable `Clone`.
 fn field_is_clone(ty: &IrType, enum_clone: &dyn Fn(&ModPath, Symbol) -> bool) -> bool {
+    clone_under(ty, enum_clone, &ipe_ir::payload_leaf_is_clone)
+}
+
+/// Is a value of type `ty` inside an emitted function body `Clone`?
+///
+/// The same walk as [`field_is_clone`], plus a row witness: an emitted
+/// function bounds every type parameter and every row witness by `Clone`, so
+/// both are `Clone` there at any depth.
+pub(crate) fn fn_value_is_clone(
+    ty: &IrType,
+    enum_clone: &dyn Fn(&ModPath, Symbol) -> bool,
+) -> bool {
+    clone_under(ty, enum_clone, &|t| {
+        matches!(t, IrType::RowGeneric(_)) || ipe_ir::payload_leaf_is_clone(t)
+    })
+}
+
+/// The `Clone` walk shared by [`field_is_clone`] and [`fn_value_is_clone`];
+/// `leaf` decides every type that is neither a named enum nor a carrier.
+fn clone_under(
+    ty: &IrType,
+    enum_clone: &dyn Fn(&ModPath, Symbol) -> bool,
+    leaf: &dyn Fn(&IrType) -> bool,
+) -> bool {
+    let go = |t: &IrType| clone_under(t, enum_clone, leaf);
     match ty {
-        IrType::Enum { home, name, args } => {
-            enum_clone(home, *name) && args.iter().all(|a| field_is_clone(a, enum_clone))
-        }
-        IrType::Maybe(e) | IrType::List(e) | IrType::Set(e) => field_is_clone(e, enum_clone),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            field_is_clone(a, enum_clone) && field_is_clone(b, enum_clone)
-        }
-        IrType::Tuple(es) => es.iter().all(|e| field_is_clone(e, enum_clone)),
-        IrType::Record(fields) => fields.values().all(|f| field_is_clone(f, enum_clone)),
-        IrType::Ui { msg, .. } => field_is_clone(msg, enum_clone),
-        IrType::WebRoute(page) => field_is_clone(page, enum_clone),
-        other => ipe_ir::payload_leaf_is_clone(other),
+        IrType::Enum { home, name, args } => enum_clone(home, *name) && args.iter().all(go),
+        IrType::Maybe(e) | IrType::List(e) | IrType::Set(e) => go(e),
+        IrType::Result(a, b) | IrType::Dict(a, b) => go(a) && go(b),
+        IrType::Tuple(es) => es.iter().all(go),
+        IrType::Record(fields) => fields.values().all(go),
+        IrType::Ui { msg, .. } => go(msg),
+        IrType::WebRoute(page) => go(page),
+        other => leaf(other),
     }
 }
 

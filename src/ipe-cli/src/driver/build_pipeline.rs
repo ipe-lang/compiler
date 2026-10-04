@@ -1,4 +1,5 @@
 use super::{CliError, diag_span, io_err};
+use crate::env_dir::{HomeDir, HomeRefusal};
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
@@ -6,6 +7,7 @@ use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path,
     ffi, fs, project, render, runtime_embed, text,
 };
+use ipe_backend_rust::rust_str_lit;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -741,14 +743,15 @@ fn names_no_directory(err: &std::io::Error) -> bool {
 /// How the user's home bounds a manifest walk.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HomeCeiling {
-    /// No home directory is configured, or none exists at the configured path.
+    /// The home variable is unset, or no directory exists at the home it names.
     ///
     /// A directory that does not exist is no ancestor of any file, so only
     /// version-control roots and the depth cap bound the walk.
     Absent,
     /// The walk stops at the directory with this identity.
     At(DirIdentity),
-    /// A home exists but its identity cannot be read.
+    /// A home exists but its identity cannot be read, or the home variable is
+    /// set to a value the parser refuses.
     ///
     /// No directory above the start can be shown to lie below the home, so
     /// the walk examines the start directory alone.
@@ -756,14 +759,29 @@ pub enum HomeCeiling {
 }
 
 impl HomeCeiling {
-    /// The ceiling a configured `home` sets, read once.
+    /// The ceiling the parsed `home` sets, read once.
+    ///
+    /// Only an unset home widens the walk to [`Self::Absent`]: a home that is
+    /// set but refused may still name the user's tree, so it fails closed to
+    /// [`Self::Unreadable`] rather than letting the walk climb past it.
     #[must_use]
-    pub fn of(home: Option<&Path>) -> Self {
-        home.map_or(Self::Absent, |dir| match DirIdentity::read(dir) {
-            Ok(identity) => Self::At(identity),
-            Err(err) if names_no_directory(&err) => Self::Absent,
-            Err(_) => Self::Unreadable,
-        })
+    pub fn of(home: Result<&HomeDir, HomeRefusal>) -> Self {
+        match home {
+            Ok(dir) => match DirIdentity::read(dir.as_path()) {
+                Ok(identity) => Self::At(identity),
+                Err(err) if names_no_directory(&err) => Self::Absent,
+                Err(_) => Self::Unreadable,
+            },
+            Err(HomeRefusal::Unset) => Self::Absent,
+            Err(
+                HomeRefusal::NotUtf8
+                | HomeRefusal::ContainsNul
+                | HomeRefusal::NotAbsolute
+                | HomeRefusal::ParentComponent
+                | HomeRefusal::WindowsDeviceOrVerbatim
+                | HomeRefusal::WindowsUnc,
+            ) => Self::Unreadable,
+        }
     }
 
     /// Whether the walk ends at `here` once its manifest has been looked for.
@@ -799,7 +817,7 @@ impl HomeCeiling {
 ///
 /// As [`find_manifest_bounded`].
 pub fn find_manifest_for_ipe_file(ipe_file: &Path) -> Result<Option<PathBuf>, CliError> {
-    let home = HomeCeiling::of(crate::env_dir::home().as_deref());
+    let home = HomeCeiling::of(crate::env_dir::home().as_ref().map_err(|refusal| *refusal));
     find_manifest_bounded(ipe_file, &home, MAX_MANIFEST_WALK_DEPTH)
 }
 
@@ -1317,31 +1335,72 @@ pub fn source_for_span_in_linked(
         .unwrap_or_else(|| entry.clone())
 }
 
-/// Attribute a `(diag, home)` query error to the source file that OWNS it.
+/// Attribute a post-link pipeline error to the source file that OWNS it.
 ///
-/// A non-empty `home` resolves DIRECTLY via `home_to_source` (O(log N), exact);
-/// an empty home (homeless backend/emit error, or a non-solver error) falls
-/// back to the byte-offset heuristic over the linked program. This is the
-/// single attribution rule every post-link pipeline error shares, so `ipe build`
-/// and `ipe type-check` frame the identical diagnostic against the identical source.
+/// A type-checker error is framed by [`frame_infer_error`]: its typed home
+/// names the file exactly, and no byte offset is consulted. A link or lowering
+/// error with a non-empty `home` resolves DIRECTLY via `home_to_source`; only
+/// one with an empty home falls back to the byte-offset heuristic over the
+/// linked program. This is the single attribution rule every post-link
+/// pipeline error shares, so `ipe build` and `ipe type-check` frame the
+/// identical diagnostic against the identical source.
 pub fn attribute_post_link_error(
     linked: &ipe_canon::ast::Module,
     home_to_source: &BTreeMap<Vec<ipe_intern::Symbol>, (PathBuf, String)>,
     entry: &(PathBuf, String),
-    diag: Diagnostic,
-    home: &[ipe_intern::Symbol],
+    err: ipe_db::PipelineError,
 ) -> CliError {
-    let (file, src) = if home.is_empty() {
-        source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
-    } else {
-        home_to_source.get(home).cloned().unwrap_or_else(|| {
-            source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
-        })
-    };
-    CliError::Pipeline {
-        file,
-        src,
-        diag: Box::new(diag),
+    match err {
+        ipe_db::PipelineError::Infer(infer) => frame_infer_error(home_to_source, entry, infer),
+        ipe_db::PipelineError::Lower(diag, home) => {
+            let (file, src) = if home.is_empty() {
+                source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
+            } else {
+                home_to_source.get(&home).cloned().unwrap_or_else(|| {
+                    source_for_span_in_linked(linked, home_to_source, entry, diag_span(&diag))
+                })
+            };
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
+        }
+    }
+}
+
+/// Frame a type-checker error against the file its typed home names.
+///
+/// A sited error resolves exactly through `home_to_source`. A home naming no
+/// module there is refused as [`Diagnostic::CompilerBug`] blamed on `entry`,
+/// never handed to a byte-offset guess. A whole-program error is framed against
+/// the entry with no snippet, since it belongs to no single source.
+pub fn frame_infer_error(
+    home_to_source: &BTreeMap<Vec<ipe_intern::Symbol>, (PathBuf, String)>,
+    entry: &(PathBuf, String),
+    err: ipe_types::InferError,
+) -> CliError {
+    match err {
+        ipe_types::InferError::Sited { diag, home } => home_to_source.get(home.path()).map_or_else(
+            || CliError::Pipeline {
+                file: entry.0.clone(),
+                src: entry.1.clone(),
+                diag: Box::new(Diagnostic::CompilerBug {
+                    where_: "driver.frame_infer_error",
+                    detail: "a type-checker error names a module with no source file".to_owned(),
+                }),
+            },
+            |(file, src)| CliError::Pipeline {
+                file: file.clone(),
+                src: src.clone(),
+                diag: Box::new(diag),
+            },
+        ),
+        ipe_types::InferError::Program(program) => CliError::Pipeline {
+            file: entry.0.clone(),
+            src: String::new(),
+            diag: Box::new(program.into_diagnostic()),
+        },
     }
 }
 
@@ -1380,8 +1439,8 @@ pub fn render_homed_warnings(
 }
 
 /// Run the canon decoder-pipeline direction gate (IPE-N0040) over the linked
-/// program, returning the rejection in the post-link `(diag, home)` shape both
-/// the build and the type-check surfaces attribute through.
+/// program, returning the rejection in the post-link [`ipe_db::PipelineError`]
+/// shape both the build and the type-check surfaces attribute through.
 ///
 /// The gate rejects the reverse-associated hand-nested spelling of the
 /// `required` / `optional` / `requiredAt` / `custom` decoder combinators, which
@@ -1394,9 +1453,9 @@ pub fn render_homed_warnings(
 /// the other homeless post-link errors already use.
 pub fn gate_decoder_pipelines(
     linked: &ipe_canon::ast::Module,
-) -> Result<(), ipe_types::HomedDiagnostic> {
+) -> Result<(), ipe_db::PipelineError> {
     ipe_canon::decoder_pipeline_gate::check_decoder_pipelines(linked)
-        .map_err(|diag| (diag, Vec::new()))
+        .map_err(|diag| ipe_db::PipelineError::Lower(diag, Vec::new()))
 }
 
 /// Demand `canonicalize` for every module in dep-first order, attributing a
@@ -1768,16 +1827,9 @@ pub fn compile_prepared(
         })?;
     }
 
-    // Use the attributed variant so cross-module type errors are attributed to
-    // the correct source file via the `home` carried on the failing constraint,
-    // rather than relying solely on the byte-offset heuristic (`source_for_span`)
-    // which can mis-attribute when two merged modules share overlapping numeric
-    // span ranges.
-    //
-    // When `home` is non-empty we look it up in `home_to_source` directly —
-    // O(log N) and exact (solver and exhaustiveness errors carry their owning
-    // def's home). When the home is empty (non-solver errors: constraint
-    // generation, field-access pass) we fall back to the byte-offset heuristic.
+    // Every type-checker error names its owning module by construction, so it
+    // is framed by an exact `home_to_source` lookup; a span's byte offsets are
+    // shared by every linked module and never select its file.
     //
     // `ipe_db::typecheck` is the memoized
     // SEAM over `ipe_types::infer_attributed`: same whole-program computation,
@@ -1785,9 +1837,7 @@ pub fn compile_prepared(
     // this demand — the query takes its own lock internally.
     let types = ipe_db::typecheck(db, source_root, entry_file)
         .clone()
-        .map_err(|(diag, home)| {
-            attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
-        })?;
+        .map_err(|err| attribute_post_link_error(linked, &home_to_source, &entry, err.into()))?;
     // Print non-fatal warnings (e.g. IPE-T0011 RedundantCaseBranch) to stderr,
     // each framed against its home module's file. These are Severity::Warning:
     // the build continues and exit code stays 0.
@@ -1809,8 +1859,11 @@ pub fn compile_prepared(
     // Main.ipe def whose byte range coincidentally overlaps the failing span.
     // An empty `home` (homeless backend diagnostic, or a pre-def lowering
     // error) falls back to the byte-offset heuristic `source_for_span`.
-    let span_attributed_err = |(diag, home): ipe_types::HomedDiagnostic| {
-        attribute_post_link_error(linked, &home_to_source, &entry, diag, &home)
+    let span_attributed_err = |err: ipe_db::PipelineError| {
+        attribute_post_link_error(linked, &home_to_source, &entry, err)
+    };
+    let homed_err = |(diag, home): (Diagnostic, Vec<ipe_intern::Symbol>)| {
+        span_attributed_err(ipe_db::PipelineError::Lower(diag, home))
     };
 
     // Decoder-pipeline direction gate (IPE-N0040): reject the hand-nested
@@ -1838,7 +1891,7 @@ pub fn compile_prepared(
     // analysis cannot go undetected.
     ipe_db::program_metadata(db, source_root, entry_file)
         .clone()
-        .map_err(span_attributed_err)?;
+        .map_err(homed_err)?;
 
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:
@@ -1855,7 +1908,7 @@ pub fn compile_prepared(
     // config field flows through unchanged.
     let emitted = ipe_db::emit_manifest(db, source_root, entry_file, config)
         .clone()
-        .map_err(span_attributed_err)?;
+        .map_err(homed_err)?;
     let mut emitted = (*emitted).clone();
 
     // Thread the widget manifest into the emitted program. The emit query is a
@@ -1897,11 +1950,12 @@ pub fn compile_prepared(
 /// The registration is a single `ipe_runtime::web::widget_assets::register(&[…])`
 /// call spliced in right after `install_panic_classifier();` in the generated
 /// `main()` — the first line of the entry point, before any task runs. Each
-/// `(tag, content)` is rendered as a Rust string-literal pair; the content is
-/// emitted as a raw string literal with a hash fence wide enough to clear any run
-/// of `#` in the file, so arbitrary JS (including embedded `"` / `#`) is a valid
-/// literal and no author byte can break out of the string into code (the content
-/// is DATA in the emitted program, exactly as it is data in the browser).
+/// `(tag, content)` is rendered as a Rust string-literal pair through the
+/// backend's one literal owner, `rust_str_lit`, which escapes every scalar the
+/// literal grammar cannot carry raw (`"`, `\`, a lone CR, a bidi override), so
+/// arbitrary JS is a valid literal rustc accepts and no author byte can break
+/// out of the string into code (the content is DATA in the emitted program,
+/// exactly as it is data in the browser).
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `src/main.rs` is absent
@@ -1933,9 +1987,9 @@ pub fn inject_widget_registration(
     let mut entries = String::new();
     for (tag, content) in manifest {
         entries.push_str("        (");
-        entries.push_str(&rust_str_literal(tag));
+        entries.push_str(&rust_str_lit(tag));
         entries.push_str(", ");
-        entries.push_str(&rust_raw_str_literal(content));
+        entries.push_str(&rust_str_lit(content));
         entries.push_str("),\n");
     }
     let call = format!("\n    ipe_runtime::web::widget_assets::register(&[\n{entries}    ]);\n");
@@ -2050,36 +2104,6 @@ pub fn inject_wasm_widget_bundle(
     };
     index.insert_str(pos, &scripts);
     Ok(())
-}
-
-/// Render `s` as a double-quoted Rust string literal.
-///
-/// Rust's own `Debug` grammar escapes every character a literal cannot carry
-/// raw, bidi overrides included.
-pub fn rust_str_literal(s: &str) -> String {
-    format!("{s:?}")
-}
-
-/// Render `s` as a Rust RAW string literal `r#"…"#` with a hash fence wide enough
-/// to clear any `"#` run inside `s`, so arbitrary content (author JS with quotes
-/// and hashes) is emitted verbatim as data — it can never terminate the literal
-/// early and spill into code.
-pub fn rust_raw_str_literal(s: &str) -> String {
-    // The fence must be longer than the longest run of `#` that immediately
-    // follows a `"` in the content (that is the only sequence that could close a
-    // raw literal). Computing the max `#`-run overall is a safe over-approximation.
-    let mut max_hashes = 0usize;
-    let mut run = 0usize;
-    for ch in s.chars() {
-        if ch == '#' {
-            run += 1;
-            max_hashes = max_hashes.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    let fence = "#".repeat(max_hashes + 1);
-    format!("r{fence}\"{s}\"{fence}")
 }
 
 /// Write an emitted project to `target`, vendoring the runtime module tree
@@ -2256,7 +2280,41 @@ pub fn build_emit_manifest(
     for (rel, contents) in &emitted.files {
         manifest.insert(PathBuf::from(rel.as_str()), contents.clone());
     }
+    refuse_unlexable_rust(&manifest)?;
     Ok(manifest)
+}
+
+/// Refuse a manifest whose `.rs` text holds a character the Rust lexer refuses raw.
+///
+/// The scan covers the FINAL manifest — vendored runtime, backend emit, post-emit
+/// injections and a cache-deserialized project alike — so no text reaches
+/// `cargo` that would make it fail a program `ipe` accepted. The detail names the
+/// file, byte offset and code point through the hazard's own rendering, never the
+/// raw character.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying [`Diagnostic::CompilerBug`] on the first hit.
+fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), CliError> {
+    let hit = manifest
+        .iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        })
+        .find_map(|(path, text)| ipe_intern::find_lexer_hazard(text).map(|hazard| (path, hazard)));
+    hit.map_or(Ok(()), |(path, hazard)| {
+        let shown = path.to_string_lossy();
+        Err(CliError::Pipeline {
+            file: path.clone(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::CompilerBug {
+                where_: ipe_intern::EMIT_LEXABLE,
+                detail: format!(
+                    "emitted {shown:?} holds {hazard}, which the Rust lexer refuses raw"
+                ),
+            }),
+        })
+    })
 }
 
 /// Vendor only the runtime source files the emitted `mod.rs` reaches.
@@ -2616,7 +2674,7 @@ pub fn build_project_into(
         &canonical_project_dir(manifest_path),
     );
     let options = BuildOptions {
-        wasm_public_env: manifest.wasm.public_env.clone(),
+        wasm_public_env: manifest.wasm.public_env.to_names(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,
@@ -2694,9 +2752,100 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A widget's JS reaches the emitted `main.rs` with every bidi override and
+    /// lone CR escaped, since rustc refuses either raw inside any string literal.
     #[test]
-    fn rust_str_literal_escapes_quotes_backslashes_and_bidi_overrides() {
-        assert_eq!(rust_str_literal("a\u{202E}\"b\\"), r#""a\u{202e}\"b\\""#);
+    fn widget_registration_escapes_bidi_and_lone_cr_in_content() {
+        let mut files = BTreeMap::new();
+        let rel = ipe_backend::RelPath::new("src/main.rs").expect("valid rel path");
+        files.insert(
+            rel,
+            "fn main() {\n    install_panic_classifier();\n}\n".to_owned(),
+        );
+        let mut emitted = ipe_backend::EmittedProject {
+            files,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        };
+        let manifest = BTreeMap::from([(
+            "x-w\u{202E}".to_owned(),
+            "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
+        )]);
+        assert!(inject_widget_registration(&mut emitted, &manifest).is_ok());
+        let main = emitted.files.get("src/main.rs").map_or("", String::as_str);
+        assert!(
+            !main.contains(['\u{202E}', '\u{2066}', '\r']),
+            "a raw bidi override or lone CR reached the emitted literal: {main}"
+        );
+        assert!(
+            main.contains(
+                r###"("x-w\u{202e}", "/* \u{202e}evil\u{2066} */ a\rb \"#\"## c\\d"),"###
+            ),
+            "the widget pair is not the Debug-escaped literal pair: {main}"
+        );
+    }
+
+    /// An emitted project for the manifest: a vendored `mod.rs` that declares
+    /// no runtime module, so the scan sees only `files` and reads no disk.
+    fn vendored_project(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
+        let mut map = BTreeMap::new();
+        for (path, body) in files.iter().chain(&[("src/ipe_runtime/mod.rs", "")]) {
+            let rel = ipe_backend::RelPath::new(*path).expect("valid rel path");
+            map.insert(rel, (*body).to_owned());
+        }
+        ipe_backend::EmittedProject {
+            files: map,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        }
+    }
+
+    /// The manifest refuses `.rs` text holding a raw bidi control or a bare CR,
+    /// past every renderer, and names the hazard without echoing it.
+    #[test]
+    fn manifest_refuses_a_raw_lexer_hazard() {
+        let missing = Path::new("/nonexistent-runtime-dir");
+        for (path, body) in [
+            ("src/main.rs", "fn main() { let _ = \"a\u{202E}b\"; }\n"),
+            ("src/ipe_runtime/x.rs", "// a\rb\n"),
+            ("src/ipe_mods/upper.RS", "// a\u{2066}b\n"),
+        ] {
+            let refused = build_emit_manifest(&vendored_project(&[(path, body)]), missing, true);
+            assert!(
+                matches!(&refused, Err(CliError::Pipeline { .. })),
+                "a raw hazard in {path} passed the manifest"
+            );
+            let Err(CliError::Pipeline { file, diag, .. }) = refused else {
+                return;
+            };
+            assert_eq!(file, PathBuf::from(path));
+            assert!(
+                matches!(
+                    &*diag,
+                    Diagnostic::CompilerBug {
+                        where_: ipe_intern::EMIT_LEXABLE,
+                        ..
+                    }
+                ),
+                "not the lexability refusal: {diag:?}"
+            );
+            let Diagnostic::CompilerBug { detail, .. } = *diag else {
+                return;
+            };
+            assert!(
+                !detail.contains(['\u{202E}', '\r']),
+                "the refusal echoed the raw hazard: {detail:?}"
+            );
+        }
+        for (path, body) in [
+            ("src/main.rs", "fn main() {}\r\n// \u{200E}\u{FEFF} é 𝄞\r\n"),
+            ("www/index.html", "<p>\u{202E}\r</p>"),
+        ] {
+            assert!(
+                build_emit_manifest(&vendored_project(&[(path, body)]), missing, true).is_ok(),
+                "lexable or non-Rust text in {path} was refused"
+            );
+        }
     }
 
     /// A build whose caller states no intent is a release build.

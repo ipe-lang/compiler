@@ -133,10 +133,14 @@ where
     }
 }
 
+/// The name of the entry thread [`block_on`] drives its task on.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+const BLOCK_ON_THREAD: &str = "ipe-block-on";
+
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromUnavailable + Send + 'static,
     A: Send + 'static,
 {
     let rt = match global_runtime() {
@@ -154,15 +158,21 @@ where
     // floor first thing, so a guarded recursion entered directly from `block_on`
     // (a synchronous CLI computation) trips at the same depth as one entered on a
     // tokio worker, and the red-zone probe has a floor here too.
-    let spawned = std::thread::Builder::new()
-        .stack_size(crate::core::RUNTIME_THREAD_STACK_SIZE)
-        .spawn(move || {
+    let spawned = crate::threads::spawn_sized(
+        BLOCK_ON_THREAD,
+        crate::core::RUNTIME_THREAD_STACK_SIZE,
+        move || {
             crate::core::record_stack_floor(crate::core::RUNTIME_THREAD_STACK_SIZE);
             rt.block_on(future)
-        });
+        },
+    );
     let handle = match spawned {
         Ok(h) => h,
-        Err(e) => return IpeResult::Err(format!("failed to spawn block_on thread: {e}").into()),
+        Err(e) => {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(BLOCK_ON_THREAD, &e).into_error(),
+            );
+        }
     };
     match handle.join() {
         Ok(r) => r,
@@ -694,7 +704,7 @@ where
 // its entry differently (`spawn_local`), so it is excluded there but present on
 // `wasm32-wasip1`, where a `Direct` program's `main` calls it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
-pub fn task_run<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Send + 'static>(
     task: IpeTask<E, A>,
 ) -> IpeResult<E, A> {
     block_on(task)
@@ -1257,6 +1267,24 @@ mod retry_tests {
 //   2. An all-`Ok` run returns the results in INPUT order regardless of the
 //      order in which the tasks actually complete.
 //
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[cfg(test)]
+mod block_on_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_entry_thread_is_an_unavailable_error() {
+        let _refusing = crate::threads::refusal_hook::refuse(BLOCK_ON_THREAD);
+        let task: IpeTask<crate::IpeError, i64> = Box::pin(async { IpeResult::Ok(1) });
+        match block_on(task) {
+            IpeResult::Err(e) => {
+                assert_eq!(crate::ipe_error_kind(e), crate::IpeErrorKind::Unavailable);
+            }
+            IpeResult::Ok(v) => panic!("a refused entry thread must not run the task, got Ok({v})"),
+        }
+    }
+}
+
 // Exercises the concurrent spawn-based `task_parallel` (`tokio::spawn` + abort),
 // so it compiles only when the `tokio` feature is on.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -1439,10 +1467,12 @@ mod std_block_on_tests {
                 }
                 self.armed = true;
                 let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    waker.wake();
-                });
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        waker.wake();
+                    })
+                    .expect("spawn test thread");
                 Poll::Pending
             }
         }

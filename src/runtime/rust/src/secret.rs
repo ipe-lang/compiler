@@ -66,11 +66,9 @@ use zeroize::Zeroize;
 
 use super::stringify::IpeStringify;
 
-/// The fixed placeholder every stringification path returns, regardless of
-/// the wrapped value. Never formatted with the payload interpolated in —
-/// `format!` on a runtime `&str` constant, not a template that could
-/// accidentally splice the secret back in.
-const REDACTED: &str = "<redacted>";
+// The fixed placeholder every stringification path returns, regardless of the
+// wrapped value; one spelling shared with every redacting `Debug`.
+use crate::redact::REDACTED;
 
 /// `Ipe.Secret`'s opaque, sealed newtype. See the module doc for the
 /// full design rationale.

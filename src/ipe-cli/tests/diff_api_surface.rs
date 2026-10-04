@@ -200,3 +200,30 @@ bad n =
         other => panic!("expected a typecheck failure, got {other:?}"),
     }
 }
+
+/// A module that does not resolve fails closed with its own resolve
+/// diagnostic — never with the internal refusal a homeless error becomes.
+#[test]
+fn a_package_that_does_not_resolve_reports_its_resolve_error() {
+    let pkg = temp_pkg("unresolved");
+    write_module(
+        &pkg,
+        "Lib",
+        r"module Lib exposing (bad)
+
+
+bad : Int
+bad =
+    zzzzzzzzUnknownName
+",
+    );
+
+    match extract_tree(&pkg) {
+        Err(DiffError::Typecheck { diag, .. }) => assert_eq!(
+            diag.code().as_str(),
+            "IPE-N0001",
+            "an unknown name must surface as itself, got {diag:?}"
+        ),
+        other => panic!("expected a resolve failure, got {other:?}"),
+    }
+}

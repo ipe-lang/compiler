@@ -89,6 +89,7 @@ use std::time::{Duration, Instant};
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
 use crate::project;
 use crate::text;
+use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
 
 /// A lifecycle notification from a running watch session.
@@ -558,7 +559,7 @@ pub(crate) fn resolve_project_sources(
             entry_path,
             blame_path: manifest_path,
             db_driver: manifest.driver,
-            wasm_public_env: manifest.wasm.public_env,
+            wasm_public_env: manifest.wasm.public_env.to_names(),
             cargo_name,
             scope: ScopeSpec::Package {
                 root: package_root,
@@ -715,12 +716,21 @@ const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// failure. Without this, a transient failure has no other route back into
 /// the orchestrator's event loop: the triggering save is lost until an
 /// unrelated future filesystem event happens to arrive.
+///
+/// When the OS refuses the retry's thread the session keeps running and says
+/// the retry is skipped; the next filesystem event rebuilds as usual.
 fn schedule_resolve_retry(evt_tx: &mpsc::Sender<OrchestratorEvent>) {
     let retry_tx = evt_tx.clone();
-    thread::spawn(move || {
+    let scheduled = threads::spawn_named(ThreadRole::WatchResolveRetry, move || {
         thread::sleep(RESOLVE_RETRY_DELAY);
         let _ = retry_tx.send(OrchestratorEvent::FsBatch { settle: None });
     });
+    if let Err(refused) = scheduled {
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(&text::watch_thread_refused(&refused)),
+            WatchRole::Info,
+        );
+    }
 }
 
 /// A handle to a running [`spawn`]ed watch session.
@@ -807,8 +817,13 @@ impl Drop for WatchHandle {
 /// (as an [`OrchestratorEvent::Shutdown`]), so shutdown ordering is
 /// serialised with every other event exactly like a real Ctrl-C would be —
 /// no separate code path to keep in sync.
-#[must_use]
-pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, WatchHandle) {
+///
+/// # Errors
+///
+/// [`CliError::ThreadRefused`] when the OS refuses the session's thread.
+pub fn spawn(
+    opts: WatchOptions,
+) -> Result<(thread::JoinHandle<Result<(), CliError>>, WatchHandle), CliError> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     // `done_tx` is moved into the spawned thread's own closure (never handed
     // to `run_inner` itself) and is unconditionally dropped the instant that
@@ -817,18 +832,18 @@ pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, W
     // `WatchHandle::wait_for_shutdown` therefore unblocks promptly even if
     // `run_inner` fails before ever reaching its main loop.
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let handle = thread::spawn(move || {
+    let handle = threads::spawn_named(ThreadRole::WatchSession, move || {
         let result = run_inner(&opts, Some(stop_rx));
         let _ = done_tx.send(());
         result
-    });
-    (
+    })?;
+    Ok((
         handle,
         WatchHandle {
             stop_tx,
             done_rx: Mutex::new(Some(done_rx)),
         },
-    )
+    ))
 }
 
 enum CompileOutcome {
@@ -997,13 +1012,14 @@ fn run_inner(
 
     let (batch_tx, batch_rx) = mpsc::channel::<ipe_watch::Batch>();
     let debounce_cfg = opts.debounce;
-    let coalesce_handle =
-        thread::spawn(move || ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg));
+    let coalesce_handle = threads::spawn_named(ThreadRole::WatchCoalesce, move || {
+        ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg);
+    })?;
 
     let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
     {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchFsRelay, move || {
             for batch in batch_rx {
                 // The settle window is the batch's arrival now minus when its
                 // first raw event opened the window — the true edit→settled
@@ -1014,7 +1030,7 @@ fn run_inner(
                     return;
                 }
             }
-        });
+        })?;
     }
     // SIGTERM → orderly shutdown, for the CLI `run()` path ONLY (`external_stop`
     // is `None` exactly there). A supervisor's `kill -TERM <ipe-pid>` (systemd's
@@ -1065,11 +1081,11 @@ fn run_inner(
     }
     if let Some(stop_rx) = external_stop {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchStopRelay, move || {
             if stop_rx.recv().is_ok() {
                 let _ = evt_tx.send(OrchestratorEvent::Shutdown);
             }
-        });
+        })?;
     }
 
     // Resolve the runtime crate root once, fail-closed, before the event loop
@@ -1352,8 +1368,8 @@ fn run_inner(
                 let db_worker = db_main.clone();
                 let entry_path = resolved.entry_path.clone();
                 let blame_path = resolved.blame_path.clone();
-                let evt_tx = evt_tx.clone();
-                compile_worker = Some(thread::spawn(move || {
+                let worker_tx = evt_tx.clone();
+                let spawned = threads::spawn_named(ThreadRole::WatchCompile, move || {
                     // Measure the salsa warm-compile on the worker thread: the
                     // orchestrator only sees the event, so the span has to be
                     // taken here at the real call boundary.
@@ -1373,12 +1389,24 @@ fn run_inner(
                             Ok(Err(e)) => CompileOutcome::Red(e.to_string()),
                             Err(_cancelled) => CompileOutcome::Cancelled,
                         };
-                    let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                    let _ = worker_tx.send(OrchestratorEvent::CompileDone {
                         generation: this_gen,
                         outcome,
                         compile: compile_started.elapsed(),
                     });
-                }));
+                });
+                // A refused worker is this generation's red compile, so the
+                // session reports it and waits for the next edit.
+                match spawned {
+                    Ok(worker) => compile_worker = Some(worker),
+                    Err(refused) => {
+                        let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                            generation: this_gen,
+                            outcome: CompileOutcome::Red(refused.to_string()),
+                            compile: Duration::ZERO,
+                        });
+                    }
+                }
             }
 
             OrchestratorEvent::CompileDone {
@@ -3214,7 +3242,7 @@ fn spawn_cargo_build(
     }));
     let shared_for_waiter = Arc::clone(&shared);
 
-    thread::spawn(move || {
+    let waiter = threads::spawn_os(ThreadRole::WatchCargoWaiter, move || {
         // Both pipes drain on threads scoped to this waiter while it polls, so
         // the drains end with the build and are joined before the event goes out.
         let drained = pipes.drain_while(|| {
@@ -3267,6 +3295,15 @@ fn spawn_cargo_build(
             cargo: cargo_started.elapsed(),
         });
     });
+    if let Err(refused) = waiter {
+        // No waiter would ever reap the build, so it is stopped and reaped
+        // here before the refusal goes back.
+        let mut cargo = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = cargo.child.kill();
+        let _ = cargo.child.wait();
+        drop(cargo);
+        return Err(refused);
+    }
 
     Ok(shared)
 }
@@ -3914,29 +3951,31 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind an ephemeral loopback listener");
         let port = listener.local_addr().expect("local addr").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept the sender");
-            // Read the token record: 4-byte length prefix then the token bytes.
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).expect("read token length");
-            let token_len = u32::from_be_bytes(len_buf) as usize;
-            let mut token = vec![0u8; token_len];
-            stream.read_exact(&mut token).expect("read token body");
-            // Drain the frame record (prefix + body) so the sender's write completes.
-            stream.read_exact(&mut len_buf).expect("read frame length");
-            let frame_len = u32::from_be_bytes(len_buf) as usize;
-            let mut frame = vec![0u8; frame_len];
-            stream.read_exact(&mut frame).expect("read frame body");
-            // Reply with a positive Ack, mirroring the child's ack stub.
-            let ack = ControlFrame::Ack {
-                ok: true,
-                detail: "ack".to_string(),
-            };
-            let out = encode_frame(&ack).expect("encode the ack");
-            stream.write_all(&out).expect("write the ack");
-            stream.flush().expect("flush the ack");
-            String::from_utf8(token).expect("token is utf8")
-        });
+        let server = std::thread::Builder::new()
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept the sender");
+                // Read the token record: 4-byte length prefix then the token bytes.
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).expect("read token length");
+                let token_len = u32::from_be_bytes(len_buf) as usize;
+                let mut token = vec![0u8; token_len];
+                stream.read_exact(&mut token).expect("read token body");
+                // Drain the frame record (prefix + body) so the sender's write completes.
+                stream.read_exact(&mut len_buf).expect("read frame length");
+                let frame_len = u32::from_be_bytes(len_buf) as usize;
+                let mut frame = vec![0u8; frame_len];
+                stream.read_exact(&mut frame).expect("read frame body");
+                // Reply with a positive Ack, mirroring the child's ack stub.
+                let ack = ControlFrame::Ack {
+                    ok: true,
+                    detail: "ack".to_string(),
+                };
+                let out = encode_frame(&ack).expect("encode the ack");
+                stream.write_all(&out).expect("write the ack");
+                stream.flush().expect("flush the ack");
+                String::from_utf8(token).expect("token is utf8")
+            })
+            .expect("spawn test thread");
 
         let frame = ControlFrame::Ack {
             ok: true,
@@ -4221,6 +4260,61 @@ mod tests {
         assert!(
             matches!(outcome, Some(super::CargoOutcome::Killed)),
             "a superseded build must report Killed"
+        );
+    }
+
+    /// A build whose waiter thread the OS refuses is an error, and the build
+    /// it had started is killed and reaped before that error goes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_cargo_waiter_reaps_the_build() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchCargoWaiter);
+        let cargo = fake_cargo("waiter_refused", "exec sleep 30");
+        let out_dir = cargo.parent().expect("fake cargo has a parent dir");
+        let (tx, _rx) = mpsc::channel();
+        let spawned =
+            super::spawn_cargo_build(&cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true);
+        let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
+        let _ = std::fs::remove_dir_all(out_dir);
+        assert!(
+            spawned.is_err(),
+            "a refused waiter must fail the build start"
+        );
+        assert_eq!(
+            left.err(),
+            Some(rustix::io::Errno::CHILD),
+            "the refused build's child must already be reaped"
+        );
+    }
+
+    /// A watch session whose thread the OS refuses is a typed error, not a
+    /// panic in the embedder.
+    #[test]
+    fn a_refused_session_thread_is_a_typed_error() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchSession);
+        let opts = super::WatchOptions::new(
+            PathBuf::from("Main.ipe"),
+            PathBuf::from("out"),
+            PathBuf::from("runtime"),
+        );
+        assert!(matches!(
+            super::spawn(opts),
+            Err(crate::CliError::ThreadRefused {
+                role: crate::threads::ThreadRole::WatchSession,
+                ..
+            })
+        ));
+    }
+
+    /// A refused retry thread skips the retry and leaves the session running.
+    #[test]
+    fn a_refused_resolve_retry_is_skipped() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchResolveRetry);
+        let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
+        schedule_resolve_retry(&evt_tx);
+        assert!(
+            evt_rx.recv_timeout(RESOLVE_RETRY_DELAY * 2).is_err(),
+            "a refused retry sends nothing"
         );
     }
 

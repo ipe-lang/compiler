@@ -42,11 +42,20 @@ impl JailMounts {
         working_tree: CanonicalPath,
         read_only: Vec<CanonicalPath>,
     ) -> Result<Self, JailPathError> {
-        let cargo_home = crate::home::tool_home("CARGO_HOME", ".cargo")
+        let home = crate::home::home_dir();
+        let cargo_home = crate::home::tool_home("CARGO_HOME", home.as_ref().ok(), ".cargo")
             .map_err(JailPathError::ToolHomeRelative)?;
-        let homes = HomeMasks::resolve(crate::home::home_dir().as_deref(), cargo_home.as_deref())?;
-        let cargo_home = cargo_home.ok_or(JailPathError::UserHomeUnresolved)?;
-        Self::checked(scoped_tmp, working_tree, read_only, homes, cargo_home)
+        let user_home = home.map_err(JailPathError::UserHomeUnresolved)?;
+        let homes = HomeMasks::resolve(Ok(&user_home), cargo_home.as_ref())?;
+        let cargo_home =
+            cargo_home.unwrap_or_else(|| crate::home::ToolHome::under(&user_home, ".cargo"));
+        Self::checked(
+            scoped_tmp,
+            working_tree,
+            read_only,
+            homes,
+            cargo_home.as_path().to_path_buf(),
+        )
     }
 
     /// `scoped_tmp`, `working_tree`, and `read_only` checked against

@@ -117,8 +117,6 @@ impl Subsystem {
 /// - Test-only variables (`IPE_TEST_*`, `IPE_BLESS`, `IPE_RUN_WITH_TEST_VAR`,
 ///   `IPE_LOAD_ENV_PROBE_VAR`, `IPE_HTTP_TEST_URL`, `IPE_ORACLE_SHARED_TARGET`,
 ///   `IPE_DEBUG_TODO_SUBPROCESS`).
-/// - Deprecated `IPE_LIVE_*` aliases (being removed; documented as "deprecated
-///   alias" in the `purpose` field of their canonical `IPE_WEB_*` replacement).
 /// - Build-time baked vars set by `option_env!` only
 ///   (`IPE_BUILD_COMMIT`, `IPE_BUILD_AT`, `IPE_VERSION`) — documented here for
 ///   operator awareness but never read via `std::env::var` at runtime.
@@ -730,11 +728,14 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_DENY_PRIVATE",
-        default: "unset (auto: on in production, off in dev)",
+        default: "unset (on, except a development binary with no exposed listener)",
         purpose: "Set to `1`, `on`, or `true` to block all outbound HTTP / SMTP / \
                   database connections to RFC-1918 private, loopback, and link-local \
-                  addresses, closing the SSRF attack surface. In production the guard \
-                  is on by default; set to `0` to disable explicitly in dev.",
+                  addresses, closing the SSRF attack surface; `0`, `off`, or `false` \
+                  disables it. Unset, the guard is on in every `ipe release` artifact \
+                  and production posture, and off only in a development binary in a \
+                  dev posture that has bound no listener beyond loopback. Any other \
+                  value turns the guard on and logs one warning.",
         subsystem: Subsystem::Http,
         class: Class::SecurityTunable,
     },
@@ -795,7 +796,9 @@ pub static ENV_VARS: &[EnvVar] = &[
                   console requires a token, Secure cookies, no dev banner. Unset, the \
                   build decides: `ipe build`, `ipe run`, `ipe test` and `ipe watch` \
                   binaries read as development, `ipe release` artifacts as production. \
-                  Also accepted as bare `ENV`.",
+                  An `ipe release` artifact is production whatever this says: a dev \
+                  marker there opens no dev-only surface and logs one notice. Also \
+                  accepted as bare `ENV`.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
@@ -981,7 +984,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_BANNER",
         default: "unset (on in dev)",
         purpose: "Set to `off`, `0`, or `false` to disable the reconnection-status \
-                  banner in the browser client. Deprecated alias: `IPE_LIVE_BANNER`.",
+                  banner in the browser client.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -990,8 +993,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "unset (root-mounted)",
         purpose: "Sub-app mount prefix, e.g. `/billing`. All session-cookie, \
                   CSRF-cookie, and asset paths are scoped to this prefix. Set \
-                  automatically when mounting a sub-app. Deprecated alias: \
-                  `IPE_LIVE_BASE_PATH`.",
+                  automatically when mounting a sub-app.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -999,8 +1001,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_CSRF_ORIGIN_CHECK",
         default: "unset (off)",
         purpose: "Set to `on` to enforce strict `Origin`-header cross-origin checking \
-                  on top of the double-submit CSRF token. Deprecated alias: \
-                  `IPE_LIVE_CSRF_ORIGIN_CHECK`.",
+                  on top of the double-submit CSRF token.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1010,7 +1011,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Space-separated `Content-Security-Policy: frame-ancestors` allow-list, \
                   e.g. `https://app.example.com`. Enables embedding this app in a \
                   third-party iframe; also sets `SameSite=None; Secure` on session \
-                  cookies. Deprecated alias: `IPE_LIVE_FRAME_ANCESTORS`.",
+                  cookies.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1018,7 +1019,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_HEARTBEAT_TTL_MS",
         default: "35000",
         purpose: "SSE heartbeat interval (ms) the browser uses to detect a stale \
-                  connection. Deprecated alias: `IPE_LIVE_HEARTBEAT_TTL_MS`.",
+                  connection.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1026,8 +1027,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_HELLO_TIMEOUT_MS",
         default: "8000",
         purpose: "Timeout (ms) for the initial SSE hello handshake. The browser \
-                  closes and retries if this deadline passes. Deprecated alias: \
-                  `IPE_LIVE_HELLO_TIMEOUT_MS`.",
+                  closes and retries if this deadline passes.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1035,8 +1035,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_MAX_BODY_BYTES",
         default: "33554432 (32 MiB)",
         purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
-                  for large file uploads; lower to tighten the DoS floor. Deprecated \
-                  alias: `IPE_LIVE_MAX_BODY_BYTES`.",
+                  for large file uploads; lower to tighten the DoS floor.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1044,8 +1043,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_MAX_SESSIONS",
         default: "50000",
         purpose: "Maximum concurrent web sessions before new connections are rejected. \
-                  Prevents unbounded memory growth under a session-creation flood. \
-                  Deprecated alias: `IPE_LIVE_MAX_SESSIONS`.",
+                  Prevents unbounded memory growth under a session-creation flood.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1062,8 +1060,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_QUEUE_MAX",
         default: "50",
-        purpose: "Maximum queued events per session before back-pressure is applied. \
-                  Deprecated alias: `IPE_LIVE_QUEUE_MAX`.",
+        purpose: "Maximum queued events per session before back-pressure is applied.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1082,7 +1079,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_RETRY_BASE_MS",
         default: "500",
         purpose: "Initial retry interval (ms) for client reconnection after a \
-                  disconnect. Deprecated alias: `IPE_LIVE_RETRY_BASE_MS`.",
+                  disconnect.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1099,23 +1096,21 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "3000",
         purpose: "Duration (ms) of the fast-retry window after a disconnect. Set to \
                   `8000` automatically by `ipe watch` to accommodate server restart \
-                  time. Deprecated alias: `IPE_LIVE_RETRY_FAST_WINDOW_MS`.",
+                  time.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_ATTEMPTS",
         default: "10",
-        purpose: "Maximum reconnection attempts before the client stops retrying. \
-                  Deprecated alias: `IPE_LIVE_RETRY_MAX_ATTEMPTS`.",
+        purpose: "Maximum reconnection attempts before the client stops retrying.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_MS",
         default: "16000",
-        purpose: "Maximum retry interval (ms) — the exponential back-off ceiling. \
-                  Deprecated alias: `IPE_LIVE_RETRY_MAX_MS`.",
+        purpose: "Maximum retry interval (ms) — the exponential back-off ceiling.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1124,7 +1119,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "1500",
         purpose: "Grace period (ms) between receiving SIGTERM and closing active \
                   connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown. Deprecated alias: `IPE_LIVE_SHUTDOWN_GRACE_MS`.",
+                  immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1132,8 +1127,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_SSE_BUFFER",
         default: "16",
         purpose: "SSE channel buffer capacity per session (clamped 1–1024). A full \
-                  buffer applies TCP backpressure rather than dropping events. \
-                  Deprecated alias: `IPE_LIVE_SSE_BUFFER`.",
+                  buffer applies TCP backpressure rather than dropping events.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1141,8 +1135,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_STATIC_DIR",
         default: "unset",
         purpose: "Directory served at `/static/*`. Populated from `package.ipe [web] \
-                  static`. Path traversal is blocked by construction. Deprecated alias: \
-                  `IPE_LIVE_STATIC_DIR`.",
+                  static`. Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1187,8 +1180,7 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_WEB_TTL",
         default: "1800 (30 min)",
         purpose: "Session idle TTL. Accepts seconds (`1800`) or duration strings \
-                  (`30m`, `1h`). Takes precedence over `Web.sessionTtl`. Deprecated \
-                  alias: `IPE_LIVE_TTL`.",
+                  (`30m`, `1h`). Takes precedence over `Web.sessionTtl`.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1242,10 +1234,12 @@ pub static ENV_VARS: &[EnvVar] = &[
 ];
 
 /// Set of variable names that are intentionally excluded from the drift gate
-/// because they are test-only, build-time baked, or deprecated aliases.
+/// because they are test-only, internal, or build-time baked.
 ///
 /// The drift gate checks that every `IPE_*` string literal read at runtime
-/// appears in `ENV_VARS` OR in this exclusion set.
+/// appears in `ENV_VARS` OR in this exclusion set. The reverse holds too: a name
+/// here that no source file reads is refused, as is an `IPE_*` name in a registry
+/// entry's text that is neither registered nor excluded.
 pub static EXCLUDED_NAMES: &[&str] = &[
     // Test harness variables — not operator-facing.
     "IPE_ALLOWED_E2E", // Windows jail e2e test sentinel
@@ -1254,8 +1248,7 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_CAPABILITY_FLOOR", // a linker-retained static symbol, not an env var
     "IPE_COVERAGE_BUILD_JOBS", // coverage test harness: parallel build+run job count
     "IPE_DEBUG_TODO_SUBPROCESS",
-    "IPE_DEFINITELY_NOT_REGISTERED_PROBE", // synthetic orphan-read fixture for the env-var coverage matrix
-    "IPE_E2E",                             // CI gate for enabling e2e test suites
+    "IPE_E2E",                              // CI gate for enabling e2e test suites
     "IPE_E2E_BUILD_IDLE_SECS", // golden E2E harness: emitted-crate build idle-inactivity cap
     "IPE_E2E_BUILD_TIMEOUT_SECS", // golden E2E harness: emitted-crate build fail-fast cap
     "IPE_E2E_SECRET",          // macOS jail e2e test sentinel
@@ -1264,9 +1257,7 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_FUZZ_SEED",           // fuzz template harness: random-run seed
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
-    "IPE_JUNCTION_AT",  // Windows junction test helper: PowerShell script input
     "IPE_JUNCTION_OUT", // Windows junction test helper: compiled helper output path
-    "IPE_JUNCTION_TO",  // Windows junction test helper: PowerShell script input
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
@@ -1280,8 +1271,9 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TEST_BOOL_T",
     "IPE_TEST_BOOL_UNSET",
     "IPE_TEST_CEILING", // runtime env-ceiling contract tests: a fixed name, never read in production
+    "IPE_TEST_DURATION", // runtime env-duration contract tests: a fixed name, never read in production
+    "IPE_TEST_DURATION_LIVE", // runtime env-duration live-read test: a fixed name, never read in production
     "IPE_TEST_GETENV_PRESENT",
-    "IPE_TEST_GETENV_UNSET_XYZ_",
     "IPE_TEST_GETENV_UNSET_XYZ_42", // variant with numeric suffix in proptest
     "IPE_TEST_INT_BAD",
     "IPE_TEST_INT_OK",
@@ -1292,27 +1284,6 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TMP", // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
     "IPE_WINDOWS_E2E_ENV_CHILD", // Windows jail e2e: marks the env-seeded re-exec
-    // Deprecated IPE_LIVE_* aliases — documented in the canonical IPE_WEB_* entry.
-    "IPE_LIVE_BANNER",
-    "IPE_LIVE_BASE_PATH",
-    "IPE_LIVE_CSRF_ORIGIN_CHECK",
-    "IPE_LIVE_FRAME_ANCESTORS",
-    "IPE_LIVE_HEARTBEAT_TTL_MS",
-    "IPE_LIVE_HELLO_TIMEOUT_MS",
-    "IPE_LIVE_MAX_BODY_BYTES",
-    "IPE_LIVE_MAX_SESSIONS",
-    "IPE_LIVE_PORT",
-    "IPE_LIVE_QUEUE_MAX",
-    "IPE_LIVE_RETRY_BASE_MS",
-    "IPE_LIVE_RETRY_FAST_WINDOW_MS",
-    "IPE_LIVE_RETRY_MAX_ATTEMPTS",
-    "IPE_LIVE_RETRY_MAX_MS",
-    "IPE_LIVE_SHUTDOWN_GRACE_MS",
-    "IPE_LIVE_SSE_BUFFER",
-    "IPE_LIVE_STATIC_DIR",
-    "IPE_LIVE_STORE",
-    "IPE_LIVE_STORE_PATH",
-    "IPE_LIVE_TTL",
     // Dev-loop-internal listener relocation port — set by `ipe watch` and the
     // dev console proxy on the child they spawn (never operator-set); it
     // outranks the operator port vars and is never inherited by `Process.*` children.

@@ -2710,6 +2710,39 @@ pub fn carrier_is_clone(ty: &IrType, payloads: &crate::EnumPayloadTable) -> bool
     }
 }
 
+/// Does this type's emitted carrier implement `Clone` under the bound every emitted generic carries?
+///
+/// The verdict of [`carrier_is_clone`], except that a [`IrType::Generic`] or
+/// [`IrType::RowGeneric`] leaf counts as `Clone` at every depth: the emitter
+/// stamps a `Clone` bound on every type parameter and row witness, so a
+/// `.clone()` of such a value type-checks.
+#[must_use]
+pub fn carrier_is_clone_bounded(ty: &IrType, payloads: &crate::EnumPayloadTable) -> bool {
+    if matches!(ty, IrType::Generic(_) | IrType::RowGeneric(_)) {
+        return true;
+    }
+    match carrier_leaf(ty) {
+        CarrierLeaf::Clone => true,
+        CarrierLeaf::NonClone => false,
+        CarrierLeaf::Carrier(Carried::One(e)) => carrier_is_clone_bounded(e, payloads),
+        CarrierLeaf::Carrier(Carried::Pair(a, b)) => {
+            carrier_is_clone_bounded(a, payloads) && carrier_is_clone_bounded(b, payloads)
+        }
+        CarrierLeaf::Carrier(Carried::Tuple(es)) => {
+            es.iter().all(|e| carrier_is_clone_bounded(e, payloads))
+        }
+        CarrierLeaf::Carrier(Carried::Record(fields)) => fields
+            .values()
+            .all(|f| carrier_is_clone_bounded(f, payloads)),
+        CarrierLeaf::Carrier(Carried::Enum { home, name, args }) => {
+            args.iter().all(|a| carrier_is_clone_bounded(a, payloads))
+                && !crate::enum_payload_holds(home, name, payloads, &|p| {
+                    !crate::payload_leaf_is_clone(p)
+                })
+        }
+    }
+}
+
 /// Does a value of `ty` hold a `Task` / `Cmd` / `Sub` effect carrier anywhere?
 ///
 /// Every effect carrier renders to a runtime value with no `Clone` impl, so a
@@ -2937,6 +2970,9 @@ pub enum Expr {
     ListIndexClone {
         list: Box<Self>,
         index: usize,
+        /// The list's element type; the emitter proves it is `Clone` before
+        /// it writes the `.clone()`.
+        elem: IrType,
     },
     /// A borrowing list-length CHECK for a Class 4 item C2 arm guard:
     /// `<list>.len() >= <len>` (`exact == false`, an OPEN cons chain
@@ -3401,11 +3437,11 @@ pub enum BinOp {
     /// panics on `b == 0` (divide by zero) **and** on `i64::MIN / -1`
     /// (signed overflow); `//` is a Rust line comment, so it cannot be
     /// emitted literally. The backend routes this variant through the total
-    /// helper `ipe_runtime::math::ipe_int_div(l, r)`, never via `op_str`.
+    /// helper `ipe_runtime::math::ipe_int_div(l, r)`, never as a raw infix token.
     IntDiv,
     /// String append `++`. Unlike the infix arithmetic/comparison operators,
     /// this has no single Rust infix form for two `String`s, so the backend
-    /// emits it as a `format!` concatenation rather than via `op_str`.
+    /// emits it as a `format!` concatenation rather than as an infix token.
     Append,
 }
 
@@ -3537,10 +3573,17 @@ pub enum Pat {
     /// type `Nil | Cons`, so a `[]` arm plus an `_ :: _`-shaped arm is an
     /// exhaustive cover; coverage over the flattened shape is the type phase's
     /// usefulness check (IPE-T0010), proven before lowering. The backend renders
-    /// this directly as a Rust slice pattern (`[p0, p1]` / `[p0, p1, rest @ ..]`).
+    /// this as a Rust slice pattern (`[p0, p1]` / `[p0, p1, rest @ ..]`) over a
+    /// borrow under [`SliceOwnership::BorrowClone`], or over an owned view
+    /// under [`SliceOwnership::OwnedMove`].
     Slice {
         prefix: Vec<Self>,
         rest: Option<Box<Self>>,
+        /// How the binders take their elements; the lowerer decides it from the element type.
+        own: SliceOwnership,
+        /// The list's element type; the emitter proves it is `Clone` before a
+        /// borrowing arm clones a binder out.
+        elem: IrType,
     },
     /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches. Each
     /// alternative is an arbitrary [`Pat`] and recurses. Every alternative binds
@@ -3552,6 +3595,18 @@ pub enum Pat {
     /// discriminates). Invariant: length ≥ 2 — the lowerer never wraps a lone
     /// alternative.
     Or(Vec<Self>),
+}
+
+/// How a list pattern's binders take their elements.
+///
+/// Decided by the lowerer from the element's clone class; the emitter renders
+/// exactly this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SliceOwnership {
+    /// Borrow the scrutinee (`as_slice`), copy each binder out (`Clone` elements).
+    BorrowClone,
+    /// Consume the scrutinee into an owned view; binders move (non-`Clone` elements).
+    OwnedMove,
 }
 
 /// Whether a pattern matches EVERY value of its scrutinee type.
@@ -4708,6 +4763,8 @@ mod tests {
         assert!(!is_dispatch_free(&Pat::Slice {
             prefix: vec![Pat::Var(x)],
             rest: None,
+            own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
         }));
         assert!(!is_dispatch_free(&Pat::Str("s".to_owned())));
         Ok(())

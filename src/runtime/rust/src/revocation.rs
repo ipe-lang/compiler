@@ -68,6 +68,9 @@ pub enum Verdict {
 pub enum RevocationError {
     /// The store lock is poisoned — the store is in an unknown state.
     Unavailable,
+    /// The operator's `IPE_REVOCATION_CAPACITY` setting is refused, so no store
+    /// runs under a capacity the operator did not set.
+    Misconfigured(crate::system::EnvCeilingRefusal),
     /// The map is at its ceiling and no expired entries could be reclaimed.
     /// The new revocation was NOT recorded. The caller must escalate (e.g.
     /// rotate the signing key, which invalidates every session at once).
@@ -78,6 +81,7 @@ impl std::fmt::Display for RevocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable => write!(f, "revocation store unavailable"),
+            Self::Misconfigured(refusal) => write!(f, "revocation store unavailable: {refusal}"),
             Self::AtCapacity => write!(
                 f,
                 "revocation store at capacity — no expired entries to reclaim; \
@@ -165,18 +169,40 @@ enum MapSelector {
     Sessions,
 }
 
-fn store() -> &'static Mutex<RevocationStore> {
-    static STORE: OnceLock<Mutex<RevocationStore>> = OnceLock::new();
-    STORE.get_or_init(|| {
-        let capacity = crate::app_config::resolve_revocation_capacity();
-        Mutex::new(RevocationStore::new(capacity))
-    })
+/// The process store, or the refusal of the operator's capacity setting.
+fn store() -> &'static Result<Mutex<RevocationStore>, crate::system::EnvCeilingRefusal> {
+    static STORE: OnceLock<Result<Mutex<RevocationStore>, crate::system::EnvCeilingRefusal>> =
+        OnceLock::new();
+    STORE.get_or_init(|| store_with(crate::app_config::resolve_revocation_capacity()))
 }
 
-/// Acquire the store lock. Returns `None` on lock poison (fail-closed: the
-/// caller treats `None` as [`Verdict::Unknown`] and denies the request).
-fn lock() -> Option<MutexGuard<'static, RevocationStore>> {
-    store().lock().ok()
+/// A store of the resolved capacity; a refused capacity yields no store at all.
+///
+/// The store never runs under a capacity the operator did not set. The refusal
+/// is raised at `Server.listen`; past it, every verdict is [`Verdict::Unknown`]
+/// and every write is [`RevocationError::Misconfigured`].
+fn store_with(
+    capacity: Result<usize, crate::system::EnvCeilingRefusal>,
+) -> Result<Mutex<RevocationStore>, crate::system::EnvCeilingRefusal> {
+    capacity.map(|capacity| Mutex::new(RevocationStore::new(capacity)))
+}
+
+/// Acquire the lock of `store`: a refused capacity is
+/// [`RevocationError::Misconfigured`], a poisoned lock
+/// [`RevocationError::Unavailable`]. The per-request gate maps either to
+/// [`Verdict::Unknown`], which denies the request.
+fn guard_of(
+    store: &Result<Mutex<RevocationStore>, crate::system::EnvCeilingRefusal>,
+) -> Result<MutexGuard<'_, RevocationStore>, RevocationError> {
+    match store {
+        Ok(store) => store.lock().map_err(|_| RevocationError::Unavailable),
+        Err(refusal) => Err(RevocationError::Misconfigured(refusal.clone())),
+    }
+}
+
+/// Acquire the process store's lock (see [`guard_of`]).
+fn lock() -> Result<MutexGuard<'static, RevocationStore>, RevocationError> {
+    guard_of(store())
 }
 
 /// Query whether `subject` or `jti` is revoked.
@@ -191,7 +217,7 @@ fn lock() -> Option<MutexGuard<'static, RevocationStore>> {
 /// under-deny.
 #[must_use]
 pub fn is_revoked(subject: &str, jti: &str) -> Verdict {
-    let Some(guard) = lock() else {
+    let Ok(guard) = lock() else {
         return Verdict::Unknown;
     };
     if guard.subjects.contains_key(subject) || guard.sessions.contains_key(jti) {
@@ -207,12 +233,14 @@ pub fn is_revoked(subject: &str, jti: &str) -> Verdict {
 /// token for this subject could remain valid. A re-revoke takes the max, never
 /// shortening the window.
 pub fn revoke_subject(subject: String) -> Result<(), RevocationError> {
-    let Some(mut guard) = lock() else {
-        return Err(RevocationError::Unavailable);
-    };
+    let mut guard = lock()?;
     let now = crate::jwt::now_unix_seconds();
-    let max_lifetime =
-        i64::try_from(crate::app_config::resolve_auth_max_lifetime()).unwrap_or(i64::MAX);
+    // A refused lifetime setting leaves the longest live token unknown, so the
+    // entry never expires: the revocation is still recorded and can only
+    // over-deny. The refusal itself surfaces at `Server.listen`, `signToken`
+    // and the re-issue path.
+    let max_lifetime = crate::app_config::resolve_auth_max_lifetime()
+        .map_or(i64::MAX, |secs| i64::try_from(secs).unwrap_or(i64::MAX));
     // Expiry anchored to the *current* AuthMaxLifetime (ML): any token minted
     // right now could live at most `now + ML`, so this entry stays in the store
     // until all currently mintable tokens have expired.
@@ -243,9 +271,7 @@ pub fn revoke_subject(subject: String) -> Result<(), RevocationError> {
 /// drop the entry once the cap has passed (the JWT gate denies the token anyway
 /// from that point, making the revocation entry redundant).
 pub fn revoke_session(jti: String, cap_unix_secs: i64) -> Result<(), RevocationError> {
-    let Some(mut guard) = lock() else {
-        return Err(RevocationError::Unavailable);
-    };
+    let mut guard = lock()?;
     let now = crate::jwt::now_unix_seconds();
     guard.insert_bounded(MapSelector::Sessions, jti, cap_unix_secs, now)
 }
@@ -255,9 +281,7 @@ pub fn revoke_session(jti: String, cap_unix_secs: i64) -> Result<(), RevocationE
 /// unaffected — restoring the subject does not un-revoke specific sessions that
 /// were independently revoked via `revoke_session`).
 pub fn restore_subject(subject: &str) -> Result<(), RevocationError> {
-    let Some(mut guard) = lock() else {
-        return Err(RevocationError::Unavailable);
-    };
+    let mut guard = lock()?;
     guard.subjects.remove(subject);
     Ok(())
 }
@@ -267,9 +291,7 @@ pub fn restore_subject(subject: &str) -> Result<(), RevocationError> {
 /// `jti`). Intended for the `isRevoked` app-facing kernel (an admin UI query),
 /// not for the per-request auth gate (which calls [`is_revoked`]).
 pub fn subject_is_revoked(subject: &str) -> Result<bool, RevocationError> {
-    let Some(guard) = lock() else {
-        return Err(RevocationError::Unavailable);
-    };
+    let guard = lock()?;
     Ok(guard.subjects.contains_key(subject))
 }
 
@@ -357,6 +379,44 @@ mod tests {
     // capacity bound operate on a local RevocationStore directly.
 
     const FAR_FUTURE: i64 = i64::MAX / 2;
+
+    #[test]
+    fn a_refused_capacity_builds_no_store_and_names_its_variable() {
+        crate::system::locked_set_var("IPE_REVOCATION_CAPACITY", "1k");
+        let refused = store_with(crate::app_config::resolve_revocation_capacity());
+        crate::system::locked_set_var("IPE_REVOCATION_CAPACITY", "16");
+        let accepted = store_with(crate::app_config::resolve_revocation_capacity());
+        crate::system::locked_remove_var("IPE_REVOCATION_CAPACITY");
+        assert!(accepted.is_ok(), "a well-formed capacity builds a store");
+        match guard_of(&refused) {
+            Err(RevocationError::Misconfigured(refusal)) => {
+                assert_eq!(refusal.name(), "IPE_REVOCATION_CAPACITY");
+            }
+            Err(other) => panic!("a refused capacity must name its variable, got {other}"),
+            Ok(_) => panic!("a malformed capacity must build no store"),
+        }
+        let shown = guard_of(&refused).err().map(|e| e.to_string());
+        assert!(
+            shown.is_some_and(|s| s.contains("IPE_REVOCATION_CAPACITY")),
+            "the write error names the refused variable"
+        );
+    }
+
+    #[test]
+    fn a_refused_lifetime_still_records_a_never_expiring_revocation() {
+        let subject = "refused-lifetime-subject-001";
+        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "8h");
+        let outcome = revoke_subject(subject.to_string());
+        crate::system::locked_remove_var("IPE_AUTH_MAX_LIFETIME");
+        assert_eq!(outcome, Ok(()), "a revocation is never dropped");
+        assert_eq!(is_revoked(subject, "any-jti"), Verdict::Revoked);
+        let expiry = lock().ok().and_then(|g| g.subjects.get(subject).copied());
+        assert_eq!(
+            expiry,
+            Some(i64::MAX),
+            "an unknown lifetime keeps the entry until restored"
+        );
+    }
 
     // ─── Existing behaviour tests (updated for new signatures) ────────────────
 
@@ -657,8 +717,10 @@ mod tests {
     fn subject_expiry_covers_live_sessions() {
         let mut s = local_store(8);
         let now = now_approx();
-        let max_lifetime =
-            i64::try_from(crate::app_config::resolve_auth_max_lifetime()).unwrap_or(i64::MAX);
+        let max_lifetime = i64::try_from(
+            crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
+        )
+        .unwrap_or(i64::MAX);
         let subject_expiry = now.saturating_add(max_lifetime);
 
         s.insert_bounded(

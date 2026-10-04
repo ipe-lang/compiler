@@ -3,10 +3,11 @@ use super::{
     LitKind, LowerError, NativeUiEmit, Span, Symbol, UiDelegate, UiEmitPlan,
     appearance_literal_record_fields, callee_name, clone_targets_in_expr, collect_free_vars,
     emit_expr_at, emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars,
-    kernel_name, render_type, shape_appearance_literal_args, ui_call_shape,
+    int_literal, kernel_name, render_type, shape_appearance_literal_args, ui_call_shape,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
+use ipe_intern::rust_str_lit;
 
 /// The clone-rewritten container argument of a call whose runtime takes its
 /// arguments reversed ([`Callee::evaluates_args_reversed`], the single source of
@@ -787,11 +788,7 @@ pub fn emit_task_retry_call(
         | KernelFn::TaskWithRetryOn
         | KernelFn::TaskDefaultRetryPolicy
         | KernelFn::TaskWithMaxAttempts
-        | KernelFn::TaskWithBaseMs
-        | KernelFn::BackoffLinear
-        | KernelFn::BackoffLinearWithJitter
-        | KernelFn::BackoffExponential
-        | KernelFn::BackoffExponentialWithJitter),
+        | KernelFn::TaskWithBaseMs),
     ) = callee
     else {
         return Ok(None);
@@ -921,18 +918,6 @@ pub fn emit_task_retry_call(
                 "{{ let mut __ipe_rec = ({policy_s}); __ipe_rec.baseMs = {ms_s}; __ipe_rec }}"
             )))
         }
-        KernelFn::BackoffLinear => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::Linear".to_owned(),
-        )),
-        KernelFn::BackoffLinearWithJitter => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::LinearWithJitter".to_owned(),
-        )),
-        KernelFn::BackoffExponential => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::Exponential".to_owned(),
-        )),
-        KernelFn::BackoffExponentialWithJitter => Ok(Some(
-            "ipe_runtime::task::BackoffStrategy::ExponentialWithJitter".to_owned(),
-        )),
         KernelFn::TaskRetryOn | KernelFn::TaskWithRetryOn => {
             // `retryOn pred policy` / `withRetryOn pred policy` — move-update shouldRetry.
             let pred = args.first().ok_or_else(|| Diagnostic::CompilerBug {
@@ -1781,7 +1766,7 @@ pub fn emit_config_ctor_call(callee: &Callee) -> Option<String> {
         KernelFn::WebRevocationStore => 1,
         _ => return None,
     };
-    Some(format!("{tag}i64"))
+    Some(int_literal(tag))
 }
 
 /// Fail closed unless the entry's surface is the one whose loop reads this input subscription.
@@ -3055,7 +3040,10 @@ pub fn emit_ui_plan(
                         .map(|slot| format!("__ipe_lit.get({slot}).to_string()")),
                     (Some(LitKind::Int), Expr::Int(n)) => {
                         ctx.hoist_style_literal(&n.to_string()).map(|slot| {
-                            format!("__ipe_lit.get({slot}).parse::<i64>().unwrap_or({n}i64)")
+                            format!(
+                                "__ipe_lit.get({slot}).parse::<i64>().unwrap_or({})",
+                                int_literal(*n)
+                            )
                         })
                     }
                     (Some(LitKind::Float), Expr::Float(f)) if f.is_finite() => {
@@ -4024,6 +4012,7 @@ pub fn emit_ui_plan(
                     detail: format!("{k:?} is not a fully-classified Html event kernel"),
                 });
             };
+            let name_lit = rust_str_lit(name);
             let [payload_e] = args else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_ui_call::HtmlEvent",
@@ -4050,14 +4039,14 @@ pub fn emit_ui_plan(
             };
             let call = match shape {
                 ipe_ir::HtmlEventShape::Msg => {
-                    format!("ipe_runtime::html::html_on_msg_({name:?}.to_owned(), {payload_s})")
+                    format!("ipe_runtime::html::html_on_msg_({name_lit}.to_owned(), {payload_s})")
                 }
                 ipe_ir::HtmlEventShape::String => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_string_({name:?}.to_owned(), \
+                    "ipe_runtime::html::html_on_string_({name_lit}.to_owned(), \
                      ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
                 )),
                 ipe_ir::HtmlEventShape::Bool => wrap_hoisted(format!(
-                    "ipe_runtime::html::html_on_bool_({name:?}.to_owned(), \
+                    "ipe_runtime::html::html_on_bool_({name_lit}.to_owned(), \
                      ::std::sync::Arc::new(move |_x| ({peeled_payload_src})(_x)))"
                 )),
                 // `html_on_raw_`'s own signature requires
@@ -4134,10 +4123,10 @@ pub fn emit_ui_plan(
                 // (`F: Fn(T) -> M + Send + Sync + 'static`) requires.
                 ipe_ir::HtmlEventShape::Raw => match on_form {
                     ipe_ir::OnFormKind::FixedValue => format!(
-                        "ipe_runtime::html::html_on_raw_fixed_({name:?}.to_owned(), {payload_s})"
+                        "ipe_runtime::html::html_on_raw_fixed_({name_lit}.to_owned(), {payload_s})"
                     ),
                     ipe_ir::OnFormKind::Decoder => wrap_hoisted(format!(
-                        "ipe_runtime::html::html_on_raw_({name:?}.to_owned(), move |_x| ({peeled_payload_src})(_x))"
+                        "ipe_runtime::html::html_on_raw_({name_lit}.to_owned(), move |_x| ({peeled_payload_src})(_x))"
                     )),
                     ipe_ir::OnFormKind::NotForm => {
                         return Err(Diagnostic::CompilerBug {

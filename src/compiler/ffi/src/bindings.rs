@@ -24,7 +24,10 @@
 
 use std::collections::BTreeSet;
 
+use ipe_intern::rust_str_lit;
+
 use crate::carrier::{Carrier, ClosureRet, ClosureSig, EnumDef, StructDef};
+use crate::emit::{foreign_to_ipe, param_ipe_type};
 use crate::naming::{RustIdent, arg_name, rust_kernel_name, rust_safe_ident, wrapper_fn_ident};
 use crate::num_coerce::{is_numeric_rust, num_saturate, num_widen_scalar};
 use crate::pkginfo::{Effect, EnumArm, EnumVariantKind, FnInfo, FnShape, Param, PkgInfo};
@@ -68,15 +71,6 @@ pub fn absolutize_crate(krate: &str, s: &str) -> String {
         }
     }
     out
-}
-
-/// Render `s` as a double-quoted Rust string literal.
-///
-/// Rust's own `Debug` grammar escapes every character a literal cannot carry
-/// raw, so a foreign tag name holding `"`, `\` or a bidi override stays inside
-/// the literal and never trips rustc's `text_direction_codepoint_in_literal`.
-fn rust_str_lit(s: &str) -> String {
-    format!("{s:?}")
 }
 
 /// If the type is `Wrapper<inner>`, return `inner` (trimmed).
@@ -630,14 +624,11 @@ fn translate_tuple_ret(comps: &[String]) -> (String, RetCoercion) {
 fn effective_ok_raw(f: &FnInfo) -> String {
     let raw = f.results().first().map_or("", Param::rust_type_str);
     let base = if raw.is_empty() {
-        let ipe = f.results().first().map_or("()", |r| {
-            if r.foreign_ty.is_empty() {
-                "()"
-            } else {
-                r.foreign_ty.as_str()
-            }
-        });
-        ipe_type_to_rust(ipe)
+        let ipe = f
+            .results()
+            .first()
+            .map_or_else(|| "()".to_owned(), |r| foreign_to_ipe(&r.foreign_ty));
+        ipe_type_to_rust(&ipe)
     } else {
         raw.to_owned()
     };
@@ -772,7 +763,7 @@ struct WrapperCx<'a> {
 impl<'a> WrapperCx<'a> {
     fn new(krate: &'a str, kernel_name: &str, f: &'a FnInfo) -> Self {
         let ref_name = f.wrapper_ref_name();
-        let surface_types: Vec<String> = f.params().iter().map(|p| p.ipe_type.clone()).collect();
+        let surface_types: Vec<String> = f.params().iter().map(param_ipe_type).collect();
         let raw_param_types: Vec<String> = f
             .params()
             .iter()
@@ -939,14 +930,12 @@ impl<'a> WrapperCx<'a> {
     fn effective_raw_result(&self) -> String {
         let raw = self.f.results().first().map_or("", Param::rust_type_str);
         if raw.is_empty() {
-            let ipe = self.f.results().first().map_or("()", |r| {
-                if r.foreign_ty.is_empty() {
-                    "()"
-                } else {
-                    r.foreign_ty.as_str()
-                }
-            });
-            ipe_type_to_rust(ipe)
+            let ipe = self
+                .f
+                .results()
+                .first()
+                .map_or_else(|| "()".to_owned(), |r| foreign_to_ipe(&r.foreign_ty));
+            ipe_type_to_rust(&ipe)
         } else {
             raw.to_owned()
         }
@@ -2347,11 +2336,6 @@ mod tests {
     // ── helper units ────────────────────────────────────────────────────
 
     #[test]
-    fn rust_str_lit_escapes_quotes_backslashes_and_bidi_overrides() {
-        assert_eq!(rust_str_lit("a\u{202E}\"b\\"), r#""a\u{202e}\"b\\""#);
-    }
-
-    #[test]
     fn absolutize_rewrites_only_path_starts() {
         assert_eq!(absolutize_crate("csv", "csv::Reader"), "::csv::Reader");
         assert_eq!(
@@ -2859,6 +2843,31 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
             out.contains("// IPE-FFI-WRAPPER BEGIN counter_new"),
             "{out}"
         );
+    }
+
+    /// A param/result carrying only its foreign `type` (no `ipeType`, no
+    /// `rustType`) takes the same Ipê type the interface signature declares
+    /// (`emit::param_ipe_type`), so the wrapper and the `Rust.<Crate>`
+    /// forwarder agree on `i64`, never the `String` opaque fallback.
+    #[test]
+    fn a_type_only_param_and_result_match_the_interface_signature() {
+        let pkg = semver_pkg(&json!([{
+            "name": "shift",
+            "params": [{"name": "n", "type": "i64"}],
+            "results": [{"name": "", "type": "i64"}],
+            "effect": "pure"
+        }]));
+        let f = pkg.fns().first().expect("one fn");
+        assert_eq!(
+            crate::emit::wrapper_ipe_signature(f),
+            "Int -> Result Error Int"
+        );
+        let out = emit_bindings(&pkg);
+        assert!(
+            out.contains("pub fn semver_shift(arg0: i64) -> IpeResult<IpeError, i64> {"),
+            "{out}"
+        );
+        assert!(out.contains("::semver::shift(arg0)"), "{out}");
     }
 
     #[test]

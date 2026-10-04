@@ -208,11 +208,13 @@ fn lsp_diagnostics_query_is_cancelled_by_the_next_keystroke_and_converges_to_lat
     // CLONED database handle, exactly `ipe watch`'s orchestrator/worker
     // split (see the doc comment in `crates/ipe/src/watch.rs`).
     let db_worker = db.clone();
-    let worker = thread::spawn(move || {
-        salsa::Cancelled::catch(AssertUnwindSafe(|| {
-            ipe_db::typecheck(&db_worker, root, entry).clone()
-        }))
-    });
+    let worker = thread::Builder::new()
+        .spawn(move || {
+            salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                ipe_db::typecheck(&db_worker, root, entry).clone()
+            }))
+        })
+        .expect("spawn test thread");
 
     first_exec_rx
         .recv_timeout(Duration::from_secs(10))
