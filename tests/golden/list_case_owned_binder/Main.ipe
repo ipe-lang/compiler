@@ -120,6 +120,25 @@ countJusts ms =
             0
 
 
+-- A `case` whose heads bind nothing moves no element, so the list is still
+-- live for the later use.
+sizeThenRun : List (Task Error String) -> Task Error String
+sizeThenRun ts =
+    let
+        size =
+            case ts of
+                [] ->
+                    "empty "
+
+                [ _ ] ->
+                    "one "
+
+                _ ->
+                    "many "
+    in
+    sequence ts |> Task.andThen (\s -> Task.succeed (size ++ s))
+
+
 say : Task Error String -> Task Error ()
 say t =
     t |> Task.andThen (\s -> Io.println s)
@@ -140,3 +159,4 @@ main =
         |> Task.andThen (\_ -> say (firstJust [ Nothing, Just (Task.succeed "j"), Just (Task.succeed "k") ]))
         |> Task.andThen (\_ -> say (firstJust [ Nothing ]))
         |> Task.andThen (\_ -> Io.println (String.fromInt (countJusts [ Just (Task.succeed "a"), Nothing, Just (Task.succeed "b") ])))
+        |> Task.andThen (\_ -> say (sizeThenRun [ Task.succeed "a", Task.succeed "b" ]))

@@ -1141,6 +1141,38 @@ fn owned_view_scrutinee_reuse_fails_closed() -> DResult<()> {
     Ok(())
 }
 
+/// A list `case` whose heads bind nothing borrows its scrutinee even over a
+/// non-`Clone` element: it moves no part, so the consume counter still calls
+/// the list live after it, and an owned view would move it.
+#[test]
+fn binder_free_owned_list_case_borrows_the_scrutinee() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("probe")?;
+    let xs = interner.intern("xs")?;
+    let own = SliceOwnership::OwnedMove;
+    let arms = vec![
+        Arm::new(slice(vec![], None, own), Expr::Int(0)),
+        Arm::new(slice(vec![Pat::Wildcard], None, own), Expr::Int(1)),
+        Arm::new(Pat::Wildcard, Expr::Int(2)),
+    ];
+    let f = list_case_fn(func, xs, IrType::Task(Box::new(IrType::Int)), arms)?;
+    let src = emit(&interner, &program(main_mod, vec![], vec![f]))?;
+    assert!(
+        src.contains("match (xs).as_slice() {"),
+        "a binder-free list case matches the borrowed slice, got:\n{src}"
+    );
+    assert!(
+        !src.contains("ipe_list_view_owned"),
+        "a binder-free list case takes no owned view, got:\n{src}"
+    );
+    assert!(
+        !src.contains(".clone()") && !src.contains(".to_vec()"),
+        "a binder-free list case copies nothing out, got:\n{src}"
+    );
+    Ok(())
+}
+
 /// A borrow-clone list `case` keeps its borrowed-slice emission: the slice
 /// scrutinee and the copy-out rebinds of each binder.
 #[test]

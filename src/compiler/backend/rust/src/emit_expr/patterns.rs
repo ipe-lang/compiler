@@ -5,7 +5,9 @@ use super::{
 use crate::EmitCtx;
 use core::fmt::Write as _;
 use ipe_ir::SliceOwnership;
-use ipe_ir::free_vars::{free_vars, pat_bound_symbols, pat_has_str_guard_slot};
+use ipe_ir::free_vars::{
+    free_vars, pat_bound_symbols, pat_has_str_guard_slot, pat_moves_nested_part,
+};
 use std::collections::BTreeSet;
 
 /// Render `s` as a Rust double-quoted string literal through Rust's own
@@ -103,10 +105,16 @@ pub fn tuple_col_modes(arms: &[Arm], arity: usize) -> DResult<Vec<ColMode>> {
 /// under an alias or or-pattern head, must share. An owned view is one slot
 /// wider than the longest slice prefix, so a closed prefix always has the
 /// `None` slot that proves its length.
+///
+/// A column no head moves a part out of (every head binds nothing) is borrowed
+/// whatever its slices' ownership: the lowerer's consume counter counts a
+/// `case` over a variable as a move only when some head moves a part, so an
+/// owned view there would move a list the counter still calls live.
 pub fn list_view<'p>(pats: impl Iterator<Item = &'p Pat> + Clone, tag: usize) -> DResult<ListView> {
     if !pats.clone().any(|p| matches!(p, Pat::Slice { .. })) {
         return Ok(ListView::Off);
     }
+    let moves = pats.clone().any(pat_moves_nested_part);
     let mut own = None;
     let mut longest: usize = 0;
     let mut pending: Vec<&Pat> = pats.collect();
@@ -142,6 +150,7 @@ pub fn list_view<'p>(pats: impl Iterator<Item = &'p Pat> + Clone, tag: usize) ->
     match own {
         None => Ok(ListView::Off),
         Some(SliceOwnership::BorrowClone) => Ok(ListView::Borrow),
+        Some(SliceOwnership::OwnedMove) if !moves => Ok(ListView::Borrow),
         Some(SliceOwnership::OwnedMove) => {
             let width = longest
                 .checked_add(1)
@@ -559,7 +568,8 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
 /// Render one arm head of a list column for the column's [`ListView`].
 ///
 /// Every list-column arm head passes through here. A borrowed view renders the
-/// slice pattern and the copy-out rebinds of [`list_binder_rebinds`]; an owned
+/// slice pattern and the copy-out rebinds of [`list_binder_rebinds`]; a head
+/// that binds nothing has no rebind, whatever its slices' ownership. An owned
 /// view renders the move-out pattern of [`owned_list_arm_head`].
 pub fn list_arm_head(
     ctx: &EmitCtx,
@@ -567,11 +577,14 @@ pub fn list_arm_head(
     list: ListView,
 ) -> DResult<(String, String, Vec<String>)> {
     match list {
-        ListView::Borrow => Ok((
-            render_pat(ctx, pat)?,
-            list_binder_rebinds(ctx, pat, SliceOwnership::BorrowClone)?,
-            Vec::new(),
-        )),
+        ListView::Borrow => {
+            let rebinds = if pat_moves_nested_part(pat) {
+                list_binder_rebinds(ctx, pat, SliceOwnership::BorrowClone)?
+            } else {
+                String::new()
+            };
+            Ok((render_pat(ctx, pat)?, rebinds, Vec::new()))
+        }
         ListView::Owned { width, tag } => {
             let (head, prelude) = owned_list_arm_head(ctx, pat, width, tag)?;
             Ok((head, prelude, Vec::new()))
