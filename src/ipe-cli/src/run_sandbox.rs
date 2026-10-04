@@ -449,10 +449,26 @@ fn inject_floor_reference(src: &str) -> Result<String, CliError> {
 /// # Errors
 ///
 /// [`CliError::Usage`] on a missing/tampered profile or a profile weaker
-/// than the embedded floor (both refuse-to-run).
+/// than the embedded floor (both refuse-to-run); [`CliError::FileTooLarge`]
+/// on a binary past [`crate::io_bounded::RELEASE_APP_READ_CAP`].
 pub fn load_and_verify_artifact(
     profile_path: &Path,
     binary_path: &Path,
+) -> Result<SandboxProfile, CliError> {
+    verify_artifact_under(
+        profile_path,
+        binary_path,
+        crate::io_bounded::RELEASE_APP_READ_CAP,
+    )
+}
+
+/// [`load_and_verify_artifact`] with the binary read held under `binary_cap`
+/// bytes (a planted oversized binary is [`CliError::FileTooLarge`], never
+/// buffered whole).
+fn verify_artifact_under(
+    profile_path: &Path,
+    binary_path: &Path,
+    binary_cap: u64,
 ) -> Result<SandboxProfile, CliError> {
     use ipe_sandbox::run_jail;
 
@@ -471,10 +487,7 @@ pub fn load_and_verify_artifact(
     // Read the authoritative floor from the binary's embedded `.rodata` bytes
     // (passively — the binary is NOT executed). A binary with no readable floor
     // refuses.
-    let binary = std::fs::read(binary_path).map_err(|e| CliError::Io {
-        path: binary_path.to_path_buf(),
-        source: e,
-    })?;
+    let binary = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
     let floor = run_jail::scan_capfloor(&binary).ok_or_else(|| {
         CliError::Usage(crate::text::msg::run_floor_unreadable(
             &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
@@ -695,6 +708,31 @@ mod tests {
         assert!(
             !recovered.network,
             "adjacent permissive bytes cannot raise the network ceiling"
+        );
+    }
+
+    #[test]
+    fn artifact_binary_read_is_capped_before_the_floor_scan() {
+        let dir = ScratchDir::new("ipe-verify-cap").expect("scratch dir");
+        let profile = SandboxProfile::maximally_isolated();
+        let profile_path = dir.path().join("ipe.profile");
+        std::fs::write(&profile_path, profile.to_profile_string()).expect("write profile");
+        let mut binary = profile.to_capfloor_line().into_bytes();
+        binary.push(b'\n');
+        let binary_path = dir.path().join("ipe-app");
+        std::fs::write(&binary_path, &binary).expect("write binary");
+        let len = u64::try_from(binary.len()).expect("small length");
+
+        // At the cap the floor is read and verified.
+        assert!(
+            verify_artifact_under(&profile_path, &binary_path, len).is_ok(),
+            "a binary exactly at the cap verifies"
+        );
+        // One byte past the cap is refused before the binary is buffered whole.
+        let over = verify_artifact_under(&profile_path, &binary_path, len - 1);
+        assert!(
+            matches!(over, Err(CliError::FileTooLarge { .. })),
+            "a binary past the cap is FileTooLarge, got: {over:?}"
         );
     }
 
