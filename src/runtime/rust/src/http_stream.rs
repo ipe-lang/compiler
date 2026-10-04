@@ -342,6 +342,32 @@ fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Busy> {
     }
 }
 
+/// When a stream ended, relative to every other ended stream.
+///
+/// Stamped at the moment its tombstone is recorded, so the tombstone table
+/// forgets the stream that ended first, not the one that opened first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EndStamp(u64);
+
+/// Hands out `EndStamp`s in strictly increasing order.
+///
+/// A spent clock hands out none, so no stamp ever repeats or wraps.
+struct EndClock {
+    next: u64,
+}
+
+impl EndClock {
+    const fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    fn tick(&mut self) -> Option<EndStamp> {
+        let stamp = self.next;
+        self.next = stamp.checked_add(1)?;
+        Some(EndStamp(stamp))
+    }
+}
+
 /// What a `chunks` subscribe must do.
 enum Subscription<V> {
     /// First subscribe of a parked stream: drain this response.
@@ -356,12 +382,13 @@ enum Subscription<V> {
 struct StreamRegistry<V> {
     /// Streams holding a connection, parked or draining: at most `CLIENT_STREAMS_MAX`.
     live: HashMap<StreamKey, Entry<V>>,
-    /// Tombstones of ended streams with their `seq`, so a re-subscribe stays quiet.
+    /// Tombstones of ended streams with when each ended, so a re-subscribe stays quiet.
     ///
     /// A table of its own: a tombstone holds no connection, so no churn of ended
     /// streams can crowd out a live one, and no live stream can crowd out a tombstone.
-    ended: HashMap<StreamKey, u64>,
+    ended: HashMap<StreamKey, EndStamp>,
     next_seq: u64,
+    end_clock: EndClock,
     conns: Arc<Semaphore>,
 }
 
@@ -371,6 +398,7 @@ impl<V> StreamRegistry<V> {
             live: HashMap::new(),
             ended: HashMap::new(),
             next_seq: 0,
+            end_clock: EndClock::new(),
             conns: Arc::new(Semaphore::new(CLIENT_STREAMS_MAX)),
         }
     }
@@ -386,7 +414,7 @@ impl<V> StreamRegistry<V> {
     fn oldest_ended(&self) -> Option<StreamKey> {
         self.ended
             .iter()
-            .min_by_key(|(_, seq)| **seq)
+            .min_by_key(|(_, ended)| **ended)
             .map(|(k, _)| *k)
     }
 
@@ -421,15 +449,22 @@ impl<V> StreamRegistry<V> {
         self.try_permit().ok_or_else(refused)
     }
 
-    /// Remembers `key` as ended; a full table forgets its oldest tombstone first.
-    fn tombstone(&mut self, key: StreamKey, seq: u64) {
+    /// Remembers `key` as ended now; a full table first forgets the stream that ended first.
+    ///
+    /// A spent end clock records nothing and reports `false`: the handle is then
+    /// unknown, and a later subscribe, unable to record a refusal, starts nothing.
+    fn tombstone(&mut self, key: StreamKey) -> bool {
+        let Some(stamp) = self.end_clock.tick() else {
+            return false;
+        };
         if self.ended.len() >= TOMBSTONES_MAX
             && !self.ended.contains_key(&key)
             && let Some(oldest) = self.oldest_ended()
         {
             self.ended.remove(&oldest);
         }
-        self.ended.insert(key, seq);
+        self.ended.insert(key, stamp);
+        true
     }
 
     /// Parks `value` under a freshly minted handle.
@@ -470,10 +505,11 @@ impl<V> StreamRegistry<V> {
     fn close(&mut self, key: StreamKey) -> Result<(), IpeError> {
         match self.live.remove(&key) {
             Some(Entry {
-                seq,
                 slot: Slot::Draining(cancel),
+                ..
             }) => {
-                self.tombstone(key, seq);
+                // A spent end clock leaves the handle unknown, never live.
+                self.tombstone(key);
                 // The drain sees its cancel half drop and releases the connection.
                 drop(cancel);
                 Ok(())
@@ -498,14 +534,12 @@ impl<V> StreamRegistry<V> {
         if self.ended.contains_key(&key) {
             return Subscription::Active;
         }
-        match self.bump_seq() {
-            Ok(seq) => {
-                self.tombstone(key, seq);
-                Subscription::Refused
-            }
-            // A spent sequence records nothing more, so a refusal could not be
+        if self.tombstone(key) {
+            Subscription::Refused
+        } else {
+            // A spent end clock records nothing more, so a refusal could not be
             // deduplicated: start nothing.
-            Err(_) => Subscription::Active,
+            Subscription::Active
         }
     }
 
@@ -519,7 +553,8 @@ impl<V> StreamRegistry<V> {
             .is_some_and(|e| e.seq == seq && matches!(e.slot, Slot::Draining(_)));
         if owned {
             self.live.remove(&key);
-            self.tombstone(key, seq);
+            // A spent end clock leaves the handle unknown, never live.
+            self.tombstone(key);
         }
     }
 }
@@ -1254,21 +1289,41 @@ mod tests {
         assert!(matches!(drain.await, Ok(IpeResult::Ok(()))));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn close_inside_the_body_reads_no_further_chunk() {
+    /// A chunk at once, every time it is asked for, forever.
+    fn always_ready() -> FakeBody {
+        Box::pin(stream::repeat_with(|| Ok::<String, String>("x".to_owned())))
+    }
+
+    /// Where a body closes its own stream.
+    #[derive(Clone, Copy)]
+    enum CloseAt {
+        /// When the body is called, before its step is first polled.
+        Call,
+        /// Inside the step, as it completes.
+        Step,
+    }
+
+    /// Drains `upstream` through a body that closes its own stream on every call.
+    ///
+    /// A second call means a chunk was read after the close; its close is then
+    /// refused, so the drain ends `Err`.
+    async fn drain_closing_in_the_body(upstream: FakeBody, at: CloseAt) {
         let reg = new_reg::<FakeConn>();
-        let (sid, dropped) = park(reg, ticking());
+        let (sid, dropped) = park(reg, upstream);
         let key = sid.key;
         let calls = Arc::new(AtomicUsize::new(0));
         let body = {
             let calls = Arc::clone(&calls);
             move |_chunk: String| -> IpeTask<IpeError, ()> {
                 calls.fetch_add(1, Ordering::SeqCst);
-                let closed = with_registry(reg, |r| r.close(key));
-                Box::pin(std::future::ready(match closed {
+                let close = move || match with_registry(reg, |r| r.close(key)) {
                     Ok(()) => IpeResult::Ok(()),
                     Err(e) => IpeResult::Err(e),
-                }))
+                };
+                match at {
+                    CloseAt::Call => Box::pin(std::future::ready(close())),
+                    CloseAt::Step => Box::pin(async move { close() }),
+                }
             }
         };
         let drained = tokio::time::timeout(
@@ -1280,6 +1335,22 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(free_permits(reg), CLIENT_STREAMS_MAX);
+    }
+
+    /// Runs of the always-ready scenario: an unbiased wait picks the read with
+    /// probability one half each run, so all of them passing by luck is 2^-64.
+    const ALWAYS_READY_RUNS: usize = 64;
+
+    #[tokio::test(start_paused = true)]
+    async fn close_inside_the_body_reads_no_further_chunk() {
+        drain_closing_in_the_body(ticking(), CloseAt::Call).await;
+        drain_closing_in_the_body(ticking(), CloseAt::Step).await;
+        // With a chunk always ready, only the cancel arm's priority stops the
+        // next read: both arms are ready together at every wait.
+        for _ in 0..ALWAYS_READY_RUNS {
+            drain_closing_in_the_body(always_ready(), CloseAt::Call).await;
+            drain_closing_in_the_body(always_ready(), CloseAt::Step).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1304,9 +1375,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
         let started = Instant::now();
-        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        // The outer bound turns a missing idle ceiling into a failure, not a hang.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)),
+        )
+        .await;
         let waited = started.elapsed();
-        let refused = into_err(drained);
+        assert!(drained.is_ok());
+        let refused = drained.ok().and_then(into_err);
         assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
         assert!(matches!(&refused, Some(e) if message(e) == STREAM_IDLE_TIMED_OUT));
         assert!(waited >= Duration::from_secs(5));
@@ -1339,9 +1416,15 @@ mod tests {
         ];
         let (sid, _dropped) = park(reg, scripted(beats));
         let started = Instant::now();
-        let drained = for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)).await;
+        // The outer bound turns a missing idle ceiling into a failure, not a hang.
+        let drained = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            for_each_chunk_in(reg, sid.key, ms(5_000), counting_body(&calls)),
+        )
+        .await;
         let waited = started.elapsed();
-        let refused = into_err(drained);
+        assert!(drained.is_ok());
+        let refused = drained.ok().and_then(into_err);
         assert!(matches!(&refused, Some(e) if kind(e) == IpeErrorKind::Timeout));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // Two reads of 4 s each stay under the ceiling; the stall then costs one ceiling.
@@ -1488,9 +1571,9 @@ mod tests {
             ),
         )
         .await;
-        let Some(sid) = opened.ok().and_then(into_ok) else {
-            return;
-        };
+        let sid = opened.ok().and_then(into_ok);
+        assert!(sid.is_some());
+        let Some(sid) = sid else { return };
         let calls = Arc::new(AtomicUsize::new(0));
         let drain = tokio::spawn(for_each_chunk_in(
             reg,
@@ -1879,7 +1962,7 @@ mod tests {
         assert!(reg.open((), &mut source).is_ok());
     }
 
-    // E-T12: tombstones live in a table of their own, bounded and oldest-first.
+    // Tombstones live in a table of their own, bounded and oldest-first.
     #[test]
     fn the_tombstone_table_is_bounded_and_forgets_its_oldest() {
         let mut reg = StreamRegistry::<()>::new();
@@ -1916,6 +1999,60 @@ mod tests {
     }
 
     #[test]
+    fn a_full_tombstone_table_forgets_the_stream_that_ended_first() {
+        let mut reg = StreamRegistry::<()>::new();
+        let mut source = counting_source();
+        // Opened before every other handle, ended after all of them.
+        let long_lived = reg.open((), &mut source).unwrap();
+        let claimed = reg.take_for_drain(long_lived.key).unwrap();
+        let first = 10_000;
+        for n in 1..=TOMBSTONES_MAX {
+            let n = u128::try_from(n).unwrap();
+            assert!(matches!(
+                reg.subscribe(key(first + n)),
+                Subscription::Refused
+            ));
+        }
+        reg.finish_drain(long_lived.key, claimed.seq);
+        assert!(is_ended(&reg, long_lived.key));
+        assert!(!is_ended(&reg, key(first + 1)));
+        // One more tombstone forgets the next to end, never the newest end.
+        let over = first + u128::try_from(TOMBSTONES_MAX).unwrap() + 1;
+        assert!(matches!(reg.subscribe(key(over)), Subscription::Refused));
+        assert_eq!(reg.ended.len(), TOMBSTONES_MAX);
+        assert!(!is_ended(&reg, key(first + 2)));
+        assert!(is_ended(&reg, long_lived.key));
+        // A re-subscribe after its `Done` stays quiet: no stray `Errored`.
+        assert!(matches!(
+            reg.subscribe(long_lived.key),
+            Subscription::Active
+        ));
+    }
+
+    #[test]
+    fn a_spent_end_clock_records_nothing_and_starts_nothing() {
+        let mut reg = StreamRegistry::<()>::new();
+        let mut source = counting_source();
+        let sid = reg.open((), &mut source).unwrap();
+        assert!(reg.take_for_drain(sid.key).is_ok());
+        // The clock's last stamp is `u64::MAX - 1`; past it, none is handed out.
+        reg.end_clock = EndClock { next: u64::MAX - 1 };
+        assert!(matches!(reg.subscribe(key(77)), Subscription::Refused));
+        assert!(is_ended(&reg, key(77)));
+        // Spent: an unknown handle is neither recorded nor refused.
+        assert!(matches!(reg.subscribe(key(78)), Subscription::Active));
+        assert!(!is_ended(&reg, key(78)));
+        assert!(matches!(reg.subscribe(key(78)), Subscription::Active));
+        // A close still ends the drain; its handle is unknown, never live.
+        assert!(reg.close(sid.key).is_ok());
+        assert!(!is_draining(&reg, sid.key));
+        assert!(!is_ended(&reg, sid.key));
+        assert_unknown(&reg.close(sid.key));
+        assert!(matches!(reg.subscribe(sid.key), Subscription::Active));
+        assert_eq!(reg.ended.len(), 1);
+    }
+
+    #[test]
     fn evicted_parked_key_then_refused() {
         let mut reg = StreamRegistry::<FakeConn>::new();
         let mut source = counting_source();
@@ -1946,7 +2083,7 @@ mod tests {
         assert!(reg.close(key(2)).is_ok());
     }
 
-    // E-T11: a registry full of draining streams still dedups an unknown subscribe.
+    // A registry full of draining streams still dedups an unknown subscribe.
     #[test]
     fn all_draining_registry_still_refuses_and_dedups_an_unknown_subscribe() {
         let mut reg = StreamRegistry::<FakeConn>::new();
