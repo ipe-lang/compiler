@@ -1,7 +1,7 @@
-Emit a self-contained Rust project with a tree-shaken runtime.
+Emit a self-contained production Rust project with a tree-shaken runtime.
 
 ```
-ipe eject [<path>]
+ipe release eject [<path>]
 ```
 
 ## Arguments

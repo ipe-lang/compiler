@@ -5,7 +5,7 @@
 //! runtime (`ipe_maybe_map(m, f)`). Rust evaluates arguments left-to-right, so
 //! the container runs BEFORE `f`'s closure is built: a non-Copy binding the
 //! container moves (`label` passed by value into `wrapJust label`) is gone when
-//! the closure's `let label = label.clone()` capture reads it — `ipe build`
+//! the closure's `let label = label.clone()` capture reads it — `ipe dev build`
 //! exit 0, then `cargo build` E0382. The lowerer's last-use clone rewrite walks
 //! every kernel declared `ArgOrder::ContainerFirst` in that evaluation
 //! order, so the container's read is the one cloned and the closure's capture

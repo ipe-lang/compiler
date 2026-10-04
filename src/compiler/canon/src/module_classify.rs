@@ -52,7 +52,7 @@ struct ModuleInfo {
 /// touches a `server`-classified module.
 ///
 /// `entry` is the client entry module's path (`linked.name` for today's
-/// single-entry `ipe build --target wasm`; a distinct `[wasm].entry` module
+/// single-entry `ipe dev build --target wasm`; a distinct `[wasm].entry` module
 /// takes the same role once M6 wires it through). Walks the linked program's
 /// defs, grouped by their retained `home` (original source module — see
 /// `ast::Def::home`), classifying each and building the module dependency

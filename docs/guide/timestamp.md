@@ -46,7 +46,7 @@ gapSeconds =
     Duration.toMillis (Timestamp.diff oneHourLater start) // 1000
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 start (unix ms): 1000000000000

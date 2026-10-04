@@ -6,7 +6,7 @@
 #
 # GEO_PORT defaults to 18080 and LAYOUT_PORT to 18081.  The script:
 #   1. Builds the ipe compiler (cargo build -p ipe --release).
-#   2. Compiles each example (geo-clipboard, layout-fill) via `ipe build`.
+#   2. Compiles each example (geo-clipboard, layout-fill) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
 #   5. Runs the Playwright specs.
@@ -40,7 +40,7 @@ serve() {
 
   echo "==> Compiling $name example..."
   rm -rf "$out"
-  "$IPE" build "$REPO_ROOT/examples/shapes/web/$name/package.ipe" --out "$out"
+  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name/package.ipe" --out "$out"
 
   echo "==> Cargo-building emitted $name project..."
   cargo build --release --manifest-path "$out/rust/Cargo.toml"

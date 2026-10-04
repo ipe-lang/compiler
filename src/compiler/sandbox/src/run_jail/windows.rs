@@ -707,7 +707,7 @@ mod windows_jail {
         Ok(code)
     }
 
-    /// A per-run AppContainer name: unique enough that concurrent `ipe run`
+    /// A per-run AppContainer name: unique enough that concurrent `ipe dev run`
     /// invocations do not collide on the same container profile.
     fn per_run_container_name() -> OsString {
         let pid = std::process::id();
@@ -942,7 +942,7 @@ mod windows_jail {
         let active_cap = active_process_cap(profile);
         // The address-space and CPU-second ceilings the profile mandates. On the
         // Unix arms these are `prlimit --as`/`--cpu`; the Job Object enforces the
-        // equivalents so a runaway or memory-bomb under an untrusted `ipe run` is
+        // equivalents so a runaway or memory-bomb under an untrusted `ipe dev run` is
         // bounded on every platform, not just Unix (PRINCIPLES.md: bounded by
         // construction — a process that could exhaust host memory or spin forever
         // has broken soundness, and over the network principle 1's exhaustion

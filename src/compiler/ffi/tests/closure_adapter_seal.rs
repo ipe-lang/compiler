@@ -1,6 +1,6 @@
 //! SEAL fixture for the `[rust.define.closure]` sync closure adapter.
 //!
-//! The keystone invariant is `ipe build ⇒ cargo build ⇒ the closure runs`. This
+//! The keystone invariant is `ipe dev build ⇒ cargo build ⇒ the closure runs`. This
 //! fixture proves the emitted adapter wrapper is not just well-shaped text but
 //! real, compilable Rust: it takes an Ipê function value (already a
 //! `Box<dyn Fn(..) -> R + Send + Sync + 'static>` on the app side), hands a

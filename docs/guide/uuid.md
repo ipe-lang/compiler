@@ -56,7 +56,7 @@ allValid ids =
     List.all (\id -> Maybe.isJust (Uuid.parse id)) ids
 ```
 
-Running it (`ipe run`) confirms the structural facts — 36-character canonical
+Running it (`ipe dev run`) confirms the structural facts — 36-character canonical
 form, all parse, v7 batch already in creation order, and a non-UUID rejected:
 
 ```

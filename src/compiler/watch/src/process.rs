@@ -1,6 +1,6 @@
 //! Task 23 — the running-process state machine (INV-3, H15, H16, H20).
 //!
-//! Models the ONE thing `ipe watch` supervises — the compiled child binary —
+//! Models the ONE thing `ipe dev watch` supervises — the compiled child binary —
 //! so "old process killed, new process failed to bind" is structurally
 //! unrepresentable rather than a runtime invariant a maintainer has to keep
 //! remembering to preserve.
@@ -139,7 +139,7 @@ impl Default for RestartTimeouts {
 }
 
 impl RestartTimeouts {
-    /// The timeouts a live-reload dev watch uses. `ipe watch` is a DEV-only loop,
+    /// The timeouts a live-reload dev watch uses. `ipe dev watch` is a DEV-only loop,
     /// so the stop is aggressive: no drain grace. The old server holds the port
     /// the rebuilt one must bind, and every millisecond draining it is latency on
     /// the critical path from save to reloaded app; a mid-flight dev request is

@@ -31,7 +31,7 @@
 //!   root itself and the leaf area are always claimed (created and marked, or
 //!   adopted); the levels between them and above the root are passed through.
 //!
-//! A tree ipe hands over to the user (`ipe eject`) goes through [`HandoverRoot`]
+//! A tree ipe hands over to the user (`ipe release eject`) goes through [`HandoverRoot`]
 //! and [`HandoverDir`] instead: it must lie outside every tree ipe owns or may
 //! delete, and claiming it marks no ancestor, so once its own marker is dropped
 //! nothing ipe later cleans can contain it.
@@ -1021,7 +1021,7 @@ impl OutputRoot {
         })
     }
 
-    /// Resolve a fresh directory for a project handed to the user (`ipe eject`).
+    /// Resolve a fresh directory for a project handed to the user (`ipe release eject`).
     ///
     /// The overlap checks are those of [`OutputRoot::resolve`], which already
     /// refuse every [`ReservedName`] — any project's [`CACHE_NAMESPACE_DIR`]

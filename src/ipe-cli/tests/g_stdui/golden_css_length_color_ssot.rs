@@ -62,7 +62,7 @@ fn css_length_color_ssot_emits_byte_identical() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_length_color_ssot: {:?}",
+        "ipe dev build must succeed for css_length_color_ssot: {:?}",
         built.err()
     );
 
@@ -89,7 +89,7 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_length_color_ssot E2E: {:?}",
+        "ipe dev build must succeed for css_length_color_ssot E2E: {:?}",
         built.err()
     );
 

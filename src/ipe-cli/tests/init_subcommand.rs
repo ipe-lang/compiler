@@ -150,11 +150,8 @@ fn init_unknown_flag_returns_usage_error() {
     let result = ipe::run_cli(&["init".to_owned(), "--bogus".to_owned()]);
     assert!(
         matches!(
-            result,
-            Err(ipe::CliError::CommandUsage {
-                command: "init",
-                ..
-            })
+            &result,
+            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "init"
         ),
         "unknown flag must yield a command-usage error, got: {result:?}"
     );
@@ -213,7 +210,7 @@ fn init_lib_scaffold_is_lint_clean() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// E2E (gated on `IPE_E2E=1`): scaffold, `ipe build`, and `cargo build` a fresh
+/// E2E (gated on `IPE_E2E=1`): scaffold, `ipe dev build`, and `cargo build` a fresh
 /// project of a single shape (or the `--lib` library), asserting THE SEAL —
 /// `ipe`-accepts must imply `cargo`-builds. `init_args` are the `ipe init` args
 /// after the target; `entry_rel` is the module entry the emitter starts from.
@@ -241,7 +238,7 @@ fn assert_scaffold_builds(
     let built = ipe::build(&entry, &out_dir, runtime_dir);
     assert!(
         built.is_ok(),
-        "[{tag}] ipe build on the scaffold must succeed: {built:?}"
+        "[{tag}] ipe dev build on the scaffold must succeed: {built:?}"
     );
 
     let cargo_status = std::process::Command::new("cargo")

@@ -2,7 +2,7 @@
 # Regenerate the Markdown semantic-parity snapshot.
 #
 # `Ipe.Markdown` is the Markdown parse authority. This runs the parity
-# serializer (examples/shapes/script/markdown-parity) through `ipe run` and
+# serializer (examples/shapes/script/markdown-parity) through `ipe dev run` and
 # writes its stdout to the committed snapshot the doc-side Rust port is checked
 # against. The snapshot is therefore produced by an actual `ipe` run — never
 # hand-authored — so `Ipe.Markdown` stays the single source of truth and any
@@ -36,8 +36,8 @@ staged="$(mktemp "$snapshot.XXXXXX")"
 trap 'rm -rf "$scratch" "$staged"' EXIT
 
 echo "regen-markdown-parity: running the serializer via $ipe_bin…" >&2
-# `ipe run` emits + builds + runs the serializer; its stdout is the snapshot.
-( cd "$serializer_dir" && "$ipe_bin" run --out "$scratch/out" ) > "$staged"
+# `ipe dev run` emits + builds + runs the serializer; its stdout is the snapshot.
+( cd "$serializer_dir" && "$ipe_bin" dev run --out "$scratch/out" ) > "$staged"
 mv "$staged" "$snapshot"
 
 echo "regen-markdown-parity: wrote $snapshot" >&2

@@ -2622,7 +2622,7 @@ pub fn emit_css_value_call(
 /// ([`EmitCtx::hoist_style_literal`] returns a slot — which it does not under
 /// the flag-off / production emit, nor inside a `move` closure or a discard
 /// probe). Under any of those the function returns `None` and the subtree emits
-/// inline, byte-for-byte as before — so release / `ipe build` output is
+/// inline, byte-for-byte as before — so release / `ipe dev build` output is
 /// unchanged (golden-verified) and dev == prod at the emit level (the baked
 /// default IS the serialized template).
 ///
@@ -2665,7 +2665,7 @@ pub fn emit_html_template(ctx: &EmitCtx, expr: &Expr) -> Option<String> {
 /// hoisting is armed ([`EmitCtx::hoist_style_literal`] returns a slot — which it
 /// does not under the flag-off / production emit, nor inside a `move` closure or a
 /// discard probe). Under any of those the function returns `None` and the subtree
-/// emits inline, byte-for-byte as before — so release / `ipe build` output is
+/// emits inline, byte-for-byte as before — so release / `ipe dev build` output is
 /// unchanged (golden-verified) and dev == prod at the emit level (the baked
 /// default IS the serialized template).
 ///
@@ -3013,7 +3013,7 @@ pub fn emit_ui_plan(
             // the original literal, so a stale or malformed patch can neither
             // panic nor change the built value.
             // Gate on the shape-aware `hot_appearance` flag (armed for a web or
-            // tui view under `ipe watch`), NOT `uses_web`: the table now lives in
+            // tui view under `ipe dev watch`), NOT `uses_web`: the table now lives in
             // `ipe_runtime::literal_table`, present for a terminal dev-loop build
             // (`control-wire`) as well as a web one (`web-core`), so a `Tui.tea`
             // appearance literal hoists too. WHICH kernels hoist is itself

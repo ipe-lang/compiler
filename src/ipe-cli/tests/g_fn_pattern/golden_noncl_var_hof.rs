@@ -45,7 +45,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for fixture {fixture}: {:?}",
+        "ipe dev build must succeed for fixture {fixture}: {:?}",
         built.err()
     );
 }
@@ -75,7 +75,7 @@ fn a1_noncl_var_task_and_then_compiles() {
         let built = ipe::build(&entry, &out, &runtime);
         assert!(
             built.is_ok(),
-            "ipe build must succeed for noncl_var_hof: {:?}",
+            "ipe dev build must succeed for noncl_var_hof: {:?}",
             built.err()
         );
 

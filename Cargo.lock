@@ -3492,6 +3492,7 @@ name = "ipe_wrapper"
 version = "0.4.0"
 dependencies = [
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "ipe_sandbox",
 ]

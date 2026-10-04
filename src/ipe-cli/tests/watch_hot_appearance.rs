@@ -1,4 +1,4 @@
-//! End-to-end proof for `ipe watch`'s appearance hot-swap classifier.
+//! End-to-end proof for `ipe dev watch`'s appearance hot-swap classifier.
 //!
 //! Under `IPE_WATCH_HOT_APPEARANCE`, an edit to a hoisted style-value literal in
 //! a web `view` is classified `AppearanceOnly` and pushed to the running app as a

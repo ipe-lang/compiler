@@ -1,5 +1,5 @@
 //! Execute an emitted `wasm32-wasip1` module in an EMBEDDED wasmtime engine —
-//! the run-side of `ipe run --target wasi` (issue #2461).
+//! the run-side of `ipe dev run --target wasi` (issue #2461).
 //!
 //! ## Why embedded, and why deny-by-default
 //!
@@ -405,7 +405,7 @@ mod engine {
             Err(trap) => {
                 // A clean WASI exit surfaces as an `I32Exit` trap: exit 0 is
                 // success, non-zero is the guest's own outcome (propagated as
-                // `ipe run`'s non-zero exit). Any other trap is a genuine run
+                // `ipe dev run`'s non-zero exit). Any other trap is a genuine run
                 // failure — including a memory-ceiling trap (linear memory grew
                 // past `limits.as_bytes`) or a wall-clock epoch-deadline trap
                 // (the guest overran its wall floor) — a typed error, never a

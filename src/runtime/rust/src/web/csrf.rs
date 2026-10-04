@@ -185,7 +185,7 @@ pub fn csrf_set_cookie(token: &str, base: &str) -> String {
 ///
 /// The `/_ipe/hot-*` family (`hot-appearance`, `hot-transition`, `hot-msg`,
 /// `hot-subs`, `hot-init`, `hot-wiring`) is exempt because these are not
-/// browser-driven POSTs: each is a server-to-server call from the `ipe watch`
+/// browser-driven POSTs: each is a server-to-server call from the `ipe dev watch`
 /// process, authenticated by its own per-process `X-Ipe-Hot-Token` (a stronger
 /// control here than the browser-oriented CSRF cookie, which the watch does not
 /// hold). All these routes are mounted only under the dev overlay gate, so they do
@@ -325,7 +325,7 @@ mod tests {
     }
 
     // The dev-only transition-hot-swap POST is CSRF-exempt for the same reason as
-    // the appearance one: a loopback `ipe watch` call carrying its own
+    // the appearance one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_transition_is_csrf_exempt() {
@@ -334,7 +334,7 @@ mod tests {
     }
 
     // The dev-only additive-`Msg`-set POST is CSRF-exempt for the same reason as
-    // the appearance/transition ones: a loopback `ipe watch` call carrying its own
+    // the appearance/transition ones: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_msg_is_csrf_exempt() {
@@ -343,7 +343,7 @@ mod tests {
     }
 
     // The dev-only subscription-hot-swap POST is CSRF-exempt for the same reason
-    // as the transition one: a loopback `ipe watch` call carrying its own
+    // as the transition one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_subs_is_csrf_exempt() {
@@ -353,7 +353,7 @@ mod tests {
 
     // The dev-only init-datum and Cmd-wiring hot-swap POSTs are CSRF-exempt for
     // the same reason as the appearance and transition siblings: loopback `ipe
-    // watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
+    // dev watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
     // dev overlay gate, never reachable in a production build.
     #[test]
     fn hot_init_and_hot_wiring_are_csrf_exempt() {

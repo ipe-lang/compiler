@@ -91,7 +91,7 @@ fn e2e_tools() -> Option<RunJailTools> {
 /// Only an establishment failure gates skipping; a *successful* canary lets the
 /// real assertions run and catch a genuine jail bug. This is inert on the
 /// production path — it lives in the test harness and never touches how
-/// `ipe run` / `ipe exec` decide to refuse.
+/// `ipe dev run` / `ipe release run` decide to refuse.
 fn jail_can_establish(tools: &RunJailTools) -> bool {
     static CANARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CANARY.get_or_init(|| {

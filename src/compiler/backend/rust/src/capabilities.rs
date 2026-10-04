@@ -249,8 +249,8 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
     },
     // The loopback dev-loop control channel for a repaintable TERMINAL shape. A
     // `Tui.tea` app has no HTTP control port, so its appearance hot-swap rides the
-    // `control-wire` loopback socket instead. Selected ONLY for an `ipe watch`
-    // build of a tui view: `hot_appearance` AND `uses_tui`. A plain `ipe build` /
+    // `control-wire` loopback socket instead. Selected ONLY for an `ipe dev watch`
+    // build of a tui view: `hot_appearance` AND `uses_tui`. A plain `ipe dev build` /
     // `ipe release` arms no dev-loop flag, so a production terminal artifact
     // selects it not — the control server is absent from production by
     // construction (dev == prod by absence).

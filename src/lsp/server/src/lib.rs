@@ -4,14 +4,14 @@
 //! A thin, synchronous single-writer loop over [`lsp_server`]: the loop owns
 //! the one [`ipe_db::IpeDatabase`], mutates its inputs on document
 //! notifications (in receipt order), and computes diagnostics on a worker
-//! thread holding a cloned database handle — exactly `ipe watch`'s
+//! thread holding a cloned database handle — exactly `ipe dev watch`'s
 //! orchestrator/worker split. A superseding edit cancels the in-flight
 //! worker through salsa's own `Cancelled` unwind, so a stale diagnostics
 //! push cannot be delivered.
 //!
 //! The server owns no language logic: feature payloads come from
 //! [`ipe_lsp_features`], which reads the same memoized `ipe_db` queries
-//! `ipe build` runs. Project layout resolution (filesystem, manifest,
+//! `ipe dev build` runs. Project layout resolution (filesystem, manifest,
 //! stdlib injection) is injected through [`ProjectLoader`] by the CLI
 //! driver — this crate and the driver are the only I/O holders; the query
 //! layer never reads a file.

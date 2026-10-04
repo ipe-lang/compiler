@@ -54,7 +54,7 @@ package =
     }
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 columns: id, kind, weight

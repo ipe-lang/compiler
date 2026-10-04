@@ -163,7 +163,7 @@ fn http_default_request_emits_without_signature_consumer() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for a HttpRequest built via \
+        "ipe dev build must succeed for a HttpRequest built via \
          Http.defaultRequestFromString whose only consumer is a field read (no \
          Http.request call, no signature spelling out the fieldset); \
          got: {:?}",
