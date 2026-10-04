@@ -348,39 +348,65 @@ dbRefusalsStateOneFix =
             )
 
 
--- The environment is read and parsed at startup alone. Every call that reads
--- the environment, the working directory or the filesystem's view of a root
--- is admitted at one named site, and each admitted site is counted, so a new
--- read anywhere else is red whatever variable it names. Under `src/Lib`: no
--- module reads the environment; `System.cwd`, `isDir` and `absolutize` live
--- in `RepoPath`; `parseRoot` is called from `RepoPath` and `Settings` only;
--- the three setting parsers are called from `Settings` only. In `Main`: the
--- environment is read on exactly two code lines — `requireEnv`'s read and the
--- `requireSettings` call in `main` — `requireEnv` is called twice,
--- `parseIndexSettings` and `parseReviewDb` once each, and no other reader or
--- parser at all. `Settings` exports both parsers and neither the bare
--- `indexSettings` nor `reviewDb`. Red on any of these, or if the library
--- directory is empty.
+-- The environment is read and parsed at startup alone. Every name that can
+-- read the environment or the working directory, check a directory, or
+-- parse a configured location is counted in every module of `src`, and each
+-- module's count must equal its row in `admittedSites`: a new call, a
+-- wrapper around an admitted one, a second import of `Ipe.System`, or a read
+-- in a new module is red whatever it is spelled as or whatever variable it
+-- names. `Ipe.System`'s environment readers all contain `getenv` and its
+-- working-directory readers all contain `cwd`, so an alias or an
+-- `exposing` import cannot dodge the count; the only admitted import is the
+-- exact `import Ipe.System as System`. In `Main`: the environment is read on
+-- exactly two code lines — `requireEnv`'s read and the `requireSettings`
+-- call in `main` — and `requireEnv` is called twice. `Settings` exports both
+-- parsers and neither the bare `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
     do
         cwd <- System.cwd ()
-        libDir <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib"))
-        names <- File.readDir libDir
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <-
             Task.sequence
                 (List.map
-                    (\name -> readLibSource (cwd ++ "/src/Lib/" ++ name) |> Task.map (\text -> ( name, codeText text )))
-                    (List.filter (String.endsWith ".ipe") names)
+                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, codeText text )))
+                    (moduleFiles topNames libNames)
                 )
         settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
         mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map codeText
         Task.succeed
-            (List.length sources >= 8
-                && List.all libraryAdmits sources
+            (layoutAdmits topNames libNames
+                && List.length sources >= 12
+                && sitesAdmitted sources
                 && mainAdmits mainSource
                 && settingsExports settings
             )
+
+
+
+readDirAt : String -> Task.Task Error (List String)
+readDirAt dir =
+    Task.fromResult (Path.fromString dir) |> Task.andThen File.readDir
+
+
+
+-- Every module of `src` by its path relative to `src`.
+moduleFiles : List String -> List String -> List String
+moduleFiles topNames libNames =
+    List.filter (String.endsWith ".ipe") topNames
+        ++ List.map (\name -> "Lib/" ++ name) (List.filter (String.endsWith ".ipe") libNames)
+
+
+
+-- `src` holds `.ipe` modules and the `Lib` directory, and `Lib` holds only
+-- `.ipe` modules, so every module is one `moduleFiles` lists. A dot-named
+-- entry is admitted: no module path can pass through it.
+layoutAdmits : List String -> List String -> Bool
+layoutAdmits topNames libNames =
+    List.member "Lib" topNames
+        && List.all (\name -> name == "Lib" || String.endsWith ".ipe" name || String.startsWith "." name) topNames
+        && List.all (\name -> String.endsWith ".ipe" name || String.startsWith "." name) libNames
 
 
 
@@ -405,26 +431,117 @@ occurrences needle text =
 
 
 
--- Each reader or parser and the library modules admitted to name it.
-libraryAdmitted : List ( String, List String )
-libraryAdmitted =
-    [ ( "getenv", [] )
-    , ( "System.cwd", [ "RepoPath.ipe" ] )
-    , ( "isDir", [ "RepoPath.ipe" ] )
-    , ( "absolutize", [ "RepoPath.ipe", "Settings.ipe" ] )
-    , ( "parseRoot", [ "RepoPath.ipe", "Settings.ipe" ] )
-    , ( "parseIndexSettings", [ "Settings.ipe" ] )
-    , ( "parseReviewDb", [ "Settings.ipe" ] )
-    , ( "parseDbLocation", [ "Settings.ipe" ] )
+-- Each needle and, for every module admitted to name it, the exact number of
+-- times its code does. A module absent from a needle's row names it zero
+-- times. `System.` counts every qualified use of the module: `Main`'s
+-- `getenv`, `getenvOr` and two `exit`s, `RepoPath`'s `cwd`.
+admittedSites : List ( String, List ( String, Int ) )
+admittedSites =
+    [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    , ( "Ipe.Ffi", [] )
+    , ( "System.", [ ( "Main.ipe", 4 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    , ( "getenv", [ ( "Main.ipe", 2 ) ] )
+    , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseDbLocation", [ ( "Lib/Settings.ipe", 5 ) ] )
+    , ( "parseIndexSettings", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     ]
 
 
 
-libraryAdmits : ( String, String ) -> Bool
-libraryAdmits ( name, text ) =
+admittedCount : String -> List ( String, Int ) -> Int
+admittedCount rel admitted =
+    case List.find (\( file, _ ) -> file == rel) admitted of
+        Just ( _, count ) ->
+            count
+
+        Nothing ->
+            0
+
+
+
+-- Every module names every needle exactly as often as `admittedSites`
+-- admits, every admitted module exists (a stale row is drift), and every
+-- import of `Ipe.System` is the exact admitted line.
+sitesAdmitted : List ( String, String ) -> Bool
+sitesAdmitted sources =
     List.all
-        (\( needle, admitted ) -> List.member name admitted || occurrences needle text == 0)
-        libraryAdmitted
+        (\( needle, admitted ) ->
+            List.all (\( rel, text ) -> occurrences needle text == admittedCount rel admitted) sources
+                && List.all (\( file, _ ) -> List.any (\( rel, _ ) -> rel == file) sources) admitted
+        )
+        admittedSites
+        && List.all (\( _, text ) -> List.all systemImportAdmitted (String.lines text)) sources
+
+
+
+systemImportAdmitted : String -> Bool
+systemImportAdmitted line =
+    let
+        parts =
+            String.words line
+    in
+    List.take 2 parts /= [ "import", "Ipe.System" ] || parts == [ "import", "Ipe.System", "as", "System" ]
+
+
+
+-- The scan refuses each way around it: a reader behind an alias or an
+-- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
+-- parser from a request path, a reader in a module outside `src/Lib`, and a
+-- directory the inventory would not read. Red while the scan matches one
+-- qualified spelling per reader or reads `src/Lib` alone.
+startupScanRefusesEvasions : Task.Task Error Bool
+startupScanRefusesEvasions =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <-
+            Task.sequence
+                (List.map
+                    (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, codeText text )))
+                    (moduleFiles topNames libNames)
+                )
+        Task.succeed
+            (sitesAdmitted sources
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System exposing (getenvOr)\nraw = getenvOr \"X\" \"\""
+                && evaded sources "Lib/RepoPath.ipe" "again = System.getcwd ()"
+                && evaded sources "Lib/RepoPath.ipe" "reparse raw = parseRoot raw"
+                && evaded sources "Lib/Settings.ipe" "again raw = RepoPath.absolutize raw"
+                && evaded sources "Lib/Queue.ipe" "reload = Settings.parseIndexSettings"
+                && evaded sources "Migrations.ipe" "import Ipe.System as System\nraw = System.getenvOr \"X\" \"\""
+                && evaded sources "Lib/Index.ipe" "fresh = File.isDir"
+                && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
+                && not (layoutAdmits ("Pages" :: topNames) libNames)
+                && not (layoutAdmits topNames ("Extra" :: libNames))
+                && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
+            )
+
+
+
+-- The scan refuses `sources` once `extra` is appended to module `rel`.
+evaded : List ( String, String ) -> String -> String -> Bool
+evaded sources rel extra =
+    not (sitesAdmitted (appendTo rel extra sources))
+
+
+
+-- `sources` with `extra` appended to the code of module `rel`.
+appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+appendTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, text ++ "\n" ++ extra )
+
+            else
+                ( name, text )
+        )
+        sources
 
 
 
@@ -481,4 +598,5 @@ checks =
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
+        , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         ]
