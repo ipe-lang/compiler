@@ -110,8 +110,19 @@ fn run_bundle(show_profile: bool, app_args: &[OsString]) -> ExitCode {
 
     // Read and parse the profile strictly before touching the binary (fail
     // early with a clear message on a missing profile).
-    let profile_text = match std::fs::read_to_string(&profile_path) {
-        Ok(t) => t,
+    let profile_text = match read_capped(&profile_path, run_jail::PROFILE_READ_CAP) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => fatal!(
+                "ipe.profile at {} is not UTF-8 — refusing to run with an unparseable profile",
+                profile_path.display()
+            ),
+        },
+        Ok(None) => fatal!(
+            "ipe.profile at {} is larger than {} bytes — bundle is tampered",
+            profile_path.display(),
+            run_jail::PROFILE_READ_CAP
+        ),
         Err(e) => fatal!(
             "ipe.profile not found at {} — bundle is incomplete or tampered: {e}",
             profile_path.display()
@@ -130,14 +141,86 @@ fn run_bundle(show_profile: bool, app_args: &[OsString]) -> ExitCode {
     }
 
     // Scan the binary for its embedded floor and verify the profile against it.
-    let app_bytes = match std::fs::read(&app_path) {
-        Ok(b) => b,
+    let app_bytes = match read_capped(&app_path, run_jail::APP_READ_CAP) {
+        Ok(Some(b)) => b,
+        Ok(None) => fatal!(
+            "ipe-app at {} is larger than {} bytes — bundle is tampered",
+            app_path.display(),
+            run_jail::APP_READ_CAP
+        ),
         Err(e) => fatal!(
             "ipe-app not found at {} — bundle is incomplete: {e}",
             app_path.display()
         ),
     };
-    exec_after_verify(&app_bytes, &profile, &app_path, app_args)
+    deliver_bundle_app(&app_bytes, &profile, &app_path, app_args)
+}
+
+/// Run the bundle's app from the bytes just read, sealed: the bytes the
+/// floor is verified against are the bytes the jail runs, so a swap of
+/// `ipe-app` between the read and the exec runs nothing new.
+#[cfg(all(
+    not(embed_mode),
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )
+))]
+fn deliver_bundle_app(
+    app_bytes: &[u8],
+    profile: &SandboxProfile,
+    _app_path: &std::path::Path,
+    app_args: &[OsString],
+) -> ExitCode {
+    let sealed = match run_jail::write_sealed_app_memfd(app_bytes) {
+        Ok(s) => s,
+        Err(e) => fatal!("cannot seal ipe-app: {e}"),
+    };
+    exec_sealed_after_verify(profile, sealed, app_args)
+}
+
+/// Run the bundle's app by path on a platform with no sealed delivery.
+#[cfg(all(
+    not(embed_mode),
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))
+))]
+fn deliver_bundle_app(
+    app_bytes: &[u8],
+    profile: &SandboxProfile,
+    app_path: &std::path::Path,
+    app_args: &[OsString],
+) -> ExitCode {
+    exec_after_verify(app_bytes, profile, app_path, app_args)
+}
+
+/// Read at most `max` bytes of the regular file at `path`: `None` when it
+/// holds more, so an oversized or planted file is refused, never buffered
+/// whole.
+fn read_capped(path: &std::path::Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let not_regular =
+        || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok(u64::try_from(bytes.len())
+        .is_ok_and(|len| len <= max)
+        .then_some(bytes))
 }
 
 // ── Embed mode ──────────────────────────────────────────────────────────────
@@ -180,7 +263,7 @@ fn run_embed(show_profile: bool, app_args: &[OsString]) -> ExitCode {
         Err(e) => fatal!("cannot seal embedded binary: {e}"),
     };
 
-    exec_embed_after_verify(&profile, sealed, app_args)
+    exec_sealed_after_verify(&profile, sealed, app_args)
 }
 
 // ── Embed-mode verify + exec ─────────────────────────────────────────────────
@@ -201,8 +284,15 @@ fn run_embed(show_profile: bool, app_args: &[OsString]) -> ExitCode {
 /// - profile does not satisfy the floor (widened profile → refuse)
 /// - jail primitive unavailable on this platform
 /// - jail establishment failure
-#[cfg(embed_mode)]
-fn exec_embed_after_verify(
+#[cfg(any(
+    embed_mode,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+fn exec_sealed_after_verify(
     profile: &SandboxProfile,
     sealed: run_jail::SealedApp,
     app_args: &[OsString],
@@ -260,7 +350,7 @@ fn exec_embed_after_verify(
 /// satisfies it, and exec the app at `app_path` inside the jail.
 ///
 /// Bundle mode only: the app is a sibling file on disk. Embed mode uses
-/// [`exec_embed_after_verify`], which verifies and delivers from a sealed
+/// [`exec_sealed_after_verify`], which verifies and delivers from a sealed
 /// descriptor instead of a host path.
 ///
 /// Fail-closed on:
@@ -268,7 +358,16 @@ fn exec_embed_after_verify(
 /// - profile does not satisfy the floor (widened profile → refuse)
 /// - jail primitive unavailable on this platform
 /// - jail establishment failure
-#[cfg(not(embed_mode))]
+#[cfg(all(
+    not(embed_mode),
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))
+))]
 fn exec_after_verify(
     app_bytes: &[u8],
     profile: &SandboxProfile,
@@ -403,6 +502,22 @@ mod tests {
         assert_eq!(recovered.network, profile.network);
         assert_eq!(recovered.subprocess, profile.subprocess);
         assert!(matches!(recovered.filesystem, FilesystemScope::Isolated));
+    }
+
+    /// A read holds at most the cap: a file at the cap is read whole, one
+    /// byte over refuses, and a directory is not a regular file.
+    #[test]
+    fn read_capped_reads_at_the_cap_and_refuses_one_over() {
+        let dir = super::ScratchDir::new("ipe-wrapper-cap").expect("scratch dir");
+        let path = dir.path().join("ipe-app");
+        std::fs::write(&path, b"0123456789").expect("write app");
+        assert_eq!(
+            super::read_capped(&path, 10).expect("read"),
+            Some(b"0123456789".to_vec())
+        );
+        assert_eq!(super::read_capped(&path, 9).expect("read"), None);
+        assert!(super::read_capped(dir.path(), 10).is_err());
+        assert!(super::read_capped(&dir.path().join("absent"), 10).is_err());
     }
 
     /// `--show-profile` is a wrapper flag only before the first `--`.

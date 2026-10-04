@@ -63,7 +63,7 @@ pub const SMALL_FILE_READ_CAP: u64 = 1024 * 1024;
 ///
 /// 512 MiB is far above any statically-linked app while refusing a planted
 /// device node or multi-GiB file before it is buffered whole.
-pub const RELEASE_APP_READ_CAP: u64 = 512 * 1024 * 1024;
+pub const RELEASE_APP_READ_CAP: u64 = ipe_sandbox::run_jail::APP_READ_CAP;
 
 // ── Regular-file open ─────────────────────────────────────────────────────────
 

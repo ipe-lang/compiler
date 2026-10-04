@@ -492,10 +492,8 @@ fn verify_artifact_under(
     binary_cap: u64,
 ) -> Result<VerifiedArtifact, CliError> {
     // Parse the profile mirror strictly (parse-fail ⇒ refuse).
-    let profile_text = crate::io_bounded::read_to_string_capped(
-        profile_path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )?;
+    let profile_text =
+        crate::io_bounded::read_to_string_capped(profile_path, run_jail::PROFILE_READ_CAP)?;
     let profile = run_jail::parse_profile(&profile_text).map_err(|e| {
         CliError::Usage(crate::text::msg::run_profile_unparsable(
             &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),

@@ -565,6 +565,15 @@ pub fn profile_from_capabilities(
 /// this marker, which survives `strip` (`.rodata` is allocated).
 pub const CAPFLOOR_MARKER: &str = "ipe-capfloor 1 ";
 
+/// Ceiling on the bytes of a release app read for its floor scan.
+///
+/// 512 MiB is far above any statically-linked app while refusing a planted
+/// device node or multi-GiB file before it is buffered whole.
+pub const APP_READ_CAP: u64 = 512 * 1024 * 1024;
+
+/// Ceiling on the bytes of a release bundle's `ipe.profile`.
+pub const PROFILE_READ_CAP: u64 = 1024 * 1024;
+
 /// Scan a binary's bytes for the embedded capability-floor line and parse it —
 /// the tamper-safe floor read that does NOT execute the binary and survives
 /// `strip`.
