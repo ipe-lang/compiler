@@ -1501,15 +1501,17 @@ fn thread_config_into_entry(
     names: &ConfigThreadNames,
     home: &[Symbol],
 ) -> bool {
-    // Peel `\… -> …` / `let … in …` wrappers to the head call, matching the TEA
-    // entry classification (`main_head_is_tea_entry`). Only a `main` whose head
-    // is a `Web` entry `Call` is threadable; a bare kernel reference with no cfg
-    // argument is not a valid entry and is left for the type-checker.
+    // Walk the same steps as `main_result_step` to the head call. Only a `main`
+    // whose head is a `Web` entry `Call` is threadable; a bare kernel reference
+    // with no cfg argument is not a valid entry and is left for the type-checker.
     match &mut body.value {
         canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
             thread_config_into_entry(inner, names, home)
         }
         canon::Expr_::Call(callee, args) => {
+            if let Some(rest) = task_bind_rest_mut(callee, args) {
+                return thread_config_into_entry(rest, names, home);
+            }
             let canon::Expr_::VarKernel { module, name, .. } = &callee.value else {
                 return false;
             };
@@ -1675,14 +1677,95 @@ const _: () = {
     }
 };
 
+/// Whether `callee` is the `Task.andThen` kernel, by registry id. A user
+/// binding named `andThen`, or `Task.andThen` through a user alias, resolves to
+/// a `VarTopLevel` and never matches; only a stdlib-origin module can mint the
+/// kernel alias.
+const fn is_task_and_then(callee: &canon::Expr) -> bool {
+    matches!(
+        callee.value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::TaskAndThen),
+            ..
+        }
+    )
+}
+
+/// The continuation body of a `do` bind, `Task.andThen (\p -> rest) task`:
+/// `rest` when `callee args` is the kernel applied to exactly a one-parameter
+/// continuation lambda and the task, in the kernel's argument order. The task
+/// argument is never returned: it runs before the continuation, so `main`'s
+/// result never comes from it.
+fn task_bind_rest<'e>(callee: &canon::Expr, args: &'e [canon::Expr]) -> Option<&'e canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_ref()),
+        _ => None,
+    }
+}
+
+/// [`task_bind_rest`] for the in-place `config` rewrite.
+fn task_bind_rest_mut<'e>(
+    callee: &canon::Expr,
+    args: &'e mut [canon::Expr],
+) -> Option<&'e mut canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &mut continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_mut()),
+        _ => None,
+    }
+}
+
+/// One step from a `main` body toward its result expression, or `None` at the
+/// head.
+///
+/// A `do` bind steps into its continuation body ([`task_bind_rest`]); any other
+/// application steps into its callee (`entry cfg` -> `entry`); a lambda
+/// (`\req -> …`) and a `let … in` (a `do` bare run included) step into their
+/// body. Every resolver classification of `main` walks with this step, so a
+/// `do` block's tail is the head whether or not the block binds.
+fn main_result_step(node: &canon::Expr) -> Option<&canon::Expr> {
+    match &node.value {
+        canon::Expr_::Call(callee, args) => {
+            let head: &canon::Expr = callee;
+            Some(task_bind_rest(callee, args).unwrap_or(head))
+        }
+        canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
+            let body: &canon::Expr = inner;
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
+/// The head of `main`'s result expression: the node [`main_result_step`]
+/// cannot step past.
+fn main_result_head(body: &canon::Expr) -> &canon::Expr {
+    let mut node = body;
+    while let Some(next) = main_result_step(node) {
+        node = next;
+    }
+    node
+}
+
 /// IPE-N0045: reject a `main` that selects its shape at run time.
 ///
 /// A program's shape is pinned by the head of `main` at compile time (§ static
 /// pinning): `main = Web.tea …` is a web app, `main = Tui.tea …` a
 /// terminal app, a `Task Error ()` `main` a script. It is never chosen from a
-/// value, so a `main` whose head — after peeling application / `let` / `\… ->`,
-/// exactly as the shape classifier peels it — is an `if` or `case` with a branch
-/// that reaches an app entry is a run-time shape choice, refused here.
+/// value, so a `main` whose result head ([`main_result_head`]) is an `if` or
+/// `case` with a branch that reaches an app entry is a run-time shape choice,
+/// refused here.
 ///
 /// Only a branch that reaches a shape entry trips this. A plain program whose
 /// `main` is a `Task` computed through an `if` / `case` (no branch heads on an
@@ -1704,81 +1787,61 @@ fn check_main_not_runtime_branched(canon_mod: &canon::Module, interner: &Interne
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the head the shape classifier reads, keeping the located node so a
-    // rejection blames the branching head itself.
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                let any_shape = arms
-                    .iter()
-                    .map(|(_, branch)| branch)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|branch| branch_head_reaches_tea_entry(branch, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            canon::Expr_::Case(_, branches) => {
-                let any_shape = branches
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            _ => return Ok(()),
-        }
+    // The head the shape classifier reads, kept located so a rejection blames
+    // the branching head itself.
+    let head = main_result_head(body);
+    let any_shape = match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, branch)| branch)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|branch| branch_head_reaches_tea_entry(branch, interner)),
+        canon::Expr_::Case(_, branches) => branches
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => false,
+    };
+    if any_shape {
+        Err(Diagnostic::Name {
+            span: head.span,
+            msg: NameError::RuntimeBranchedMain,
+        })
+    } else {
+        Ok(())
     }
 }
 
 /// Does a branch of `main`'s `if` / `case` head-reach a TEA app entry?
 ///
-/// Peels the same forms as the shape classifier (application / `let` / `\… ->`)
-/// and, for a nested `if` / `case`, recurses into every sub-branch — so
+/// Walks to the branch's result head ([`main_result_head`]) and, for a nested
+/// `if` / `case`, recurses into every sub-branch — so
 /// `if a then Web.tea c else if b then Cli … else …` is caught at any depth. A
 /// branch whose head is a plain expression (a `Task`, a value) reaches no entry
 /// and does not, on its own, mark the `main` a shape choice.
 fn branch_head_reaches_tea_entry(branch: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = branch;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                return arms
-                    .iter()
-                    .map(|(_, inner)| inner)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|inner| branch_head_reaches_tea_entry(inner, interner));
-            }
-            canon::Expr_::Case(_, sub) => {
-                return sub
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-            }
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
+    let head = main_result_head(branch);
+    match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, inner)| inner)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|inner| branch_head_reaches_tea_entry(inner, interner)),
+        canon::Expr_::Case(_, sub) => sub
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => is_tea_entry_head(head, interner),
     }
+}
+
+/// `true` iff `head` is a resolved TEA app-entry kernel ([`TEA_APP_ENTRIES`]).
+fn is_tea_entry_head(head: &canon::Expr, interner: &Interner) -> bool {
+    let canon::Expr_::VarKernel { module, name, .. } = &head.value else {
+        return false;
+    };
+    let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name)) else {
+        return false;
+    };
+    TEA_APP_ENTRIES.contains(&(m, n))
 }
 
 /// IPE-N0033: reject a Program (plain-`main` module) that imports any
@@ -1831,15 +1894,12 @@ fn check_program_tea_import_gate(
         return Ok(());
     };
 
-    // The module is a TEA app iff its `main` head-calls a shape entry.
-    let main_is_app_entry = {
-        let body = match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        };
-        main_head_is_tea_entry(body, interner)
+    let main_body = match main_def {
+        canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
 
-    if main_is_app_entry {
+    // The module is a TEA app iff its `main` head-calls a shape entry.
+    if main_head_is_tea_entry(main_body, interner) {
         return Ok(());
     }
 
@@ -1849,12 +1909,7 @@ fn check_program_tea_import_gate(
     // (shape-model §9). Such a `main` head-calls `Server.listen`, not a TEA
     // shape entry, so it would otherwise trip this gate; exempt it. The embedded
     // app is a VALUE consumed by the Server, not the module's own app shape.
-    if main_head_is_server_listen(
-        match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        },
-        interner,
-    ) {
+    if main_head_is_server_listen(main_body) {
         return Ok(());
     }
 
@@ -1867,61 +1922,31 @@ fn check_program_tea_import_gate(
 }
 
 /// Does this `main` body head-call `Server.listen` — the declarative
-/// `Ipe.Http.Server` entry? Same head-peeling as [`main_head_is_tea_entry`]. A
+/// `Ipe.Http.Server` entry? The head is [`main_result_head`]; the kernel is
+/// matched by its registry id, never by spelling. A
 /// Server program that embeds a web app (`Web.embed` + `Server.mountApp`) is a
 /// Program at the module level, not a TEA app, so it is exempt from the
 /// `Ipe.Tea.*`-import gate (IPE-N0033).
-fn main_head_is_server_listen(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return m == "Server" && n == "listen";
-            }
-            _ => return false,
+fn main_head_is_server_listen(body: &canon::Expr) -> bool {
+    matches!(
+        main_result_head(body).value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::ServerListen),
+            ..
         }
-    }
+    )
 }
 
 /// Does this `main` body head-call a TEA shape entry ([`TEA_APP_ENTRIES`])?
 ///
-/// Peels the forms a TEA `main` takes — an application `entry { … }`, a
-/// point-free `main = \… -> entry …` lambda, and a `let cfg = { … } in entry
-/// cfg` — down to the head expression, then checks whether it is a shape-entry
-/// `VarKernel`. Only the head matters: a Program's `main` never reduces to a
-/// shape-entry kernel at its head. Peeling `let` keeps a let-bound-config app
-/// classified as a TEA app so its malformed config reaches the precise
-/// `IPE-L0119` lowering diagnostic instead of the coarser IPE-N0033 gate.
+/// The head is [`main_result_head`]: it reaches the entry under an application
+/// `entry { … }`, a point-free `\… -> entry …` lambda, a `let cfg = { … } in
+/// entry cfg` and a `do` block's tail. Only the head matters: a Program's `main`
+/// never reduces to a shape-entry kernel at its head. A let-bound-config app
+/// stays a TEA app, so its malformed config reaches the precise `IPE-L0119`
+/// lowering diagnostic instead of the coarser IPE-N0033 gate.
 fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            // `entry { cfg }` / `entry a b` — the callee is the head.
-            canon::Expr_::Call(callee, _) => node = callee,
-            // `main = \req -> entry { cfg }` — the lambda body is the head.
-            canon::Expr_::Lambda(_, inner) => node = inner,
-            // `main = let cfg = { … } in entry cfg` — the `in` body is the head.
-            // A let-bound config is still a TEA-app entry (the head-called shape
-            // kernel is under the `in`), so a malformed one reaches its precise
-            // `IPE-L0119` lowering diagnostic rather than being misread as a
-            // Program under IPE-N0033.
-            canon::Expr_::Let(_, body) => node = body,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
-    }
+    is_tea_entry_head(main_result_head(body), interner)
 }
 
 /// The TEA app surface a `main` proves from its entry kernel.
@@ -1931,21 +1956,14 @@ fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
 /// shape-entry app — the cross-shape gate then does not apply (a plain-`main`
 /// Program importing `Ipe.Tea.*` is already rejected by IPE-N0033).
 fn app_shape_name(body: &canon::Expr, interner: &Interner) -> Option<AppSurface> {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
-                return TEA_APP_ENTRIES
-                    .iter()
-                    .find(|(em, en)| *em == m && *en == n)
-                    .and_then(|(shape, _member)| AppSurface::from_segment(shape));
-            }
-            _ => return None,
-        }
-    }
+    let canon::Expr_::VarKernel { module, name, .. } = &main_result_head(body).value else {
+        return None;
+    };
+    let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
+    TEA_APP_ENTRIES
+        .iter()
+        .find(|(em, en)| *em == m && *en == n)
+        .and_then(|(shape, _member)| AppSurface::from_segment(shape))
 }
 
 /// IPE-N0035: reject a TEA app that imports another shape's `Cmd` / `Sub`.
@@ -2067,22 +2085,20 @@ fn check_input_fields_are_subscriptions(
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the entry call the shape classifier reads.
+    // Walk `main_result_step` to the entry call the shape classifier reads.
     let mut node = body;
     let (entry, surface, cfg) = loop {
-        match &node.value {
-            canon::Expr_::Call(callee, args) => {
-                if let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
-                    && let Some(surface) = k.app_entry_surface()
-                    && let [cfg] = args.as_slice()
-                {
-                    break (*k, surface, cfg);
-                }
-                node = callee;
-            }
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            _ => return Ok(()),
+        if let canon::Expr_::Call(callee, args) = &node.value
+            && let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
+            && let Some(surface) = k.app_entry_surface()
+            && let [cfg] = args.as_slice()
+        {
+            break (*k, surface, cfg);
         }
+        let Some(next) = main_result_step(node) else {
+            return Ok(());
+        };
+        node = next;
     };
     // The config record: inline, or a same-module top-level binding.
     let fields = match &cfg.value {
@@ -8792,6 +8808,140 @@ mod config_threading_tests {
             untouched,
             "no config threaded when none is declared (single cfg arg stands)"
         );
+    }
+}
+
+#[cfg(test)]
+mod main_result_head_tests {
+    //! Unit coverage for [`main_result_step`] / [`main_result_head`]: a `do`
+    //! bind (`Task.andThen (\p -> rest) task`) steps into its continuation body
+    //! only, and only when the callee is the `Task.andThen` kernel by id.
+
+    use super::*;
+    use ipe_diagnostics::Located;
+
+    fn sym(i: &mut Interner, s: &str) -> Symbol {
+        i.intern(s).expect("intern must succeed")
+    }
+
+    const fn at(e: canon::Expr_) -> canon::Expr {
+        Located::new(Span::DUMMY, e)
+    }
+
+    const fn unit() -> canon::Expr {
+        at(canon::Expr_::Unit)
+    }
+
+    fn kernel(i: &mut Interner, id: Option<StdlibKernel>, module: &str, name: &str) -> canon::Expr {
+        let module = sym(i, module);
+        let name = sym(i, name);
+        at(canon::Expr_::VarKernel { id, module, name })
+    }
+
+    fn call(callee: canon::Expr, args: Vec<canon::Expr>) -> canon::Expr {
+        at(canon::Expr_::Call(Box::new(callee), args))
+    }
+
+    fn lambda(params: usize, body: canon::Expr) -> canon::Expr {
+        let params =
+            std::iter::repeat_with(|| Located::new(Span::DUMMY, canon::Pattern_::PAnything))
+                .take(params)
+                .collect();
+        at(canon::Expr_::Lambda(params, Box::new(body)))
+    }
+
+    fn and_then(i: &mut Interner) -> canon::Expr {
+        kernel(i, Some(StdlibKernel::TaskAndThen), "Task", "andThen")
+    }
+
+    /// `Task.andThen (\_ -> rest) task` — the parser's `do` bind desugar.
+    fn bind(i: &mut Interner, rest: canon::Expr, task: canon::Expr) -> canon::Expr {
+        call(and_then(i), vec![lambda(1, rest), task])
+    }
+
+    /// `Server.listen () ()` — the listen entry applied to two stand-in args.
+    fn listen(i: &mut Interner) -> canon::Expr {
+        let head = kernel(i, Some(StdlibKernel::ServerListen), "Server", "listen");
+        call(head, vec![unit(), unit()])
+    }
+
+    #[test]
+    fn bind_follows_continuation_to_listen() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn nested_binds_and_runs_reach_tail() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let inner = bind(&mut i, tail, unit());
+        let run = at(canon::Expr_::Let(Vec::new(), Box::new(inner)));
+        let body = bind(&mut i, run, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn task_argument_is_never_followed() {
+        let mut i = Interner::new();
+        let task = listen(&mut i);
+        let body = bind(&mut i, unit(), task);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(matches!(main_result_head(&body).value, canon::Expr_::Unit));
+    }
+
+    #[test]
+    fn user_and_then_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let main_mod = sym(&mut i, "Main");
+        let name = sym(&mut i, "andThen");
+        let user = at(canon::Expr_::VarTopLevel {
+            module: vec![main_mod],
+            name,
+        });
+        let body = call(user, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn unbacked_and_then_name_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let unbacked = kernel(&mut i, None, "Task", "andThen");
+        let body = call(unbacked, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn partial_and_then_stops_on_kernel() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(1, tail)]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn two_param_continuation_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(2, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn bind_tail_tea_entry_classifies_as_app() {
+        let mut i = Interner::new();
+        let entry = kernel(&mut i, None, "Web", "tea");
+        let tail = call(entry, vec![unit()]);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_tea_entry(&body, &i));
+        assert!(app_shape_name(&body, &i).is_some());
+        assert!(!main_head_is_server_listen(&body));
     }
 }
 
