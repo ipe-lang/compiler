@@ -12,7 +12,6 @@
 use crate::model::{RepoSpec, RepoTag, split_tag};
 use crate::walk::{FileId, Refusal, RelPath, shown};
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -215,7 +214,9 @@ struct Probed {
     id: FileId,
 }
 
-/// Canonicalizes `spec`'s root and takes its identity from an opened handle.
+/// Canonicalizes `spec`'s root and takes its identity from its metadata.
+///
+/// The root is never opened: opening a FIFO blocks until a writer appears.
 fn probe(spec: &RepoSpec) -> Result<Probed, RepoSetError> {
     let unreachable = |e: io::Error| RepoSetError::Unreachable {
         tag: spec.tag.clone(),
@@ -225,8 +226,7 @@ fn probe(spec: &RepoSpec) -> Result<Probed, RepoSetError> {
     if root.to_str().is_none() {
         return Err(RepoSetError::NonUtf8Root(spec.tag.clone()));
     }
-    let held = File::open(&root).map_err(unreachable)?;
-    let md = held.metadata().map_err(unreachable)?;
+    let md = std::fs::metadata(&root).map_err(unreachable)?;
     if !md.is_dir() {
         return Err(RepoSetError::NotADirectory(spec.tag.clone()));
     }
@@ -367,10 +367,11 @@ impl RepoSet {
 
     /// The declared root whose directory is `dir`, found by directory identity.
     ///
-    /// `None` when `dir` cannot be opened, is no directory, or is none of the
-    /// roots: a subdirectory of a root is not that root.
+    /// `None` when `dir` cannot be read, is no directory, or is none of the
+    /// roots: a subdirectory of a root is not that root. `dir` is never
+    /// opened, so a FIFO named there cannot block the caller.
     pub fn root_at_dir(&self, dir: &str) -> Option<&DeclaredRoot> {
-        let md = File::open(dir).ok()?.metadata().ok()?;
+        let md = std::fs::metadata(dir).ok()?;
         if !md.is_dir() {
             return None;
         }
@@ -753,5 +754,25 @@ mod tests {
         assert_eq!(tag("out/plain"), None);
         assert_eq!(tag("absent"), None);
         assert_eq!(tag(""), None);
+    }
+
+    // A FIFO is neither a root nor a directory, and naming one returns at
+    // once: it is never opened, which would wait for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_opening_it() {
+        let s = Scratch::new("fifo");
+        let set = nested_set(&s);
+        let fifo = s.path("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(set.root_at_dir(&fifo).is_none());
+        assert!(matches!(
+            RepoSet::parse(&[spec("p", &fifo)]),
+            Err(RepoSetError::NotADirectory(_))
+        ));
     }
 }
