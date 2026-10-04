@@ -62,7 +62,7 @@ use constrain::{
 use solve::solve_attributed;
 use ty::{Content, FlatType};
 pub use unify::con_heads_compatible;
-use unify::unify_at;
+use unify::{occurs_guard, super_admits_record, unify_at};
 use unionfind::{UnionFind, VarId};
 
 /// The result of inference: resolved types for bindings and for every region.
@@ -631,6 +631,12 @@ fn infer_core(
         .map(|w| uf.find(*w))
         .collect::<Result<_, _>>()
         .map_err(InferError::unsited)?;
+    // Every pinned variable's deep check reads its nested variables, which a
+    // LATER entry's default may still pin (`{ x = n }` compared before
+    // `n + 1` defaults `n` to `Int`). The checks therefore run after every
+    // default, so the verdict never depends on the order the obligations were
+    // generated in.
+    let mut pinned: Vec<(VarId, TyBounds, Span, &ModuleHome)> = Vec::new();
     for SuperVar {
         var: v,
         bounds: orig_bounds,
@@ -726,22 +732,23 @@ fn infer_core(
             // rigid `Super`), but those arms are covered for totality and need no
             // action either.
             Content::Super { .. } | Content::Flex | Content::Rigid => {}
-            // The variable pinned to a concrete type during solving. Verify —
-            // deeply, against the fully-resolved type — that the type really
-            // supports the operation. The unifier's head pin-check already
-            // cleared a function HEAD; this catches a function NESTED inside a
-            // tuple / record / enum under an equality obligation (Rust cannot
-            // compare it), failing closed with IPE-T0014 instead of emitting
-            // code `cargo` rejects.
-            Content::Structure(_) => {
-                let ty = lift!(zonk(&mut uf, budget, root));
-                if !concrete_super_ok(interner, *orig_bounds, &ty, &enum_embeds_fn) {
-                    return Err(InferError::sited(
-                        super_unsatisfied(interner, *orig_bounds, &ty, *span),
-                        home,
-                    ));
-                }
-            }
+            // The variable pinned to a concrete type during solving: checked
+            // below, once every default has been applied.
+            Content::Structure(_) => pinned.push((root, *orig_bounds, *span, home)),
+        }
+    }
+    // Verify — deeply, against the fully-resolved type — that each pinned type
+    // really supports the operation. The unifier's head pin-check already
+    // cleared a function HEAD; this catches a function NESTED inside a tuple /
+    // record / enum under an equality obligation (Rust cannot compare it),
+    // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    for (root, orig_bounds, span, home) in pinned {
+        let ty = lift!(zonk(&mut uf, budget, root));
+        if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds_fn) {
+            return Err(InferError::sited(
+                super_unsatisfied(interner, orig_bounds, &ty, span),
+                home,
+            ));
         }
     }
 
@@ -2306,7 +2313,8 @@ impl ErrorRecordFields {
 /// The 3-way outcome of resolving one [`FieldAccess`]'s base (helper of
 /// [`resolve_deferred`]; built by [`field_access_state`]).
 enum FieldState {
-    /// The base var is still `Flex` — defer to the next fixpoint pass.
+    /// The base is still undecided ([`base_state`]) — defer to the next
+    /// fixpoint pass.
     Deferred,
     /// The base is a record (or a fixed-field builtin Con) and has the
     /// field; the payload is the field's type var.
@@ -2346,13 +2354,64 @@ enum Peek {
 enum RuPeek {
     /// `(field, value_var, field_var-if-present)` per updated field.
     Fields(Vec<(Symbol, VarId, Option<VarId>)>),
-    Flex,
+    /// The base is still undecided ([`base_state`]) — defer to the next pass.
+    Undecided,
     /// The base is a nominal BUILTIN with a fixed READABLE field table
     /// (`PanicInfo` / `TypeInfo` / `ErrorInfo` / `Request`) — field access
     /// works, record UPDATE does not. Reported as the dedicated IPE-T0017
     /// rather than a misleading "no field" IPE-T0012.
     BuiltinCon(Symbol),
     Other,
+}
+
+/// How far unification has decided a deferred obligation's base variable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BaseState {
+    /// An unconstrained variable: a record may still be grown onto it.
+    Flex,
+    /// A non-rigid super variable whose obligations admit a record head: a
+    /// later pass, or [`unify`], may still pin it to a record.
+    PinnableSuper,
+    /// Unification will never make it a record it is not already.
+    Decided,
+}
+
+impl BaseState {
+    /// Whether a later pass could still settle the base to a record.
+    const fn is_undecided(self) -> bool {
+        matches!(self, Self::Flex | Self::PinnableSuper)
+    }
+}
+
+/// Classify a base descriptor, exhaustively over [`Content`].
+///
+/// The one rule every deferred pass (field access, its row tail, record update,
+/// the no-progress settle) asks, so no pass decides against a variable another
+/// pass would still wait on.
+fn base_state(content: &Content) -> BaseState {
+    match content {
+        Content::Flex => BaseState::Flex,
+        Content::Super {
+            rigid: false,
+            bounds,
+        } if super_admits_record(*bounds) => BaseState::PinnableSuper,
+        Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::Record(_, _)
+            | FlatType::EmptyRecord,
+        ) => BaseState::Decided,
+    }
+}
+
+/// Whether the variable `var` is still undecided ([`BaseState::is_undecided`]).
+fn base_is_undecided(uf: &mut UnionFind<Content>, var: VarId) -> DResult<bool> {
+    let root = uf.find(var)?;
+    Ok(base_state(uf.root_content(root)?).is_undecided())
 }
 
 /// Resolve one [`FieldAccess`]'s base to its [`FieldState`].
@@ -2400,22 +2459,40 @@ fn field_access_state(
         {
             Peek::ErrCon(*name)
         }
-        Content::Flex => Peek::Deferred, // not settled yet
-        _ => Peek::Missing,              // rigid / super / non-record structure — error
+        // Undecided (a `Flex`, or a super that may still pin to a record) →
+        // wait; a rigid, a record-refusing super, or a non-record structure →
+        // a genuine "no field".
+        content @ (Content::Flex
+        | Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::EmptyRecord,
+        )) => {
+            if base_state(content).is_undecided() {
+                Peek::Deferred
+            } else {
+                Peek::Missing
+            }
+        }
     };
     Ok(match peek {
         // Present → Found. Missing on an OPEN tail (Flex root) → GrowOpen (the
-        // record is row-polymorphic and absorbs the new field); missing on a
-        // CLOSED tail (`EmptyRecord` / any non-Flex) → Missing (IPE-T0012).
+        // record is row-polymorphic and absorbs the new field); on a tail that
+        // may still pin to a record → Deferred; on a CLOSED or otherwise decided
+        // tail → Missing (IPE-T0012).
         Peek::Record(Some(v), _) => FieldState::Found(v),
         Peek::Record(None, ext) => {
             // Resolve the tail's root (mutable `find`) BEFORE the immutable
             // `root_content` read so the two borrows don't overlap.
             let ext_root = uf.find(ext)?;
-            if matches!(uf.root_content(ext_root)?, Content::Flex) {
-                FieldState::GrowOpen
-            } else {
-                FieldState::Missing
+            match base_state(uf.root_content(ext_root)?) {
+                BaseState::Flex => FieldState::GrowOpen,
+                BaseState::PinnableSuper => FieldState::Deferred,
+                BaseState::Decided => FieldState::Missing,
             }
         }
         Peek::Req => found_or_missing(tables.req.field_var(uf, field)?),
@@ -2457,7 +2534,11 @@ fn resolve_deferred(
         let mut made_progress = false;
 
         // ── Field accesses ────────────────────────────────────────────────────
+        // Every visit of a pending item is a solver step: a pass may discharge
+        // only one of `n` items (a chain `r.f.f…f` settles one base per pass), so
+        // the fixpoint costs O(n²) visits and the solver budget is its ceiling.
         for fa in &pending_fa {
+            lift!(budget.tick());
             let root = lift!(uf.find(fa.record));
             // See [`field_access_state`] for the encoding + borrow discipline.
             match lift!(field_access_state(uf, tables, root, fa.field)) {
@@ -2475,11 +2556,19 @@ fn resolve_deferred(
                     // field map (the `field_access_state` borrow has ended),
                     // insert, and re-seat with a FRESH open tail.
                     made_progress = true;
-                    let mut fields = match lift!(uf.root_content(root)).clone() {
-                        Content::Structure(FlatType::Record(fs, _)) => fs,
-                        // Unreachable: `GrowOpen` is only produced from a
-                        // `Record` root above; treat any drift as a fresh map.
-                        _ => BTreeMap::new(),
+                    // The record adopts `fa.result` as a field, so the base must
+                    // not occur inside it (`let a = r.a in g r.next`): a cycle is
+                    // an infinite type, never written.
+                    occurs_guard(uf, budget, interner, fa.span, root, fa.result)
+                        .map_err(|d| InferError::sited(d, &fa.home))?;
+                    let Content::Structure(FlatType::Record(mut fields, _)) =
+                        lift!(uf.root_content(root)).clone()
+                    else {
+                        // `GrowOpen` is only produced from a `Record` root.
+                        return Err(InferError::unsited(Diagnostic::CompilerBug {
+                            where_: "ipe_types::resolve_deferred",
+                            detail: "a grow-open field access base is not a record".into(),
+                        }));
                     };
                     fields.insert(fa.field, fa.result);
                     let new_ext = lift!(uf.fresh(Content::Flex));
@@ -2503,6 +2592,7 @@ fn resolve_deferred(
             // Deferred → carry to the next pass; Discharged → progress; Error →
             // propagate. Extracted into a helper so this fixpoint driver stays
             // under the readability line-cap.
+            lift!(budget.tick());
             match resolve_one_record_update(uf, budget, interner, tables, ru)? {
                 RuOutcome::Deferred => next_ru.push(ru),
                 RuOutcome::Discharged => made_progress = true,
@@ -2512,9 +2602,9 @@ fn resolve_deferred(
 
         if !made_progress {
             // Nothing was discharged this pass — every remaining item's base var
-            // is still `Flex` (no closed record ever pinned it).
+            // is still undecided (no closed record ever pinned it).
             //
-            // A `Flex` base is NOT an error: it is a field access on a parameter
+            // An undecided base is NOT an error: it is a field access on a parameter
             // no call site constrained (an un-called `viewJob job = … job.running`),
             // which the reference infers row-polymorphically — Ipe's `Access`
             // constrain (`Ipe.Type.Constrain.Expression`) unifies the target with
@@ -2525,20 +2615,28 @@ fn resolve_deferred(
             // base (`job.result`, `job.id`) absorb into the open tail via the
             // open-record unify path; the loop makes progress and terminates.
             //
-            // A base that has settled to a NON-record structure (rigid var, a
-            // concrete non-record type) still falls through to IPE-T0012 — those
-            // are genuine "not a record" errors, never reached here because a
-            // settled non-record makes `field_access_state` return `Missing`
-            // during the pass (handled above), not `Deferred`.
-            if let Some(fa) = pending_fa.first() {
-                let root = lift!(uf.find(fa.record));
-                if matches!(lift!(uf.root_content(root)), Content::Flex) {
-                    let mut fields = BTreeMap::new();
-                    fields.insert(fa.field, fa.result);
-                    let ext = lift!(uf.fresh(Content::Flex));
-                    lift!(uf.set_content(root, Content::Structure(FlatType::Record(fields, ext)),));
-                    continue;
+            // The settle goes through `unify`, never a raw write: it checks a
+            // super base's obligations and runs the occurs check, so
+            // `g r = g r.next` is an infinite type, not a cyclic record.
+            //
+            // When no pending base is undecided (each is a record waiting on a
+            // super tail), the first access falls through to IPE-T0012.
+            let mut undecided = None;
+            for fa in &pending_fa {
+                if lift!(base_is_undecided(uf, fa.record)) {
+                    undecided = Some(*fa);
+                    break;
                 }
+            }
+            if let Some(fa) = undecided {
+                let mut fields = BTreeMap::new();
+                fields.insert(fa.field, fa.result);
+                let ext = lift!(uf.fresh(Content::Flex));
+                let rec = lift!(uf.fresh(Content::Structure(FlatType::Record(fields, ext))));
+                unify_at(uf, budget, interner, &fa.home, fa.span, fa.record, rec)?;
+                continue;
+            }
+            if let Some(fa) = pending_fa.first() {
                 return Err(InferError::sited(
                     no_such_field(uf, budget, interner, fa.record, fa.field, fa.span),
                     &fa.home,
@@ -2552,6 +2650,12 @@ fn resolve_deferred(
                     &ru.home,
                 ));
             }
+            // A pass that made no progress, settled nothing and named no failing
+            // item would repeat itself forever: fail closed instead.
+            return Err(InferError::unsited(Diagnostic::CompilerBug {
+                where_: "ipe_types::resolve_deferred",
+                detail: "a deferred pass made no progress and reported no item".into(),
+            }));
         }
     }
 }
@@ -2574,7 +2678,7 @@ enum RuOutcome {
 ///   field's type var (or IPE-T0012 on a missing field);
 /// * a nominal builtin (`PanicInfo`/`TypeInfo`/`ErrorInfo`/`Request`) → the
 ///   dedicated IPE-T0017 (readable fields, no update form);
-/// * `Flex` → defer to the next pass;
+/// * an undecided base ([`base_state`]) → defer to the next pass;
 /// * anything else → IPE-T0012 on the first updated field (degenerate empty
 ///   update on a non-record base is treated as discharged so the loop can't
 ///   stall on it).
@@ -2606,8 +2710,24 @@ fn resolve_one_record_update(
         {
             RuPeek::BuiltinCon(*name)
         }
-        Content::Flex => RuPeek::Flex,
-        _ => RuPeek::Other,
+        // An update never grows a record: an undecided base waits, a decided
+        // non-record base is a genuine "no field".
+        content @ (Content::Flex
+        | Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::EmptyRecord,
+        )) => {
+            if base_state(content).is_undecided() {
+                RuPeek::Undecided
+            } else {
+                RuPeek::Other
+            }
+        }
     };
     match peek {
         RuPeek::Fields(fields) => {
@@ -2628,7 +2748,7 @@ fn resolve_one_record_update(
             }
             Ok(RuOutcome::Discharged)
         }
-        RuPeek::Flex => Ok(RuOutcome::Deferred),
+        RuPeek::Undecided => Ok(RuOutcome::Deferred),
         RuPeek::BuiltinCon(name) => Err(InferError::sited(
             lift!(builtin_record_update(interner, name, ru.span)),
             &ru.home,
@@ -5742,6 +5862,174 @@ mod tests {
                 })
             ),
             "a field on a non-record must be NoSuchField, got {r:?}"
+        );
+    }
+
+    /// Module header for the deferred-base tests. The compiled-source stdlib
+    /// modules (`Ipe.List`, `Ipe.Maybe`) do not canonicalise in this crate, so
+    /// the higher-order-kernel callback-result shapes are pinned end to end in
+    /// `negative_suite.rs` and `g_misc/golden_lambda_field_access_seal.rs`.
+    const DEFERRED_HDR: &str = "module Main exposing (ok)\n\n";
+
+    /// Infer `body` under [`DEFERRED_HDR`], returning the result.
+    fn infer_deferred(body: &str) -> DResult<SolvedTypes> {
+        let (solved, ..) = infer_src(&format!("{DEFERRED_HDR}{body}"));
+        solved
+    }
+
+    /// Whether `r` is a type error satisfying `is_msg`.
+    fn is_type_error(r: &DResult<SolvedTypes>, is_msg: fn(&TypeError) -> bool) -> bool {
+        matches!(r, Err(Diagnostic::Type { msg, .. }) if is_msg(msg))
+    }
+
+    /// A record of one `depth`-read chain `r.f.f…f` beside `riders` reads
+    /// `sK.a`, each on its own never-settled parameter.
+    fn chain_with_riders(depth: usize, riders: usize) -> String {
+        let params = (0..riders)
+            .map(|k| format!(" s{k}"))
+            .collect::<Vec<_>>()
+            .concat();
+        let reads = (0..riders)
+            .map(|k| format!(", a{k} = s{k}.a"))
+            .collect::<Vec<_>>()
+            .concat();
+        format!(
+            "{DEFERRED_HDR}ok r{params} =\n    {{ c = r{}{reads} }}\n",
+            ".f".repeat(depth)
+        )
+    }
+
+    /// The fewest solver steps `src` infers within; `None` when it fails for a
+    /// reason other than the budget, or needs more than `2^20` steps.
+    fn min_solver_steps(src: &str) -> Option<u64> {
+        let fits = |steps: u64| -> Option<bool> {
+            let (m, mut i) = canon_src(src)?;
+            match infer_with_budget(&m, &mut i, &mut Budget::new(steps)) {
+                Ok(_) => Some(true),
+                Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                }) => Some(false),
+                Err(_) => None,
+            }
+        };
+        let (mut lo, mut hi) = (0_u64, 1_u64 << 20);
+        if !fits(hi)? {
+            return None;
+        }
+        // `lo` does not fit, `hi` fits.
+        while hi.checked_sub(lo)? > 1 {
+            let mid = lo.checked_add(hi.checked_sub(lo)? / 2)?;
+            if fits(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(hi)
+    }
+
+    #[test]
+    fn deferred_fixpoint_charges_the_solver_budget() {
+        // The chain settles one base per pass, so the deferred fixpoint runs
+        // about `2 * depth` passes, and a rider read whose base nothing settles
+        // is revisited on every one of them. Each visit is a solver step, so the
+        // budget bounds the fixpoint's work, not only the unifications inside
+        // it: the riders cost at least `riders * depth` steps over the chain
+        // alone, where their own unifications cost a constant each.
+        let (depth, riders) = (64_usize, 8_usize);
+        let alone = min_solver_steps(&chain_with_riders(depth, 0));
+        let ridden = min_solver_steps(&chain_with_riders(depth, riders));
+        assert!(
+            alone.is_some() && ridden.is_some(),
+            "both chains must infer under some budget: {alone:?} {ridden:?}"
+        );
+        let (Some(alone), Some(ridden)) = (alone, ridden) else {
+            return;
+        };
+        let floor = u64::try_from(riders * depth).unwrap_or(u64::MAX);
+        assert!(
+            ridden.saturating_sub(alone) >= floor,
+            "{riders} riders over a {depth}-deep chain cost {} steps, under {floor}",
+            ridden.saturating_sub(alone)
+        );
+    }
+
+    #[test]
+    fn field_access_on_number_super_is_no_such_field() {
+        // A `number` super can never be a record, so the access is decided at
+        // once rather than deferred.
+        let r = infer_deferred("ok n =\n    n + n.x\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::NoSuchField { .. })),
+            "a field on a number super must be NoSuchField, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn self_referential_access_is_infinite_type() {
+        // The access's result is its own base: the no-progress settle goes
+        // through `unify`, whose occurs check refuses the cyclic record.
+        let r = infer_deferred("ok r =\n    ok r.next\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a self-referential field access must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn self_referential_grow_open_is_infinite_type() {
+        // `r.a` settles `r` to an open record; `r.next` then grows it with a
+        // field whose type is `r` itself — refused before the write.
+        let r = infer_deferred("ok r =\n    let a = r.a in ok r.next\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a self-referential grown field must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn super_pinned_to_containing_structure_is_infinite_type() {
+        // The equality super `a` would pin to `List a`: an infinite type, not a
+        // solver spin to the step budget.
+        let r = infer_deferred("ok a =\n    a == [ a ]\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a super pinned to a structure containing it must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn equality_on_a_deferred_record_base_is_order_independent() {
+        // `a` owes equality and settles to `{ x : Int }` only in the deferred
+        // pass; the verdict must not depend on which operand was constrained
+        // first.
+        let fwd = infer_deferred("ok a =\n    a.x == 1 && a == a\n");
+        assert!(
+            fwd.is_ok(),
+            "field read before equality must infer: {fwd:?}"
+        );
+        let rev = infer_deferred("ok a =\n    a == a && a.x == 1\n");
+        assert!(
+            rev.is_ok(),
+            "equality before field read must infer: {rev:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_super_check_sees_a_later_default() {
+        // `p == p` is constrained before `n + 1` makes `n` numeric: the deep
+        // equality check on `{ x = n }` must read `n` after it defaults to
+        // `Int`, exactly as the reversed spelling does.
+        let rev = infer_deferred("ok n =\n    (let p = { x = n } in p == p) && n + 1 > 0\n");
+        assert!(
+            rev.is_ok(),
+            "equality before the numeric use must infer: {rev:?}"
+        );
+        let fwd = infer_deferred("ok n =\n    n + 1 > 0 && (let p = { x = n } in p == p)\n");
+        assert!(
+            fwd.is_ok(),
+            "numeric use before equality must infer: {fwd:?}"
         );
     }
 

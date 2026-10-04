@@ -25,7 +25,7 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
-use ipe_ir::once_closure::MovedCapture;
+use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
@@ -1661,7 +1661,7 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
 //
-// `rewrite_captured_clones`'s depth==0 bare-callee exemption for a NonClone
+// `rewrite_captured_clones`'s bare-callee exemption for a NonClone
 // (function-typed) capture is sound only when the capturing lambda is not
 // ITSELF nested inside another lambda that also captures the same symbol.
 // Each `lower_lambda` call classifies its OWN captures independently, with
@@ -1677,51 +1677,59 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 //
 // Fix: after a `let`-bound function-typed value's WHOLE remaining scope has
 // been lowered (`lower_let`'s `PVar` arm, once every later sibling binding
-// has already folded around it), check whether the symbol is referenced at
-// lambda-nesting depth >= 2, or at depth >= 1 in 2+ distinct places
-// (`needs_shared_capture`). If so:
-//   * every read of the symbol at lambda-nesting depth >= 1 is rewritten to
-//     `CloneVar` (`force_shared_capture_clones`) -- a depth-0 (non-nested)
-//     read stays bare, since calling through an `Arc<dyn Fn>` auto-derefs
-//     exactly like `Box<dyn Fn>` and needs no clone;
+// has already folded around it), check whether the symbol is referenced
+// past a `Recallable` closure, or inside `Recallable` closures in 2+ distinct
+// places (`needs_shared_capture`; scopes per `ipe_ir::once_closure`, the
+// `move |_|` around a `TaskSeq` continuation counted as a `Once` closure).
+// If so:
+//   * every read of the symbol inside a closure is rewritten to
+//     `CloneVar` (`force_shared_capture_clones`) -- a non-nested read stays
+//     bare, since calling through an `Arc<dyn Fn>` auto-derefs exactly like
+//     `Box<dyn Fn>` and needs no clone;
 //   * the let-bound closure LITERAL itself is wrapped in `Expr::SharedLambda`
 //     so the backend boxes it with `Arc::new` (`+ Send + Sync` trait-object
 //     bound) instead of `Box::new` -- `Arc<T>: Clone`, so the inserted
-//     `.clone()` calls above compile. A single depth-1 occurrence (the
-//     common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
+//     `.clone()` calls above compile. A single occurrence directly inside
+//     one `Recallable` closure (the common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
 //     ts)`) stays untouched: byte-identical `Box<dyn Fn>`, zero behaviour
 //     change for the steady-state pattern this fix must not regress.
 
-/// Record, into `depths`, the LAMBDA-NESTING DEPTH (relative to `expr`'s own
-/// scope) of every live (non-shadowed) `Var(sym)` / `CloneVar(sym)` occurrence
-/// in `expr`. `cur_depth` is the number of `Lambda` / `SharedLambda`
-/// boundaries already crossed to reach `expr`. Mirrors
-/// [`lambda_body_refs_sym`]'s shadowing discipline exactly, generalised from
-/// a boolean "does it occur" to "at what depth does it occur, possibly more
-/// than once". `Expr::Update.record` is walked too (unlike
-/// `lambda_body_refs_sym`, which treats it as borrow-only for a DIFFERENT
-/// question) -- a false positive here only costs an unneeded (but harmless)
-/// `Arc`/`.clone()`, whereas a false negative would leave a real E0507/E0382
-/// unfixed, so this walker is deliberately the more conservative of the two.
+/// Record, into `out`, the [`CaptureScope`] of every live `Var(sym)` / `CloneVar(sym)` in `expr`.
+///
+/// `scope` is where `expr` itself sits; every closure the backend emits steps
+/// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
+/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
+/// shadowing discipline exactly, generalised from a boolean "does it occur" to
+/// "where does it occur, possibly more than once". `Expr::Update.record` is
+/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
+/// for a DIFFERENT question) -- a false positive here only costs an unneeded
+/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
+/// real E0507/E0382 unfixed, so this walker is deliberately the more
+/// conservative of the two.
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
-fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depths: &mut Vec<u32>) {
+fn collect_capture_scopes(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    out: &mut Vec<CaptureScope>,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                depths.push(cur_depth);
+                out.push(scope);
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth + 1, depths);
+                collect_capture_scopes(sym, body, scope.enter_boundary(expr), out);
             }
         }
         Expr::Let { name, value, body } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if *name != sym {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Destructure {
@@ -1729,75 +1737,75 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
             value,
             body,
         } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if !pat_binds_symbol(binder, sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Match(m) => {
-            collect_lambda_capture_depths(sym, m.scrutinee(), cur_depth, depths);
+            collect_capture_scopes(sym, m.scrutinee(), scope, out);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
                     for e in arm.guard.iter().chain([&arm.body]) {
-                        collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                        collect_capture_scopes(sym, e, scope, out);
                     }
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            collect_lambda_capture_depths(sym, lhs, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rhs, cur_depth, depths);
+            collect_capture_scopes(sym, lhs, scope, out);
+            collect_capture_scopes(sym, rhs, scope, out);
         }
         Expr::If { cond, then_, else_ } => {
-            collect_lambda_capture_depths(sym, cond, cur_depth, depths);
-            collect_lambda_capture_depths(sym, then_, cur_depth, depths);
-            collect_lambda_capture_depths(sym, else_, cur_depth, depths);
+            collect_capture_scopes(sym, cond, scope, out);
+            collect_capture_scopes(sym, then_, scope, out);
+            collect_capture_scopes(sym, else_, scope, out);
         }
         Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Apply { func, args } => {
-            collect_lambda_capture_depths(sym, func, cur_depth, depths);
+            collect_capture_scopes(sym, func, scope, out);
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Cons { head, tail } => {
-            collect_lambda_capture_depths(sym, head, cur_depth, depths);
-            collect_lambda_capture_depths(sym, tail, cur_depth, depths);
+            collect_capture_scopes(sym, head, scope, out);
+            collect_capture_scopes(sym, tail, scope, out);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            collect_lambda_capture_depths(sym, list, cur_depth, depths);
+            collect_capture_scopes(sym, list, scope, out);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Update { record, fields } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            collect_lambda_capture_depths(sym, effect, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rest, cur_depth, depths);
+            collect_capture_scopes(sym, effect, scope, out);
+            collect_capture_scopes(sym, rest, scope.enter_boundary(expr), out);
         }
         Expr::Access { record, .. } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -1810,26 +1818,29 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
     }
 }
 
-/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared
-/// capture treatment? True when some occurrence is nested at least 2 lambda
-/// levels deep (the outer closure must move-capture it to hand off to the
-/// inner closure, which ALSO move-captures it) OR there are at least 2
-/// distinct depth-at-least-1 occurrences (two independent closures each
-/// move-capturing the same symbol -- the sibling-closure analogue of the
-/// same E0507/E0382 class). A single depth-1 occurrence (the common,
-/// already-sound case) returns `false`, so ordinary single-capture closures
-/// stay byte-identical `Box<dyn Fn>`.
+/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared capture?
+///
+/// True when some occurrence sits past a `Recallable` closure (the outer
+/// closure must move-capture it to hand off to the inner closure, which ALSO
+/// move-captures it, on every call) OR at least 2 occurrences sit inside
+/// `Recallable` closures (two independent closures each move-capturing the
+/// same symbol -- the sibling-closure analogue of the same E0507/E0382
+/// class). A single occurrence directly inside one `Recallable` closure (the
+/// common, already-sound case) returns `false`, so ordinary single-capture
+/// closures stay byte-identical `Box<dyn Fn>`; so do reads inside only `Once`
+/// closures, such as a top-level run-statement chain.
 fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    depths.iter().any(|&d| d >= 2) || depths.iter().filter(|&&d| d >= 1).count() >= 2
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    scopes.iter().any(|s| s.borrow_is_hazard())
+        || scopes.iter().filter(|s| s.move_is_hazard()).count() >= 2
 }
 
 // ── Usage-site (not nesting-site) shared-capture trigger ──────────────────
 //
 // `needs_shared_capture` (above) closes the class: a `let`-bound closure
 // moved into 2+ competing closure environments. It does NOT cover a narrower,
-// DIFFERENT class — a single, non-nested (depth-0) reference to a `let`-bound
+// DIFFERENT class — a single, non-nested reference to a `let`-bound
 // closure passed straight into a kernel call whose runtime consumer itself
 // requires `Send + Sync` (`KernelFn::requires_sync_capture`, e.g.
 // `Ui.onSubmit` / `Ui.onInput` / `Ipe.Html.Events.on*` / `Stream.stream`).
@@ -1845,14 +1856,14 @@ fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
 // ORs this predicate into the same `Expr::SharedLambda` promotion path.
 
 /// Does `sym` occur ANYWHERE inside `expr` as a live `Var`/`CloneVar` leaf
-/// (any lambda-nesting depth, no boundary exemptions)? Used only to test
+/// (inside any closures, no boundary exemptions)? Used only to test
 /// whether a specific kernel-call ARGUMENT subtree mentions `sym` —
 /// deliberately over-inclusive (a false positive costs one harmless
 /// `Arc`/`.clone()`; a false negative would leave a real E0277 unfixed).
 fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    !depths.is_empty()
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    !scopes.is_empty()
 }
 
 /// Does `sym` (a `let`-bound, function-typed local) flow — anywhere in
@@ -1862,7 +1873,7 @@ fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
 /// (`KernelFn::requires_sync_capture`)? See the module comment above for the
 /// bug class this closes.
 ///
-/// Traversal mirrors [`collect_lambda_capture_depths`] (recurse into every
+/// Traversal mirrors [`collect_capture_scopes`] (recurse into every
 /// `Expr` variant, lambda bodies included — a sync-requiring call reachable
 /// only through a nested closure still needs the same promotion), but asks a
 /// structurally different question at each node, so it is its own walker.
@@ -4003,6 +4014,10 @@ fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
         Expr::Record { fields, .. } | Expr::Update { fields, .. } => fields
             .iter()
             .any(|(_, e)| binder_captured_in_move_closure(binder, e)),
+        // The `move |_|` around the continuation is a `Once` boundary
+        // (`ipe_ir::once_closure::boundary_kind`) whose slot asks only `Send`,
+        // so it adds no `Sync` obligation of its own; a `Fn` closure around
+        // the node already sees the continuation's reads through it.
         Expr::TaskSeq { effect, rest } => {
             binder_captured_in_move_closure(binder, effect)
                 || binder_captured_in_move_closure(binder, rest)
@@ -5773,8 +5788,13 @@ fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
                     .sum::<usize>()
         }
         Expr::Ctor { args, .. } => args.iter().map(|a| count_fn_value_uses(sym, a)).sum(),
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`): a
+        // read there, a borrowing call included, moves `sym` into that closure
+        // once, and the moves inside it count on their own.
         Expr::TaskSeq { effect, rest } => {
-            count_fn_value_uses(sym, effect) + count_fn_value_uses(sym, rest)
+            count_fn_value_uses(sym, effect)
+                + count_fn_value_uses(sym, rest).max(usize::from(lambda_body_refs_sym(sym, rest)))
         }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
@@ -5969,9 +5989,18 @@ fn fn_value_move_walk(
                 fn_value_move_walk(sym, e, state, payloads);
             }
         }
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`):
+        // building it is one consuming read of `sym`, after the effect. Inside
+        // it the closure owns `sym`, so its own reads start unmoved.
         Expr::TaskSeq { effect, rest } => {
             fn_value_move_walk(sym, effect, state, payloads);
-            fn_value_move_walk(sym, rest, state, payloads);
+            if lambda_body_refs_sym(sym, rest) {
+                state.read(true);
+                let mut inner = FnValueMoveState::default();
+                fn_value_move_walk(sym, rest, &mut inner, payloads);
+                state.hazard |= inner.hazard;
+            }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
@@ -7040,13 +7069,17 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 // `wrap`'s 2 flattened args, so a residual `\eta_0 -> wrap(<partial>, eta_0)`
 // capturing `wrap` exists only post-lowering).
 //
-// Read soundness for a `Box`-carried fn binding, by position:
-//   * depth-0 direct callee — borrows via `Fn::call(&self, ..)`, sound.
-//   * depth-0 non-callee, single use — a plain final move, sound.
-//   * NON-CALLEE read at closure depth ≥ 1 — the closure body moves the
-//     captured `Box` out of a `&self` env per call → E0507.
-//   * ANY read at closure depth ≥ 2 — an inner closure's construction moves
-//     the value out of the outer closure's env per call → E0507/E0525.
+// Read soundness for a `Box`-carried fn binding, by its `CaptureScope`
+// (`ipe_ir::once_closure`; the `move |_|` around a `TaskSeq` continuation is
+// a `Once` closure like any other):
+//   * direct callee short of past-`Recallable` — borrows via
+//     `Fn::call(&self, ..)`, sound.
+//   * non-callee outside every `Recallable` closure, single use — a plain
+//     final move, sound.
+//   * NON-CALLEE read inside a `Recallable` closure — the closure body moves
+//     the captured `Box` out of a `&self` env per call → E0507.
+//   * ANY read past a `Recallable` closure — an inner closure's construction
+//     moves the value out of the outer closure's env per call → E0507/E0525.
 //   * > 1 consuming use — the second move of a non-`Clone` value → E0382.
 // The last three demand the `Arc` carrier; [`fn_value_read_flags`] +
 // [`count_fn_value_uses`] detect them.
@@ -7069,12 +7102,15 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 /// whose output is byte-pinned.
 #[derive(Clone, Copy, Default)]
 struct FnValueReadFlags {
-    /// A non-callee `Var`/`CloneVar` read at closure depth ≥ 1 exists — a bare
-    /// `Box` capture would be moved out of a `Fn` env per call (E0507).
-    non_callee_ge1: bool,
-    /// Any read at closure depth ≥ 2 exists — an intermediate closure's
-    /// construction would move the `Box` out of its enclosing env (E0525).
-    any_ge2: bool,
+    /// A non-callee `Var`/`CloneVar` read inside a `Recallable` closure exists.
+    ///
+    /// A bare `Box` capture would be moved out of a `Fn` env per call (E0507).
+    move_in_recallable: bool,
+    /// Any read past a `Recallable` closure exists.
+    ///
+    /// An intermediate closure's construction would move the `Box` out of its
+    /// enclosing env per call (E0507/E0525).
+    any_past: bool,
 }
 
 /// Threaded per-symbol summary maintained across the reverse fold in
@@ -7089,12 +7125,13 @@ struct FnValueReadFlags {
 /// - `var_uses`             ← `count_var_uses(sym, acc)`
 /// - `fn_value_uses`        ← `count_fn_value_uses(sym, acc)`
 /// - `fn_flags`             ← `fn_value_read_flags(sym, acc)`
-/// - `depth1_capture_count` ← count of depth-≥1 entries in
-///   `collect_lambda_capture_depths(sym, acc, 0, ..)`
-/// - `any_depth2_capture`   ← any depth-≥2 entry in the same collection
+/// - `recallable_capture_count` ← count of entries inside a `Recallable`
+///   closure in `collect_capture_scopes(sym, acc, CaptureScope::Top, ..)`
+/// - `any_past_capture` ← any entry past a `Recallable` closure in the same
+///   collection
 ///
 /// From those last two: `needs_shared_capture(sym, acc)` =
-/// `any_depth2_capture || depth1_capture_count >= 2`.
+/// `any_past_capture || recallable_capture_count >= 2`.
 ///
 /// `flows_into_sync_kernel_call` is intentionally NOT threaded: its
 /// alias-chain resolution (`let g = f in Ui.onSubmit g` propagating `f`'s
@@ -7106,8 +7143,8 @@ struct LetAccum {
     var_uses: usize,
     fn_value_uses: usize,
     fn_flags: FnValueReadFlags,
-    depth1_capture_count: usize,
-    any_depth2_capture: bool,
+    recallable_capture_count: usize,
+    any_past_capture: bool,
 }
 
 impl LetAccum {
@@ -7120,47 +7157,47 @@ impl LetAccum {
         let fn_value_uses = count_fn_value_uses(sym, expr);
         let fn_flags = {
             let mut f = FnValueReadFlags::default();
-            fn_value_read_flags_walk(sym, expr, 0, &mut f);
+            fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut f);
             f
         };
-        let mut depths: Vec<u32> = Vec::new();
-        collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-        let depth1_capture_count = depths.iter().filter(|&&d| d >= 1).count();
-        let any_depth2_capture = depths.iter().any(|&d| d >= 2);
+        let mut scopes = Vec::new();
+        collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+        let recallable_capture_count = scopes.iter().filter(|s| s.move_is_hazard()).count();
+        let any_past_capture = scopes.iter().any(|s| s.borrow_is_hazard());
         Self {
             var_uses,
             fn_value_uses,
             fn_flags,
-            depth1_capture_count,
-            any_depth2_capture,
+            recallable_capture_count,
+            any_past_capture,
         }
     }
 
     /// Fold `other` (computed over a fresh sub-expression) into `self`
     /// (accumulated over all previously folded sub-expressions).  Correct
-    /// because the sub-expressions are at the SAME lambda-nesting depth —
-    /// they are sibling Let-value sub-trees separated by Let nodes, and a
-    /// `Let` node does not increment depth.  Counts add; boolean flags OR.
+    /// because the sub-expressions sit at the SAME capture scope — they are
+    /// sibling Let-value sub-trees separated by Let nodes, and a `Let` node
+    /// is no closure boundary.  Counts add; boolean flags OR.
     const fn merge(&mut self, other: Self) {
         // `count_var_uses` is additive across Let-separated sub-expressions
-        // at the same depth.  The MAX semantics within If/Match are already
+        // at the same scope.  The MAX semantics within If/Match are already
         // captured by `count_var_uses` when called on each individual
         // sub-expression; merging across disjoint sub-trees is always SUM.
         self.var_uses += other.var_uses;
         self.fn_value_uses += other.fn_value_uses;
-        self.fn_flags.non_callee_ge1 |= other.fn_flags.non_callee_ge1;
-        self.fn_flags.any_ge2 |= other.fn_flags.any_ge2;
-        // Depth-counts add: two distinct depth-1 captures in different
-        // sub-expressions each contribute one slot; their SUM determines
-        // whether `needs_shared_capture` fires (>= 2 depth-1 captures).
-        self.depth1_capture_count += other.depth1_capture_count;
-        self.any_depth2_capture |= other.any_depth2_capture;
+        self.fn_flags.move_in_recallable |= other.fn_flags.move_in_recallable;
+        self.fn_flags.any_past |= other.fn_flags.any_past;
+        // Capture counts add: two distinct captures inside `Recallable`
+        // closures in different sub-expressions each contribute one slot;
+        // their SUM determines whether `needs_shared_capture` fires (>= 2).
+        self.recallable_capture_count += other.recallable_capture_count;
+        self.any_past_capture |= other.any_past_capture;
     }
 
     /// Reconstruct the `needs_shared_capture` boolean from the threaded
-    /// depth-count summary.  Mirrors `needs_shared_capture`'s own condition.
+    /// capture-scope summary.  Mirrors `needs_shared_capture`'s own condition.
     const fn needs_shared(&self) -> bool {
-        self.any_depth2_capture || self.depth1_capture_count >= 2
+        self.any_past_capture || self.recallable_capture_count >= 2
     }
 }
 
@@ -7286,44 +7323,50 @@ fn batch_accum_update(accum: &mut BTreeMap<Symbol, LetAccum>, expr: &Expr) {
 }
 
 /// Gather [`FnValueReadFlags`] for `sym` over `expr`. Shadow discipline and
-/// callee-position handling mirror [`count_fn_value_uses`]; depth counting
-/// mirrors [`collect_lambda_capture_depths`]. Enumerated exhaustively (no `_`
+/// callee-position handling mirror [`count_fn_value_uses`]; scope tracking
+/// mirrors [`collect_capture_scopes`]. Enumerated exhaustively (no `_`
 /// catch-all) so a future `Expr` variant is a compile error here, not a
 /// silently-missed read.
 fn fn_value_read_flags(sym: Symbol, expr: &Expr) -> FnValueReadFlags {
     let mut flags = FnValueReadFlags::default();
-    fn_value_read_flags_walk(sym, expr, 0, &mut flags);
+    fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut flags);
     flags
 }
 
 #[allow(clippy::too_many_lines)]
-fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut FnValueReadFlags) {
+fn fn_value_read_flags_walk(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    flags: &mut FnValueReadFlags,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                flags.non_callee_ge1 |= depth >= 1;
-                flags.any_ge2 |= depth >= 2;
+                flags.move_in_recallable |= scope.move_is_hazard();
+                flags.any_past |= scope.borrow_is_hazard();
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth + 1, flags);
+                fn_value_read_flags_walk(sym, body, scope.enter_boundary(expr), flags);
             }
         }
         Expr::Apply { func, args } => {
             match func.as_ref() {
                 // Direct-callee read: borrows (`Fn::call`), so it is not a
-                // non-callee hazard — but at depth ≥ 2 its capture chain still
-                // moves the value through an intermediate closure env.
+                // non-callee hazard — but past a `Recallable` closure its
+                // capture chain still moves the value through an intermediate
+                // closure env.
                 Expr::Var(s) | Expr::CloneVar(s) if *s == sym => {
-                    flags.any_ge2 |= depth >= 2;
+                    flags.any_past |= scope.borrow_is_hazard();
                 }
-                other => fn_value_read_flags_walk(sym, other, depth, flags),
+                other => fn_value_read_flags_walk(sym, other, scope, flags),
             }
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         // A sync-capture kernel argument is the sync-promotion path's slot —
@@ -7331,14 +7374,14 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
         Expr::Call { callee, args, .. } => {
             if !matches!(callee, Callee::Kernel(k) if k.requires_sync_capture()) {
                 for a in args {
-                    fn_value_read_flags_walk(sym, a, depth, flags);
+                    fn_value_read_flags_walk(sym, a, scope, flags);
                 }
             }
         }
         Expr::Let { name, value, body } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if *name != sym {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Destructure {
@@ -7346,67 +7389,67 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
             value,
             body,
         } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if !pat_binds_symbol(binder, sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Match(m) => {
-            fn_value_read_flags_walk(sym, m.scrutinee(), depth, flags);
+            fn_value_read_flags_walk(sym, m.scrutinee(), scope, flags);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
-                    fn_value_read_flags_walk(sym, &arm.body, depth, flags);
+                    fn_value_read_flags_walk(sym, &arm.body, scope, flags);
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            fn_value_read_flags_walk(sym, lhs, depth, flags);
-            fn_value_read_flags_walk(sym, rhs, depth, flags);
+            fn_value_read_flags_walk(sym, lhs, scope, flags);
+            fn_value_read_flags_walk(sym, rhs, scope, flags);
         }
         Expr::If { cond, then_, else_ } => {
-            fn_value_read_flags_walk(sym, cond, depth, flags);
-            fn_value_read_flags_walk(sym, then_, depth, flags);
-            fn_value_read_flags_walk(sym, else_, depth, flags);
+            fn_value_read_flags_walk(sym, cond, scope, flags);
+            fn_value_read_flags_walk(sym, then_, scope, flags);
+            fn_value_read_flags_walk(sym, else_, scope, flags);
         }
         Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Cons { head, tail } => {
-            fn_value_read_flags_walk(sym, head, depth, flags);
-            fn_value_read_flags_walk(sym, tail, depth, flags);
+            fn_value_read_flags_walk(sym, head, scope, flags);
+            fn_value_read_flags_walk(sym, tail, scope, flags);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            fn_value_read_flags_walk(sym, list, depth, flags);
+            fn_value_read_flags_walk(sym, list, scope, flags);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Update { record, fields } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            fn_value_read_flags_walk(sym, effect, depth, flags);
-            fn_value_read_flags_walk(sym, rest, depth, flags);
+            fn_value_read_flags_walk(sym, effect, scope, flags);
+            fn_value_read_flags_walk(sym, rest, scope.enter_boundary(expr), flags);
         }
         Expr::Access { record, .. } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -18754,7 +18797,9 @@ impl<'a> Lowerer<'a> {
     /// T3 capture-clone rewrite for a closure body: classify the free locals
     /// captured by the closure (from its CANON body) and rewrite the LOWERED
     /// `body` — `CloneOk` reads become `CloneVar` (`.clone()`), `NonClone` captures
-    /// outside the depth-0 callee position fail-close IPE-L0125/L0126.
+    /// outside a borrowing callee position fail-close IPE-L0126. A callee read
+    /// past the closure, such as one in a run-statement continuation inside
+    /// it, refuses at the capture's own use.
     ///
     /// A captured pure-`Fun` symbol whose binder can carry the `Arc<dyn Fn>`
     /// promotion (a plain `let` name or a def/lambda param — see
@@ -18772,10 +18817,11 @@ impl<'a> Lowerer<'a> {
         span: Span,
         body: Expr,
     ) -> DResult<Expr> {
-        let captures = self.captured_locals(all_param_pats, cur_body)?;
+        let captures = self.captured_locals_at(all_param_pats, cur_body)?;
         let mut clone_set: BTreeSet<Symbol> = BTreeSet::new();
         let mut noncl_set: BTreeSet<Symbol> = BTreeSet::new();
-        for (sym, binder_ty) in captures {
+        let mut capture_spans: BTreeMap<Symbol, Span> = BTreeMap::new();
+        for (sym, capture_span, binder_ty) in captures {
             let ir_ty = binder_ty.classified();
             if fun_value_arc_promotable(ir_ty) && self.promotable_fn_binders.borrow().contains(&sym)
             {
@@ -18788,6 +18834,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Some(false) => {
                     noncl_set.insert(sym);
+                    capture_spans.insert(sym, capture_span);
                 }
                 None => {}
             }
@@ -18795,9 +18842,9 @@ impl<'a> Lowerer<'a> {
         rewrite_captured_clones(
             &clone_set,
             &noncl_set,
-            &CaptureWalk::refusing(span),
+            &CaptureWalk::refusing_at(span, capture_spans),
             body,
-            0,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )
     }
 
@@ -18816,7 +18863,7 @@ impl<'a> Lowerer<'a> {
     ///   `Clone` `Arc` carrier when a read here would move it;
     /// * a `CloneOk` read clones, exactly as in a source lambda, or the closure
     ///   would move it out of its `Fn` environment (E0507);
-    /// * a `NonClone` read the body moves (anything but a depth-0 callee) is
+    /// * a `NonClone` read the body moves (anything but a borrowing callee) is
     ///   recorded: the closure is then `FnOnce` only and is built as an
     ///   [`Expr::OnceLambda`], which the once check admits only where its
     ///   position calls it at most once;
@@ -18855,7 +18902,11 @@ impl<'a> Lowerer<'a> {
         }
         let walk = CaptureWalk::recording(span);
         let body = Box::new(rewrite_captured_clones(
-            &clone_set, &noncl_set, &walk, body, 0,
+            &clone_set,
+            &noncl_set,
+            &walk,
+            body,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )?);
         Ok(match walk.first_moved() {
             None => Expr::Lambda { params, ret, body },
@@ -19007,9 +19058,10 @@ impl<'a> Lowerer<'a> {
             // per call (E0507) unless it rides the `Clone` `Arc` carrier —
             // the flags walk deliberately excludes those slots, so the flow
             // check is the param-side trigger for them.
-            if flags.non_callee_ge1
-                || flags.any_ge2
+            if flags.move_in_recallable
+                || flags.any_past
                 || count_fn_value_uses(sym, &body) > 1
+                || fn_value_use_after_consume(sym, &body, &self.enum_payloads)
                 || flows_into_sync_kernel_call(sym, &body)
             {
                 let shimmed = shim_fn_value_reads(
@@ -29823,7 +29875,7 @@ impl<'a> Lowerer<'a> {
                 &noncl_set,
                 &CaptureWalk::refusing(value_span),
                 value,
-                0,
+                CaptureScope::Top.enter(ClosureKind::Recallable),
             )?
         };
         let thunk_name = self.fresh_destructure_thunk_symbol()?;
@@ -29927,11 +29979,11 @@ impl<'a> Lowerer<'a> {
         }
         // NOTE the deferred-capture signal is NOT a trigger: a deferral
         // also fires for the lean, sound capture shapes (a single
-        // depth-0-callee read inside one closure), which must keep the bare
+        // borrowing-callee read inside one closure), which must keep the bare
         // `Box` carrier byte-identically. The walkers below detect exactly
         // the read patterns a `Box` cannot serve; `needs_shared_capture`
-        // (depth ≥ 2 / 2+ closure captures) joins in the carrier-flip
-        // condition further down.
+        // (a read past a `Recallable` closure / 2+ closure captures) joins in
+        // the carrier-flip condition further down.
         // Use threaded counts from the accumulator when available (O(1)),
         // falling back to fresh walks of `acc` (O(|acc|)) only when called
         // without a precomputed summary.
@@ -29941,7 +29993,8 @@ impl<'a> Lowerer<'a> {
         // in evaluation order by ANY further read, including a borrowing
         // direct-callee call — is the third unsound shape. It is invisible to
         // `count_fn_value_uses` (which exempts the callee position) and to
-        // `non_callee_ge1` (the reuse can be two depth-0 reads), so it is
+        // `move_in_recallable` (the reuse can be two reads outside every
+        // closure), so it is
         // detected order-aware here. Like `flows_into_sync_kernel_call` it is
         // not additively threadable across `Let` siblings (a move in one
         // binding and a use in the next cross the boundary), so it is a full
@@ -29949,10 +30002,10 @@ impl<'a> Lowerer<'a> {
         let new_trigger = fun_shape.is_some()
             && (precomputed.map_or_else(
                 || {
-                    fn_value_read_flags(name, &acc).non_callee_ge1
+                    fn_value_read_flags(name, &acc).move_in_recallable
                         || count_fn_value_uses(name, &acc) > 1
                 },
-                |a| a.fn_flags.non_callee_ge1 || a.fn_value_uses > 1,
+                |a| a.fn_flags.move_in_recallable || a.fn_value_uses > 1,
             ) || fn_value_use_after_consume(name, &acc, &self.enum_payloads));
         let mut acc = match (&fun_shape, new_trigger) {
             (Some((ps, r)), true) => {
@@ -30032,20 +30085,21 @@ impl<'a> Lowerer<'a> {
         // is built INLINE at the call site, never when it is a `Var` read
         // of an already-built `Box<dyn Fn + Send>` local (capturing an
         // already-non-Sync value cannot make the capturing wrapper `Sync`).
-        // `flows_into_sync_kernel_call` detects this at depth 0 — where
+        // `flows_into_sync_kernel_call` detects this outside every closure — where
         // `needs_shared_capture` intentionally stays silent, a single
         // non-nested capture being the common sound case for THAT trigger —
         // and ORs into the same promotion path.
         let mut value = value;
-        // A NEW-trigger promotion (deferred capture / non-callee depth ≥ 1
-        // read / value reuse — decided on the LOWERED scope above) MUST flip
+        // A NEW-trigger promotion (deferred capture / non-callee read inside
+        // a `Recallable` closure / value reuse — decided on the LOWERED scope
+        // above) MUST flip
         // the carrier here or the inserted `.clone()`s hit E0599 on a `Box`.
         // OR it into the promotion alongside the existing nesting /
         // sync-kernel heuristics.
-        // `needs_shared_capture` is derived from the threaded depth-count
+        // `needs_shared_capture` is derived from the threaded capture-scope
         // summary when available.  `apply_move_ownership_precomputed` (the
         // non-new-trigger path) converts Var→CloneVar but preserves capture
-        // depths, so the threaded value remains correct post-rewrite.
+        // scopes, so the threaded value remains correct post-rewrite.
         //
         // `flows_into_sync_kernel_call` is always a full walk: its
         // alias-chain resolution cannot be accumulated incrementally across
@@ -30089,13 +30143,18 @@ impl<'a> Lowerer<'a> {
                 // alias `Var`, a top-level `FuncValue`, a fn-typed record
                 // field access, …): mint the `Arc` carrier by eta-expanding
                 // the value into a `SharedLambda` that moves the underlying
-                // value in once and forwards per call. A LEGACY-only trigger
-                // keeps the value untouched — an alias binding propagates the
-                // promoted root's `Arc` type through Rust inference (see
-                // `flows_into_sync_kernel_call`'s alias-chain doc), and that
-                // behaviour is byte-pinned.
+                // value in once and forwards per call. A nesting trigger
+                // (`needs_shared_capture`) mints it the same way, an alias
+                // `Var` included: its reads inside closures become
+                // `.clone()`s, and nothing promotes the alias root for them, so
+                // a `Box` root would leave them without `Clone`. An alias under
+                // the sync-kernel trigger alone keeps the value untouched — it
+                // propagates the promoted root's `Arc` type through Rust
+                // inference (see `flows_into_sync_kernel_call`'s alias-chain
+                // doc, which promotes the root too), and that behaviour is
+                // byte-pinned.
                 other => {
-                    value = if new_trigger {
+                    value = if new_trigger || needs_shared_val {
                         eta_shared_rebind(other, &ps, &r, self.eta_slice())?
                     } else {
                         other
@@ -33192,6 +33251,59 @@ mod tests {
             vec![user_call(vec![Expr::Var(w)]), user_call(vec![read_tag()])],
         );
         assert!(nonclone_read_after_move(env, w, &wrap_task, &unordered));
+    }
+
+    /// A run-statement continuation is the body of the `move |_|` closure
+    /// `task_and_then` receives, so any read of a function value there,
+    /// a borrowing direct call included, moves the value into it.
+    #[test]
+    fn taskseq_continuation_read_moves_the_fn_value() {
+        use ipe_ir::{CallPin, Callee, Expr, FuncId, OnFormKind};
+
+        use super::{count_fn_value_uses, fn_value_use_after_consume};
+
+        let mut interner = Interner::new();
+        let f = interner.intern("f").expect("intern");
+        let payloads = ipe_ir::EnumPayloadTable::new();
+        let pass = || Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args: vec![Expr::Var(f)],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+        let call_f = || Expr::Apply {
+            func: Box::new(Expr::Var(f)),
+            args: vec![Expr::Int(1)],
+        };
+        let seq = |effect: Expr, rest: Expr| Expr::TaskSeq {
+            effect: Box::new(effect),
+            rest: Box::new(rest),
+        };
+
+        // `do { use f ; f 1 }`: the effect moves `f`, the continuation closure
+        // captures it again.
+        let moved_then_called = seq(pass(), call_f());
+        assert_eq!(count_fn_value_uses(f, &moved_then_called), 2);
+        assert!(fn_value_use_after_consume(f, &moved_then_called, &payloads));
+
+        // `do { f 1 ; f 1 }`: the effect borrows; the one capture is sound.
+        let called_twice = seq(call_f(), call_f());
+        assert_eq!(count_fn_value_uses(f, &called_twice), 1);
+        assert!(!fn_value_use_after_consume(f, &called_twice, &payloads));
+
+        // `do { f 1 ; use f }`: inside the continuation the closure owns `f`.
+        let called_then_moved = seq(call_f(), pass());
+        assert_eq!(count_fn_value_uses(f, &called_then_moved), 1);
+        assert!(!fn_value_use_after_consume(
+            f,
+            &called_then_moved,
+            &payloads
+        ));
+
+        // A continuation that never reads `f` captures nothing.
+        let unrelated = seq(pass(), Expr::Unit);
+        assert_eq!(count_fn_value_uses(f, &unrelated), 1);
+        assert!(!fn_value_use_after_consume(f, &unrelated, &payloads));
     }
 
     /// A sequenced task whose capture-clone rewrite would clone a non-Clone

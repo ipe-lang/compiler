@@ -281,9 +281,12 @@ pub(super) fn force_shared_capture_clones(sym: Symbol, expr: Expr) -> Expr {
     }
 }
 
-/// wrap a (already recursively-processed) `TaskSeq` node in a pre-clone
-/// `let sym = sym.clone() in <TaskSeq>` IFF its `rest` continuation directly
-/// references `sym`. The emitter renders `TaskSeq { effect, rest }` as
+/// Pre-clone `sym` around an already-processed `TaskSeq` whose `rest` reads it.
+///
+/// The node becomes `let sym = sym.clone() in <TaskSeq>`. This is the one
+/// placement of a `CloneOk` capture's pre-clone at the entry of a `TaskSeq`
+/// continuation, the `Once` boundary `ipe_ir::once_closure::boundary_kind`
+/// names for the node. The emitter renders `TaskSeq { effect, rest }` as
 /// `task_and_then(effect, Box::new(move |_| { rest }))`; placing the pre-clone
 /// OUTSIDE the whole node emits it BEFORE the `task_and_then(…)` call, hence
 /// outside the synthetic `move |_|` closure, so that closure captures the fresh

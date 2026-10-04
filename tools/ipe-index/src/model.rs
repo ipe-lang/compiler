@@ -134,6 +134,15 @@ impl RepoTag {
     }
 }
 
+/// One `--repo tag:path` entry as given: the tag every stored path of the repo
+/// carries and the directory spelling its sources are read from, before
+/// [`crate::repo_set::RepoSet::parse`] resolves it to a directory identity.
+#[derive(Debug, Clone)]
+pub struct RepoSpec {
+    pub tag: RepoTag,
+    pub root: String,
+}
+
 /// Split a repo-tagged path (`"ipe:crates/foo.rs"`) into `(tag, relpath)`.
 /// Untagged paths (no `:` before the first `/`) return `("", path)`.
 pub fn split_tag(path: &str) -> (&str, &str) {
@@ -235,6 +244,18 @@ impl Lang {
             Other => "other",
         }
     }
+
+    /// Every `Lang` variant — read by `tests/lang_vectors.json`'s own test, the
+    /// shared fixture code-review's `Highlight.langFor` is pinned against.
+    ///
+    /// Built from an exhaustive match (no wildcard): a new `Lang` variant
+    /// fails this build until it is listed here too.
+    #[cfg(test)]
+    pub(crate) const ALL: [Lang; 5] = match Lang::Rust {
+        Lang::Rust | Lang::Bash | Lang::Ts | Lang::Ipe | Lang::Other => {
+            [Lang::Rust, Lang::Bash, Lang::Ts, Lang::Ipe, Lang::Other]
+        }
+    };
 }
 impl Role {
     pub fn as_str(&self) -> &'static str {
@@ -312,6 +333,37 @@ mod tests {
         assert_eq!(
             stage_of("src/compiler/backend/rust/src/builder.rs"),
             Some(Stage::Generate)
+        );
+    }
+
+    const LANG_VECTORS: &str = include_str!("../tests/lang_vectors.json");
+
+    // The fixture's `stored` set must equal `Lang::as_str` over every
+    // variant — exactly once each — so a parser reading it is never fed a
+    // value outside ipe-index's vocabulary, and `Lang::ALL` growing without
+    // the fixture growing too goes red here.
+    #[test]
+    fn lang_vectors_list_every_language() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(LANG_VECTORS).unwrap();
+        let stored: Vec<&str> = rows
+            .iter()
+            .map(|row| row["stored"].as_str().unwrap())
+            .collect();
+        let want: Vec<&str> = Lang::ALL.iter().map(Lang::as_str).collect();
+        let mut sorted_stored = stored.clone();
+        sorted_stored.sort_unstable();
+        sorted_stored.dedup();
+        assert_eq!(
+            stored.len(),
+            sorted_stored.len(),
+            "lang_vectors.json has a duplicate `stored` value: {stored:?}"
+        );
+        let mut sorted_want = want.clone();
+        sorted_want.sort_unstable();
+        assert_eq!(
+            sorted_stored, sorted_want,
+            "lang_vectors.json must list exactly ipe-index's Lang vocabulary \
+             ({want:?}), got {stored:?}"
         );
     }
 

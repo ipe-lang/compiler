@@ -72,6 +72,8 @@ mod golden_http_statuscode_imagesrc_seal;
 mod golden_if_expr;
 #[path = "g_misc/golden_l0105_refutable_gates.rs"]
 mod golden_l0105_refutable_gates;
+#[path = "g_misc/golden_lambda_field_access_seal.rs"]
+mod golden_lambda_field_access_seal;
 #[path = "g_misc/golden_lazy_emit_seal.rs"]
 mod golden_lazy_emit_seal;
 #[path = "g_misc/golden_local_type_shadows_dep.rs"]
