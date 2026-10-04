@@ -7993,16 +7993,44 @@ fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()>
 
 /// The ownership gates of one list arm head at `span` over `prefix`.
 ///
-/// Under [`SliceOwnership::OwnedMove`] an element alias whose inner binds a name
-/// is refused (IPE-L0135), and the owned-move rendering itself is refused
-/// (IPE-L0116) until the emitter renders the owned view.
+/// Under [`SliceOwnership::OwnedMove`] each element moves out of the owned view,
+/// so an element alias whose inner binds a name would own its part twice and is
+/// refused (IPE-L0135).
 fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResult<()> {
     match own {
         SliceOwnership::BorrowClone => Ok(()),
-        SliceOwnership::OwnedMove => {
-            slice_element_alias_refusal(prefix, span)?;
-            Err(unsupported(span, Feature::NestedCtorDiscrimination))
-        }
+        SliceOwnership::OwnedMove => slice_element_alias_refusal(prefix, span),
+    }
+}
+
+/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
+///
+/// An owned list view moves each binder out of one view shape, so every
+/// alternative would have to bind each name at the same position of the view;
+/// the owned rendering supports alternatives that bind nothing.
+fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
+    let owned = alts.iter().any(holds_owned_slice_head);
+    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
+        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
+    }
+    Ok(())
+}
+
+/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
+fn holds_owned_slice_head(pat: &Pat) -> bool {
+    match pat {
+        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
+        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
+        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_) => false,
     }
 }
 
@@ -31145,6 +31173,7 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
+                owned_or_refusal(&lowered, p.span)?;
                 Ok(Pat::Or(lowered))
             }
         }
@@ -32682,9 +32711,12 @@ mod tests {
     #[test]
     fn carrier_clone_authority_agrees_with_clone_class() {
         use ipe_intern::Symbol;
-        use ipe_ir::{EnumPayloadTable, IrType, ModPath, carrier_is_clone};
+        use ipe_ir::{
+            EnumPayloadTable, IrType, ModPath, SliceOwnership, carrier_is_clone,
+            carrier_is_clone_bounded,
+        };
 
-        use super::{CloneClass, CloneEnv, clone_class};
+        use super::{CloneClass, CloneEnv, clone_class, slice_ownership};
 
         // The shared authority agreement is checked on non-FFI types (an FFI
         // foreign-interface `Enum` is intentionally NonClone in `clone_class`
@@ -32761,7 +32793,38 @@ mod tests {
         assert!(carrier_is_clone(&named(shared_fn, Vec::new()), &payloads));
         assert!(carrier_is_clone(&named(wrap, vec![IrType::Int]), &payloads));
         assert!(!carrier_is_clone(&named(boxed_fn, Vec::new()), &payloads));
-        assert!(!carrier_is_clone(&named(wrap, vec![fun]), &payloads));
+        assert!(!carrier_is_clone(&named(wrap, vec![fun.clone()]), &payloads));
+
+        // The list-`case` ownership decision and the emitter's generic-aware
+        // authority agree: a slice element copies out exactly when its carrier
+        // is `Clone` under the emitted bound.
+        let generic = IrType::Generic(Symbol::from_raw(8));
+        let mut owned_samples = samples.clone();
+        owned_samples.push(generic.clone());
+        for ty in &owned_samples {
+            assert_eq!(
+                slice_ownership(env, ty) == SliceOwnership::OwnedMove,
+                !carrier_is_clone_bounded(ty, &payloads),
+                "slice_ownership / carrier_is_clone_bounded drift on {ty:?}"
+            );
+        }
+        assert_eq!(slice_ownership(env, &generic), SliceOwnership::BorrowClone);
+        assert_eq!(slice_ownership(env, &fun), SliceOwnership::OwnedMove);
+        assert_eq!(
+            slice_ownership(env, &IrType::Task(Box::new(IrType::Int))),
+            SliceOwnership::OwnedMove
+        );
+        // A composite over a type parameter is the one conservative direction:
+        // `clone_class` floors it to `NonClone`, so its elements move out of the
+        // owned view although a copy-out would also resolve. A move never needs
+        // `Clone`, so this direction cannot break the emitted build; the reverse
+        // (copy-out over a carrier that is not `Clone`) must never occur.
+        let generic_pair = IrType::Tuple(vec![generic, IrType::Int]);
+        assert!(carrier_is_clone_bounded(&generic_pair, &payloads));
+        assert_eq!(
+            slice_ownership(env, &generic_pair),
+            SliceOwnership::OwnedMove
+        );
     }
 
     /// SEAL: an FFI foreign opaque handle (`Rust.*`-homed `Enum`) is a real
@@ -37239,6 +37302,49 @@ mod tests {
             owned_slice_refusal(SliceOwnership::BorrowClone, &aliased, span),
             Ok(())
         );
+    }
+
+    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
+    #[test]
+    fn owned_or_pattern_binding_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Pat, SliceOwnership};
+
+        use super::{owned_or_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let x = fx.sym("x");
+        let span = Span::DUMMY;
+        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
+            prefix,
+            rest: None,
+            own,
+        };
+        let binding = [
+            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
+            slice(
+                SliceOwnership::OwnedMove,
+                vec![Pat::Wildcard, Pat::Var(x)],
+            ),
+        ];
+        assert_eq!(
+            owned_or_refusal(&binding, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        let unbound = [
+            slice(SliceOwnership::OwnedMove, vec![]),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
+        ];
+        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
+        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
+        let borrowed = [
+            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
+            slice(
+                SliceOwnership::BorrowClone,
+                vec![Pat::Wildcard, Pat::Var(x)],
+            ),
+        ];
+        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
     }
 
     /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.

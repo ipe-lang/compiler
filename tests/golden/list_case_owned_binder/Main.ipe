@@ -1,0 +1,142 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+-- List `case` over an element type that is not `Clone` (`Task`, and a `Maybe`
+-- of one). Every binder moves out of the list; none is copied, so the emitted
+-- Rust builds although the element has no `Clone` impl.
+
+
+-- `[]`, `[_]` and a whole-list catch-all binder.
+describe : List (Task Error String) -> String
+describe ts =
+    case ts of
+        [] ->
+            "none"
+
+        [ _ ] ->
+            "one"
+
+        other ->
+            "count " ++ String.fromInt (List.length other)
+
+
+-- `[t]` before the overlapping `t :: rest`.
+sequence : List (Task Error String) -> Task Error String
+sequence ts =
+    case ts of
+        [] ->
+            Task.succeed ""
+
+        [ t ] ->
+            t
+
+        t :: rest ->
+            t |> Task.andThen (\a -> sequence rest |> Task.andThen (\b -> Task.succeed (a ++ b)))
+
+
+-- A two-element prefix with a rest, and a wildcard catch-all.
+firstTwo : List (Task Error String) -> Task Error String
+firstTwo ts =
+    case ts of
+        x :: y :: rest ->
+            let
+                n =
+                    List.length rest
+            in
+            x |> Task.andThen (\a -> y |> Task.andThen (\b -> Task.succeed (a ++ b ++ String.fromInt n)))
+
+        _ ->
+            Task.succeed "short"
+
+
+-- A list column of a tuple scrutinee.
+pick : List (Task Error String) -> Int -> Task Error String
+pick ts n =
+    case ( ts, n ) of
+        ( t :: _, 0 ) ->
+            t
+
+        ( _ :: r, _ ) ->
+            pick r (n - 1)
+
+        ( [], _ ) ->
+            Task.succeed "none"
+
+
+-- The first arm's string guard fails for `Just "stop"`; the next arm binds.
+gated : List (Task Error String) -> Maybe String -> Task Error String
+gated ts flag =
+    case ( ts, flag ) of
+        ( t :: _, Just "go" ) ->
+            t
+
+        ( _ :: r, _ ) ->
+            sequence r
+
+        ( [], _ ) ->
+            Task.succeed "empty"
+
+
+-- A constructor element pattern.
+firstJust : List (Maybe (Task Error String)) -> Task Error String
+firstJust ms =
+    case ms of
+        (Just t) :: _ ->
+            t
+
+        Nothing :: r ->
+            firstJust r
+
+        [] ->
+            Task.succeed "no task"
+
+
+weight : Maybe (Task Error String) -> Int
+weight m =
+    case m of
+        Just _ ->
+            1
+
+        Nothing ->
+            0
+
+
+-- An element alias over a pattern that binds nothing.
+countJusts : List (Maybe (Task Error String)) -> Int
+countJusts ms =
+    case ms of
+        ((Just _) as m) :: r ->
+            weight m + countJusts r
+
+        Nothing :: r ->
+            countJusts r
+
+        [] ->
+            0
+
+
+say : Task Error String -> Task Error ()
+say t =
+    t |> Task.andThen (\s -> Io.println s)
+
+
+main : Task Error ()
+main =
+    say (sequence [ Task.succeed "a", Task.succeed "b", Task.succeed "c" ])
+        |> Task.andThen (\_ -> Io.println (describe []))
+        |> Task.andThen (\_ -> Io.println (describe [ Task.succeed "x" ]))
+        |> Task.andThen (\_ -> Io.println (describe [ Task.succeed "x", Task.succeed "y", Task.succeed "z" ]))
+        |> Task.andThen (\_ -> say (firstTwo [ Task.succeed "p", Task.succeed "q", Task.succeed "r" ]))
+        |> Task.andThen (\_ -> say (firstTwo [ Task.succeed "p" ]))
+        |> Task.andThen (\_ -> say (pick [ Task.succeed "a", Task.succeed "b", Task.succeed "c" ] 1))
+        |> Task.andThen (\_ -> say (pick [ Task.succeed "a" ] 5))
+        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] (Just "go")))
+        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] (Just "stop")))
+        |> Task.andThen (\_ -> say (firstJust [ Nothing, Just (Task.succeed "j"), Just (Task.succeed "k") ]))
+        |> Task.andThen (\_ -> say (firstJust [ Nothing ]))
+        |> Task.andThen (\_ -> Io.println (String.fromInt (countJusts [ Just (Task.succeed "a"), Nothing, Just (Task.succeed "b") ])))

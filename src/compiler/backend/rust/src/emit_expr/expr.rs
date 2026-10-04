@@ -636,7 +636,9 @@ pub fn emit_expr_at(
             // Clone the element at a constant index — the arm guard already
             // proved `list.len() > index`, so the Rust index is in
             // bounds by construction. `.clone()` keeps the list intact for the
-            // sibling tail binder.
+            // sibling tail binder; the lowerer builds this node only over a
+            // `Clone` element and refuses a nested cons over any other
+            // (IPE-L0116), so the clone always resolves.
             let l = emit_expr_at(ctx, list, indent, child, generics)?;
             Ok(format!("({l})[{index}].clone()"))
         }

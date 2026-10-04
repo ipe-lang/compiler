@@ -485,10 +485,83 @@ pub fn list_sort_with<A: Clone>(cmp: impl Fn(A, A) -> i64, list: Vec<A>) -> Vec<
     result
 }
 
+/// Split an owned list into a view of its first `W` slots and the remaining tail.
+///
+/// Slot `i` is `Some` of the `i`-th element while the list has one, then `None`
+/// past the end; the tail holds every element after the first `W`. This is the
+/// owned destructure a list `case` over a non-`Clone` element matches against:
+/// every element moves into the view, none is cloned. Total.
+#[must_use]
+pub fn ipe_list_view_owned<T, const W: usize>(xs: Vec<T>) -> ([Option<T>; W], Vec<T>) {
+    let mut it = xs.into_iter();
+    let head = core::array::from_fn(|_| it.next());
+    (head, it.collect())
+}
+
+/// Rebuild the list a run of view slots plus the view's tail stands for.
+///
+/// The slots are a suffix of a view built by [`ipe_list_view_owned`], so every
+/// `None` sits after every `Some` and the elements keep their list order. Moves;
+/// never clones. Total.
+#[must_use]
+pub fn ipe_list_view_rest<T, const N: usize>(spill: [Option<T>; N], tail: Vec<T>) -> Vec<T> {
+    spill.into_iter().flatten().chain(tail).collect()
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    /// A non-`Clone` element: a stray clone in either view helper cannot compile.
+    type Once = Box<dyn FnOnce() -> i64>;
+
+    fn once_list(n: i64) -> Vec<Once> {
+        (0..n).map(|i| Box::new(move || i) as Once).collect()
+    }
+
+    fn run_all(xs: Vec<Once>) -> Vec<i64> {
+        xs.into_iter().map(|f| f()).collect()
+    }
+
+    fn run_slots<const W: usize>(slots: [Option<Once>; W]) -> Vec<Option<i64>> {
+        slots.into_iter().map(|s| s.map(|f| f())).collect()
+    }
+
+    #[test]
+    fn list_view_owned_splits_every_length_around_the_width() {
+        // Width 3: lengths 0, W-1, W and W+1.
+        let (slots, tail) = ipe_list_view_owned::<_, 3>(once_list(0));
+        assert_eq!(run_slots(slots), vec![None, None, None]);
+        assert!(tail.is_empty());
+
+        let (slots, tail) = ipe_list_view_owned::<_, 3>(once_list(2));
+        assert_eq!(run_slots(slots), vec![Some(0), Some(1), None]);
+        assert!(tail.is_empty());
+
+        let (slots, tail) = ipe_list_view_owned::<_, 3>(once_list(3));
+        assert_eq!(run_slots(slots), vec![Some(0), Some(1), Some(2)]);
+        assert!(tail.is_empty());
+
+        let (slots, tail) = ipe_list_view_owned::<_, 3>(once_list(4));
+        assert_eq!(run_slots(slots), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(run_all(tail), vec![3]);
+    }
+
+    #[test]
+    fn list_view_rest_round_trips_the_view() {
+        for n in 0..6 {
+            let (slots, tail) = ipe_list_view_owned::<_, 3>(once_list(n));
+            assert_eq!(
+                run_all(ipe_list_view_rest(slots, tail)),
+                (0..n).collect::<Vec<_>>()
+            );
+        }
+        // A suffix of the slots rebuilds the rest after the matched prefix.
+        let ([first, s1, s2], tail) = ipe_list_view_owned::<_, 3>(once_list(5));
+        assert_eq!(first.map(|f| f()), Some(0));
+        assert_eq!(run_all(ipe_list_view_rest([s1, s2], tail)), vec![1, 2, 3, 4]);
+    }
 
     // Every HOF kernel in this file must accept the EXACT shape
     // `ipe_backend_rust::emit_expr::emit_lambda` emits for every Ipê closure

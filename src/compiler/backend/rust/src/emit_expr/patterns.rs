@@ -4,7 +4,9 @@ use super::{
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
-use ipe_ir::free_vars::pat_has_str_guard_slot;
+use ipe_ir::SliceOwnership;
+use ipe_ir::free_vars::{free_vars, pat_bound_symbols, pat_has_str_guard_slot};
+use std::collections::BTreeSet;
 
 /// Render `s` as a Rust double-quoted string literal through Rust's own
 /// `Debug` grammar for `str`.
@@ -24,17 +26,35 @@ pub fn rust_str_lit(s: &str) -> String {
 /// Emit the scrutinee of a `Match` plus its two mode flags. A string scrutinee is
 /// matched as `&str` (so literal patterns apply) — the presence of a `Pat::Str`
 /// head is the reliable signal (the type checker proved the scrutinee a
-/// `String`). A LIST scrutinee (the runtime's `Vec<T>`) is matched as a slice so
-/// the native Rust slice patterns `[]` / `[a, b]` / `[x, rest @ ..]` apply — a
-/// `Pat::Slice` head is the signal. Shared by the value-context (`emit_match`)
+/// `String`). A LIST scrutinee (the runtime's `Vec<T>`) is matched through its
+/// [`ListView`] — a borrowed slice (`[]` / `[a, b]` / `[x, rest @ ..]`) for a
+/// `Clone` element, the owned view `ipe_list_view_owned` returns for any other —
+/// and a `Pat::Slice` head is the signal. Shared by the value-context (`emit_match`)
 /// and tail-context (`emit_expr_tail`) match emitters so the two agree exactly.
 /// How a `match` scrutinee is coerced for pattern matching. A WHOLE scrutinee is
-/// matched as `&str` (string `case`) or `&[T]` (list `case`) or as-is; a TUPLE
+/// matched as `&str` (string `case`), through its [`ListView`] (list `case`), or
+/// as-is; a TUPLE
 /// scrutinee (a multi-arm product `case`) is matched column-by-column, each
 /// column carrying its own string / list coercion.
 pub enum ScrutMode {
-    Whole { str_mode: bool, list_mode: bool },
+    Whole { str_mode: bool, list: ListView },
     Tuple(Vec<ColMode>),
+}
+
+/// How a list scrutinee, or a list column of a tuple scrutinee, is matched.
+///
+/// Decided from the [`SliceOwnership`] the lowerer stamped on the column's
+/// slice arms; every arm of the column renders against the one view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListView {
+    /// Not a list column: no arm head slices it.
+    Off,
+    /// Matched as a borrowed slice (`as_slice()`); each binder copies out.
+    Borrow,
+    /// Matched as the owned view `ipe_list_view_owned::<_, width>` returns;
+    /// each binder moves out. `tag` keeps the view's temporaries apart from a
+    /// sibling column's.
+    Owned { width: usize, tag: usize },
 }
 
 /// The per-column coercion flags of a tuple-scrutinee `match`. A column is
@@ -43,7 +63,7 @@ pub enum ScrutMode {
 #[derive(Clone, Copy)]
 pub struct ColMode {
     str_mode: bool,
-    list_mode: bool,
+    list: ListView,
 }
 
 /// The arity of a tuple-scrutinee `match` — the element count of the first arm
@@ -61,29 +81,119 @@ pub fn tuple_arm_arity(arms: &[Arm]) -> Option<usize> {
 /// is in list mode when some arm slices it, and in string mode when some arm
 /// matches it against a string literal. (A column is never both — the scrutinee
 /// element has a single type the checker pinned.)
-pub fn tuple_col_modes(arms: &[Arm], arity: usize) -> Vec<ColMode> {
-    let mut cols = vec![
-        ColMode {
-            str_mode: false,
-            list_mode: false,
-        };
-        arity
-    ];
-    for arm in arms {
-        if let Pat::Tuple(elems) = &arm.pat {
-            for (c, sub) in elems.iter().enumerate() {
-                if let Some(col) = cols.get_mut(c) {
-                    if matches!(sub, Pat::Str(_)) {
-                        col.str_mode = true;
-                    }
-                    if matches!(sub, Pat::Slice { .. }) {
-                        col.list_mode = true;
-                    }
+pub fn tuple_col_modes(arms: &[Arm], arity: usize) -> DResult<Vec<ColMode>> {
+    let mut cols = Vec::with_capacity(arity);
+    for c in 0..arity {
+        let column = arms.iter().filter_map(|arm| match &arm.pat {
+            Pat::Tuple(elems) => elems.get(c),
+            _ => None,
+        });
+        cols.push(ColMode {
+            str_mode: column.clone().any(|sub| matches!(sub, Pat::Str(_))),
+            list: list_view(column, c)?,
+        });
+    }
+    Ok(cols)
+}
+
+/// The [`ListView`] of one list column: the arm heads `pats` matched against it.
+///
+/// The column is a list column when some head is a slice. Its view follows the
+/// slices' [`SliceOwnership`], which every slice of the column, including one
+/// under an alias or or-pattern head, must share. An owned view is one slot
+/// wider than the longest slice prefix, so a closed prefix always has the
+/// `None` slot that proves its length.
+pub fn list_view<'p>(pats: impl Iterator<Item = &'p Pat> + Clone, tag: usize) -> DResult<ListView> {
+    if !pats.clone().any(|p| matches!(p, Pat::Slice { .. })) {
+        return Ok(ListView::Off);
+    }
+    let mut own = None;
+    let mut longest: usize = 0;
+    let mut pending: Vec<&Pat> = pats.collect();
+    while let Some(pat) = pending.pop() {
+        match pat {
+            Pat::Slice {
+                prefix, own: here, ..
+            } => {
+                if own.is_some_and(|seen| seen != *here) {
+                    return Err(Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::list_view",
+                        detail: "the slice arms of one list column disagree on their \
+                                 ownership; the lowerer decides it once per element type"
+                            .to_owned(),
+                    });
                 }
+                own = Some(*here);
+                longest = longest.max(prefix.len());
             }
+            Pat::Alias(inner, _) => pending.push(inner),
+            Pat::Or(alts) => pending.extend(alts),
+            Pat::Var(_)
+            | Pat::Wildcard
+            | Pat::Int(_)
+            | Pat::Bool(_)
+            | Pat::Char(_)
+            | Pat::Str(_)
+            | Pat::Ctor { .. }
+            | Pat::Tuple(_)
+            | Pat::Record(_) => {}
         }
     }
-    cols
+    match own {
+        None => Ok(ListView::Off),
+        Some(SliceOwnership::BorrowClone) => Ok(ListView::Borrow),
+        Some(SliceOwnership::OwnedMove) => {
+            let width = longest
+                .checked_add(1)
+                .ok_or_else(|| Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::list_view",
+                    detail: "list pattern prefix length overflowed the view width".to_owned(),
+                })?;
+            Ok(ListView::Owned { width, tag })
+        }
+    }
+}
+
+/// Refuse an owned view of a bare variable scrutinee `s` that an arm still reads.
+///
+/// The owned view consumes `s`, so a read of it in an arm body or guard would
+/// be a use after move. The lowerer's consume accounting refuses that program
+/// first (IPE-L0135); this re-checks it independently over the arms' free
+/// variables.
+fn owned_scrutinee_reuse_refusal(scrutinee: &Expr, view: ListView, arms: &[Arm]) -> DResult<()> {
+    let (ListView::Owned { .. }, Expr::Var(s)) = (view, scrutinee) else {
+        return Ok(());
+    };
+    for arm in arms {
+        let mut bound = BTreeSet::new();
+        pat_bound_symbols(&arm.pat, &mut bound);
+        if bound.contains(s) {
+            continue;
+        }
+        let read = free_vars(&arm.body).contains(s)
+            || arm.guard.as_ref().is_some_and(|g| free_vars(g).contains(s));
+        if read {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::emit_match_scrutinee",
+                detail: "an owned list view consumes its variable scrutinee, but an arm \
+                         still reads it; the lowerer's consume gate refuses that reuse \
+                         (IPE-L0135)"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Render the list scrutinee `e` for its column's [`ListView`].
+fn list_scrutinee(e: String, view: ListView) -> String {
+    match view {
+        ListView::Off => e,
+        ListView::Borrow => format!("({e}).as_slice()"),
+        ListView::Owned { width, .. } => {
+            format!("ipe_runtime::list::ipe_list_view_owned::<_, {width}>({e})")
+        }
+    }
 }
 
 pub fn emit_match_scrutinee(
@@ -115,39 +225,31 @@ pub fn emit_match_scrutinee(
                 ),
             });
         }
-        let cols = tuple_col_modes(m.arms(), arity);
+        let cols = tuple_col_modes(m.arms(), arity)?;
         let mut parts = Vec::with_capacity(arity);
         for (elem, col) in elems.iter().zip(&cols) {
+            owned_scrutinee_reuse_refusal(elem, col.list, m.arms())?;
             let e = emit_expr_at(ctx, elem, indent, child, generics)?;
             let e = if col.str_mode {
                 format!("({e}).as_str()")
-            } else if col.list_mode {
-                format!("({e}).as_slice()")
             } else {
-                e
+                list_scrutinee(e, col.list)
             };
             parts.push(e);
         }
         return Ok((format!("({})", parts.join(", ")), ScrutMode::Tuple(cols)));
     }
 
-    let scrut_expr = emit_expr_at(ctx, m.scrutinee(), indent, child, generics)?;
     let str_mode = m.arms().iter().any(|a| matches!(a.pat, Pat::Str(_)));
-    let list_mode = m.arms().iter().any(|a| matches!(a.pat, Pat::Slice { .. }));
+    let list = list_view(m.arms().iter().map(|a| &a.pat), 0)?;
+    owned_scrutinee_reuse_refusal(m.scrutinee(), list, m.arms())?;
+    let scrut_expr = emit_expr_at(ctx, m.scrutinee(), indent, child, generics)?;
     let scrut = if str_mode {
         format!("({scrut_expr}).as_str()")
-    } else if list_mode {
-        format!("({scrut_expr}).as_slice()")
     } else {
-        scrut_expr
+        list_scrutinee(scrut_expr, list)
     };
-    Ok((
-        scrut,
-        ScrutMode::Whole {
-            str_mode,
-            list_mode,
-        },
-    ))
+    Ok((scrut, ScrutMode::Whole { str_mode, list }))
 }
 
 /// Render one match-arm head to its Rust pattern plus any leading rebind/unbox
@@ -181,10 +283,7 @@ pub fn emit_arm_head(
     mode: &ScrutMode,
 ) -> DResult<(String, String, Option<String>)> {
     let (rendered, prelude, guards) = match mode {
-        ScrutMode::Whole {
-            str_mode,
-            list_mode,
-        } => emit_whole_arm_head(ctx, pat, *str_mode, *list_mode)?,
+        ScrutMode::Whole { str_mode, list } => emit_whole_arm_head(ctx, pat, *str_mode, *list)?,
         ScrutMode::Tuple(cols) => emit_tuple_arm_head(ctx, pat, cols)?,
     };
     let guard = if guards.is_empty() {
@@ -204,7 +303,7 @@ pub fn emit_whole_arm_head(
     ctx: &EmitCtx,
     pat: &Pat,
     str_mode: bool,
-    list_mode: bool,
+    list: ListView,
 ) -> DResult<(String, String, Vec<String>)> {
     if let Pat::Ctor {
         home,
@@ -214,18 +313,18 @@ pub fn emit_whole_arm_head(
     } = pat
     {
         emit_ctor_arm_pat(ctx, home, *ty, *variant, args)
-    } else if str_mode || list_mode {
-        // STR/LIST mode: the scrutinee IS a reference (`.as_str()` /
-        // `.as_slice()`), so `render_pat`'s `name @ inner` is a borrow and
-        // sound for any inner shape. A top-level `Pat::Str`
-        // matches the `&str`-wrapped scrutinee directly (a literal pattern), so no
-        // guard is synthesized here.
-        let prelude = if str_mode {
-            str_binder_rebinds(ctx, pat)?
-        } else {
-            list_binder_rebinds(ctx, pat)?
-        };
-        Ok((render_pat(ctx, pat)?, prelude, Vec::new()))
+    } else if str_mode {
+        // STR mode: the scrutinee IS a reference (`.as_str()`), so
+        // `render_pat`'s `name @ inner` is a borrow and sound for any inner
+        // shape. A top-level `Pat::Str` matches the `&str`-wrapped scrutinee
+        // directly (a literal pattern), so no guard is synthesized here.
+        Ok((
+            render_pat(ctx, pat)?,
+            str_binder_rebinds(ctx, pat)?,
+            Vec::new(),
+        ))
+    } else if list != ListView::Off {
+        list_arm_head(ctx, pat, list)
     } else {
         // WHOLE mode, by value: a top-level dispatch-free alias head
         // (`(a, b) as w ->`) takes the alias-safe clone-rebuild path; a
@@ -262,7 +361,7 @@ pub fn emit_tuple_arm_head(
             for (c, sub) in elems.iter().enumerate() {
                 // `unwrap_or` on a missing column would silently coerce a
                 // wider-than-known tuple pattern to `str_mode: false,
-                // list_mode: false` — the WRONG per-column coercion emits a
+                // list: ListView::Off` — the WRONG per-column coercion emits a
                 // binder of the wrong type, an exit-0-then-cargo-fail (E0308)
                 // THE SEAL forbids. Fail closed instead: this is the same
                 // "lowerer only produces columns it schemed" invariant the
@@ -278,7 +377,7 @@ pub fn emit_tuple_arm_head(
                         ),
                     }
                 })?;
-                let (rp, pre, gs) = emit_whole_arm_head(ctx, sub, col.str_mode, col.list_mode)?;
+                let (rp, pre, gs) = emit_whole_arm_head(ctx, sub, col.str_mode, col.list)?;
                 rendered.push(rp);
                 prelude.push_str(&pre);
                 guards.extend(gs);
@@ -457,18 +556,70 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
     }
 }
 
-/// In LIST mode the scrutinee is matched as a slice (`(v).as_slice()`), so every
-/// binder a list arm introduces is a borrow: an ELEMENT binder is `&T` and a
-/// REST / whole-list binder is `&[T]`. This builds the `let … = …;` prelude that
-/// rebinds each to the owned Ipê value the arm body expects — an element via
-/// `.clone()` (so the body sees `T`), a rest / whole list via `.to_vec()` (so the
-/// body sees `Vec<T>`). Cloning is the sound owned destructure of a shared slice;
-/// the lowerer gates a list `case` binding a still-generic (non-`Clone`) element
-/// type (IPE-L0102), so the `.clone()` / `.to_vec()` always resolve.
-pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
+/// Render one arm head of a list column for the column's [`ListView`].
+///
+/// Every list-column arm head passes through here. A borrowed view renders the
+/// slice pattern and the copy-out rebinds of [`list_binder_rebinds`]; an owned
+/// view renders the move-out pattern of [`owned_list_arm_head`].
+pub fn list_arm_head(
+    ctx: &EmitCtx,
+    pat: &Pat,
+    list: ListView,
+) -> DResult<(String, String, Vec<String>)> {
+    match list {
+        ListView::Borrow => Ok((
+            render_pat(ctx, pat)?,
+            list_binder_rebinds(ctx, pat, SliceOwnership::BorrowClone)?,
+            Vec::new(),
+        )),
+        ListView::Owned { width, tag } => {
+            let (head, prelude) = owned_list_arm_head(ctx, pat, width, tag)?;
+            Ok((head, prelude, Vec::new()))
+        }
+        ListView::Off => Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::list_arm_head",
+            detail: "a list arm head was rendered for a column no slice arm matches".to_owned(),
+        }),
+    }
+}
+
+/// Build the copy-out prelude of a list arm over a borrowed slice.
+///
+/// Under [`SliceOwnership::BorrowClone`] the scrutinee is matched as a slice
+/// (`(v).as_slice()`), so every binder a list arm introduces is a borrow: an
+/// ELEMENT binder is `&T` and a REST / whole-list binder is `&[T]`. This builds
+/// the `let … = …;` prelude that rebinds each to the owned Ipê value the arm
+/// body expects — an element via `.clone()` (so the body sees `T`), a rest /
+/// whole list via `.to_vec()` (so the body sees `Vec<T>`). The lowerer stamps
+/// `BorrowClone` only on an element type whose clone class is `Clone` (a bare
+/// type parameter carries the emitted `Clone` bound), so the `.clone()` /
+/// `.to_vec()` always resolve. A non-`Clone` element is
+/// [`SliceOwnership::OwnedMove`], whose binders move out of the owned view and
+/// have no copy-out prelude, so reaching here with it is an internal error.
+pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DResult<String> {
+    match own {
+        SliceOwnership::BorrowClone => {}
+        SliceOwnership::OwnedMove => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::list_binder_rebinds",
+                detail: "an owned-move list arm reached the copy-out rebinds".to_owned(),
+            });
+        }
+    }
     let mut out = String::new();
     match pat {
-        Pat::Slice { prefix, rest, .. } => {
+        Pat::Slice {
+            prefix,
+            rest,
+            own: here,
+        } => {
+            if *here != own {
+                return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::list_binder_rebinds",
+                    detail: "a list arm's slice ownership disagrees with its column's view"
+                        .to_owned(),
+                });
+            }
             for sub in prefix {
                 collect_elem_rebinds(ctx, sub, &mut out)?;
             }
@@ -481,7 +632,7 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         Pat::Var(_) => collect_list_rebinds(ctx, pat, &mut out)?,
         Pat::Alias(inner, name) => {
             rebind_to_vec(ctx, *name, &mut out)?;
-            out.push_str(&list_binder_rebinds(ctx, inner)?);
+            out.push_str(&list_binder_rebinds(ctx, inner, own)?);
         }
         // A wildcard binds nothing; other heads never reach a list `case`.
         Pat::Wildcard
@@ -496,11 +647,205 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // alternative's rebinds are the whole arm's set.
         Pat::Or(alts) => {
             if let Some(first) = alts.first() {
-                out.push_str(&list_binder_rebinds(ctx, first)?);
+                out.push_str(&list_binder_rebinds(ctx, first, own)?);
             }
         }
     }
     Ok(out)
+}
+
+/// The slot-array name of the owned view tagged `tag`.
+fn view_slots(tag: usize) -> String {
+    format!("__ipe_v{tag}_a")
+}
+
+/// The tail name of the owned view tagged `tag`.
+fn view_tail(tag: usize) -> String {
+    format!("__ipe_v{tag}_t")
+}
+
+/// Does `pat` bind any name at any depth?
+fn binds_any(pat: &Pat) -> bool {
+    let mut bound = BTreeSet::new();
+    pat_bound_symbols(pat, &mut bound);
+    !bound.is_empty()
+}
+
+/// Write `let <name> = ipe_list_view_rest(<slots>, <tail>);` into `prelude`.
+fn push_view_rest(
+    ctx: &EmitCtx,
+    name: Symbol,
+    slots: &str,
+    tail: &str,
+    prelude: &mut String,
+) -> DResult<()> {
+    let name = ctx.emit_ident(name)?;
+    write!(
+        prelude,
+        "let {name} = ipe_runtime::list::ipe_list_view_rest({slots}, {tail}); "
+    )
+    .map_err(|e| Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::owned_list_arm_head",
+        detail: format!("writing owned list rebind failed: {e}"),
+    })
+}
+
+/// Render one arm head of an owned list view `width` slots wide, plus its prelude.
+///
+/// The column is matched against `([Option<T>; width], Vec<T>)` by value, so
+/// every binder moves out of the view and none is cloned:
+///
+/// * a closed prefix of `k` elements is `([Some(p0), …, None, ..], _)` — slot `k`
+///   is `None` exactly when the list has `k` elements, since `k < width`;
+/// * an open prefix of `k` with rest `r` binds the slots past `k` and the tail,
+///   then rebuilds `r` from them (`ipe_list_view_rest`);
+/// * a whole-list binder `xs` binds the slot array and the tail and rebuilds
+///   `xs`; an alias whose inner binds nothing binds the slot array over the
+///   inner shape the same way.
+///
+/// The lowerer refuses an alias or or-pattern that would own an element twice
+/// (IPE-L0135, IPE-L0116), so reaching one here is an internal error.
+pub fn owned_list_arm_head(
+    ctx: &EmitCtx,
+    pat: &Pat,
+    width: usize,
+    tag: usize,
+) -> DResult<(String, String)> {
+    let mut prelude = String::new();
+    if matches!(pat, Pat::Wildcard) {
+        return Ok(("_".to_owned(), prelude));
+    }
+    let (slots, tail) = owned_view_shape(ctx, pat, width, tag, &mut prelude)?;
+    Ok((format!("({slots}, {tail})"), prelude))
+}
+
+/// The slot-array pattern and tail pattern of an owned list arm head.
+fn owned_view_shape(
+    ctx: &EmitCtx,
+    pat: &Pat,
+    width: usize,
+    tag: usize,
+    prelude: &mut String,
+) -> DResult<(String, String)> {
+    let fault = |detail: &str| Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::owned_list_arm_head",
+        detail: detail.to_owned(),
+    };
+    match pat {
+        Pat::Wildcard => Ok(("_".to_owned(), "_".to_owned())),
+        Pat::Var(name) => {
+            let (slots, tail) = (view_slots(tag), view_tail(tag));
+            push_view_rest(ctx, *name, &slots, &tail, prelude)?;
+            Ok((slots, tail))
+        }
+        Pat::Slice {
+            prefix,
+            rest,
+            own: SliceOwnership::OwnedMove,
+        } => {
+            let k = prefix.len();
+            if k >= width {
+                return Err(fault("a slice prefix is as wide as its owned view"));
+            }
+            let mut parts = Vec::with_capacity(width.saturating_add(1));
+            for sub in prefix {
+                parts.push(format!("Some({})", render_owned_elem(ctx, sub)?));
+            }
+            let tail = match rest.as_deref() {
+                None => {
+                    parts.push("None".to_owned());
+                    parts.push("..".to_owned());
+                    "_".to_owned()
+                }
+                Some(Pat::Wildcard) => {
+                    parts.push("..".to_owned());
+                    "_".to_owned()
+                }
+                Some(Pat::Var(r)) => {
+                    let spill: Vec<String> =
+                        (k..width).map(|i| format!("__ipe_v{tag}_s{i}")).collect();
+                    parts.extend(spill.iter().cloned());
+                    let tail = view_tail(tag);
+                    push_view_rest(ctx, *r, &format!("[{}]", spill.join(", ")), &tail, prelude)?;
+                    tail
+                }
+                Some(_) => return Err(fault("a slice rest is neither a variable nor a wildcard")),
+            };
+            Ok((format!("[{}]", parts.join(", ")), tail))
+        }
+        Pat::Slice {
+            own: SliceOwnership::BorrowClone,
+            ..
+        } => Err(fault("a borrow-clone slice reached an owned list view")),
+        Pat::Alias(inner, name) => {
+            if binds_any(inner) {
+                return Err(fault(
+                    "an alias over a binding list pattern reached an owned list view; \
+                     the lowerer refuses it (IPE-L0135)",
+                ));
+            }
+            let (inner_slots, _) = owned_view_shape(ctx, inner, width, tag, prelude)?;
+            let (slots, tail) = (view_slots(tag), view_tail(tag));
+            push_view_rest(ctx, *name, &slots, &tail, prelude)?;
+            if inner_slots == "_" {
+                Ok((slots, tail))
+            } else {
+                Ok((format!("{slots} @ {inner_slots}"), tail))
+            }
+        }
+        Pat::Or(alts) => {
+            if binds_any(pat) {
+                return Err(fault(
+                    "a binding or-pattern reached an owned list view; the lowerer \
+                     refuses it (IPE-L0116)",
+                ));
+            }
+            let mut parts = Vec::with_capacity(alts.len());
+            for alt in alts {
+                parts.push(owned_view_shape(ctx, alt, width, tag, prelude)?.0);
+            }
+            Ok((format!("({})", parts.join(" | ")), "_".to_owned()))
+        }
+        Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_) => Err(fault("a non-list arm head reached an owned list view")),
+    }
+}
+
+/// Render an element sub-pattern of an owned list view, matched by value.
+///
+/// Each binder moves its part out of the element. An alias whose inner binds
+/// nothing renders `n @ p`, which moves only `n`. An alias whose inner binds a
+/// name would own its part twice and is refused at lowering (IPE-L0135); a
+/// string literal or a nested list in an element is refused there too
+/// (IPE-L0116). Reaching any of the three here is an internal error.
+fn render_owned_elem(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
+    if owned_elem_fault(pat) {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::render_owned_elem",
+            detail: "an owned list element holds a binding alias, a string literal or a \
+                     nested list; the lowerer refuses each"
+                .to_owned(),
+        });
+    }
+    render_pat(ctx, pat)
+}
+
+/// Does an owned list element hold a shape that cannot be matched by value?
+fn owned_elem_fault(pat: &Pat) -> bool {
+    match pat {
+        Pat::Slice { .. } | Pat::Str(_) => true,
+        Pat::Alias(inner, _) => binds_any(inner) || owned_elem_fault(inner),
+        Pat::Tuple(subs) => subs.iter().any(owned_elem_fault),
+        Pat::Ctor { args, .. } => args.iter().any(owned_elem_fault),
+        Pat::Record(fields) => fields.iter().any(|(_, p)| owned_elem_fault(p)),
+        Pat::Or(alts) => alts.iter().any(owned_elem_fault),
+        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) => false,
+    }
 }
 
 /// Collect the owned-by-`clone` rebinds for an ELEMENT sub-pattern (a head
@@ -913,14 +1258,14 @@ pub fn render_arm_pat_alias_safe(
                 Ok(format!("{struct_name} {{ {}, .. }}", parts.join(", ")))
             }
         }
-        // A `Slice` carrying a nested alias reaches LIST mode, which matches
-        // by reference and so needs no by-value alias-safety handling — this
-        // by-VALUE renderer is never invoked from that path, so reaching here
-        // is an internal invariant violation, not a real user program.
+        // Every `Slice` head selects a list view (`list_arm_head`): a borrowed
+        // view matches by reference, an owned view renders through
+        // `owned_list_arm_head`. Neither reaches this by-value renderer, so
+        // reaching here is an internal invariant violation.
         Pat::Slice { .. } => Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::render_arm_pat_alias_safe",
             detail: "Pat::Slice reached the by-value alias-safe renderer; list-mode \
-                     arms must route through render_pat directly"
+                     arms must route through list_arm_head"
                 .to_owned(),
         }),
         // An or-pattern reaching the alias-safe body carries an alias or a
@@ -976,8 +1321,10 @@ pub fn render_arm_pat_alias_safe(
 /// let (a, b) = whole.clone();
 /// ```
 ///
-/// A destructure-position value is `Clone` — the derive-seal already
-/// rejects any non-`Clone` payload upstream — so the clone always resolves.
+/// The lowerer refuses (IPE-L0135) an alias whose inner pattern binds a name
+/// over a non-`Clone` part, so the clone always resolves. An alias whose inner
+/// binds nothing takes no part, so it binds the whole alone (`let whole =
+/// <value>;`) with no clone, whatever the part's clone class.
 /// When the binder carries NO alias the fast path emits the single flat
 /// `let <pat> = <value>;`, a plain clone-free binding. Aliases nested inside
 /// tuples (`let (x, (a, b) as inner) = …`) are
@@ -1012,6 +1359,9 @@ pub fn push_binding_stmts(
         Pat::Alias(inner, name) => {
             let name = ctx.emit_ident(*name)?;
             out.push(format!("let {name} = {src};"));
+            if !binds_any(inner) {
+                return Ok(());
+            }
             push_binding_stmts(ctx, inner, &format!("{name}.clone()"), counter, out)
         }
         // A tuple carrying an alias in some element: bind each element to a
