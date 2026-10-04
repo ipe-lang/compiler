@@ -11,7 +11,8 @@ name: Build & test
 #     diagnostic-tone, build-tools, the docs-drift gates, the example gates, the
 #     first-party check-floor + shapes build gate, wasm-floor, editors-configure.
 #     A pull request runs only this phase.
-#   • TESTS (`tests`: merge queue, dispatch) — test (nextest), the 14-shard e2e
+#   • TESTS (`tests`: merge queue, dispatch) — test (nextest, with the `ipe`
+#     feature job wasi-run), the 14-shard e2e
 #     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
 #     Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
@@ -714,13 +715,43 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Required aggregation gate for `test`: green only when every shard and the
-  # doctest job (in test-prep) passed. Branch protection lists this job, so a
+  # The `wasi_run` and `signing` Cargo features of `ipe` are off by default, so
+  # no other job compiles the embedded wasmtime engine, the sigstore verifier or
+  # the code and tests behind them. This job lints and tests `ipe` with both on,
+  # then runs the WASI seal and the wall-clock and memory ceiling tests of the
+  # embedded run. `ci/verify-manifest.py` check 22 holds every feature of a
+  # workspace member to a command that enables it.
+  wasi-run:
+    runs-on: ubuntu-latest
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Lint ipe with the optional features on
+        run: cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
+      - name: Test ipe with the optional features on
+        run: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
+      - name: Run the WASI seal end to end
+        env:
+          IPE_E2E: "1"
+        run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
+
+  # Required aggregation gate for `test`: green only when every shard, the
+  # doctest job (in test-prep) and the feature job `wasi-run` passed. Branch protection lists this job, so a
   # matrix expansion never silently drops a required check. The `always()` guard
   # makes a skipped/failed dependency a FAILURE here, never a false green.
   test:
     runs-on: ubuntu-latest
-    needs: [changes, test-prep, test-run]
+    needs: [changes, test-prep, test-run, wasi-run]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -734,6 +765,7 @@ jobs:
             changes=${{ needs.changes.result }}
             test-prep=${{ needs.test-prep.result }}
             test-run=${{ needs.test-run.result }}
+            wasi-run=${{ needs.wasi-run.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}

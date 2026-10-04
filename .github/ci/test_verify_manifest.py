@@ -57,6 +57,7 @@ check_dependabot_pr_budget = verify_manifest.check_dependabot_pr_budget
 check_workspace_inheritance = verify_manifest.check_workspace_inheritance
 check_test_claims = verify_manifest.check_test_claims
 check_ci_suites_required = verify_manifest.check_ci_suites_required
+check_feature_coverage = verify_manifest.check_feature_coverage
 
 with open(os.path.join(HERE, "github-env-allowlist.txt")) as _f:
     VALID_ENV_ALLOWLIST = _f.read()
@@ -6187,6 +6188,169 @@ class TestCiSuitesRequired(unittest.TestCase):
         errors: list[str] = []
         check_ci_suites_required(verify_manifest.load_manifest()["checks"], errors)
         self.assertEqual(errors, [])
+
+_FC_CI = """\
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo nextest run -p ipe
+  wasi-run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy -p ipe --features wasi_run,signing --all-targets
+  advisory:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo check -p ipe --all-features
+"""
+_FC_ENTRIES = [{"context": "test", "disposition": "gate", "producer": "ci.yml", "aggregates": ["wasi-run"]}]
+_FC_FILES = {
+    "Cargo.toml": '[workspace]\nmembers = ["src/ipe-cli", "src/compiler/ffi", "src/runtime/rust"]\n',
+    "src/ipe-cli/Cargo.toml": (
+        '[package]\nname = "ipe"\n'
+        "[features]\nsigning = []\nwasi_run = []\n"
+        '[dev-dependencies]\nipe_ffi = { path = "../compiler/ffi", features = ["testing"] }\n'
+    ),
+    "src/compiler/ffi/Cargo.toml": '[package]\nname = "ipe_ffi"\n[features]\ntesting = []\n',
+    "src/runtime/rust/Cargo.toml": '[package]\nname = "ipe-runtime-rust"\n[features]\nasync = []\n',
+}
+
+
+class TestFeatureCoverage(unittest.TestCase):
+    """Check 22: every cargo feature is compiled by a required ci.yml job."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = self._tmp.name
+        self.root = os.path.join(self.repo, ".github")
+        self.files = dict(_FC_FILES)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, ci: str = _FC_CI, entries: list[dict] | None = None) -> list[str]:
+        for rel, text in self.files.items():
+            _write(os.path.join(self.repo, rel), text)
+        _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
+        errors: list[str] = []
+        check_feature_coverage(
+            _FC_ENTRIES if entries is None else entries, errors, root=self.root, tracked=sorted(self.files)
+        )
+        return errors
+
+    def assertRefused(self, ci: str, needle: str) -> None:
+        errors = self.errors(ci)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def with_wasi_run(self, run: str) -> str:
+        return _FC_CI.replace("cargo clippy -p ipe --features wasi_run,signing --all-targets", run)
+
+    def test_valid_workspace_passes(self) -> None:
+        self.assertEqual(self.errors(), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        check_feature_coverage(verify_manifest.load_manifest()["checks"], errors)
+        self.assertEqual(errors, [])
+
+    def test_uncovered_feature_refused(self) -> None:
+        self.assertRefused(self.with_wasi_run("cargo clippy -p ipe --features wasi_run --all-targets"), "'signing'")
+
+    def test_misspelled_feature_value_refused(self) -> None:
+        self.assertRefused(
+            self.with_wasi_run("cargo clippy -p ipe --features wasi_run,sign1ng --all-targets"), "'signing'"
+        )
+
+    def test_every_feature_flag_spelling_covers(self) -> None:
+        for run in (
+            "cargo clippy -p ipe -F wasi_run,signing --all-targets",
+            "cargo clippy -p ipe --features=wasi_run --features signing --all-targets",
+            "cargo clippy -p ipe --features ipe/wasi_run,ipe/signing --all-targets",
+            "cargo clippy -p ipe --all-features --all-targets",
+        ):
+            with self.subTest(run=run):
+                self.assertEqual(self.errors(self.with_wasi_run(run)), [])
+
+    def test_a_feature_another_feature_lists_is_covered_through_it(self) -> None:
+        self.files["src/ipe-cli/Cargo.toml"] = self.files["src/ipe-cli/Cargo.toml"].replace(
+            "wasi_run = []\n", 'wasi_run = []\nfull = ["signing", "wasi_run"]\n'
+        )
+        self.assertRefused(_FC_CI, "'full'")
+        self.assertEqual(self.errors(self.with_wasi_run("cargo clippy -p ipe --features full --all-targets")), [])
+
+    def test_all_features_covers_only_the_selected_members(self) -> None:
+        self.assertRefused(self.with_wasi_run("cargo clippy -p ipe_ffi --all-features"), "'signing'")
+
+    def test_dev_dependency_edge_covers_when_tests_compile(self) -> None:
+        self.assertEqual(self.errors(), [])
+        errors = self.errors(
+            self.with_wasi_run("cargo clippy -p ipe --features wasi_run,signing").replace(
+                "cargo nextest run -p ipe", "cargo check -p ipe"
+            )
+        )
+        self.assertTrue(any("'testing'" in e for e in errors), errors)
+
+    def test_normal_dependency_edge_covers(self) -> None:
+        self.files["src/ipe-cli/Cargo.toml"] = self.files["src/ipe-cli/Cargo.toml"].replace(
+            "[dev-dependencies]", "[dependencies]"
+        )
+        ci = self.with_wasi_run("cargo check -p ipe --features wasi_run,signing").replace(
+            "cargo nextest run -p ipe", "cargo check -p ipe"
+        )
+        self.assertEqual(self.errors(ci), [])
+
+    def test_optional_dependency_edge_covers_nothing(self) -> None:
+        self.files["src/ipe-cli/Cargo.toml"] = self.files["src/ipe-cli/Cargo.toml"].replace(
+            "[dev-dependencies]\nipe_ffi = {", "[dependencies]\nipe_ffi = { optional = true,"
+        )
+        ci = self.with_wasi_run("cargo check -p ipe --features wasi_run,signing").replace(
+            "cargo nextest run -p ipe", "cargo check -p ipe"
+        )
+        self.assertRefused(ci, "'testing'")
+
+    def test_feature_in_a_non_required_job_refused(self) -> None:
+        ci = self.with_wasi_run("cargo clippy -p ipe --all-targets")
+        self.assertRefused(ci, "'wasi_run'")
+        self.assertRefused(ci, "'signing'")
+
+    def test_masked_job_or_step_covers_nothing(self) -> None:
+        masked_job = _FC_CI.replace("  wasi-run:\n", "  wasi-run:\n    continue-on-error: true\n")
+        self.assertRefused(masked_job, "'signing'")
+        masked_step = _FC_CI.replace(
+            "      - run: cargo clippy -p ipe --features", "      - if: false\n        run: cargo clippy -p ipe --features"
+        )
+        self.assertRefused(masked_step, "'signing'")
+        dead_job = _FC_CI.replace("  wasi-run:\n", "  wasi-run:\n    if: false\n")
+        self.assertRefused(dead_job, "'signing'")
+
+    def test_workspace_exclude_is_not_counted(self) -> None:
+        self.assertRefused(
+            self.with_wasi_run("cargo clippy --workspace --exclude ipe-runtime-rust --all-features"), "'signing'"
+        )
+
+    def test_unreadable_feature_command_refused(self) -> None:
+        self.assertRefused(
+            self.with_wasi_run("cargo xtask-alias -p ipe --features wasi_run,signing"), "cannot be read"
+        )
+
+    def test_unreadable_command_without_features_is_not_a_feature_claim(self) -> None:
+        ci = _FC_CI.replace("      - run: cargo nextest run -p ipe\n", "      - run: cargo xtask-alias\n      - run: cargo nextest run -p ipe\n")
+        self.assertEqual(self.errors(ci), [])
+
+    def test_exemption_is_exactly_the_runtime_crate(self) -> None:
+        self.assertEqual(sorted(verify_manifest.FEATURE_COVERAGE_EXEMPT), ["src/runtime/rust"])
+        with mock.patch.object(verify_manifest, "FEATURE_COVERAGE_EXEMPT", {}):
+            self.assertRefused(_FC_CI, "'async'")
+
+    def test_stale_exemption_refused(self) -> None:
+        with mock.patch.object(
+            verify_manifest, "FEATURE_COVERAGE_EXEMPT", {"src/runtime/rust": "x", "src/nowhere": "x"}
+        ):
+            self.assertRefused(_FC_CI, "names 'src/nowhere'")
+        self.files["src/runtime/rust/Cargo.toml"] = '[package]\nname = "ipe-runtime-rust"\n'
+        self.assertRefused(_FC_CI, "names 'src/runtime/rust'")
 
 
 if __name__ == "__main__":

@@ -353,6 +353,21 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       and no `working-directory`.  A suite no required job runs is refused,
       so a refusal test cannot exist yet be advisory.  LIMIT: a suite
       outside `.github/ci/` is not inventoried.
+  22. Every cargo feature is compiled by a required job: each `[features]`
+      key of every workspace member is switched on by a cargo command of a
+      required `ci.yml` job (one a `gate` entry produced by it names or
+      aggregates; not behind a literal-false `if:` or `continue-on-error`) —
+      through `--features`/`-F` (plain or `pkg/feat`), `--all-features`, a
+      default feature, a feature another feature lists, or a
+      `features = [..]` edge from a compiled member (a dev-dependency edge
+      only when its crate's test targets are compiled; an optional edge
+      never).  A misspelled `--features` value switches nothing on, so its
+      feature stays uncovered and is refused; a command that names features
+      and cannot be read is refused.  `FEATURE_COVERAGE_EXEMPT` names the
+      members whose matrix another job owns (the runtime crate:
+      `runtime-feature-combos`), with a refusal for a stale entry.  LIMIT: a
+      `--workspace --exclude` run is not counted; `cfg(all(feature=a,
+      not(feature=b)))` combinations are not enumerated.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -5359,6 +5374,265 @@ def check_ci_suites_required(entries: list[dict], errors: list[str], root: str =
             )
 
 
+# Check 22: the workspace members whose feature matrix another check owns, each
+# with its reason. Every other member's `[features]` keys must be compiled by a
+# required ci.yml job.
+FEATURE_COVERAGE_EXEMPT = {
+    "src/runtime/rust": "its feature matrix is owned by the `runtime-feature-combos` job",
+}
+# Cargo's feature flags: a command naming one whose text cannot be read is refused.
+_FEATURE_FLAG_TEXT = re.compile(r"--features|--all-features|--no-default-features|(?<![\w-])-F\b")
+# Subcommands that compile a selected package's test targets.
+_TEST_COMPILING = frozenset({"test", "bench", "nextest run", "nextest archive", "nextest list"})
+
+
+@dataclass(frozen=True)
+class _DepEdge:
+    """A dependency of one workspace member on another."""
+
+    target: str
+    features: tuple[str, ...]
+    default: bool
+    optional: bool
+    dev: bool
+
+
+@dataclass
+class _FeatureMember:
+    name: str
+    features: dict[str, list[str]]
+    edges: list[_DepEdge]
+
+
+def _str_list(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _feature_members(repo: str, errors: list[str]) -> dict[str, _FeatureMember] | None:
+    """Each workspace member's package name, `[features]` table and
+    dependency edges onto other members, keyed by directory; None (with the
+    reason in `errors`) when the workspace cannot be read."""
+    top = _load_toml(os.path.join(repo, "Cargo.toml"))
+    if isinstance(top, str):
+        errors.append(f"check 22: the root Cargo.toml {top}; refused")
+        return None
+    ws = top.get("workspace")
+    dirs = ws.get("members") if isinstance(ws, dict) else None
+    if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
+        errors.append("check 22: the root Cargo.toml needs a literal `[workspace] members` list; refused")
+        return None
+    ws_deps = ws.get("dependencies") if isinstance(ws, dict) else None
+    ws_deps = ws_deps if isinstance(ws_deps, dict) else {}
+    docs: dict[str, dict[str, object]] = {}
+    for d in dirs:
+        doc = _load_toml(os.path.join(repo, d, "Cargo.toml"))
+        if isinstance(doc, str):
+            errors.append(f"check 22: {d}/Cargo.toml {doc}; refused")
+            return None
+        docs[d] = doc
+    names: dict[str, str] = {}
+    dir_name: dict[str, str] = {}
+    for d, doc in docs.items():
+        pkg = doc.get("package")
+        name = pkg.get("name") if isinstance(pkg, dict) else None
+        if not isinstance(name, str):
+            errors.append(f"check 22: {d}/Cargo.toml names no package; refused")
+            return None
+        names[name] = d
+        dir_name[d] = name
+    members: dict[str, _FeatureMember] = {}
+    for d, doc in docs.items():
+        raw = doc.get("features")
+        table = {k: _str_list(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        targets = doc.get("target")
+        scopes = [doc] + [t for t in (targets.values() if isinstance(targets, dict) else []) if isinstance(t, dict)]
+        edges: list[_DepEdge] = []
+        for scope in scopes:
+            for kind, dev in (("dependencies", False), ("build-dependencies", False), ("dev-dependencies", True)):
+                deps = scope.get(kind)
+                for key, spec in deps.items() if isinstance(deps, dict) else []:
+                    if not isinstance(spec, dict):
+                        continue
+                    base = ws_deps.get(key) if spec.get("workspace") is True else None
+                    base = base if isinstance(base, dict) else {}
+                    package = spec.get("package", base.get("package", key))
+                    target = names.get(package) if isinstance(package, str) else None
+                    if target is None:
+                        continue
+                    edges.append(
+                        _DepEdge(
+                            target,
+                            tuple(_str_list(base.get("features")) + _str_list(spec.get("features"))),
+                            spec.get("default-features", base.get("default-features", True)) is not False,
+                            spec.get("optional") is True,
+                            dev,
+                        )
+                    )
+        members[d] = _FeatureMember(dir_name[d], table, edges)
+    return members
+
+
+def _feature_closure(
+    members: dict[str, _FeatureMember], roots: set[str], seeds: set[tuple[str, str]], tests: bool
+) -> set[tuple[str, str]]:
+    """Every `(member directory, feature)` active when `roots` compile with
+    `seeds` switched on: the seeds, the `features = [..]` that the
+    (non-optional) edges of each compiled member name, all closed over the
+    members' feature tables. A root's dev-dependency edges count when `tests`
+    compiles its test targets; an optional edge is never counted."""
+    by_name = {m.name: d for d, m in members.items()}
+    compiled: set[str] = set(roots)
+    active: set[tuple[str, str]] = set()
+    wanted: set[tuple[str, str]] = set(seeds)
+    changed = True
+    while changed:
+        before = (len(compiled), len(active), len(wanted))
+        for d in sorted(compiled):
+            for edge in members[d].edges:
+                if edge.optional or (edge.dev and not (tests and d in roots)):
+                    continue
+                compiled.add(edge.target)
+                wanted.update((edge.target, f) for f in edge.features)
+                if edge.default:
+                    wanted.add((edge.target, "default"))
+        for d, f in sorted(wanted):
+            if d not in compiled or (d, f) in active or f not in members[d].features:
+                continue
+            active.add((d, f))
+            for entry in members[d].features[f]:
+                if entry.startswith("dep:"):
+                    continue
+                if "/" in entry:
+                    pkg, feat = entry.split("/", 1)
+                    target = by_name.get(pkg.rstrip("?"))
+                    if target is not None:
+                        wanted.add((target, feat))
+                else:
+                    wanted.add((d, entry))
+        changed = before != (len(compiled), len(active), len(wanted))
+    return active
+
+
+def _required_ci_jobs(entries: list[dict], wf: Workflow) -> list[dict]:
+    """The jobs of `wf` whose outcome a required context reports: a `gate`
+    entry produced by it names the job, or aggregates it."""
+    gates = [e for e in entries if isinstance(e, dict) and e.get("disposition") == "gate" and e.get("producer") == wf.fname]
+    out: list[dict] = []
+    for wj in wf.jobs:
+        ctx = str(wj.raw.get("name", wj.job_id))
+        reported = any(
+            str(e.get("context")) == ctx
+            or any(a == wj.job_id or ctx == a or ctx.startswith(f"{a} (") for a in e.get("aggregates") or [])
+            for e in gates
+        )
+        if reported:
+            out.append(wj.raw)
+    return out
+
+
+def _always_runs(node: object) -> bool:
+    """Whether a job or step runs unconditionally: no `if:` and no
+    `continue-on-error` that could mask it."""
+    if not isinstance(node, dict):
+        return False
+    if "continue-on-error" in node and node["continue-on-error"] is not False:
+        return False
+    return str(node.get("if", "true")).strip().lower() not in ("false", "${{ false }}")
+
+
+def _invocation_roots(
+    inv: cargo_invocation.CargoInvocation, sel: cargo_invocation.Selection, members: dict[str, _FeatureMember]
+) -> set[str]:
+    """The member directories `inv` compiles at the top; empty for a
+    `--workspace` run that excludes members (what stays is not read)."""
+    if sel.whole_workspace:
+        return set() if "--exclude" in inv.command else set(members)
+    by_name = {m.name: d for d, m in members.items()}
+    roots = set(sel.dirs)
+    for spec in sel.packages:
+        d = by_name.get(spec.rsplit("#", 1)[-1].split("@", 1)[0])
+        if d is not None:
+            roots.add(d)
+    return roots.intersection(members)
+
+
+def _invocation_seeds(
+    inv: cargo_invocation.CargoInvocation, roots: set[str], members: dict[str, _FeatureMember]
+) -> set[tuple[str, str]]:
+    """The `(member directory, feature)` pairs `inv`'s feature flags switch on."""
+    by_name = {m.name: d for d, m in members.items()}
+    seeds: set[tuple[str, str]] = set()
+    for d in roots:
+        if inv.all_features:
+            seeds.update((d, f) for f in members[d].features)
+        elif not inv.no_default_features:
+            seeds.add((d, "default"))
+        for flag in inv.features:
+            pkg, _, feat = flag.rpartition("/")
+            if not pkg:
+                seeds.add((d, feat))
+                continue
+            target = by_name.get(pkg.rstrip("?"))
+            if target is not None:
+                seeds.add((target, feat))
+    return seeds
+
+
+def check_feature_coverage(
+    entries: list[dict], errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None
+) -> None:
+    """Check 22 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    members = _feature_members(repo, errors)
+    layout = _workspace_layout(repo, tracked)
+    if isinstance(layout, str):
+        errors.append(f"check 22: {layout}; cannot tell what a cargo command compiles")
+        return
+    if members is None:
+        return
+    covered: set[tuple[str, str]] = set()
+    for wf in _load_workflows(root, errors):
+        if wf.fname != "ci.yml":
+            continue
+        for job in _required_ci_jobs(entries, wf):
+            if not _always_runs(job):
+                continue
+            steps = [s for s in job.get("steps") or [] if _always_runs(s)]
+            for found in _job_cargo({**job, "steps": steps}, repo, wf.doc):
+                inv = found.invocation
+                if isinstance(inv, str):
+                    if _FEATURE_FLAG_TEXT.search(found.line):
+                        errors.append(f"check 22: `{found.line}` names features but cannot be read ({inv}); refused")
+                    continue
+                if inv.subcommand not in cargo_invocation.COMPILING or inv.subcommand == "install":
+                    continue
+                sel = cargo_invocation.select(inv, found.cwd, layout)
+                if isinstance(sel, str) or not sel.in_workspace:
+                    continue
+                roots = _invocation_roots(inv, sel, members)
+                tests = inv.subcommand in _TEST_COMPILING or (
+                    isinstance(inv.selection, cargo_invocation.ExplicitTargets)
+                    and (inv.selection.all_tests or bool(inv.selection.tests))
+                )
+                covered.update(_feature_closure(members, roots, _invocation_seeds(inv, roots, members), tests))
+    for d, m in sorted(members.items()):
+        if d in FEATURE_COVERAGE_EXEMPT:
+            continue
+        for feature in sorted(m.features):
+            if (d, feature) not in covered:
+                errors.append(
+                    f"check 22: feature {feature!r} of workspace member {d} ({m.name}) is enabled by no "
+                    "command of a required ci.yml job — add it to a `--features` list of a required job's "
+                    "cargo command (or a `features = [..]` dependency edge from a compiled member)"
+                )
+    for d in sorted(FEATURE_COVERAGE_EXEMPT):
+        if d not in members or not members[d].features:
+            errors.append(
+                f"check 22: FEATURE_COVERAGE_EXEMPT names {d!r}, which is not a workspace member "
+                "with features; drop it"
+            )
+
+
 def load_manifest() -> dict:
     doc = strict_yaml.safe_load(open(MANIFEST))
     if not isinstance(doc, dict) or "checks" not in doc:
@@ -5508,6 +5782,9 @@ def main() -> int:
 
     # ---- 21. Every CI-tooling refusal suite runs in a required job ----
     check_ci_suites_required(entries, errors)
+
+    # ---- 22. Every cargo feature is compiled by a required job ----
+    check_feature_coverage(entries, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

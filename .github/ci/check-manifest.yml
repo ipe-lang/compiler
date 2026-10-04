@@ -103,7 +103,15 @@ checks:
         - cmd: cargo nextest run {packages} --profile ci --no-tests=warn
           differs: CI runs the same suite from one archive split over shards; locally it runs over the selected crates directly
         - cargo test --doc {lib_packages}
-    aggregates: [test-prep, test-run]
+        - cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
+        - cmd: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
+          env:
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+        - cmd: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
+          env:
+            IPE_E2E: "1"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+    aggregates: [test-prep, test-run, wasi-run]
   - context: artifact-guard
     disposition: gate
     producer: ci.yml
