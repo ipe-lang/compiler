@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, open, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
+module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -242,16 +242,10 @@ probe loc =
         |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
 
 
--- The review database from `IPE_REVIEW_DB`, opened, never migrated: `probe`
--- is the one migrate, run at startup, so a review file deleted under a
--- running server is never silently re-created empty.
-open : Task.Task Error Db
-open =
-    Settings.reviewDb |> Task.andThen openAt
-
-
 -- The review database at a parsed location, opened through the one review URL
--- builder (`Settings.reviewUrl`); no raw URL reaches the driver.
+-- builder (`Settings.reviewUrl`); no raw URL reaches the driver. It never
+-- migrates: `probe` is the one migrate, run at startup, so a review file
+-- deleted under a running server is never silently re-created empty.
 openAt : DbLocation -> Task.Task Error Db
 openAt loc =
     Db.open "sqlite" (Settings.reviewUrl loc)

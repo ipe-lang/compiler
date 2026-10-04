@@ -1,11 +1,10 @@
-module Lib.Settings exposing (DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, reviewDb, reviewUrl)
+module Lib.Settings exposing (AppSettings, DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
 
 import Ipe.Encoding as Encoding
 import Ipe.Error as Error
 import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.System as System
 import Ipe.Task as Task
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.SafeText as SafeText exposing (SafeText)
@@ -25,6 +24,15 @@ type DbLocation
 type alias IndexSettings =
     { db : DbLocation
     , roots : RootMap
+    }
+
+
+-- Every location the app serves from: the index and the review database,
+-- each parsed once at startup. A request reads this value and never the
+-- environment.
+type alias AppSettings =
+    { index : IndexSettings
+    , review : DbLocation
     }
 
 
@@ -55,11 +63,11 @@ parseIndexSettings rawDb rawRoot =
         Task.succeed { db = db, roots = roots }
 
 
--- The review database location from `IPE_REVIEW_DB`, `review.db` in the
--- working directory when unset.
-reviewDb : Task.Task Error DbLocation
-reviewDb =
-    parseDbLocation "IPE_REVIEW_DB" (System.getenvOr "IPE_REVIEW_DB" "review.db")
+-- The review database location from the raw `IPE_REVIEW_DB` value `main`
+-- reads once at startup (`review.db` in the working directory when unset).
+parseReviewDb : String -> Task.Task Error DbLocation
+parseReviewDb raw =
+    parseDbLocation "IPE_REVIEW_DB" raw
 
 
 -- A file path is refused when blank or when it carries `?`, `#` or `%` (each

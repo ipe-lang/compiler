@@ -29,6 +29,8 @@ module TestSupport exposing
     , insertUnitRows
     , setIndexEnv
     , envSettings
+    , envReview
+    , envAppSettings
     , loadFirstPage
     , indexConn
     , loadUnitNow
@@ -497,23 +499,42 @@ envSettings =
 
 
 
+-- The review store location a server resolves once at startup, here parsed
+-- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
+envReview : Task.Task Error Settings.DbLocation
+envReview =
+    Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
+
+
+
+-- Every setting a server resolves once at startup, from the current
+-- environment.
+envAppSettings : Task.Task Error Settings.AppSettings
+envAppSettings =
+    do
+        index <- envSettings
+        review <- envReview
+        Task.succeed { index = index, review = review }
+
+
+
 -- Each request-time function below, run on settings resolved from the current
 -- environment.
 loadPageNow : Index.Cursor -> Task.Task Error Queue.QueuePage
 loadPageNow cursor =
-    envSettings |> Task.andThen (\settings -> Queue.loadPage settings cursor)
+    envAppSettings |> Task.andThen (\settings -> Queue.loadPage settings cursor)
 
 
 
 loadHistoryPageNow : LibDb.HistoryCursor -> Task.Task Error Queue.HistoryPage
 loadHistoryPageNow cursor =
-    envSettings |> Task.andThen (\settings -> Queue.loadHistoryPage settings cursor)
+    envAppSettings |> Task.andThen (\settings -> Queue.loadHistoryPage settings cursor)
 
 
 
 drainThenLoadNow : Index.Attested -> Index.Cursor -> Task.Task Error Queue.QueuePage
 drainThenLoadNow attested cursor =
-    envSettings |> Task.andThen (\settings -> Queue.drainThenLoad settings attested cursor)
+    envAppSettings |> Task.andThen (\settings -> Queue.drainThenLoad settings attested cursor)
 
 
 
