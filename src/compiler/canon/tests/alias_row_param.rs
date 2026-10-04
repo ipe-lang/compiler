@@ -46,10 +46,11 @@ fn canonicalise_chain(sources: &[&str]) -> (DResult<(Module, ModuleExports)>, In
 /// The record parameter of the top-level function `name`'s annotation.
 fn param<'m>(module: &'m Module, interner: &Interner, name: &str) -> Option<&'m Type> {
     module.defs.iter().find_map(|d| match d {
-        Def::Typed { name: n, ty, .. } if interner.resolve(n.value) == Some(name) => match ty {
-            Type::Lambda(arg, _) => Some(arg.as_ref()),
-            _ => None,
-        },
+        Def::Typed {
+            name: n,
+            ty: Type::Lambda(arg, _),
+            ..
+        } if interner.resolve(n.value) == Some(name) => Some(arg.as_ref()),
         _ => None,
     })
 }
@@ -188,7 +189,7 @@ fn exported_body_has_no_source_param() {
 }
 
 /// The row-argument fault `result` was refused with, if any.
-fn row_fault<T>(result: &DResult<T>) -> Option<&AliasRowFault> {
+const fn row_fault<T>(result: &DResult<T>) -> Option<&AliasRowFault> {
     match result {
         Err(Diagnostic::Name {
             msg: NameError::AliasRowArgument { fault, .. },
@@ -351,5 +352,52 @@ fn parameterless_local_alias_charges_body_once() {
     assert!(
         result.is_ok(),
         "a parameterless alias within the node ceiling must expand at its use site, got {result:?}"
+    );
+}
+
+#[test]
+fn row_param_threaded_beside_value_param() {
+    // `Wrap`'s slots and `Named`'s share their spelling; the inner expansion
+    // must leave the outer slots for the outer substitution.
+    let src = "module Lib.Use exposing (..)\n\n\
+               type alias Named r = { r | name : String }\n\n\
+               type alias Wrap a r = Named { r | v : a }\n\n\
+               f : Wrap Int b -> Int\n\
+               f x = 1\n";
+    assert_eq!(
+        shape_of(&[src], "f"),
+        Some((Some("b".to_owned()), strings(&["v", "name"]))),
+        "the outer row argument fills the inner alias's row"
+    );
+    let (result, i) = canonicalise_chain(&[src]);
+    let field_v = result
+        .as_ref()
+        .ok()
+        .and_then(|(m, _)| match param(m, &i, "f") {
+            Some(Type::RecordOpen(_, fields)) => fields
+                .iter()
+                .find(|(n, _)| i.resolve(*n) == Some("v"))
+                .map(|(_, ty)| ty.clone()),
+            _ => None,
+        });
+    assert!(
+        matches!(&field_v, Some(Type::Con { args, .. }) if args.is_empty()),
+        "`v` must be the value argument `Int`, got {field_v:?}"
+    );
+}
+
+#[test]
+fn row_param_chain_across_modules() {
+    let aged = "module Lib.Aged exposing (..)\n\n\
+                import Lib.Named exposing (Named)\n\n\
+                type alias Aged r = Named { r | age : Int }\n";
+    let user = "module Lib.Use exposing (..)\n\n\
+                import Lib.Aged exposing (Aged)\n\n\
+                f : Aged { id : Int } -> Int\n\
+                f x = 1\n";
+    assert_eq!(
+        shape_of(&[NAMED, aged, user], "f"),
+        Some((None, strings(&["id", "age", "name"]))),
+        "an exported alias over another module's row alias threads the use site's record"
     );
 }
