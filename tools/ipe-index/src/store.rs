@@ -1078,7 +1078,7 @@ mod tests {
     // would wait out the busy timeout and fail here.
     #[test]
     fn open_beside_a_held_write_lock_rewrites_nothing() {
-        let file = DbFile(ipe_test_temp::temp_root().join(format!(
+        let file = DbFile(std::env::current_exe().unwrap().with_file_name(format!(
             "ipe-index-open-beside-write-lock-{}.db",
             std::process::id()
         )));
