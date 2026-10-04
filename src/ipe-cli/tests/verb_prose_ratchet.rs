@@ -6,11 +6,19 @@
 //! template, or comment that still spells a bare form teaches a command that
 //! fails, so this scan walks the tracked tree (`git ls-files`, minus the
 //! history files `CHANGELOG.md` and `docs/adr/`) and fails on each line that
-//! names `ipe` followed by a bare `build`, `run`, `exec`, `watch`, or `eject`,
-//! or names `ipe release` followed by anything but one of its verbs.
+//! names the `ipe` binary followed by a bare `build`, `run`, `exec`, `watch`,
+//! or `eject`, or by `release` and anything but one of its verbs.
+//!
+//! The binary is every spelling a command line opens with: `ipe`, `ipe.exe`,
+//! a quoted one, and a shell variable naming it (`$IPE`, `"$ipe_bin"`,
+//! `${IPEC_BIN}`), separated from the verb by any run of blanks. A backticked
+//! `` `ipe` `` is also the binary's name in prose ("an `ipe` build"), so it
+//! counts as a command only when an argument follows the verb.
 //!
 //! Exemptions name a file exactly, and a companion test fails once an exempt
-//! file stops matching, so an exemption cannot outlive its reason.
+//! file stops matching, so an exemption cannot outlive its reason. The
+//! transcript goldens snapshot stdout only and a refusal prints to stderr, so
+//! no refusal transcript spells a refused form and none is exempt.
 
 use std::path::{Path, PathBuf};
 
@@ -40,18 +48,106 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// One spelling of the `ipe` binary in a line.
+struct Invocation {
+    /// Byte offset just past the spelling.
+    end: usize,
+    /// Whether the spelling is a backticked `` `ipe` ``, a command only when
+    /// an argument follows its verb.
+    ticked: bool,
+}
+
+/// Every spelling of the `ipe` binary in `line`.
+fn invocations(line: &str) -> Vec<Invocation> {
+    line.char_indices()
+        .filter_map(|(at, c)| match c {
+            '$' => {
+                variable_end(line, at + c.len_utf8()).map(|end| Invocation { end, ticked: false })
+            }
+            'i' => binary(line, at),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The end of a shell variable naming the binary whose name starts at `from`.
+///
+/// The name is braced or bare, and one of its `_`-separated parts opens with
+/// `ipe` in any case (`IPE`, `ipe_bin`, `IPEC_BIN`); a closing quote is part
+/// of the spelling.
+fn variable_end(line: &str, from: usize) -> Option<usize> {
+    let rest = line.get(from..)?;
+    let (braced, body) = rest
+        .strip_prefix('{')
+        .map_or((false, rest), |body| (true, body));
+    let len = body.find(|c: char| !is_word(c)).unwrap_or(body.len());
+    let name = body.get(..len)?;
+    let after = body.get(len..)?;
+    let after = if braced {
+        after.strip_prefix('}')?
+    } else {
+        after
+    };
+    let names_ipe = name.split('_').any(|part| {
+        part.get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case("ipe"))
+    });
+    names_ipe.then(|| {
+        let after = after.strip_prefix(['"', '\'', '`']).unwrap_or(after);
+        line.len() - after.len()
+    })
+}
+
+/// The `ipe` or `ipe.exe` word starting at `at`, with its closing quote.
+fn binary(line: &str, at: usize) -> Option<Invocation> {
+    let starts_word = line
+        .get(..at)?
+        .chars()
+        .next_back()
+        .is_none_or(|c| !is_word(c));
+    let rest = line.get(at..)?.strip_prefix("ipe")?;
+    if !starts_word {
+        return None;
+    }
+    let rest = rest.strip_prefix(".exe").unwrap_or(rest);
+    let (ticked, rest) = rest.strip_prefix('`').map_or_else(
+        || (false, rest.strip_prefix(['"', '\'']).unwrap_or(rest)),
+        |rest| (true, rest),
+    );
+    Some(Invocation {
+        end: line.len() - rest.len(),
+        ticked,
+    })
+}
+
+/// `text` without its leading blanks, `None` when it has none.
+fn after_blanks(text: &str) -> Option<&str> {
+    let rest = text.trim_start_matches([' ', '\t']);
+    (rest.len() < text.len()).then_some(rest)
+}
+
 /// Whether `line` names a refused verb form.
 fn refused(line: &str) -> bool {
-    line.match_indices("ipe ").any(|(at, _)| {
-        let starts_word = line
-            .get(..at)
-            .and_then(|before| before.chars().next_back())
-            .is_none_or(|c| !is_word(c));
-        let Some(rest) = line.get(at + "ipe ".len()..) else {
+    invocations(line).iter().any(|inv| {
+        let Some(rest) = line.get(inv.end..).and_then(after_blanks) else {
             return false;
         };
-        starts_word && (bare_verb(rest) || foreign_release_word(rest))
+        (!inv.ticked || argued(rest)) && (bare_verb(rest) || foreign_release_word(rest))
     })
+}
+
+/// Whether the word opening `rest` is followed by an argument: the end of the
+/// line, a flag, a path, a placeholder, a variable, or a quoted word.
+fn argued(rest: &str) -> bool {
+    let tail = rest.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let Some(next) = after_blanks(tail) else {
+        return tail.is_empty();
+    };
+    let token = next.split_whitespace().next().unwrap_or_default();
+    token.is_empty()
+        || token.starts_with(['-', '.', '/', '<', '[', '$', '"', '\''])
+        || token.contains('/')
+        || token.ends_with(".ipe")
 }
 
 /// Whether `rest` opens with a whole bare verb.
@@ -62,9 +158,9 @@ fn bare_verb(rest: &str) -> bool {
     })
 }
 
-/// Whether `rest` is `release ` followed by a word that is not its verb.
+/// Whether `rest` is `release` and blanks followed by a word not its verb.
 fn foreign_release_word(rest: &str) -> bool {
-    let Some(tail) = rest.strip_prefix("release ") else {
+    let Some(tail) = rest.strip_prefix("release").and_then(after_blanks) else {
         return false;
     };
     let end = tail
@@ -186,6 +282,20 @@ fn a_bare_verb_in_prose_is_reported() {
         "`ipe release src/Main.ipe`",
         "ipe release --emit-permissions",
         "ipe release ",
+        "ipe.exe build",
+        "C:\\bin\\ipe.exe run app",
+        "\"$ipe_bin\" run src/Main.ipe",
+        "$IPE build",
+        "${IPE_BIN} watch",
+        "\"$IPEC_BIN\" build src/Main.ipe --out out/rust",
+        "ipe  build",
+        "ipe\trun",
+        "\"ipe\" eject out/",
+        "`ipe` build src/Main.ipe",
+        "`ipe` run Main.ipe",
+        "`ipe` build --target wasm",
+        "`ipe` exec",
+        "$IPE release  src/Main.ipe",
     ] {
         assert!(refused(line), "{line:?} must be reported");
     }
@@ -204,6 +314,20 @@ fn a_grouped_verb_is_not_reported() {
         "pipe run",
         "ipe builder",
         "ipe release",
+        "ipe.exe dev build",
+        "\"$ipe_bin\" dev run src/Main.ipe",
+        "$IPE release build",
+        "${IPEC_BIN} release run dist/app",
+        "ipe  dev  build",
+        "ipe release  build",
+        "$RECIPE build",
+        "$PIPELINE run",
+        "$CARGO build",
+        "ipe.example run",
+        "a missing entry fails at `ipe` build time",
+        "One `ipe` run of the parity serializer",
+        "the `ipe` build-tools compile once",
+        "one `ipe` build: the producer",
     ] {
         assert!(!refused(line), "{line:?} must not be reported");
     }
