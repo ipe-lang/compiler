@@ -8,7 +8,9 @@ import Ipe.Task as Task
 
 -- List `case` over an element type that is not `Clone` (`Task`, and a `Maybe`
 -- of one). Every binder moves out of the list; none is copied, so the emitted
--- Rust builds although the element has no `Clone` impl.
+-- Rust builds although the element has no `Clone` impl. No lambda captures a
+-- moved element (the compiler refuses that), so elements reach `Task.map2` as
+-- arguments.
 
 
 -- `[]`, `[_]` and a whole-list catch-all binder.
@@ -36,7 +38,7 @@ sequence ts =
             t
 
         t :: rest ->
-            t |> Task.andThen (\a -> sequence rest |> Task.andThen (\b -> Task.succeed (a ++ b)))
+            Task.map2 (\a b -> a ++ b) t (sequence rest)
 
 
 -- A two-element prefix with a rest, and a wildcard catch-all.
@@ -48,7 +50,7 @@ firstTwo ts =
                 n =
                     List.length rest
             in
-            x |> Task.andThen (\a -> y |> Task.andThen (\b -> Task.succeed (a ++ b ++ String.fromInt n)))
+            Task.map2 (\a b -> a ++ b ++ String.fromInt n) x y
 
         _ ->
             Task.succeed "short"
@@ -69,10 +71,10 @@ pick ts n =
 
 
 -- The first arm's string guard fails for `Just "stop"`; the next arm binds.
-gated : List (Task Error String) -> Maybe String -> Task Error String
+gated : List (Task Error String) -> String -> Task Error String
 gated ts flag =
     case ( ts, flag ) of
-        ( t :: _, Just "go" ) ->
+        ( t :: _, "go" ) ->
             t
 
         ( _ :: r, _ ) ->
@@ -154,8 +156,8 @@ main =
         |> Task.andThen (\_ -> say (firstTwo [ Task.succeed "p" ]))
         |> Task.andThen (\_ -> say (pick [ Task.succeed "a", Task.succeed "b", Task.succeed "c" ] 1))
         |> Task.andThen (\_ -> say (pick [ Task.succeed "a" ] 5))
-        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] (Just "go")))
-        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] (Just "stop")))
+        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] "go"))
+        |> Task.andThen (\_ -> say (gated [ Task.succeed "x", Task.succeed "y" ] "stop"))
         |> Task.andThen (\_ -> say (firstJust [ Nothing, Just (Task.succeed "j"), Just (Task.succeed "k") ]))
         |> Task.andThen (\_ -> say (firstJust [ Nothing ]))
         |> Task.andThen (\_ -> Io.println (String.fromInt (countJusts [ Just (Task.succeed "a"), Nothing, Just (Task.succeed "b") ])))
