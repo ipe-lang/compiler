@@ -59,6 +59,12 @@ pub const MAX_MODULE_DEPTH: u32 = 32;
 /// The most steps one path walk takes, links' targets included.
 const MAX_WALK_STEPS: u32 = 8192;
 
+/// The most URL rewrites (Git `insteadOf` and `pushInsteadOf`, Mercurial `[schemes]`) one scan reads.
+pub const MAX_URL_REWRITES: usize = 256;
+
+/// The most pairs of a URL rewrite and a URL value one scan composes.
+pub const MAX_REWRITE_PAIRS: usize = 16384;
+
 /// `n` as a [`NonZeroU64`], or one for zero.
 const fn nonzero_u64(n: u64) -> NonZeroU64 {
     match NonZeroU64::new(n) {
@@ -494,6 +500,13 @@ pub enum Unprovable {
     TooManyWords,
     /// The value holds a carriage return, vertical tab, or form feed, which tools split words at differently.
     OddSpace,
+    /// The value lets Git hand a URL the scan does not read (one in `.gitmodules`, one typed on a command line) to a remote helper.
+    ///
+    /// A URL rewrite to a base Git may read as `<helper>::` once a URL's text
+    /// follows it (`hg:`, `gcrypt:`), or a `protocol.<name>.allow` letting a
+    /// helper run from any URL, turns such a URL into a program run on a
+    /// path the jail writes.
+    RemoteHelper,
 }
 
 impl fmt::Display for Unprovable {
@@ -542,6 +555,10 @@ impl fmt::Display for Unprovable {
                 "it holds a carriage return, vertical tab, or form feed, which the shell and the \
                  tool split words at differently",
             ),
+            Self::RemoteHelper => f.write_str(
+                "it lets Git hand a URL the scan does not read, such as one in `.gitmodules`, to a \
+                 remote helper or `ext::`, which runs a program",
+            ),
         }
     }
 }
@@ -575,6 +592,8 @@ pub enum ConfigFault {
     Bytes,
     /// The scan reached [`ConfigLimits::paths`].
     Paths,
+    /// The scan read more than [`MAX_URL_REWRITES`] URL rewrites, or more than [`MAX_REWRITE_PAIRS`] pairs of a rewrite and a URL.
+    Rewrites,
     /// It is not valid UTF-8.
     NotUtf8,
 }
@@ -592,6 +611,7 @@ impl fmt::Display for ConfigFault {
             Self::Files => f.write_str("the scan reached its limit on configuration files"),
             Self::Bytes => f.write_str("the scan reached its limit on configuration bytes"),
             Self::Paths => f.write_str("the scan reached its limit on resolved paths"),
+            Self::Rewrites => f.write_str("the scan reached its limit on URL rewrites"),
             Self::NotUtf8 => f.write_str("it is not valid UTF-8"),
         }
     }
@@ -879,6 +899,8 @@ pub fn scan(
         deferred: Vec::new(),
         network_urls: Vec::new(),
         helper_remote: false,
+        rewrites: Vec::new(),
+        urls: Vec::new(),
     };
     run.seed(roots)?;
     while let Some(item) = run.pending.pop() {
@@ -1106,6 +1128,71 @@ struct Deferred {
     setting: Setting,
     /// The value.
     value: String,
+}
+
+/// A rewrite a tool applies to a URL before it reads it, once, never to its own result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rewrite {
+    /// Git's `url.<base>.insteadOf` or `pushInsteadOf`: a URL starting with `prefix` has it replaced by `base`.
+    Prefix {
+        /// The file it came from.
+        source: PathBuf,
+        /// The text a URL starts with.
+        prefix: String,
+        /// The text put in its place.
+        base: String,
+    },
+    /// Mercurial's `[schemes]`: a URL `<scheme>://<rest>` becomes `template` followed by `rest`.
+    Scheme {
+        /// The file it came from.
+        source: PathBuf,
+        /// The scheme, matched in any case.
+        scheme: String,
+        /// The URL text put in place of `<scheme>://`.
+        template: String,
+    },
+}
+
+impl Rewrite {
+    /// The file it came from.
+    fn source(&self) -> &Path {
+        match self {
+            Self::Prefix { source, .. } | Self::Scheme { source, .. } => source,
+        }
+    }
+
+    /// The form `url` takes under this rewrite, or `None` when it does not apply.
+    ///
+    /// A template holding a brace substitutes parts of the URL through
+    /// Mercurial's templater, which the scan does not model, so it is
+    /// unprovable.
+    fn apply(&self, url: &str) -> Option<Result<String, Unprovable>> {
+        match self {
+            Self::Prefix { prefix, base, .. } => url
+                .strip_prefix(prefix.as_str())
+                .map(|rest| Ok(format!("{base}{rest}"))),
+            Self::Scheme {
+                scheme, template, ..
+            } => {
+                let (name, rest) = url.split_once("://")?;
+                if !name.eq_ignore_ascii_case(scheme) {
+                    return None;
+                }
+                if template.contains(['{', '}']) {
+                    return Some(Err(Unprovable::Glob));
+                }
+                Some(Ok(format!("{template}{rest}")))
+            }
+        }
+    }
+}
+
+/// A URL value as written, kept to be judged in each form a [`Rewrite`] gives it.
+struct UrlValue {
+    /// The value and where it came from.
+    item: Deferred,
+    /// Whether Git's `host:path` form counts as a network URL for it.
+    scp: bool,
 }
 
 /// Why judging a value stopped.
@@ -1367,6 +1454,10 @@ struct Scan<'s> {
     network_urls: Vec<Deferred>,
     /// Whether any file read sets `remote.<name>.vcs`, which hands a remote's URL verbatim to `git-remote-<vcs>`.
     helper_remote: bool,
+    /// The URL rewrites of every file read, always or conditionally.
+    rewrites: Vec<Rewrite>,
+    /// Every URL value as written, judged again in each form a rewrite gives it.
+    urls: Vec<UrlValue>,
 }
 
 impl Scan<'_> {
@@ -2050,6 +2141,7 @@ impl Scan<'_> {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
                         .map_err(&refuse)?;
+                    git_protocol(&entry.setting, &entry.value).map_err(&refuse)?;
                     self.note_remote(ctx, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
@@ -2057,6 +2149,31 @@ impl Scan<'_> {
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
+            if let Some(rewrite) = rewrite_of(ctx, &entry.setting, &entry.value) {
+                if self.rewrites.len() >= MAX_URL_REWRITES {
+                    return Err(self.unreadable(&ctx.source, ConfigFault::Rewrites));
+                }
+                self.rewrites.push(rewrite);
+            }
+            let url_scp = match &route {
+                Route::Judge(Role::Url { scp })
+                    if !is_rewrite_target(ctx.syntax, &entry.setting) =>
+                {
+                    Some(*scp)
+                }
+                Route::RemoteName => (entry.value != ".").then_some(true),
+                Route::Judge(_) => None,
+            };
+            if let Some(scp) = url_scp {
+                self.urls.push(UrlValue {
+                    item: Deferred {
+                        ctx: ctx.clone(),
+                        setting: entry.setting.clone(),
+                        value: entry.value.clone(),
+                    },
+                    scp,
+                });
+            }
             if is_remote_url(ctx.syntax, &entry.setting) && is_network_url(&entry.value, true) {
                 self.network_urls.push(Deferred {
                     ctx: ctx.clone(),
@@ -2094,6 +2211,9 @@ impl Scan<'_> {
             return Err(unproven(Unprovable::ExtTransport));
         }
         if &**section == "url" {
+            if is_helper_base(subsection) {
+                return Err(unproven(Unprovable::RemoteHelper));
+            }
             return self.judge(ctx, &Role::Url { scp: true }, subsection);
         }
         Ok(())
@@ -2147,6 +2267,7 @@ impl Scan<'_> {
     /// set anywhere no remote URL is admitted for its network shape.
     fn judge_deferred(&mut self) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
+        self.judge_rewritten()?;
         let network_urls = std::mem::take(&mut self.network_urls);
         if self.helper_remote {
             for item in network_urls {
@@ -2174,6 +2295,54 @@ impl Scan<'_> {
                 .map_err(|stop| {
                     stop.into_refusal(kind, &item.ctx.source, || item.setting.public())
                 })?;
+        }
+        Ok(())
+    }
+
+    /// Judge every form a URL rewrite gives a URL value, as a URL of the value's setting.
+    ///
+    /// The tool rewrites a URL before reading it, so the value as written
+    /// proves nothing about what it reads: `[url "ext:"] insteadOf = ab` turns
+    /// `ab:/tree/x`, a network URL as written, into `ext::/tree/x`. Git applies
+    /// only the longest matching prefix; every match is judged, the longest
+    /// among them. A rewritten URL that is a network URL is kept to be judged
+    /// as a path too once a remote names a helper.
+    fn judge_rewritten(&mut self) -> Result<(), ConfigRefusal> {
+        let kind = self.kind;
+        if self.rewrites.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.rewrites.len().saturating_mul(self.urls.len());
+        if pairs > MAX_REWRITE_PAIRS {
+            let source = self
+                .rewrites
+                .first()
+                .map(|rewrite| rewrite.source().to_path_buf())
+                .unwrap_or_default();
+            return Err(self.unreadable(&source, ConfigFault::Rewrites));
+        }
+        let rewrites = std::mem::take(&mut self.rewrites);
+        for url in std::mem::take(&mut self.urls) {
+            let item = url.item;
+            let refuse =
+                |stop: Stop| stop.into_refusal(kind, &item.ctx.source, || item.setting.public());
+            for rewrite in &rewrites {
+                let Some(rewritten) = rewrite.apply(&item.value) else {
+                    continue;
+                };
+                let rewritten = rewritten.map_err(|reason| refuse(unproven(reason)))?;
+                self.judge(&item.ctx, &Role::Url { scp: url.scp }, &rewritten)
+                    .map_err(refuse)?;
+                if is_network_url(&rewritten, url.scp)
+                    && is_remote_url(item.ctx.syntax, &item.setting)
+                {
+                    self.network_urls.push(Deferred {
+                        ctx: item.ctx.clone(),
+                        setting: item.setting.clone(),
+                        value: rewritten,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -2807,16 +2976,20 @@ fn is_path_shaped(word: &str) -> bool {
 /// `value` split into shell words: quotes group, a backslash escapes, whitespace separates.
 ///
 /// An unterminated quote ends the last word at the end of the value, so its
-/// text is still judged. The shell expands a leading `~` only when the word's
-/// first character is that unquoted `~`; a word starting with a quoted or
-/// escaped `~` (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`) names the relative path
-/// `~/x`, so it comes back as `./~/x`.
+/// text is still judged. The shell expands a leading `~` only when every
+/// character of its tilde prefix, from the `~` to the first unquoted `/` or
+/// the end of the word, is unquoted. A word whose `~` is quoted or escaped
+/// (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`), or whose prefix holds a quote or an
+/// escape (`~"/x"`, `~\/x`, `~''/x`), names the relative path `~/x`, so it
+/// comes back as `./~/x`.
 fn shell_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    // Whether the word being read started with an unquoted `~`.
+    // Whether the word being read started with an unquoted `~` and its tilde prefix is unquoted so far.
     let mut home = false;
+    // Whether the word's tilde prefix is still being read.
+    let mut in_prefix = false;
     let mut quote: Option<char> = None;
     let finish = |word: String, home: bool| {
         if word.starts_with('~') && !home {
@@ -2827,39 +3000,152 @@ fn shell_words(value: &str) -> Vec<String> {
     };
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+        let unquoted = match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => {
+                quote = None;
+                false
+            }
             (Some('"') | None, '\\') => {
                 in_word = true;
                 if let Some(escaped) = chars.next() {
                     word.push(escaped);
                 }
+                false
             }
-            (Some(_), other) => word.push(other),
+            (Some(_), other) => {
+                word.push(other);
+                false
+            }
             (None, '\'' | '"') => {
                 in_word = true;
                 quote = Some(c);
+                false
             }
             (None, other) if is_c_space(other) => {
                 if in_word {
                     words.push(finish(std::mem::take(&mut word), home));
                     in_word = false;
                     home = false;
+                    in_prefix = false;
                 }
+                continue;
             }
             (None, other) => {
                 if !in_word {
                     home = other == '~';
+                    in_prefix = home;
+                } else if in_prefix && is_separator(other) {
+                    in_prefix = false;
                 }
                 in_word = true;
                 word.push(other);
+                true
             }
+        };
+        if !unquoted && in_prefix {
+            home = false;
+            in_prefix = false;
         }
     }
     if in_word {
         words.push(finish(word, home));
     }
     words
+}
+
+/// Whether Git may read `base` with more URL text after it as `<helper>::<address>`.
+///
+/// Git takes a URL's leading run of scheme characters (an ASCII letter or
+/// digit, then also `+`, `-` and `.`) as a helper's name when `::` follows
+/// it. A base that is only such a run, or such a run and one `:` (`hg:`,
+/// `ext:`, `gcrypt:`), reaches that form when the rewritten URL's rest starts
+/// with `::` or `:`, whatever URL the rest comes from. A base whose run is
+/// followed by anything else (`https://`, `git@host:`) never does.
+fn is_helper_base(base: &str) -> bool {
+    let run = base
+        .char_indices()
+        .take_while(|&(at, c)| {
+            c.is_ascii_alphanumeric() || (at > 0 && matches!(c, '+' | '-' | '.'))
+        })
+        .count();
+    let rest = base.get(run..).unwrap_or_default();
+    rest.is_empty() || rest == ":"
+}
+
+/// Refuse a `protocol.allow` or `protocol.<name>.allow` that lets Git run a program from a URL the scan does not read.
+///
+/// Git allows `ext::` only by `protocol.ext.allow` or `protocol.allow`, and
+/// a remote helper from a submodule's `.gitmodules` URL only by `always`. A
+/// URL the scan reads is judged whatever these say; a URL in a file the jail
+/// writes and the scan does not read (`.gitmodules`) is not, so a policy
+/// opening either refuses. The network and file transports Git ships run no
+/// program a URL names.
+fn git_protocol(setting: &Setting, value: &str) -> Result<(), Stop> {
+    let Setting::Key {
+        section,
+        subsection,
+        key,
+    } = setting
+    else {
+        return Ok(());
+    };
+    if &**section != "protocol" || !key.eq_ignore_ascii_case("allow") {
+        return Ok(());
+    }
+    let never = value.eq_ignore_ascii_case("never");
+    let always = value.eq_ignore_ascii_case("always");
+    let named = |names: &[&str]| {
+        subsection
+            .as_deref()
+            .is_some_and(|name| names.iter().any(|n| name.eq_ignore_ascii_case(n)))
+    };
+    let opened = if named(&["ext"]) {
+        (!never).then_some(Unprovable::ExtTransport)
+    } else if named(&["http", "https", "git", "ssh", "file"]) {
+        None
+    } else {
+        always.then_some(Unprovable::RemoteHelper)
+    };
+    opened.map_or(Ok(()), |why| Err(unproven(why)))
+}
+
+/// The URL rewrite `setting` of a file in `ctx` declares: Git's `url.<base>.insteadOf` or `pushInsteadOf`, or a Mercurial `[schemes]` entry.
+fn rewrite_of(ctx: &FileCtx, setting: &Setting, value: &str) -> Option<Rewrite> {
+    let Setting::Key {
+        section,
+        subsection,
+        key,
+    } = setting
+    else {
+        return None;
+    };
+    match (ctx.syntax, subsection.as_deref()) {
+        (Syntax::Git, Some(base))
+            if &**section == "url"
+                && (key.eq_ignore_ascii_case("insteadof")
+                    || key.eq_ignore_ascii_case("pushinsteadof")) =>
+        {
+            Some(Rewrite::Prefix {
+                source: ctx.source.clone(),
+                prefix: value.to_owned(),
+                base: base.to_owned(),
+            })
+        }
+        (Syntax::Hg, _) if &**section == "schemes" => Some(Rewrite::Scheme {
+            source: ctx.source.clone(),
+            scheme: key.clone(),
+            template: value.to_owned(),
+        }),
+        (Syntax::Git | Syntax::Hg | Syntax::Toml | Syntax::Darcs | Syntax::GitRemote, _) => None,
+    }
+}
+
+/// Whether `setting` of a file in `syntax` is a rewrite's target, which the tool never rewrites again: a Mercurial `[schemes]` template.
+fn is_rewrite_target(syntax: Syntax, setting: &Setting) -> bool {
+    matches!(
+        (syntax, setting),
+        (Syntax::Hg, Setting::Key { section, .. }) if &**section == "schemes"
+    )
 }
 
 /// Whether `value` is a Git boolean.
@@ -2953,6 +3239,11 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
         return Role::Forced(path.to_owned());
     }
     if &**section == "paths" && (!key.contains(':') || key.ends_with(":pushurl")) {
+        return Role::Url { scp: false };
+    }
+    // A `[schemes]` template or a `[subpaths]` replacement is the URL the
+    // tool reads in place of one it was given, `.hgsub` sources included.
+    if &**section == "schemes" || &**section == "subpaths" {
         return Role::Url { scp: false };
     }
     if exempt(VcsKind::Mercurial, (&**section, None, key.as_str())) {
@@ -4735,6 +5026,9 @@ mod tests {
             "\"~/bin/less\"",
             "\\~/bin/less",
             "''~/bin/less",
+            "~\"/bin/less\"",
+            "~\\/bin/less",
+            "~''/bin/less",
         ] {
             git_config(&f, &format!("[core]\n\tpager = {}\n", git_quoted(value)));
             assert_eq!(
@@ -4771,6 +5065,193 @@ mod tests {
             );
         }
         write(&repo.join("config.toml"), "[ui]\npager = \"less -R\"\n");
+        assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+    }
+
+    fn names_code(result: &Result<(), ConfigRefusal>) -> bool {
+        matches!(result, Err(ConfigRefusal::NamesWritableCode { .. }))
+    }
+
+    #[test]
+    fn rewritten_git_url_judged_after_the_rewrite() {
+        let f = fixture("urlrewrite");
+        let tree = f.tree.display();
+        for text in [
+            format!(
+                "[protocol \"ext\"]\n\tallow = always\n[url \"ext:\"]\n\tinsteadOf = ab\n\
+                 [remote \"origin\"]\n\turl = ab:{tree}/evil\n"
+            ),
+            format!(
+                "[url \"ext:\"]\n\tinsteadOf = ab\n[remote \"origin\"]\n\turl = ab:{tree}/evil\n"
+            ),
+            format!(
+                "[url \"ext:\"]\n\tpushInsteadOf = ab\n[remote \"origin\"]\n\tpushurl = ab:{tree}/evil\n"
+            ),
+            format!(
+                "[url \"hg:\"]\n\tinsteadOf = ab\n[remote \"origin\"]\n\turl = ab:{tree}/evil\n"
+            ),
+            format!("[url \"hg:\"]\n\tinsteadOf = ab\n[submodule \"x\"]\n\turl = ab:{tree}/evil\n"),
+            format!("[url \"hg:\"]\n\tinsteadOf = ab\n[branch \"x\"]\n\tremote = ab:{tree}/evil\n"),
+            format!(
+                "[url \"gcrypt:\"]\n\tinsteadOf = ab\n[remote \"o\"]\n\turl = ab:{tree}/evil\n"
+            ),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(names_code(&result), "{text:?}: {result:?}");
+        }
+
+        // The rewrite in an included file, the URL in the file including it.
+        let included = f.out.join("rewrite.cfg");
+        write(&included, "[url \"hg:\"]\n\tinsteadOf = ab\n");
+        let shown = included.display();
+        for include in ["[include]", "[includeIf \"gitdir:/no/such/place/\"]"] {
+            git_config(
+                &f,
+                &format!("{include}\n\tpath = {shown}\n[remote \"o\"]\n\turl = ab:{tree}/evil\n"),
+            );
+            let result = scan_git(&f);
+            assert!(names_code(&result), "{include}: {result:?}");
+        }
+
+        for text in [
+            "[url \"https://example.com/\"]\n\tinsteadOf = gh:\n[remote \"o\"]\n\turl = gh:x/y\n",
+            "[url \"git@example.com:\"]\n\tinsteadOf = https://example.com/\n\
+             [remote \"o\"]\n\turl = https://example.com/x/y\n",
+            "[url \"ssh://git@example.com/\"]\n\tpushInsteadOf = https://example.com/\n\
+             [remote \"o\"]\n\turl = https://example.com/x/y\n",
+            "[remote \"o\"]\n\turl = example.com:x/y\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn rewrite_base_a_helper_can_follow_refused() {
+        let f = fixture("helperbase");
+        for base in ["hg:", "ext:", "gcrypt:", "hg", "a.b-c+d:", ""] {
+            git_config(&f, &format!("[url \"{base}\"]\n\tinsteadOf = gh\n"));
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::RemoteHelper),
+                "{base:?}"
+            );
+        }
+        for base in ["https://example.com/", "git@example.com:", "ab:c", "a_b:"] {
+            git_config(&f, &format!("[url \"{base}\"]\n\tinsteadOf = gh\n"));
+            assert_eq!(scan_git(&f), Ok(()), "{base:?}");
+        }
+    }
+
+    #[test]
+    fn protocol_policy_opening_a_helper_refused() {
+        let f = fixture("protocol");
+        for (text, why) in [
+            (
+                "[protocol \"ext\"]\n\tallow = always\n",
+                Unprovable::ExtTransport,
+            ),
+            (
+                "[protocol \"EXT\"]\n\tallow = user\n",
+                Unprovable::ExtTransport,
+            ),
+            (
+                "[protocol \"hg\"]\n\tallow = Always\n",
+                Unprovable::RemoteHelper,
+            ),
+            ("[protocol]\n\tallow = always\n", Unprovable::RemoteHelper),
+        ] {
+            git_config(&f, text);
+            assert_eq!(unprovable(&scan_git(&f)), Some(why), "{text:?}");
+        }
+        for text in [
+            "[protocol \"ext\"]\n\tallow = never\n",
+            "[protocol \"file\"]\n\tallow = always\n",
+            "[protocol \"https\"]\n\tallow = always\n",
+            "[protocol \"hg\"]\n\tallow = user\n",
+            "[protocol]\n\tallow = user\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn rewrite_ceilings() {
+        use std::fmt::Write as _;
+        let f = fixture("rewriteceil");
+        let repeated = |n: usize, line: fn(&mut String, usize)| -> String {
+            let mut text = String::new();
+            for i in 0..n {
+                line(&mut text, i);
+            }
+            text
+        };
+        let rewrites = |n: usize| {
+            repeated(n, |text, i| {
+                write!(
+                    text,
+                    "[url \"https://example.com/{i}/\"]\n\tinsteadOf = p{i}:\n"
+                )
+                .expect("write to a String");
+            })
+        };
+        let remotes = |n: usize| {
+            repeated(n, |text, i| {
+                write!(
+                    text,
+                    "[remote \"r{i}\"]\n\turl = https://example.com/r{i}\n"
+                )
+                .expect("write to a String");
+            })
+        };
+        git_config(&f, &rewrites(MAX_URL_REWRITES));
+        assert_eq!(scan_git(&f), Ok(()));
+        git_config(&f, &rewrites(MAX_URL_REWRITES.saturating_add(1)));
+        assert_eq!(fault(&scan_git(&f)), Some(ConfigFault::Rewrites));
+
+        git_config(&f, &format!("{}{}", rewrites(128), remotes(128)));
+        assert_eq!(scan_git(&f), Ok(()));
+        git_config(&f, &format!("{}{}", rewrites(128), remotes(129)));
+        assert_eq!(fault(&scan_git(&f)), Some(ConfigFault::Rewrites));
+    }
+
+    #[test]
+    fn hg_scheme_rewrite_judged() {
+        let f = fixture("hgschemes");
+        let dot_hg = f.tree.join(".hg");
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        write(
+            &dot_hg.join("hgrc"),
+            "[schemes]\nhttps = evil\n[paths]\ndefault = https://example.com/x\n",
+        );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        write(
+            &dot_hg.join("hgrc"),
+            "[schemes]\nssh = https://{1}.example.com/\n[paths]\ndefault = ssh://x/y\n",
+        );
+        assert_eq!(
+            unprovable(&scan_with(&f, &roots, ConfigLimits::DEFAULT)),
+            Some(Unprovable::Glob)
+        );
+        write(&dot_hg.join("hgrc"), "[subpaths]\nhttp://h/(.*) = \\1\n");
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        let mut replaced = f.tree.clone();
+        replaced.push(r"\1");
+        assert_eq!(in_grant(&result), Some(replaced.as_path()));
+        write(
+            &dot_hg.join("hgrc"),
+            "[schemes]\npy = https://hg.example.com/\n[paths]\ndefault = https://example.com/x\n\
+             [subpaths]\nhttp://h/(.*)-hg/ = https://hg.example.com/\\1/\n",
+        );
         assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
     }
 
