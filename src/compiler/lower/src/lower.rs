@@ -25,7 +25,7 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
-use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
+use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
@@ -18794,12 +18794,16 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
-    /// T3 capture-clone rewrite for a closure body: classify the free locals
-    /// captured by the closure (from its CANON body) and rewrite the LOWERED
-    /// `body` — `CloneOk` reads become `CloneVar` (`.clone()`), `NonClone` captures
-    /// outside a borrowing callee position fail-close IPE-L0126. A callee read
-    /// past the closure, such as one in a run-statement continuation inside
-    /// it, refuses at the capture's own use.
+    /// T3 capture-clone rewrite for a source lambda's body: classify the free
+    /// locals captured by the lambda (from its CANON body) and rewrite the
+    /// LOWERED `body` — `CloneOk` reads become `CloneVar` (`.clone()`). A
+    /// `NonClone` capture the body moves (any read but a borrowing callee, or
+    /// any read past an inner closure the body builds) is recorded on the
+    /// returned walk, so [`CaptureWalk::closure`] builds the lambda as an
+    /// [`Expr::OnceLambda`] at the capture's own use. The once check then
+    /// admits it only where its position calls it at most once and refuses it
+    /// with IPE-L0126 everywhere else — the same verdict an eta-built closure
+    /// gets, so a source lambda's kind comes from its position.
     ///
     /// A captured pure-`Fun` symbol whose binder can carry the `Arc<dyn Fn>`
     /// promotion (a plain `let` name or a def/lambda param — see
@@ -18816,7 +18820,7 @@ impl<'a> Lowerer<'a> {
         cur_body: &canon::Expr,
         span: Span,
         body: Expr,
-    ) -> DResult<Expr> {
+    ) -> DResult<(Expr, CaptureWalk)> {
         let captures = self.captured_locals_at(all_param_pats, cur_body)?;
         let mut clone_set: BTreeSet<Symbol> = BTreeSet::new();
         let mut noncl_set: BTreeSet<Symbol> = BTreeSet::new();
@@ -18839,13 +18843,15 @@ impl<'a> Lowerer<'a> {
                 None => {}
             }
         }
-        rewrite_captured_clones(
+        let walk = CaptureWalk::recording(span, capture_spans);
+        let body = rewrite_captured_clones(
             &clone_set,
             &noncl_set,
-            &CaptureWalk::refusing_at(span, capture_spans),
+            &walk,
             body,
             CaptureScope::Top.enter(ClosureKind::Recallable),
-        )
+        )?;
+        Ok((body, walk))
     }
 
     /// Build the closure of a SYNTHETIC eta expansion (a partial or
@@ -18900,30 +18906,15 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        let walk = CaptureWalk::recording(span);
-        let body = Box::new(rewrite_captured_clones(
+        let walk = CaptureWalk::recording(span, use_spans);
+        let body = rewrite_captured_clones(
             &clone_set,
             &noncl_set,
             &walk,
             body,
             CaptureScope::Top.enter(ClosureKind::Recallable),
-        )?);
-        Ok(match walk.first_moved() {
-            None => Expr::Lambda { params, ret, body },
-            Some(name) => {
-                let at = use_spans.get(&name).copied().unwrap_or(span);
-                Expr::OnceLambda {
-                    params,
-                    ret,
-                    body,
-                    capture: MovedCapture {
-                        name,
-                        lo: at.lo,
-                        hi: at.hi,
-                    },
-                }
-            }
-        })
+        )?;
+        Ok(walk.closure(params, ret, body))
     }
 
     /// Run `f` with `poly` installed as the enclosing def's generic type-variable map.
@@ -19358,10 +19349,12 @@ impl<'a> Lowerer<'a> {
                 args: eta_pad.iter().map(|s| Expr::Var(*s)).collect(),
             };
         }
-        // T3: Capture-clone rewrite — classify free locals captured
-        // by this closure and replace CloneOk reads with `.clone()`, emitting
-        // IPE-L0125 for NonClone captures outside callee position.
-        body = self.rewrite_lambda_captures(&all_param_pats, cur_body, span, body)?;
+        // T3: Capture-clone rewrite — classify free locals captured by this
+        // closure, replace CloneOk reads with `.clone()`, and record a moved
+        // NonClone capture, which makes the closure once-only.
+        let (captured, walk) =
+            self.rewrite_lambda_captures(&all_param_pats, cur_body, span, body)?;
+        body = captured;
         // Fold each destructuring param's `Destructure` around the body through
         // the same shared fold as the def-head params, so every bound component
         // runs the move-ownership discipline. (Lambdas are not TCO'd, so there is
@@ -19382,11 +19375,7 @@ impl<'a> Lowerer<'a> {
         for (sym, ir_ty) in &ir_params {
             body = self.apply_param_move_ownership(*sym, ir_ty, body, span)?;
         }
-        Ok(Expr::Lambda {
-            params: ir_params,
-            ret,
-            body: Box::new(body),
-        })
+        Ok(walk.closure(ir_params, ret, body))
     }
 
     /// Convert a solved [`Ty`] (used for the return type of untyped bindings,
@@ -29854,18 +29843,32 @@ impl<'a> Lowerer<'a> {
 
         // T3-style capture-clone rewrite on the thunk body: the thunk has zero
         // params, so every free VarLocal in `canon_value` is an outer capture,
-        // classified by the shared `classify_capture_clone` rule.
+        // classified by the shared `classify_capture_clone` rule. The thunk is
+        // called once per read of a bound name, so it must stay `Fn`: a moved
+        // `NonClone` capture refuses at its use. A promotable pure-`Fun`
+        // capture is left to its binder site, exactly as for a source lambda.
         let thunk_body = {
-            let captures = self.captured_locals(&[], canon_value)?;
+            let captures = self.captured_locals_at(&[], canon_value)?;
             let mut clone_set: BTreeSet<Symbol> = BTreeSet::new();
             let mut noncl_set: BTreeSet<Symbol> = BTreeSet::new();
-            for (sym, binder_ty) in captures {
-                match classify_capture_clone(self.clone_env(), binder_ty.classified()) {
+            let mut capture_spans: BTreeMap<Symbol, Span> = BTreeMap::new();
+            for (sym, capture_span, binder_ty) in captures {
+                let ir_ty = binder_ty.classified();
+                if fun_value_arc_promotable(ir_ty)
+                    && self.promotable_fn_binders.borrow().contains(&sym)
+                {
+                    self.deferred_fun_captures
+                        .borrow_mut()
+                        .insert(sym, value_span);
+                    continue;
+                }
+                match classify_capture_clone(self.clone_env(), ir_ty) {
                     Some(true) => {
                         clone_set.insert(sym);
                     }
                     Some(false) => {
                         noncl_set.insert(sym);
+                        capture_spans.insert(sym, capture_span);
                     }
                     None => {}
                 }
@@ -29873,7 +29876,7 @@ impl<'a> Lowerer<'a> {
             rewrite_captured_clones(
                 &clone_set,
                 &noncl_set,
-                &CaptureWalk::refusing(value_span),
+                &CaptureWalk::refusing_at(value_span, capture_spans),
                 value,
                 CaptureScope::Top.enter(ClosureKind::Recallable),
             )?

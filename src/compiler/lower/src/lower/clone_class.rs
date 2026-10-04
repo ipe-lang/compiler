@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_diagnostics::{DResult, Diagnostic, Feature, Span};
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::once_closure::CaptureScope;
+use ipe_ir::once_closure::{CaptureScope, MovedCapture};
 use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath, Pat, enum_payload_holds};
 
 use super::capture_rewrite::force_shared_capture_clones;
@@ -481,10 +481,12 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
 
 /// What [`rewrite_captured_clones`] does with a moved non-`Clone` capture.
 pub(super) enum NonCloneCapture {
-    /// A source lambda: refuse the capture with IPE-L0126.
+    /// A closure that must stay `Fn` (a destructure thunk): refuse the capture
+    /// with IPE-L0126.
     Refuse,
-    /// An eta-built closure: record the first moved capture and keep walking,
-    /// so the builder can make the closure an [`Expr::OnceLambda`].
+    /// A source lambda or an eta-built closure: record the first moved capture
+    /// and keep walking, so the builder can make the closure an
+    /// [`Expr::OnceLambda`] that the once check admits by its position.
     Record(Cell<Option<Symbol>>),
 }
 
@@ -492,19 +494,18 @@ pub(super) enum NonCloneCapture {
 pub(super) struct CaptureWalk {
     /// The closure's span, for a `Refuse` diagnostic.
     pub(super) span: Span,
-    /// Each non-`Clone` capture's first use, for a refusal reported at the capture.
+    /// Each non-`Clone` capture's first use: where a refusal or a once
+    /// closure's moved capture is reported.
     pub(super) capture_spans: BTreeMap<Symbol, Span>,
     /// What a moved non-`Clone` capture does.
     pub(super) policy: NonCloneCapture,
 }
 
 impl CaptureWalk {
-    /// A walk that refuses a moved non-`Clone` capture at `span`.
-    pub(super) const fn refusing(span: Span) -> Self {
-        Self::refusing_at(span, BTreeMap::new())
-    }
-
-    /// A refusing walk that reports a capture moved through a call at its use in `capture_spans`.
+    /// A walk that refuses a moved non-`Clone` capture.
+    ///
+    /// A capture moved through a call is reported at its use in
+    /// `capture_spans`; any other move at the closure's `span`.
     pub(super) const fn refusing_at(span: Span, capture_spans: BTreeMap<Symbol, Span>) -> Self {
         Self {
             span,
@@ -514,11 +515,37 @@ impl CaptureWalk {
     }
 
     /// A walk that records the first moved non-`Clone` capture.
-    pub(super) const fn recording(span: Span) -> Self {
+    pub(super) const fn recording(span: Span, capture_spans: BTreeMap<Symbol, Span>) -> Self {
         Self {
             span,
-            capture_spans: BTreeMap::new(),
+            capture_spans,
             policy: NonCloneCapture::Record(Cell::new(None)),
+        }
+    }
+
+    /// Wrap a walked closure body as the closure its recorded moves call for.
+    ///
+    /// No moved capture leaves it an `Fn` [`Expr::Lambda`]. A moved capture
+    /// makes it an [`Expr::OnceLambda`] whose capture span is that capture's
+    /// use (the closure's span when absent); the once check then admits or
+    /// refuses it by its position.
+    pub(super) fn closure(&self, params: Vec<(Symbol, IrType)>, ret: IrType, body: Expr) -> Expr {
+        let body = Box::new(body);
+        match self.first_moved() {
+            None => Expr::Lambda { params, ret, body },
+            Some(name) => {
+                let at = self.capture_spans.get(&name).copied().unwrap_or(self.span);
+                Expr::OnceLambda {
+                    params,
+                    ret,
+                    body,
+                    capture: MovedCapture {
+                        name,
+                        lo: at.lo,
+                        hi: at.hi,
+                    },
+                }
+            }
         }
     }
 
@@ -561,21 +588,6 @@ impl CaptureWalk {
             }
         }
     }
-
-    /// Does the walk drop the non-`Clone` set at the closure-literal argument `arg`?
-    ///
-    /// A source lambda's own pass already judged a closure literal passed as
-    /// an argument, so a refusing walk does not re-examine it. A recording walk
-    /// keeps the set: building that inner `move` closure still moves the
-    /// capture out of the outer one, so the outer closure is `FnOnce` either way.
-    const fn clears_at(&self, arg: &Expr) -> bool {
-        match self.policy {
-            NonCloneCapture::Refuse => {
-                matches!(arg, Expr::Lambda { .. } | Expr::OnceLambda { .. })
-            }
-            NonCloneCapture::Record(_) => false,
-        }
-    }
 }
 
 /// Rewrite a lowered IR expression — the body of a `move` closure — to make
@@ -586,7 +598,8 @@ impl CaptureWalk {
 /// * `Var(s)` where `s ∈ noncl_set` AND `s` is the DIRECT callee of an
 ///   `Apply` → kept bare while the call borrows (`Fn::call` takes `&self`):
 ///   at any scope short of [`CaptureScope::PastRecallable`]
-/// * `Var(s)` where `s ∈ noncl_set` elsewhere → `Err(IPE-L0126)`
+/// * `Var(s)` where `s ∈ noncl_set` elsewhere → a move of `s` out of the
+///   closure: recorded or refused with IPE-L0126 by `walk`'s policy
 /// * all others → unchanged (not captured, or `CopyLeaf`)
 ///
 /// `scope` is the read's place among the emitted closures, the closure being
@@ -639,20 +652,10 @@ pub(super) fn rewrite_captured_clones(
         // inside an inner `move` closure built on each outer call, which moves
         // it out of the outer env (E0507), so the read is a hazard.
         //
-        // Args discipline: a lambda that appears as a CALLBACK ARGUMENT
-        // (e.g. `task_and_then(task, \ts -> insertRow db ts)`) has already been
-        // fully processed by its own `lower_lambda` pass, including the
-        // callee-position exemption for NonClone symbols.  Propagating
-        // `noncl_set` into arg-position lambdas here would re-examine already-
-        // handled callee sites one closure deeper, where the exemption does
-        // NOT fire, spuriously emitting L0126.
-        //
-        // Lambdas in FUNC position (immediately-invoked pattern
-        // `(\x -> f x) p`) are NOT cleared: the inner lambda creation moves a
-        // NonClone value out of the outer env on every call → outer closure
-        // becomes FnOnce against a `Box<dyn Fn>` return annotation → Rust E0277.
-        // Those still propagate `noncl_set` via the normal
-        // `other` path into the `Lambda` arm.
+        // Every argument keeps the full `noncl_set`, a closure literal
+        // included: building that inner `move` closure moves each capture it
+        // reads out of this closure's environment, so the read past it is
+        // this closure's move, recorded or refused by `walk`.
         Expr::Apply { func, args } => {
             let new_func = Box::new(match *func {
                 Expr::Var(s) if noncl_set.contains(&s) => {
@@ -665,20 +668,7 @@ pub(super) fn rewrite_captured_clones(
             });
             let new_args = args
                 .into_iter()
-                .map(|a| {
-                    // Clear `noncl_set` for lambda arguments — they are
-                    // already self-consistent from their own `lower_lambda`
-                    // pass.  Non-lambda expressions keep the full `noncl_set`
-                    // so forwarding a NonClone value in arg position (e.g.
-                    // `applyTwice f x` where `f` is non-callee) still fires
-                    // L0126 as expected.
-                    if walk.clears_at(&a) {
-                        let empty = BTreeSet::new();
-                        rewrite_captured_clones(clone_set, &empty, walk, a, scope)
-                    } else {
-                        rewrite_captured_clones(clone_set, noncl_set, walk, a, scope)
-                    }
-                })
+                .map(|a| rewrite_captured_clones(clone_set, noncl_set, walk, a, scope))
                 .collect::<DResult<Vec<_>>>()?;
             Ok(Expr::Apply {
                 func: new_func,
@@ -895,17 +885,8 @@ pub(super) fn rewrite_captured_clones(
                 clone_set, noncl_set, walk, *else_, scope,
             )?),
         }),
-        // Call: kernel / top-level function application.
-        //
-        // Same Lambda-in-args discipline as `Expr::Apply`: a lambda
-        // passed as a callback to a kernel (e.g. `List.map (\m -> f m) xs` or
-        // `task_and_then(task, \ts -> insertRow db ts)`) is already fully
-        // processed by its own `lower_lambda` pass at scope 0.  Propagating
-        // `noncl_set` into it here would fire spurious L0126 at scope+1.
-        //
-        // Non-lambda args keep the full `noncl_set` so forwarding a NonClone
-        // value in arg position (e.g. `applyTwice f x` where `f` is non-callee)
-        // is still rejected.
+        // Call: kernel / top-level function application. Every argument keeps
+        // the full `noncl_set`, exactly as in `Expr::Apply`.
         Expr::Call {
             callee,
             args,
@@ -915,14 +896,7 @@ pub(super) fn rewrite_captured_clones(
             callee,
             args: args
                 .into_iter()
-                .map(|a| {
-                    if walk.clears_at(&a) {
-                        let empty = BTreeSet::new();
-                        rewrite_captured_clones(clone_set, &empty, walk, a, scope)
-                    } else {
-                        rewrite_captured_clones(clone_set, noncl_set, walk, a, scope)
-                    }
-                })
+                .map(|a| rewrite_captured_clones(clone_set, noncl_set, walk, a, scope))
                 .collect::<DResult<Vec<_>>>()?,
             pin,
             on_form,
@@ -1582,7 +1556,7 @@ mod handler_capture_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use ipe_diagnostics::{DResult, Diagnostic, Feature, LowerError, Span};
     use ipe_intern::Symbol;
@@ -1721,9 +1695,88 @@ mod tests {
 
     #[test]
     fn a_recording_walk_records_the_capture_moved_through_the_continuation() {
-        let walk = CaptureWalk::recording(CLOSURE);
+        let walk = CaptureWalk::recording(CLOSURE, BTreeMap::new());
         let out = walk_body(&walk, call_prepare_after_a_run_statement(), IN_LAMBDA);
         assert!(out.is_ok(), "a recording walk never refuses: {out:?}");
         assert_eq!(walk.first_moved(), Some(PREPARE));
+    }
+
+    /// `kernel (\at -> prepare at) at`: a closure literal argument calling the capture.
+    fn closure_arg_calling_prepare(kernel: KernelFn) -> Expr {
+        Expr::Call {
+            callee: Callee::Kernel(kernel),
+            args: vec![
+                Expr::Lambda {
+                    params: vec![(PARAM, IrType::Int)],
+                    ret: IrType::Unit,
+                    body: Box::new(Expr::Apply {
+                        func: Box::new(Expr::Var(PREPARE)),
+                        args: vec![Expr::Var(PARAM)],
+                    }),
+                },
+                Expr::Var(AT),
+            ],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        }
+    }
+
+    #[test]
+    fn a_refusing_walk_keeps_the_capture_set_at_a_closure_argument() {
+        for kernel in [KernelFn::ListMap, KernelFn::TaskAndThen] {
+            let out = walk_body(
+                &refusing_walk(),
+                closure_arg_calling_prepare(kernel),
+                IN_LAMBDA,
+            );
+            assert!(
+                matches!(
+                    &out,
+                    Err(Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::RebuiltClosureMovesCapture),
+                    }) if *span == CAPTURE
+                ),
+                "building the argument closure moves the capture out of the `Fn` one: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recording_walk_records_the_capture_an_argument_closure_moves() {
+        let walk = CaptureWalk::recording(CLOSURE, std::iter::once((PREPARE, CAPTURE)).collect());
+        let out = walk_body(
+            &walk,
+            closure_arg_calling_prepare(KernelFn::TaskAndThen),
+            IN_LAMBDA,
+        );
+        let Ok(body) = out else {
+            assert!(out.is_ok(), "a recording walk never refuses: {out:?}");
+            return;
+        };
+        let built = walk.closure(vec![(AT, IrType::Int)], IrType::Unit, body);
+        assert!(
+            matches!(
+                &built,
+                Expr::OnceLambda { capture, .. }
+                    if capture.name == PREPARE && capture.lo == CAPTURE.lo && capture.hi == CAPTURE.hi
+            ),
+            "the closure moves `prepare`, so it is built once-only at the capture: {built:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_moves_nothing_builds_a_recallable_closure() {
+        let walk = CaptureWalk::recording(CLOSURE, BTreeMap::new());
+        let out = walk_body(&walk, call_prepare(), IN_LAMBDA);
+        let Ok(body) = out else {
+            assert!(out.is_ok(), "a borrowing call never refuses: {out:?}");
+            return;
+        };
+        let built = walk.closure(vec![(AT, IrType::Int)], IrType::Unit, body);
+        assert!(
+            matches!(&built, Expr::Lambda { .. }),
+            "`Fn::call` borrows, so the closure stays `Fn`: {built:?}"
+        );
     }
 }

@@ -2,12 +2,14 @@
 //!
 //! A `do` block's run statement lowers to a `TaskSeq` whose continuation the
 //! backend wraps in a `move |_|` closure for the runtime's `FnOnce`
-//! `task_and_then` slot. Inside a `Recallable` closure (the `\at ->` a bind
-//! statement builds), that hidden closure moves each capture out of the
-//! enclosing environment on every call. A promotable function binder there is
-//! moved onto the `Clone` `Arc` carrier; a non-promotable one (bound by a tuple
+//! `task_and_then` slot. Inside a `Recallable` closure (a `List.map`
+//! callback), that hidden closure moves each capture out of the enclosing
+//! environment on every call. A promotable function binder there is moved onto
+//! the `Clone` `Arc` carrier; a non-promotable one (bound by a tuple
 //! destructure) is refused with IPE-L0126 at its use, before cargo can fail on
-//! a `Box<dyn Fn>` moved out of a `Fn` closure (E0507).
+//! a `Box<dyn Fn>` moved out of a `Fn` closure (E0507). The `\at ->` a bind
+//! statement builds is once-only, so a destructure-bound function moves into
+//! it soundly.
 //!
 //! ```text
 //! IPE_E2E=1 cargo nextest run -p ipe --test g_fn_pattern golden_fn_capture_boundary
@@ -196,11 +198,12 @@ main =
 /// The lines [`ACCEPTED`] prints, in order.
 const ACCEPTED_STDOUT: &str = "n\nn\nn\nr\n1\nm\nm-b\nm\nr\nlet\nk-b\nk\nalias\nx\ng\nr\na\nx\na\nx\nr\ntop-a\ntop-b\ntop-c\ne\nrest\nm\nuse\nrest\nuse\nsecond\na\nax\nar\nn1\nn2\n";
 
-/// A destructure-bound function called in a continuation inside the bind's lambda.
+/// A destructure-bound function called in a continuation inside a `List.map` callback.
 const DESTRUCTURED: &str = r#"module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
+import Ipe.List as List
 import Ipe.Task as Task
 
 
@@ -209,23 +212,28 @@ step s =
     Io.println s
 
 
-go : ( String -> Task Error (), Int ) -> (String -> Task Error ()) -> Task Error ()
-go pair mutate =
+go : ( String -> Task Error (), Int ) -> List String -> Task Error ()
+go pair xs =
     let
         ( prepare, _ ) =
             pair
     in
-    do
-        at <- Task.succeed "x"
-        Io.println at
-        prepare at
-        r <- Task.succeed "r"
-        mutate r
+    Task.map (\_ -> ())
+        (Task.sequence
+            (List.map
+                (\x ->
+                    do
+                        Io.println x
+                        prepare x
+                )
+                xs
+            )
+        )
 
 
 main : Task Error ()
 main =
-    go ( step, 1 ) step
+    go ( step, 1 ) [ "a", "b" ]
 "#;
 
 /// Write `source` as a one-file program and return its entry and output dir.
@@ -303,8 +311,8 @@ fn destructure_bound_capture_in_a_continuation_is_refused_at_the_capture() {
     assert_eq!(
         got,
         Some(ipe_diagnostics::IPE_L0126),
-        "a continuation moving `prepare` out of the bind's lambda must fail closed at ipe time, \
-         got {built:?}"
+        "a continuation moving `prepare` out of a recalled callback must fail closed at ipe \
+         time, got {built:?}"
     );
     let want = span_of(DESTRUCTURED, "prepare");
     assert!(

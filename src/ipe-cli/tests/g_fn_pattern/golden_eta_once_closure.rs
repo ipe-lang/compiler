@@ -9,6 +9,10 @@
 //! continuation) and refuses every other position with IPE-L0126 at the moved
 //! capture, before cargo can fail on a `Box<dyn Fn>` that moves it (E0507).
 //!
+//! A source lambda takes the same verdict: one that moves such a capture,
+//! directly or by building an inner closure that captures it, is an
+//! `Expr::OnceLambda` admitted or refused by its position alike.
+//!
 //! ```text
 //! IPE_E2E=1 cargo nextest run -p ipe --test g_fn_pattern golden_eta_once_closure
 //! ```
@@ -159,6 +163,214 @@ fn admitted_once_positions_build_and_run() {
     assert!(
         outcome.stdout.contains("once=5,41 param=2,3"),
         "must print the once and param line; got: {:?}",
+        outcome.stdout
+    );
+}
+
+/// R5a: an inner source lambda in an admitted slot of a recalled source lambda.
+const R5A: &str = r#"module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task
+
+
+run : ( Int -> Task Error Int, Int ) -> List (Task Error Int) -> List (Task Error Int)
+run ( h, _ ) ts =
+    List.map (\t -> Task.andThen (\x -> h x) t) ts
+
+
+inc : Int -> Task Error Int
+inc n =
+    Task.succeed (n + 1)
+
+
+main : Task Error ()
+main =
+    Task.sequence (run ( inc, 0 ) [ Task.succeed 1 ])
+        |> Task.andThen (\_ -> Io.println "unreachable")
+"#;
+
+/// R5b: an admitted once partial inside a recalled source lambda.
+const R5B: &str = r#"module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task
+
+
+combine : Task Error Int -> Int -> Task Error Int
+combine t n =
+    t |> Task.map (\m -> m + n)
+
+
+run : Task Error Int -> List (Task Error Int) -> List (Task Error Int)
+run t ts =
+    List.map (\s -> Task.andThen (combine t) s) ts
+
+
+main : Task Error ()
+main =
+    Task.sequence (run (Task.succeed 1) [ Task.succeed 2 ])
+        |> Task.andThen (\_ -> Io.println "unreachable")
+"#;
+
+/// Once source lambdas at once positions, each built and run.
+const SOURCE_ADMITTED: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String
+import Ipe.Task as Task
+
+
+step : String -> Task Error ()
+step s =
+    Io.println s
+
+
+combine : Task Error Int -> Int -> Task Error Int
+combine t n =
+    t |> Task.map (\m -> m + n)
+
+
+-- R5b with the outer lambda in `Task.andThen`'s continuation: it runs once.
+chain : Task Error Int -> Task Error Int
+chain t =
+    Task.andThen (\n -> Task.andThen (combine t) (Task.succeed n)) (Task.succeed 2)
+
+
+-- The bind of `twice`, written as an explicit `Task.andThen`.
+twice : (String -> Task Error ()) -> Task Error ()
+twice prepare =
+    Task.andThen (\at -> Task.andThen (\_ -> prepare at) (Io.println "a")) (Task.succeed "x")
+
+
+-- A destructure-bound function moved into the bind's once-only lambda.
+twiceDestructured : ( String -> Task Error (), Int ) -> Task Error ()
+twiceDestructured ( prepare, _ ) =
+    do
+        at <- Task.succeed "y"
+        Io.println "b"
+        prepare at
+        Task.succeed ()
+
+
+-- The same with a later bind inside the bind's lambda.
+laterBind : ( String -> Task Error (), Int ) -> (String -> Task Error ()) -> Task Error ()
+laterBind ( prepare, _ ) mutate =
+    do
+        at <- Task.succeed "z"
+        Io.println at
+        prepare at
+        r <- Task.succeed "r"
+        mutate r
+
+
+main : Task Error ()
+main =
+    do
+        n <- chain (Task.succeed 40)
+        Io.println ("r5b=" ++ String.fromInt n)
+        twice step
+        twiceDestructured ( step, 1 )
+        laterBind ( step, 2 ) step
+"#;
+
+/// The lines [`SOURCE_ADMITTED`] prints, in order.
+const SOURCE_ADMITTED_STDOUT: &str = "r5b=42\na\nx\nb\ny\nz\nz\nr\n";
+
+/// Write `source` as a one-file program and return its entry and output dir.
+#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+fn write_program(name: &str, source: &str) -> (PathBuf, PathBuf) {
+    let dir = crate::support::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the fixture scratch dir must be writable");
+    let entry = dir.join("Main.ipe");
+    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
+    (entry, dir.join("out"))
+}
+
+fn build_source(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
+    let (entry, out) = write_program(name, source);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    (ipe::build(&entry, &out, &runtime), out)
+}
+
+/// The one-byte span of the last `needle` in `source`: its leading capture.
+fn source_capture_span(source: &str, needle: &str) -> Span {
+    #[allow(clippy::expect_used)] // the needle is written into the source
+    let lo = source.rfind(needle).expect("needle is in the source");
+    #[allow(clippy::expect_used)] // the sources are far below 4 GiB
+    let lo = u32::try_from(lo).expect("offset fits u32");
+    Span {
+        lo,
+        hi: lo.saturating_add(1),
+    }
+}
+
+/// A source program is refused at ipe time by the once check, at the moved capture.
+fn assert_source_refused_at_capture(name: &str, source: &str, needle: &str) {
+    let (built, _) = build_source(name, source);
+    let want = source_capture_span(source, needle);
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::RebuiltClosureMovesCapture),
+                    } if *span == want
+                )
+        ),
+        "{name}: a recalled source lambda moving a capture must fail closed with IPE-L0126 \
+         at the capture ({want:?}), got {built:?}"
+    );
+}
+
+/// R5a: building the inner lambda moves `h` out of the `List.map` callback.
+#[test]
+fn source_lambda_building_a_capturing_lambda_is_refused_at_the_capture() {
+    assert_source_refused_at_capture("eta_once_source_r5a", R5A, "h x)");
+}
+
+/// R5b: building the once partial moves `t` out of the `List.map` callback.
+#[test]
+fn source_lambda_building_a_once_partial_is_refused_at_the_capture() {
+    assert_source_refused_at_capture("eta_once_source_r5b", R5B, "t) s)");
+}
+
+/// Once source lambdas at once positions pass ipe.
+#[test]
+fn admitted_once_source_lambdas_pass_ipe() {
+    let (built, _) = build_source("eta_once_source_admitted", SOURCE_ADMITTED);
+    assert!(
+        built.is_ok(),
+        "a once source lambda at a once position must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for the once source lambdas: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn admitted_once_source_lambdas_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("eta_once_source_admitted_e2e", SOURCE_ADMITTED);
+    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("eta_once_source_admitted", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the once source lambdas must build and exit 0 (no E0507/E0525); stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains(SOURCE_ADMITTED_STDOUT),
+        "must print every shape's lines in order; got: {:?}",
         outcome.stdout
     );
 }
