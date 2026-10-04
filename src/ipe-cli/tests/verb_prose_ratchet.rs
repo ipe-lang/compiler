@@ -147,7 +147,9 @@ fn argued(rest: &str) -> bool {
     token.is_empty()
         || token.starts_with(['-', '.', '/', '<', '[', '$', '"', '\''])
         || token.contains('/')
-        || token.ends_with(".ipe")
+        || Path::new(token)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ipe"))
 }
 
 /// Whether `rest` opens with a whole bare verb.
