@@ -5388,36 +5388,99 @@ fn dev_build_allows_debug() {
     );
 }
 
+/// Whether `result` is the `Ipe.Debug.*` release gate's IPE-L0140 refusal.
+fn is_debug_gate<T>(result: &Result<T, CliError>) -> bool {
+    matches!(result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140")
+}
+
+/// A fresh project dir under the temp root holding a manifest and `main`.
+///
+/// Returns the project dir and its `package.ipe` path.
+fn debug_project(label: &str, package: &str, main: &str) -> (PathBuf, String) {
+    let tmp = ipe_test_temp::temp_root().join(format!("ipec-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(tmp.join("src")).expect("create project dir");
+    fs::write(tmp.join("package.ipe"), package).expect("write package.ipe");
+    fs::write(tmp.join("src").join("Main.ipe"), main).expect("write Main.ipe");
+    let manifest = tmp.join("package.ipe").to_string_lossy().into_owned();
+    (tmp, manifest)
+}
+
+/// A minimal manifest naming the package `name`.
+fn named_package(name: &str) -> String {
+    format!("module Package exposing (package)\n\n\npackage =\n    {{ name = \"{name}\" }}\n")
+}
+
+/// `ipe dev build` admits `Debug.*` through the whole dispatch path.
+///
+/// The positive control for the release gates below: a site that dropped its
+/// verb's intent would fall back to the release default and refuse here.
+/// Gated on `IPE_E2E=1`: the dispatch path cargo-builds the emitted crate.
+#[test]
+fn dev_build_dispatch_admits_debug() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (tmp, package) = debug_project(
+        "dev-build-dispatch-debug",
+        &named_package("dev-build-debug"),
+        DEBUG_LOG_MAIN,
+    );
+    let out = tmp.join("out").to_string_lossy().into_owned();
+    let result = run_argv(&["dev", "build", &package, "--out", &out]);
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        result.is_ok(),
+        "`ipe dev build` admits Debug.log end to end: {result:?}"
+    );
+}
+
+/// A desktop `Web.tea` app whose `update` calls `Debug.log`.
+const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\npackage : Package\npackage =\n    { name = \"desktop-debug\"\n    , version = \"0.1.0\"\n    }\n";
+
+/// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
+const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
+
+/// Bundle the Debug-using desktop app under `profile`.
+fn bundle_debug_desktop(profile: BundleProfile, label: &str) -> Result<(), CliError> {
+    let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
+    let project = tmp.to_string_lossy().into_owned();
+    let result = bundle_delivery(BundleHost::Desktop, profile, Some(&project));
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
 /// A release desktop bundle refuses `Debug.*`.
 ///
 /// The bundle compiles under the release posture, so IPE-L0140 fires before
 /// any cargo build.
 #[test]
 fn release_desktop_bundle_gates_debug() {
-    let tmp = ipe_test_temp::temp_root()
-        .join(format!("ipec-release-desktop-debug-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(tmp.join("src")).expect("create project dir");
-    fs::write(
-        tmp.join("package.ipe"),
-        "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\npackage : Package\npackage =\n    { name = \"desktop-debug\"\n    , version = \"0.1.0\"\n    }\n",
-    )
-    .expect("write package.ipe");
-    fs::write(
-        tmp.join("src").join("Main.ipe"),
-        "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n",
-    )
-    .expect("write Main.ipe");
-    let project = tmp.to_string_lossy().into_owned();
-    let result = bundle_delivery(
-        BundleHost::Desktop,
+    let result = bundle_debug_desktop(
         Verb::RELEASE_BUILD.bundle_profile(),
-        Some(&project),
+        "release-desktop-debug",
     );
-    let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        is_debug_gate(&result),
         "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
+    );
+}
+
+/// A dev desktop bundle admits `Debug.*`: its compile and gates pass.
+///
+/// The positive control for [`release_desktop_bundle_gates_debug`]: a bundle
+/// that dropped its profile's intent would compile under the release default
+/// and refuse here. Gated on `IPE_E2E=1`: past the compile it cargo-builds,
+/// so only a compile or gate refusal fails it.
+#[test]
+fn dev_desktop_bundle_admits_debug() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let result = bundle_debug_desktop(Verb::DEV_BUILD.bundle_profile(), "dev-desktop-debug");
+    assert!(
+        !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
+        "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"
     );
 }
 
@@ -5466,15 +5529,22 @@ fn release_build_wasm_produces_artifact() {
 
 // ── `release run` and `release eject` ───────────────────────────────────────
 
-/// `release run` compiles under the release posture, so `Debug.*` is refused.
+/// `ipe release run` refuses `Debug.*` through the whole dispatch path.
 ///
-/// IPE-L0140 fires in the compile, before any cargo step.
+/// IPE-L0140 fires in the compile, before any cargo step or jail; the
+/// positive control is [`dev_build_dispatch_admits_debug`].
 #[test]
 fn release_run_gates_debug() {
-    assert_eq!(ReleasePurpose::Run.verb(), Verb::RELEASE_RUN);
-    let result = compile_debug_log_as(ReleasePurpose::Run.verb(), "release-run");
+    let (tmp, package) = debug_project(
+        "release-run-debug",
+        &named_package("release-run-debug"),
+        DEBUG_LOG_MAIN,
+    );
+    let out = tmp.join("out").to_string_lossy().into_owned();
+    let result = run_argv(&["release", "run", &package, "--out", &out]);
+    let _ = fs::remove_dir_all(&tmp);
     assert!(
-        matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        is_debug_gate(&result),
         "a release run refuses Debug.log with IPE-L0140: {result:?}"
     );
 }
