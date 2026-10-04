@@ -22,7 +22,7 @@
 //!    author gate scans ONLY author Rust, keeping the provenance boundary exact
 //!    by construction.
 //! 2. **Capability consistency** — the inferred capability set (the call-graph
-//!    union that backs `ipe capabilities`) must EQUAL the manifest's declared
+//!    union that backs `ipe release capabilities`) must EQUAL the manifest's declared
 //!    `[capabilities]`. A used-but-undeclared capability is a hidden effect; a
 //!    declared-but-unused one is an over-broad, misleading claim. Either rejects.
 //! 3. **Enforced semver** — `ipe diff` / [`crate::diff::check_semver_bump`]

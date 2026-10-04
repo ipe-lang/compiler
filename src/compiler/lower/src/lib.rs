@@ -25,7 +25,7 @@ mod lower;
 mod once_check;
 
 /// Whole-program capability inference: the exact security-capability set a
-/// lowered program exercises. Consumed by `ipe capabilities` (SP1) and, ahead,
+/// lowered program exercises. Consumed by `ipe release capabilities` and, ahead,
 /// by manifest generation (SP2) and sandbox configuration (SP4).
 pub use capabilities::program_capabilities;
 

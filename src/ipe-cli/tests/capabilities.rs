@@ -1,4 +1,4 @@
-//! `ipe capabilities` — the read-only capability report and the
+//! `ipe release capabilities` — the read-only capability report and the
 //! declared-set verification primitive.
 
 use std::collections::BTreeSet;
@@ -107,6 +107,7 @@ fn run_ipe(args: &[&str]) -> Result<(bool, String), Box<dyn Error>> {
 #[test]
 fn reports_network_for_an_http_program() -> TestResult {
     let (ok, stdout) = run_ipe(&[
+        "release",
         "capabilities",
         "--plain",
         &fixture("uses_http.ipe").to_string_lossy(),
@@ -119,6 +120,7 @@ fn reports_network_for_an_http_program() -> TestResult {
 #[test]
 fn reports_none_for_a_pure_program() -> TestResult {
     let (ok, stdout) = run_ipe(&[
+        "release",
         "capabilities",
         "--plain",
         &fixture("pure_string.ipe").to_string_lossy(),
@@ -137,8 +139,9 @@ fn reports_none_for_a_pure_program() -> TestResult {
 fn reports_unsafe_for_an_html_unsafe_script_program() -> TestResult {
     // Importing `Ipe.Html.Unsafe` (the inline-`<script>` / raw-HTML escape-hatch
     // home) discloses the `unsafe` capability — the import itself is the signal,
-    // so a raw HTML/script sink cannot hide from `ipe capabilities`.
+    // so a raw HTML/script sink cannot hide from `ipe release capabilities`.
     let (ok, stdout) = run_ipe(&[
+        "release",
         "capabilities",
         "--plain",
         &fixture("uses_html_unsafe_script.ipe").to_string_lossy(),
@@ -150,11 +153,33 @@ fn reports_unsafe_for_an_html_unsafe_script_program() -> TestResult {
 
 #[test]
 fn capabilities_help_page_lists_the_command() -> TestResult {
-    let (ok, stdout) = run_ipe(&["capabilities", "--help"])?;
+    let (ok, stdout) = run_ipe(&["release", "capabilities", "--help"])?;
     assert!(ok, "--help exits 0");
     assert!(
-        stdout.contains("capabilities"),
-        "help page names the command, got:\n{stdout}"
+        stdout.contains("ipe release capabilities"),
+        "help page names the grouped command, got:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// The bare name is no longer a command: it refuses, naming the grouped form.
+#[test]
+fn bare_capabilities_is_refused_towards_release() -> TestResult {
+    let entry = fixture("uses_http.ipe");
+    let entry = entry.to_string_lossy();
+    let out = Command::new(support::ipe_bin())
+        .args(["capabilities", "--plain", &*entry])
+        .env("NO_COLOR", "1")
+        .output()?;
+    assert!(
+        !out.status.success(),
+        "the bare `capabilities` name must fail"
+    );
+    assert!(out.stdout.is_empty(), "a refusal reports nothing on stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ipe release capabilities --plain"),
+        "the refusal must name the grouped form with the typed tail, got:\n{stderr}"
     );
     Ok(())
 }
@@ -224,7 +249,12 @@ main =
 #[test]
 fn acceptance_http_and_clock_example_infers_network_and_clock() -> TestResult {
     let example = fixture("uses_http_and_clock.ipe");
-    let (ok, stdout) = run_ipe(&["capabilities", "--plain", &example.to_string_lossy()])?;
+    let (ok, stdout) = run_ipe(&[
+        "release",
+        "capabilities",
+        "--plain",
+        &example.to_string_lossy(),
+    ])?;
     assert!(ok, "capabilities must exit 0 on the example");
     let reported: BTreeSet<&str> = stdout.split_whitespace().collect();
     assert_eq!(
@@ -335,7 +365,7 @@ fn a_web_app_mounts_into_a_server() -> TestResult {
 
 /// A program that mounts a `CustomElement.node` ships browser JS, so its inferred
 /// capability set must contain `custom-element`. Proven through the same
-/// `verify_capabilities` inference `ipe capabilities` reports, over a real
+/// `verify_capabilities` inference `ipe release capabilities` reports, over a real
 /// Web-shape widget app.
 #[test]
 fn a_widget_program_discloses_custom_element() -> TestResult {
@@ -532,7 +562,7 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
 /// up-tree) must disclose `custom-element` for a constructed-but-unmounted
 /// `customElement` handle. This is the seam the run-jail resolver consumes via
 /// [`ipe::run_sandbox::resolve_for_run`]; routing it through the
-/// served-widget-aware inference keeps it consistent with `ipe capabilities` /
+/// served-widget-aware inference keeps it consistent with `ipe release capabilities` /
 /// `package audit`. The `customElement "js/counter.js"` literal
 /// resolves against the lone entry's own directory, so the JS sits beside it.
 #[test]
@@ -564,7 +594,7 @@ fn a_manifest_less_single_file_handle_discloses_custom_element() -> TestResult {
 /// A Web-shape app that reaches a `Js.send` / `Js.subscribe` port exchanges raw
 /// typed values with page JavaScript, so its inferred capability set must contain
 /// `js-port`. A port program discloses the same way a widget program discloses
-/// `custom-element`: through the `verify_capabilities` inference `ipe
+/// `custom-element`: through the `verify_capabilities` inference `ipe release
 /// capabilities` reports.
 const JS_PORT_APP: &str = r#"module Main exposing (main)
 

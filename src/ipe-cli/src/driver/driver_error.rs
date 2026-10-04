@@ -951,9 +951,9 @@ impl std::fmt::Display for CliError {
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
-            // What was typed, then one hint per grouped form. A bare group
-            // states it needs a subcommand; its members stay discoverable
-            // through `ipe <group> --help`.
+            // What was typed, one hint per grouped form, then what each
+            // posture is for. A bare group states it needs a subcommand; its
+            // members stay discoverable through `ipe <group> --help`.
             Self::GroupRequired {
                 attempted,
                 forms,
@@ -974,6 +974,12 @@ impl std::fmt::Display for CliError {
                     writeln!(f)?;
                     f.write_str(&crate::style::gutter(&text::cli_group_required_form(
                         &shown,
+                    )))?;
+                }
+                for umbrella in crate::verb::Umbrella::ALL {
+                    writeln!(f)?;
+                    f.write_str(&crate::style::gutter(&text::cli_group_required_posture(
+                        &umbrella.posture(),
                     )))?;
                 }
                 Ok(())

@@ -112,6 +112,10 @@ const GROUPS: &[Group] = &[
                 verb: Verb::RELEASE_EJECT,
                 page: include_str!("../help/release-eject.md"),
             },
+            Member {
+                verb: Verb::RELEASE_CAPABILITIES,
+                page: include_str!("../help/release-capabilities.md"),
+            },
         ],
     },
 ];
@@ -376,12 +380,6 @@ const COMMANDS: &[Command] = &[
         hidden: false,
     },
     Command {
-        name: "capabilities",
-        run: crate::run_capabilities,
-        page: include_str!("../help/capabilities.md"),
-        hidden: false,
-    },
-    Command {
         name: "diff",
         run: crate::diff::run_diff,
         page: include_str!("../help/diff.md"),
@@ -613,12 +611,16 @@ pub fn group(name: &str, stream: &impl IsTerminal) -> Option<String> {
     find_group(name).map(|g| render_group(g, p))
 }
 
-/// Render a group's subpage from its [`Group`] entry: the summary, a synopsis
-/// line, and one aligned member line per verb.
+/// Render a group's subpage from its [`Group`] entry: the summary, what each
+/// posture is for, a synopsis line, and one aligned member line per verb.
 fn render_group(g: &Group, p: &Palette) -> String {
     let mut out = String::new();
     out.push('\n');
     let _ = writeln!(out, "{}{}{}", p.dim, g.summary(), p.reset);
+    out.push('\n');
+    for umbrella in Umbrella::ALL {
+        let _ = writeln!(out, "{}", umbrella.posture());
+    }
     out.push('\n');
     let _ = writeln!(out, "{}ipe {} <verb>{}", p.yellow, g.name(), p.reset);
     out.push('\n');
@@ -880,8 +882,16 @@ fn render_command(cmd: Entry, p: &Palette) -> String {
 mod tests {
     use super::*;
 
-    /// The bare build-producing names that live only in the refusal table.
-    const LEGACY: [&str; 6] = ["build", "run", "watch", "exec", "eject", "release"];
+    /// The bare names that live only in the refusal table.
+    const LEGACY: [&str; 7] = [
+        "build",
+        "run",
+        "watch",
+        "exec",
+        "eject",
+        "capabilities",
+        "release",
+    ];
 
     #[test]
     fn plain_top_level_names_every_command_and_section() {
@@ -1127,6 +1137,14 @@ mod tests {
         for g in GROUPS {
             let page = render_group(g, &Palette::PLAIN);
             assert!(page.contains(&format!("ipe {} <verb>", g.name())));
+            for umbrella in Umbrella::ALL {
+                assert!(
+                    page.contains(umbrella.posture()),
+                    "group {} subpage must state the {} posture",
+                    g.name(),
+                    umbrella.name()
+                );
+            }
             for m in g.members {
                 assert!(
                     page.contains(&format!("ipe {}", m.verb)),
@@ -1182,7 +1200,7 @@ mod tests {
         }
     }
 
-    /// A bare build-producing name has no help page, no handler, and no doc
+    /// A bare legacy name has no help page, no handler, and no doc
     /// key: the refusal table is its only representation.
     #[test]
     fn legacy_names_have_no_page_and_no_handler() {
@@ -1203,7 +1221,7 @@ mod tests {
     /// never renders a page.
     #[test]
     fn legacy_help_is_refusal() {
-        for name in ["build", "run", "watch", "exec", "eject"] {
+        for name in ["build", "run", "watch", "exec", "eject", "capabilities"] {
             let argv = [name.to_owned(), "--help".to_owned()];
             let result = crate::driver::run_cli(&argv);
             assert!(
@@ -1296,6 +1314,9 @@ mod tests {
         });
         assert_help_flags_are_accepted(Verb::RELEASE_EJECT.name(), |a| {
             crate::cli_args::parse_eject(a).map(|_| ())
+        });
+        assert_help_flags_are_accepted(Verb::RELEASE_CAPABILITIES.name(), |a| {
+            crate::cli_args::split_format(a, Verb::RELEASE_CAPABILITIES.name()).map(|_| ())
         });
         assert_help_flags_are_accepted("fix", |a| crate::cli_args::parse_fix(a).map(|_| ()));
         assert_help_flags_are_accepted("type-check", |a| {

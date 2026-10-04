@@ -1178,17 +1178,20 @@ Deliberate omissions, not gaps to close.
 
 ```bash
 ipe init [name]                    # new project
-# The dev inner loop lives under `ipe dev {build,run,watch}` (dev posture:
-# Debug.* on, unsigned, hot-reload). `ipe release build|run|eject` is the
-# distinct shipping posture (optimised, Debug.* rejected, native code jailed)
-# — there is no `watch` under release, so hot-reloading a shipping build is
-# not expressible. A `build` / `run` with no group in front is refused: the
-# group names the posture.
+# `ipe dev` is for fast iteration on code you trust: it does not promise a capability check, a consent prompt, or a jail.
+# `ipe release` is for production and for running external packages: it infers capabilities, asks your consent, gates Debug.*, and runs jailed.
+# The dev inner loop lives under `ipe dev {build,run,watch}` (Debug.* on,
+# unsigned, hot-reload). `ipe release build|run|eject|capabilities` is the
+# shipping posture (optimised, Debug.* rejected) — there is no `watch` under
+# release, so hot-reloading a shipping build is not expressible. A `build` /
+# `run` with no group in front is refused: the group names the posture. Run
+# external packages only through `ipe release`.
 ipe dev build src/Main.ipe         # compile → out/app
 ipe dev build src/Main.ipe --target wasm   # browser-WASM project (cdylib + www/ shell)
 ipe dev run src/Main.ipe           # build + run
 ipe release build src/Main.ipe     # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
+ipe release capabilities src/Main.ipe  # the inferred capability set
 ipe dev build|run … --static       # fully-static musl single binary (dlmalloc
                                    #  default; --target <triple> --allocator
                                    #  <auto|system|dlmalloc|talc|mimalloc>)

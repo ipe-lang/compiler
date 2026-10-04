@@ -110,7 +110,7 @@ fn version_json_carries_the_version_field() {
 
 #[test]
 fn capabilities_default_is_human_labelled() {
-    let r = run(&["capabilities", &sample_entry()]);
+    let r = run(&["release", "capabilities", &sample_entry()]);
     assert!(r.ok, "stderr: {}", r.stderr);
     // Human form is a guttered, labelled report, not the bare list.
     assert!(
@@ -128,7 +128,7 @@ fn capabilities_default_is_human_labelled() {
 
 #[test]
 fn capabilities_plain_is_the_bare_scriptable_list() {
-    let r = run(&["capabilities", "--plain", &sample_entry()]);
+    let r = run(&["release", "capabilities", "--plain", &sample_entry()]);
     assert!(r.ok, "stderr: {}", r.stderr);
     // The historical scriptable output: bare names, one per line, flush-left.
     // This is the migration guarantee — pipelines adopt `--plain` unchanged.
@@ -137,33 +137,31 @@ fn capabilities_plain_is_the_bare_scriptable_list() {
 
 #[test]
 fn capabilities_json_is_a_stable_object() {
-    let r = run(&["capabilities", "--json", &sample_entry()]);
+    let r = run(&["release", "capabilities", "--json", &sample_entry()]);
     assert!(r.ok, "stderr: {}", r.stderr);
     assert_eq!(
         r.stdout.trim(),
         "{\"schema\":\"ipe.cli.capabilities/1\",\"status\":\"ok\",\
-         \"command\":\"capabilities\",\"payload\":{\"capabilities\":[\"network\",\"clock\"]}}"
+         \"command\":\"release capabilities\",\"payload\":{\"capabilities\":[\"network\",\"clock\"]}}"
     );
 }
 
-/// Regression: `ipe capabilities` with no positional, run inside a project
-/// directory (a `package.ipe` present), must resolve the project's entry `.ipe`
-/// rather than trying to read the directory itself. The prior bug surfaced as a
-/// raw `io error at .: Is a directory` because the bare `.` default was passed
-/// straight to the source reader instead of through the same directory→entry
-/// resolution `ipe type-check` uses.
+/// `ipe release capabilities` with no positional, run inside a project
+/// directory (a `package.ipe` present), resolves the project's entry `.ipe`
+/// through the same directory→entry resolution `ipe type-check` uses, never
+/// by reading the directory itself as a source file.
 #[test]
 fn capabilities_in_a_project_dir_resolves_the_entry() {
     // A known-valid example project (a `package.ipe` + `src/Main.ipe`). Run
-    // `capabilities` with NO positional and the project dir as the working
-    // directory, exactly as the bug report did.
+    // `release capabilities` with NO positional and the project dir as the
+    // working directory.
     let proj = support::manifest_dir().join("../../examples/shapes/non-tea/hello-world");
     assert!(
         proj.join("package.ipe").is_file(),
         "the hello-world example must exist"
     );
     let r = match Command::new(support::ipe_bin())
-        .arg("capabilities")
+        .args(["release", "capabilities"])
         .current_dir(&proj)
         .env("NO_COLOR", "1")
         .output()
@@ -338,7 +336,7 @@ fn doc_lookup_command_renders() {
 fn plain_and_json_together_is_a_usage_error_showing_help() {
     for cmd in [
         vec!["version", "--plain", "--json"],
-        vec!["capabilities", "--plain", "--json"],
+        vec!["release", "capabilities", "--plain", "--json"],
         vec!["doc", "IPE-L0131", "--plain", "--json"],
     ] {
         let r = run(&cmd);
@@ -702,8 +700,9 @@ fn upgrade_no_prebuilt_renders_message_without_help() {
 /// and show that command's `--help` page — never swallow the flag and exit 0.
 #[test]
 fn unknown_flag_shows_help_and_exits_nonzero() {
-    for name in ["capabilities", "diff", "doc"] {
-        let r = run(&[name, "--nope"]);
+    for name in ["release capabilities", "diff", "doc"] {
+        let args: Vec<&str> = name.split(' ').chain(["--nope"]).collect();
+        let r = run(&args);
         assert!(
             !r.ok,
             "`ipe {name} --nope` must exit non-zero, not swallow the flag"

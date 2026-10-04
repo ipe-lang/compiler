@@ -746,9 +746,6 @@ pub fn emit_permissions(
     Ok(())
 }
 
-/// `ipe capabilities <entry.ipe>` — print the program's inferred security
-/// capabilities, one per line in sorted order, or `none` when the program is
-/// pure. Read-only analysis: nothing is emitted or written.
 /// `ipe package <subcommand>` — package-authoring commands: `audit` (the SP4
 /// Tier-1 package gate), `publish` (run the gate, compute the index entry, and
 /// open the index PR), `validate-entry` (schema-check an entry file), and
@@ -1822,15 +1819,22 @@ pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
     run_project_tests_with(path, TestStdio::Quiet).map(|_| ())
 }
 
+/// `ipe release capabilities [<path>]` — report the program's inferred
+/// security capabilities in sorted order. Read-only analysis: nothing is
+/// emitted or written.
+///
+/// # Errors
+/// [`CliError::CommandUsage`] on an unknown flag; the type-check and source
+/// errors of the analysed program otherwise.
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
-    let (format, positional) = cli_args::split_format(rest, "capabilities")?;
+    let (format, positional) = cli_args::split_format(rest, Verb::RELEASE_CAPABILITIES.name())?;
     let arg = match positional.first() {
         Some(e) => PathBuf::from(e),
         None => PathBuf::from(default_entry()?),
     };
     // Route a directory / project-root `.` to its entry `.ipe` file, the same
     // argument convention `ipe type-check` uses. Without this a bare
-    // `ipe capabilities` in a project dir passes `.` straight to the reader and
+    // `ipe release capabilities` in a project dir passes `.` straight to the reader and
     // fails with a raw "Is a directory" io error. A file argument is never
     // substituted — only widened to `tests ∪ src` when it names a test file.
     let target = resolve_analysis_target(&arg)?;
@@ -1887,7 +1891,7 @@ pub fn render_capabilities(
                 cli_args::json::object(&[("capabilities", cli_args::json::string_array(names))]);
             crate::machine_output::MachineOutput::ok(
                 "ipe.cli.capabilities/1",
-                "capabilities",
+                Verb::RELEASE_CAPABILITIES.name(),
                 payload,
             )
             .render_json()

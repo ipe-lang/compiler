@@ -400,7 +400,7 @@ fn emit_ir_prints_a_tree_for_the_golden() {
 
 /// A program importing a compiled-source stdlib module that defines its own
 /// types (`Ipe.Test`) must resolve its qualified members through the CLI
-/// analysis path (`ipe dev build --emit-ir` / `ipe capabilities`), exactly as it
+/// analysis path (`ipe dev build --emit-ir` / `ipe release capabilities`), exactly as it
 /// does through a real `ipe dev build`. Both share the injection-aware
 /// source-graph pipeline: the analysis path once ran a bare single-module
 /// lower that never injected the closure, so `Test.runMain` / `Test.equal`
@@ -435,7 +435,7 @@ fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
         "`Test.runMain` must resolve to the injected member:\n{tree}"
     );
 
-    // The same source-graph pipeline backs `ipe capabilities` via
+    // The same source-graph pipeline backs `ipe release capabilities` via
     // `lower_entry_via_graph`; it must resolve identically (a pure test
     // program).
     assert!(
@@ -3311,7 +3311,7 @@ fn nested_test_file_importing_a_test_sibling_type_checks_green() {
     );
 }
 
-/// `ipe dev build --emit-ir` and `ipe capabilities` analyse a NAMED non-default
+/// `ipe dev build --emit-ir` and `ipe release capabilities` analyse a NAMED non-default
 /// `src/` file, blamed on it, never the project's default entry.
 #[test]
 fn emit_ir_and_capabilities_over_a_non_default_src_file_analyse_it_not_main() {
@@ -3333,7 +3333,7 @@ fn emit_ir_and_capabilities_over_a_non_default_src_file_analyse_it_not_main() {
     );
     assert!(
         matches!(&caps_result, Err(CliError::Pipeline { file, .. }) if file == blamed.as_path()),
-        "`ipe capabilities` over the NAMED file must analyse it, blamed on it: {caps_result:?}"
+        "`ipe release capabilities` over the NAMED file must analyse it, blamed on it: {caps_result:?}"
     );
 }
 
@@ -5199,6 +5199,40 @@ fn assert_group_required(args: &[&str], attempted: &str, forms: &[Verb], tail: &
         forms.len(),
         "one hint line per grouped form: {screen}"
     );
+    assert_states_both_postures(&screen, args);
+}
+
+/// A bare-verb refusal says what each posture is for, in the catalog's words.
+fn assert_states_both_postures(screen: &str, args: &[&str]) {
+    for posture in [crate::text::posture_dev(), crate::text::posture_release()] {
+        assert!(
+            screen.contains(posture),
+            "`ipe {}` must state the posture {posture:?}: {screen}",
+            args.join(" ")
+        );
+    }
+}
+
+/// Every bare legacy verb and every bare group refuses with both posture lines.
+///
+/// Walks the refusal table itself, so a new bare name cannot skip them.
+#[test]
+fn every_bare_refusal_states_both_postures() {
+    let bare = super::commands::GROUP_REQUIRED
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["release", "dev"]);
+    for name in bare {
+        let result = run_argv(&[name]);
+        assert!(
+            matches!(&result, Err(CliError::GroupRequired { .. })),
+            "bare `ipe {name}` must be a group-required refusal: {result:?}"
+        );
+        let Err(err) = result else {
+            return;
+        };
+        assert_states_both_postures(&err.to_string(), &[name]);
+    }
 }
 
 #[test]
@@ -5233,6 +5267,22 @@ fn bare_exec_refuses() {
 }
 
 #[test]
+fn bare_capabilities_refuses() {
+    assert_group_required(
+        &["capabilities"],
+        "capabilities",
+        &[Verb::RELEASE_CAPABILITIES],
+        "",
+    );
+    assert_group_required(
+        &["capabilities", "src/Main.ipe", "--json"],
+        "capabilities",
+        &[Verb::RELEASE_CAPABILITIES],
+        "src/Main.ipe --json",
+    );
+}
+
+#[test]
 fn bare_eject_refuses() {
     assert_group_required(
         &["eject", "--out", "x"],
@@ -5242,7 +5292,7 @@ fn bare_eject_refuses() {
     );
 }
 
-/// A bare `ipe release` lists its three members and fails.
+/// A bare `ipe release` lists its four members and fails.
 ///
 /// `--help` on the group is a help request, never this refusal.
 #[test]
@@ -5250,7 +5300,12 @@ fn bare_release_refuses_nonzero() {
     assert_group_required(
         &["release"],
         "release",
-        &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+        &[
+            Verb::RELEASE_BUILD,
+            Verb::RELEASE_RUN,
+            Verb::RELEASE_EJECT,
+            Verb::RELEASE_CAPABILITIES,
+        ],
         "",
     );
     assert!(intercept_help(&["release".to_owned()]).is_none());
@@ -5302,7 +5357,7 @@ fn release_build_capabilities_flag_is_unknown() {
             return;
         };
         assert!(
-            !err.to_string().contains("ipe capabilities"),
+            !err.to_string().contains("capabilities`"),
             "the refusal must not redirect to another command: {err}"
         );
     }

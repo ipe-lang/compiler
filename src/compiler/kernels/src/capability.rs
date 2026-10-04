@@ -730,7 +730,7 @@ impl Capability {
         matches!(self, Self::Clock | Self::Random | Self::Unsafe)
     }
 
-    /// The stable lowercase wire name, used in the `ipe capabilities` report and
+    /// The stable lowercase wire name, used in the `ipe release capabilities` report and
     /// the generated manifest.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

@@ -103,6 +103,9 @@ fn render_sections(
 fn render_group(out: &mut String, group: &GroupSpec) {
     let _ = writeln!(out, "### `ipe {}`\n", group.name);
     let _ = writeln!(out, "{}\n", group.summary);
+    for umbrella in crate::verb::Umbrella::ALL {
+        let _ = writeln!(out, "{}\n", umbrella.posture());
+    }
     out.push_str(crate::text::verbs_label());
     out.push_str("\n\n");
     for &verb in &group.members {

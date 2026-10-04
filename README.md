@@ -128,12 +128,20 @@ served counter with the released binary, once the runtime's dependencies are com
 - **Comprehensive stdlib** — web (SSR + SSE), typed HTTP and SQL, auth, email, cache, pub/sub, WebSockets — all behind one `Task Error a` boundary with a typed `Error`.
 - **Compiles to readable Rust**, incrementally (salsa); `ipe dev watch` hot-swaps most edits and recompiles only on a type change.
 - **No authored abrupt failure** — the compiler and runtime carry no `panic!` / `unwrap` / `expect` / index panic; every failure is a typed `Result` or diagnostic.
-- **Capabilities are inferred, not declared** — `ipe capabilities <entry>` reports exactly what a program may do (network, fs, env, ffi, …). → [capabilities](docs/reference/capabilities.md)
 - **Accessible by default** — real `<button>`s, semantic landmarks, a contrast-safe focus ring, and reduced-motion honored out of the box.
 - **Rust FFI** — `ipe rust add <crate>` binds a crate as a generated `Rust.<Crate>` interface (sandbox-inspected; discloses the `native-ffi` capability). → [dependencies](docs/guide/getting-started.md)
 - **Delivery grammar** — `ipe dev build web desktop|ios|android` for a fast dev bundle, `ipe release build web desktop|ios|android` for a production distributable (desktop-webview or mobile system-webview shell).
 - **Eject to plain Rust** — `ipe release eject` vendors and tree-shakes the runtime into a standalone Cargo project you build with no `ipe` toolchain.
 - **Static binary** — `ipe dev build --static` produces a fully-static musl single binary — copy and run anywhere.
+
+## Capabilities
+
+Capabilities are inferred, not declared: `ipe release capabilities <entry>` reports exactly what a program may do (network, fs, env, ffi, …).
+
+- `ipe dev` is for fast iteration on code you trust: it does not promise a capability check, a consent prompt, or a jail.
+- `ipe release` is for production and for running external packages: it infers capabilities, asks your consent, gates Debug.*, and runs jailed.
+
+Run external packages only through `ipe release`. → [capabilities](docs/reference/capabilities.md)
 
 ## Tooling
 

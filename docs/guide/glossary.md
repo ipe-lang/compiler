@@ -10,7 +10,7 @@ Entries are alphabetical.
 
 What a program is permitted to do — read the filesystem, open a network
 connection, access a secret. Ipê infers a program's capabilities from the code
-it actually uses; nothing is declared. Run `ipe capabilities --help` for the
+it actually uses; nothing is declared. Run `ipe release capabilities --help` for the
 full model.
 
 ## Cmd

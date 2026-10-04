@@ -65,13 +65,14 @@ pub const INVOCATIONS: &[Invocation] = &[
         args: |_root| Some(vec!["doc".to_owned(), "IPE-L0131".to_owned()]),
     },
     Invocation {
-        golden: "capabilities_http",
+        golden: "release_capabilities_http",
         // Inference over a committed fixture; `--plain` is flush-left and carries
         // no version banner. Skipped on a sparse checkout lacking the fixture.
         args: |root| {
             let fixture = root.join("src/ipe-cli/tests/fixtures/capabilities/uses_http.ipe");
             fixture.is_file().then(|| {
                 vec![
+                    "release".to_owned(),
                     "capabilities".to_owned(),
                     fixture.to_string_lossy().into_owned(),
                     "--plain".to_owned(),
@@ -98,11 +99,12 @@ pub enum Hermetic {
 #[must_use]
 pub fn classify(name: &str) -> Hermetic {
     match name {
-        // Deterministic, self-contained command bodies. `version`,
-        // `capabilities`, and `doc` are each driven by an [`INVOCATIONS`] entry;
-        // `diff` needs two package trees and is body-driven in diff_cli.rs, but is
-        // `Snapshot` here so its `--help` page acquires a golden like the rest.
-        "version" | "capabilities" | "doc" | "diff" => Hermetic::Snapshot,
+        // Deterministic, self-contained command bodies. `version` and `doc`
+        // are each driven by an [`INVOCATIONS`] entry, as is the grouped
+        // `release capabilities`; `diff` needs two package trees and is
+        // body-driven in diff_cli.rs, but is `Snapshot` here so its `--help`
+        // page acquires a golden like the rest.
+        "version" | "doc" | "diff" => Hermetic::Snapshot,
 
         // Cargo / build / run / execute — heavy, environment-dependent output.
         "test" | "verify" => {

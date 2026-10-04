@@ -92,6 +92,14 @@ Hello, Ada and Linus and Grace!
 
 To build the executable without running it, use `ipe dev build`.
 
+Every build, run, and watch command lives under one of two postures:
+
+- `ipe dev` is for fast iteration on code you trust: it does not promise a capability check, a consent prompt, or a jail.
+- `ipe release` is for production and for running external packages: it infers capabilities, asks your consent, gates Debug.*, and runs jailed.
+
+Run a package someone else wrote only through `ipe release`; the
+[capabilities](../reference/capabilities.md) reference lists what it can grant.
+
 ## Change it
 
 Try editing the list — add a name, or remove one — and run again:

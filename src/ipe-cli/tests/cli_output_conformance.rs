@@ -108,7 +108,7 @@ const MACHINE_CONFORMANCE: &[MachineConformance] = &[
         success: MachineSuccess::Drive(|| Some(vec![])),
     },
     MachineConformance {
-        command: "capabilities",
+        command: "release capabilities",
         success: MachineSuccess::Drive(|| {
             Some(vec![capabilities_entry().to_string_lossy().into_owned()])
         }),
@@ -361,7 +361,8 @@ fn machine_success_quadrants_route_through_the_ssot() {
         };
 
         for format in ["--plain", "--json"] {
-            let mut args: Vec<&str> = vec![cmd];
+            // A grouped verb's name (`release capabilities`) is its argv words.
+            let mut args: Vec<&str> = cmd.split(' ').collect();
             for a in &extra {
                 args.push(a);
             }
@@ -415,7 +416,7 @@ fn machine_success_json_carries_the_envelope_schema_per_command() {
             continue; // sparse checkout without the fixture — skip, never a false red
         };
 
-        let mut args: Vec<&str> = vec![cmd];
+        let mut args: Vec<&str> = cmd.split(' ').collect();
         for a in &extra {
             args.push(a);
         }

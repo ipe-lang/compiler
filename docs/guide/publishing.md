@@ -140,8 +140,8 @@ hidden effect, and a declared-but-unused one is a misleading claim. Both reject.
 See exactly what your package exercises:
 
 ```sh
-ipe capabilities            # the inferred set, human-readable
-ipe capabilities --json     # the same set as a JSON envelope
+ipe release capabilities          # the inferred set, human-readable
+ipe release capabilities --json   # the same set as a JSON envelope
 ```
 
 Declare that set in `package.ipe` so a consumer sees, up front, precisely what
@@ -250,7 +250,7 @@ ipe dev build
   overwrites it.
 - **The audit rejects.** The reject header names the failing check — map it to
   the list [above](#audit-before-you-publish): a capability mismatch means your
-  `[capabilities]` and `ipe capabilities` disagree; an enforced-semver reject
+  `[capabilities]` and `ipe release capabilities` disagree; an enforced-semver reject
   means the version does not clear the bump `ipe diff` requires; a supply-chain
   reject comes from `cargo-deny` or a dependency hash mismatch.
 - **`publish` refuses on a dirty tree or unpushed `HEAD`.** Commit and push your

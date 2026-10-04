@@ -27,7 +27,6 @@
 - lsp
 - clean
 - health
-- capabilities
 - diff
 - fix
 - upgrade

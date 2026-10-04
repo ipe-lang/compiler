@@ -65,6 +65,15 @@ pub fn render_capabilities_docs(caps: &[Capability]) -> String {
          The axes are declared once in the compiler's closed `Capability` enum \
          and cannot be extended without a source change.\n\n",
     );
+    // The two postures, in the CLI message catalog's words (`posture-dev`,
+    // `posture-release` in `src/ipe-cli/text/messages.md`); the verb prose
+    // ratchet asserts the generated page carries them verbatim.
+    out.push_str(
+        "`ipe dev` is for fast iteration on code you trust: it does not promise a capability check, a consent prompt, or a jail.\n\n\
+         `ipe release` is for production and for running external packages: it infers capabilities, asks your consent, gates Debug.*, and runs jailed.\n\n\
+         Run external packages only through `ipe release`; \
+         `ipe release capabilities <entry>` reports a program's inferred set.\n\n",
+    );
 
     // Collect the unique boundary classes in ALL order (first occurrence wins).
     let classes = collect_classes(caps);

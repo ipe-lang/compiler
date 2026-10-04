@@ -2,12 +2,13 @@
 //! Refuses every tracked mention of a verb form the CLI no longer accepts.
 //!
 //! The build, run, and watch verbs live under `dev`, and the shipping verbs
-//! under `release`; the bare forms are refused at parse time. A doc, script,
-//! template, or comment that still spells a bare form teaches a command that
-//! fails, so this scan walks the tracked tree (`git ls-files`, minus the
-//! trees that carry a reader-facing spelling) and fails on each line that
-//! names the `ipe` binary followed by a bare `build`, `run`, `exec`, `watch`,
-//! or `eject`, or by `release` and anything but one of its verbs.
+//! and the capability report under `release`; the bare forms are refused at
+//! parse time. A doc, script, template, or comment that still spells a bare
+//! form teaches a command that fails, so this scan walks the tracked tree
+//! (`git ls-files`, minus the trees that carry a reader-facing spelling) and
+//! fails on each line that names the `ipe` binary followed by a bare `build`,
+//! `run`, `exec`, `watch`, `eject`, or `capabilities`, or by `release` and
+//! anything but one of its verbs.
 //!
 //! The scan reads only the trees it lists. A tracked tree it neither lists nor
 //! sets aside is refused, so a new tree cannot slip past unscanned; the files
@@ -88,10 +89,10 @@ fn scope_of(rel: &str) -> Scope {
 }
 
 /// Verbs refused when they follow `ipe` directly.
-const BARE_VERBS: &[&str] = &["build", "run", "exec", "watch", "eject"];
+const BARE_VERBS: &[&str] = &["build", "run", "exec", "watch", "eject", "capabilities"];
 
 /// The words that may follow `ipe release`.
-const RELEASE_MEMBERS: &[&str] = &["build", "run", "eject", "--help"];
+const RELEASE_MEMBERS: &[&str] = &["build", "run", "eject", "capabilities", "--help"];
 
 /// Ceiling on the number of tracked files the scan reads.
 const MAX_FILES: usize = 20_000;
@@ -390,8 +391,43 @@ fn a_bare_verb_in_prose_is_reported() {
         "`ipe` build --target wasm",
         "`ipe` exec",
         "$IPE release  src/Main.ipe",
+        "ipe capabilities src/Main.ipe",
+        "ipe capabilities",
+        "`ipe capabilities --json`",
+        "$IPE capabilities --plain",
+        "`ipe` capabilities --plain",
     ] {
         assert!(refused(line), "{line:?} must be reported");
+    }
+}
+
+/// The sources that explain the two postures to a reader.
+const POSTURE_SURFACES: &[&str] = &[
+    "README.md",
+    "docs/guide/getting-started.md",
+    "docs/reference/capabilities.md",
+    "src/ipe-docs/src/bin/gen_capabilities_docs.rs",
+    "src/ipe-cli/templates/AGENTS.md.in",
+];
+
+/// Every posture surface carries both catalog sentences verbatim.
+///
+/// The CLI's bare-verb refusals and group help pages print the catalog's
+/// `posture-dev` / `posture-release` lines; a doc that paraphrases them, or
+/// drops one, teaches a posture the CLI does not state.
+#[test]
+fn every_posture_surface_states_the_catalog_pair() {
+    let root = workspace();
+    for rel in POSTURE_SURFACES {
+        let text = text_of(&root.join(rel)).unwrap_or_default();
+        for umbrella in ipe::verb::Umbrella::ALL {
+            assert!(
+                text.contains(umbrella.posture()),
+                "{rel} must state the {} posture verbatim: {:?}",
+                umbrella.name(),
+                umbrella.posture()
+            );
+        }
     }
 }
 
@@ -403,6 +439,9 @@ fn a_grouped_verb_is_not_reported() {
         "ipe release build src/Main.ipe",
         "ipe release run dist/app",
         "ipe release eject out/",
+        "ipe release capabilities src/Main.ipe",
+        "`ipe release capabilities --json`",
+        "$IPE release capabilities --plain",
         "ipe release --help",
         "recipe builds",
         "pipe run",
@@ -422,6 +461,7 @@ fn a_grouped_verb_is_not_reported() {
         "One `ipe` run of the parity serializer",
         "the `ipe` build-tools compile once",
         "one `ipe` build: the producer",
+        "the `ipe` capabilities model",
     ] {
         assert!(!refused(line), "{line:?} must not be reported");
     }

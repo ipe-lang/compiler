@@ -1,7 +1,7 @@
-//! The typed identity of every build-producing CLI verb.
+//! The typed identity of every grouped CLI verb.
 //!
 //! A verb lives under exactly one umbrella group (`dev` or `release`), and the
-//! umbrella alone fixes its build posture: [`Umbrella::Dev`] builds with
+//! umbrella alone fixes its posture: [`Umbrella::Dev`] builds with
 //! [`BuildIntent::Development`] and [`BundleProfile::Dev`], [`Umbrella::Release`]
 //! with [`BuildIntent::Release`] and [`BundleProfile::Release`]. A verb's
 //! [`fmt::Display`] (`dev build`) is the one spelling of its name for help
@@ -15,12 +15,12 @@ use ipe_backend_rust::BuildIntent;
 use crate::driver::BundleProfile;
 use crate::text;
 
-/// The umbrella group a build-producing verb lives under.
+/// The umbrella group a verb lives under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Umbrella {
     /// `ipe dev …` — the development inner loop.
     Dev,
-    /// `ipe release build|run|eject` — the production artifact.
+    /// `ipe release …` — the production artifact and its capability report.
     Release,
 }
 
@@ -34,6 +34,19 @@ impl Umbrella {
         match self {
             Self::Dev => "dev",
             Self::Release => "release",
+        }
+    }
+
+    /// What this umbrella's posture is for, in the catalog's one sentence.
+    ///
+    /// Every surface that explains the two postures (a bare-verb refusal, a
+    /// group help page, the CLI reference) shows these lines, in [`Self::ALL`]
+    /// order.
+    #[must_use]
+    pub const fn posture(self) -> &'static str {
+        match self {
+            Self::Dev => text::posture_dev(),
+            Self::Release => text::posture_release(),
         }
     }
 
@@ -82,9 +95,11 @@ pub enum ReleaseVerb {
     Run,
     /// `ipe release eject`.
     Eject,
+    /// `ipe release capabilities`.
+    Capabilities,
 }
 
-/// A build-producing verb: an umbrella group plus the verb under it.
+/// A grouped verb: an umbrella group plus the verb under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Verb {
     /// A `dev` verb.
@@ -106,15 +121,18 @@ impl Verb {
     pub const RELEASE_RUN: Self = Self::Release(ReleaseVerb::Run);
     /// `ipe release eject`.
     pub const RELEASE_EJECT: Self = Self::Release(ReleaseVerb::Eject);
+    /// `ipe release capabilities`.
+    pub const RELEASE_CAPABILITIES: Self = Self::Release(ReleaseVerb::Capabilities);
 
     /// Every verb, grouped by umbrella in help order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DEV_BUILD,
         Self::DEV_RUN,
         Self::DEV_WATCH,
         Self::RELEASE_BUILD,
         Self::RELEASE_RUN,
         Self::RELEASE_EJECT,
+        Self::RELEASE_CAPABILITIES,
     ];
 
     /// The umbrella this verb lives under.
@@ -146,6 +164,7 @@ impl Verb {
             Self::Dev(DevVerb::Run) | Self::Release(ReleaseVerb::Run) => "run",
             Self::Dev(DevVerb::Watch) => "watch",
             Self::Release(ReleaseVerb::Eject) => "eject",
+            Self::Release(ReleaseVerb::Capabilities) => "capabilities",
         }
     }
 
@@ -165,6 +184,7 @@ impl Verb {
             Self::Release(ReleaseVerb::Build) => "release build",
             Self::Release(ReleaseVerb::Run) => "release run",
             Self::Release(ReleaseVerb::Eject) => "release eject",
+            Self::Release(ReleaseVerb::Capabilities) => "release capabilities",
         }
     }
 
@@ -178,6 +198,7 @@ impl Verb {
             Self::Release(ReleaseVerb::Build) => "release-build",
             Self::Release(ReleaseVerb::Run) => "release-run",
             Self::Release(ReleaseVerb::Eject) => "release-eject",
+            Self::Release(ReleaseVerb::Capabilities) => "release-capabilities",
         }
     }
 
@@ -212,7 +233,7 @@ impl fmt::Display for Verb {
 pub enum CommandName {
     /// A top-level command (`fmt`, `doc`, …).
     Command(&'static str),
-    /// A grouped build-producing verb.
+    /// A grouped verb.
     Verb(Verb),
 }
 
@@ -326,6 +347,8 @@ mod tests {
         }
         assert_eq!(Verb::member(Umbrella::Dev, "eject"), None);
         assert_eq!(Verb::member(Umbrella::Release, "watch"), None);
+        assert_eq!(Verb::member(Umbrella::Dev, "capabilities"), None);
+        assert_eq!(Verb::from_name("capabilities"), None);
         assert_eq!(Verb::from_name("build"), None);
     }
 }

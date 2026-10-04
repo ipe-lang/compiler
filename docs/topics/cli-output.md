@@ -12,7 +12,7 @@ terminal. Piped or redirected output, or any run with `NO_COLOR` set, is clean
 plain text with no escape codes.
 
 ```
-$ ipe capabilities examples/shapes/script/release-preflight/src/Main.ipe
+$ ipe release capabilities examples/shapes/script/release-preflight/src/Main.ipe
   This program exercises 2 security capabilities:
     • network
     • clock
@@ -41,7 +41,7 @@ and `ipe upgrade` render this shape; other commands adopt it incrementally.
 
 ## `--plain` and `--json`
 
-The data-producing commands — `capabilities`, `diff`, `version`, and `doc`
+The data-producing commands — `release capabilities`, `diff`, `version`, and `doc`
 (`list` and single-module lookups) — accept two mutually-exclusive machine forms:
 
 - **`--plain`** — unstyled, **flush-left**, one record per line, so `grep`,
@@ -52,26 +52,23 @@ Passing both `--plain` and `--json` together is a usage error. The other
 commands (`run`, `build`, `init`, `watch`, `fix`, `fmt`) and `--help` do not take
 these flags — they are not data producers.
 
-### `capabilities`
+### `release capabilities`
 
 ```
-$ ipe capabilities --plain <entry>
+$ ipe release capabilities --plain <entry>
 network
 clock
 
-$ ipe capabilities --json <entry>
-{"schema":"ipe.cli.capabilities/1","status":"ok","command":"capabilities","payload":{"capabilities":["network","clock"]}}
+$ ipe release capabilities --json <entry>
+{"schema":"ipe.cli.capabilities/1","status":"ok","command":"release capabilities","payload":{"capabilities":["network","clock"]}}
 ```
 
 `--plain` is the bare capability names, one per line — a pure program prints
 nothing, so `| wc -l` counts them. `--json` is the shared `{schema, status,
 command, payload}` machine envelope; the sorted name array (empty for a pure
 program) rides under `payload.capabilities`, so `jq '.payload.capabilities'`
-reads it.
-
-> **Migration.** `--plain` is byte-for-byte the old default `ipe capabilities`
-> output. A script that parsed the bare list adopts `--plain` with no other
-> change; the unflagged command is now the human report.
+reads it. The unflagged command is the human report; a script parses
+`--plain` or `--json`.
 
 ### `version`
 

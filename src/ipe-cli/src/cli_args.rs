@@ -2196,9 +2196,9 @@ mod tests {
     fn split_format_rejects_unknown_leading_dash_flag() {
         // A `-`-leading token that is not a format flag is an unknown flag, never
         // swallowed into the positional list.
-        let err = split_format(&s(&["--nope"]), "capabilities").expect_err("must reject");
+        let err = split_format(&s(&["--nope"]), "release capabilities").expect_err("must reject");
         assert!(
-            matches!(err, CliError::Usage(m) if m == "ipe capabilities: unknown flag `--nope`")
+            matches!(err, CliError::Usage(m) if m == "ipe release capabilities: unknown flag `--nope`")
         );
     }
 
@@ -2305,11 +2305,11 @@ mod tests {
     #[test]
     fn format_plain_and_json_are_recognised() {
         let plain = s(&["x", "--plain"]);
-        let (fmt, pos) = split_format(&plain, "capabilities").expect("plain");
+        let (fmt, pos) = split_format(&plain, "release capabilities").expect("plain");
         assert_eq!(fmt, OutputFormat::Plain);
         assert_eq!(pos, vec!["x"]);
         let json = s(&["--json", "x"]);
-        let (fmt, _) = split_format(&json, "capabilities").expect("json");
+        let (fmt, _) = split_format(&json, "release capabilities").expect("json");
         assert_eq!(fmt, OutputFormat::Json);
     }
 
@@ -2358,7 +2358,7 @@ mod tests {
     }
 
     /// `--capabilities` / `--show-profile` are unknown flags of `release
-    /// build`: `ipe capabilities` is the one inspection form.
+    /// build`: `ipe release capabilities` is the one inspection form.
     #[test]
     fn release_build_capabilities_flags_are_unknown() {
         for flag in ["--capabilities", "--show-profile"] {

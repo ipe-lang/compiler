@@ -900,6 +900,12 @@ messages! {
     cli_subcommand_required(group) = "cli-subcommand-required";
     /// One grouped form offered for a group-required refusal.
     cli_group_required_form(form) = "cli-group-required-form";
+    /// One posture line closing a group-required refusal.
+    cli_group_required_posture(posture) = "cli-group-required-posture";
+    /// What the `dev` posture is for — the one sentence every surface reuses.
+    posture_dev = "posture-dev";
+    /// What the `release` posture is for — the one sentence every surface reuses.
+    posture_release = "posture-release";
     /// A stage of `ipe verify` failed.
     cli_verify_failed(stage) = "cli-verify-failed";
     /// The project's test runner exited non-zero.

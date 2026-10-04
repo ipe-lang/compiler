@@ -608,6 +608,18 @@ unknown `ipe {group}` verb `{attempted}`
 
 = help: `ipe {form}`
 
+## cli-group-required-posture
+
+= note: {posture}
+
+## posture-dev
+
+`ipe dev` is for fast iteration on code you trust: it does not promise a capability check, a consent prompt, or a jail.
+
+## posture-release
+
+`ipe release` is for production and for running external packages: it infers capabilities, asks your consent, gates Debug.*, and runs jailed.
+
 ## cli-verify-failed
 
 verify: the {stage} stage failed

@@ -1,7 +1,7 @@
 Report the security capabilities a program exercises, inferred from its code.
 
 ```
-ipe capabilities [<path>]
+ipe release capabilities [<path>]
 ```
 
 ## Arguments

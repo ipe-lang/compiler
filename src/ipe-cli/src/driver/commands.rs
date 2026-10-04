@@ -6,7 +6,7 @@ use super::{
     compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
     io_err, resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir,
-    run_version, runtime_dep_from_env, single_file_cargo_name_from_env,
+    run_capabilities, run_version, runtime_dep_from_env, single_file_cargo_name_from_env,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
@@ -232,6 +232,7 @@ pub const GROUP_REQUIRED: &[(&str, &[Verb])] = &[
     ("watch", &[Verb::DEV_WATCH]),
     ("exec", &[Verb::RELEASE_RUN]),
     ("eject", &[Verb::RELEASE_EJECT]),
+    ("capabilities", &[Verb::RELEASE_CAPABILITIES]),
 ];
 
 /// The forms a bare umbrella group's refusal names.
@@ -241,7 +242,12 @@ pub const GROUP_REQUIRED: &[(&str, &[Verb])] = &[
 const fn bare_group_forms(umbrella: Umbrella) -> &'static [Verb] {
     match umbrella {
         Umbrella::Dev => &[],
-        Umbrella::Release => &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+        Umbrella::Release => &[
+            Verb::RELEASE_BUILD,
+            Verb::RELEASE_RUN,
+            Verb::RELEASE_EJECT,
+            Verb::RELEASE_CAPABILITIES,
+        ],
     }
 }
 
@@ -274,6 +280,7 @@ pub fn dispatch(verb: Verb, args: &[String]) -> Result<(), CliError> {
         Verb::Release(ReleaseVerb::Build) => run_release(args),
         Verb::Release(ReleaseVerb::Run) => run_release_run(args),
         Verb::Release(ReleaseVerb::Eject) => run_eject(args),
+        Verb::Release(ReleaseVerb::Capabilities) => run_capabilities(args),
     };
     with_help_on_misuse(verb, result)
 }
@@ -3518,7 +3525,7 @@ pub fn program_constructs_a_widget(
 /// parse→canon→infer→lower. Without injection an entry importing a
 /// compiled-source stdlib module (e.g. `Ipe.Test`) fails name resolution with
 /// IPE-N0004 even though a real `ipe dev build` of the same program succeeds — the
-/// analysis surfaces (`ipe capabilities`, `ipe dev build --emit-ir`) must resolve
+/// analysis surfaces (`ipe release capabilities`, `ipe dev build --emit-ir`) must resolve
 /// such a module identically to the build.
 ///
 /// # Errors
@@ -3692,7 +3699,7 @@ fn build_source_graph_from(
         project::inject_compiled_std_closure(&mut collected.sources, &mut collected.discovered);
     // The SAME FFI seam the build runs: without it, a project with installed
     // crates (or asserted `Rust.Ffi.call` definitions) has no `Rust.*`
-    // interface modules here, so `ipe type-check` / `ipe capabilities` /
+    // interface modules here, so `ipe type-check` / `ipe release capabilities` /
     // `--emit-ir` would refuse a program the build accepts.
     let ffi_injected = ffi::prepare_ffi(&mut collected.sources, blame_path)?.injected;
 
@@ -4192,7 +4199,7 @@ mod capability_resolution_once_tests {
     #[test]
     fn capability_resolution_has_one_consent_site() {
         // `consent_to_capabilities` (dev build / dev run / release build) is the
-        // one resolution site; `ipe capabilities` is the inspection form.
+        // one resolution site; `ipe release capabilities` is the inspection form.
         assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 1);
         assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
         let site = "consent_to_capabilities";
