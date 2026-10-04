@@ -201,12 +201,28 @@ no file unit and nothing of it is queued beyond its units.
 An index built before file units attested their residual is rebuilt in full by
 the next `update`. A pending file row is then re-pointed at its residual
 attestation, so it stays drainable. A file unit decided under its whole-file
-hash counts in neither progress number until its residual next changes.
+hash is open again: the decided pair names bytes the unit no longer attests.
 
 A `reviewed` table holds the code-review app's decided `(uid, body_hash)`
-pairs, so the app counts review progress with one SQL aggregate. The app is
-its sole writer; `index` keeps the table across a rebuild, as it keeps the
-queue.
+pairs, so the app counts review progress with one SQL aggregate. A
+`reviewed_stamp` table (one row) names the review-database state that copy
+reflects. The app is the sole writer of both; `index` keeps them across a
+rebuild, as it keeps the queue.
+
+The `open_units` view is the open backlog: every unit in `units` whose current
+`(uid, body_hash)` is not in `reviewed`. Membership comes from the units the
+working tree holds now, never from the queue: a unit that vanished is not
+listed, a unit that returns under new bytes is open, and a unit that returns
+under decided bytes stays decided. The queue only annotates a listed unit
+(`change`, `old_hash`, and `enqueued_at` as its order); a unit with no queue
+row for its current bytes is listed with a NULL `change` and `enqueued_at` 0,
+ahead of every queued unit. The view is re-created whenever a binary opens an
+index whose stored definition differs from its own.
+
+```bash
+sqlite3 .ipe-index/index.db \
+  "SELECT COUNT(*) FROM open_units; SELECT path, qualified, change FROM open_units ORDER BY enqueued_at, uid LIMIT 5"
+```
 
 ```bash
 ipe-index pending                 # queued unit changes as JSON lines
@@ -242,7 +258,19 @@ never write. `<old>` for `rename-path` is the untagged repo-relative path
 - `--repo <tag:path>` — repeatable; override the indexed repo set. Default is
   `ipe:.`. A tag is non-empty and holds no `/` and no `:` (the tags a stored
   `tag:path` reads back as; pinned by `tests/repo_tag_vectors.json`), and each
-  tag is given once.
+  tag is given once. Each tag names one directory: roots are compared by
+  directory identity, not by spelling, so `a:.` with `b:./`, a `..` spelling,
+  or a symbolic link to a declared root is refused as a second tag for one
+  directory. The number of roots is capped by `max_repos` in
+  `tests/max_repos.json`, and more than one root needs a platform with
+  directory identity (Unix). Roots may nest: a file belongs only to the deepest declared root that contains it, so
+  an outer root's walk and `update` skip everything under an inner root, which
+  indexes those files under its own tag. A root that is a subdirectory of its
+  work tree is diffed relative to itself (`git diff --relative`). A declared
+  root replaced by another directory between parsing and the walk fails the
+  run. The index records the root set it was built under; any change to that
+  set makes `update` rebuild the whole index, and units whose owning root moved
+  are re-queued under their new tagged path (deleted under the old one).
 
 ---
 
