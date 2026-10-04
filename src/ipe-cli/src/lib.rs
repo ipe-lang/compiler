@@ -82,6 +82,7 @@ pub mod text;
 pub mod threads;
 pub mod toolchain;
 pub mod unsafe_ack;
+pub mod verb;
 pub mod version_check;
 pub mod wasi_run;
 pub mod web_consent;

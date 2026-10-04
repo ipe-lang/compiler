@@ -105,7 +105,7 @@ pub fn classify(name: &str) -> Hermetic {
         "version" | "capabilities" | "doc" | "diff" => Hermetic::Snapshot,
 
         // Cargo / build / run / execute — heavy, environment-dependent output.
-        "build" | "run" | "release" | "test" | "verify" | "exec" | "watch" => {
+        "test" | "verify" => {
             Hermetic::Excluded("runs cargo / builds / executes — flaky transcript")
         }
 
@@ -117,7 +117,7 @@ pub fn classify(name: &str) -> Hermetic {
         // Project-tree mutators / environment probes — output depends on a
         // project or the host toolchain. `type-check` reads and compiles a
         // project tree, so its diagnostics/paths are environment-dependent.
-        "type-check" | "lint" | "fmt" | "clean" | "fix" | "eject" | "rust" | "health" => {
+        "type-check" | "lint" | "fmt" | "clean" | "fix" | "rust" | "health" => {
             Hermetic::Excluded("depends on a project tree / host toolchain — flaky transcript")
         }
 
@@ -293,7 +293,7 @@ pub fn golden_dir(repo_root: &Path) -> PathBuf {
 /// The per-command `--help` golden basename (`help_<command>`).
 #[must_use]
 pub fn help_golden_name(command: &str) -> String {
-    format!("help_{command}")
+    format!("help_{}", command.replace(' ', "-"))
 }
 
 #[cfg(test)]

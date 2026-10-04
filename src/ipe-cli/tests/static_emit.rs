@@ -216,17 +216,25 @@ fn cli_refusals_are_typed_and_artifact_free() {
     // reaching the build plan. The dispatcher wraps it as `CommandUsage` so the
     // caller shows `build`'s help; the reason still names the bad allocator.
     let err = refuse(
-        &["build", "NoSuch.ipe", "--static", "--allocator", "jemalloc"],
+        &[
+            "dev",
+            "build",
+            "NoSuch.ipe",
+            "--static",
+            "--allocator",
+            "jemalloc",
+        ],
         "unknown allocator must refuse",
     );
     assert!(
-        matches!(&err, CliError::CommandUsage { command: "build", reason } if reason.as_str().contains("jemalloc")),
+        matches!(&err, CliError::CommandUsage { command, reason } if *command == "dev build" && reason.as_str().contains("jemalloc")),
         "got: {err:?}"
     );
 
     // --target without --static.
     let err = refuse(
         &[
+            "dev",
             "build",
             "NoSuch.ipe",
             "--target",
@@ -245,6 +253,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
     // Unsupported static target.
     let err = refuse(
         &[
+            "dev",
             "build",
             "NoSuch.ipe",
             "--static",
@@ -256,13 +265,20 @@ fn cli_refusals_are_typed_and_artifact_free() {
     // The closed `--target` vocabulary is parsed at the CLI boundary, so an
     // unsupported triple is a command-usage refusal there, naming the value.
     assert!(
-        matches!(&err, CliError::CommandUsage { command: "build", reason } if reason.as_str().contains("x86_64-apple-darwin")),
+        matches!(&err, CliError::CommandUsage { command, reason } if *command == "dev build" && reason.as_str().contains("x86_64-apple-darwin")),
         "wrong refusal: {err:?}"
     );
 
     // talc is refused until the arena design lands.
     let err = refuse(
-        &["build", "NoSuch.ipe", "--static", "--allocator", "talc"],
+        &[
+            "dev",
+            "build",
+            "NoSuch.ipe",
+            "--static",
+            "--allocator",
+            "talc",
+        ],
         "talc must refuse",
     );
     assert!(
@@ -283,6 +299,7 @@ fn cli_refusals_are_typed_and_artifact_free() {
 #[test]
 fn cfree_contradictions_are_refused_at_the_cli_boundary() {
     let err = ipe::run_cli(&[
+        "dev".into(),
         "build".into(),
         "NoSuch.ipe".into(),
         "--static".into(),
@@ -300,6 +317,7 @@ fn cfree_contradictions_are_refused_at_the_cli_boundary() {
     );
 
     let err = ipe::run_cli(&[
+        "dev".into(),
         "build".into(),
         "NoSuch.ipe".into(),
         "--static".into(),
@@ -321,6 +339,7 @@ fn cfree_contradictions_are_refused_at_the_cli_boundary() {
 #[test]
 fn run_subcommand_refuses_like_build() {
     let err = ipe::run_cli(&[
+        "dev".into(),
         "run".into(),
         "NoSuch.ipe".into(),
         "--static".into(),
@@ -337,6 +356,7 @@ fn run_subcommand_refuses_like_build() {
     );
 
     let err = ipe::run_cli(&[
+        "dev".into(),
         "run".into(),
         "NoSuch.ipe".into(),
         "--target".into(),

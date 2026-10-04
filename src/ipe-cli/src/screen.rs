@@ -723,7 +723,7 @@ mod tests {
             matches!(
                 err,
                 Some(CliError::CommandUsage {
-                    command: "verify",
+                    command: crate::verb::CommandName::Command("verify"),
                     ..
                 })
             ),
@@ -736,9 +736,9 @@ mod tests {
     #[test]
     fn a_manifest_value_cannot_inject_escapes_into_the_help_screen() {
         let err = crate::driver::with_help_on_misuse(
-            "build",
+            crate::verb::Verb::DEV_BUILD,
             Err(CliError::Usage(crate::text::msg::command_refusal(
-                &"build",
+                &crate::verb::Verb::DEV_BUILD,
                 &format!("unknown manifest value `{HOSTILE}`"),
             ))),
         )

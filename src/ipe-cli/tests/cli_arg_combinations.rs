@@ -333,8 +333,8 @@ fn run_no_debugger_flag_is_false() {
 /// `ipe release --debugger` must be rejected (unknown flag on release).
 #[test]
 fn release_debugger_flag_rejected() {
-    use ipe::cli_args::parse_release;
-    let result = parse_release(&v(&["--debugger"]));
+    use ipe::cli_args::parse_release_build;
+    let result = parse_release_build(&v(&["--debugger"]));
     assert!(
         result.is_err(),
         "`ipe release --debugger` must be rejected as unknown flag, got: {result:?}"

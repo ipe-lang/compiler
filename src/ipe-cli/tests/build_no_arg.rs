@@ -57,17 +57,14 @@ fn build_no_arg_empty_dir_returns_usage_error() {
     let dir = fresh_dir("build_empty");
     fs::create_dir_all(&dir).unwrap();
 
-    let result = in_dir!(&dir, ipe::run_cli(&["build".to_owned()]));
+    let result = in_dir!(&dir, ipe::run_cli(&["dev".to_owned(), "build".to_owned()]));
 
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
         matches!(
-            result,
-            Err(ipe::CliError::CommandUsage {
-                command: "build",
-                ..
-            })
+            &result,
+            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev build"
         ),
         "bare `ipe build` in an empty dir must yield a build command-usage error, got: {result:?}"
     );
@@ -80,14 +77,14 @@ fn run_no_arg_empty_dir_returns_usage_error() {
     let dir = fresh_dir("run_empty");
     fs::create_dir_all(&dir).unwrap();
 
-    let result = in_dir!(&dir, ipe::run_cli(&["run".to_owned()]));
+    let result = in_dir!(&dir, ipe::run_cli(&["dev".to_owned(), "run".to_owned()]));
 
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
         matches!(
-            result,
-            Err(ipe::CliError::CommandUsage { command: "run", .. })
+            &result,
+            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
         ),
         "bare `ipe run` in an empty dir must yield a run command-usage error, got: {result:?}"
     );
@@ -118,7 +115,10 @@ fn build_no_arg_in_project_dir_succeeds() {
 
     // Switch into the project directory and call `ipe build` with no entry.
     let out_dir = project.join("out").join("rust");
-    let build_result = in_dir!(&project, ipe::run_cli(&["build".to_owned()]));
+    let build_result = in_dir!(
+        &project,
+        ipe::run_cli(&["dev".to_owned(), "build".to_owned()])
+    );
 
     assert!(
         build_result.is_ok(),
@@ -163,6 +163,7 @@ fn build_flag_first_no_entry_resolves_default() {
     let build_result = in_dir!(
         &project,
         ipe::run_cli(&[
+            "dev".to_owned(),
             "build".to_owned(),
             "--out".to_owned(),
             out_dir.to_string_lossy().into_owned(),

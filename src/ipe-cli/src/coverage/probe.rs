@@ -474,7 +474,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
     };
 
     let mut cmd = Command::new(&ipe_bin);
-    cmd.arg("run")
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
         .arg(&entry)
         .current_dir(&work_dir)
         .env(EMIT_PACKAGE_NAME, &package_name);

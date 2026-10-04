@@ -12,6 +12,7 @@ use crate::cargo_step::{
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
+use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
@@ -627,14 +628,8 @@ pub fn build_wasm_for_mobile(
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    // A dev shell hosts a `build --target wasm` bundle; a release shell hosts a
-    // production `release --target wasm` bundle (Debug.* gated, optimised).
-    let verb = match profile {
-        BundleProfile::Dev => "build",
-        BundleProfile::Release => "release",
-    };
     let status = std::process::Command::new(&exe)
-        .arg(verb)
+        .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
         .args(["--target", "wasm", "--out"])
         .arg(output_root)
@@ -651,7 +646,20 @@ pub fn build_wasm_for_mobile(
     Ok(())
 }
 
-/// `build|release --emit-permissions <ios|macos|android> [<path>]` — the
+/// The verb a mobile shell's wasm bundle is built with.
+///
+/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
+/// a production `release build --target wasm` bundle (Debug.* gated,
+/// optimised).
+#[must_use]
+pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
+    match profile {
+        BundleProfile::Dev => Verb::DEV_BUILD,
+        BundleProfile::Release => Verb::RELEASE_BUILD,
+    }
+}
+
+/// `release build --emit-permissions <ios|macos|android> [<path>]` — the
 /// read-only inspection face of the packager's permission derivation
 /// ([`pack::permissions::derive_permissions`]), the single source of truth for
 /// what a bundled app may do. Resolves the project manifest, reads its accepted
@@ -3396,6 +3404,27 @@ mod installer_tag_tests {
             b"ipe-ipe-v0.2.5",
         ] {
             assert_eq!(parse_installer_tag(raw), None, "accepted {raw:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod self_reinvocation_tests {
+    use super::*;
+
+    /// The mobile shell's wasm build re-invokes `ipe` with the argv of the
+    /// verb its profile names, so the spelling comes from [`Verb`] alone.
+    #[test]
+    fn self_reinvocation_argv_from_verb() {
+        assert_eq!(wasm_build_verb(BundleProfile::Dev).argv(), ["dev", "build"]);
+        assert_eq!(
+            wasm_build_verb(BundleProfile::Release).argv(),
+            ["release", "build"]
+        );
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = wasm_build_verb(profile);
+            assert_eq!(verb.bundle_profile(), profile, "{verb}");
+            assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
         }
     }
 }

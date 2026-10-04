@@ -894,6 +894,12 @@ messages! {
     cli_unknown_group_verb(group, attempted) = "cli-unknown-group-verb";
     /// The near-miss suggestion offered for an unknown group verb.
     cli_unknown_group_suggestion(group, sugg) = "cli-unknown-group-suggestion";
+    /// A legacy verb name typed without the group it now lives under.
+    cli_group_required(attempted) = "cli-group-required";
+    /// A command group typed with no subcommand.
+    cli_subcommand_required(group) = "cli-subcommand-required";
+    /// One grouped form offered for a group-required refusal.
+    cli_group_required_form(form) = "cli-group-required-form";
     /// A stage of `ipe verify` failed.
     cli_verify_failed(stage) = "cli-verify-failed";
     /// The project's test runner exited non-zero.

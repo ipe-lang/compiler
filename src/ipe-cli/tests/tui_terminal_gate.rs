@@ -49,13 +49,17 @@ fn write_entry(dir_name: &str, src: &str) -> std::path::PathBuf {
 #[test]
 fn run_refuses_a_tui_entry_without_an_interactive_terminal() {
     let entry = write_entry("ipe_run_tui_gate", TUI_ENTRY);
-    let args: Vec<String> = vec!["run".to_owned(), entry.to_string_lossy().into_owned()];
+    let args: Vec<String> = vec![
+        "dev".to_owned(),
+        "run".to_owned(),
+        entry.to_string_lossy().into_owned(),
+    ];
     let result = ipe::run_cli(&args);
     assert!(
         matches!(
             &result,
             Err(ipe::CliError::CommandUsage { command, reason })
-                if *command == "run" && reason.as_str().contains("interactive terminal")
+                if *command == "dev run" && reason.as_str().contains("interactive terminal")
         ),
         "expected a `run` command-usage error naming the missing interactive terminal, got: {result:?}"
     );
@@ -66,13 +70,17 @@ fn run_refuses_a_tui_entry_without_an_interactive_terminal() {
 #[test]
 fn watch_refuses_a_tui_entry_without_an_interactive_terminal() {
     let entry = write_entry("ipe_watch_tui_gate", TUI_ENTRY);
-    let args: Vec<String> = vec!["watch".to_owned(), entry.to_string_lossy().into_owned()];
+    let args: Vec<String> = vec![
+        "dev".to_owned(),
+        "watch".to_owned(),
+        entry.to_string_lossy().into_owned(),
+    ];
     let result = ipe::run_cli(&args);
     assert!(
         matches!(
             &result,
             Err(ipe::CliError::CommandUsage { command, reason })
-                if *command == "watch" && reason.as_str().contains("interactive terminal")
+                if *command == "dev watch" && reason.as_str().contains("interactive terminal")
         ),
         "expected a `watch` command-usage error naming the missing interactive terminal, got: {result:?}"
     );

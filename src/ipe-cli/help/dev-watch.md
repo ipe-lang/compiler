@@ -1,7 +1,7 @@
-Rebuild and re-run a program on every source change.
+Rebuild and re-run a development build on every source change.
 
 ```
-ipe watch [<path>]
+ipe dev watch [<path>]
 ```
 
 ## Arguments

@@ -1,13 +1,12 @@
 use super::{
-    AnalysisTarget, BuildOptions, BundleHost, BundleProfile, CliError, CollectedSources, OutTarget,
+    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, OutTarget,
     RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
     bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
     collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
     compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, render_capabilities, resolve_analysis_entry, resolve_analysis_target,
-    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
-    single_file_cargo_name_from_env,
+    io_err, resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir,
+    run_version, runtime_dep_from_env, single_file_cargo_name_from_env,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
@@ -15,6 +14,7 @@ use crate::cargo_step::{
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
+use crate::verb::{CommandName, DevVerb, ReleaseVerb, Umbrella, Verb};
 use crate::{
     ALL_CODES, BTreeMap, Interner, Path, PathBuf, build_plan, cli_args, delivery, explain_page,
     ffi, fs, help, io_bounded, native_ffi_consent, package_manifest, project, run_sandbox,
@@ -78,44 +78,39 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
         _ => {}
     }
 
-    // `ipe <group> <verb> --help`: the member verb's own command page — the
-    // grouped form and the bare form share the one help page. Checked BEFORE the
-    // bare-group branch so a member verb's `--help` resolves to the verb, not the
-    // group subpage.
+    // `ipe <group> <verb> --help`: the grouped verb's own page, keyed by its
+    // typed `Verb`. Checked BEFORE the group branch so a member verb's `--help`
+    // resolves to the verb, not the group subpage.
     if let Some((group, tail)) = args.split_first()
-        && help::is_group(group)
-        && let Some((verb, rest)) = tail.split_first()
-        && help::is_group_member(group, verb)
+        && let Some((sub, rest)) = tail.split_first()
+        && let Some(verb) = help::group_member(group, sub)
         && rest.iter().any(|a| is_help_flag(a))
     {
         if has_json(rest) {
-            if let Some(json) = help::command_json(verb) {
+            if let Some(json) = help::command_json(verb.name()) {
                 screen::emit_machine(screen::Stream::Stdout, &json);
                 return Some(HelpRequest);
             }
-        } else if let Some(page) = help::command(verb, &std::io::stdout()) {
+        } else if let Some(page) = help::command(verb.name(), &std::io::stdout()) {
             show_help_page(&page);
             return Some(HelpRequest);
         }
     }
 
-    // A command group invoked bare (`ipe dev`) or with a help flag directly on
-    // the group (`ipe dev --help`): its subpage. Progressive help — a group with
-    // no verb teaches its verbs rather than erroring. A member verb followed by
-    // `--help` was already resolved to the verb's page above; a group followed by
-    // a NON-member token falls through to `run_cli`, which reports the unknown
-    // verb over the subpage. So this fires only when the group leads and either
-    // stands alone or is immediately helped.
+    // A help flag directly on a group (`ipe dev --help`): its subpage. A bare
+    // group is not a help request — `run_cli` refuses it with
+    // [`CliError::GroupRequired`].
     if let Some((first, rest)) = args.split_first()
         && help::is_group(first)
-        && (rest.is_empty() || (rest.first().is_some_and(|a| is_help_flag(a))))
+        && rest.first().is_some_and(|a| is_help_flag(a))
         && let Some(page) = help::group(first, &std::io::stdout())
     {
         show_help_page(&page);
         return Some(HelpRequest);
     }
 
-    // `<cmd> --help [--json]`: the command's own page, when the command is known.
+    // `<cmd> --help [--json]`: a top-level command's own page. A legacy verb
+    // name is no command, so `ipe build --help` falls through to its refusal.
     if let Some((cmd, rest)) = args.split_first()
         && help::is_command(cmd)
         && rest.iter().any(|a| is_help_flag(a))
@@ -186,30 +181,29 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     if cmd == "pack" {
         return Err(CliError::Usage(text::msg::pack_retired()));
     }
-    // A command group (`ipe dev <verb> …`) dispatches to the member verb's own
-    // handler — the grouped and bare forms run the same code, so a verb under
-    // `dev` is a dev-posture build by construction. A group followed by an
-    // unknown token is misuse: its subpage is shown with an "unknown verb" line.
-    // (A bare group or `ipe dev --help` was already handled by `intercept_help`.)
-    if let Some(group) = help::group_name(cmd.as_str()) {
-        let Some((verb, tail)) = rest.split_first() else {
-            // Unreachable in practice — a bare group is intercepted as help
-            // above — but handled totally rather than assumed away.
-            return Err(CliError::UnknownGroupSub {
-                group,
-                attempted: TerminalSafe::sanitize(""),
-            });
+    // A legacy verb name has no handler: its one representation is this
+    // refusal naming the grouped forms.
+    if let Some(&(_, forms)) = GROUP_REQUIRED
+        .iter()
+        .find(|(name, _)| *name == cmd.as_str())
+    {
+        return Err(group_required(cmd, forms, rest));
+    }
+    // An umbrella group (`ipe dev <verb> …`) resolves its member to a typed
+    // `Verb`, and `dispatch` runs it with the umbrella's posture. A bare group
+    // refuses; a `release` followed by a non-member token (`ipe release web`)
+    // refuses with the `release build` form carrying that tail; a `dev`
+    // followed by a non-member token is an unknown verb of the group.
+    if let Some(umbrella) = Umbrella::from_name(cmd) {
+        let Some((sub, tail)) = rest.split_first() else {
+            return Err(group_required(cmd, bare_group_forms(umbrella), &[]));
         };
-        return match help::handler(verb.as_str()) {
-            Some((name, run)) if help::is_group_member(group, verb.as_str()) => {
-                with_help_on_misuse(name, run(tail))
-            }
-            // A known command that is not a member of this group, or an unknown
-            // token: both are an unknown verb FOR THIS GROUP. Routing a non-member
-            // command through the group is refused so the namespace stays honest.
-            _ => Err(CliError::UnknownGroupSub {
-                group,
-                attempted: TerminalSafe::sanitize(verb),
+        return match (Verb::member(umbrella, sub), umbrella) {
+            (Some(verb), _) => dispatch(verb, tail),
+            (None, Umbrella::Release) => Err(group_required(cmd, &[Verb::RELEASE_BUILD], rest)),
+            (None, Umbrella::Dev) => Err(CliError::UnknownGroupSub {
+                group: umbrella.name(),
+                attempted: TerminalSafe::sanitize(sub),
             }),
         };
     }
@@ -228,18 +222,74 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     }
 }
 
+/// The legacy verb names and the grouped forms each refusal names.
+///
+/// A name here has no handler and no help page: typing it yields
+/// [`CliError::GroupRequired`] and nothing else.
+pub const GROUP_REQUIRED: &[(&str, &[Verb])] = &[
+    ("build", &[Verb::DEV_BUILD, Verb::RELEASE_BUILD]),
+    ("run", &[Verb::DEV_RUN, Verb::RELEASE_RUN]),
+    ("watch", &[Verb::DEV_WATCH]),
+    ("exec", &[Verb::RELEASE_RUN]),
+    ("eject", &[Verb::RELEASE_EJECT]),
+];
+
+/// The forms a bare umbrella group's refusal names.
+///
+/// A bare `ipe dev` names none; its members stay discoverable through
+/// `ipe dev --help`.
+const fn bare_group_forms(umbrella: Umbrella) -> &'static [Verb] {
+    match umbrella {
+        Umbrella::Dev => &[],
+        Umbrella::Release => &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+    }
+}
+
+/// The [`CliError::GroupRequired`] refusal for `attempted` followed by `tail`.
+///
+/// Both echo user argv, so both are sanitized for the terminal.
+fn group_required(attempted: &str, forms: &'static [Verb], tail: &[String]) -> CliError {
+    CliError::GroupRequired {
+        attempted: TerminalSafe::sanitize(attempted),
+        forms,
+        tail: TerminalSafe::sanitize(&tail.join(" ")),
+    }
+}
+
+/// Run the grouped verb `verb` on its argument tail.
+///
+/// The match is exhaustive over [`Verb`], so a verb added to the type has no
+/// representation until it is given a handler here. A usage error renders the
+/// verb's own help page.
+///
+/// # Errors
+///
+/// Whatever the verb's handler returns, with usage errors mapped to
+/// [`CliError::CommandUsage`].
+pub fn dispatch(verb: Verb, args: &[String]) -> Result<(), CliError> {
+    let result = match verb {
+        Verb::Dev(DevVerb::Build) => run_build(args),
+        Verb::Dev(DevVerb::Run) => run_run(args),
+        Verb::Dev(DevVerb::Watch) => run_watch(args),
+        Verb::Release(ReleaseVerb::Build) => run_release(args),
+        Verb::Release(ReleaseVerb::Run) => run_exec(args),
+        Verb::Release(ReleaseVerb::Eject) => run_eject(args),
+    };
+    with_help_on_misuse(verb, result)
+}
+
 /// Map a known command's raw usage error into a [`CliError::CommandUsage`] so the
 /// caller prints that command's full, indented `--help` page — the uniform
 /// "misuse shows help" output. Any non-usage error (a compile failure, a
 /// filesystem error) passes through untouched, since it is not a help-worthy
-/// misuse. `command` is always a known command name.
+/// misuse. `command` is always a known command or grouped verb.
 pub fn with_help_on_misuse(
-    command: &'static str,
+    command: impl Into<CommandName>,
     result: Result<(), CliError>,
 ) -> Result<(), CliError> {
     match result {
         Err(CliError::Usage(reason)) => Err(CliError::CommandUsage {
-            command,
+            command: command.into(),
             reason: TerminalSafe::sanitize(&reason),
         }),
         other => other,
@@ -285,11 +335,16 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     // build-run-reload loop that serves the served runtime; it takes no `--static`.
     // A grammar refusal (e.g. `web solo ios`, which cannot be watched — see the
     // spec's mobile-watch note) is caught here before the loop starts.
-    let delivery = resolve_delivery(Path::new(&entry), &args.delivery, false, "watch")?;
+    let delivery = resolve_delivery(
+        Path::new(&entry),
+        &args.delivery,
+        false,
+        Verb::DEV_WATCH.name(),
+    )?;
 
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — same as `ipe run`.
-    gate_terminal("watch", delivery.shape())?;
+    gate_terminal(Verb::DEV_WATCH.name(), delivery.shape())?;
     // Watch is always a native dependency-model dev build (it never vendors the
     // runtime tree, nor targets wasm), so — like `ipe build` on its default path
     // — it must NOT require the vendored runtime source subtree. It resolves the
@@ -577,7 +632,7 @@ pub fn run_build(rest: &[String]) -> Result<(), CliError> {
         Err(e) => Err(if format == cli_args::OutputFormat::Human {
             e
         } else {
-            emit_machine_error(format, "build", &e)
+            emit_machine_error(format, Verb::DEV_BUILD.name(), &e)
         }),
         Ok(success) => {
             if format == cli_args::OutputFormat::Json {
@@ -605,16 +660,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         None => default_entry()?,
     };
     let entry_path = PathBuf::from(&entry);
-
-    // `--emit-permissions <platform>` is a read-only inspection that builds
-    // nothing: print the OS-permission derivation and stop, before any compile.
-    if let Some(platform) = args.emit_permissions.as_deref() {
-        emit_permissions(platform, Some(entry.as_str()), "build")?;
-        return Ok(BuildSuccess {
-            entry,
-            out_dir: PathBuf::new(),
-        });
-    }
 
     let wants_static = matches!(
         &args.mode,
@@ -677,7 +722,12 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // gate. Runs after the static-plan check so a flag contradiction fires
     // before the entry file is read. A webview-native `web desktop` drives
     // `webview_host` below.
-    let delivery = resolve_delivery(&entry_path, &args.delivery, wants_static, "build")?;
+    let delivery = resolve_delivery(
+        &entry_path,
+        &args.delivery,
+        wants_static,
+        Verb::DEV_BUILD.name(),
+    )?;
 
     // Human-friendly progress: the consent gates and the compile+emit below are
     // otherwise silent, so the banner and a start line come first and a done line
@@ -730,7 +780,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     )?;
 
     if let Some(host) = bundle_host {
-        bundle_delivery(host, BundleProfile::Dev, Some(entry.as_str()))?;
+        bundle_delivery(host, Verb::DEV_BUILD.bundle_profile(), Some(entry.as_str()))?;
         return Ok(BuildSuccess {
             entry,
             out_dir: PathBuf::new(),
@@ -753,7 +803,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let (engine, triple) = compile_target.engine_triple();
     delivery
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::Usage(text::msg::command_refusal(&"build", &e)))?;
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?;
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
@@ -783,8 +833,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         target: compile_target.ir_target(),
         wasm_public_env: Vec::new(),
         wasm_hydrate_mode: false,
-        // `ipe build` is a development artifact — Debug.* is permitted.
-        intent: ipe_backend_rust::BuildIntent::Development,
+        // A `dev build` is a development artifact — Debug.* is permitted.
+        intent: Verb::DEV_BUILD.intent(),
         runtime_dep,
         // `ipe build` never tree-shakes the vendored tree — a dep-model build
         // carries no vendored source, and a vendored (`IPE_RUNTIME_VENDORED`)
@@ -1167,7 +1217,7 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 /// defaults — eject is the plain native standalone shape.
 pub(super) fn eject_options() -> BuildOptions {
     BuildOptions {
-        intent: ipe_backend_rust::BuildIntent::Release,
+        intent: Verb::RELEASE_EJECT.intent(),
         runtime_dep: false,
         tree_shake_vendored: true,
         ..BuildOptions::default()
@@ -1216,24 +1266,80 @@ pub(super) fn eject_options() -> BuildOptions {
 /// errors.
 #[allow(clippy::too_many_lines)]
 pub fn run_release(rest: &[String]) -> Result<(), CliError> {
-    let args = cli_args::parse_release(rest)?;
+    // Resolve the output format in a first, infallible pass so a refusal
+    // renders through the machine surface the caller asked for.
+    let format = cli_args::peek_output_format(rest);
+    run_release_body(rest).map_err(|e| {
+        if format == cli_args::OutputFormat::Human {
+            e
+        } else {
+            emit_machine_error(format, Verb::RELEASE_BUILD.name(), &e)
+        }
+    })
+}
+
+/// The artifact a `release build` produces.
+///
+/// Built only by [`release_artifact`], whose exhaustive match leaves no target
+/// that produces nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseArtifact {
+    /// The production browser bundle (`wasm32-unknown-unknown`).
+    Browser,
+    /// A statically linked native binary for the triple.
+    Native(ipe_backend_rust::static_build::StaticTriple),
+}
+
+impl ReleaseArtifact {
+    /// The compile target this artifact emits for.
+    #[must_use]
+    pub const fn compile_target(self) -> CompileTarget {
+        match self {
+            Self::Browser => CompileTarget::WasmClient,
+            Self::Native(_) => CompileTarget::Native,
+        }
+    }
+}
+
+/// The artifact a `release build` with `target` produces, given the target a
+/// native `--target` resolves to through `IPE_TARGET` and `[wasm].mode`.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] when the resolved target is the WASI module, which has
+/// no release form.
+pub fn release_artifact(
+    target: cli_args::ReleaseTarget,
+    resolved: CompileTarget,
+) -> Result<ReleaseArtifact, CliError> {
+    match (target, resolved) {
+        (cli_args::ReleaseTarget::Wasm, _)
+        | (cli_args::ReleaseTarget::Native(_), CompileTarget::WasmClient) => {
+            Ok(ReleaseArtifact::Browser)
+        }
+        (cli_args::ReleaseTarget::Native(triple), CompileTarget::Native) => {
+            Ok(ReleaseArtifact::Native(triple))
+        }
+        (cli_args::ReleaseTarget::Native(_), CompileTarget::WasmWasi) => {
+            Err(CliError::Usage(text::msg::release_no_wasi()))
+        }
+    }
+}
+
+/// The body of [`run_release`], format-agnostic.
+#[allow(clippy::too_many_lines)]
+pub fn run_release_body(rest: &[String]) -> Result<(), CliError> {
+    let args = cli_args::parse_release_build(rest)?;
     let entry = match args.entry {
         Some(e) => e,
         None => default_entry()?,
     };
     let entry_path = PathBuf::from(&entry);
 
-    // `--capabilities` / `--show-profile`: inspect the inferred capability
-    // model without building or writing anything.
-    if args.capabilities_only {
-        let manifest = discover_manifest(&entry_path)?;
-        return run_release_capabilities(&entry_path, manifest.as_deref(), args.format);
-    }
-
-    // `--emit-permissions <platform>`: the same read-only permission inspection
-    // `build` offers, on the release verb too — print the derivation and stop.
+    // `--emit-permissions <platform>`: a read-only inspection — print the
+    // OS-permission derivation and stop, before any compile.
     if let Some(platform) = args.emit_permissions.as_deref() {
-        return emit_permissions(platform, Some(entry.as_str()), "release");
+        return emit_permissions(platform, Some(entry.as_str()), Verb::RELEASE_BUILD.name());
     }
 
     // Discover the manifest (same logic as build/eject).
@@ -1266,27 +1372,32 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     // profile). The served/default host falls through to the ordinary release
     // artifact below. The delivery grammar is the one vocabulary for every bundle
     // target.
-    let bundle_delivery_resolved = resolve_delivery(&entry_path, &args.delivery, false, "release")?;
+    let bundle_delivery_resolved = resolve_delivery(
+        &entry_path,
+        &args.delivery,
+        false,
+        Verb::RELEASE_BUILD.name(),
+    )?;
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
-        return bundle_delivery(host, BundleProfile::Release, Some(entry.as_str()));
+        return bundle_delivery(
+            host,
+            Verb::RELEASE_BUILD.bundle_profile(),
+            Some(entry.as_str()),
+        );
     }
 
     let manifest_wasm: Option<project::WasmConfig> =
         manifest_parsed.as_ref().map(|m| m.wasm.clone());
 
-    // Route on the typed target: Wasm → browser bundle; Native → static binary.
-    // `ipe release` ships the browser client (`--target wasm`) or a native
-    // artifact; the co-located WASI target is a `build`-only development target
-    // (no release-distribution form yet), so a `wasm` release resolves the
-    // browser client. `resolve_compile_target` also checks the `IPE_TARGET` env
-    // var and manifest.
-    let cli_wasm = if args.target == cli_args::ReleaseTarget::Wasm {
-        cli_args::WasmKind::Client
-    } else {
-        cli_args::WasmKind::None
-    };
-    let compile_target = resolve_compile_target(cli_wasm, manifest_wasm.as_ref());
-    let wasm_target = compile_target.is_wasm();
+    // Route on the typed artifact: the browser bundle or a static native
+    // binary. A native `--target` still yields to `IPE_TARGET` and the
+    // manifest's `[wasm].mode`; a WASI resolution has no release form and
+    // refuses.
+    let artifact = release_artifact(
+        args.target,
+        resolve_compile_target(cli_args::WasmKind::None, manifest_wasm.as_ref()),
+    )?;
+    let compile_target = artifact.compile_target();
 
     // Fail closed unless the delivery runtime and the compile target agree — the
     // `(engine, triple)` validity matrix is the single live gate — so a sandboxed
@@ -1295,85 +1406,79 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     let (engine, triple) = compile_target.engine_triple();
     bundle_delivery_resolved
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::Usage(text::msg::command_refusal(&"release", &e)))?;
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::RELEASE_BUILD, &e)))?;
 
-    if wasm_target {
-        // Browser/wasm production path.
-        let output =
-            resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
-        let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
-        let out_dir = rust_area.path()?;
-        let runtime_dep = runtime_dep_from_env();
-        let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
+    // Native path: the triple the parse validated; the browser bundle
+    // returns from its own arm.
+    let triple = match artifact {
+        ReleaseArtifact::Native(triple) => triple,
+        ReleaseArtifact::Browser => {
+            // Browser/wasm production path.
+            let output =
+                resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+            let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
+            let out_dir = rust_area.path()?;
+            let runtime_dep = runtime_dep_from_env();
+            let runtime_dir = resolve_vendored_runtime_dir(args.runtime, !runtime_dep)?;
 
-        let show_progress = {
-            use std::io::IsTerminal as _;
-            std::io::stderr().is_terminal()
-        };
-        if show_progress {
-            crate::screen::chatter(
-                crate::screen::Stream::Stderr,
-                crate::screen::Tone::Text,
-                &format!(
-                    "{} releasing {entry} (wasm)",
-                    style::outcome_glyph(style::Outcome::Step)
-                ),
-            );
-        }
+            let show_progress = {
+                use std::io::IsTerminal as _;
+                std::io::stderr().is_terminal()
+            };
+            if show_progress {
+                crate::screen::chatter(
+                    crate::screen::Stream::Stderr,
+                    crate::screen::Tone::Text,
+                    &format!(
+                        "{} releasing {entry} (wasm)",
+                        style::outcome_glyph(style::Outcome::Step)
+                    ),
+                );
+            }
 
-        // Emit the Rust wasm project as a release build so the Debug gate fires.
-        let options = BuildOptions {
-            static_plan: None,
-            target: ipe_ir::Target::WasmClient,
-            wasm_public_env: manifest_parsed
-                .as_ref()
-                .map(|m| m.wasm.public_env.clone())
-                .unwrap_or_default(),
-            wasm_hydrate_mode: manifest_wasm
-                .as_ref()
-                .is_some_and(|w| w.mode.as_deref() == Some("hydrate")),
-            intent: ipe_backend_rust::BuildIntent::Release,
-            runtime_dep,
-            tree_shake_vendored: false,
-            cargo_name: String::new(),
-            // The debugger is never enabled on a release build.
-            debugger: false,
-            // A release build never carries appearance hot-swap scaffolding.
-            hot_appearance: false,
-            // Set from the resolved delivery; a webview-native `web desktop` is wired
-            // where the classified shape is known (build_project_with_options).
-            webview_host: false,
-            webview_window: None,
-        };
-        let crate_dir = emit_into(
-            &entry_path,
-            manifest.as_deref(),
-            &EmitTarget::Area(rust_area),
-            &runtime_dir,
-            options,
-        )?;
-        bundle_wasm(&crate_dir)?;
-        if show_progress {
-            crate::screen::chatter(
-                crate::screen::Stream::Stderr,
-                crate::screen::Tone::Success,
-                &format!(
-                    "{} released → {}/www/",
-                    style::outcome_glyph(style::Outcome::Success),
-                    out_dir.display()
-                ),
-            );
-        }
-        return Ok(());
-    }
-
-    // Native path: extract the triple already validated at parse time.
-    let triple = match args.target {
-        cli_args::ReleaseTarget::Native(t) => t,
-        cli_args::ReleaseTarget::Wasm => {
-            // `wasm_target` above is true when `args.target == Wasm`, so this
-            // branch is unreachable in practice; the exhaustive match keeps the
-            // compiler satisfied without a panic or unreachable!().
+            // Emit the Rust wasm project as a release build so the Debug gate fires.
+            let options = BuildOptions {
+                static_plan: None,
+                target: ipe_ir::Target::WasmClient,
+                wasm_public_env: manifest_parsed
+                    .as_ref()
+                    .map(|m| m.wasm.public_env.clone())
+                    .unwrap_or_default(),
+                wasm_hydrate_mode: manifest_wasm
+                    .as_ref()
+                    .is_some_and(|w| w.mode.as_deref() == Some("hydrate")),
+                intent: Verb::RELEASE_BUILD.intent(),
+                runtime_dep,
+                tree_shake_vendored: false,
+                cargo_name: String::new(),
+                // The debugger is never enabled on a release build.
+                debugger: false,
+                // A release build never carries appearance hot-swap scaffolding.
+                hot_appearance: false,
+                // Set from the resolved delivery; a webview-native `web desktop` is wired
+                // where the classified shape is known (build_project_with_options).
+                webview_host: false,
+                webview_window: None,
+            };
+            let crate_dir = emit_into(
+                &entry_path,
+                manifest.as_deref(),
+                &EmitTarget::Area(rust_area),
+                &runtime_dir,
+                options,
+            )?;
+            bundle_wasm(&crate_dir)?;
+            if show_progress {
+                crate::screen::chatter(
+                    crate::screen::Stream::Stderr,
+                    crate::screen::Tone::Success,
+                    &format!(
+                        "{} released → {}/www/",
+                        style::outcome_glyph(style::Outcome::Success),
+                        out_dir.display()
+                    ),
+                );
+            }
             return Ok(());
         }
     };
@@ -1422,7 +1527,7 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
         let options = BuildOptions {
             static_plan: app_static_plan,
             target: ipe_ir::Target::Native,
-            intent: ipe_backend_rust::BuildIntent::Release,
+            intent: Verb::RELEASE_BUILD.intent(),
             runtime_dep: runtime_dep_from_env(),
             tree_shake_vendored: false,
             ..BuildOptions::default()
@@ -1513,7 +1618,7 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
     let options = BuildOptions {
         static_plan: app_static_plan,
         target: ipe_ir::Target::Native,
-        intent: ipe_backend_rust::BuildIntent::Release,
+        intent: Verb::RELEASE_BUILD.intent(),
         runtime_dep: runtime_dep_from_env(),
         tree_shake_vendored: false,
         ..BuildOptions::default()
@@ -1652,26 +1757,6 @@ pub fn run_release(rest: &[String]) -> Result<(), CliError> {
             ),
         }
     }
-    Ok(())
-}
-
-/// Inspect the inferred capability model for `entry_path` without building or
-/// writing anything — the body of `ipe release --capabilities` / `--show-profile`.
-pub fn run_release_capabilities(
-    entry_path: &Path,
-    manifest: Option<&Path>,
-    format: cli_args::OutputFormat,
-) -> Result<(), CliError> {
-    let manifest_parsed = match manifest {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed.as_ref(), manifest, entry_path)?;
-    let names: Vec<&'static str> = resolved.union().iter().map(|c| c.as_str()).collect();
-    screen::emit_report(
-        format,
-        &render_capabilities(&names, format, &std::io::stdout()),
-    );
     Ok(())
 }
 
@@ -2446,7 +2531,7 @@ pub fn run_run(rest: &[String]) -> Result<(), CliError> {
         if format == cli_args::OutputFormat::Human {
             e
         } else {
-            emit_machine_error(format, "run", &e)
+            emit_machine_error(format, Verb::DEV_RUN.name(), &e)
         }
     })
 }
@@ -2514,12 +2599,17 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // gate) against the shape `main` pins — same as `ipe build`. A webview-native
     // `web desktop` drives `webview_host` below. Runs after the static-plan check
     // so a flag contradiction fires before the entry file is read.
-    let delivery = resolve_delivery(&entry_path, &args.delivery, wants_static, "run")?;
+    let delivery = resolve_delivery(
+        &entry_path,
+        &args.delivery,
+        wants_static,
+        Verb::DEV_RUN.name(),
+    )?;
 
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — rather than building fully and only then
     // failing on the raw-mode syscall inside the built binary.
-    gate_terminal("run", delivery.shape())?;
+    gate_terminal(Verb::DEV_RUN.name(), delivery.shape())?;
 
     // Human-friendly progress: the consent gates and the compile+emit below are
     // otherwise silent, so the banner and the running step come first. On a
@@ -2579,7 +2669,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let (engine, triple) = compile_target.engine_triple();
     delivery
         .admit_triple(engine, triple)
-        .map_err(|e| CliError::Usage(text::msg::command_refusal(&"run", &e)))?;
+        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_RUN, &e)))?;
 
     // `ipe run --target wasi` EXECUTES the emitted module under embedded
     // wasmtime; fail closed BEFORE any emit or build when no engine is linked
@@ -2630,7 +2720,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         target: compile_target.ir_target(),
         wasm_public_env: Vec::new(),
         wasm_hydrate_mode: false,
-        intent: ipe_backend_rust::BuildIntent::Development,
+        intent: Verb::DEV_RUN.intent(),
         runtime_dep,
         // `ipe run` builds and executes; it never tree-shakes the vendored tree
         // (only `ipe eject` does).
@@ -3912,12 +4002,12 @@ mod capability_resolution_once_tests {
     }
 
     #[test]
-    fn capability_resolution_has_one_consent_site_and_one_inspection_site() {
-        // `consent_to_capabilities` (build/run/release) and the read-only
-        // `release --capabilities` inspection — nothing else.
-        assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 2);
+    fn capability_resolution_has_one_consent_site() {
+        // `consent_to_capabilities` (dev build / dev run / release build) is the
+        // one resolution site; `ipe capabilities` is the inspection form.
+        assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 1);
         assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
-        for site in ["consent_to_capabilities", "run_release_capabilities"] {
+        for site in ["consent_to_capabilities"] {
             let body = fn_body(site);
             assert!(body.is_some(), "{site} is defined in this module");
             let Some(body) = body else { return };
@@ -3927,7 +4017,7 @@ mod capability_resolution_once_tests {
 
     #[test]
     fn build_run_release_each_consent_exactly_once() {
-        for entry_point in ["run_build_body", "run_release", "run_run_with_args"] {
+        for entry_point in ["run_build_body", "run_release_body", "run_run_with_args"] {
             let body = fn_body(entry_point);
             assert!(body.is_some(), "{entry_point} is defined in this module");
             let Some(body) = body else { return };
@@ -4123,7 +4213,7 @@ mod help_on_misuse_tests {
             slug: "a".to_owned(),
             name: "T".to_owned(),
         };
-        let got = with_help_on_misuse("build", Err(CliError::FfiPrep(Box::new(refusal()))));
+        let got = with_help_on_misuse(Verb::DEV_BUILD, Err(CliError::FfiPrep(Box::new(refusal()))));
         assert!(
             matches!(&got, Err(CliError::FfiPrep(inner)) if **inner == refusal()),
             "{got:?}"
