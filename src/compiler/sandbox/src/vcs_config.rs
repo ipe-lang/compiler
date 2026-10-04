@@ -2,39 +2,60 @@
 //!
 //! A carved VCS metadata directory keeps a jailed program from rewriting the
 //! hooks a host tool runs, but the tool also reads configuration that can point
-//! anywhere: `core.hooksPath`, an `include.path`, an alias, a Mercurial
-//! extension, a Jujutsu fix tool, a Darcs test command. When any value names a
-//! path inside a writable grant, the jailed program can plant code the host
-//! later runs outside the jail. [`scan`] reads every configuration file the
-//! tool reads from the carved metadata, follows its includes, and refuses when
-//! a value names such a path or cannot be proven not to.
+//! anywhere: `core.hooksPath`, an `include.path`, an alias, a remote URL, a
+//! Mercurial extension, a Jujutsu fix tool, a Darcs test command. When any
+//! value names a path inside a writable grant, the jailed program can plant
+//! code the host later runs outside the jail. [`scan`] reads every
+//! configuration file the tool reads from the carved metadata, follows its
+//! includes, and refuses when a value names such a path or cannot be proven
+//! not to.
 //!
-//! The scan is key-agnostic: every value is split into words and every
-//! path-shaped word is resolved, except under the few settings [`NON_CODE`]
-//! lists as never naming code. A relative word is resolved against both the
-//! configuration file's directory and the working tree, `~` through the
-//! injected [`Home`]; a command substitution, an expansion, another user's
-//! home, or a `..` below a missing directory is unprovable and refuses. Every
-//! read goes through a held directory handle, every loop is bounded by
-//! [`ConfigLimits`], and every unreadable, oversized, or malformed file
-//! refuses.
+//! The scan fails closed. Every value is split into words, under every setting
+//! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
+//! resolved against the configuration file's directory and the working tree,
+//! `~` through the injected [`Home`]; an option's argument is split again; a
+//! program name passes; any other word, a command substitution, an expansion,
+//! a glob, another user's home, an `ext::` transport, or a relative `..` is
+//! unprovable and refuses. Every path is judged twice: lexically against the
+//! grants, and by a walk that opens each component through a held directory
+//! handle, follows each link it meets (at most [`MAX_LINKS`]), and refuses a
+//! link stored inside a writable grant and any component that lands inside
+//! one. A configuration file or hook that is a hard link refuses. Every loop
+//! is bounded by [`ConfigLimits`] or a declared constant, and every
+//! unreadable, oversized, or malformed file refuses.
 
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal, RegularFile};
+use ipe_fs_open::{
+    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal, RegularFile,
+};
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
 use crate::vcs_metadata::VcsKind;
 
-/// The longest path-shaped word, in bytes, the resolver takes.
+/// The longest path-shaped word or link target, in bytes, the resolver takes.
 pub const MAX_PATH_BYTES: usize = 4096;
 
-/// The most components a path-shaped word may have.
+/// The most components a path-shaped word or link target may have.
 pub const MAX_PATH_COMPONENTS: usize = 256;
+
+/// The most links one path walk follows.
+pub const MAX_LINKS: u32 = 40;
+
+/// The most words one value splits into, options' arguments included.
+pub const MAX_WORDS: u32 = 4096;
+
+/// The deepest nesting of Git submodule directories the scan reads.
+pub const MAX_MODULE_DEPTH: u32 = 32;
+
+/// The most steps one path walk takes, links' targets included.
+const MAX_WALK_STEPS: u32 = 8192;
 
 /// `n` as a [`NonZeroU64`], or one for zero.
 const fn nonzero_u64(n: u64) -> NonZeroU64 {
@@ -65,7 +86,7 @@ pub struct ConfigLimits {
     pub include_depth: NonZeroU32,
     /// The most entries listed from one directory.
     pub listing: EntryCap,
-    /// The most path-shaped words and links one scan resolves.
+    /// The most path-shaped words, links, and submodule directories one scan resolves.
     pub paths: NonZeroU32,
 }
 
@@ -81,31 +102,66 @@ impl ConfigLimits {
     };
 }
 
-/// The writable grants a jail binds: the working tree and every other one.
+/// The writable grants a jail binds, and the carved directories it binds read-only inside them.
 #[derive(Debug, Clone)]
 pub struct Grants<'g> {
-    /// The working tree, the base a relative value is also resolved against.
+    /// The working tree, the base a relative command word is also resolved against.
     worktree: &'g CanonicalPath,
     /// Every writable grant, the working tree included.
     writable: Vec<&'g CanonicalPath>,
+    /// The directories carved read-only out of the grants.
+    carves: Vec<&'g CanonicalPath>,
 }
 
 impl<'g> Grants<'g> {
-    /// The grants of a jail binding `worktree` and `others` writable.
+    /// The grants of a jail binding `worktree` and `others` writable, with nothing carved.
     #[must_use]
     pub fn new(worktree: &'g CanonicalPath, others: &[&'g CanonicalPath]) -> Self {
         let mut writable = Vec::with_capacity(others.len().saturating_add(1));
         writable.push(worktree);
         writable.extend_from_slice(others);
-        Self { worktree, writable }
+        Self {
+            worktree,
+            writable,
+            carves: Vec::new(),
+        }
     }
 
-    /// Whether `path` lies inside any writable grant.
-    fn cover(&self, path: &Path) -> bool {
-        self.writable
-            .iter()
-            .any(|grant| path_covers(grant.as_path(), path))
+    /// These grants with `carves` bound read-only inside them.
+    #[must_use]
+    pub fn with_carves(mut self, carves: &[&'g CanonicalPath]) -> Self {
+        self.carves.extend_from_slice(carves);
+        self
     }
+
+    /// Whether `path` lies inside a writable grant and not lexically inside a carve of it.
+    fn covers(&self, path: &Path) -> bool {
+        let plain = lexical(path);
+        self.writable.iter().any(|grant| {
+            path_covers(grant.as_path(), path)
+                && !self.carves.iter().any(|carve| {
+                    plain.starts_with(carve.as_path())
+                        && carve.as_path().starts_with(grant.as_path())
+                })
+        })
+    }
+}
+
+/// `path` with `.` dropped and each `..` removing the component before it, without touching the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                plain.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                plain.push(component);
+            }
+        }
+    }
+    plain
 }
 
 /// The host user's home directory, injected so the scan reads no environment.
@@ -187,15 +243,8 @@ pub enum KeyMatch {
     Any,
     /// The one key, compared in the tool's own case.
     Named(&'static str),
-}
-
-/// Which values a [`NonCode`] pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueMatch {
-    /// Every value.
-    Any,
-    /// Every value but one beginning `ext::`, which names a program Git runs.
-    NotExtTransport,
+    /// Every key whose part after its last `:` is this sub-option (Mercurial's `name:option`).
+    Suboption(&'static str),
 }
 
 /// A setting whose value never names code a tool runs, so it is not scanned.
@@ -209,13 +258,11 @@ pub struct NonCode {
     pub subsection: SubsectionMatch,
     /// The keys matched.
     pub key: KeyMatch,
-    /// The values matched.
-    pub value: ValueMatch,
 }
 
 impl NonCode {
-    /// A pattern matching every value.
-    const fn any_value(
+    /// A pattern over `kind`'s `section`.
+    const fn new(
         kind: VcsKind,
         section: &'static str,
         subsection: SubsectionMatch,
@@ -226,12 +273,11 @@ impl NonCode {
             section,
             subsection,
             key,
-            value: ValueMatch::Any,
         }
     }
 
-    /// Whether this pattern matches the setting and value.
-    fn matches(&self, kind: VcsKind, setting: (&str, Option<&str>, &str), value: &str) -> bool {
+    /// Whether this pattern matches the setting.
+    fn matches(&self, kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
         let (section, subsection, key) = setting;
         let subsection_ok = match self.subsection {
             SubsectionMatch::Absent => subsection.is_none(),
@@ -241,12 +287,9 @@ impl NonCode {
         let key_ok = match self.key {
             KeyMatch::Any => true,
             KeyMatch::Named(name) => name == key,
+            KeyMatch::Suboption(name) => key.rsplit_once(':').is_some_and(|(_, sub)| sub == name),
         };
-        let value_ok = match self.value {
-            ValueMatch::Any => true,
-            ValueMatch::NotExtTransport => !value.starts_with("ext::"),
-        };
-        self.kind == kind && self.section == section && subsection_ok && key_ok && value_ok
+        self.kind == kind && self.section == section && subsection_ok && key_ok
     }
 }
 
@@ -254,140 +297,142 @@ impl NonCode {
 ///
 /// Git keys are lowercase, as Git compares them. Git's refspecs
 /// (`remote.*.fetch`, `remote.*.push`) are listed because every clone writes
-/// one shaped like a path, and a refspec names refs, never a file.
+/// one shaped like a path, and a refspec names refs, never a file. A remote or
+/// submodule URL is never exempt: it is admitted only when it is a network URL
+/// or names a defined remote, and judged as a path otherwise.
 pub const NON_CODE: &[NonCode] = &[
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "core",
         SubsectionMatch::Absent,
         KeyMatch::Named("worktree"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "core",
         SubsectionMatch::Absent,
         KeyMatch::Named("excludesfile"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "core",
         SubsectionMatch::Absent,
         KeyMatch::Named("attributesfile"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "commit",
         SubsectionMatch::Absent,
         KeyMatch::Named("template"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "blame",
         SubsectionMatch::Absent,
         KeyMatch::Named("ignorerevsfile"),
     ),
-    NonCode::any_value(
-        VcsKind::Git,
-        "submodule",
-        SubsectionMatch::Present,
-        KeyMatch::Named("url"),
-    ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "branch",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
-    NonCode::any_value(VcsKind::Git, "user", SubsectionMatch::Either, KeyMatch::Any),
-    NonCode {
-        kind: VcsKind::Git,
-        section: "remote",
-        subsection: SubsectionMatch::Present,
-        key: KeyMatch::Named("url"),
-        value: ValueMatch::NotExtTransport,
-    },
-    NonCode {
-        kind: VcsKind::Git,
-        section: "remote",
-        subsection: SubsectionMatch::Present,
-        key: KeyMatch::Named("pushurl"),
-        value: ValueMatch::NotExtTransport,
-    },
-    NonCode::any_value(
+    NonCode::new(VcsKind::Git, "user", SubsectionMatch::Either, KeyMatch::Any),
+    NonCode::new(
         VcsKind::Git,
         "remote",
         SubsectionMatch::Present,
         KeyMatch::Named("fetch"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Git,
         "remote",
         SubsectionMatch::Present,
         KeyMatch::Named("push"),
     ),
-    NonCode::any_value(
+    NonCode::new(
+        VcsKind::Git,
+        "url",
+        SubsectionMatch::Present,
+        KeyMatch::Named("insteadof"),
+    ),
+    NonCode::new(
+        VcsKind::Git,
+        "url",
+        SubsectionMatch::Present,
+        KeyMatch::Named("pushinsteadof"),
+    ),
+    NonCode::new(
         VcsKind::Mercurial,
         "paths",
         SubsectionMatch::Absent,
-        KeyMatch::Any,
+        KeyMatch::Suboption("pushrev"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Mercurial,
         "ui",
         SubsectionMatch::Absent,
         KeyMatch::Named("username"),
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Jujutsu,
         "revset-aliases",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Jujutsu,
         "templates",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Jujutsu,
         "template-aliases",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Jujutsu,
         "colors",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
-    NonCode::any_value(
+    NonCode::new(
         VcsKind::Jujutsu,
         "user",
         SubsectionMatch::Either,
         KeyMatch::Any,
     ),
+    NonCode::new(
+        VcsKind::Jujutsu,
+        "--when",
+        SubsectionMatch::Either,
+        KeyMatch::Any,
+    ),
 ];
 
-/// Whether [`NON_CODE`] exempts the setting and value.
-fn exempt(kind: VcsKind, setting: (&str, Option<&str>, &str), value: &str) -> bool {
+/// Whether [`NON_CODE`] exempts the setting.
+fn exempt(kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
     NON_CODE
         .iter()
-        .any(|pattern| pattern.matches(kind, setting, value))
+        .any(|pattern| pattern.matches(kind, setting))
 }
 
 /// The setting a refused value came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSetting {
-    /// A key under a section and optional subsection; for Jujutsu, under its table path.
+    /// A key under a section and optional subsection.
     Key {
-        /// The section, or the dotted table path; empty for a top-level key.
-        section: String,
+        /// The section; empty for a key outside any section.
+        section: Box<str>,
         /// The subsection, when the key has one.
-        subsection: Option<String>,
+        subsection: Option<Box<str>>,
         /// The key.
-        key: String,
+        key: Box<str>,
     },
+    /// A Jujutsu value, by the path of table keys leading to it.
+    Table(Vec<String>),
     /// A Mercurial `%include` directive.
     Include,
     /// A Darcs preference line, by its one-based number.
@@ -402,14 +447,14 @@ impl fmt::Display for ConfigSetting {
                 subsection,
                 key,
             } => {
-                if !section.is_empty() {
-                    write!(f, "{}.", Shown(section))?;
-                }
-                if let Some(subsection) = subsection {
-                    write!(f, "{}.", Shown(subsection))?;
-                }
-                write!(f, "{}", Shown(key))
+                let head = Some(&**section).filter(|text| !text.is_empty());
+                let parts = head
+                    .into_iter()
+                    .chain(subsection.as_deref())
+                    .chain(std::iter::once(&**key));
+                write_parts(f, parts)
             }
+            Self::Table(parts) => write_parts(f, parts.iter().map(String::as_str)),
             Self::Include => f.write_str("%include"),
             Self::Line(number) => write!(f, "on line {number}"),
         }
@@ -421,18 +466,28 @@ impl fmt::Display for ConfigSetting {
 pub enum Unprovable {
     /// The value runs a command substitution (`$(` or a backtick).
     CommandSubstitution,
-    /// A path-shaped word expands a variable (`$NAME`, `%NAME%`).
+    /// The value expands a variable (`$NAME`, `%NAME%`).
     Expansion,
     /// A path-shaped word names another user's home (`~user`).
     TildeUser,
     /// A path-shaped word starts with `~` and no home directory is known.
     NoHome,
-    /// A `..` follows a directory that does not exist yet.
+    /// A `..` follows a missing directory or one inside a writable grant, or a relative command word holds one.
     DotDot,
-    /// The path names an entry that exists but does not resolve.
+    /// The path names an entry that exists but cannot be walked, or follows more than [`MAX_LINKS`] links.
     Unresolvable,
-    /// The word is longer than [`MAX_PATH_BYTES`] or has more than [`MAX_PATH_COMPONENTS`] components.
+    /// The word or a link target is longer than [`MAX_PATH_BYTES`] or has more than [`MAX_PATH_COMPONENTS`] components.
     TooLong,
+    /// A word is neither a program name, a path, an option, nor a number.
+    BareWord,
+    /// A word holds a glob character (`*`, `?`, `[`).
+    Glob,
+    /// The value or its subsection names Git's `ext::` transport, which runs a program.
+    ExtTransport,
+    /// The file has more than one name.
+    HardLinked,
+    /// The value splits into more than [`MAX_WORDS`] words.
+    TooManyWords,
 }
 
 impl fmt::Display for Unprovable {
@@ -446,14 +501,32 @@ impl fmt::Display for Unprovable {
             }
             Self::TildeUser => f.write_str("it names another user's home directory"),
             Self::NoHome => f.write_str("it starts with `~` and the home directory is unknown"),
-            Self::DotDot => {
-                f.write_str("it climbs with `..` out of a directory that does not exist")
-            }
-            Self::Unresolvable => f.write_str("it names an entry that exists but does not resolve"),
+            Self::DotDot => f.write_str(
+                "it climbs with `..` out of a directory that does not exist or lies inside a \
+                 writable grant, or from the directory the tool runs in",
+            ),
+            Self::Unresolvable => write!(
+                f,
+                "it names an entry that exists but cannot be walked, or follows more than \
+                 {MAX_LINKS} links"
+            ),
             Self::TooLong => write!(
                 f,
                 "it is longer than {MAX_PATH_BYTES} bytes or {MAX_PATH_COMPONENTS} components"
             ),
+            Self::BareWord => f.write_str(
+                "it holds a word that is not a path, an option, or a number, which may name a \
+                 file relative to the directory the tool runs in",
+            ),
+            Self::Glob => f.write_str(
+                "it holds a glob pattern, whose matches are unknown until the tool runs",
+            ),
+            Self::ExtTransport => f.write_str("it runs a program through Git's `ext::` transport"),
+            Self::HardLinked => f.write_str(
+                "it is a hard link, so another name of the same file may lie inside a writable \
+                 grant",
+            ),
+            Self::TooManyWords => write!(f, "it splits into more than {MAX_WORDS} words"),
         }
     }
 }
@@ -461,7 +534,7 @@ impl fmt::Display for Unprovable {
 /// What a refused value or link names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Named {
-    /// This resolved path, inside a writable grant.
+    /// This path, inside a writable grant.
     InGrant(PathBuf),
     /// A path that cannot be proven outside every writable grant.
     Unprovable(Unprovable),
@@ -479,6 +552,8 @@ pub enum ConfigFault {
     },
     /// Its includes nest deeper than [`ConfigLimits::include_depth`], or form a cycle.
     IncludeDepth,
+    /// Its submodule directories nest deeper than [`MAX_MODULE_DEPTH`].
+    ModuleDepth,
     /// The scan reached [`ConfigLimits::files`].
     Files,
     /// The scan reached [`ConfigLimits::total_bytes`].
@@ -495,6 +570,10 @@ impl fmt::Display for ConfigFault {
             Self::Open(refusal) => write!(f, "{refusal}"),
             Self::Malformed { line } => write!(f, "line {line} is not valid configuration syntax"),
             Self::IncludeDepth => f.write_str("its includes nest past the include depth limit"),
+            Self::ModuleDepth => write!(
+                f,
+                "its submodule directories nest deeper than {MAX_MODULE_DEPTH} levels"
+            ),
             Self::Files => f.write_str("the scan reached its limit on configuration files"),
             Self::Bytes => f.write_str("the scan reached its limit on configuration bytes"),
             Self::Paths => f.write_str("the scan reached its limit on resolved paths"),
@@ -533,13 +612,22 @@ pub enum ConfigRefusal {
         /// What the value names.
         named: Named,
     },
-    /// A link the tool follows (a configuration file, a hooks directory or hook) points inside a writable grant, or may.
+    /// A link or hard link the tool reads through (a configuration file, a hooks directory or hook) reaches inside a writable grant, or may.
     LinkNamesWritable {
         /// The tool.
         kind: VcsKind,
         /// The link.
         link: PathBuf,
-        /// What the link points at.
+        /// What the link reaches.
+        named: Named,
+    },
+    /// A configuration file or directory the tool reads lies inside a writable grant, or may.
+    ConfigInGrant {
+        /// The tool.
+        kind: VcsKind,
+        /// The file or directory, as the tool reads it.
+        path: PathBuf,
+        /// Where it lies.
         named: Named,
     },
     /// A configuration file could not be checked.
@@ -594,7 +682,7 @@ impl ConfigRefusal {
         }
     }
 
-    /// The sentence for a link pointing at `named`.
+    /// The sentence for a link reaching `named`.
     fn fmt_link(
         f: &mut fmt::Formatter<'_>,
         kind: VcsKind,
@@ -608,13 +696,38 @@ impl ConfigRefusal {
                 f,
                 "the {tool} link `{link}` points at `{}` inside a writable grant, so a jailed \
                  program could change what {tool} reads or runs outside the jail; replace the link \
-                 with the file it names, {REFUSING}",
+                 with a copy of the file it names, {REFUSING}",
                 Shown(path.as_os_str())
             ),
             Named::Unprovable(why) => write!(
                 f,
                 "the {tool} link `{link}` cannot be proven to point outside the writable grants: \
-                 {why}; replace the link with the file it names, {REFUSING}"
+                 {why}; replace the link with a copy of the file it names, {REFUSING}"
+            ),
+        }
+    }
+
+    /// The sentence for a configuration file or directory lying at `named`.
+    fn fmt_config(
+        f: &mut fmt::Formatter<'_>,
+        kind: VcsKind,
+        path: &Path,
+        named: &Named,
+    ) -> fmt::Result {
+        let tool = tool_name(kind);
+        let path = Shown(path.as_os_str());
+        match named {
+            Named::InGrant(at) => write!(
+                f,
+                "the {tool} configuration `{path}` lies at `{}` inside a writable grant, so a \
+                 jailed program could change what {tool} reads or runs outside the jail; carve it \
+                 out of the grant, {REFUSING}",
+                Shown(at.as_os_str())
+            ),
+            Named::Unprovable(why) => write!(
+                f,
+                "the {tool} configuration `{path}` cannot be proven to lie outside the writable \
+                 grants: {why}; carve it out of the grant, {REFUSING}"
             ),
         }
     }
@@ -630,6 +743,7 @@ impl fmt::Display for ConfigRefusal {
                 named,
             } => Self::fmt_value(f, *kind, source, setting, named),
             Self::LinkNamesWritable { kind, link, named } => Self::fmt_link(f, *kind, link, named),
+            Self::ConfigInGrant { kind, path, named } => Self::fmt_config(f, *kind, path, named),
             Self::Unreadable { kind, path, fault } => write!(
                 f,
                 "the {} configuration `{}` cannot be checked for code inside a writable grant: \
@@ -643,44 +757,90 @@ impl fmt::Display for ConfigRefusal {
 
 impl std::error::Error for ConfigRefusal {}
 
-/// Text shown injectively: a backslash, a control or bidirectional-format
-/// character, and every byte that is not UTF-8 is written as an escape.
-struct Shown<'a, T: ?Sized>(&'a T);
-
-impl<T: AsRef<std::ffi::OsStr> + ?Sized> fmt::Display for Shown<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for chunk in self.0.as_ref().as_encoded_bytes().utf8_chunks() {
-            for c in chunk.valid().chars() {
-                if c == '\\' {
-                    f.write_str("\\\\")?;
-                } else if c.is_control()
-                    || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-                {
-                    let code = u32::from(c);
-                    write!(f, "\\u{{{code:x}}}")?;
-                } else {
-                    f.write_char(c)?;
-                }
-            }
-            for byte in chunk.invalid() {
-                write!(f, "\\x{byte:02x}")?;
+/// Write `bytes` injectively: a backslash, a control, bidirectional-format, or
+/// invisible separator character, every byte that is not UTF-8, and with
+/// `quote` a double quote, each as an escape.
+fn write_escaped(f: &mut fmt::Formatter<'_>, bytes: &[u8], quote: bool) -> fmt::Result {
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c == '\\' {
+                f.write_str("\\\\")?;
+            } else if quote && c == '"' {
+                f.write_str("\\\"")?;
+            } else if c.is_control()
+                || matches!(
+                    c,
+                    '\u{61c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+            {
+                let code = u32::from(c);
+                write!(f, "\\u{{{code:x}}}")?;
+            } else {
+                f.write_char(c)?;
             }
         }
-        Ok(())
+        for byte in chunk.invalid() {
+            write!(f, "\\x{byte:02x}")?;
+        }
+    }
+    Ok(())
+}
+
+/// One part of a dotted setting name: bare when it is a plain identifier, quoted and escaped otherwise.
+fn write_part(f: &mut fmt::Formatter<'_>, part: &str) -> fmt::Result {
+    let bare = !part.is_empty()
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if bare {
+        return f.write_str(part);
+    }
+    f.write_char('"')?;
+    write_escaped(f, part.as_bytes(), true)?;
+    f.write_char('"')
+}
+
+/// The parts of a setting name, joined with `.`.
+fn write_parts<'p>(
+    f: &mut fmt::Formatter<'_>,
+    parts: impl IntoIterator<Item = &'p str>,
+) -> fmt::Result {
+    for (index, part) in parts.into_iter().enumerate() {
+        if index > 0 {
+            f.write_char('.')?;
+        }
+        write_part(f, part)?;
+    }
+    Ok(())
+}
+
+/// Text shown injectively, as [`write_escaped`] writes it.
+struct Shown<'a, T: ?Sized>(&'a T);
+
+impl<T: AsRef<OsStr> + ?Sized> fmt::Display for Shown<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_escaped(f, self.0.as_ref().as_encoded_bytes(), false)
     }
 }
 
 /// Scan the configuration a tool reads from `roots`, refusing when it names code inside a grant.
 ///
-/// Every configuration file the tool reads from the carved metadata is read
-/// through a held handle, its includes followed, and every value judged; the
-/// Git hooks directories are listed for links. Nothing is read from the
+/// Every configuration file the tool reads from the carved metadata (Git's
+/// per-worktree and submodule configuration included) is reached by a held
+/// walk, its includes followed, and every value judged; the Git hooks
+/// directories are listed for links and hard links. Nothing is read from the
 /// environment: the grants and the home directory are injected.
 ///
 /// # Errors
 /// [`ConfigRefusal::NamesWritableCode`] for a value naming, or perhaps naming,
 /// a path inside a writable grant; [`ConfigRefusal::LinkNamesWritable`] for
-/// such a link; [`ConfigRefusal::Unreadable`] for a root directory or file that
+/// such a link or a hard-linked file; [`ConfigRefusal::ConfigInGrant`] for a
+/// configuration file or directory lying inside a grant;
+/// [`ConfigRefusal::Unreadable`] for a grant, root directory, or file that
 /// cannot be opened, read, or parsed, or a ceiling reached.
 pub fn scan(
     roots: &ConfigRoots<'_>,
@@ -688,21 +848,25 @@ pub fn scan(
     home: &Home,
     limits: ConfigLimits,
 ) -> Result<(), ConfigRefusal> {
+    let kind = roots.kind();
     let mut run = Scan {
-        kind: roots.kind(),
+        kind,
         grants,
         home,
         limits,
+        marks: marks(grants, kind)?,
         files: 0,
         bytes: 0,
         paths: 0,
         pending: Vec::new(),
+        remotes: BTreeSet::new(),
+        deferred: Vec::new(),
     };
     run.seed(roots)?;
     while let Some(item) = run.pending.pop() {
         run.read(item)?;
     }
-    Ok(())
+    run.judge_deferred()
 }
 
 /// The configuration syntax a file is parsed with.
@@ -730,6 +894,7 @@ struct Pending {
 }
 
 /// A configuration file being judged.
+#[derive(Debug, Clone)]
 struct FileCtx {
     /// The path the tool reads it at.
     source: PathBuf,
@@ -746,14 +911,46 @@ struct FileCtx {
 enum Role {
     /// Never names code: not judged.
     Exempt,
-    /// Every path-shaped word is judged.
+    /// Every word is judged.
     Words,
-    /// Every path-shaped word, and this text as one path whatever its shape.
+    /// Every word, and this text as one command path whatever its shape.
     Forced(String),
-    /// As [`Role::Forced`] over the whole value, then the file it names is read.
+    /// The whole value as one path to a file that is then read.
     Include,
-    /// As [`Role::Forced`] over the whole value, then the directory it names is listed for links.
+    /// Every word, and the whole value as one directory that is then listed for links.
     HooksPath,
+    /// Admitted when a network URL (also in `host:path` form when `scp`), judged as [`Role::Forced`] otherwise.
+    Url {
+        /// Whether Git's `host:path` form counts as a network URL.
+        scp: bool,
+    },
+}
+
+/// What becomes of a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    /// It is judged in this role.
+    Judge(Role),
+    /// It names a remote: admitted when one is defined, judged as a URL otherwise, once every file is read.
+    RemoteName,
+}
+
+/// Which bases a relative path word resolves against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A program or argument: the file's directories and the working tree; a `..` is unprovable.
+    Command,
+    /// A file the tool reads relative to the including file: only the file's directories.
+    Include,
+}
+
+/// Where a word stands in its command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// The program a command runs, found through the host's `PATH`.
+    Program,
+    /// An argument, which a program may read relative to the directory it runs in.
+    Argument,
 }
 
 /// Where a parsed value came from, sharing its section text.
@@ -783,9 +980,9 @@ impl Setting {
                 subsection,
                 key,
             } => ConfigSetting::Key {
-                section: section.to_string(),
-                subsection: subsection.as_ref().map(ToString::to_string),
-                key: key.clone(),
+                section: Box::from(&**section),
+                subsection: subsection.as_deref().map(Box::from),
+                key: Box::from(key.as_str()),
             },
             Self::Include => ConfigSetting::Include,
             Self::Line(number) => ConfigSetting::Line(*number),
@@ -802,13 +999,14 @@ struct Entry {
     value: String,
 }
 
-/// A path resolved through its longest existing prefix.
-#[derive(Debug)]
-struct Resolved {
-    /// The canonical existing prefix joined with the rest.
-    path: PathBuf,
-    /// Whether the whole path exists.
-    exists: bool,
+/// A remote-name value waiting for every remote to be known.
+struct Deferred {
+    /// The file it came from.
+    ctx: FileCtx,
+    /// The setting holding it.
+    setting: Setting,
+    /// The value.
+    value: String,
 }
 
 /// Why judging a value stopped.
@@ -839,6 +1037,199 @@ impl Stop {
     }
 }
 
+/// A value stopped as unprovable.
+const fn unproven(why: Unprovable) -> Stop {
+    Stop::Named(Named::Unprovable(why))
+}
+
+/// Where a walk stands relative to the grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zone {
+    /// Outside every grant.
+    Outside,
+    /// Inside a writable grant and outside its carves.
+    Writable,
+    /// Inside a carve.
+    Carved,
+}
+
+/// A grant or carve directory, by path and identity.
+struct Mark {
+    /// Its canonical path.
+    path: PathBuf,
+    /// Its identity.
+    id: FileId,
+    /// [`Zone::Writable`] for a grant, [`Zone::Carved`] for a carve.
+    zone: Zone,
+}
+
+/// Every grant and carve of `grants`, identified now.
+fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal> {
+    let writable = grants.writable.iter().map(|path| (path, Zone::Writable));
+    let carved = grants.carves.iter().map(|path| (path, Zone::Carved));
+    writable
+        .chain(carved)
+        .map(|(path, zone)| {
+            let path = path.as_path();
+            FileId::of_path(path)
+                .map(|id| Mark {
+                    path: path.to_path_buf(),
+                    id,
+                    zone,
+                })
+                .map_err(|refusal| ConfigRefusal::Unreadable {
+                    kind,
+                    path: path.to_path_buf(),
+                    fault: fault_of(refusal),
+                })
+        })
+        .collect()
+}
+
+/// One step of a path walk.
+enum Step {
+    /// Enter the entry of this name.
+    Name(OsString),
+    /// Climb to the parent.
+    Up,
+}
+
+/// Push the steps of `path` so that popping yields them in order.
+fn push_steps(steps: &mut Vec<Step>, path: &Path) {
+    for component in path.components().rev() {
+        match component {
+            Component::Normal(part) => steps.push(Step::Name(part.to_os_string())),
+            Component::ParentDir => steps.push(Step::Up),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+}
+
+/// The root of an absolute path: its prefix and root components.
+fn root_of(path: &Path) -> PathBuf {
+    path.components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .collect()
+}
+
+/// A path walk in progress: the held directory reached, its real path, and the steps left.
+struct Walk {
+    /// The directory reached.
+    cur: HeldDir,
+    /// Its path, as the walk reached it through real directories.
+    real: PathBuf,
+    /// Its zone.
+    zone: Zone,
+    /// The zone of every directory above it, innermost last.
+    above: Vec<Zone>,
+    /// The steps left, next last.
+    steps: Vec<Step>,
+    /// Links followed.
+    links: u32,
+    /// Steps taken.
+    taken: u32,
+    /// Whether a link was followed.
+    linked: bool,
+}
+
+/// Why a walk stopped.
+enum WalkStop {
+    /// The path names this.
+    Named {
+        /// What it names.
+        named: Named,
+        /// Whether the walk followed a link before it stopped.
+        linked: bool,
+    },
+    /// A refusal not about the path (a ceiling).
+    Refused(ConfigRefusal),
+}
+
+impl From<WalkStop> for Stop {
+    fn from(stop: WalkStop) -> Self {
+        match stop {
+            WalkStop::Named { named, .. } => Self::Named(named),
+            WalkStop::Refused(refusal) => Self::Refused(refusal),
+        }
+    }
+}
+
+impl Walk {
+    /// The walk stopped as unprovable.
+    const fn stop(&self, why: Unprovable) -> WalkStop {
+        WalkStop::Named {
+            named: Named::Unprovable(why),
+            linked: self.linked,
+        }
+    }
+
+    /// Climb to the parent through the handle; the root's parent is the root.
+    fn up(&mut self) -> Result<(), WalkStop> {
+        if self.zone == Zone::Writable {
+            return Err(self.stop(Unprovable::DotDot));
+        }
+        match self.cur.parent() {
+            Ok(Some(parent)) => {
+                let Some(zone) = self.above.pop() else {
+                    return Err(self.stop(Unprovable::Unresolvable));
+                };
+                self.cur = parent;
+                self.zone = zone;
+                self.real.pop();
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(_) => Err(self.stop(Unprovable::Unresolvable)),
+        }
+    }
+
+    /// Append the steps left below a missing entry, which must hold no `..`.
+    fn missing(&mut self) -> Result<(), WalkStop> {
+        let mut count = self.real.components().count();
+        while let Some(step) = self.steps.pop() {
+            match step {
+                Step::Name(part) => {
+                    count = count.saturating_add(1);
+                    if count > MAX_PATH_COMPONENTS {
+                        return Err(self.stop(Unprovable::TooLong));
+                    }
+                    self.real.push(part);
+                }
+                Step::Up => return Err(self.stop(Unprovable::DotDot)),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a walk ended on.
+enum End {
+    /// Nothing: the path names an entry that does not exist yet.
+    Missing,
+    /// A directory.
+    Dir(HeldDir),
+    /// An entry that is neither a directory nor a link, in the held directory.
+    Entry(HeldDir, EntryName),
+}
+
+/// A walked path proven outside every writable grant.
+struct Resolved {
+    /// The path the walk reached, through real directories.
+    path: PathBuf,
+    /// What it ended on.
+    end: End,
+}
+
+/// What one named step of a walk led to.
+enum Next {
+    /// A directory or a link: the walk goes on.
+    Continue,
+    /// A missing entry: the walk is over.
+    Missing,
+    /// A non-directory entry: the walk is over.
+    Entry(EntryName),
+}
+
 /// An opened configuration file.
 struct Opened {
     /// The held file.
@@ -857,6 +1248,8 @@ struct Scan<'s> {
     home: &'s Home,
     /// The ceilings.
     limits: ConfigLimits,
+    /// The grants and carves, identified.
+    marks: Vec<Mark>,
     /// Files read so far.
     files: u32,
     /// Bytes read so far.
@@ -865,6 +1258,10 @@ struct Scan<'s> {
     paths: u32,
     /// Files still to read.
     pending: Vec<Pending>,
+    /// The Git remotes defined with a URL.
+    remotes: BTreeSet<String>,
+    /// Remote-name values waiting for every remote to be known.
+    deferred: Vec<Deferred>,
 }
 
 impl Scan<'_> {
@@ -883,6 +1280,25 @@ impl Scan<'_> {
             kind: self.kind,
             link: link.to_path_buf(),
             named,
+        }
+    }
+
+    /// The refusal for a configuration file or directory at `path` whose walk stopped.
+    fn root_refusal(&self, path: &Path, stop: WalkStop) -> ConfigRefusal {
+        match stop {
+            WalkStop::Refused(refusal) => refusal,
+            WalkStop::Named {
+                named,
+                linked: true,
+            } => self.link_refusal(path, named),
+            WalkStop::Named {
+                named,
+                linked: false,
+            } => ConfigRefusal::ConfigInGrant {
+                kind: self.kind,
+                path: path.to_path_buf(),
+                named,
+            },
         }
     }
 
@@ -905,7 +1321,7 @@ impl Scan<'_> {
         HeldDir::open_root(dir).map_err(|refusal| self.unreadable(dir, fault_of(refusal)))
     }
 
-    /// Queue every root file of `roots` and list the Git hooks directories.
+    /// Queue every root file of `roots`, and list the Git hooks directories.
     fn seed(&mut self, roots: &ConfigRoots<'_>) -> Result<(), ConfigRefusal> {
         match *roots {
             ConfigRoots::Git { gitdir, commondir } => {
@@ -916,11 +1332,14 @@ impl Scan<'_> {
                 self.queue(gitdir.join("config.worktree"), Syntax::Git);
                 if common != gitdir {
                     self.queue(common.join("config"), Syntax::Git);
+                    self.queue(common.join("config.worktree"), Syntax::Git);
                 }
                 self.list_hooks(&gitdir.join("hooks"))?;
                 if common != gitdir {
                     self.list_hooks(&common.join("hooks"))?;
                 }
+                self.seed_worktrees(common, gitdir)?;
+                self.seed_modules(common)?;
             }
             ConfigRoots::Mercurial { dot_hg, shared } => {
                 self.require(dot_hg)?;
@@ -934,12 +1353,74 @@ impl Scan<'_> {
             ConfigRoots::Jujutsu { dot_jj, repo } => {
                 self.queue_toml(dot_jj)?;
                 self.queue_toml(repo)?;
+                self.queue(repo.join("store/git/config"), Syntax::Git);
             }
             ConfigRoots::Darcs { dot_darcs } => {
                 self.require(dot_darcs)?;
                 let prefs = dot_darcs.join("prefs");
                 self.queue(prefs.join("defaults"), Syntax::Darcs);
                 self.queue(prefs.join("prefs"), Syntax::Darcs);
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue the `config.worktree` of every linked worktree of `common` but `gitdir`'s own.
+    fn seed_worktrees(&mut self, common: &Path, gitdir: &Path) -> Result<(), ConfigRefusal> {
+        let Some((dir, real)) = self.open_dir(&common.join("worktrees"))? else {
+            return Ok(());
+        };
+        let own = lexical(gitdir);
+        let entries = dir
+            .entries(self.limits.listing)
+            .map_err(|refusal| self.unreadable(&real, fault_of(refusal)))?;
+        for (name, kind) in entries {
+            if matches!(kind, FileKind::Dir | FileKind::Symlink) {
+                let entry = real.join(name.as_os_str());
+                if entry != own {
+                    self.queue(entry.join("config.worktree"), Syntax::Git);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue the configuration and list the hooks of every submodule gitdir below `common/modules`.
+    ///
+    /// A directory holding a `config` entry is a submodule gitdir, whose own
+    /// `modules` directory is walked next; any other directory groups
+    /// submodules by name and every directory or link in it is walked. The walk
+    /// keeps an explicit stack, and every directory it pushes is counted
+    /// against [`ConfigLimits::paths`].
+    fn seed_modules(&mut self, common: &Path) -> Result<(), ConfigRefusal> {
+        let mut stack: Vec<(PathBuf, u32)> = vec![(common.join("modules"), 1)];
+        while let Some((path, depth)) = stack.pop() {
+            let Some((dir, real)) = self.open_dir(&path)? else {
+                continue;
+            };
+            if depth > MAX_MODULE_DEPTH {
+                return Err(self.unreadable(&path, ConfigFault::ModuleDepth));
+            }
+            let entries = dir
+                .entries(self.limits.listing)
+                .map_err(|refusal| self.unreadable(&real, fault_of(refusal)))?;
+            let gitdir = entries
+                .iter()
+                .any(|(name, kind)| name.as_os_str() == "config" && *kind != FileKind::Dir);
+            let below = depth.saturating_add(1);
+            if gitdir {
+                self.queue(real.join("config"), Syntax::Git);
+                self.queue(real.join("config.worktree"), Syntax::Git);
+                self.list_hooks(&real.join("hooks"))?;
+                self.count_path(&real)?;
+                stack.push((real.join("modules"), below));
+            } else {
+                for (name, kind) in entries {
+                    if matches!(kind, FileKind::Dir | FileKind::Symlink) {
+                        self.count_path(&real)?;
+                        stack.push((real.join(name.as_os_str()), below));
+                    }
+                }
             }
         }
         Ok(())
@@ -971,65 +1452,303 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Resolve the link `link`, refusing when it points inside a grant or cannot be proven not to.
-    fn link_target(&mut self, link: &Path) -> Result<Resolved, ConfigRefusal> {
-        self.count_path(link)?;
-        let target = std::fs::read_link(link)
-            .map_err(|e| self.unreadable(link, ConfigFault::Open(OpenRefusal::Io(e.kind()))))?;
-        let joined = link
-            .parent()
-            .map_or_else(|| target.clone(), |dir| dir.join(&target));
-        let resolved =
-            resolve(&joined).map_err(|why| self.link_refusal(link, Named::Unprovable(why)))?;
-        if self.grants.cover(&resolved.path) {
-            return Err(self.link_refusal(link, Named::InGrant(resolved.path)));
+    /// The zone of the directory `dir`, held at `real`, below a directory of zone `parent`.
+    fn classify(&self, dir: &HeldDir, real: &Path, parent: Zone) -> Result<Zone, Unprovable> {
+        let id = dir.id().map_err(|_| Unprovable::Unresolvable)?;
+        let hit = |zone: Zone| {
+            self.marks
+                .iter()
+                .any(|mark| mark.zone == zone && (mark.id == id || mark.path.as_path() == real))
+        };
+        if hit(Zone::Carved) {
+            Ok(Zone::Carved)
+        } else if hit(Zone::Writable) {
+            Ok(Zone::Writable)
+        } else {
+            Ok(parent)
         }
-        Ok(resolved)
     }
 
-    /// List a hooks directory, refusing a link (the directory or an entry) into a grant.
-    fn list_hooks(&mut self, hooks: &Path) -> Result<(), ConfigRefusal> {
-        let Some((parent, name)) = split(hooks) else {
-            return Err(self.unreadable(hooks, ConfigFault::Open(OpenRefusal::BadName)));
+    /// Begin a walk of the absolute `path` at its root.
+    fn walk_start(&self, path: &Path) -> Result<Walk, Unprovable> {
+        if path.as_os_str().len() > MAX_PATH_BYTES
+            || path.components().count() > MAX_PATH_COMPONENTS
+        {
+            return Err(Unprovable::TooLong);
+        }
+        if !path.is_absolute() {
+            return Err(Unprovable::Unresolvable);
+        }
+        let root = root_of(path);
+        let cur = HeldDir::open_root(&root).map_err(|_| Unprovable::Unresolvable)?;
+        let zone = self.classify(&cur, &root, Zone::Outside)?;
+        let mut steps = Vec::new();
+        push_steps(&mut steps, path);
+        Ok(Walk {
+            cur,
+            real: root,
+            zone,
+            above: Vec::new(),
+            steps,
+            links: 0,
+            taken: 0,
+            linked: false,
+        })
+    }
+
+    /// Walk the absolute `path` component by component through held handles.
+    ///
+    /// Each directory is opened below the last without following a link; a
+    /// link is read through its directory's handle and its target walked in
+    /// its place, unless the link lies inside a writable grant. The walk stops
+    /// with [`Named::InGrant`] when it ends inside a writable grant, and with
+    /// [`Named::Unprovable`] for a `..` below a missing entry or out of a
+    /// grant, an entry that cannot be walked, or a ceiling. `source` is the
+    /// file a link count is charged to.
+    fn walk(&mut self, path: &Path, source: &Path) -> Result<Resolved, WalkStop> {
+        let mut walk = self.walk_start(path).map_err(|why| WalkStop::Named {
+            named: Named::Unprovable(why),
+            linked: false,
+        })?;
+        while let Some(step) = walk.steps.pop() {
+            walk.taken = walk.taken.saturating_add(1);
+            if walk.taken > MAX_WALK_STEPS {
+                return Err(walk.stop(Unprovable::TooLong));
+            }
+            let next = match step {
+                Step::Up => {
+                    walk.up()?;
+                    Next::Continue
+                }
+                Step::Name(part) => self.walk_name(&mut walk, &part, source)?,
+            };
+            match next {
+                Next::Continue => {}
+                Next::Missing => {
+                    let Walk {
+                        real, zone, linked, ..
+                    } = walk;
+                    return self.finish(real, zone, linked, End::Missing);
+                }
+                Next::Entry(name) => {
+                    let Walk {
+                        cur,
+                        real,
+                        zone,
+                        linked,
+                        ..
+                    } = walk;
+                    return self.finish(real, zone, linked, End::Entry(cur, name));
+                }
+            }
+        }
+        let Walk {
+            cur,
+            real,
+            zone,
+            linked,
+            ..
+        } = walk;
+        self.finish(real, zone, linked, End::Dir(cur))
+    }
+
+    /// Take the step into the entry `part` of the walk's directory.
+    fn walk_name(
+        &mut self,
+        walk: &mut Walk,
+        part: &OsStr,
+        source: &Path,
+    ) -> Result<Next, WalkStop> {
+        let Some(name) = EntryName::new(part) else {
+            return Err(walk.stop(Unprovable::Unresolvable));
         };
-        let held = match HeldDir::open_root(parent) {
-            Ok(held) => held,
-            Err(OpenRefusal::Absent) => return Ok(()),
-            Err(refusal) => return Err(self.unreadable(parent, fault_of(refusal))),
-        };
-        let kind = held
+        let kind = walk
+            .cur
             .kind_of(&name)
-            .map_err(|refusal| self.unreadable(hooks, fault_of(refusal)))?;
-        let (dir, listed_at) = match kind {
-            None
-            | Some(
+            .map_err(|_| walk.stop(Unprovable::Unresolvable))?;
+        match kind {
+            None => {
+                walk.real.push(part);
+                walk.missing()?;
+                Ok(Next::Missing)
+            }
+            Some(FileKind::Dir) => {
+                let child = walk
+                    .cur
+                    .child_dir(&name)
+                    .map_err(|_| walk.stop(Unprovable::Unresolvable))?;
+                if walk.above.len() >= MAX_PATH_COMPONENTS {
+                    return Err(walk.stop(Unprovable::TooLong));
+                }
+                walk.real.push(part);
+                let zone = self
+                    .classify(&child, &walk.real, walk.zone)
+                    .map_err(|why| walk.stop(why))?;
+                walk.above.push(walk.zone);
+                walk.zone = zone;
+                walk.cur = child;
+                Ok(Next::Continue)
+            }
+            Some(FileKind::Symlink) => {
+                self.walk_link(walk, &name, source)?;
+                Ok(Next::Continue)
+            }
+            Some(
                 FileKind::Regular
                 | FileKind::Fifo
                 | FileKind::Socket
                 | FileKind::Device
                 | FileKind::Other,
-            ) => return Ok(()),
-            Some(FileKind::Dir) => (
-                held.child_dir(&name)
-                    .map_err(|refusal| self.unreadable(hooks, fault_of(refusal)))?,
-                hooks.to_path_buf(),
-            ),
-            Some(FileKind::Symlink) => {
-                let target = self.link_target(hooks)?;
-                if !target.exists {
-                    return Ok(());
+            ) => {
+                if !walk.steps.is_empty() {
+                    return Err(walk.stop(Unprovable::Unresolvable));
                 }
-                let dir = HeldDir::open_root(&target.path)
-                    .map_err(|refusal| self.unreadable(&target.path, fault_of(refusal)))?;
-                (dir, target.path)
+                walk.real.push(part);
+                Ok(Next::Entry(name))
             }
-        };
+        }
+    }
+
+    /// Replace the link `name` of the walk's directory with the steps of its target.
+    fn walk_link(
+        &mut self,
+        walk: &mut Walk,
+        name: &EntryName,
+        source: &Path,
+    ) -> Result<(), WalkStop> {
+        if walk.zone == Zone::Writable {
+            return Err(WalkStop::Named {
+                named: Named::InGrant(walk.real.join(name.as_os_str())),
+                linked: true,
+            });
+        }
+        walk.links = walk.links.saturating_add(1);
+        if walk.links > MAX_LINKS {
+            return Err(walk.stop(Unprovable::Unresolvable));
+        }
+        self.count_path(source).map_err(WalkStop::Refused)?;
+        walk.linked = true;
+        let target = walk
+            .cur
+            .read_link(name)
+            .map_err(|_| walk.stop(Unprovable::Unresolvable))?;
+        if target.as_os_str().len() > MAX_PATH_BYTES
+            || target.components().count() > MAX_PATH_COMPONENTS
+        {
+            return Err(walk.stop(Unprovable::TooLong));
+        }
+        if target.is_absolute() {
+            let root = root_of(&target);
+            let cur = HeldDir::open_root(&root).map_err(|_| walk.stop(Unprovable::Unresolvable))?;
+            let zone = self
+                .classify(&cur, &root, Zone::Outside)
+                .map_err(|why| walk.stop(why))?;
+            walk.cur = cur;
+            walk.real = root;
+            walk.zone = zone;
+            walk.above.clear();
+        } else if target.has_root()
+            || matches!(target.components().next(), Some(Component::Prefix(_)))
+        {
+            return Err(walk.stop(Unprovable::Unresolvable));
+        }
+        push_steps(&mut walk.steps, &target);
+        Ok(())
+    }
+
+    /// End a walk at `real`, refusing a place inside a writable grant.
+    fn finish(
+        &self,
+        real: PathBuf,
+        zone: Zone,
+        linked: bool,
+        end: End,
+    ) -> Result<Resolved, WalkStop> {
+        if zone == Zone::Writable || self.grants.covers(&real) {
+            return Err(WalkStop::Named {
+                named: Named::InGrant(real),
+                linked,
+            });
+        }
+        Ok(Resolved { path: real, end })
+    }
+
+    /// Refuse a file with more than one name.
+    fn single_link(&self, at: &Path, file: &RegularFile) -> Result<(), ConfigRefusal> {
+        match file.link_count() {
+            Ok(count) if count <= 1 => Ok(()),
+            Ok(_) => Err(self.link_refusal(at, Named::Unprovable(Unprovable::HardLinked))),
+            Err(refusal) => Err(self.unreadable(at, fault_of(refusal))),
+        }
+    }
+
+    /// Walk to the directory at `path`; `None` when it is absent or not a directory.
+    fn open_dir(&mut self, path: &Path) -> Result<Option<(HeldDir, PathBuf)>, ConfigRefusal> {
+        let found = self
+            .walk(path, path)
+            .map_err(|stop| self.root_refusal(path, stop))?;
+        match found.end {
+            End::Missing | End::Entry(..) => Ok(None),
+            End::Dir(dir) => Ok(Some((dir, found.path))),
+        }
+    }
+
+    /// List a hooks directory, refusing a link into a grant and a hard-linked hook.
+    fn list_hooks(&mut self, hooks: &Path) -> Result<(), ConfigRefusal> {
+        if let Some((dir, real)) = self.open_dir(hooks)? {
+            self.list_held(&dir, &real)?;
+        }
+        Ok(())
+    }
+
+    /// Check every entry of the held hooks directory at `real`.
+    fn list_held(&mut self, dir: &HeldDir, real: &Path) -> Result<(), ConfigRefusal> {
         let entries = dir
             .entries(self.limits.listing)
-            .map_err(|refusal| self.unreadable(&listed_at, fault_of(refusal)))?;
-        for (entry, entry_kind) in entries {
-            if entry_kind == FileKind::Symlink {
-                self.link_target(&listed_at.join(entry.as_os_str()))?;
+            .map_err(|refusal| self.unreadable(real, fault_of(refusal)))?;
+        for (name, kind) in entries {
+            let at = real.join(name.as_os_str());
+            match kind {
+                FileKind::Symlink => self.held_link(dir, real, &name, &at)?,
+                FileKind::Regular => {
+                    let file = dir
+                        .open_regular(&name)
+                        .map_err(|refusal| self.unreadable(&at, fault_of(refusal)))?;
+                    self.single_link(&at, &file)?;
+                }
+                FileKind::Dir
+                | FileKind::Fifo
+                | FileKind::Socket
+                | FileKind::Device
+                | FileKind::Other => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Check the hook link `name` of the held directory at `real`, listed as `at`.
+    fn held_link(
+        &mut self,
+        dir: &HeldDir,
+        real: &Path,
+        name: &EntryName,
+        at: &Path,
+    ) -> Result<(), ConfigRefusal> {
+        let target = dir
+            .read_link(name)
+            .map_err(|refusal| self.unreadable(at, fault_of(refusal)))?;
+        self.count_path(at)?;
+        let found = self
+            .walk(&real.join(target), at)
+            .map_err(|stop| match stop {
+                WalkStop::Named { named, .. } => self.link_refusal(at, named),
+                WalkStop::Refused(refusal) => refusal,
+            })?;
+        if let End::Entry(holder, entry) = found.end {
+            match holder.open_regular(&entry) {
+                Ok(file) => self.single_link(at, &file)?,
+                Err(OpenRefusal::Absent) => {}
+                Err(refusal) => return Err(self.unreadable(at, fault_of(refusal))),
             }
         }
         Ok(())
@@ -1037,44 +1756,33 @@ impl Scan<'_> {
 
     /// Open the configuration file at `path`; `None` when it is absent.
     fn open(&mut self, path: &Path) -> Result<Option<Opened>, ConfigRefusal> {
-        let Some((dir, name)) = split(path) else {
-            return Err(self.unreadable(path, ConfigFault::Open(OpenRefusal::BadName)));
+        let found = self
+            .walk(path, path)
+            .map_err(|stop| self.root_refusal(path, stop))?;
+        let file = match found.end {
+            End::Missing => return Ok(None),
+            End::Dir(_) => {
+                let fault = ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Dir));
+                return Err(self.unreadable(path, fault));
+            }
+            End::Entry(dir, name) => match dir.open_regular(&name) {
+                Ok(file) => file,
+                Err(OpenRefusal::Absent) => return Ok(None),
+                Err(refusal) => return Err(self.unreadable(path, fault_of(refusal))),
+            },
         };
-        let held = match HeldDir::open_root(dir) {
-            Ok(held) => held,
-            Err(OpenRefusal::Absent) => return Ok(None),
-            Err(refusal) => return Err(self.unreadable(dir, fault_of(refusal))),
-        };
-        match held.open_regular(&name) {
-            Ok(file) => Ok(Some(Opened {
-                file,
-                bases: vec![dir.to_path_buf()],
-            })),
-            Err(OpenRefusal::Absent) => Ok(None),
-            Err(OpenRefusal::Link) => self.open_link(path, dir),
-            Err(refusal) => Err(self.unreadable(path, fault_of(refusal))),
+        self.single_link(path, &file)?;
+        let mut bases = Vec::with_capacity(2);
+        if let Some(dir) = path.parent() {
+            bases.push(lexical(dir));
         }
-    }
-
-    /// Open the file the link `path` points at, once it is proven outside every grant.
-    fn open_link(&mut self, path: &Path, dir: &Path) -> Result<Option<Opened>, ConfigRefusal> {
-        let target = self.link_target(path)?;
-        if !target.exists {
-            return Ok(None);
+        if let Some(dir) = found.path.parent() {
+            let dir = dir.to_path_buf();
+            if !bases.contains(&dir) {
+                bases.push(dir);
+            }
         }
-        let Some((target_dir, target_name)) = split(&target.path) else {
-            return Err(self.unreadable(&target.path, ConfigFault::Open(OpenRefusal::BadName)));
-        };
-        let held = HeldDir::open_root(target_dir)
-            .map_err(|refusal| self.unreadable(target_dir, fault_of(refusal)))?;
-        match held.open_regular(&target_name) {
-            Ok(file) => Ok(Some(Opened {
-                file,
-                bases: vec![dir.to_path_buf(), target_dir.to_path_buf()],
-            })),
-            Err(OpenRefusal::Absent) => Ok(None),
-            Err(refusal) => Err(self.unreadable(&target.path, fault_of(refusal))),
-        }
+        Ok(Some(Opened { file, bases }))
     }
 
     /// Read, parse, and judge one configuration file.
@@ -1125,13 +1833,78 @@ impl Scan<'_> {
     fn judge_entries(&mut self, ctx: &FileCtx, entries: &[Entry]) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
         for entry in entries {
-            let role = match ctx.syntax {
-                Syntax::Git => git_role(&entry.setting, &entry.value),
-                Syntax::Hg => hg_role(&entry.setting, &entry.value),
-                Syntax::Toml | Syntax::Darcs => Role::Words,
+            let refuse =
+                |stop: Stop| stop.into_refusal(kind, &ctx.source, || entry.setting.public());
+            let route = match ctx.syntax {
+                Syntax::Git => {
+                    self.judge_git_subsection(ctx, &entry.setting)
+                        .map_err(&refuse)?;
+                    self.note_remote(&entry.setting);
+                    git_route(&entry.setting, &entry.value)
+                }
+                Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
+                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
             };
-            self.judge(ctx, &role, &entry.value)
-                .map_err(|stop| stop.into_refusal(kind, &ctx.source, || entry.setting.public()))?;
+            match route {
+                Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
+                Route::RemoteName => {
+                    if entry.value != "." && !is_network_url(&entry.value, true) {
+                        self.deferred.push(Deferred {
+                            ctx: ctx.clone(),
+                            setting: entry.setting.clone(),
+                            value: entry.value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Judge a Git subsection: an `ext::` transport anywhere refuses, and a `url` section's names a URL.
+    fn judge_git_subsection(&mut self, ctx: &FileCtx, setting: &Setting) -> Result<(), Stop> {
+        let Setting::Key {
+            section,
+            subsection: Some(subsection),
+            ..
+        } = setting
+        else {
+            return Ok(());
+        };
+        if has_ext(subsection) {
+            return Err(unproven(Unprovable::ExtTransport));
+        }
+        if &**section == "url" {
+            return self.judge(ctx, &Role::Url { scp: true }, subsection);
+        }
+        Ok(())
+    }
+
+    /// Record the remote a `remote.<name>.url` setting defines.
+    fn note_remote(&mut self, setting: &Setting) {
+        if let Setting::Key {
+            section,
+            subsection: Some(name),
+            key,
+        } = setting
+            && &**section == "remote"
+            && key.eq_ignore_ascii_case("url")
+        {
+            self.remotes.insert(String::from(&**name));
+        }
+    }
+
+    /// Judge every remote-name value naming no defined remote as a URL.
+    fn judge_deferred(&mut self) -> Result<(), ConfigRefusal> {
+        let kind = self.kind;
+        for item in std::mem::take(&mut self.deferred) {
+            if self.remotes.contains(&item.value) {
+                continue;
+            }
+            self.judge(&item.ctx, &Role::Url { scp: true }, &item.value)
+                .map_err(|stop| {
+                    stop.into_refusal(kind, &item.ctx.source, || item.setting.public())
+                })?;
         }
         Ok(())
     }
@@ -1140,7 +1913,9 @@ impl Scan<'_> {
     ///
     /// The walk keeps an explicit stack, so the depth the parser admits never
     /// becomes recursion here; each key is kept once in an arena of
-    /// parent-linked labels, and a setting's text is built only on refusal.
+    /// parent-linked labels, and a setting's text is built only on refusal. A
+    /// string is judged as a command line, an array's items as the words of
+    /// one: the first the program, the rest its arguments.
     fn judge_toml(&mut self, ctx: &FileCtx, text: &str) -> Result<(), ConfigRefusal> {
         let table: toml::Table = toml::from_str(text).map_err(|e| {
             let line = e.span().map_or(1, |span| line_of(text, span.start));
@@ -1148,30 +1923,44 @@ impl Scan<'_> {
         })?;
         let kind = self.kind;
         let mut labels: Vec<(Option<usize>, &str)> = Vec::new();
-        let mut stack: Vec<(TomlNode<'_>, Option<usize>, bool)> =
-            vec![(TomlNode::Table(&table), None, true)];
-        while let Some((node, label, top)) = stack.pop() {
+        let mut stack: Vec<(TomlNode<'_>, Option<usize>, bool, TomlPos)> =
+            vec![(TomlNode::Table(&table), None, true, TomlPos::Text)];
+        while let Some((node, label, top, pos)) = stack.pop() {
             match node {
                 TomlNode::Table(table) => {
                     for (key, value) in table {
-                        if top && exempt(VcsKind::Jujutsu, (key.as_str(), None, ""), "") {
+                        if top && exempt(VcsKind::Jujutsu, (key.as_str(), None, "")) {
                             continue;
                         }
                         let index = labels.len();
                         labels.push((label, key.as_str()));
-                        stack.push((TomlNode::Value(value), Some(index), top && key == "--scope"));
+                        let scope = top && key == "--scope";
+                        stack.push((TomlNode::Value(value), Some(index), scope, TomlPos::Text));
                     }
                 }
                 TomlNode::Value(value) => match value {
                     toml::Value::String(text) => {
-                        self.judge(ctx, &Role::Words, text).map_err(|stop| {
+                        let judged = match pos {
+                            TomlPos::Text => self.judge(ctx, &Role::Words, text),
+                            TomlPos::Word(position) => self.judge_word(ctx, text, position),
+                        };
+                        judged.map_err(|stop| {
                             stop.into_refusal(kind, &ctx.source, || toml_setting(&labels, label))
                         })?;
                     }
                     toml::Value::Array(items) => {
-                        stack.extend(items.iter().map(|item| (TomlNode::Value(item), label, top)));
+                        stack.extend(items.iter().enumerate().map(|(index, item)| {
+                            let position = if index == 0 {
+                                Position::Program
+                            } else {
+                                Position::Argument
+                            };
+                            (TomlNode::Value(item), label, top, TomlPos::Word(position))
+                        }));
                     }
-                    toml::Value::Table(inner) => stack.push((TomlNode::Table(inner), label, top)),
+                    toml::Value::Table(inner) => {
+                        stack.push((TomlNode::Table(inner), label, top, TomlPos::Text));
+                    }
                     toml::Value::Integer(_)
                     | toml::Value::Float(_)
                     | toml::Value::Boolean(_)
@@ -1184,19 +1973,26 @@ impl Scan<'_> {
 
     /// Judge one value by its role.
     fn judge(&mut self, ctx: &FileCtx, role: &Role, value: &str) -> Result<(), Stop> {
+        if *role != Role::Exempt {
+            value_checks(value).map_err(unproven)?;
+        }
         match role {
             Role::Exempt => Ok(()),
             Role::Words => self.judge_words(ctx, value),
             Role::Forced(path) => {
                 self.judge_words(ctx, value)?;
-                self.judge_forced(ctx, path).map(drop)
+                self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
             Role::Include => {
-                self.judge_words(ctx, value)?;
-                let resolved = self.judge_forced(ctx, value)?;
-                if let Some(target) = resolved.into_iter().next().filter(|r| r.exists) {
+                let mut queued: Vec<PathBuf> = Vec::new();
+                for found in self.judge_forced(ctx, value, Reach::Include)? {
+                    if matches!(found.end, End::Entry(..)) && !queued.contains(&found.path) {
+                        queued.push(found.path);
+                    }
+                }
+                for path in queued {
                     self.pending.push(Pending {
-                        path: target.path,
+                        path,
                         depth: ctx.depth.saturating_add(1),
                         syntax: ctx.syntax,
                     });
@@ -1205,64 +2001,133 @@ impl Scan<'_> {
             }
             Role::HooksPath => {
                 self.judge_words(ctx, value)?;
-                for target in self.judge_forced(ctx, value)? {
-                    if target.exists {
-                        self.list_hooks(&target.path).map_err(Stop::Refused)?;
+                for found in self.judge_forced(ctx, value, Reach::Command)? {
+                    if let End::Dir(dir) = found.end {
+                        self.list_held(&dir, &found.path).map_err(Stop::Refused)?;
                     }
                 }
                 Ok(())
             }
+            Role::Url { scp } => {
+                if is_network_url(value, *scp) {
+                    return Ok(());
+                }
+                self.judge_words(ctx, value)?;
+                self.judge_forced(ctx, value, Reach::Command).map(drop)
+            }
         }
     }
 
-    /// Judge every path-shaped word of `value`.
+    /// Judge every word of the command line `value`.
     fn judge_words(&mut self, ctx: &FileCtx, value: &str) -> Result<(), Stop> {
-        if value.contains("$(") || value.contains('`') {
-            return Err(Stop::Named(Named::Unprovable(
-                Unprovable::CommandSubstitution,
-            )));
-        }
-        for word in shell_words(value) {
-            let compound = word.contains(is_word_separator);
-            let pieces = std::iter::once(word.as_str())
-                .chain(word.split(is_word_separator).filter(|_| compound));
-            for piece in pieces {
-                let piece = strip_runners(piece);
-                if is_path_shaped(piece) {
-                    self.judge_path(ctx, piece)?;
+        let mut words = Words::default();
+        words
+            .push_split(value, Position::Program)
+            .map_err(unproven)?;
+        self.judge_queue(ctx, &mut words)
+    }
+
+    /// Judge `text` as one word of a command, standing at `position`.
+    fn judge_word(&mut self, ctx: &FileCtx, text: &str, position: Position) -> Result<(), Stop> {
+        value_checks(text).map_err(unproven)?;
+        let mut words = Words::default();
+        words.push(text.to_owned(), position).map_err(unproven)?;
+        self.judge_queue(ctx, &mut words)
+    }
+
+    /// Judge every word on `words`, splitting options and compound words onto it.
+    ///
+    /// A path-shaped word is resolved; an option's attached argument and a
+    /// compound word's pieces are pushed back to be judged in turn; a program
+    /// name, a number, and the empty word pass; any other word may name a file
+    /// relative to the directory the tool runs in, so it is unprovable.
+    fn judge_queue(&mut self, ctx: &FileCtx, words: &mut Words) -> Result<(), Stop> {
+        while let Some((word, position)) = words.stack.pop() {
+            if word.len() > MAX_PATH_BYTES {
+                return Err(unproven(Unprovable::TooLong));
+            }
+            if word.contains(['*', '?', '[']) {
+                return Err(unproven(Unprovable::Glob));
+            }
+            let text = strip_runners(&word);
+            if let Some(long) = text.strip_prefix("--") {
+                if let Some((_, argument)) = long.split_once('=') {
+                    words
+                        .push_split(argument, Position::Argument)
+                        .map_err(unproven)?;
                 }
+                continue;
+            }
+            if let Some(short) = text.strip_prefix('-') {
+                let mut chars = short.chars();
+                chars.next();
+                let rest = chars.as_str();
+                let argument = rest.strip_prefix('=').unwrap_or(rest);
+                words
+                    .push_split(argument, Position::Argument)
+                    .map_err(unproven)?;
+                continue;
+            }
+            let shaped = is_path_shaped(text);
+            if shaped {
+                self.judge_path(ctx, text, Reach::Command)?;
+            }
+            if text.contains(is_word_separator) {
+                words.push_pieces(text, position).map_err(unproven)?;
+                continue;
+            }
+            let admitted = shaped
+                || text.is_empty()
+                || text.bytes().all(|b| b.is_ascii_digit())
+                || position == Position::Program;
+            if !admitted {
+                return Err(unproven(Unprovable::BareWord));
             }
         }
         Ok(())
     }
 
     /// Judge `text` as one path whatever its shape; empty text names nothing.
-    fn judge_forced(&mut self, ctx: &FileCtx, text: &str) -> Result<Vec<Resolved>, Stop> {
+    fn judge_forced(
+        &mut self,
+        ctx: &FileCtx,
+        text: &str,
+        reach: Reach,
+    ) -> Result<Vec<Resolved>, Stop> {
         let path = strip_runners(text.trim_matches(is_c_space));
         if path.is_empty() {
             return Ok(Vec::new());
         }
-        self.judge_path(ctx, path)
+        self.judge_path(ctx, path, reach)
     }
 
-    /// Resolve `word` against every base, refusing a resolution inside a grant.
-    fn judge_path(&mut self, ctx: &FileCtx, word: &str) -> Result<Vec<Resolved>, Stop> {
+    /// Walk `word` from every base, refusing a place inside a grant reached lexically or by the walk.
+    fn judge_path(
+        &mut self,
+        ctx: &FileCtx,
+        word: &str,
+        reach: Reach,
+    ) -> Result<Vec<Resolved>, Stop> {
         self.count_path(&ctx.source).map_err(Stop::Refused)?;
-        let unprovable = |why| Stop::Named(Named::Unprovable(why));
-        let candidates = self.candidates(word, &ctx.bases).map_err(unprovable)?;
+        let candidates = self.candidates(word, &ctx.bases, reach).map_err(unproven)?;
         let mut resolved = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let found = resolve(&candidate).map_err(unprovable)?;
-            if self.grants.cover(&found.path) {
-                return Err(Stop::Named(Named::InGrant(found.path)));
+            let found = self.walk(&candidate, &ctx.source).map_err(Stop::from)?;
+            if self.grants.covers(&candidate) {
+                return Err(Stop::Named(Named::InGrant(lexical(&candidate))));
             }
             resolved.push(found);
         }
         Ok(resolved)
     }
 
-    /// The absolute paths `word` may name: itself, under the home, or under each base and the working tree.
-    fn candidates(&self, word: &str, bases: &[PathBuf]) -> Result<Vec<PathBuf>, Unprovable> {
+    /// The absolute paths `word` may name: itself, under the home, or under each base (and the working tree for a command).
+    fn candidates(
+        &self,
+        word: &str,
+        bases: &[PathBuf],
+        reach: Reach,
+    ) -> Result<Vec<PathBuf>, Unprovable> {
         if word.len() > MAX_PATH_BYTES {
             return Err(Unprovable::TooLong);
         }
@@ -1287,12 +2152,72 @@ impl Scan<'_> {
         if path.is_absolute() {
             return Ok(vec![path.to_path_buf()]);
         }
+        let command = reach == Reach::Command;
+        if command
+            && path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(Unprovable::DotDot);
+        }
+        let worktree = command.then(|| self.grants.worktree.as_path().join(path));
         Ok(bases
             .iter()
             .map(|base| base.join(path))
-            .chain(std::iter::once(self.grants.worktree.as_path().join(path)))
+            .chain(worktree)
             .collect())
     }
+}
+
+/// The words of one value still to judge, bounded by [`MAX_WORDS`].
+#[derive(Default)]
+struct Words {
+    /// The words left, next last.
+    stack: Vec<(String, Position)>,
+    /// Words pushed so far.
+    pushed: u32,
+}
+
+impl Words {
+    /// Push one word.
+    fn push(&mut self, word: String, position: Position) -> Result<(), Unprovable> {
+        self.pushed = self.pushed.saturating_add(1);
+        if self.pushed > MAX_WORDS {
+            return Err(Unprovable::TooManyWords);
+        }
+        self.stack.push((word, position));
+        Ok(())
+    }
+
+    /// Push the shell words of `text`, the first at `first` and the rest as arguments.
+    fn push_split(&mut self, text: &str, first: Position) -> Result<(), Unprovable> {
+        for (index, word) in shell_words(text).into_iter().enumerate().rev() {
+            let position = if index == 0 {
+                first
+            } else {
+                Position::Argument
+            };
+            self.push(word, position)?;
+        }
+        Ok(())
+    }
+
+    /// Push the pieces of `word` between its separators, each at `position`.
+    fn push_pieces(&mut self, word: &str, position: Position) -> Result<(), Unprovable> {
+        for piece in word.split(is_word_separator).rev() {
+            self.push(piece.to_owned(), position)?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a TOML node stands: free text, or one word of an argument array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TomlPos {
+    /// A string judged as a whole command line.
+    Text,
+    /// An array item judged as one word.
+    Word(Position),
 }
 
 /// A node of a parsed TOML document.
@@ -1306,23 +2231,18 @@ enum TomlNode<'t> {
 
 /// The setting the label `label` names, walking its parents.
 fn toml_setting(labels: &[(Option<usize>, &str)], label: Option<usize>) -> ConfigSetting {
-    let mut keys: Vec<&str> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
     let mut at = label;
     while let Some(index) = at {
         let Some(&(parent, key)) = labels.get(index) else {
             break;
         };
-        keys.push(key);
+        keys.push(key.to_owned());
         // A parent always precedes its child, so the walk strictly descends.
         at = parent.filter(|p| *p < index);
     }
     keys.reverse();
-    let key = keys.pop().unwrap_or_default().to_owned();
-    ConfigSetting::Key {
-        section: keys.join("."),
-        subsection: None,
-        key,
-    }
+    ConfigSetting::Table(keys)
 }
 
 /// The one-based line holding byte `offset` of `text`.
@@ -1331,62 +2251,62 @@ fn line_of(text: &str, offset: usize) -> usize {
         .map_or(1, |head| head.matches('\n').count().saturating_add(1))
 }
 
-/// The directory and entry name of `path`.
-fn split(path: &Path) -> Option<(&Path, EntryName)> {
-    let dir = path.parent()?;
-    let name = EntryName::new(path.file_name()?)?;
-    Some((dir, name))
+/// Whether `text` names Git's `ext::` transport anywhere, in any case.
+fn has_ext(text: &str) -> bool {
+    text.as_bytes()
+        .windows(5)
+        .any(|window| window.eq_ignore_ascii_case(b"ext::"))
 }
 
-/// Resolve an absolute path through its longest existing prefix.
-///
-/// The prefix is canonicalised; the rest must not exist from its first
-/// component on, and must hold no `..`, so the result is the one place the path
-/// will name when it is created.
-fn resolve(path: &Path) -> Result<Resolved, Unprovable> {
-    if path.as_os_str().len() > MAX_PATH_BYTES || path.components().count() > MAX_PATH_COMPONENTS {
-        return Err(Unprovable::TooLong);
+/// The checks every judged value passes first: no substitution, expansion, or `ext::` transport.
+fn value_checks(value: &str) -> Result<(), Unprovable> {
+    if value.contains("$(") || value.contains('`') {
+        return Err(Unprovable::CommandSubstitution);
     }
-    if !path.is_absolute() {
-        return Err(Unprovable::Unresolvable);
+    if value.contains('$') {
+        return Err(Unprovable::Expansion);
     }
-    for ancestor in path.ancestors() {
-        let Ok(real) = CanonicalPath::resolve(ancestor) else {
-            continue;
-        };
-        let Ok(rest) = path.strip_prefix(ancestor) else {
-            return Err(Unprovable::Unresolvable);
-        };
-        return below(real.as_path(), rest);
+    if has_ext(value) {
+        return Err(Unprovable::ExtTransport);
     }
-    Err(Unprovable::Unresolvable)
+    Ok(())
 }
 
-/// `rest` joined below the existing canonical `real`.
-fn below(real: &Path, rest: &Path) -> Result<Resolved, Unprovable> {
-    let mut joined = real.to_path_buf();
-    let mut exists = true;
-    for component in rest.components() {
-        match component {
-            Component::Normal(part) => {
-                if exists {
-                    let next = joined.join(part);
-                    match std::fs::symlink_metadata(&next) {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => exists = false,
-                        Ok(_) | Err(_) => return Err(Unprovable::Unresolvable),
-                    }
-                }
-                joined.push(part);
-            }
-            Component::CurDir => {}
-            Component::ParentDir => return Err(Unprovable::DotDot),
-            Component::RootDir | Component::Prefix(_) => return Err(Unprovable::Unresolvable),
-        }
+/// The URL schemes that reach a repository over the network, never through a local program or file.
+const NETWORK_SCHEMES: &[&str] = &[
+    "http", "https", "ssh", "git", "git+ssh", "ssh+git", "ftp", "ftps",
+];
+
+/// Whether `authority` (`[user@]host[:port]`) names a host that cannot be read as an option.
+fn host_ok(authority: &str) -> bool {
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.starts_with('-')
+        && !host.is_empty()
+        && !host.starts_with('-')
+}
+
+/// Whether `value` is a network URL: a known scheme with a host, or with `scp` Git's `host:path` form.
+fn is_network_url(value: &str, scp: bool) -> bool {
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return false;
     }
-    Ok(Resolved {
-        path: joined,
-        exists,
-    })
+    if let Some((scheme, rest)) = value.split_once("://") {
+        let known = NETWORK_SCHEMES
+            .iter()
+            .any(|name| scheme.eq_ignore_ascii_case(name));
+        let authority = rest.split('/').next().unwrap_or_default();
+        return known && host_ok(authority);
+    }
+    let Some((head, _)) = value.split_once(':').filter(|_| scp) else {
+        return false;
+    };
+    head.len() >= 2
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+        && !head.starts_with(['-', '.'])
+        && host_ok(head)
 }
 
 /// A path separator of the host.
@@ -1436,7 +2356,7 @@ fn shell_words(value: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('"'), '\\') | (None, '\\') => {
+            (Some('"') | None, '\\') => {
                 in_word = true;
                 if let Some(escaped) = chars.next() {
                     word.push(escaped);
@@ -1472,15 +2392,15 @@ fn is_git_bool(value: &str) -> bool {
         .any(|word| value.eq_ignore_ascii_case(word))
 }
 
-/// How Git treats a value of `setting`.
-fn git_role(setting: &Setting, value: &str) -> Role {
+/// What Git does with a value of `setting`.
+fn git_route(setting: &Setting, value: &str) -> Route {
     let Setting::Key {
         section,
         subsection,
         key,
     } = setting
     else {
-        return Role::Words;
+        return Route::Judge(Role::Words);
     };
     let key = key.to_ascii_lowercase();
     let subsection = subsection.as_deref();
@@ -1489,20 +2409,32 @@ fn git_role(setting: &Setting, value: &str) -> Role {
         shape,
         ("include", false, "path") | ("includeif", true, "path")
     ) {
-        return Role::Include;
+        return Route::Judge(Role::Include);
     }
     if shape == ("core", false, "hookspath") {
-        return Role::HooksPath;
+        return Route::Judge(Role::HooksPath);
     }
     let forced = shape == ("init", false, "templatedir")
         || (shape == ("core", false, "fsmonitor") && !is_git_bool(value));
     if forced {
-        return Role::Forced(value.to_owned());
+        return Route::Judge(Role::Forced(value.to_owned()));
     }
-    if exempt(VcsKind::Git, (&**section, subsection, key.as_str()), value) {
-        Role::Exempt
+    if matches!(
+        shape,
+        ("remote", true, "url" | "pushurl") | ("submodule", true, "url")
+    ) {
+        return Route::Judge(Role::Url { scp: true });
+    }
+    if matches!(
+        shape,
+        ("branch", true, "remote" | "pushremote") | ("remote", false, "pushdefault")
+    ) {
+        return Route::RemoteName;
+    }
+    if exempt(VcsKind::Git, (&**section, subsection, key.as_str())) {
+        Route::Judge(Role::Exempt)
     } else {
-        Role::Words
+        Route::Judge(Role::Words)
     }
 }
 
@@ -1516,15 +2448,17 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
     if &**section == "extensions" {
         return Role::Forced(value.to_owned());
     }
-    if &**section == "hooks" {
-        if let Some((path, _)) = value
+    if &**section == "hooks"
+        && let Some((path, _)) = value
             .strip_prefix("python:")
             .and_then(|rest| rest.rsplit_once(':'))
-        {
-            return Role::Forced(path.to_owned());
-        }
+    {
+        return Role::Forced(path.to_owned());
     }
-    if exempt(VcsKind::Mercurial, (&**section, None, key.as_str()), value) {
+    if &**section == "paths" && (!key.contains(':') || key.ends_with(":pushurl")) {
+        return Role::Url { scp: false };
+    }
+    if exempt(VcsKind::Mercurial, (&**section, None, key.as_str())) {
         Role::Exempt
     } else {
         Role::Words
@@ -1890,7 +2824,9 @@ mod tests {
         for dir in [&fixture.tree, &fixture.out, &fixture.home, &fixture.other] {
             make_dir(dir);
         }
-        make_dir(&fixture.tree.join(".git"));
+        for carve in [".git", ".hg", ".jj", "_darcs"] {
+            make_dir(&fixture.tree.join(carve));
+        }
         fixture
     }
 
@@ -1916,7 +2852,10 @@ mod tests {
     ) -> Result<(), ConfigRefusal> {
         let tree = canonical(&fixture.tree);
         let other = canonical(&fixture.other);
-        let grants = Grants::new(&tree, &[&other]);
+        let carves =
+            [".git", ".hg", ".jj", "_darcs"].map(|name| canonical(&fixture.tree.join(name)));
+        let [git, hg, jj, darcs] = &carves;
+        let grants = Grants::new(&tree, &[&other]).with_carves(&[git, hg, jj, darcs]);
         let home = Home::known(canonical(&fixture.home));
         scan(roots, &grants, &home, limits)
     }
@@ -1971,6 +2910,18 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn hard_linked(result: &Result<(), ConfigRefusal>) -> Option<&Path> {
+        match result {
+            Err(ConfigRefusal::LinkNamesWritable {
+                link,
+                named: Named::Unprovable(Unprovable::HardLinked),
+                ..
+            }) => Some(link.as_path()),
+            Ok(()) | Err(_) => None,
+        }
+    }
+
     #[test]
     fn absent_config_admitted_and_absent_root_refused() {
         let f = fixture("absent");
@@ -1988,17 +2939,14 @@ mod tests {
             "[core]\n\trepositoryformatversion = 0\n\thooksPath = .githooks\n",
         );
         let result = scan_git(&f);
-        assert_eq!(
-            in_grant(&result),
-            Some(f.tree.join(".git/.githooks").as_path())
-        );
+        assert_eq!(in_grant(&result), Some(f.tree.join(".githooks").as_path()));
         assert!(
             matches!(
                 &result,
                 Err(ConfigRefusal::NamesWritableCode {
                     setting: ConfigSetting::Key { key, .. },
                     ..
-                }) if key == "hooksPath"
+                }) if &**key == "hooksPath"
             ),
             "{result:?}"
         );
@@ -2059,20 +3007,54 @@ mod tests {
     }
 
     #[test]
+    fn other_worktree_and_submodule_configs_scanned() {
+        let f = fixture("wtmodules");
+        let tree = f.tree.display();
+        let linked = f.tree.join(".git/worktrees/wt/config.worktree");
+        write(&linked, &format!("[core]\n\thooksPath = {tree}/h\n"));
+        let result = scan_git(&f);
+        assert_eq!(source(&result), Some(linked.as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("h").as_path()));
+        std::fs::remove_file(&linked).expect("remove worktree config");
+
+        let module = f.tree.join(".git/modules/sub/config");
+        write(&module, &format!("[alias]\n\tx = !{tree}/x\n"));
+        let result = scan_git(&f);
+        assert_eq!(source(&result), Some(module.as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("x").as_path()));
+    }
+
+    #[test]
+    fn config_dir_inside_uncarved_grant_refused() {
+        let f = fixture("uncarved");
+        let granted_gitdir = f.other.join("gitdir");
+        write(&granted_gitdir.join("config"), "[core]\n\tbare = false\n");
+        let result = scan_git_at(&f, &granted_gitdir);
+        assert!(
+            matches!(&result, Err(ConfigRefusal::ConfigInGrant { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn relative_value_resolves_both_bases() {
         let f = fixture("bases");
         let outside_gitdir = f.out.join("gitdir");
         write(&outside_gitdir.join("config"), "[alias]\n\tx = !bin/run\n");
         let result = scan_git_at(&f, &outside_gitdir);
         assert_eq!(in_grant(&result), Some(f.tree.join("bin/run").as_path()));
+    }
 
-        let granted_gitdir = f.other.join("gitdir");
-        write(&granted_gitdir.join("config"), "[alias]\n\tx = !bin/run\n");
-        let result = scan_git_at(&f, &granted_gitdir);
-        assert_eq!(
-            in_grant(&result),
-            Some(granted_gitdir.join("bin/run").as_path())
-        );
+    #[cfg(unix)]
+    #[test]
+    fn relative_value_through_link_into_grant_refused() {
+        let f = fixture("baselink");
+        let outside_gitdir = f.out.join("gitdir");
+        write(&outside_gitdir.join("config"), "[alias]\n\tx = !bin/run\n");
+        make_dir(&f.other.join("bin"));
+        link(&f.other.join("bin"), &outside_gitdir.join("bin"));
+        let result = scan_git_at(&f, &outside_gitdir);
+        assert_eq!(in_grant(&result), Some(f.other.join("bin/run").as_path()));
     }
 
     #[test]
@@ -2085,8 +3067,28 @@ mod tests {
         );
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("run.sh").as_path()));
-        git_config(&f, "[frobnicate \"x\"]\n\trunner = sh -c true\n");
+        let out = f.out.display();
+        git_config(
+            &f,
+            &format!("[frobnicate \"x\"]\n\trunner = sh {out}/run.sh\n"),
+        );
         assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn non_path_words_refused() {
+        let f = fixture("barewords");
+        git_config(&f, "[alias]\n\tx = !sh evil\n");
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::BareWord));
+        let out = f.out.display();
+        git_config(&f, &format!("[alias]\n\tx = !cat {out}/*\n"));
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::Glob));
+        git_config(&f, "[alias]\n\tx = !ssh '-oProxyCommand=sh x' host\n");
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::BareWord));
+        git_config(&f, "[alias]\n\tx = -c core.hooksPath=x status\n");
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::BareWord));
+        git_config(&f, "[alias]\n\tx = !../x\n");
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::DotDot));
     }
 
     #[test]
@@ -2114,7 +3116,8 @@ mod tests {
         git_config(&f, "[alias]\n\tx = !~/bin/x\n");
         assert_eq!(scan_git(&f), Ok(()));
         let tree = canonical(&f.tree);
-        let grants = Grants::new(&tree, &[]);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git]);
         let roots = ConfigRoots::Git {
             gitdir: &f.tree.join(".git"),
             commondir: None,
@@ -2142,11 +3145,15 @@ mod tests {
             &f,
             &format!(
                 "[core]\n\tbare = false\n\tworktree = {tree}\n\texcludesFile = {tree}/.ignore\n\
-                 \tfsmonitor = true\n\
+                 \tattributesFile = {tree}/.attrs\n\tfsmonitor = true\n\
+                 [commit]\n\ttemplate = {tree}/.msg\n\
+                 [blame]\n\tignoreRevsFile = {tree}/.revs\n\
                  [remote \"origin\"]\n\turl = git@example.com:team/tree.git\n\
+                 \tpushurl = https://example.com/team/tree.git\n\
                  \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                 \tpush = refs/heads/*:refs/heads/*\n\
                  [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\
-                 [user]\n\tname = A Person\n\
+                 [user]\n\tname = A Person\n\temail = a@example.com\n\
                  [extensions]\n\tworktreeConfig = true\n"
             ),
         );
@@ -2154,15 +3161,35 @@ mod tests {
     }
 
     #[test]
-    fn ext_url_refused() {
-        let f = fixture("exturl");
-        let tree = f.tree.display();
+    fn remote_name_resolved_against_defined_remotes() {
+        let f = fixture("remotename");
         git_config(
             &f,
-            &format!("[remote \"origin\"]\n\turl = ext::{tree}/transport %S\n"),
+            "[remote \"up\"]\n\turl = https://example.com/r\n[branch \"main\"]\n\tremote = up\n",
         );
+        assert_eq!(scan_git(&f), Ok(()));
+        git_config(&f, "[branch \"main\"]\n\tremote = sub/repo\n");
         let result = scan_git(&f);
-        assert_eq!(in_grant(&result), Some(f.tree.join("transport").as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("sub/repo").as_path()));
+    }
+
+    #[test]
+    fn ext_transport_refused() {
+        let f = fixture("exturl");
+        let tree = f.tree.display();
+        for text in [
+            format!("[remote \"origin\"]\n\turl = ext::{tree}/transport %S\n"),
+            "[remote \"origin\"]\n\turl = EXT::sh -c x\n".to_owned(),
+            "[url \"ext::sh -c x\"]\n\tinsteadOf = origin\n".to_owned(),
+            "[submodule \"s\"]\n\turl = ext::sh\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::ExtTransport),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2172,7 +3199,7 @@ mod tests {
         let result = scan_git(&f);
         assert_eq!(
             in_grant(&result),
-            Some(f.tree.join(".git/fsmonitor-hook").as_path())
+            Some(f.tree.join("fsmonitor-hook").as_path())
         );
     }
 
@@ -2238,6 +3265,7 @@ mod tests {
         let dot_hg = f.tree.join(".hg");
         let tree = f.tree.display();
         let out = f.out.display();
+        let other = f.other.display();
         let roots = ConfigRoots::Mercurial {
             dot_hg: &dot_hg,
             shared: None,
@@ -2245,12 +3273,20 @@ mod tests {
         write(
             &dot_hg.join("hgrc"),
             &format!(
-                "[paths]\ndefault = {tree}\n[ui]\nusername = A <a@example.com>\n\
+                "[paths]\ndefault = https://example.com/repo\ndefault:pushrev = .\n\
+                 [ui]\nusername = A <a@example.com>\n\
                  [extensions]\nrebase =\n[hooks]\nx = python:hgext.hook.run\n\
                  y = python:{out}/hook.py:run\n"
             ),
         );
         assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+
+        write(
+            &dot_hg.join("hgrc"),
+            &format!("[paths]\ndefault = {other}/repo\n"),
+        );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(in_grant(&result), Some(f.other.join("repo").as_path()));
 
         write(&dot_hg.join("hgrc"), &format!("%include {tree}/team.rc\n"));
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
@@ -2270,19 +3306,19 @@ mod tests {
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(
             in_grant(&result),
-            Some(dot_hg.join("ext/local.py").as_path())
+            Some(f.tree.join("ext/local.py").as_path())
         );
 
         write(&dot_hg.join("hgrc"), "[extensions]\nlocal = local.py\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(in_grant(&result), Some(dot_hg.join("local.py").as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("local.py").as_path()));
 
         write(
             &dot_hg.join("hgrc"),
             "[hooks]\ncommit = python:hook.py:run\n",
         );
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(in_grant(&result), Some(dot_hg.join("hook.py").as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("hook.py").as_path()));
 
         write(&dot_hg.join("hgrc"), "[ui]\nnot an item\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
@@ -2328,9 +3364,9 @@ mod tests {
             matches!(
                 &result,
                 Err(ConfigRefusal::NamesWritableCode {
-                    setting: ConfigSetting::Key { section, key, .. },
+                    setting: ConfigSetting::Table(parts),
                     ..
-                }) if section == "fix.tools.fmt" && key == "command"
+                }) if parts == &["fix", "tools", "fmt", "command"]
             ),
             "{result:?}"
         );
@@ -2353,13 +3389,20 @@ mod tests {
         let roots = ConfigRoots::Darcs {
             dot_darcs: &dot_darcs,
         };
-        write(&dot_darcs.join("prefs/prefs"), "test make check\n");
+        let out = f.out.display();
+        write(
+            &dot_darcs.join("prefs/prefs"),
+            &format!("test {out}/check.sh\n"),
+        );
         assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
+        write(&dot_darcs.join("prefs/prefs"), "test sh run\n");
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(unprovable(&result), Some(Unprovable::BareWord));
         write(&dot_darcs.join("prefs/prefs"), "\ntest ./run-tests.sh\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(
             in_grant(&result),
-            Some(dot_darcs.join("prefs/run-tests.sh").as_path())
+            Some(f.tree.join("run-tests.sh").as_path())
         );
         assert!(
             matches!(
@@ -2372,12 +3415,12 @@ mod tests {
             "{result:?}"
         );
         write(&dot_darcs.join("prefs/prefs"), "");
-        write(&dot_darcs.join("prefs/defaults"), "apply posthook ./hook\n");
-        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
-        assert_eq!(
-            in_grant(&result),
-            Some(dot_darcs.join("prefs/hook").as_path())
+        write(
+            &dot_darcs.join("prefs/defaults"),
+            "apply --posthook=./hook\n",
         );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(in_grant(&result), Some(f.tree.join("hook").as_path()));
     }
 
     #[cfg(unix)]
@@ -2453,6 +3496,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn hooks_path_through_link_inside_grant_refused() {
+        let f = fixture("husky");
+        link(&f.out, &f.tree.join(".husky"));
+        git_config(&f, "[core]\n\thooksPath = .husky/_\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join(".husky").as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn config_symlink_into_tree_refused() {
         let f = fixture("cfglink");
         let gitdir = f.out.join("gitdir");
@@ -2478,6 +3531,25 @@ mod tests {
 
         write(&real, "[core]\n\tbare = false\n");
         assert_eq!(scan_git_at(&f, &gitdir), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_config_and_hook_refused() {
+        let f = fixture("hardlink");
+        let planted = f.out.join("planted.cfg");
+        write(&planted, "[core]\n\tbare = false\n");
+        let config = f.tree.join(".git/config");
+        std::fs::hard_link(&planted, &config).expect("hard link config");
+        assert_eq!(hard_linked(&scan_git(&f)), Some(config.as_path()));
+        std::fs::remove_file(&config).expect("remove config");
+
+        let tool = f.out.join("tool");
+        write(&tool, "#!/bin/sh\n");
+        let hook = f.tree.join(".git/hooks/pre-commit");
+        make_dir(&f.tree.join(".git/hooks"));
+        std::fs::hard_link(&tool, &hook).expect("hard link hook");
+        assert_eq!(hard_linked(&scan_git(&f)), Some(hook.as_path()));
     }
 
     fn limits_with(change: impl FnOnce(&mut ConfigLimits)) -> ConfigLimits {
@@ -2583,9 +3655,9 @@ mod tests {
             kind: VcsKind::Git,
             source: PathBuf::from(source),
             setting: ConfigSetting::Key {
-                section: "alias".to_owned(),
+                section: "alias".into(),
                 subsection: None,
-                key: key.to_owned(),
+                key: key.into(),
             },
             named: Named::InGrant(PathBuf::from("/tree/\u{1b}[2Jx")),
         };
@@ -2594,7 +3666,7 @@ mod tests {
         assert!(!shown.contains('\u{1b}'), "{shown}");
         assert!(!shown.contains('\u{202e}'), "{shown}");
         assert!(shown.contains("/a\\u{a}b"), "{shown}");
-        assert!(shown.contains("alias.k\\u{202e}"), "{shown}");
+        assert!(shown.contains("alias.\"k\\u{202e}\""), "{shown}");
         assert!(
             shown.contains("point the setting outside the writable grants"),
             "{shown}"
