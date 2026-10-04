@@ -763,7 +763,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     }
 
     if let Some(host) = bundle_host {
-        bundle_delivery(host, Verb::DEV_BUILD.bundle_profile(), Some(entry.as_str()))?;
+        bundle_delivery(host, NativeFinish::Dev, Some(entry.as_str()))?;
         return Ok(BuildSuccess {
             entry,
             out_dir: PathBuf::new(),
@@ -933,7 +933,7 @@ pub struct NativeBuild {
 /// no profile, so every release reader refuses it. A release build lowers its
 /// consented capabilities to the floor it embeds, so a release floor exists
 /// only behind a [`ConsentedCapabilities`] witness.
-enum NativeFinish<'a> {
+pub(crate) enum NativeFinish<'a> {
     /// `ipe dev`: the development marker, no profile, a debug build.
     Dev,
     /// `ipe release`: the consented capabilities' profile and release floor are
@@ -948,23 +948,23 @@ enum NativeFinish<'a> {
 
 /// The cargo build of an emitted native crate in its [`NativeFinish`]
 /// posture: the one path every dev and release native build takes.
-struct FlooredBuild<'a> {
+pub(crate) struct FlooredBuild<'a> {
     /// The resolved `cargo`.
-    cargo: &'a toolchain::CargoBin,
+    pub(crate) cargo: &'a toolchain::CargoBin,
     /// The emitted crate, both floored and built.
-    crate_dir: &'a OwnedDir,
+    pub(crate) crate_dir: &'a OwnedDir,
     /// The posture: it decides the floor and picks the cargo profile, so a
     /// release floor is never built as a debug binary and a dev build carries
     /// only the development marker.
-    finish: NativeFinish<'a>,
+    pub(crate) finish: NativeFinish<'a>,
     /// The compile target.
-    target: CargoTarget,
+    pub(crate) target: CargoTarget,
     /// Where cargo's output goes.
-    output: CargoOutput,
+    pub(crate) output: CargoOutput,
     /// What is built, named in the failure diagnostic.
-    what: &'static str,
+    pub(crate) what: &'static str,
     /// The runtime crate the build links against, when resolved.
-    runtime: Option<RuntimeContext>,
+    pub(crate) runtime: Option<RuntimeContext>,
 }
 
 impl FlooredBuild<'_> {
@@ -978,7 +978,7 @@ impl FlooredBuild<'_> {
     /// The errors of [`run_sandbox::build_profile`],
     /// [`run_sandbox::write_build_artifacts`],
     /// [`run_sandbox::write_dev_floor_marker`] and [`CargoBuild::run`].
-    fn run(self) -> Result<String, CliError> {
+    pub(crate) fn run(self) -> Result<String, CliError> {
         let profile = match self.finish {
             NativeFinish::Dev => {
                 run_sandbox::write_dev_floor_marker(self.crate_dir)?;
@@ -1001,6 +1001,31 @@ impl FlooredBuild<'_> {
         }
         .run()
     }
+}
+
+/// Build the pure-native release binary of `crate_dir` for `triple`: an
+/// optimised static build carrying the floor `consented` lowers to.
+///
+/// # Errors
+/// The errors of [`FlooredBuild::run`].
+fn build_pure_native_release(
+    cargo: &toolchain::CargoBin,
+    crate_dir: &OwnedDir,
+    consented: &ConsentedCapabilities,
+    driver: ipe_backend_rust::DbDriver,
+    triple: ipe_backend_rust::static_build::StaticTriple,
+    verbosity: Verbosity,
+) -> Result<String, CliError> {
+    FlooredBuild {
+        cargo,
+        crate_dir,
+        finish: NativeFinish::Release { consented, driver },
+        target: CargoTarget::Static(triple),
+        output: CargoOutput::Human(verbosity),
+        what: "the release binary",
+        runtime: None,
+    }
+    .run()
 }
 
 /// Compile the just-emitted native dev crate. Split out of [`run_build`] so
@@ -1481,8 +1506,19 @@ pub fn release_pipeline(
     ) {
         return Err(CliError::NoRunForm { target });
     }
+    // The database driver a release profile's socket allowances follow.
+    let driver = manifest_parsed
+        .as_ref()
+        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
-        bundle_delivery(host, verb.bundle_profile(), Some(entry.as_str()))?;
+        bundle_delivery(
+            host,
+            NativeFinish::Release {
+                consented: &consented,
+                driver,
+            },
+            Some(entry.as_str()),
+        )?;
         return Ok(ReleaseOutput::Distributable);
     }
 
@@ -1592,9 +1628,6 @@ pub fn release_pipeline(
 
     // The consented capabilities discriminate between native-bearing (needs jail
     // wrapper) and pure-native (plain optimised binary).
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
     let resolved = consented.resolved();
 
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), false)?;
@@ -1647,16 +1680,14 @@ pub fn release_pipeline(
             options,
         )?;
 
-        CargoBuild {
-            cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            profile: CargoProfile::Release,
-            target: CargoTarget::Static(triple),
-            output: CargoOutput::Human(Verbosity::Progress),
-            what: "the release binary",
-            runtime: None,
-        }
-        .run()?;
+        build_pure_native_release(
+            &cargo_bin,
+            &crate_dir,
+            &consented,
+            driver,
+            triple,
+            Verbosity::Progress,
+        )?;
 
         let app_target_dir = crate::cargo_step::target_directory(&cargo_bin, &out_dir)?;
         // Cargo names the built binary after the emitted crate IDENTITY (the
@@ -2868,10 +2899,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    CargoBuild {
+    FlooredBuild {
         cargo: &cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
@@ -3682,6 +3713,13 @@ pub struct ConsentedCapabilities {
 }
 
 impl ConsentedCapabilities {
+    /// A witness over `resolved` with no consent gate run, for a test that
+    /// needs a release posture without a project to infer.
+    #[cfg(test)]
+    pub(crate) const fn admitted(resolved: run_sandbox::ResolvedCapabilities) -> Self {
+        Self { resolved }
+    }
+
     /// The inferred and declared sets the consent gates admitted.
     #[must_use]
     pub const fn resolved(&self) -> &run_sandbox::ResolvedCapabilities {
@@ -4489,6 +4527,64 @@ mod held_crate_tests {
         assert!(
             args.contains("--release") && args.contains(&format!("--target {}", triple.as_str())),
             "a release floor is built --release for its static target: {args}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pure-native release binary carries the floor its consented
+    /// capabilities lower to, written before cargo runs, and no development
+    /// marker: `ipe release run` reads the floor the release consented to.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn pure_native_release_embeds_its_floor() {
+        use super::{ConsentedCapabilities, build_pure_native_release};
+        use crate::run_sandbox;
+        use ipe_backend_rust::static_build::StaticTriple;
+        use ipe_sandbox::run_jail::FloorIntent;
+
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("pure-native");
+        let consented = ConsentedCapabilities {
+            resolved: crate::run_sandbox::ResolvedCapabilities {
+                inferred: std::collections::BTreeSet::new(),
+                declared: std::collections::BTreeSet::new(),
+            },
+        };
+        assert!(!run_sandbox::is_native_bearing(
+            &consented.resolved().union()
+        ));
+        let driver = ipe_backend_rust::DbDriver::Sqlite;
+        let profile = run_sandbox::build_profile(consented.resolved(), driver).expect("profile");
+        let triple = StaticTriple::X8664LinuxMusl;
+        let built = build_pure_native_release(
+            &CargoBin::stub(cargo),
+            &crate_dir,
+            &consented,
+            driver,
+            triple,
+            Verbosity::Quiet,
+        );
+        assert!(built.is_err(), "the stub fails the build: {built:?}");
+        let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        assert!(
+            handed.contains(&run_sandbox::capfloor_static_source(
+                &profile,
+                FloorIntent::Release
+            )),
+            "cargo must build a main.rs already carrying the release floor:\n{handed}"
+        );
+        assert!(
+            !handed.contains(&run_sandbox::dev_floor_marker_source()),
+            "a release build never carries the development marker:\n{handed}"
+        );
+        assert_eq!(
+            handed.matches("IPE_CAPABILITY_FLOOR:").count(),
+            1,
+            "a release build embeds exactly one floor static:\n{handed}"
+        );
+        let args = std::fs::read_to_string(&seen_args).expect("cargo arguments");
+        assert!(
+            args.contains("--release") && args.contains(&format!("--target {}", triple.as_str())),
+            "the pure-native release is built --release for its static target: {args}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

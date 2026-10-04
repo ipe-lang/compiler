@@ -271,13 +271,52 @@ pub fn write_build_artifacts(
 /// holds a symlink on the way; [`CliError::Io`] on any filesystem failure;
 /// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
 pub fn write_dev_floor_marker(crate_dir: &crate::output_dir::OwnedDir) -> Result<(), CliError> {
-    embed_floor(
-        crate_dir,
-        &capfloor_static_source(
-            &SandboxProfile::maximally_isolated(),
-            FloorIntent::Development,
-        ),
+    embed_floor(crate_dir, &dev_floor_marker_source())
+}
+
+/// The Rust source of the development marker: the constant, maximally isolated
+/// floor whose intent is [`FloorIntent::Development`].
+#[must_use]
+pub fn dev_floor_marker_source() -> String {
+    capfloor_static_source(
+        &SandboxProfile::maximally_isolated(),
+        FloorIntent::Development,
     )
+}
+
+/// The floor line the CLI writes into an emitted crate, fixed by the emit's
+/// intent and target.
+///
+/// Every native development emit carries the development marker from the
+/// moment its crate is written, so no dev-intent path can link a floorless
+/// binary. A native release emit carries no floor until the floored release
+/// build writes the consented one before cargo runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitFloor {
+    /// A native development emit: the development marker, written with the
+    /// crate.
+    DevelopmentMarker,
+    /// A native release emit: the consented release floor, written by the
+    /// floored release build.
+    ReleaseFloorAtBuild,
+    /// A wasm emit: no native binary a release reader runs.
+    NoNativeBinary,
+}
+
+impl EmitFloor {
+    /// The floor an emit of `intent` for `target` carries.
+    #[must_use]
+    pub const fn of(intent: ipe_backend_rust::BuildIntent, target: ipe_ir::Target) -> Self {
+        use ipe_backend_rust::BuildIntent;
+        match (target, intent) {
+            (ipe_ir::Target::Native, BuildIntent::Development) => Self::DevelopmentMarker,
+            (ipe_ir::Target::Native, BuildIntent::Release) => Self::ReleaseFloorAtBuild,
+            (
+                ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi,
+                BuildIntent::Development | BuildIntent::Release,
+            ) => Self::NoNativeBinary,
+        }
+    }
 }
 
 /// Append `floor_static` to the emitted `src/main.rs`, with a `black_box` read
@@ -286,7 +325,8 @@ pub fn write_dev_floor_marker(crate_dir: &crate::output_dir::OwnedDir) -> Result
 /// A mere `#[used]` static is garbage-collected by an aggressive linker like
 /// `mold`, and `strip` removes unreferenced data; the read keeps the bytes in
 /// `.rodata`, where `strip` cannot touch them and `ipe release run` scans them
-/// out passively. Idempotent: any prior floor block and reference are replaced.
+/// out passively. Idempotent: any prior floor block and reference are replaced,
+/// and an unchanged file is not rewritten.
 ///
 /// # Errors
 ///
@@ -302,27 +342,34 @@ fn embed_floor(
         &main_rs.path(),
         crate::io_bounded::SOURCE_READ_CAP,
     )?;
-    let base = strip_capfloor_block(&existing);
-    let referenced = inject_floor_reference(&base)?;
-    let with_floor = format!("{referenced}{floor_static}");
+    let with_floor = embed_floor_text(&existing, floor_static)?;
+    if with_floor == existing {
+        return Ok(());
+    }
     main_rs.write(with_floor.as_bytes())
 }
 
-/// Remove any previously-appended capfloor block AND its main-body reference, so
-/// re-emitting is idempotent (both are delimited by unique markers).
+/// `main_rs` with every prior floor block and reference replaced by
+/// `floor_static` and its `black_box` read at the top of `fn main`.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] when the emitted `fn main` anchor is absent.
+pub fn embed_floor_text(main_rs: &str, floor_static: &str) -> Result<String, CliError> {
+    let base = strip_capfloor_block(main_rs);
+    let referenced = inject_floor_reference(&base)?;
+    Ok(format!("{referenced}{floor_static}"))
+}
+
+/// Remove a previously-embedded floor block and its `fn main` reference, so
+/// re-embedding is idempotent. Only the exact text [`embed_floor_text`] wrote
+/// is removed: a program line that merely names the floor stays.
 fn strip_capfloor_block(src: &str) -> String {
     const BLOCK_MARKER: &str = "\n// The runtime capability FLOOR, embedded read-only";
-    const REF_MARKER: &str = "    // Retain the embedded capability floor";
     let without_block = src
-        .find(BLOCK_MARKER)
-        .map_or_else(|| src.to_owned(), |i| src[..i].to_owned());
-    // Drop the injected reference line (and its comment) if present.
-    without_block
-        .lines()
-        .filter(|l| !l.starts_with(REF_MARKER) && !l.contains("IPE_CAPABILITY_FLOOR"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+        .rsplit_once(BLOCK_MARKER)
+        .map_or(src, |(before, _)| before);
+    without_block.replacen(FLOOR_REFERENCE, "", 1)
 }
 
 /// The line the linker retains the floor by: a `black_box` read of the static at
@@ -339,14 +386,14 @@ const FLOOR_REFERENCE: &str = "    // Retain the embedded capability floor (keep
 /// that a linker would collect).
 fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     const ANCHOR: &str = "fn main() {\n";
-    let idx = src
-        .find(ANCHOR)
+    let (before, after) = src
+        .split_once(ANCHOR)
         .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
-    let insert_at = idx + ANCHOR.len();
-    let mut out = String::with_capacity(src.len() + FLOOR_REFERENCE.len());
-    out.push_str(&src[..insert_at]);
+    let mut out = String::with_capacity(src.len().saturating_add(FLOOR_REFERENCE.len()));
+    out.push_str(before);
+    out.push_str(ANCHOR);
     out.push_str(FLOOR_REFERENCE);
-    out.push_str(&src[insert_at..]);
+    out.push_str(after);
     Ok(out)
 }
 
@@ -732,5 +779,72 @@ mod tests {
     #[test]
     fn inject_floor_reference_refuses_a_missing_main_anchor() {
         assert!(inject_floor_reference("fn not_main() {}\n").is_err());
+    }
+
+    #[test]
+    fn embed_floor_text_is_a_fixpoint() -> Result<(), CliError> {
+        let base = "fn ipe_main() {}\n\nfn main() {\n    run();\n}\n";
+        let marker = dev_floor_marker_source();
+        let once = embed_floor_text(base, &marker)?;
+        assert_eq!(embed_floor_text(&once, &marker)?, once);
+        Ok(())
+    }
+
+    #[test]
+    fn embed_floor_text_replaces_the_development_marker_with_a_release_floor()
+    -> Result<(), CliError> {
+        let base = "fn main() {\n    run();\n}\n";
+        let dev = embed_floor_text(base, &dev_floor_marker_source())?;
+        let release = embed_floor_text(
+            &dev,
+            &capfloor_static_source(&SandboxProfile::maximally_isolated(), FloorIntent::Release),
+        )?;
+        assert_eq!(release.matches("static IPE_CAPABILITY_FLOOR").count(), 1);
+        assert_eq!(
+            release.matches("black_box(&IPE_CAPABILITY_FLOOR)").count(),
+            1
+        );
+        let development = SandboxProfile::maximally_isolated()
+            .to_capfloor_line(FloorIntent::Development)
+            .into_bytes();
+        let dev_array = development
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            !release.contains(&dev_array),
+            "the development marker is gone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embed_floor_text_keeps_a_program_line_naming_the_floor() -> Result<(), CliError> {
+        let line = "    let name = \"IPE_CAPABILITY_FLOOR\"; say(name);\n";
+        let base = format!("fn main() {{\n{line}}}\n");
+        let embedded = embed_floor_text(&base, &dev_floor_marker_source())?;
+        assert!(embedded.contains(line), "the program line survives");
+        let again = embed_floor_text(&embedded, &dev_floor_marker_source())?;
+        assert!(again.contains(line), "the program line survives a re-embed");
+        Ok(())
+    }
+
+    #[test]
+    fn an_emit_floor_follows_intent_and_target() {
+        use ipe_backend_rust::BuildIntent;
+        assert_eq!(
+            EmitFloor::of(BuildIntent::Development, ipe_ir::Target::Native),
+            EmitFloor::DevelopmentMarker
+        );
+        assert_eq!(
+            EmitFloor::of(BuildIntent::Release, ipe_ir::Target::Native),
+            EmitFloor::ReleaseFloorAtBuild
+        );
+        for target in [ipe_ir::Target::WasmClient, ipe_ir::Target::WasmWasi] {
+            for intent in [BuildIntent::Development, BuildIntent::Release] {
+                assert_eq!(EmitFloor::of(intent, target), EmitFloor::NoNativeBinary);
+            }
+        }
     }
 }

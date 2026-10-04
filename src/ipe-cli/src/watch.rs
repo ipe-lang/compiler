@@ -711,6 +711,17 @@ const SHUTDOWN_WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// unrelated edit.
 const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// The target every watch rebuild emits for.
+const REBUILD_TARGET: ipe_ir::Target = ipe_ir::Target::Native;
+
+/// The intent every watch rebuild emits with: a development loop, so `Debug.*`
+/// is allowed.
+const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WATCH.intent();
+
+/// The floor every watch rebuild's crate carries: the development marker.
+const REBUILD_FLOOR: crate::run_sandbox::EmitFloor =
+    crate::run_sandbox::EmitFloor::of(REBUILD_INTENT, REBUILD_TARGET);
+
 /// Schedule one follow-up [`OrchestratorEvent::FsBatch`] after
 /// [`RESOLVE_RETRY_DELAY`] — the recovery path for a `resolve_project_sources`
 /// failure. Without this, a transient failure has no other route back into
@@ -1326,11 +1337,10 @@ fn run_inner(
                         &db_main,
                         resolved.db_driver,
                         ffi_prep.emit,
-                        ipe_ir::Target::Native,
+                        REBUILD_TARGET,
                         resolved.wasm_public_env.clone(),
                         false,
-                        // `ipe dev watch` is a development loop — Debug.* is allowed.
-                        crate::verb::Verb::DEV_WATCH.intent(),
+                        REBUILD_INTENT,
                         // Dependency-model emit: the project links the runtime as a
                         // path dependency (what `ipe dev build` uses by default), so
                         // no runtime source is vendored into `src/ipe_runtime/`.
@@ -1624,6 +1634,7 @@ fn run_inner(
                             &opts.runtime_dir,
                             None,
                             false,
+                            REBUILD_FLOOR,
                         ) {
                             Ok(dir) => dir,
                             Err(e) => {
@@ -4380,5 +4391,41 @@ mod tests {
             "an untouched crate is handed back to run, got {proven:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A watch rebuild links its crate through `cargo` directly, so the crate
+    /// carries the development marker from the moment it is written: a release
+    /// reader refuses the binary as a development build.
+    #[test]
+    fn watch_rebuild_embeds_the_development_marker() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::REBUILD_FLOOR,
+            crate::run_sandbox::EmitFloor::DevelopmentMarker
+        );
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-watch-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+        let claimed = crate::output_dir::OwnedDir::claim(&base.join("crate"))?;
+        let written = super::write_emitted_project(
+            &emitted_with_main("fn main() {\n    run();\n}\n"),
+            &super::EmitTarget::Claimed(claimed),
+            &base.join("no-runtime"),
+            None,
+            false,
+            super::REBUILD_FLOOR,
+        )?;
+        let main_rs = std::fs::read_to_string(written.path().join("src").join("main.rs"))?;
+        assert!(
+            main_rs.contains(&crate::run_sandbox::dev_floor_marker_source()),
+            "the development marker is embedded, got {main_rs}"
+        );
+        assert!(
+            main_rs.contains("fn main() {\n    // Retain the embedded capability floor"),
+            "fn main retains the marker, got {main_rs}"
+        );
+        assert_eq!(main_rs.matches("static IPE_CAPABILITY_FLOOR").count(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 }

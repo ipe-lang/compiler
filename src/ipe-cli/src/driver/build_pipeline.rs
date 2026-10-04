@@ -1045,6 +1045,7 @@ pub fn compile_modules_observed(
                 runtime_dir,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
+                crate::run_sandbox::EmitFloor::of(options.intent, options.target),
             ),
             CacheOutcome::Hit,
         );
@@ -1113,6 +1114,7 @@ pub fn compile_modules_observed(
                     runtime_dir,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
+                    crate::run_sandbox::EmitFloor::of(options.intent, options.target),
                 );
                 // Warm the (cheaper-to-hit) EmittedProject tier for the
                 // next build too — advisory, best-effort, and rooted in the
@@ -1175,6 +1177,7 @@ pub fn compile_modules_observed(
         runtime_dir,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
+        crate::run_sandbox::EmitFloor::of(options.intent, options.target),
     );
 
     // A writable cache root comes only from the claim the write above
@@ -2132,22 +2135,41 @@ pub fn inject_wasm_widget_bundle(
 /// from the project proven again; a claimed target is proven still the
 /// directory it claimed.
 ///
+/// A native development emit's `src/main.rs` carries the development marker
+/// as it is written ([`crate::run_sandbox::EmitFloor`]), so every binary a
+/// dev-intent path links names its posture, whichever cargo step builds it.
+///
 /// # Errors
 /// [`CliError::Io`] on any filesystem failure; [`CliError::StaticRefusal`]
 /// for a webview shape under a static plan; [`CliError::Pipeline`] on a
 /// backend-invariant breach (manifest anchor drift);
 /// [`CliError::OutputRefused`] when the target cannot be claimed or was
-/// replaced since it was claimed.
+/// replaced since it was claimed; [`CliError::Usage`] when a native
+/// development emit has no `src/main.rs` or no `fn main` anchor.
 pub fn write_emitted_project(
     emitted: &ipe_backend::EmittedProject,
     target: &EmitTarget,
     runtime_dir: &Path,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     tree_shake_vendored: bool,
+    floor: crate::run_sandbox::EmitFloor,
 ) -> Result<OwnedDir, CliError> {
     use ipe_backend_rust::static_build;
 
     let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored)?;
+    match floor {
+        crate::run_sandbox::EmitFloor::DevelopmentMarker => {
+            let main_rs = manifest
+                .get_mut(Path::new("src/main.rs"))
+                .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
+            *main_rs = crate::run_sandbox::embed_floor_text(
+                main_rs,
+                &crate::run_sandbox::dev_floor_marker_source(),
+            )?;
+        }
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+        | crate::run_sandbox::EmitFloor::NoNativeBinary => {}
+    }
     if let Some(plan) = static_plan {
         // The webview-under-static refusal reads the backend's typed
         // `uses_webview` signal (set from the resolved runtime/host), never a

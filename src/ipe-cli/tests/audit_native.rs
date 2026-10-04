@@ -1613,4 +1613,127 @@ mod real_jail {
             "the refusal names the development build:\nstderr:\n{stderr}"
         );
     }
+
+    /// The binary `ipe dev run` built from the crate it emitted under `out`:
+    /// the crate's one bin target, in the target directory cargo reports for it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn dev_run_binary(out: &std::path::Path) -> PathBuf {
+        let crate_dir = out.join("rust");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(&crate_dir)
+        .stdin(std::process::Stdio::null());
+        let meta = super::run_child(cmd).expect("run cargo metadata");
+        assert!(
+            meta.status.success(),
+            "cargo metadata reads the emitted crate:\n{}",
+            String::from_utf8_lossy(&meta.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&meta.stdout).expect("metadata JSON");
+        let target_dir = json
+            .get("target_directory")
+            .and_then(serde_json::Value::as_str)
+            .expect("metadata names the target directory");
+        let bins: Vec<&str> = json
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|package| package.get("targets").and_then(serde_json::Value::as_array))
+            .flatten()
+            .filter(|target| {
+                target
+                    .get("kind")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+            })
+            .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            bins.len(),
+            1,
+            "the emitted crate has one bin target: {bins:?}"
+        );
+        let bin = bins.first().expect("one bin target");
+        let path = PathBuf::from(target_dir).join("debug").join(bin);
+        assert!(
+            path.is_file(),
+            "the dev run's binary exists: {}",
+            path.display()
+        );
+        path
+    }
+
+    /// A binary `ipe dev run` built, whose program data holds a release-shaped
+    /// floor line, is refused as a development build: the dev run path embeds
+    /// the development marker like `ipe dev build`, so the forged line cannot
+    /// launder the binary into a release.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_dev_run_binary_with_forged_release_literal() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-forged-dev-run");
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let entry = project.join("Main.ipe");
+        std::fs::write(
+            &entry,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    \
+             Io.println \"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\\n\"\n",
+        )
+        .expect("Main.ipe");
+        let out = base.join("out");
+        let mut cmd = std::process::Command::new(super::support::ipe_bin());
+        cmd.args(["dev", "run"])
+            .arg(&entry)
+            .arg("--out")
+            .arg(&out)
+            .current_dir(&project)
+            .env(
+                "IPE_RUNTIME_DIR",
+                e2e_support::require_runtime().into_path_buf(),
+            )
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        let ran = super::run_child(cmd).expect("run ipe dev run");
+        assert!(
+            ran.status.success(),
+            "the dev run builds and runs:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let (dir, _) = floor_bundle(&base, &[]);
+        std::fs::copy(dev_run_binary(&out), dir.join("ipe-app"))
+            .expect("the dev run's binary becomes the bundle's app");
+        std::fs::write(
+            dir.join("ipe.profile"),
+            SandboxProfile::maximally_isolated().to_profile_string(),
+        )
+        .expect("profile");
+        let app = std::fs::read(dir.join("ipe-app")).expect("read the app");
+        assert!(
+            app.windows(b"intent=release".len())
+                .any(|w| w == b"intent=release"),
+            "the forged release line is in the linked binary (control)"
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("ipe-capfloor"),
+            "a forged release literal never runs a dev run binary:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("built by `ipe dev build`"),
+            "the refusal names the development build:\nstderr:\n{stderr}"
+        );
+    }
 }
