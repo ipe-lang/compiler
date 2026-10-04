@@ -178,7 +178,7 @@ pub enum ChunkEvent<E> {
     Errored(E),
 }
 
-/// Live upstream connections allowed at once: the registry's entry cap and the
+/// Live upstream connections allowed at once: the live-table cap and the
 /// connection-permit count.
 const CLIENT_STREAMS_MAX: usize = 1024;
 
@@ -297,17 +297,18 @@ impl LiveStream for LiveResponse {
     }
 }
 
-/// Where a registered stream is in its life.
+/// Ended handles remembered at once; a full table forgets its oldest.
+const TOMBSTONES_MAX: usize = CLIENT_STREAMS_MAX;
+
+/// Where a live stream is in its life.
 enum Slot<V> {
     /// Opened, its response parked until a drain or a close.
     Parked(V),
     /// One drain owns the response; dropping the half cancels it.
     Draining(CancelHalf),
-    /// Drained or closed; kept as a tombstone so a re-subscribe stays quiet.
-    Ended,
 }
 
-/// One registry entry: an insertion order (never an identity) and its slot.
+/// One live registry entry: an insertion order (never an identity) and its slot.
 struct Entry<V> {
     seq: u64,
     slot: Slot<V>,
@@ -321,16 +322,11 @@ struct Claimed<V> {
     seq: u64,
 }
 
-/// Why a slot cannot be claimed for a drain.
-enum Unclaimed {
-    /// Another drain owns it.
-    Busy,
-    /// It already ended.
-    Ended,
-}
+/// Another drain owns the slot.
+struct Busy;
 
-/// Moves a parked entry to `Draining`, or reports why it cannot.
-fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Unclaimed> {
+/// Moves a parked entry to `Draining`, or reports that a drain already owns it.
+fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Busy> {
     let (half, cancel) = cancel_pair();
     match std::mem::replace(&mut entry.slot, Slot::Draining(half)) {
         Slot::Parked(value) => Ok(Claimed {
@@ -338,15 +334,10 @@ fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Unclaimed> {
             cancel,
             seq: entry.seq,
         }),
-        // Put the previous slot back: the half just installed drops, and a
-        // running drain's half (inside `previous`) is never dropped.
-        previous => {
-            let refusal = match previous {
-                Slot::Draining(_) => Unclaimed::Busy,
-                Slot::Parked(_) | Slot::Ended => Unclaimed::Ended,
-            };
-            entry.slot = previous;
-            Err(refusal)
+        // The running drain's half goes back; the one just installed drops.
+        running @ Slot::Draining(_) => {
+            entry.slot = running;
+            Err(Busy)
         }
     }
 }
@@ -355,28 +346,21 @@ fn claim<V>(entry: &mut Entry<V>) -> Result<Claimed<V>, Unclaimed> {
 enum Subscription<V> {
     /// First subscribe of a parked stream: drain this response.
     Drain(Claimed<V>),
-    /// The stream is draining or ended: nothing to start.
+    /// The stream is draining or ended, or nothing more can be recorded: nothing to start.
     Active,
     /// The handle names no stream: emit one `Errored`; a tombstone now dedups it.
     Refused,
-    /// The handle names no stream and the registry is full of draining
-    /// streams, so no tombstone could dedup the refusal: emit nothing.
-    Unrecorded,
-}
-
-/// What `close` does to an entry.
-enum CloseAct {
-    /// A drain owns the response: end the entry, which cancels the drain.
-    EndInPlace,
-    /// A parked response nothing reads: drop it and its entry.
-    Remove,
-    /// The stream already ended: nothing to release, so the close is refused.
-    Refuse,
 }
 
 /// The one registry of client streams; every state change is one method under one lock.
 struct StreamRegistry<V> {
-    map: HashMap<StreamKey, Entry<V>>,
+    /// Streams holding a connection, parked or draining: at most `CLIENT_STREAMS_MAX`.
+    live: HashMap<StreamKey, Entry<V>>,
+    /// Tombstones of ended streams with their `seq`, so a re-subscribe stays quiet.
+    ///
+    /// A table of its own: a tombstone holds no connection, so no churn of ended
+    /// streams can crowd out a live one, and no live stream can crowd out a tombstone.
+    ended: HashMap<StreamKey, u64>,
     next_seq: u64,
     conns: Arc<Semaphore>,
 }
@@ -384,30 +368,26 @@ struct StreamRegistry<V> {
 impl<V> StreamRegistry<V> {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            live: HashMap::new(),
+            ended: HashMap::new(),
             next_seq: 0,
             conns: Arc::new(Semaphore::new(CLIENT_STREAMS_MAX)),
         }
     }
 
-    /// The oldest entry whose slot satisfies `pick`.
-    fn oldest_where(&self, pick: impl Fn(&Slot<V>) -> bool) -> Option<StreamKey> {
-        self.map
+    fn oldest_parked(&self) -> Option<StreamKey> {
+        self.live
             .iter()
-            .filter(|(_, e)| pick(&e.slot))
+            .filter(|(_, e)| matches!(e.slot, Slot::Parked(_)))
             .min_by_key(|(_, e)| e.seq)
             .map(|(k, _)| *k)
     }
 
-    /// The entry a full registry gives up for one more, or `None` when there is room.
-    fn victim(&self) -> Result<Option<StreamKey>, IpeError> {
-        if self.map.len() < CLIENT_STREAMS_MAX {
-            return Ok(None);
-        }
-        self.oldest_where(|s| matches!(s, Slot::Ended))
-            .or_else(|| self.oldest_where(|s| matches!(s, Slot::Parked(_))))
-            .map(Some)
-            .ok_or_else(|| IpeError::unavailable(TOO_MANY_STREAMS.to_owned()))
+    fn oldest_ended(&self) -> Option<StreamKey> {
+        self.ended
+            .iter()
+            .min_by_key(|(_, seq)| **seq)
+            .map(|(k, _)| *k)
     }
 
     fn bump_seq(&mut self) -> Result<u64, IpeError> {
@@ -427,31 +407,29 @@ impl<V> StreamRegistry<V> {
 
     /// Claims one connection permit for a request about to go out.
     ///
-    /// A full registry gives up its oldest parked stream (its response drops at
-    /// once and returns its permit); with nothing parked it refuses. The claim
-    /// and the eviction share the registry lock, so no other claimant can take
-    /// the freed permit in between.
+    /// With no permit free the registry gives up its oldest parked stream (its
+    /// response drops at once and returns its permit); with nothing parked it
+    /// refuses. The claim and the eviction share the registry lock, so no other
+    /// claimant can take the freed permit in between.
     fn reserve(&mut self) -> Result<ConnPermit, IpeError> {
         let refused = || IpeError::unavailable(TOO_MANY_STREAMS.to_owned());
         if let Some(permit) = self.try_permit() {
             return Ok(permit);
         }
-        let parked = self
-            .oldest_where(|s| matches!(s, Slot::Parked(_)))
-            .ok_or_else(refused)?;
-        self.map.remove(&parked);
+        let parked = self.oldest_parked().ok_or_else(refused)?;
+        self.live.remove(&parked);
         self.try_permit().ok_or_else(refused)
     }
 
-    /// Makes room, then records `slot` under `key`.
-    fn insert(&mut self, key: StreamKey, slot: Slot<V>) -> Result<(), IpeError> {
-        let victim = self.victim()?;
-        let seq = self.bump_seq()?;
-        if let Some(victim) = victim {
-            self.map.remove(&victim);
+    /// Remembers `key` as ended; a full table forgets its oldest tombstone first.
+    fn tombstone(&mut self, key: StreamKey, seq: u64) {
+        if self.ended.len() >= TOMBSTONES_MAX
+            && !self.ended.contains_key(&key)
+            && let Some(oldest) = self.oldest_ended()
+        {
+            self.ended.remove(&oldest);
         }
-        self.map.insert(key, Entry { seq, slot });
-        Ok(())
+        self.ended.insert(key, seq);
     }
 
     /// Parks `value` under a freshly minted handle.
@@ -459,57 +437,75 @@ impl<V> StreamRegistry<V> {
     where
         S: FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
     {
-        // Refuse a registry full of draining streams before drawing entropy.
-        self.victim()?;
-        let key = mint_with(source, |k| self.map.contains_key(&k))?;
-        self.insert(key, Slot::Parked(value))?;
+        // Every live stream holds a permit, so the table is never full here
+        // unless the permit count and the table drift: refuse then, fail closed.
+        if self.live.len() >= CLIENT_STREAMS_MAX {
+            return Err(IpeError::unavailable(TOO_MANY_STREAMS.to_owned()));
+        }
+        let key = mint_with(source, |k| {
+            self.live.contains_key(&k) || self.ended.contains_key(&k)
+        })?;
+        let seq = self.bump_seq()?;
+        self.live.insert(
+            key,
+            Entry {
+                seq,
+                slot: Slot::Parked(value),
+            },
+        );
         Ok(IpeStreamId { key })
     }
 
     /// Hands a parked response to one drain; any other state is a typed refusal.
     fn take_for_drain(&mut self, key: StreamKey) -> Result<Claimed<V>, IpeError> {
-        let Some(entry) = self.map.get_mut(&key) else {
+        let Some(entry) = self.live.get_mut(&key) else {
             return Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned()));
         };
-        claim(entry).map_err(|why| match why {
-            Unclaimed::Busy => IpeError::conflict(STREAM_BUSY.to_owned()),
-            Unclaimed::Ended => IpeError::invalid_input(UNKNOWN_STREAM.to_owned()),
-        })
+        claim(entry).map_err(|Busy| IpeError::conflict(STREAM_BUSY.to_owned()))
     }
 
     /// Releases a live stream. A handle naming no live stream (never opened,
     /// already closed, ended, or evicted) is a typed refusal that leaves the
     /// registry unchanged.
     fn close(&mut self, key: StreamKey) -> Result<(), IpeError> {
-        let Some(entry) = self.map.get_mut(&key) else {
-            return Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned()));
-        };
-        let act = match entry.slot {
-            Slot::Draining(_) => CloseAct::EndInPlace,
-            Slot::Parked(_) => CloseAct::Remove,
-            Slot::Ended => CloseAct::Refuse,
-        };
-        match act {
-            CloseAct::EndInPlace => entry.slot = Slot::Ended,
-            CloseAct::Remove => {
-                self.map.remove(&key);
+        match self.live.remove(&key) {
+            Some(Entry {
+                seq,
+                slot: Slot::Draining(cancel),
+            }) => {
+                self.tombstone(key, seq);
+                // The drain sees its cancel half drop and releases the connection.
+                drop(cancel);
+                Ok(())
             }
-            CloseAct::Refuse => return Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned())),
+            // A parked response nothing reads drops with its entry.
+            Some(Entry {
+                slot: Slot::Parked(_),
+                ..
+            }) => Ok(()),
+            None => Err(IpeError::invalid_input(UNKNOWN_STREAM.to_owned())),
         }
-        Ok(())
     }
 
     /// Decides one `chunks` subscribe.
     fn subscribe(&mut self, key: StreamKey) -> Subscription<V> {
-        if let Some(entry) = self.map.get_mut(&key) {
+        if let Some(entry) = self.live.get_mut(&key) {
             return match claim(entry) {
                 Ok(claimed) => Subscription::Drain(claimed),
-                Err(Unclaimed::Busy | Unclaimed::Ended) => Subscription::Active,
+                Err(Busy) => Subscription::Active,
             };
         }
-        match self.insert(key, Slot::Ended) {
-            Ok(()) => Subscription::Refused,
-            Err(_) => Subscription::Unrecorded,
+        if self.ended.contains_key(&key) {
+            return Subscription::Active;
+        }
+        match self.bump_seq() {
+            Ok(seq) => {
+                self.tombstone(key, seq);
+                Subscription::Refused
+            }
+            // A spent sequence records nothing more, so a refusal could not be
+            // deduplicated: start nothing.
+            Err(_) => Subscription::Active,
         }
     }
 
@@ -517,11 +513,13 @@ impl<V> StreamRegistry<V> {
     ///
     /// An entry the drain does not own (another `seq`, or not draining) is left alone.
     fn finish_drain(&mut self, key: StreamKey, seq: u64) {
-        if let Some(entry) = self.map.get_mut(&key)
-            && entry.seq == seq
-            && matches!(entry.slot, Slot::Draining(_))
-        {
-            entry.slot = Slot::Ended;
+        let owned = self
+            .live
+            .get(&key)
+            .is_some_and(|e| e.seq == seq && matches!(e.slot, Slot::Draining(_)));
+        if owned {
+            self.live.remove(&key);
+            self.tombstone(key, seq);
         }
     }
 }
@@ -761,7 +759,7 @@ where
                     UNKNOWN_STREAM.to_owned(),
                 ))));
             }
-            Subscription::Active | Subscription::Unrecorded => {}
+            Subscription::Active => {}
         }
         tokio::spawn(async {}) // dummy handle for `SubRuntime` to abort harmlessly
     }))
@@ -989,15 +987,15 @@ mod tests {
     }
 
     fn slot_of(reg: &StreamRegistry<()>, k: StreamKey) -> Option<&Slot<()>> {
-        reg.map.get(&k).map(|e| &e.slot)
+        reg.live.get(&k).map(|e| &e.slot)
     }
 
     fn is_draining<V>(reg: &StreamRegistry<V>, k: StreamKey) -> bool {
-        matches!(reg.map.get(&k).map(|e| &e.slot), Some(Slot::Draining(_)))
+        matches!(reg.live.get(&k).map(|e| &e.slot), Some(Slot::Draining(_)))
     }
 
     fn is_ended<V>(reg: &StreamRegistry<V>, k: StreamKey) -> bool {
-        matches!(reg.map.get(&k).map(|e| &e.slot), Some(Slot::Ended))
+        reg.ended.contains_key(&k)
     }
 
     fn draining_in<V>(reg: &Mutex<StreamRegistry<V>>, k: StreamKey) -> bool {
@@ -1585,7 +1583,7 @@ mod tests {
     fn start_pump(
         reg: &mut StreamRegistry<FakeConn>,
         idle: IdleCeiling,
-    ) -> (StreamKey, u64, JoinHandle<DrainEnd<String, String>>) {
+    ) -> (StreamKey, JoinHandle<DrainEnd<String, String>>) {
         let permit = reg.reserve().unwrap();
         let body = scripted(vec![Beat::Stall]);
         let sid = reg.open(FakeConn { body, permit }, os_entropy).unwrap();
@@ -1598,13 +1596,13 @@ mod tests {
             idle,
         };
         let task = tokio::spawn(pump.run(|_chunk| std::future::ready(Ok::<(), String>(()))));
-        (sid.key, claimed.seq, task)
+        (sid.key, task)
     }
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_registry_cancels_a_running_drain() {
         let mut reg = StreamRegistry::<FakeConn>::new();
-        let (_key, _seq, task) = start_pump(&mut reg, ms(7_200_000));
+        let (_key, task) = start_pump(&mut reg, ms(7_200_000));
         tokio::time::sleep(Duration::from_millis(1)).await;
         drop(reg);
         let end = tokio::time::timeout(Duration::from_secs(3_600), task).await;
@@ -1614,15 +1612,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn overwriting_a_draining_entry_cancels_its_drain() {
         let mut reg = StreamRegistry::<FakeConn>::new();
-        let (key, seq, task) = start_pump(&mut reg, ms(7_200_000));
+        let (key, task) = start_pump(&mut reg, ms(7_200_000));
         tokio::time::sleep(Duration::from_millis(1)).await;
-        reg.map.insert(
-            key,
-            Entry {
-                seq,
-                slot: Slot::Ended,
-            },
-        );
+        reg.live.remove(&key);
         let end = tokio::time::timeout(Duration::from_secs(3_600), task).await;
         assert!(matches!(end, Ok(Ok(DrainEnd::Cancelled))));
     }
@@ -1652,12 +1644,12 @@ mod tests {
         let sid = reg.open((), counting_source()).unwrap();
         // A forged handle the registry never held.
         assert_unknown(&reg.close(key(99)));
-        assert_eq!(reg.map.len(), 1);
+        assert_eq!(reg.live.len(), 1);
         assert!(slot_of(&reg, key(99)).is_none());
         assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Parked(()))));
         // Happy twin: closing the held handle removes it.
         assert!(reg.close(sid.key).is_ok());
-        assert!(reg.map.is_empty());
+        assert!(reg.live.is_empty());
     }
 
     #[test]
@@ -1673,7 +1665,7 @@ mod tests {
         assert!(reg.take_for_drain(draining.key).is_ok());
         assert!(reg.close(draining.key).is_ok());
         assert_unknown(&reg.close(draining.key));
-        assert!(matches!(slot_of(&reg, draining.key), Some(Slot::Ended)));
+        assert!(is_ended(&reg, draining.key));
     }
 
     #[test]
@@ -1683,17 +1675,7 @@ mod tests {
         let claimed = reg.take_for_drain(sid.key).unwrap();
         reg.finish_drain(sid.key, claimed.seq);
         assert_unknown(&reg.close(sid.key));
-        assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
-    }
-
-    #[test]
-    fn close_evicted_key_refused() {
-        let mut reg = StreamRegistry::<()>::new();
-        let mut source = counting_source();
-        fill(&mut reg, &mut source);
-        assert!(reg.open((), &mut source).is_ok());
-        assert_unknown(&reg.close(key(1)));
-        assert!(reg.close(key(2)).is_ok());
+        assert!(is_ended(&reg, sid.key));
     }
 
     #[test]
@@ -1714,7 +1696,7 @@ mod tests {
         reg.finish_drain(sid.key, claimed.seq);
         let again = reg.take_for_drain(sid.key);
         assert!(matches!(&again, Err(e) if kind(e) == IpeErrorKind::InvalidInput));
-        assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
+        assert!(is_ended(&reg, sid.key));
     }
 
     #[test]
@@ -1725,10 +1707,10 @@ mod tests {
         assert!(is_draining(&reg, sid.key));
         assert!(reg.close(sid.key).is_ok());
         assert!(!is_draining(&reg, sid.key));
-        assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
+        assert!(is_ended(&reg, sid.key));
         // The drain's own lease then ends nothing further.
         reg.finish_drain(sid.key, claimed.seq);
-        assert!(matches!(slot_of(&reg, sid.key), Some(Slot::Ended)));
+        assert!(is_ended(&reg, sid.key));
     }
 
     #[test]
@@ -1883,27 +1865,69 @@ mod tests {
     }
 
     #[test]
-    fn eviction_prefers_ended_tombstone() {
+    fn open_at_the_live_cap_is_unavailable() {
         let mut reg = StreamRegistry::<()>::new();
         let mut source = counting_source();
         fill(&mut reg, &mut source);
-        // A later stream ends; the oldest (key 1) stays parked.
-        let ended = key(500);
-        let claimed = reg.take_for_drain(ended).unwrap();
-        reg.finish_drain(ended, claimed.seq);
+        let refused = reg.open((), &mut source);
+        assert!(matches!(&refused, Err(e) if kind(e) == IpeErrorKind::Unavailable));
+        let Err(e) = refused else { return };
+        assert_eq!(message(&e), TOO_MANY_STREAMS);
+        assert_eq!(reg.live.len(), CLIENT_STREAMS_MAX);
+        // Happy twin: one close frees a slot.
+        assert!(reg.close(key(1)).is_ok());
         assert!(reg.open((), &mut source).is_ok());
-        assert_eq!(reg.map.len(), CLIENT_STREAMS_MAX);
-        assert!(slot_of(&reg, ended).is_none());
-        assert!(matches!(slot_of(&reg, key(1)), Some(Slot::Parked(()))));
+    }
+
+    // E-T12: tombstones live in a table of their own, bounded and oldest-first.
+    #[test]
+    fn the_tombstone_table_is_bounded_and_forgets_its_oldest() {
+        let mut reg = StreamRegistry::<()>::new();
+        let mut source = counting_source();
+        let parked = reg.open((), &mut source).unwrap();
+        let first = 10_000;
+        for n in 1..=CLIENT_STREAMS_MAX {
+            let n = u128::try_from(n).unwrap();
+            assert!(matches!(
+                reg.subscribe(key(first + n)),
+                Subscription::Refused
+            ));
+        }
+        assert_eq!(reg.ended.len(), TOMBSTONES_MAX);
+        assert!(is_ended(&reg, key(first + 1)));
+        // One more refusal forgets the oldest tombstone and keeps the rest.
+        let over = first + u128::try_from(CLIENT_STREAMS_MAX).unwrap() + 1;
+        assert!(matches!(reg.subscribe(key(over)), Subscription::Refused));
+        assert_eq!(reg.ended.len(), TOMBSTONES_MAX);
+        assert!(!is_ended(&reg, key(first + 1)));
+        assert!(is_ended(&reg, key(first + 2)));
+        assert!(is_ended(&reg, key(over)));
+        // Tombstone churn never touches a live entry.
+        assert_eq!(reg.live.len(), 1);
+        assert!(matches!(slot_of(&reg, parked.key), Some(Slot::Parked(()))));
+        // A forgotten handle is unknown again: close refuses it, subscribe re-records it.
+        assert_unknown(&reg.close(key(first + 1)));
+        assert!(matches!(
+            reg.subscribe(key(first + 1)),
+            Subscription::Refused
+        ));
+        // Happy twin: a remembered handle stays quiet.
+        assert!(matches!(reg.subscribe(key(over)), Subscription::Active));
     }
 
     #[test]
     fn evicted_parked_key_then_refused() {
-        let mut reg = StreamRegistry::<()>::new();
+        let mut reg = StreamRegistry::<FakeConn>::new();
         let mut source = counting_source();
-        fill(&mut reg, &mut source);
-        assert!(reg.open((), &mut source).is_ok());
-        assert_eq!(reg.map.len(), CLIENT_STREAMS_MAX);
+        for _ in 0..CLIENT_STREAMS_MAX {
+            park_local(&mut reg, &mut source);
+        }
+        // A new request evicts the oldest parked stream for its permit.
+        let permit = reg.reserve().unwrap();
+        assert_eq!(reg.live.len(), CLIENT_STREAMS_MAX - 1);
+        let body = scripted(Vec::new());
+        assert!(reg.open(FakeConn { body, permit }, &mut source).is_ok());
+        assert_eq!(reg.live.len(), CLIENT_STREAMS_MAX);
         let evicted = reg.take_for_drain(key(1));
         assert!(matches!(&evicted, Err(e) if kind(e) == IpeErrorKind::InvalidInput));
         // The next-oldest is still held.
@@ -1911,24 +1935,42 @@ mod tests {
     }
 
     #[test]
-    fn all_draining_open_unavailable() {
-        let mut reg = StreamRegistry::<()>::new();
+    fn close_evicted_key_refused() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
         let mut source = counting_source();
-        fill(&mut reg, &mut source);
-        for n in 1..=CLIENT_STREAMS_MAX {
-            let n = u128::try_from(n).unwrap();
-            assert!(reg.take_for_drain(key(n)).is_ok());
+        for _ in 0..CLIENT_STREAMS_MAX {
+            park_local(&mut reg, &mut source);
         }
-        let refused = reg.open((), &mut source);
+        assert!(reg.reserve().is_ok());
+        assert_unknown(&reg.close(key(1)));
+        assert!(reg.close(key(2)).is_ok());
+    }
+
+    // E-T11: a registry full of draining streams still dedups an unknown subscribe.
+    #[test]
+    fn all_draining_registry_still_refuses_and_dedups_an_unknown_subscribe() {
+        let mut reg = StreamRegistry::<FakeConn>::new();
+        let mut source = counting_source();
+        let mut held = Vec::new();
+        for _ in 0..CLIENT_STREAMS_MAX {
+            let sid = park_local(&mut reg, &mut source);
+            held.push(reg.take_for_drain(sid.key).unwrap());
+        }
+        let refused = reg.reserve();
         assert!(matches!(&refused, Err(e) if kind(e) == IpeErrorKind::Unavailable));
-        let Err(e) = refused else { return };
-        assert_eq!(message(&e), TOO_MANY_STREAMS);
-        assert_eq!(reg.map.len(), CLIENT_STREAMS_MAX);
-        // An unknown subscribe finds no room for a tombstone and stays silent.
-        assert!(matches!(
-            reg.subscribe(key(u128::MAX)),
-            Subscription::Unrecorded
-        ));
+        assert!(matches!(&refused, Err(e) if message(e) == TOO_MANY_STREAMS));
+        assert_eq!(reg.live.len(), CLIENT_STREAMS_MAX);
+        // The unknown handle is refused once, then deduplicated.
+        let unknown = key(u128::MAX);
+        assert!(matches!(reg.subscribe(unknown), Subscription::Refused));
+        assert!(matches!(reg.subscribe(unknown), Subscription::Active));
+        assert!(is_ended(&reg, unknown));
+        // No live drain was disturbed.
+        assert_eq!(reg.live.len(), CLIENT_STREAMS_MAX);
+        assert!(is_draining(&reg, key(1)));
+        // Happy twin: one drain ending frees its permit for a new request.
+        drop(held.pop());
+        assert!(reg.reserve().is_ok());
     }
 
     #[cfg(feature = "web-core")]
