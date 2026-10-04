@@ -1,7 +1,25 @@
+use crate::repo_set::{LocateRefusal, RepoSet};
 use crate::store::Store;
+use crate::walk::{ReadRefusal, shown};
 use anyhow::Result;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+/// Escapes `text` so it matches only itself inside a `LIKE ... ESCAPE '\'` pattern.
+///
+/// The one place a user-typed string becomes pattern text: `%`, `_` and the
+/// escape character itself lose their wildcard meaning.
+fn like_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// A resolved review unit: enough to locate it, judge it, and follow it into
 /// the callgraph. The shared shape behind `locate`, `callers`, `callees`, and
@@ -283,6 +301,89 @@ pub fn cmd_context(db: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Why `changed` will not diff the directory it was pointed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangedRefusal {
+    /// The directory is no root of the set this index was built under.
+    NotARecordedRoot { dir: String },
+}
+
+impl fmt::Display for ChangedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotARecordedRoot { dir } => write!(
+                f,
+                "--repo `{}` is none of the roots this index was built from",
+                shown(dir)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChangedRefusal {}
+
+/// The units of one tagged path that a changed line range overlaps.
+fn units_in_ranges(
+    st: &mut rusqlite::Statement<'_>,
+    tagged: &str,
+    ranges: &[(i64, i64)],
+) -> Result<Vec<UnitRow>> {
+    let rows: Vec<UnitRow> = st
+        .query_map([tagged], |r| {
+            Ok(UnitRow {
+                uid: r.get(0)?,
+                path: r.get(1)?,
+                kind: r.get(2)?,
+                qualified: r.get(3)?,
+                line_start: r.get(4)?,
+                line_end: r.get(5)?,
+                facing: r.get(6)?,
+                purpose: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|u| {
+            ranges
+                .iter()
+                .any(|(a, b)| u.line_start <= *b && *a <= u.line_end)
+        })
+        .collect())
+}
+
+/// The units of `repo`'s diff over `range`: those a changed line range overlaps.
+///
+/// `repo` must be a root of the recorded set; a path changed under a root
+/// nested in it belongs to the nested root's tag.
+fn changed_units(s: &Store, repo: &str, range: &str) -> Result<Vec<UnitRow>> {
+    let set = s.repo_set()?;
+    let Some(root) = set.root_at_dir(repo) else {
+        return Err(ChangedRefusal::NotARecordedRoot {
+            dir: repo.to_string(),
+        }
+        .into());
+    };
+    // The changed line ranges per file, from git — the source of truth for
+    // which units a diff overlaps.
+    let hunks = crate::diff::changed_line_ranges(root, range)?;
+    let mut st = s.conn.prepare(
+        "SELECT uid, path, kind, qualified, line_start, line_end, facing, purpose \
+         FROM units WHERE path = ?1 AND kind != 'file' \
+         ORDER BY line_start",
+    )?;
+    let mut found = Vec::new();
+    for (rel, ranges) in &hunks {
+        let (owner, below) = set.owner_of(root, rel);
+        found.extend(units_in_ranges(
+            &mut st,
+            &owner.tag().tagged(below),
+            ranges,
+        )?);
+    }
+    Ok(found)
+}
+
 /// `changed <git-range>`: the review entry point for a branch/PR. Lists the
 /// units that fall inside the changed line ranges of `<range>` (e.g.
 /// `main..HEAD`), each as a concise clickable coordinate, so a reviewer sees
@@ -290,6 +391,7 @@ pub fn cmd_context(db: &str, target: &str) -> Result<()> {
 pub fn cmd_changed(db: &str, repo: &str, range: &str) -> Result<()> {
     use std::io::Write;
     let s = Store::open(db)?;
+    let units = changed_units(&s, repo, range)?;
     let stdout = std::io::stdout();
     let mut locked = stdout.lock();
     macro_rules! writeln_bp {
@@ -300,45 +402,10 @@ pub fn cmd_changed(db: &str, repo: &str, range: &str) -> Result<()> {
             }
         };
     }
-    // The changed line ranges per file, from git — the source of truth for
-    // which units a diff overlaps.
-    let hunks = crate::diff::changed_line_ranges(repo, range)?;
-    let mut any = false;
-    let mut st = s.conn.prepare(
-        "SELECT uid, path, kind, qualified, line_start, line_end, facing, purpose \
-         FROM units WHERE (path = ?1 OR path LIKE ?2) AND kind != 'file' \
-         ORDER BY line_start",
-    )?;
-    for (rel, ranges) in &hunks {
-        // A unit is stored under a `tag:` prefix; match the untagged rel.
-        let tagged = format!("%:{rel}");
-        let rows: Vec<UnitRow> = st
-            .query_map(rusqlite::params![rel, tagged], |r| {
-                Ok(UnitRow {
-                    uid: r.get(0)?,
-                    path: r.get(1)?,
-                    kind: r.get(2)?,
-                    qualified: r.get(3)?,
-                    line_start: r.get(4)?,
-                    line_end: r.get(5)?,
-                    facing: r.get(6)?,
-                    purpose: r.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        for u in &rows {
-            if ranges
-                .iter()
-                .any(|(a, b)| u.line_start <= *b && *a <= u.line_end)
-            {
-                writeln_bp!("{}", unit_line(u));
-                let _ = &u.facing;
-                let _ = &u.purpose;
-                any = true;
-            }
-        }
+    for u in &units {
+        writeln_bp!("{}", unit_line(u));
     }
-    if !any {
+    if units.is_empty() {
         writeln_bp!("(no changed units in {range})");
     }
     Ok(())
@@ -353,15 +420,15 @@ pub fn cmd_rdeps(db: &str, module: &str, count: bool, subtree: bool) -> Result<(
     // Build the WHERE clause:
     //   - exact dst match (default): `dst = ?`
     //   - exact resolved match when arg is path-shaped: `resolved = ?`
-    //   - subtree: additionally `dst LIKE 'module.%'`
+    //   - subtree: additionally `dst LIKE 'module.%'` with `module` escaped
     // We do NOT use unanchored LIKE so `rdeps "List"` can't accidentally
     // fold in `Data.List`, `container/list`, or `*ListSpec` files.
     if count {
         let n: i64 = if subtree {
             s.conn.query_row(
                 "SELECT COUNT(DISTINCT src) FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 OR resolved=?1)",
-                rusqlite::params![module, format!("{module}.%")],
+                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved=?1)",
+                rusqlite::params![module, format!("{}.%", like_literal(module))],
                 |r| r.get(0),
             )?
         } else if looks_like_path {
@@ -386,8 +453,8 @@ pub fn cmd_rdeps(db: &str, module: &str, count: bool, subtree: bool) -> Result<(
         let (sql, params) = if subtree {
             sql_and_params = (
                 "SELECT DISTINCT src FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 OR resolved=?1) ORDER BY src",
-                vec![module.to_string(), format!("{module}.%")],
+                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved=?1) ORDER BY src",
+                vec![module.to_string(), format!("{}.%", like_literal(module))],
             );
             (&sql_and_params.0, &sql_and_params.1)
         } else if looks_like_path {
@@ -429,10 +496,13 @@ pub fn cmd_deps(db: &str, module: &str) -> Result<()> {
     // "substring match"). `?1` is bound as a parameter, so this is injection-safe;
     // the looseness — `deps "List"` folding in any path containing "List" — is the
     // documented CLI contract, not a bug. Use `rdeps` for exact dst/resolved match.
+    // Only the surrounding `%` are wildcards: `module` itself is matched literally.
     let mut st = s.conn.prepare(
-        "SELECT DISTINCT dst FROM edges WHERE src LIKE ?1 AND kind='import' ORDER BY dst",
+        "SELECT DISTINCT dst FROM edges WHERE src LIKE ?1 ESCAPE '\\' AND kind='import' ORDER BY dst",
     )?;
-    let rows = st.query_map([format!("%{module}%")], |r| r.get::<_, String>(0))?;
+    let rows = st.query_map([format!("%{}%", like_literal(module))], |r| {
+        r.get::<_, String>(0)
+    })?;
     for r in rows {
         println!("{}", r?);
     }
@@ -469,10 +539,12 @@ pub fn cmd_covers(db: &str, kernel: &str) -> Result<()> {
     let s = Store::open(db)?;
     // Unanchored substring match by design (the CLI documents `covers` as
     // "substring match"); `?1` is a bound parameter so it stays injection-safe.
-    let mut st = s
-        .conn
-        .prepare("SELECT src FROM edges WHERE kind='covers' AND dst LIKE ?1 ORDER BY src")?;
-    let rows = st.query_map([format!("%{kernel}%")], |r| r.get::<_, String>(0))?;
+    let mut st = s.conn.prepare(
+        "SELECT src FROM edges WHERE kind='covers' AND dst LIKE ?1 ESCAPE '\\' ORDER BY src",
+    )?;
+    let rows = st.query_map([format!("%{}%", like_literal(kernel))], |r| {
+        r.get::<_, String>(0)
+    })?;
     for r in rows {
         println!("{}", r?);
     }
@@ -880,20 +952,31 @@ pub fn cmd_pending(db: &str, since: Option<&str>, limit: Option<i64>) -> Result<
     Ok(())
 }
 
-/// A7 `rename-path <old> [--to <new>]`: whole-segment path match across
-/// files, symbols, units, import edges (dst/resolved), and links (to_ref).
-/// Outputs JSON lines: {kind,path,line,col,context,replacement?}.
-/// kind ∈ {file,symbol,unit,import,link}. Read-only.
-/// Whole-segment path match for a stored (repo-tagged) path column. Stored
-/// paths are `tag:rel`, but a caller types the untagged `rel`, so the four
-/// patterns match the exact rel and its subtree under any tag prefix.
+/// The match patterns for a stored (repo-tagged) path column.
+///
+/// Stored paths are `tag:rel`, but a caller types the untagged `rel`, so the
+/// four patterns select the exact rel and its subtree, tagged or not. The
+/// first is compared with `=`; the others are `LIKE ... ESCAPE '\'` patterns
+/// over the escaped name. They only narrow the scan: [`names_path`] decides.
 fn path_match_patterns(old: &str) -> (String, String, String, String) {
+    let literal = like_literal(old);
     (
-        old.to_string(),      // exact, untagged (matches an untagged store)
-        format!("%:{old}"),   // exact, under a `tag:` prefix
-        format!("{old}/%"),   // subtree, untagged
-        format!("%:{old}/%"), // subtree, under a `tag:` prefix
+        old.to_string(),
+        format!("%:{literal}"),
+        format!("{literal}/%"),
+        format!("%:{literal}/%"),
     )
+}
+
+/// Whether the rel after the stored path's tag is `old` or a path below it.
+///
+/// Whole segments only, and case-sensitive, which a SQL `LIKE` is not.
+fn names_path(stored: &str, old: &str) -> bool {
+    let (_, rel) = crate::model::split_tag(stored);
+    rel == old
+        || rel
+            .strip_prefix(old)
+            .is_some_and(|below| below.starts_with('/'))
 }
 
 /// Splice a whole-segment path rename onto a stored (possibly tagged) path,
@@ -906,8 +989,8 @@ fn splice_path(stored: &str, old: &str, to: &str) -> String {
     } else if let Some(suffix) = rel.strip_prefix(&format!("{old}/")) {
         format!("{to}/{suffix}")
     } else {
-        // No structural match on the rel (should not happen given the SQL
-        // filter); leave it unchanged rather than corrupt the path.
+        // Not a whole-segment match of `old`: leave it unchanged rather than
+        // corrupt the path.
         rel.to_string()
     };
     if tag.is_empty() {
@@ -917,28 +1000,29 @@ fn splice_path(stored: &str, old: &str, to: &str) -> String {
     }
 }
 
-pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
-    use std::io::Write;
-    let s = Store::open(db)?;
-    let stdout = std::io::stdout();
-    let mut locked = stdout.lock();
+/// What follows `old` in `name` when `name` is `old` or a dotted path below it.
+fn below_module<'a>(name: &'a str, old: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(old)?;
+    (rest.is_empty() || rest.starts_with('.')).then_some(rest)
+}
 
-    macro_rules! writeln_bp {
-        ($($arg:tt)*) => {
-            if let Err(e) = writeln!(locked, $($arg)*) {
-                if e.kind() == std::io::ErrorKind::BrokenPipe { return Ok(()); }
-                return Err(e.into());
-            }
-        };
+/// The tail an import edge carries onto its replacement: empty for `old` itself.
+fn edge_tail<'a>(dst: &'a str, resolved: Option<&'a str>, old: &str) -> Option<&'a str> {
+    if dst == old || resolved == Some(old) {
+        return Some("");
     }
+    below_module(dst, old).or_else(|| resolved.and_then(|r| below_module(r, old)))
+}
 
+/// The sites a whole-segment rename of `old` touches, sorted.
+fn rename_path_sites(s: &Store, old: &str, to: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let mut sites = Vec::new();
     let (p_exact, p_exact_tag, p_sub, p_sub_tag) = path_match_patterns(old);
 
     // files.path — exact or subtree, tagged or not.
     {
         let mut st = s.conn.prepare(
-            "SELECT path FROM files WHERE path = ?1 OR path LIKE ?2 OR path LIKE ?3 OR path LIKE ?4",
+            "SELECT path FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\' OR path LIKE ?3 ESCAPE '\\' OR path LIKE ?4 ESCAPE '\\'",
         )?;
         let rows = st.query_map(
             rusqlite::params![p_exact, p_exact_tag, p_sub, p_sub_tag],
@@ -946,6 +1030,9 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         )?;
         for r in rows {
             let path = r?;
+            if !names_path(&path, old) {
+                continue;
+            }
             let replacement = to.map(|t| splice_path(&path, old, t));
             sites.push(serde_json::json!({
                 "kind": "file",
@@ -961,7 +1048,7 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
     // symbols.file — exact or subtree, tagged or not.
     {
         let mut st = s.conn.prepare(
-            "SELECT file, line, col, name FROM symbols WHERE file = ?1 OR file LIKE ?2 OR file LIKE ?3 OR file LIKE ?4",
+            "SELECT file, line, col, name FROM symbols WHERE file = ?1 OR file LIKE ?2 ESCAPE '\\' OR file LIKE ?3 ESCAPE '\\' OR file LIKE ?4 ESCAPE '\\'",
         )?;
         let rows = st.query_map(
             rusqlite::params![p_exact, p_exact_tag, p_sub, p_sub_tag],
@@ -976,6 +1063,9 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         )?;
         for r in rows {
             let (file, line, col, name) = r?;
+            if !names_path(&file, old) {
+                continue;
+            }
             let replacement = to.map(|t| splice_path(&file, old, t));
             sites.push(serde_json::json!({
                 "kind": "symbol",
@@ -991,7 +1081,7 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
     // units.path — exact or subtree, tagged or not.
     {
         let mut st = s.conn.prepare(
-            "SELECT path, line_start, qualified FROM units WHERE path = ?1 OR path LIKE ?2 OR path LIKE ?3 OR path LIKE ?4",
+            "SELECT path, line_start, qualified FROM units WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\' OR path LIKE ?3 ESCAPE '\\' OR path LIKE ?4 ESCAPE '\\'",
         )?;
         let rows = st.query_map(
             rusqlite::params![p_exact, p_exact_tag, p_sub, p_sub_tag],
@@ -1005,6 +1095,9 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         )?;
         for r in rows {
             let (path, line, qualified) = r?;
+            if !names_path(&path, old) {
+                continue;
+            }
             let replacement = to.map(|t| splice_path(&path, old, t));
             sites.push(serde_json::json!({
                 "kind": "unit",
@@ -1017,12 +1110,13 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         }
     }
 
-    // import edges: dst == old OR resolved == old OR dst LIKE old + '.%' OR resolved LIKE old + '.%'
+    // import edges: dst or resolved is old, or a dotted path below it.
     {
         let mut st = s.conn.prepare(
-            "SELECT src, dst, resolved FROM edges WHERE kind='import' AND (dst = ?1 OR resolved = ?1 OR dst LIKE ?2 OR resolved LIKE ?2)",
+            "SELECT src, dst, resolved FROM edges WHERE kind='import' AND (dst = ?1 OR resolved = ?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved LIKE ?2 ESCAPE '\\')",
         )?;
-        let rows = st.query_map([old, &format!("{old}.%")], |r| {
+        let below = format!("{}.%", like_literal(old));
+        let rows = st.query_map([old, below.as_str()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1031,20 +1125,10 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         })?;
         for r in rows {
             let (src, dst, resolved) = r?;
-            let hit = if dst == old || resolved.as_deref() == Some(old) {
-                old
-            } else if dst.starts_with(&format!("{old}.")) {
-                &dst
-            } else {
-                &resolved.unwrap_or_default()
+            let Some(tail) = edge_tail(&dst, resolved.as_deref(), old) else {
+                continue;
             };
-            let replacement = to.map(|t| {
-                if hit == old {
-                    t.to_string()
-                } else {
-                    format!("{t}{}", &hit[old.len()..])
-                }
-            });
+            let replacement = to.map(|t| format!("{t}{tail}"));
             sites.push(serde_json::json!({
                 "kind": "import",
                 "path": src,
@@ -1056,12 +1140,13 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         }
     }
 
-    // links.to_ref == old OR LIKE old + '.%' (join units for path/line)
+    // links.to_ref is old, or a dotted path below it (join units for path/line).
     {
         let mut st = s.conn.prepare(
-            "SELECT l.to_ref, u.path, l.line FROM links l JOIN units u ON u.uid = l.from_uid WHERE l.to_ref = ?1 OR l.to_ref LIKE ?2",
+            "SELECT l.to_ref, u.path, l.line FROM links l JOIN units u ON u.uid = l.from_uid WHERE l.to_ref = ?1 OR l.to_ref LIKE ?2 ESCAPE '\\'",
         )?;
-        let rows = st.query_map([old, &format!("{old}.%")], |r| {
+        let below = format!("{}.%", like_literal(old));
+        let rows = st.query_map([old, below.as_str()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1070,13 +1155,10 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
         })?;
         for r in rows {
             let (to_ref, path, line) = r?;
-            let replacement = to.map(|t| {
-                if to_ref == old {
-                    t.to_string()
-                } else {
-                    format!("{t}{}", &to_ref[old.len()..])
-                }
-            });
+            let Some(tail) = below_module(&to_ref, old) else {
+                continue;
+            };
+            let replacement = to.map(|t| format!("{t}{tail}"));
             sites.push(serde_json::json!({
                 "kind": "link",
                 "path": path,
@@ -1104,40 +1186,136 @@ pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
             .then(a_kind.cmp(b_kind))
             .then(a_ctx.cmp(b_ctx))
     });
+    Ok(sites)
+}
 
-    for site in sites {
-        writeln_bp!("{}", serde_json::to_string(&site)?);
+/// A7 `rename-path <old> [--to <new>]`: whole-segment path match across
+/// files, symbols, units, import edges (dst/resolved), and links (to_ref).
+/// Outputs JSON lines: {kind,path,line,col,context,replacement?}.
+/// kind ∈ {file,symbol,unit,import,link}. Read-only.
+pub fn cmd_rename_path(db: &str, old: &str, to: Option<&str>) -> Result<()> {
+    let s = Store::open(db)?;
+    let sites = rename_path_sites(&s, old, to)?;
+    if let Err(e) = write_sites(&sites)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e.into());
     }
     Ok(())
 }
 
-/// A8 `rename-symbol <old> [--to <new>] [--preserve <regex>...] [--map k=v,...]`:
-/// finds resolved occurrences of a symbol name (units/links). Outputs JSON lines:
-/// {kind,path,line,col,context,replacement?}. kind ∈ {symbol,occurrence}.
-/// --preserve: user regexes + baked defaults (URL-ish, kebab-case attrs).
-/// --map: k=v comma-separated, longest-key-first overrides correlated replacements.
-/// Read-only.
-pub fn cmd_rename_symbol(
-    db: &str,
+/// Why a unit's source gave no lines to scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceRefusal {
+    /// The stored path names no readable place in the recorded root set.
+    Locate(LocateRefusal),
+    /// The owning root refused the file.
+    Read(ReadRefusal),
+    /// The unit's recorded lines start past the end of the file as it is now.
+    SpanPastFile { line_start: i64, lines: usize },
+    /// A recorded or computed line or column number is outside the line-count range.
+    LineNumber,
+}
+
+impl fmt::Display for SourceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Locate(why) => write!(f, "{why}"),
+            Self::Read(why) => write!(f, "{why}"),
+            Self::SpanPastFile { line_start, lines } => write!(
+                f,
+                "a unit starts at line {line_start}, past the {lines} lines the file has now; re-run `index`"
+            ),
+            Self::LineNumber => f.write_str("a line or column number is out of range"),
+        }
+    }
+}
+
+/// A file the rename plan could not read, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnreadFile {
+    path: String,
+    why: SourceRefusal,
+}
+
+/// The sites a rename found, and the files whose lines it could not scan.
+///
+/// A plan with unread files is incomplete and never presented as complete.
+struct RenamePlan {
+    sites: Vec<serde_json::Value>,
+    unread: Vec<UnreadFile>,
+}
+
+/// The lines of a unit's file, read through the root that owns its tagged path.
+fn source_lines(set: &RepoSet, tagged: &str) -> Result<Vec<String>, SourceRefusal> {
+    let (root, rel) = set.locate(tagged).map_err(SourceRefusal::Locate)?;
+    crate::walk::read_owned(root.root(), rel.as_str(), &set.claimed_in(root))
+        .map(|text| text.lines().map(str::to_string).collect())
+        .map_err(SourceRefusal::Read)
+}
+
+/// The 1-based first and last line of a unit's recorded span.
+fn span_lines(line_start: i64, line_end: i64) -> Option<(usize, usize)> {
+    let first = usize::try_from(line_start).ok()?;
+    let last = usize::try_from(line_end).ok()?;
+    Some((first.max(1), last))
+}
+
+/// A line's identifier tokens and the byte offset each starts at.
+///
+/// A token is `[A-Za-z0-9_$]+` that does not start with a digit.
+fn identifiers(line: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    let mut open: Option<usize> = None;
+    for (at, c) in line.char_indices() {
+        match open {
+            None if is_ident_start(c) => open = Some(at),
+            Some(from) if !is_ident_char(c) => {
+                if let Some(token) = line.get(from..at) {
+                    found.push((from, token));
+                }
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = open
+        && let Some(token) = line.get(from..)
+    {
+        found.push((from, token));
+    }
+    found
+}
+
+/// Whether `qualified` is `old`, or ends in `::old` or `.old` (its final segment).
+fn ends_in_segment(qualified: &str, old: &str) -> bool {
+    qualified == old
+        || qualified
+            .strip_suffix(old)
+            .is_some_and(|head| head.ends_with("::") || head.ends_with('.'))
+}
+
+/// `qualified` with its final segment replaced by `to`, keeping its separator.
+fn splice_final_segment(qualified: &str, to: &str) -> String {
+    if let Some((head, _)) = qualified.rsplit_once("::") {
+        format!("{head}::{to}")
+    } else if let Some((head, _)) = qualified.rsplit_once('.') {
+        format!("{head}.{to}")
+    } else {
+        to.to_string()
+    }
+}
+
+/// Every site a rename of `old` touches, reading each unit's file through the
+/// root its tag names.
+fn rename_symbol_plan(
+    s: &Store,
+    set: &RepoSet,
     old: &str,
     to: Option<&str>,
     preserves: &[String],
     map: Option<&str>,
-) -> Result<()> {
-    use std::io::Write;
-    let s = Store::open(db)?;
-    let stdout = std::io::stdout();
-    let mut locked = stdout.lock();
-
-    macro_rules! writeln_bp {
-        ($($arg:tt)*) => {
-            if let Err(e) = writeln!(locked, $($arg)*) {
-                if e.kind() == std::io::ErrorKind::BrokenPipe { return Ok(()); }
-                return Err(e.into());
-            }
-        };
-    }
-
+) -> Result<RenamePlan> {
     // Compile user preserves + baked defaults
     let mut preserve_regexes = Vec::new();
     // Baked defaults: URL-ish (contains ://), kebab-case attrs
@@ -1161,31 +1339,30 @@ pub fn cmd_rename_symbol(
     }
 
     let mut sites = Vec::new();
+    let mut unread = Vec::new();
 
     // 1. Symbol-table sites: units whose qualified ends with ::old or .old (final component)
     {
         let mut st = s.conn.prepare(
-            "SELECT path, line_start, qualified FROM units WHERE qualified = ?1 OR qualified LIKE ?2 OR qualified LIKE ?3",
+            "SELECT path, line_start, qualified FROM units WHERE qualified = ?1 OR qualified LIKE ?2 ESCAPE '\\' OR qualified LIKE ?3 ESCAPE '\\'",
         )?;
-        let rows = st.query_map([old, &format!("%::{old}"), &format!("%.{old}")], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let literal = like_literal(old);
+        let rows = st.query_map(
+            [old, &format!("%::{literal}"), &format!("%.{literal}")],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
         for r in rows {
             let (path, line, qualified) = r?;
-            let replacement = to.map(|t| {
-                // Replace final segment — detect separator (:: or .) and splice correctly
-                if let Some(idx) = qualified.rfind("::") {
-                    format!("{}{t}", &qualified[..idx + 2])
-                } else if let Some(idx) = qualified.rfind('.') {
-                    format!("{}{t}", &qualified[..idx + 1])
-                } else {
-                    t.to_string()
-                }
-            });
+            if !ends_in_segment(&qualified, old) {
+                continue;
+            }
+            let replacement = to.map(|t| splice_final_segment(&qualified, t));
             sites.push(serde_json::json!({
                 "kind": "symbol",
                 "path": path,
@@ -1199,104 +1376,102 @@ pub fn cmd_rename_symbol(
 
     // 2. Occurrence sites: scan unit source spans for whole-token matches
     // Load all units with their spans
-    let units: Vec<(String, String, i64, i64, String)> = {
+    let units: Vec<(String, i64, i64)> = {
         let mut st = s
             .conn
-            .prepare("SELECT uid, path, line_start, line_end, qualified FROM units")?;
+            .prepare("SELECT path, line_start, line_end FROM units")?;
         st.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
             ))
         })?
         .collect::<std::result::Result<_, _>>()?
     };
 
-    // Cache file lines per path
-    let mut line_cache: HashMap<String, Vec<String>> = HashMap::new();
+    // Cache file lines per path; a refused file is recorded once, as `None`.
+    let mut line_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
 
-    for (_uid, path, line_start, line_end, _qualified) in units {
-        // Read file lines (tagged path: tag:rel)
+    for (path, line_start, line_end) in units {
         if !line_cache.contains_key(&path) {
-            // Strip the repo tag the same way every other path consumer does,
-            // then read the file relative to the repo root. A single repo is
-            // indexed today, so the root is the current directory.
-            let (_tag, rel) = crate::model::split_tag(&path);
-            let content =
-                crate::walk::read_indexed(std::path::Path::new("."), rel).unwrap_or_default();
-            let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-            line_cache.insert(path.clone(), lines);
+            let read = source_lines(set, &path);
+            if let Err(why) = &read {
+                unread.push(UnreadFile {
+                    path: path.clone(),
+                    why: why.clone(),
+                });
+            }
+            line_cache.insert(path.clone(), read.ok());
         }
-        let Some(lines) = line_cache.get(&path) else {
+        let Some(Some(lines)) = line_cache.get(&path) else {
             continue;
         };
-
-        // Clamp span to file bounds
         if lines.is_empty() {
             continue;
         }
-        let start = (line_start as usize).max(1).min(lines.len());
-        let end = (line_end as usize).max(start).min(lines.len());
+        let Some((first, last)) = span_lines(line_start, line_end) else {
+            unread.push(UnreadFile {
+                path,
+                why: SourceRefusal::LineNumber,
+            });
+            continue;
+        };
+        if lines.len() < first {
+            unread.push(UnreadFile {
+                path,
+                why: SourceRefusal::SpanPastFile {
+                    line_start,
+                    lines: lines.len(),
+                },
+            });
+            continue;
+        }
+        let count = last.max(first).saturating_sub(first).saturating_add(1);
 
-        for line_no in start..=end {
-            let line = &lines[line_no - 1];
-            // Simple whole-token scan for `old`
-            // Token = [A-Za-z0-9_$]+
-            let mut col = 0usize;
-            let bytes = line.as_bytes();
-            while col < bytes.len() {
-                // Skip non-ident chars
-                while col < bytes.len() && !is_ident_start(bytes[col]) {
-                    col += 1;
+        for (index, line) in lines
+            .iter()
+            .enumerate()
+            .skip(first.saturating_sub(1))
+            .take(count)
+        {
+            for (at, token) in identifiers(line) {
+                if token != old || preserve_regexes.iter().any(|re| re.is_match(token)) {
+                    continue;
                 }
-                if col >= bytes.len() {
-                    break;
-                }
-                let token_start = col;
-                while col < bytes.len() && is_ident_char(bytes[col]) {
-                    col += 1;
-                }
-                let token = &line[token_start..col];
-                if token == old {
-                    // Check preserves
-                    let mut skip = false;
-                    for re in &preserve_regexes {
-                        if re.is_match(token) {
-                            skip = true;
-                            break;
-                        }
-                    }
-                    if skip {
-                        continue;
-                    }
-
-                    // Check map override
-                    let replacement = to.map(|t| {
-                        map_vec
-                            .iter()
-                            .find(|(k, _)| k == token)
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or_else(|| t.to_string())
+                let (Ok(line_no), Some(col)) = (
+                    i64::try_from(index.saturating_add(1)),
+                    i64::try_from(at).ok().and_then(|c| c.checked_add(1)),
+                ) else {
+                    unread.push(UnreadFile {
+                        path: path.clone(),
+                        why: SourceRefusal::LineNumber,
                     });
+                    continue;
+                };
 
-                    sites.push(serde_json::json!({
-                        "kind": "occurrence",
-                        "path": path,
-                        "line": line_no as i64,
-                        "col": token_start as i64 + 1,
-                        "context": line.trim(),
-                        "replacement": replacement,
-                    }));
-                }
+                // Check map override
+                let replacement = to.map(|t| {
+                    map_vec
+                        .iter()
+                        .find(|(k, _)| k == token)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| t.to_string())
+                });
+
+                sites.push(serde_json::json!({
+                    "kind": "occurrence",
+                    "path": path,
+                    "line": line_no,
+                    "col": col,
+                    "context": line.trim(),
+                    "replacement": replacement,
+                }));
             }
         }
     }
 
     // Deduplicate by (path, line, col, kind)
-    use std::collections::HashSet;
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for s in sites {
@@ -1332,18 +1507,66 @@ pub fn cmd_rename_symbol(
             .then(a_kind.cmp(b_kind))
     });
 
+    Ok(RenamePlan { sites, unread })
+}
+
+/// One JSON site per line on stdout.
+fn write_sites(sites: &[serde_json::Value]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
     for site in sites {
-        writeln_bp!("{}", serde_json::to_string(&site)?);
+        writeln!(out, "{site}")?;
     }
     Ok(())
 }
 
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+/// A8 `rename-symbol <old> [--to <new>] [--preserve <regex>...] [--map k=v,...]`:
+/// finds resolved occurrences of a symbol name (units/links). Outputs JSON lines:
+/// {kind,path,line,col,context,replacement?}. kind ∈ {symbol,occurrence}.
+/// --preserve: user regexes + baked defaults (URL-ish, kebab-case attrs).
+/// --map: k=v comma-separated, longest-key-first overrides correlated replacements.
+///
+/// Each unit's file is read through the root its tag names in the recorded
+/// root set. A file that cannot be read is reported on stderr after the plan
+/// is printed, and the command fails: a partial plan is never a complete one.
+/// Read-only.
+pub fn cmd_rename_symbol(
+    db: &str,
+    old: &str,
+    to: Option<&str>,
+    preserves: &[String],
+    map: Option<&str>,
+) -> Result<()> {
+    let s = Store::open(db)?;
+    let set = s.repo_set()?;
+    let plan = rename_symbol_plan(&s, &set, old, to, preserves, map)?;
+    if let Err(e) = write_sites(&plan.sites)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e.into());
+    }
+    if plan.unread.is_empty() {
+        return Ok(());
+    }
+    for unread in &plan.unread {
+        eprintln!(
+            "ipe-index: not indexing {}: {}",
+            shown(&unread.path),
+            unread.why
+        );
+    }
+    anyhow::bail!(
+        "the rename plan is incomplete: {} file(s) were not read",
+        plan.unread.len()
+    )
 }
 
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c == '$'
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
 #[cfg(test)]
@@ -1372,6 +1595,15 @@ mod tests {
         assert_eq!(et, "%:tools/x");
         assert_eq!(s, "tools/x/%");
         assert_eq!(st, "%:tools/x/%");
+    }
+
+    #[test]
+    fn path_patterns_escape_the_typed_name() {
+        let (e, et, s, st) = path_match_patterns("tools/x_y%");
+        assert_eq!(e, "tools/x_y%");
+        assert_eq!(et, "%:tools/x\\_y\\%");
+        assert_eq!(s, "tools/x\\_y\\%/%");
+        assert_eq!(st, "%:tools/x\\_y\\%/%");
     }
 
     // A small indexed store to exercise the review commands.
@@ -1428,5 +1660,351 @@ mod tests {
             .unwrap();
         assert_eq!(n_callers, 1);
         assert_eq!(n_callees, 1);
+    }
+
+    #[test]
+    fn like_literal_escapes_every_wildcard() {
+        assert_eq!(like_literal("a_b%c\\d"), "a\\_b\\%c\\\\d");
+        assert_eq!(like_literal("plain/path.rs"), "plain/path.rs");
+    }
+
+    // The escaped text matches itself and nothing a wildcard would widen to.
+    #[test]
+    fn like_literal_matches_only_itself_in_sql() {
+        let s = Store::open(":memory:").unwrap();
+        let matches = |text: &str, pattern: &str| -> bool {
+            s.conn
+                .query_row(
+                    "SELECT ?1 LIKE ?2 ESCAPE '\\'",
+                    rusqlite::params![text, pattern],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let pattern = format!("%{}%", like_literal("a_b"));
+        assert!(matches("xa_by", &pattern));
+        assert!(!matches("xaxby", &pattern));
+        let percent = format!("%{}%", like_literal("50%"));
+        assert!(matches("is 50% done", &percent));
+        assert!(!matches("is 500 done", &percent));
+    }
+
+    #[test]
+    fn names_path_is_whole_segment_and_case_sensitive() {
+        assert!(names_path("ipe:tools/x", "tools/x"));
+        assert!(names_path("ipe:tools/x/y.rs", "tools/x"));
+        assert!(names_path("tools/x", "tools/x"));
+        assert!(!names_path("ipe:tools/xy", "tools/x"));
+        assert!(!names_path("ipe:tools/X", "tools/x"));
+        assert!(!names_path("ipe:other/tools/x", "tools/x"));
+    }
+
+    #[test]
+    fn module_tails_are_dotted_suffixes_only() {
+        assert_eq!(below_module("A.B", "A.B"), Some(""));
+        assert_eq!(below_module("A.B.C", "A.B"), Some(".C"));
+        assert_eq!(below_module("A.BC", "A.B"), None);
+        assert_eq!(below_module("a.b", "A.B"), None);
+        assert_eq!(edge_tail("X", Some("A.B"), "A.B"), Some(""));
+        assert_eq!(edge_tail("A.B.C", None, "A.B"), Some(".C"));
+        assert_eq!(edge_tail("X", Some("A.B.D"), "A.B"), Some(".D"));
+        assert_eq!(edge_tail("X", Some("A.BD"), "A.B"), None);
+    }
+
+    #[test]
+    fn identifiers_are_ascii_tokens_that_do_not_start_with_a_digit() {
+        assert_eq!(
+            identifiers("let 1ab = $x_y + é9z;"),
+            vec![(5, "ab"), (10, "$x_y"), (20, "z")]
+        );
+        assert_eq!(identifiers("tail"), vec![(0, "tail")]);
+        assert!(identifiers("  12 + 3 ").is_empty());
+    }
+
+    #[test]
+    fn final_segment_matching_and_splicing() {
+        assert!(ends_in_segment("crate::a::run", "run"));
+        assert!(ends_in_segment("Mod.run", "run"));
+        assert!(ends_in_segment("run", "run"));
+        assert!(!ends_in_segment("crate::a::rerun", "run"));
+        assert!(!ends_in_segment("crate::a::Run", "run"));
+        assert_eq!(splice_final_segment("crate::a::run", "go"), "crate::a::go");
+        assert_eq!(splice_final_segment("Mod.run", "go"), "Mod.go");
+        assert_eq!(splice_final_segment("run", "go"), "go");
+    }
+
+    #[test]
+    fn a_recorded_span_is_a_line_range_or_a_refusal() {
+        assert_eq!(span_lines(3, 9), Some((3, 9)));
+        assert_eq!(span_lines(0, 0), Some((1, 0)));
+        assert_eq!(span_lines(-1, 4), None);
+        assert_eq!(span_lines(1, -4), None);
+    }
+
+    // A tag the root set does not hold is a typed refusal, never a read at `.`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_tag_is_refused_before_any_read() {
+        use crate::walk::fixture::set;
+        let roots = set(&[("ipe", ".")]);
+        assert!(matches!(
+            source_lines(&roots, "zzz:x.rs"),
+            Err(SourceRefusal::Locate(LocateRefusal::UnknownTag { .. }))
+        ));
+        assert!(matches!(
+            source_lines(&roots, "x.rs"),
+            Err(SourceRefusal::Locate(LocateRefusal::UnknownTag { .. }))
+        ));
+        assert!(matches!(
+            source_lines(&roots, "ipe:../x.rs"),
+            Err(SourceRefusal::Locate(LocateRefusal::Path(_)))
+        ));
+    }
+
+    /// Indexes the fixture as `out` with `sub` declared inside it as `in`.
+    #[cfg(unix)]
+    fn index_nested(fx: &crate::walk::fixture::Fixture, sub: &str) -> String {
+        let db = fx.path(".git/ipe-index.db");
+        let roots = [format!("out:{}", fx.root()), format!("in:{}", fx.path(sub))];
+        crate::cmd_index(&roots, &db).unwrap();
+        db
+    }
+
+    #[cfg(unix)]
+    fn occurrences(plan: &RenamePlan) -> Vec<(String, i64)> {
+        plan.sites
+            .iter()
+            .filter(|s| s["kind"] == "occurrence")
+            .map(|s| {
+                (
+                    s["path"].as_str().unwrap_or_default().to_string(),
+                    s["line"].as_i64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    // A unit tagged `in:x.rs` is read from the root `in` names, not from `./x.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn rename_symbol_reads_through_the_units_root() {
+        let fx = crate::walk::fixture::Fixture::new("query-rename-root");
+        fx.write(
+            "sub/x.rs",
+            "pub fn old_name() {}\npub fn caller() { old_name(); }\n",
+        );
+        fx.write("x.rs", "pub fn unrelated() {}\npub fn another() {}\n");
+        fx.commit("one");
+        let db = index_nested(&fx, "sub");
+        let s = Store::open(&db).unwrap();
+        let set = s.repo_set().unwrap();
+        let plan = rename_symbol_plan(&s, &set, "old_name", Some("new_name"), &[], None).unwrap();
+        assert_eq!(plan.unread, []);
+        assert_eq!(
+            occurrences(&plan),
+            [("in:x.rs".to_string(), 1), ("in:x.rs".to_string(), 2)]
+        );
+    }
+
+    // A refused read drops no file silently: the plan names it and the command fails.
+    #[cfg(unix)]
+    #[test]
+    fn rename_symbol_refused_read_fails_the_plan() {
+        let fx = crate::walk::fixture::Fixture::new("query-rename-refused");
+        fx.write("sub/x.rs", "pub fn old_name() {}\n");
+        fx.write("sub/y.rs", "pub fn other() {}\n");
+        fx.write("top.rs", "pub fn old_name() {}\n");
+        fx.commit("one");
+        let db = index_nested(&fx, "sub");
+        std::fs::remove_file(fx.path("sub/x.rs")).unwrap();
+        std::os::unix::fs::symlink(fx.path("sub/y.rs"), fx.path("sub/x.rs")).unwrap();
+        let s = Store::open(&db).unwrap();
+        let set = s.repo_set().unwrap();
+        let plan = rename_symbol_plan(&s, &set, "old_name", None, &[], None).unwrap();
+        assert_eq!(plan.unread.len(), 1, "{:?}", plan.unread);
+        assert_eq!(plan.unread[0].path, "in:x.rs");
+        assert!(matches!(
+            plan.unread[0].why,
+            SourceRefusal::Read(ReadRefusal::NotRegular(_))
+        ));
+        assert_eq!(occurrences(&plan), [("out:top.rs".to_string(), 1)]);
+        let failed = cmd_rename_symbol(&db, "old_name", None, &[], None);
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("incomplete")),
+            "{failed:?}"
+        );
+    }
+
+    // A file the index recorded but that is gone is a refusal too, not an empty file.
+    #[cfg(unix)]
+    #[test]
+    fn rename_symbol_absent_file_fails_the_plan() {
+        let fx = crate::walk::fixture::Fixture::new("query-rename-absent");
+        fx.write("x.rs", "pub fn old_name() {}\n");
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        crate::cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        std::fs::remove_file(fx.path("x.rs")).unwrap();
+        let s = Store::open(&db).unwrap();
+        let set = s.repo_set().unwrap();
+        let plan = rename_symbol_plan(&s, &set, "old_name", None, &[], None).unwrap();
+        assert!(
+            plan.unread
+                .iter()
+                .any(|u| u.path == "ipe:x.rs" && u.why == SourceRefusal::Read(ReadRefusal::Absent)),
+            "{:?}",
+            plan.unread
+        );
+    }
+
+    // A unit that starts past the end of its file is a stale index, never a clamped scan.
+    #[cfg(unix)]
+    #[test]
+    fn rename_symbol_span_past_the_file_fails_the_plan() {
+        let fx = crate::walk::fixture::Fixture::new("query-rename-stale");
+        fx.write(
+            "x.rs",
+            "pub fn a() {}\npub fn old_name() {}\npub fn b() {}\n",
+        );
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        crate::cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        fx.write("x.rs", "pub fn a() {}\n");
+        let s = Store::open(&db).unwrap();
+        let set = s.repo_set().unwrap();
+        let plan = rename_symbol_plan(&s, &set, "old_name", None, &[], None).unwrap();
+        assert!(
+            plan.unread
+                .iter()
+                .any(|u| matches!(u.why, SourceRefusal::SpanPastFile { .. })),
+            "{:?}",
+            plan.unread
+        );
+    }
+
+    #[cfg(unix)]
+    fn unit_paths(units: &[UnitRow]) -> Vec<&str> {
+        let mut paths: Vec<&str> = units.iter().map(|u| u.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    // Two independent roots hold an `a.rs`; a hunk in one lists that root's units only.
+    #[cfg(unix)]
+    #[test]
+    fn changed_matches_only_the_owning_tag() {
+        use crate::walk::fixture::Fixture;
+        let out = Fixture::new("query-changed-out");
+        let inn = Fixture::new("query-changed-in");
+        for fx in [&out, &inn] {
+            fx.write("a.rs", "pub fn f() {}\n");
+            fx.commit("one");
+        }
+        inn.write("a.rs", "pub fn f() { let _x = 1; }\n");
+        inn.commit("two");
+        let db = out.path(".git/ipe-index.db");
+        let roots = [format!("out:{}", out.root()), format!("in:{}", inn.root())];
+        crate::cmd_index(&roots, &db).unwrap();
+        let s = Store::open(&db).unwrap();
+        let units = changed_units(&s, inn.root(), "HEAD~1..HEAD").unwrap();
+        assert_eq!(unit_paths(&units), ["in:a.rs"]);
+    }
+
+    // `_` in a file name is a character, not a wildcard that reaches `axb.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn changed_like_wildcards_are_literal() {
+        let fx = crate::walk::fixture::Fixture::new("query-changed-like");
+        fx.write("a_b.rs", "pub fn f() {}\n");
+        fx.write("axb.rs", "pub fn f() {}\n");
+        fx.commit("one");
+        fx.write("a_b.rs", "pub fn f() { let _x = 1; }\n");
+        fx.commit("two");
+        let db = fx.path(".git/ipe-index.db");
+        crate::cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        let s = Store::open(&db).unwrap();
+        let units = changed_units(&s, fx.root(), "HEAD~1..HEAD").unwrap();
+        assert_eq!(unit_paths(&units), ["ipe:a_b.rs"]);
+    }
+
+    // A root that is a subdirectory of its work tree is diffed by root-relative paths,
+    // and a path under a root nested in the diffed root belongs to the nested tag.
+    #[cfg(unix)]
+    #[test]
+    fn changed_subdir_root_is_diffed_relative() {
+        let fx = crate::walk::fixture::Fixture::new("query-changed-sub");
+        fx.write("sub/a.rs", "pub fn f() {}\n");
+        fx.write("top.rs", "pub fn t() {}\n");
+        fx.commit("one");
+        fx.write("sub/a.rs", "pub fn f() { let _x = 1; }\n");
+        fx.write("top.rs", "pub fn t() { let _y = 2; }\n");
+        fx.commit("two");
+        let db = index_nested(&fx, "sub");
+        let s = Store::open(&db).unwrap();
+        let inner = changed_units(&s, &fx.path("sub"), "HEAD~1..HEAD").unwrap();
+        assert_eq!(unit_paths(&inner), ["in:a.rs"]);
+        let outer = changed_units(&s, fx.root(), "HEAD~1..HEAD").unwrap();
+        assert_eq!(unit_paths(&outer), ["in:a.rs", "out:top.rs"]);
+    }
+
+    // A directory that is none of the recorded roots is refused, never diffed.
+    #[cfg(unix)]
+    #[test]
+    fn changed_refuses_a_dir_that_is_no_recorded_root() {
+        use crate::walk::fixture::Fixture;
+        let fx = Fixture::new("query-changed-root");
+        fx.write("sub/a.rs", "pub fn f() {}\n");
+        fx.commit("one");
+        let other = Fixture::new("query-changed-other");
+        other.write("a.rs", "pub fn f() {}\n");
+        other.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        crate::cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        let s = Store::open(&db).unwrap();
+        for dir in [other.root().to_string(), fx.path("sub"), fx.path("nope")] {
+            let err = changed_units(&s, &dir, "HEAD~1..HEAD").unwrap_err();
+            assert!(
+                err.downcast_ref::<ChangedRefusal>().is_some(),
+                "{dir}: {err}"
+            );
+        }
+    }
+
+    // `_` and `%` in a path are literal, and a `LIKE` that folds case does not widen it.
+    #[test]
+    fn rename_path_like_wildcards_are_literal() {
+        let s = Store::open(":memory:").unwrap();
+        for path in [
+            "ipe:a_b/x.rs",
+            "ipe:axb/x.rs",
+            "ipe:A_B/y.rs",
+            "ipe:a%b/z.rs",
+            "ipe:a_b",
+        ] {
+            s.put_file(path, "rs", "compiler-rs", 0, "").unwrap();
+        }
+        let paths = |old: &str| -> Vec<String> {
+            rename_path_sites(&s, old, None)
+                .unwrap()
+                .iter()
+                .map(|site| site["path"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(paths("a_b"), ["ipe:a_b", "ipe:a_b/x.rs"]);
+        assert_eq!(paths("a%b"), ["ipe:a%b/z.rs"]);
+        assert!(paths("a_").is_empty());
+    }
+
+    #[test]
+    fn rename_path_replaces_through_the_tag() {
+        let s = Store::open(":memory:").unwrap();
+        s.put_file("ipe:tools/old/a.rs", "rs", "compiler-rs", 0, "")
+            .unwrap();
+        let sites = rename_path_sites(&s, "tools/old", Some("tools/new")).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0]["replacement"], "ipe:tools/new/a.rs");
     }
 }

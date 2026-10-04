@@ -9,8 +9,8 @@
 //! walk of an outer root skips everything under a directory whose identity is
 //! one of its inner roots.
 
-use crate::model::{RepoSpec, RepoTag};
-use crate::walk::{FileId, shown};
+use crate::model::{RepoSpec, RepoTag, split_tag};
+use crate::walk::{FileId, Refusal, RelPath, shown};
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -100,10 +100,12 @@ impl DeclaredRoot {
 
 /// One row of the root set an index was built under.
 ///
-/// `nesting` is the enclosing root's tag and the prefix this root sits at.
+/// `root` is the canonical directory the root was indexed from. `nesting` is
+/// the enclosing root's tag and the prefix this root sits at.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordedRoot {
     pub tag: String,
+    pub root: String,
     pub nesting: Option<(String, String)>,
 }
 
@@ -126,7 +128,33 @@ pub enum RepoSetError {
     SameRoot { first: RepoTag, second: RepoTag },
     /// The host cannot prove directory identity, so a second root is refused.
     IdentityUnavailable,
+    /// A recorded tag is not a repository tag.
+    RecordedTag { tag: String },
+    /// The tree no longer has the directory or nesting an index recorded for `tag`.
+    RecordedNestingDiffers { tag: RepoTag },
 }
+
+/// Why a stored tagged path names no readable place in a [`RepoSet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocateRefusal {
+    /// The path's tag names no declared root; an untagged path has the empty tag.
+    UnknownTag { tag: String },
+    /// The path after its tag is not a plain repository-relative path.
+    Path(Refusal),
+}
+
+impl fmt::Display for LocateRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTag { tag } => {
+                write!(f, "the tag `{}` names no declared root", shown(tag))
+            }
+            Self::Path(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for LocateRefusal {}
 
 impl fmt::Display for RepoSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,6 +178,14 @@ impl fmt::Display for RepoSetError {
             ),
             Self::IdentityUnavailable => f.write_str(
                 "several --repo roots need directory identity, which this platform does not provide; declare one root",
+            ),
+            Self::RecordedTag { tag: t } => {
+                write!(f, "the recorded root tag `{}` is not a tag", shown(t))
+            }
+            Self::RecordedNestingDiffers { tag: t } => write!(
+                f,
+                "the root `{}` is no longer the directory and nesting the index recorded; re-run `index`",
+                tag(t)
             ),
         }
     }
@@ -291,6 +327,98 @@ impl RepoSet {
         self.0.iter()
     }
 
+    /// Rebuilds the set an index was built under from its recorded rows.
+    ///
+    /// The rows are re-parsed like `--repo` specs, so identity, nesting and
+    /// claims are proved again against the tree as it is now; a directory or
+    /// nesting that differs from the rows is refused, never trusted from
+    /// storage.
+    pub fn from_recorded(rows: &[RecordedRoot]) -> Result<Self, RepoSetError> {
+        let recorded_tag = |raw: &str| {
+            RepoTag::parse(raw).map_err(|_| RepoSetError::RecordedTag {
+                tag: raw.to_string(),
+            })
+        };
+        let mut specs = Vec::with_capacity(rows.len());
+        for row in rows {
+            specs.push(RepoSpec {
+                tag: recorded_tag(&row.tag)?,
+                root: row.root.clone(),
+            });
+        }
+        let set = Self::parse(&specs)?;
+        let mut want = rows.to_vec();
+        want.sort();
+        let got = set.recorded();
+        for (wanted, found) in want.iter().zip(&got) {
+            if wanted != found {
+                return Err(RepoSetError::RecordedNestingDiffers {
+                    tag: recorded_tag(&wanted.tag)?,
+                });
+            }
+        }
+        Ok(set)
+    }
+
+    /// The declared root of `tag`, if one is declared.
+    pub fn root_of(&self, tag: &str) -> Option<&DeclaredRoot> {
+        self.0.iter().find(|r| r.tag.as_str() == tag)
+    }
+
+    /// The declared root whose directory is `dir`, found by directory identity.
+    ///
+    /// `None` when `dir` cannot be opened, is no directory, or is none of the
+    /// roots: a subdirectory of a root is not that root.
+    pub fn root_at_dir(&self, dir: &str) -> Option<&DeclaredRoot> {
+        let md = File::open(dir).ok()?.metadata().ok()?;
+        if !md.is_dir() {
+            return None;
+        }
+        let id = FileId::of(&md);
+        let canonical = std::fs::canonicalize(dir).ok()?;
+        self.0
+            .iter()
+            .find(|r| r.id == id && Path::new(&r.root) == canonical)
+    }
+
+    /// The deepest declared root that owns `rel`, a path relative to `root`,
+    /// and `rel` relative to that owner.
+    ///
+    /// A path under a root nested in `root` belongs to that inner root alone,
+    /// as in the walk that indexed it.
+    pub fn owner_of<'a>(
+        &'a self,
+        root: &'a DeclaredRoot,
+        rel: &'a str,
+    ) -> (&'a DeclaredRoot, &'a str) {
+        let (mut owner, mut rest) = (root, rel);
+        for _ in 0..self.0.len() {
+            let inner = self.claimed_in(owner).into_iter().find_map(|c| {
+                let prefix = c.within.as_ref()?.prefix.as_str();
+                let below = rest.strip_prefix(prefix)?.strip_prefix('/')?;
+                Some((c, below))
+            });
+            match inner {
+                Some((c, below)) => (owner, rest) = (c, below),
+                None => break,
+            }
+        }
+        (owner, rest)
+    }
+
+    /// Resolves a stored `tag:relative` path to the root that owns it and its relative path.
+    ///
+    /// The only way a reader turns a stored path into a place to read: the
+    /// tag picks the root, never the working directory.
+    pub fn locate(&self, tagged: &str) -> Result<(&DeclaredRoot, RelPath), LocateRefusal> {
+        let (tag, rel) = split_tag(tagged);
+        let root = self.root_of(tag).ok_or_else(|| LocateRefusal::UnknownTag {
+            tag: tag.to_string(),
+        })?;
+        let rel = RelPath::parse(rel).map_err(LocateRefusal::Path)?;
+        Ok((root, rel))
+    }
+
     /// The roots nested directly in `outer`; a deeper root is reached through its parent.
     pub fn claimed_in(&self, outer: &DeclaredRoot) -> Vec<&DeclaredRoot> {
         self.0
@@ -306,6 +434,7 @@ impl RepoSet {
             .iter()
             .map(|r| RecordedRoot {
                 tag: r.tag.as_str().to_string(),
+                root: r.root.clone(),
                 nesting: r
                     .within
                     .as_ref()
@@ -465,6 +594,7 @@ mod tests {
         let nest = |outer: &str, prefix: &str| Some((outer.to_string(), prefix.to_string()));
         let row = |tag: &str, nesting| RecordedRoot {
             tag: tag.to_string(),
+            root: set.root_of(tag).unwrap().root_str().to_string(),
             nesting,
         };
         assert_eq!(
@@ -483,5 +613,145 @@ mod tests {
             .map(|r| r.tag().as_str())
             .collect();
         assert_eq!(claimed, ["mid", "sib"]);
+    }
+
+    fn nested_set(s: &Scratch) -> RepoSet {
+        std::fs::create_dir_all(s.0.join("out/sub/deep")).unwrap();
+        RepoSet::parse(&[
+            spec("out", &s.path("out")),
+            spec("sub", &s.path("out/sub")),
+            spec("deep", &s.path("out/sub/deep")),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_recorded_set_rebuilds_to_the_same_set() {
+        let s = Scratch::new("rebuild");
+        let set = nested_set(&s);
+        let rebuilt = RepoSet::from_recorded(&set.recorded()).unwrap();
+        assert_eq!(rebuilt.recorded(), set.recorded());
+    }
+
+    // A recorded nesting the tree no longer has is refused, not trusted.
+    #[test]
+    fn recorded_nesting_that_moved_is_refused() {
+        let s = Scratch::new("moved");
+        std::fs::create_dir_all(s.0.join("out/sub")).unwrap();
+        std::fs::create_dir(s.0.join("elsewhere")).unwrap();
+        let recorded =
+            RepoSet::parse(&[spec("out", &s.path("out")), spec("sub", &s.path("out/sub"))])
+                .unwrap()
+                .recorded();
+        // `sub` now sits outside `out`: same tag, a different directory.
+        let moved: Vec<RecordedRoot> = recorded
+            .iter()
+            .map(|row| RecordedRoot {
+                root: if row.tag == "sub" {
+                    s.path("elsewhere")
+                } else {
+                    row.root.clone()
+                },
+                ..row.clone()
+            })
+            .collect();
+        assert_eq!(
+            RepoSet::from_recorded(&moved).err(),
+            Some(RepoSetError::RecordedNestingDiffers {
+                tag: RepoTag::parse("sub").unwrap()
+            })
+        );
+        // The same directories with a nesting the rows do not record.
+        let unnested: Vec<RecordedRoot> = recorded
+            .iter()
+            .map(|row| RecordedRoot {
+                nesting: None,
+                ..row.clone()
+            })
+            .collect();
+        assert!(matches!(
+            RepoSet::from_recorded(&unnested),
+            Err(RepoSetError::RecordedNestingDiffers { .. })
+        ));
+    }
+
+    #[test]
+    fn a_recorded_tag_that_is_no_tag_is_refused() {
+        let s = Scratch::new("bad-tag");
+        let row = |tag: &str| RecordedRoot {
+            tag: tag.to_string(),
+            root: s.path(""),
+            nesting: None,
+        };
+        for bad in ["", "a:b", "a/b"] {
+            assert_eq!(
+                RepoSet::from_recorded(&[row(bad)]).err(),
+                Some(RepoSetError::RecordedTag {
+                    tag: bad.to_string()
+                })
+            );
+        }
+        assert_eq!(RepoSet::from_recorded(&[]).err(), Some(RepoSetError::Empty));
+    }
+
+    #[test]
+    fn locate_resolves_through_the_tag_and_refuses_the_rest() {
+        let s = Scratch::new("locate");
+        let set = nested_set(&s);
+        let (root, rel) = set.locate("sub:a/b.ipe").unwrap();
+        assert_eq!((root.tag().as_str(), rel.as_str()), ("sub", "a/b.ipe"));
+        assert_eq!(
+            set.locate("nope:a.ipe").err(),
+            Some(LocateRefusal::UnknownTag {
+                tag: "nope".to_string()
+            })
+        );
+        // An untagged path has the empty tag, which no root carries.
+        assert_eq!(
+            set.locate("a.ipe").err(),
+            Some(LocateRefusal::UnknownTag { tag: String::new() })
+        );
+        for bad in ["sub:../x", "sub:/abs", "sub:", "sub:a//b", "sub:./a"] {
+            assert!(
+                matches!(set.locate(bad), Err(LocateRefusal::Path(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_of_is_the_deepest_nested_root() {
+        let s = Scratch::new("owner");
+        let set = nested_set(&s);
+        let out = set.root_of("out").unwrap();
+        let owner = |rel: &str| {
+            let (o, below) = set.owner_of(out, rel);
+            (o.tag().as_str().to_string(), below.to_string())
+        };
+        let own = |tag: &str, below: &str| (tag.to_string(), below.to_string());
+        assert_eq!(owner("a.ipe"), own("out", "a.ipe"));
+        assert_eq!(owner("sub/a.ipe"), own("sub", "a.ipe"));
+        assert_eq!(owner("sub/deep/a/b.ipe"), own("deep", "a/b.ipe"));
+        // A sibling whose name merely starts with the prefix is not nested.
+        assert_eq!(owner("subx/a.ipe"), own("out", "subx/a.ipe"));
+        assert_eq!(owner("sub"), own("out", "sub"));
+    }
+
+    #[test]
+    fn root_at_dir_matches_the_root_directory_only() {
+        let s = Scratch::new("at-dir");
+        let set = nested_set(&s);
+        let tag = |dir: &str| {
+            set.root_at_dir(&s.path(dir))
+                .map(|r| r.tag().as_str().to_string())
+        };
+        assert_eq!(tag("out"), Some("out".to_string()));
+        assert_eq!(tag("out/sub"), Some("sub".to_string()));
+        assert_eq!(tag("out/sub/../sub"), Some("sub".to_string()));
+        // A directory below a root is not that root.
+        std::fs::create_dir(s.0.join("out/plain")).unwrap();
+        assert_eq!(tag("out/plain"), None);
+        assert_eq!(tag("absent"), None);
+        assert_eq!(tag(""), None);
     }
 }

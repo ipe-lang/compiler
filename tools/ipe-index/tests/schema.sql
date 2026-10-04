@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS reviewed (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS repos (
   tag    TEXT PRIMARY KEY,
+  root   TEXT NOT NULL,
   outer  TEXT,
   prefix TEXT,
   CHECK ((outer IS NULL) = (prefix IS NULL))

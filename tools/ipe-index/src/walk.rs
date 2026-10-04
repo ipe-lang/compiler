@@ -61,7 +61,7 @@ const SKIP_SEGMENTS: &[&str] = &[
     "incremental",
 ];
 
-fn is_indexable(path: &str) -> bool {
+pub(crate) fn is_indexable(path: &str) -> bool {
     !path.split('/').any(|seg| SKIP_SEGMENTS.contains(&seg))
 }
 
@@ -302,6 +302,23 @@ fn path_of(name: &[u8]) -> Result<String, Refusal> {
     }
 }
 
+/// A plain repository-relative UTF-8 path, parsed once.
+///
+/// Non-empty, not absolute, and no empty, `.` or `..` segment, so it never
+/// climbs out of the root it is joined to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelPath(String);
+
+impl RelPath {
+    pub fn parse(name: &str) -> Result<Self, Refusal> {
+        path_of(name.as_bytes()).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One listed path the name and mode checks admitted, or the refusal it earned.
 pub type Listed = Result<String, Refusal>;
 
@@ -506,7 +523,7 @@ pub(crate) fn git_command(repo: &str) -> Command {
 }
 
 /// Runs `git <args>` in `repo`; a failed run is an error, never empty output.
-fn git_stdout(repo: &str, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git_stdout(repo: &str, args: &[&str]) -> Result<Vec<u8>> {
     let out = git_command(repo).args(args).output()?;
     if !out.status.success() {
         bail!(
@@ -586,7 +603,7 @@ fn refuse_moved_roots(refused: &[Refusal]) -> Result<()> {
 }
 
 /// Refuses a walk of `root` once its directory is not the one the set parsed.
-fn verify_root(root: &DeclaredRoot) -> Result<()> {
+pub(crate) fn verify_root(root: &DeclaredRoot) -> Result<()> {
     let same = std::fs::symlink_metadata(root.root())
         .is_ok_and(|md| md.is_dir() && FileId::of(&md) == root.id());
     if !same {

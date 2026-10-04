@@ -131,7 +131,19 @@ ipe:src/compiler/lower/src/lower.rs:7758-7958   struct  crate::Lowerer     4a658
 ipe:src/compiler/lower/src/lower.rs:19232-19472 fn      crate::lower_case  eb30de67…
 ```
 
-`--repo <path>` points `changed` at the git repo to diff (default: current dir).
+`--repo <dir>` points `changed` at the root to diff (default: current dir). The
+directory must be a root the index recorded: it is matched by directory
+identity, so a subdirectory of a root, or a directory the index never saw, is
+refused rather than diffed. The diff is taken relative to that root
+(`git diff --relative`), and a path under a root nested in it belongs to the
+nested root's tag, so a unit is matched by its exact tagged path and never by a
+suffix. A diff header the parser cannot read, such as a quoted name, fails the
+command instead of dropping the file.
+
+```bash
+ipe-index index --repo ipe:. --repo ui:web
+ipe-index changed --repo web main..HEAD   # units under web/, tagged `ui:`
+```
 
 ### Unit-level links (by uid)
 
@@ -232,7 +244,17 @@ ipe-index rename-symbol <old> [--to <new>]    # every occurrence of a symbol nam
 
 Both emit JSON-line edit sites (`{kind,path,line,col,context,replacement?}`) and
 never write. `<old>` for `rename-path` is the untagged repo-relative path
-(e.g. `tools/ipe-index`), matched whole-segment across any repo tag.
+(e.g. `tools/ipe-index`), matched whole-segment, case-sensitively, across any
+repo tag; `%` and `_` in it are literal characters, never wildcards.
+
+`rename-symbol` rebuilds the root set the index recorded and reads each unit's
+file through its owning root: a stored `tag:path` resolves to one root and one
+repository-relative path, so the working directory never decides which file is
+read. A file that cannot be read (its tag names no root, the path is not a
+regular file, it vanished, or a unit starts past its end) is named on stderr as
+`ipe-index: not indexing <path>: <why>`; the plan still prints for the files
+that were read, and the command then exits non-zero, because a rename plan
+missing a file is not a plan. Re-run `index` after the tree changes.
 
 ---
 

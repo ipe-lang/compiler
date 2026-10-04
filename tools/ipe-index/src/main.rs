@@ -104,7 +104,8 @@ enum Cmd {
     /// any git range, e.g. `main..HEAD`. Read-only.
     Changed {
         range: String,
-        /// Repo to run `git diff` in (default: current directory).
+        /// Indexed root directory to run `git diff` in (default: current
+        /// directory); it must be a root the index recorded.
         #[arg(long, default_value = ".")]
         repo: String,
         #[arg(long, default_value = ".ipe-index/index.db")]
@@ -814,6 +815,29 @@ mod tests {
         assert_eq!(stored_files(&db), ["in:x.rs", "out:top.rs"]);
         cmd_update(std::slice::from_ref(&out), &db).unwrap();
         assert_eq!(stored_files(&db), ["out:inner/x.rs", "out:top.rs"]);
+    }
+
+    // The recorded directory is part of the root set: the same tag and nesting
+    // over another directory is a different set, so its files are never read
+    // as the old directory's.
+    #[cfg(unix)]
+    #[test]
+    fn recorded_root_repoint_forces_full_index() {
+        let a = walk::fixture::Fixture::new("index-repoint-a");
+        a.write("a.rs", "fn a() {}\n");
+        a.commit("one");
+        let b = walk::fixture::Fixture::new("index-repoint-b");
+        b.write("b.rs", "fn b() {}\n");
+        b.commit("one");
+        let db = a.path(".git/ipe-index.db");
+        let at_a = format!("ipe:{}", a.root());
+        let at_b = format!("ipe:{}", b.root());
+        cmd_index(std::slice::from_ref(&at_a), &db).unwrap();
+        let s = store::Store::open(&db).unwrap();
+        let same = parse_repos(std::slice::from_ref(&at_a)).unwrap();
+        let repointed = parse_repos(std::slice::from_ref(&at_b)).unwrap();
+        assert!(!needs_full_index(&s, &same).unwrap());
+        assert!(needs_full_index(&s, &repointed).unwrap());
     }
 
     // A rebuild that fails part-way leaves the previous index and queue.

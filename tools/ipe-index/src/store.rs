@@ -1,6 +1,6 @@
 use crate::diff::{Change, QueueOp, Snapshot, UnitState};
 use crate::model::{Kind, Unit};
-use crate::repo_set::{MAX_REPOS, RecordedRoot};
+use crate::repo_set::{MAX_REPOS, RecordedRoot, RepoSet};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -9,8 +9,9 @@ pub struct Store {
 }
 
 /// The index schema: `units`/`links`/`callgraph`/`change_queue` are the review
-/// backbone; `repos` is the root set the index was built under (a root nested
-/// in another records that root's tag and its prefix there, both or neither).
+/// backbone; `repos` is the root set the index was built under: each root's tag and
+/// canonical directory (a root nested in another also records that root's tag
+/// and its prefix there, both or neither).
 /// All `CREATE … IF NOT EXISTS` so an old DB gains missing tables on
 /// open; `index` drops and recreates every table except `change_queue` and
 /// `reviewed`. `change_queue` rows only the queue reconciliation
@@ -77,15 +78,18 @@ CREATE TABLE IF NOT EXISTS reviewed (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS repos (
   tag    TEXT PRIMARY KEY,
+  root   TEXT NOT NULL,
   outer  TEXT,
   prefix TEXT,
   CHECK ((outer IS NULL) = (prefix IS NULL))
 );
 ";
 
-/// Current schema version: v7 is v6 plus the `repos` root set the rows were
-/// indexed under; a v6 index records none, so its owner of each path is
-/// unknown. v6 rows are the v5 format, extracted only from
+/// Current schema version: v8 records, for each `repos` root, the canonical
+/// directory it was indexed from, so a reader rebuilds the set the rows were
+/// indexed under and a tag repointed at another directory is detected. v7
+/// records the root set without directories; v6 records none, so its owner of
+/// each path is unknown. v6 rows are the v5 format, extracted only from
 /// regular files named by their exact bytes; v5 rows may hold the units of a
 /// tracked symbolic link's target, a submodule path, or a lossily decoded name,
 /// which an incremental `update` would keep for every unchanged path. v5 `file`
@@ -96,7 +100,7 @@ CREATE TABLE IF NOT EXISTS repos (
 /// stamps it only on a DB with no units yet, so a stamp always describes the
 /// rows beside it; a DB holding rows of another version keeps its stamp until
 /// `index` rebuilds it.
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 
 /// Stable unit id: blake3 of `path|kind|qualified`. Content-stable across
 /// re-indexes; a rename of the symbol or path changes the id by design.
@@ -277,8 +281,8 @@ impl Store {
                 None => (None, None),
             };
             self.conn.execute(
-                "INSERT INTO repos (tag, outer, prefix) VALUES (?,?,?)",
-                rusqlite::params![root.tag, outer, prefix],
+                "INSERT INTO repos (tag, root, outer, prefix) VALUES (?,?,?,?)",
+                rusqlite::params![root.tag, root.root, outer, prefix],
             )?;
         }
         Ok(())
@@ -291,17 +295,18 @@ impl Store {
         let limit = i64::try_from(MAX_REPOS.saturating_add(1))?;
         let mut st = self
             .conn
-            .prepare("SELECT tag, outer, prefix FROM repos ORDER BY tag LIMIT ?")?;
+            .prepare("SELECT tag, root, outer, prefix FROM repos ORDER BY tag LIMIT ?")?;
         let rows = st.query_map([limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })?;
         let mut roots = Vec::new();
         for row in rows {
-            let (tag, outer, prefix) = row?;
+            let (tag, root, outer, prefix) = row?;
             let nesting = match (outer, prefix) {
                 (None, None) => None,
                 (Some(outer), Some(prefix)) => Some((outer, prefix)),
@@ -310,9 +315,20 @@ impl Store {
                     crate::walk::shown(&tag)
                 ),
             };
-            roots.push(RecordedRoot { tag, nesting });
+            roots.push(RecordedRoot { tag, root, nesting });
         }
         Ok(roots)
+    }
+    /// The root set this index was built under, re-proved against the tree.
+    ///
+    /// Every reader resolves a stored path through this set, never through
+    /// the working directory.
+    pub fn repo_set(&self) -> Result<RepoSet> {
+        let rows = self.recorded_repos()?;
+        if rows.is_empty() {
+            bail!("ipe-index: the index records no root set; run `index` first");
+        }
+        Ok(RepoSet::from_recorded(&rows)?)
     }
     pub fn count(&self, table: &str) -> Result<i64> {
         // Defense-in-depth: map table names to static SQL literals instead of formatting.
@@ -553,18 +569,18 @@ mod tests {
     }
 
     // A DB stamped with the previous version is not current, so `update`
-    // refuses to run incrementally over it, and the full rebuild stamps it 7.
+    // refuses to run incrementally over it, and the full rebuild stamps it 8.
     #[test]
-    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_7() {
-        assert_eq!(SCHEMA_VERSION, "7");
+    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_8() {
+        assert_eq!(SCHEMA_VERSION, "8");
         let s = Store::open(":memory:").unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
-        s.set_meta("schema_version", "6").unwrap();
+        s.set_meta("schema_version", "7").unwrap();
         ensure_schema_version(&s.conn).unwrap();
         assert!(!s.schema_is_current().unwrap());
         s.reset_index().unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("7"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("8"));
         assert!(s.schema_is_current().unwrap());
     }
 
@@ -675,18 +691,20 @@ mod tests {
     fn half_repos_row_rejected_by_schema() {
         let s = Store::open(":memory:").unwrap();
         for half in [
-            "INSERT INTO repos VALUES ('in', 'out', NULL)",
-            "INSERT INTO repos VALUES ('in', NULL, 'inner')",
+            "INSERT INTO repos VALUES ('in', '/r/in', 'out', NULL)",
+            "INSERT INTO repos VALUES ('in', '/r/in', NULL, 'inner')",
         ] {
             assert!(s.conn.execute(half, []).is_err(), "{half}");
         }
         let set = [
             RecordedRoot {
                 tag: "out".to_string(),
+                root: "/r".to_string(),
                 nesting: None,
             },
             RecordedRoot {
                 tag: "in".to_string(),
+                root: "/r/inner".to_string(),
                 nesting: Some(("out".to_string(), "inner".to_string())),
             },
         ];
