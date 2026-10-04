@@ -54,3 +54,9 @@ CREATE TABLE IF NOT EXISTS reviewed (
   body_hash TEXT NOT NULL,
   PRIMARY KEY (uid, body_hash)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS repos (
+  tag    TEXT PRIMARY KEY,
+  outer  TEXT,
+  prefix TEXT,
+  CHECK ((outer IS NULL) = (prefix IS NULL))
+);
