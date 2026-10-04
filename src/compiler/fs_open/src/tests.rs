@@ -467,27 +467,6 @@ fn hinted_kind_of(listed: &[(EntryName, HintedKind)], entry: &str) -> Option<Hin
         .map(|(_, kind)| *kind)
 }
 
-/// A directory that lists but cannot be searched, so any stat of an entry fails.
-#[cfg(unix)]
-struct ListOnly(PathBuf);
-
-#[cfg(unix)]
-impl ListOnly {
-    fn new(dir: PathBuf) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
-        Self(dir)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ListOnly {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
 #[test]
 fn entries_hinted_charges_cap_at_listing() {
     let dir = scratch("hinted_cap");
@@ -513,12 +492,11 @@ fn entries_hinted_charges_cap_at_listing() {
 #[cfg(unix)]
 #[test]
 fn entries_hinted_refuses_over_cap_without_touching_children() {
-    let dir = scratch("hinted_cap_unsearchable");
+    let dir = scratch("hinted_cap_dangling");
     for entry in ["a", "b", "c"] {
-        std::fs::write(dir.join(entry), entry).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join(entry)).unwrap();
     }
     let held = held(&dir);
-    let _unsearchable = ListOnly::new(dir);
     let entry_cap = EntryCap::new(2).unwrap();
     let past = held.entries_hinted(entry_cap);
     assert!(
@@ -527,22 +505,26 @@ fn entries_hinted_refuses_over_cap_without_touching_children() {
     );
 }
 
-/// A listing takes its kinds from the directory entry: entries a stat could not reach are still typed.
+/// A listing takes its kinds from the directory entry: a dangling link a following stat would fail on is still typed.
 #[cfg(unix)]
 #[test]
 fn entries_hinted_never_stats() {
     let dir = scratch("hinted_no_stat");
     std::fs::create_dir(dir.join("sub")).unwrap();
     std::fs::write(dir.join("file"), "x").unwrap();
+    std::os::unix::fs::symlink(dir.join("absent"), dir.join("gone")).unwrap();
     let held = held(&dir);
-    let _unsearchable = ListOnly::new(dir);
     let listed = held.entries_hinted(EntryCap::new(8).unwrap());
     assert!(
-        matches!(listed, Ok(ref found) if found.len() == 2),
-        "an unsearchable directory still lists, got {listed:?}"
+        matches!(listed, Ok(ref found) if found.len() == 3),
+        "a directory with a dangling link still lists, got {listed:?}"
     );
     let Ok(listed) = listed else { return };
-    for (entry, expected) in [("sub", HintedKind::Dir), ("file", HintedKind::Regular)] {
+    for (entry, expected) in [
+        ("sub", HintedKind::Dir),
+        ("file", HintedKind::Regular),
+        ("gone", HintedKind::Link),
+    ] {
         let hint = hinted_kind_of(&listed, entry);
         assert!(
             hint == Some(expected) || hint == Some(HintedKind::Unknown),
