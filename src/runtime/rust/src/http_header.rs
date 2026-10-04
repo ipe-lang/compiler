@@ -90,50 +90,44 @@ pub(crate) fn origin_host_mismatch(origin: &str, host: &str) -> bool {
     all(target_arch = "wasm32", feature = "wasm-client")
 ))]
 pub mod cookie {
-    /// Whether `b` is an RFC 6265 `cookie-octet` other than `%`.
-    const fn is_value_octet(b: u8) -> bool {
-        matches!(b, 0x21 | 0x23..=0x24 | 0x26..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
-    }
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
-    /// Whether `b` is an RFC 7230 `tchar` other than `%`.
-    const fn is_name_octet(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'!' | b'#'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-    }
+    /// The ASCII bytes a cookie value writes as `%XX`.
+    ///
+    /// Every byte that is not an RFC 6265 `cookie-octet`, and `%` itself.
+    /// Non-ASCII bytes are always written `%XX`.
+    const VALUE_ESCAPED: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'%')
+        .add(b',')
+        .add(b';')
+        .add(b'\\');
 
-    /// `raw` with every byte `keep` refuses written as `%XX` (upper-case hex).
-    fn percent_encode(raw: &str, keep: fn(u8) -> bool) -> String {
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        let mut out = String::with_capacity(raw.len());
-        for b in raw.bytes() {
-            if keep(b) {
-                out.push(char::from(b));
-            } else {
-                out.push('%');
-                for nibble in [b >> 4, b & 0x0F] {
-                    if let Some(&h) = HEX.get(usize::from(nibble)) {
-                        out.push(char::from(h));
-                    }
-                }
-            }
-        }
-        out
-    }
+    /// The ASCII bytes a cookie name writes as `%XX`.
+    ///
+    /// Every byte that is not an RFC 7230 `tchar`, and `%` itself. Non-ASCII
+    /// bytes are always written `%XX`.
+    const NAME_ESCAPED: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'%')
+        .add(b'(')
+        .add(b')')
+        .add(b',')
+        .add(b'/')
+        .add(b':')
+        .add(b';')
+        .add(b'<')
+        .add(b'=')
+        .add(b'>')
+        .add(b'?')
+        .add(b'@')
+        .add(b'[')
+        .add(b'\\')
+        .add(b']')
+        .add(b'{')
+        .add(b'}');
 
     /// The fixed base of a cookie name the runtime itself sets.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +176,7 @@ pub mod cookie {
         pub fn parse(raw: &str) -> Option<Self> {
             (!raw.is_empty()).then(|| Self {
                 text: raw.to_owned(),
-                wire: percent_encode(raw, is_name_octet),
+                wire: utf8_percent_encode(raw, NAME_ESCAPED).to_string(),
             })
         }
 
@@ -192,7 +186,7 @@ pub mod cookie {
         #[must_use]
         pub fn runtime(base: RuntimeCookie, suffix: &str) -> Self {
             let text = format!("{}{suffix}", base.base());
-            let wire = percent_encode(&text, is_name_octet);
+            let wire = utf8_percent_encode(&text, NAME_ESCAPED).to_string();
             Self { text, wire }
         }
 
@@ -236,7 +230,7 @@ pub mod cookie {
         /// A value made of the other `cookie-octet` bytes is kept byte-for-byte.
         #[must_use]
         pub fn encode(raw: &str) -> Self {
-            Self(percent_encode(raw, is_value_octet))
+            Self(utf8_percent_encode(raw, VALUE_ESCAPED).to_string())
         }
 
         /// The encoded value.
@@ -246,31 +240,15 @@ pub mod cookie {
         }
     }
 
-    /// The value of one hexadecimal digit byte.
-    fn hex_digit(b: u8) -> Option<u8> {
-        char::from(b)
-            .to_digit(16)
-            .and_then(|d| u8::try_from(d).ok())
-    }
-
     /// Invert the cookie percent-encoding of `wire`.
     ///
-    /// A `%` not followed by two hex digits, or bytes that are not UTF-8, have
-    /// no decoding: the result is `None`, never a lossy replacement.
+    /// Decoded by the runtime's one percent-decoder under the path grammar, so
+    /// a `+` stays a `+`. A `%` not followed by two hex digits, or bytes that
+    /// are not UTF-8, have no decoding: the result is `None`, never a lossy
+    /// replacement.
     #[must_use]
     pub fn decode(wire: &str) -> Option<String> {
-        let mut out = Vec::with_capacity(wire.len());
-        let mut bytes = wire.bytes();
-        while let Some(b) = bytes.next() {
-            if b == b'%' {
-                let hi = bytes.next().and_then(hex_digit)?;
-                let lo = bytes.next().and_then(hex_digit)?;
-                out.push(hi.checked_mul(16)?.checked_add(lo)?);
-            } else {
-                out.push(b);
-            }
-        }
-        String::from_utf8(out).ok()
+        crate::encoding::decode_component(wire, crate::encoding::UrlGrammar::Path).ok()
     }
 
     /// The decoded `(name, value)` pairs of one `Cookie` header or of
@@ -342,6 +320,59 @@ pub mod cookie {
             }
             assert_eq!(CookieValue::encode("é").as_str(), "%C3%A9");
             assert_eq!(decode("%c3%a9").as_deref(), Some("é"));
+        }
+
+        /// A malformed escape, a truncated escape and an overlong UTF-8 form
+        /// have no decoding, while `+` stays `+` and `%00` is the NUL byte.
+        #[test]
+        fn decode_refuses_malformed_escapes_and_invalid_utf8() {
+            for wire in ["%ZZ", "%4", "%", "a%G1", "%C0%AF", "%FF", "%C3"] {
+                assert_eq!(decode(wire), None, "{wire:?} must have no decoding");
+            }
+            assert_eq!(decode("a+b").as_deref(), Some("a+b"));
+            assert_eq!(decode("%2B").as_deref(), Some("+"));
+            assert_eq!(decode("%00").as_deref(), Some("\0"));
+        }
+
+        /// Every byte value, as the character of that code point, encodes to
+        /// RFC wire bytes only and decodes back to itself, as a value and as a
+        /// name.
+        #[test]
+        fn every_byte_round_trips_through_rfc_wire_bytes() {
+            const fn is_cookie_octet(b: u8) -> bool {
+                matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+            }
+            fn is_tchar(b: u8) -> bool {
+                b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".as_slice().contains(&b)
+            }
+            for b in 0u8..=0xFF {
+                let raw = char::from(b).to_string();
+                let value = CookieValue::encode(&raw);
+                assert!(
+                    value.as_str().bytes().all(is_cookie_octet),
+                    "byte {b:#04x}: value wire {:?} holds a non-cookie-octet",
+                    value.as_str()
+                );
+                assert_eq!(
+                    decode(value.as_str()).as_deref(),
+                    Some(raw.as_str()),
+                    "byte {b:#04x}: value"
+                );
+                let name = CookieName::parse(&raw);
+                let Some(name) = name else {
+                    panic!("byte {b:#04x}: a non-empty name parses");
+                };
+                assert!(
+                    name.as_str().bytes().all(is_tchar),
+                    "byte {b:#04x}: name wire {:?} holds a non-tchar",
+                    name.as_str()
+                );
+                assert_eq!(
+                    decode(name.as_str()).as_deref(),
+                    Some(raw.as_str()),
+                    "byte {b:#04x}: name"
+                );
+            }
         }
 
         /// A cookie value's `Debug` never prints the value it holds.
