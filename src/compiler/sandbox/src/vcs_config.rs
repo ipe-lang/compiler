@@ -4172,7 +4172,6 @@ mod tests {
             format!("[core]\n\thooksPath = !{out}/h\n"),
             format!("[core]\n\thooksPath = ={out}/h\n"),
             format!("[init]\n\ttemplateDir = !{out}/t\n"),
-            format!("[include]\n\tpath = !{out}/inc\n"),
         ] {
             git_config(&f, &text);
             let result = scan_git(&f);
@@ -4191,6 +4190,17 @@ mod tests {
         }
         git_config(&f, &format!("[alias]\n\tx = !{out}/a\n"));
         assert_eq!(scan_git(&f), Ok(()));
+
+        // An include path is a file name, never a command: `!` there is the
+        // first component of a path relative to the including file's directory.
+        let tree = f.tree.display();
+        write(&f.out.join("inc"), "[core]\n\tpager = less\n");
+        let literal = f.tree.join(".git").join(format!("!{out}")).join("inc");
+        write(&literal, &format!("[core]\n\thooksPath = {tree}/hooks\n"));
+        git_config(&f, &format!("[include]\n\tpath = !{out}/inc\n"));
+        let result = scan_git(&f);
+        assert_eq!(source(&result), Some(literal.as_path()), "{result:?}");
+        assert_eq!(in_grant(&result), Some(f.tree.join("hooks").as_path()));
     }
 
     #[cfg(unix)]
