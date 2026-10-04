@@ -1062,11 +1062,12 @@ pub(super) fn rewrite_captured_clones(
                 clone_set, noncl_set, walk, *tail, scope,
             )?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(rewrite_captured_clones(
                 clone_set, noncl_set, walk, *list, scope,
             )?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(rewrite_captured_clones(
@@ -1546,9 +1547,10 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             head: Box::new(rewrite_multiuse_clones(sym, remaining, *head)),
             tail: Box::new(rewrite_multiuse_clones(sym, remaining, *tail)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(rewrite_multiuse_clones(sym, remaining, *list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(rewrite_multiuse_clones(sym, remaining, *list)),

@@ -362,9 +362,10 @@ pub fn substitute_var(expr: Expr, target: Symbol, replacement: &Expr) -> Expr {
             head: Box::new(substitute_var(*head, target, replacement)),
             tail: Box::new(substitute_var(*tail, target, replacement)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(substitute_var(*list, target, replacement)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(substitute_var(*list, target, replacement)),

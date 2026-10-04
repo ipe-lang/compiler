@@ -2970,6 +2970,9 @@ pub enum Expr {
     ListIndexClone {
         list: Box<Self>,
         index: usize,
+        /// The list's element type; the emitter proves it is `Clone` before
+        /// it writes the `.clone()`.
+        elem: IrType,
     },
     /// A borrowing list-length CHECK for a Class 4 item C2 arm guard:
     /// `<list>.len() >= <len>` (`exact == false`, an OPEN cons chain
@@ -3578,6 +3581,9 @@ pub enum Pat {
         rest: Option<Box<Self>>,
         /// How the binders take their elements; the lowerer decides it from the element type.
         own: SliceOwnership,
+        /// The list's element type; the emitter proves it is `Clone` before a
+        /// borrowing arm clones a binder out.
+        elem: IrType,
     },
     /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches. Each
     /// alternative is an arbitrary [`Pat`] and recurses. Every alternative binds
@@ -4758,6 +4764,7 @@ mod tests {
             prefix: vec![Pat::Var(x)],
             rest: None,
             own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
         }));
         assert!(!is_dispatch_free(&Pat::Str("s".to_owned())));
         Ok(())

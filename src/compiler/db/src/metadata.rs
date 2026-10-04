@@ -233,7 +233,11 @@ fn walk_expr(
             walk_expr(head, direct_calls, types);
             walk_expr(tail, direct_calls, types);
         }
-        Expr::ListIndexClone { list, index: _ }
+        Expr::ListIndexClone {
+            list,
+            index: _,
+            elem: _,
+        }
         | Expr::ListLenCheck {
             list,
             len: _,

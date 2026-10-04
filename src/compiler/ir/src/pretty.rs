@@ -426,7 +426,9 @@ fn pat_name_at(interner: &Interner, pat: &Pat, depth: u16) -> String {
                 .join(", ");
             format!("{{ {inner} }}")
         }
-        Pat::Slice { prefix, rest, own } => {
+        Pat::Slice {
+            prefix, rest, own, ..
+        } => {
             let parts = prefix
                 .iter()
                 .map(|p| pat_name_at(interner, p, depth))
@@ -749,7 +751,7 @@ fn write_expr_at(out: &mut String, expr: &Expr, interner: &Interner, level: usiz
         }
         Expr::List { elem, items } => write_list(out, elem, items, interner, level, depth),
         Expr::Cons { head, tail } => write_cons(out, head, tail, interner, level, depth),
-        Expr::ListIndexClone { list, index } => {
+        Expr::ListIndexClone { list, index, .. } => {
             line(out, level, &format!("ListIndexClone [{index}]"));
             write_expr_at(out, list, interner, level + 1, depth);
         }

@@ -4,10 +4,10 @@ use super::{
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
-use ipe_ir::SliceOwnership;
 use ipe_ir::free_vars::{
     free_vars, pat_bound_symbols, pat_has_str_guard_slot, pat_moves_nested_part,
 };
+use ipe_ir::{IrType, SliceOwnership};
 use std::collections::BTreeSet;
 
 /// Render `s` as a Rust double-quoted string literal through Rust's own
@@ -194,6 +194,63 @@ fn owned_scrutinee_reuse_refusal(scrutinee: &Expr, view: ListView, arms: &[Arm])
     Ok(())
 }
 
+/// Prove a list element type `Clone` before the emitter clones one out.
+///
+/// The lowerer emits a `.clone()` of a list element (a borrowed-view binder
+/// copy-out, an index read under a nested list pattern) only over an element
+/// type it classified `Clone`. This re-checks that decision against the
+/// emitted Rust's own `Clone` facts, so a lowerer misclassification is an
+/// internal error at emit time rather than a `cargo` failure.
+pub fn elem_clone_proof(ctx: &EmitCtx, elem: &IrType) -> DResult<()> {
+    if crate::fn_value_is_clone(elem, &|home, name| ctx.enum_is_clone(home, name)) {
+        Ok(())
+    } else {
+        Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::elem_clone_proof",
+            detail: "a list element is cloned out, but its emitted type is not `Clone`; \
+                     the lowerer takes an owned view of such a list"
+                .to_owned(),
+        })
+    }
+}
+
+/// Prove every slice element type of a borrowed list column `Clone`.
+///
+/// A borrowed view copies each binder out with `.clone()` / `.to_vec()`, a
+/// whole-list binder included, so the proof covers the column whenever some
+/// head binds a part. A column no head binds anything from clones nothing.
+fn borrowed_column_clone_proof<'p>(
+    ctx: &EmitCtx,
+    pats: impl Iterator<Item = &'p Pat> + Clone,
+    view: ListView,
+) -> DResult<()> {
+    match view {
+        ListView::Borrow => {}
+        ListView::Off | ListView::Owned { .. } => return Ok(()),
+    }
+    if !pats.clone().any(pat_moves_nested_part) {
+        return Ok(());
+    }
+    let mut pending: Vec<&Pat> = pats.collect();
+    while let Some(pat) = pending.pop() {
+        match pat {
+            Pat::Slice { elem, .. } => elem_clone_proof(ctx, elem)?,
+            Pat::Alias(inner, _) => pending.push(inner),
+            Pat::Or(alts) => pending.extend(alts),
+            Pat::Var(_)
+            | Pat::Wildcard
+            | Pat::Int(_)
+            | Pat::Bool(_)
+            | Pat::Char(_)
+            | Pat::Str(_)
+            | Pat::Ctor { .. }
+            | Pat::Tuple(_)
+            | Pat::Record(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Render the list scrutinee `e` for its column's [`ListView`].
 fn list_scrutinee(e: String, view: ListView) -> String {
     match view {
@@ -236,7 +293,12 @@ pub fn emit_match_scrutinee(
         }
         let cols = tuple_col_modes(m.arms(), arity)?;
         let mut parts = Vec::with_capacity(arity);
-        for (elem, col) in elems.iter().zip(&cols) {
+        for ((c, elem), col) in elems.iter().enumerate().zip(&cols) {
+            let column = m.arms().iter().filter_map(|arm| match &arm.pat {
+                Pat::Tuple(heads) => heads.get(c),
+                _ => None,
+            });
+            borrowed_column_clone_proof(ctx, column, col.list)?;
             owned_scrutinee_reuse_refusal(elem, col.list, m.arms())?;
             let e = emit_expr_at(ctx, elem, indent, child, generics)?;
             let e = if col.str_mode {
@@ -251,6 +313,7 @@ pub fn emit_match_scrutinee(
 
     let str_mode = m.arms().iter().any(|a| matches!(a.pat, Pat::Str(_)));
     let list = list_view(m.arms().iter().map(|a| &a.pat), 0)?;
+    borrowed_column_clone_proof(ctx, m.arms().iter().map(|a| &a.pat), list)?;
     owned_scrutinee_reuse_refusal(m.scrutinee(), list, m.arms())?;
     let scrut_expr = emit_expr_at(ctx, m.scrutinee(), indent, child, generics)?;
     let scrut = if str_mode {
@@ -605,8 +668,10 @@ pub fn list_arm_head(
 /// body expects — an element via `.clone()` (so the body sees `T`), a rest /
 /// whole list via `.to_vec()` (so the body sees `Vec<T>`). The lowerer stamps
 /// `BorrowClone` only on an element type whose clone class is `Clone` (a bare
-/// type parameter carries the emitted `Clone` bound), so the `.clone()` /
-/// `.to_vec()` always resolve. A non-`Clone` element is
+/// type parameter carries the emitted `Clone` bound), and the scrutinee
+/// emitter re-proves the column's element type with [`elem_clone_proof`]
+/// before any arm renders, so the `.clone()` / `.to_vec()` always resolve.
+/// A non-`Clone` element is
 /// [`SliceOwnership::OwnedMove`], whose binders move out of the owned view and
 /// have no copy-out prelude, so reaching here with it is an internal error.
 pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DResult<String> {
@@ -625,6 +690,7 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DRe
             prefix,
             rest,
             own: here,
+            ..
         } => {
             if *here != own {
                 return Err(Diagnostic::CompilerBug {
@@ -755,6 +821,7 @@ fn owned_view_shape(
             prefix,
             rest,
             own: SliceOwnership::OwnedMove,
+            ..
         } => {
             let k = prefix.len();
             if k >= width {

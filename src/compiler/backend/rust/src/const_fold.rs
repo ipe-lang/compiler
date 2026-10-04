@@ -283,9 +283,10 @@ fn fold_expr(expr: Expr, funcs: &BTreeMap<FuncId, &Func>, interner: &Interner) -
             head: go_box(head),
             tail: go_box(tail),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: go_box(list),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: go_box(list),
@@ -652,9 +653,10 @@ fn substitute(expr: Expr, subst: &BTreeMap<Symbol, Expr>) -> Expr {
             head: go_box(head),
             tail: go_box(tail),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: go_box(list),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: go_box(list),

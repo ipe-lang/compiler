@@ -293,6 +293,7 @@ mod tests {
             prefix: vec![lit()],
             rest: None,
             own: crate::SliceOwnership::BorrowClone,
+            elem: crate::IrType::Int,
         };
         assert!(!pat_has_str_guard_slot(&slice));
         assert!(!pat_moves_scrutinee(&slice));

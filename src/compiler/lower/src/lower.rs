@@ -583,9 +583,10 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
             effect: Box::new(recur(*effect)),
             rest: Box::new(recur(*rest)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(recur(*list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(recur(*list)),
@@ -2521,9 +2522,10 @@ fn promote_unification_sibling_lambdas(
             head: Box::new(recur(*head)?),
             tail: Box::new(recur(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recur(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recur(*list)?),
@@ -7884,9 +7886,10 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
             head: Box::new(recurse_storage(*head)?),
             tail: Box::new(recurse_storage(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recurse(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recurse(*list)?),
@@ -7977,6 +7980,14 @@ impl FlatNestedList {
             .any(|b| matches!(b, NestedBinder::Named(_)))
             || matches!(self.tail, NestedTail::Rest(NestedBinder::Named(_)))
     }
+}
+
+/// The internal error of a nested list head binder whose element type was never resolved.
+fn unresolved_nested_cons_elem() -> Diagnostic {
+    bug(
+        "ipe_lower::desugar_ctor_nested_special_args",
+        "a nested list binds a head element but its element type was not resolved",
+    )
 }
 
 /// Refuse (IPE-L0116) a binding nested list in a constructor payload over a non-`Clone` element.
@@ -10421,9 +10432,10 @@ fn rewrite_var_free_occurrences(
             head: Box::new(rewrite_var_free_occurrences(target, *head, on_hit)),
             tail: Box::new(rewrite_var_free_occurrences(target, *tail, on_hit)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
@@ -31293,12 +31305,7 @@ impl<'a> Lowerer<'a> {
                 // The prelude copies each head out by `ListIndexClone` and takes
                 // the tail by `List.drop`, so a binding shape over a non-`Clone`
                 // element has no sound rendering here. [IPE-L0116]
-                if flat.binds_any() {
-                    nested_cons_ownership_refusal(
-                        slice_ownership(self.clone_env(), &self.list_storage_elem_ir(a.span)?),
-                        a.span,
-                    )?;
-                }
+                let elem = self.nested_cons_elem(&flat, a.span)?;
                 // Replace this ctor arg with a fresh `Vec` binder and record the
                 // guard + per-element prelude bindings against it.
                 let fresh = self.fresh_nested_cons_binder()?;
@@ -31311,13 +31318,15 @@ impl<'a> Lowerer<'a> {
                 });
                 // Head-element binders BORROW `fresh` (index + clone), so they
                 // precede the tail binder that MOVES it.
-                for (idx, elem) in flat.prefix.iter().enumerate() {
-                    if let NestedBinder::Named(sym) = elem {
+                for (idx, binder) in flat.prefix.iter().enumerate() {
+                    if let NestedBinder::Named(sym) = binder {
+                        let elem = elem.clone().ok_or_else(unresolved_nested_cons_elem)?;
                         bindings.push((
                             *sym,
                             Expr::ListIndexClone {
                                 list: Box::new(Expr::Var(fresh)),
                                 index: idx,
+                                elem,
                             },
                         ));
                     }
@@ -31357,6 +31366,20 @@ impl<'a> Lowerer<'a> {
             rhs: Box::new(g),
         });
         Ok(Some((ir_pat, guard, bindings)))
+    }
+
+    /// The element type of the nested list `flat` at `span`, when it binds a part.
+    ///
+    /// A binding shape copies each head out by `ListIndexClone` and takes the
+    /// tail by `List.drop`, so its element must be `Clone`; any other element
+    /// is refused (IPE-L0116). A shape that binds nothing reads no element.
+    fn nested_cons_elem(&self, flat: &FlatNestedList, span: Span) -> DResult<Option<IrType>> {
+        if !flat.binds_any() {
+            return Ok(None);
+        }
+        let elem = self.list_storage_elem_ir(span)?;
+        nested_cons_ownership_refusal(slice_ownership(self.clone_env(), &elem), span)?;
+        Ok(Some(elem))
     }
 
     /// Classify a constructor-arg sub-pattern as a SUPPORTABLE nested list for
@@ -31421,10 +31444,16 @@ impl<'a> Lowerer<'a> {
     /// The slice's [`SliceOwnership`] is decided here, once, from the element
     /// type of the list at `ty_span` (see [`slice_ownership`]).
     fn lower_list_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
-        let own = slice_ownership(self.clone_env(), &self.list_storage_elem_ir(ty_span)?);
+        let elem = self.list_storage_elem_ir(ty_span)?;
+        let own = slice_ownership(self.clone_env(), &elem);
         let (prefix, rest) = self.lower_list_arm_shape(p)?;
         owned_slice_refusal(own, &prefix, p.span)?;
-        Ok(Pat::Slice { prefix, rest, own })
+        Ok(Pat::Slice {
+            prefix,
+            rest,
+            own,
+            elem,
+        })
     }
 
     /// Flatten a list / cons arm head into its element prefix and its open tail binder.
@@ -37119,6 +37148,7 @@ mod tests {
             prefix: vec![Pat::Var(x)],
             rest: Some(Box::new(Pat::Var(r))),
             own,
+            elem: ipe_ir::IrType::Int,
         };
         Expr::Match(
             Match::new_flat(
@@ -37260,6 +37290,7 @@ mod tests {
             prefix: vec![Pat::Var(x)],
             rest: None,
             own: SliceOwnership::OwnedMove,
+            elem: IrType::Task(Box::new(IrType::Int)),
         };
         let case = Expr::Match(
             Match::new_flat(
@@ -37385,6 +37416,7 @@ mod tests {
             prefix,
             rest: None,
             own,
+            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
         };
         let binding = [
             slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),

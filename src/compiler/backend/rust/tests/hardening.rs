@@ -1023,13 +1023,19 @@ fn list_case_fn(name: Symbol, xs: Symbol, elem: IrType, arms: Vec<Arm>) -> DResu
     })
 }
 
-/// A slice pattern with the given prefix, rest and ownership.
-fn slice(prefix: Vec<Pat>, rest: Option<Pat>, own: SliceOwnership) -> Pat {
+/// A slice pattern with the given prefix, rest, ownership and element type.
+fn slice(prefix: Vec<Pat>, rest: Option<Pat>, own: SliceOwnership, elem: &IrType) -> Pat {
     Pat::Slice {
         prefix,
         rest: rest.map(Box::new),
         own,
+        elem: elem.clone(),
     }
+}
+
+/// The non-`Clone` element type `Task Int`.
+fn task_int() -> IrType {
+    IrType::Task(Box::new(IrType::Int))
 }
 
 /// The emitted text of the function whose `match` holds `marker`.
@@ -1057,10 +1063,18 @@ fn owned_move_list_case_copies_no_binder() -> DResult<()> {
     let other = interner.intern("other")?;
     let own = SliceOwnership::OwnedMove;
     let arms = vec![
-        Arm::new(slice(vec![], None, own), Expr::Int(0)),
-        Arm::new(slice(vec![Pat::Var(x)], None, own), Expr::Int(1)),
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
         Arm::new(
-            slice(vec![Pat::Var(x), Pat::Var(y)], Some(Pat::Var(rest)), own),
+            slice(vec![Pat::Var(x)], None, own, &task_int()),
+            Expr::Int(1),
+        ),
+        Arm::new(
+            slice(
+                vec![Pat::Var(x), Pat::Var(y)],
+                Some(Pat::Var(rest)),
+                own,
+                &task_int(),
+            ),
             Expr::Int(2),
         ),
         Arm::new(Pat::Var(other), Expr::Int(3)),
@@ -1096,9 +1110,17 @@ fn mixed_slice_ownership_fails_closed() -> DResult<()> {
     let xs = interner.intern("xs")?;
     let x = interner.intern("x")?;
     let arms = vec![
-        Arm::new(slice(vec![], None, SliceOwnership::OwnedMove), Expr::Int(0)),
         Arm::new(
-            slice(vec![Pat::Var(x)], None, SliceOwnership::BorrowClone),
+            slice(vec![], None, SliceOwnership::OwnedMove, &task_int()),
+            Expr::Int(0),
+        ),
+        Arm::new(
+            slice(
+                vec![Pat::Var(x)],
+                None,
+                SliceOwnership::BorrowClone,
+                &task_int(),
+            ),
             Expr::Int(1),
         ),
         Arm::new(Pat::Wildcard, Expr::Int(2)),
@@ -1127,6 +1149,7 @@ fn owned_view_scrutinee_reuse_fails_closed() -> DResult<()> {
                 vec![Pat::Var(x)],
                 Some(Pat::Wildcard),
                 SliceOwnership::OwnedMove,
+                &task_int(),
             ),
             Expr::Var(xs),
         ),
@@ -1152,8 +1175,11 @@ fn binder_free_owned_list_case_borrows_the_scrutinee() -> DResult<()> {
     let xs = interner.intern("xs")?;
     let own = SliceOwnership::OwnedMove;
     let arms = vec![
-        Arm::new(slice(vec![], None, own), Expr::Int(0)),
-        Arm::new(slice(vec![Pat::Wildcard], None, own), Expr::Int(1)),
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Wildcard], None, own, &task_int()),
+            Expr::Int(1),
+        ),
         Arm::new(Pat::Wildcard, Expr::Int(2)),
     ];
     let f = list_case_fn(func, xs, IrType::Task(Box::new(IrType::Int)), arms)?;
@@ -1185,9 +1211,9 @@ fn borrow_clone_list_case_keeps_slice_emission() -> DResult<()> {
     let rest = interner.intern("rest")?;
     let own = SliceOwnership::BorrowClone;
     let arms = vec![
-        Arm::new(slice(vec![], None, own), Expr::Int(0)),
+        Arm::new(slice(vec![], None, own, &IrType::Str), Expr::Int(0)),
         Arm::new(
-            slice(vec![Pat::Var(x)], Some(Pat::Var(rest)), own),
+            slice(vec![Pat::Var(x)], Some(Pat::Var(rest)), own, &IrType::Str),
             Expr::Int(1),
         ),
     ];
@@ -1209,6 +1235,100 @@ fn borrow_clone_list_case_keeps_slice_emission() -> DResult<()> {
     assert!(
         !body.contains("ipe_list_view"),
         "a borrow-clone list case takes no owned view, got:\n{body}"
+    );
+    Ok(())
+}
+
+/// Is `res` the internal error of the emitter's element `Clone` proof?
+fn is_elem_clone_refusal(res: &DResult<String>) -> bool {
+    matches!(
+        res,
+        Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::elem_clone_proof",
+            ..
+        })
+    )
+}
+
+/// A borrowed list `case` that copies a binder out of a non-`Clone` element is
+/// an internal error, never a `.clone()` cargo rejects: an element binder and a
+/// whole-list binder alike.
+#[test]
+fn borrow_clone_binder_over_nonclone_elem_fails_closed() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("heads")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let whole = interner.intern("whole")?;
+    let own = SliceOwnership::BorrowClone;
+    let elem_binder = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Var(x)], Some(Pat::Wildcard), own, &task_int()),
+            Expr::Int(1),
+        ),
+    ];
+    let whole_binder = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(Pat::Var(whole), Expr::Int(1)),
+    ];
+    for arms in [elem_binder, whole_binder] {
+        let f = list_case_fn(func, xs, task_int(), arms)?;
+        let res = emit(&interner, &program(main_mod, vec![], vec![f]));
+        assert!(
+            is_elem_clone_refusal(&res),
+            "a copy-out over a non-`Clone` element must fail closed, got {res:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An index read under a nested list pattern clones its element only after the
+/// emitter proves the element `Clone`: a `Task` element and an opaque foreign
+/// handle element are internal errors, an `Int` element emits the clone.
+#[test]
+fn list_index_clone_proves_its_element_clone() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("pick")?;
+    let xs = interner.intern("xs")?;
+    let rust = interner.intern("Rust")?;
+    let crate_seg = interner.intern("Bevy_ecs")?;
+    let world = interner.intern("World")?;
+    let handle = IrType::Enum {
+        home: ModPath(vec![rust, crate_seg]),
+        name: world,
+        args: vec![],
+    };
+    let pick = |elem: IrType| Func {
+        id: FuncId::from_raw(0),
+        name: func,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(xs, IrType::List(Box::new(IrType::Int)))],
+        ret: IrType::Int,
+        body: Expr::ListIndexClone {
+            list: Box::new(Expr::Var(xs)),
+            index: 0,
+            elem,
+        },
+    };
+    for elem in [task_int(), handle] {
+        let res = emit(&interner, &program(main_mod, vec![], vec![pick(elem)]));
+        assert!(
+            is_elem_clone_refusal(&res),
+            "an index clone over a non-`Clone` element must fail closed, got {res:?}"
+        );
+    }
+    let src = emit(
+        &interner,
+        &program(main_mod, vec![], vec![pick(IrType::Int)]),
+    )?;
+    assert!(
+        src.contains("(xs)[0].clone()"),
+        "an index read over a `Clone` element clones it, got:\n{src}"
     );
     Ok(())
 }
