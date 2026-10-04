@@ -25,7 +25,7 @@ encoding = []
 # this entry to compile — without it rustc emits E0425 for the gated functions.
 secret = []
 # The dev-loop build intent. `dev_posture_cargo_toml` promotes it into `default`
-# for an `ipe build` / `ipe run` / `ipe test` / `ipe watch` emit; a release emit
+# for an `ipe dev build` / `ipe dev run` / `ipe test` / `ipe dev watch` emit; a release emit
 # leaves it off, so the vendored console default stays closed.
 dev-posture = []
 # Declared but inert in the vendored escape hatch: `serde` / `serde_json` /

@@ -7,7 +7,6 @@ exit: 0
     ipe init     --help
     ipe dev      --help
     ipe release  --help
-    ipe exec     --help
 
   Quality
     ipe type-check  --help
@@ -31,7 +30,6 @@ exit: 0
     ipe capabilities  --help
     ipe diff          --help
     ipe fix           --help
-    ipe eject         --help
     ipe upgrade       --help
     ipe version       --help
 

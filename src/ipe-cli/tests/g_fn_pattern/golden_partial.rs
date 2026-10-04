@@ -8,7 +8,7 @@
 //! `Main.ipe` to stdout `15\n`, exit 0:
 //!
 //! ```text
-//! $ ipe run tests/golden/partial/Main.ipe
+//! $ ipe dev run tests/golden/partial/Main.ipe
 //! 15
 //! ```
 //!

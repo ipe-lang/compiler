@@ -200,7 +200,7 @@ fn capabilities_in_a_project_dir_resolves_the_entry() {
     );
 }
 
-/// Regression sibling of the capabilities bug: `ipe build --emit-ir` with no
+/// Regression sibling of the capabilities bug: `ipe dev build --emit-ir` with no
 /// positional, run inside a project dir, must resolve the project's entry `.ipe`
 /// (a directory / bare `.` default routed to its `Main.ipe`) rather than reading
 /// the directory itself and failing with a raw "Is a directory" io error.
@@ -212,7 +212,7 @@ fn emit_ir_in_a_project_dir_resolves_the_entry() {
         "the hello-world example must exist"
     );
     let r = match Command::new(support::ipe_bin())
-        .args(["build", "--emit-ir"])
+        .args(["dev", "build", "--emit-ir"])
         .current_dir(&proj)
         .env("NO_COLOR", "1")
         .output()

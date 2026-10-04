@@ -739,7 +739,7 @@ jobs:
           scope: ${{ needs.changes.outputs.code }}
 
   # SEAL smoke — the fast required proxy for THE SEAL. Build the compiler, then
-  # take ONE small `cli` example end to end: `ipe build` → `cargo build` the
+  # take ONE small `cli` example end to end: `ipe dev build` → `cargo build` the
   # emitted crate → run it → assert its expected stdout. This proves the
   # emit→build→run floor holds in ~a couple of minutes, apart from the full
   # 14-shard `e2e` below. A break here means
@@ -784,7 +784,7 @@ jobs:
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"
           cd "$WARM"
-          "$IPE" build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world/package.ipe" --out out
           cd out/rust
           cargo build --release   # compiles the runtime dep tree into the shared target
       - name: Emit + build + run (examples/shapes/non-tea/hello-world)
@@ -794,7 +794,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           cd examples/shapes/non-tea/hello-world
-          "$IPE" build package.ipe --out out
+          "$IPE" dev build package.ipe --out out
           cd out/rust
           cargo build --release   # incremental: deps already in the shared target
           OUT="$(cargo run --release --quiet)"
@@ -823,7 +823,7 @@ jobs:
 
   # First-party shape examples — the representative user-facing gate. Every
   # committed example under examples/shapes/ (one per shape: script, terminal,
-  # web) must `ipe type-check`, `ipe build`, and cargo-build its emitted crate on
+  # web) must `ipe type-check`, `ipe dev build`, and cargo-build its emitted crate on
   # every code change. This is the fast, non-flaky core of the examples proof: it catches
   # a compiler change that makes a shipped example stop type-checking or emit a
   # crate that no longer compiles — the two ways a user first feels a regression.
@@ -863,7 +863,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"; cd "$WARM"
-          "$IPE" build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight/package.ipe" --out out
           cd out/rust && cargo build
       - name: Check + emit + build every first-party shape
         env:
@@ -879,8 +879,8 @@ jobs:
             if ! "$IPE" type-check "$entry"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
-            if ! "$IPE" build "$toml" --out "$dir/out"; then
-              echo "::error::ipe build regressed: $dir"; fail=1; echo "::endgroup::"; continue
+            if ! "$IPE" dev build "$toml" --out "$dir/out"; then
+              echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
             # A debug build proves the emitted crate compiles and links — the two
             # ways a user first feels an emit regression. Release optimisation adds
@@ -1763,7 +1763,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Regenerate the Markdown parity snapshot via an ipe run
+      - name: Regenerate the Markdown parity snapshot via an ipe dev run
         run: tools/scripts/regen-markdown-parity.sh
       - name: Fail if the regenerated snapshot differs from the committed one
         run: tools/scripts/generated-unchanged.sh src/ipe-docs/src/markdown/parity/snapshot.txt
@@ -1922,7 +1922,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           OUT="$RUNNER_TEMP/geo-clipboard-emitted"
-          "$IPE" build examples/shapes/web/geo-clipboard/package.ipe --out "$OUT"
+          "$IPE" dev build examples/shapes/web/geo-clipboard/package.ipe --out "$OUT"
           bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_GEO_CLIPBOARD_EMITTED "$OUT/rust"
       - name: Cargo-build emitted project
         env:
@@ -1972,7 +1972,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/layout-fill-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" build examples/shapes/web/layout-fill/package.ipe --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/layout-fill/package.ipe --out "$OUT"
           cd "$OUT/rust"
           cargo build --release
           NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"

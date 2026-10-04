@@ -252,8 +252,8 @@ pub enum CliError {
     /// (the dispatcher wraps a raw [`Self::Usage`] into
     /// this only for a command it recognised).
     CommandUsage {
-        /// The command whose help page to show (a known command name).
-        command: &'static str,
+        /// The command whose help page to show (a known command or grouped verb).
+        command: crate::verb::CommandName,
         /// The specific reason for the misuse (e.g. an unknown flag).
         reason: TerminalSafe,
     },
@@ -268,6 +268,34 @@ pub enum CliError {
         /// The token the user typed after the group name.
         attempted: TerminalSafe,
     },
+    /// A verb name typed without the umbrella group it lives under (`ipe
+    /// build`), or a group typed with no member verb (`ipe release`).
+    ///
+    /// The legacy names have no handler: this refusal is their one
+    /// representation. [`fmt::Display`] names what was typed, then one hint
+    /// per grouped form.
+    GroupRequired {
+        /// What the user typed: the legacy verb or the bare group word.
+        attempted: TerminalSafe,
+        /// The grouped forms the hint offers; empty for a bare `ipe dev`.
+        forms: &'static [crate::verb::Verb],
+        /// The arguments that followed `attempted`, carried onto each hinted
+        /// form; empty when there were none.
+        tail: TerminalSafe,
+    },
+    /// `ipe release run` was given a target whose artifact has no run form.
+    ///
+    /// [`fmt::Display`] names the target, then hints the `ipe release build`
+    /// form that produces its artifact.
+    NoRunForm {
+        /// The target with no run form.
+        target: crate::cli_args::NoRunTarget,
+    },
+    /// A native-bearing release refused the `ipe_wrapper` source it builds.
+    ///
+    /// Nothing was built: the wrapper builds only from the verified compiler
+    /// workspace this binary was compiled from.
+    WrapperSourceRefused(Box<crate::wrapper_source::WrapperSourceRefusal>),
     /// A stage of `ipe verify` failed. Carries the stage name and the stage's
     /// own already-rendered report. Like [`Self::DocCoverage`], this is a
     /// legitimate gate result — the `verify` invocation was valid and the
@@ -322,7 +350,7 @@ pub enum CliError {
     /// exits non-zero after the report and never shows the `lint` command's
     /// `--help` page. Carries nothing: the printed findings are the message.
     LintGateFailed,
-    /// `ipe eject` was asked to eject a program it cannot make self-contained.
+    /// `ipe release eject` was asked to eject a program it cannot make self-contained.
     /// Eject vendors ONLY the embedded runtime source; a program that binds a
     /// foreign Rust crate (FFI) would need those external crates pulled from a
     /// registry, which the self-contained, source-only eject contract forbids.
@@ -463,7 +491,7 @@ pub enum CliError {
         /// What was wrong with the file.
         detail: String,
     },
-    /// `ipe run --target wasi` was invoked on an `ipe` binary built WITHOUT the
+    /// `ipe dev run --target wasi` was invoked on an `ipe` binary built WITHOUT the
     /// `wasi_run` feature, so no embedded wasmtime engine is linked to execute
     /// the emitted `wasm32-wasip1` module. A typed refusal naming the feature —
     /// never a panic, never a silent fall-through to a native run — so the
@@ -480,7 +508,7 @@ pub enum CliError {
     },
     /// The emitted `wasm32-wasip1` module ran to completion under embedded
     /// wasmtime and returned a non-zero WASI exit code. Propagated as `ipe
-    /// run`'s own non-zero exit, mirroring how the native run surfaces a child's
+    /// dev run`'s own non-zero exit, mirroring how the native run surfaces a child's
     /// non-zero status — the guest's own outcome, not a driver fault.
     WasiRunExited {
         /// The module's WASI exit code (non-zero).
@@ -634,6 +662,9 @@ impl CliError {
             Self::DocExamplesFailed(_) => "doc-examples-failed",
             Self::CommandUsage { .. } => "command-usage",
             Self::UnknownGroupSub { .. } => "unknown-group-sub",
+            Self::GroupRequired { .. } => "group-required",
+            Self::NoRunForm { .. } => "no-run-form",
+            Self::WrapperSourceRefused(_) => "wrapper-source-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
@@ -716,6 +747,9 @@ impl CliError {
             | Self::DocExamplesFailed(_)
             | Self::CommandUsage { .. }
             | Self::UnknownGroupSub { .. }
+            | Self::GroupRequired { .. }
+            | Self::NoRunForm { .. }
+            | Self::WrapperSourceRefused(_)
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
@@ -763,6 +797,8 @@ impl CliError {
             Self::UnknownCommand { .. }
                 | Self::CommandUsage { .. }
                 | Self::UnknownGroupSub { .. }
+                | Self::GroupRequired { .. }
+                | Self::NoRunForm { .. }
                 | Self::DocCoverage(_)
                 | Self::DocExamplesFailed(_)
                 | Self::VerifyFailed { .. }
@@ -890,7 +926,7 @@ impl std::fmt::Display for CliError {
             // top-level screen rather than panicking.
             Self::CommandUsage { command, reason } => {
                 writeln!(f, "{}", crate::style::gutter(reason.as_str()))?;
-                let page = help::command(command, &std::io::stderr())
+                let page = help::command(command.as_str(), &std::io::stderr())
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
@@ -915,6 +951,46 @@ impl std::fmt::Display for CliError {
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
+            // What was typed, then one hint per grouped form. A bare group
+            // states it needs a subcommand; its members stay discoverable
+            // through `ipe <group> --help`.
+            Self::GroupRequired {
+                attempted,
+                forms,
+                tail,
+            } => {
+                let headline = if help::is_group(attempted.as_str()) {
+                    text::cli_subcommand_required(attempted)
+                } else {
+                    text::cli_group_required(attempted)
+                };
+                f.write_str(&crate::style::gutter(&headline))?;
+                for form in *forms {
+                    let shown = if tail.as_str().is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{form} {tail}")
+                    };
+                    writeln!(f)?;
+                    f.write_str(&crate::style::gutter(&text::cli_group_required_form(
+                        &shown,
+                    )))?;
+                }
+                Ok(())
+            }
+            Self::NoRunForm { target } => {
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form(
+                    &target.word(),
+                )))?;
+                writeln!(f)?;
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form_hint(
+                    &target.build_form(),
+                )))
+            }
+            Self::WrapperSourceRefused(refusal) => f.write_str(&text::cli_wrapper_source_refused(
+                &refusal.root.display(),
+                &refusal.defect,
+            )),
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;
                 f.write_str(report.as_str().trim_end_matches('\n'))
@@ -1026,7 +1102,7 @@ impl std::fmt::Display for CliError {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_failed(detail))
             }
             // The guest ran to completion and returned a non-zero WASI exit; this
-            // one-line verdict pairs with `ipe run`'s own non-zero exit, mirroring
+            // one-line verdict pairs with `ipe dev run`'s own non-zero exit, mirroring
             // the native run's child-exit surfacing.
             Self::WasiRunExited { code } => {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_exited(code))

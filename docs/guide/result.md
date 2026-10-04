@@ -78,7 +78,7 @@ parseForm form =
         (parseEmail form.email)
 ```
 
-Running it (`ipe run`) over five forms — one valid, four each tripping a
+Running it (`ipe dev run`) over five forms — one valid, four each tripping a
 different check — prints:
 
 ```

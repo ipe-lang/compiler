@@ -41,7 +41,7 @@ fn html_attributes_family_renders_and_escapes() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for html_attrs: {:?}",
+        "ipe dev build must succeed for html_attrs: {:?}",
         built.err()
     );
 

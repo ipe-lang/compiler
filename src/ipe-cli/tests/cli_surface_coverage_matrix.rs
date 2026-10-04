@@ -24,8 +24,8 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     // These subcommands have no standing integration test invoking them yet.
     (
         "tested",
-        "eject",
-        "no integration test for ipe-eject path yet",
+        "release eject",
+        "no integration test for ipe-release-eject path yet",
     ),
 ];
 
@@ -44,7 +44,16 @@ fn cli_surface_contains_known_subcommands() {
     let labels: Vec<String> = items.iter().map(CliSurface::label).collect();
 
     // These are stable subcommands — their absence means the SSOT drifted.
-    for expected in ["build", "run", "fmt", "watch", "init", "version"] {
+    for expected in [
+        "dev build",
+        "dev run",
+        "dev watch",
+        "release build",
+        "release run",
+        "fmt",
+        "init",
+        "version",
+    ] {
         assert!(
             labels.contains(&expected.to_owned()),
             "CLI surface must include subcommand `{expected}`",

@@ -49,7 +49,7 @@ const LOSSY_TEXT_SITES: &[(&str, usize)] = &[
     // HTTP response bodies.
     ("src/http_client.rs", 2),
     // Streamed HTTP response chunks.
-    ("src/http_stream.rs", 2),
+    ("src/http_stream.rs", 1),
     // A request body and a WebSocket binary frame.
     ("src/server.rs", 2),
     // Subprocess output.

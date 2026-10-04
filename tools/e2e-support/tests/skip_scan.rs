@@ -215,6 +215,36 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_pure_native_is_jailed",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_accepts_artifact_dir",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_leaves_no_app_copy_in_tmp",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_native_bearing_is_jailed",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_runs_returned_artifact",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_a_development_build",
+        JAIL_ABSENT,
+    ),
+    (
         "src/ipe-cli/tests/webview_e2e.rs",
         "webview_counter_tier_b",
         "the native-window tier needs xvfb and the system webview",

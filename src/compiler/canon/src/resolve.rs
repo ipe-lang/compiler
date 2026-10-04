@@ -6,9 +6,9 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, CmdSubShapeMismatch, CodecAutoRejection, DResult, Diagnostic, Located,
-    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, SealRejection,
-    SortedNames, Span, TypeError,
+    AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
+    DResult, Diagnostic, EditTarget, Located, ModulePlacementReason, ModulePlacementRejection,
+    NameError, ParseError, SealRejection, SortedNames, Span, TypeError,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
@@ -879,7 +879,7 @@ type QualifiedAliases = BTreeMap<Symbol, crate::ExportedAlias>;
 /// The immutable context threaded through [`canonicalise_type`]. Bundling the
 /// read-only references keeps the recursive call under clippy's argument-count
 /// ceiling while leaving the per-call mutable state (`free_vars`, `visited`,
-/// `subst`) explicit at each call site.
+/// `params`) explicit at each call site.
 struct TypeCtx<'a> {
     /// The module environment; a bare type name resolves through its
     /// [`ModuleScope`] type namespace.
@@ -1005,22 +1005,11 @@ pub fn canonicalise_module_with_origin(
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
     // Legacy entry point: dep exports arrive as an owned map and the
-    // known-module universe for IPE-N0020 did-you-mean IS that map's key set —
-    // the pre-incremental behaviour, preserved for non-driver callers.
+    // importable-module catalog is that map's key set plus the kernel paths.
     let dep_refs: BTreeMap<Vec<Symbol>, &crate::ModuleExports> =
         deps.iter().map(|(k, v)| (k.clone(), v)).collect();
-    let known_modules: BTreeSet<Box<str>> = deps
-        .keys()
-        .map(|p| path_to_dot_string(interner, p))
-        .collect();
-    canonicalise_module_in_project(
-        m,
-        expected_path,
-        &dep_refs,
-        &known_modules,
-        origin,
-        interner,
-    )
+    let catalog = crate::ModuleCatalog::new(deps.keys().map(|p| path_to_dot_string(interner, p)));
+    canonicalise_module_in_project(m, expected_path, &dep_refs, &catalog, origin, interner)
 }
 
 /// Canonicalise a module against per-dep export references plus an explicit
@@ -1062,7 +1051,7 @@ pub fn canonicalise_module_in_project(
     m: &src::Module,
     expected_path: &[Symbol],
     deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
-    known_modules: &BTreeSet<Box<str>>,
+    catalog: &crate::ModuleCatalog,
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
@@ -1107,15 +1096,25 @@ pub fn canonicalise_module_in_project(
 
     let mut env = Env::initial(home.clone(), interner)?;
     env.origin = origin;
+    env.module_catalog = catalog.clone();
+    let mut import_aliases: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
+    for import in &m.imports {
+        if let Some(alias) = import.alias {
+            import_aliases
+                .entry(path_to_dot_string(interner, &import.name.value))
+                .or_default()
+                .insert(name_str(interner, alias)?);
+        }
+    }
+    env.import_aliases = Rc::new(import_aliases);
     // Fail closed at the boundary on an `Ipe.*` import that names neither a
     // kernel stdlib module nor a compiled-source dep (a typo such as
     // `Ipe.Strng`), before alias registration and the dep loop silently skip it.
-    // Runs first so the did-you-mean can rank over the project's known modules.
-    let known_module_pool: Vec<Box<str>> = known_modules.iter().cloned().collect();
+    // Runs first so the did-you-mean can rank over the importable-module catalog.
     reject_unknown_ipe_import_with_candidates(
         &m.imports,
         |p| deps.contains_key(p),
-        &known_module_pool,
+        catalog,
         interner,
     )?;
     // Register user import aliases for stdlib (`Ipê.*` / `Ipe.*`) modules BEFORE
@@ -1164,12 +1163,12 @@ pub fn canonicalise_module_in_project(
             // only — never intern on this path). An unrelated import
             // (`Rust.Firestore` against the project's own modules) is beyond the
             // edit-distance ceiling, so it yields none rather than the whole list.
-            let sugg = rank_suggestions(&name, known_modules.iter().map(Box::as_ref));
+            let sugg = rank_suggestions(&name, catalog.paths());
             Diagnostic::Name {
                 span: import.name.span,
                 msg: NameError::ModuleNotFound {
+                    suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                     name,
-                    suggestions: sugg,
                 },
             }
         })?;
@@ -1501,15 +1500,17 @@ fn thread_config_into_entry(
     names: &ConfigThreadNames,
     home: &[Symbol],
 ) -> bool {
-    // Peel `\… -> …` / `let … in …` wrappers to the head call, matching the TEA
-    // entry classification (`main_head_is_tea_entry`). Only a `main` whose head
-    // is a `Web` entry `Call` is threadable; a bare kernel reference with no cfg
-    // argument is not a valid entry and is left for the type-checker.
+    // Walk the same steps as `main_result_step` to the head call. Only a `main`
+    // whose head is a `Web` entry `Call` is threadable; a bare kernel reference
+    // with no cfg argument is not a valid entry and is left for the type-checker.
     match &mut body.value {
         canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
             thread_config_into_entry(inner, names, home)
         }
         canon::Expr_::Call(callee, args) => {
+            if let Some(rest) = task_bind_rest_mut(callee, args) {
+                return thread_config_into_entry(rest, names, home);
+            }
             let canon::Expr_::VarKernel { module, name, .. } = &callee.value else {
                 return false;
             };
@@ -1675,14 +1676,95 @@ const _: () = {
     }
 };
 
+/// Whether `callee` is the `Task.andThen` kernel, by registry id. A user
+/// binding named `andThen`, or `Task.andThen` through a user alias, resolves to
+/// a `VarTopLevel` and never matches; only a stdlib-origin module can mint the
+/// kernel alias.
+const fn is_task_and_then(callee: &canon::Expr) -> bool {
+    matches!(
+        callee.value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::TaskAndThen),
+            ..
+        }
+    )
+}
+
+/// The continuation body of a `do` bind, `Task.andThen (\p -> rest) task`:
+/// `rest` when `callee args` is the kernel applied to exactly a one-parameter
+/// continuation lambda and the task, in the kernel's argument order. The task
+/// argument is never returned: it runs before the continuation, so `main`'s
+/// result never comes from it.
+fn task_bind_rest<'e>(callee: &canon::Expr, args: &'e [canon::Expr]) -> Option<&'e canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_ref()),
+        _ => None,
+    }
+}
+
+/// [`task_bind_rest`] for the in-place `config` rewrite.
+fn task_bind_rest_mut<'e>(
+    callee: &canon::Expr,
+    args: &'e mut [canon::Expr],
+) -> Option<&'e mut canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &mut continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_mut()),
+        _ => None,
+    }
+}
+
+/// One step from a `main` body toward its result expression, or `None` at the
+/// head.
+///
+/// A `do` bind steps into its continuation body ([`task_bind_rest`]); any other
+/// application steps into its callee (`entry cfg` -> `entry`); a lambda
+/// (`\req -> …`) and a `let … in` (a `do` bare run included) step into their
+/// body. Every resolver classification of `main` walks with this step, so a
+/// `do` block's tail is the head whether or not the block binds.
+fn main_result_step(node: &canon::Expr) -> Option<&canon::Expr> {
+    match &node.value {
+        canon::Expr_::Call(callee, args) => {
+            let head: &canon::Expr = callee;
+            Some(task_bind_rest(callee, args).unwrap_or(head))
+        }
+        canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
+            let body: &canon::Expr = inner;
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
+/// The head of `main`'s result expression: the node [`main_result_step`]
+/// cannot step past.
+fn main_result_head(body: &canon::Expr) -> &canon::Expr {
+    let mut node = body;
+    while let Some(next) = main_result_step(node) {
+        node = next;
+    }
+    node
+}
+
 /// IPE-N0045: reject a `main` that selects its shape at run time.
 ///
 /// A program's shape is pinned by the head of `main` at compile time (§ static
 /// pinning): `main = Web.tea …` is a web app, `main = Tui.tea …` a
 /// terminal app, a `Task Error ()` `main` a script. It is never chosen from a
-/// value, so a `main` whose head — after peeling application / `let` / `\… ->`,
-/// exactly as the shape classifier peels it — is an `if` or `case` with a branch
-/// that reaches an app entry is a run-time shape choice, refused here.
+/// value, so a `main` whose result head ([`main_result_head`]) is an `if` or
+/// `case` with a branch that reaches an app entry is a run-time shape choice,
+/// refused here.
 ///
 /// Only a branch that reaches a shape entry trips this. A plain program whose
 /// `main` is a `Task` computed through an `if` / `case` (no branch heads on an
@@ -1704,81 +1786,61 @@ fn check_main_not_runtime_branched(canon_mod: &canon::Module, interner: &Interne
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the head the shape classifier reads, keeping the located node so a
-    // rejection blames the branching head itself.
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                let any_shape = arms
-                    .iter()
-                    .map(|(_, branch)| branch)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|branch| branch_head_reaches_tea_entry(branch, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            canon::Expr_::Case(_, branches) => {
-                let any_shape = branches
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            _ => return Ok(()),
-        }
+    // The head the shape classifier reads, kept located so a rejection blames
+    // the branching head itself.
+    let head = main_result_head(body);
+    let any_shape = match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, branch)| branch)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|branch| branch_head_reaches_tea_entry(branch, interner)),
+        canon::Expr_::Case(_, branches) => branches
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => false,
+    };
+    if any_shape {
+        Err(Diagnostic::Name {
+            span: head.span,
+            msg: NameError::RuntimeBranchedMain,
+        })
+    } else {
+        Ok(())
     }
 }
 
 /// Does a branch of `main`'s `if` / `case` head-reach a TEA app entry?
 ///
-/// Peels the same forms as the shape classifier (application / `let` / `\… ->`)
-/// and, for a nested `if` / `case`, recurses into every sub-branch — so
+/// Walks to the branch's result head ([`main_result_head`]) and, for a nested
+/// `if` / `case`, recurses into every sub-branch — so
 /// `if a then Web.tea c else if b then Cli … else …` is caught at any depth. A
 /// branch whose head is a plain expression (a `Task`, a value) reaches no entry
 /// and does not, on its own, mark the `main` a shape choice.
 fn branch_head_reaches_tea_entry(branch: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = branch;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                return arms
-                    .iter()
-                    .map(|(_, inner)| inner)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|inner| branch_head_reaches_tea_entry(inner, interner));
-            }
-            canon::Expr_::Case(_, sub) => {
-                return sub
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-            }
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
+    let head = main_result_head(branch);
+    match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, inner)| inner)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|inner| branch_head_reaches_tea_entry(inner, interner)),
+        canon::Expr_::Case(_, sub) => sub
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => is_tea_entry_head(head, interner),
     }
+}
+
+/// `true` iff `head` is a resolved TEA app-entry kernel ([`TEA_APP_ENTRIES`]).
+fn is_tea_entry_head(head: &canon::Expr, interner: &Interner) -> bool {
+    let canon::Expr_::VarKernel { module, name, .. } = &head.value else {
+        return false;
+    };
+    let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name)) else {
+        return false;
+    };
+    TEA_APP_ENTRIES.contains(&(m, n))
 }
 
 /// IPE-N0033: reject a Program (plain-`main` module) that imports any
@@ -1831,15 +1893,12 @@ fn check_program_tea_import_gate(
         return Ok(());
     };
 
-    // The module is a TEA app iff its `main` head-calls a shape entry.
-    let main_is_app_entry = {
-        let body = match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        };
-        main_head_is_tea_entry(body, interner)
+    let main_body = match main_def {
+        canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
 
-    if main_is_app_entry {
+    // The module is a TEA app iff its `main` head-calls a shape entry.
+    if main_head_is_tea_entry(main_body, interner) {
         return Ok(());
     }
 
@@ -1849,12 +1908,7 @@ fn check_program_tea_import_gate(
     // (shape-model §9). Such a `main` head-calls `Server.listen`, not a TEA
     // shape entry, so it would otherwise trip this gate; exempt it. The embedded
     // app is a VALUE consumed by the Server, not the module's own app shape.
-    if main_head_is_server_listen(
-        match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        },
-        interner,
-    ) {
+    if main_head_is_server_listen(main_body) {
         return Ok(());
     }
 
@@ -1867,61 +1921,31 @@ fn check_program_tea_import_gate(
 }
 
 /// Does this `main` body head-call `Server.listen` — the declarative
-/// `Ipe.Http.Server` entry? Same head-peeling as [`main_head_is_tea_entry`]. A
+/// `Ipe.Http.Server` entry? The head is [`main_result_head`]; the kernel is
+/// matched by its registry id, never by spelling. A
 /// Server program that embeds a web app (`Web.embed` + `Server.mountApp`) is a
 /// Program at the module level, not a TEA app, so it is exempt from the
 /// `Ipe.Tea.*`-import gate (IPE-N0033).
-fn main_head_is_server_listen(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return m == "Server" && n == "listen";
-            }
-            _ => return false,
+fn main_head_is_server_listen(body: &canon::Expr) -> bool {
+    matches!(
+        main_result_head(body).value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::ServerListen),
+            ..
         }
-    }
+    )
 }
 
 /// Does this `main` body head-call a TEA shape entry ([`TEA_APP_ENTRIES`])?
 ///
-/// Peels the forms a TEA `main` takes — an application `entry { … }`, a
-/// point-free `main = \… -> entry …` lambda, and a `let cfg = { … } in entry
-/// cfg` — down to the head expression, then checks whether it is a shape-entry
-/// `VarKernel`. Only the head matters: a Program's `main` never reduces to a
-/// shape-entry kernel at its head. Peeling `let` keeps a let-bound-config app
-/// classified as a TEA app so its malformed config reaches the precise
-/// `IPE-L0119` lowering diagnostic instead of the coarser IPE-N0033 gate.
+/// The head is [`main_result_head`]: it reaches the entry under an application
+/// `entry { … }`, a point-free `\… -> entry …` lambda, a `let cfg = { … } in
+/// entry cfg` and a `do` block's tail. Only the head matters: a Program's `main`
+/// never reduces to a shape-entry kernel at its head. A let-bound-config app
+/// stays a TEA app, so its malformed config reaches the precise `IPE-L0119`
+/// lowering diagnostic instead of the coarser IPE-N0033 gate.
 fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            // `entry { cfg }` / `entry a b` — the callee is the head.
-            canon::Expr_::Call(callee, _) => node = callee,
-            // `main = \req -> entry { cfg }` — the lambda body is the head.
-            canon::Expr_::Lambda(_, inner) => node = inner,
-            // `main = let cfg = { … } in entry cfg` — the `in` body is the head.
-            // A let-bound config is still a TEA-app entry (the head-called shape
-            // kernel is under the `in`), so a malformed one reaches its precise
-            // `IPE-L0119` lowering diagnostic rather than being misread as a
-            // Program under IPE-N0033.
-            canon::Expr_::Let(_, body) => node = body,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
-    }
+    is_tea_entry_head(main_result_head(body), interner)
 }
 
 /// The TEA app surface a `main` proves from its entry kernel.
@@ -1931,21 +1955,14 @@ fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
 /// shape-entry app — the cross-shape gate then does not apply (a plain-`main`
 /// Program importing `Ipe.Tea.*` is already rejected by IPE-N0033).
 fn app_shape_name(body: &canon::Expr, interner: &Interner) -> Option<AppSurface> {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
-                return TEA_APP_ENTRIES
-                    .iter()
-                    .find(|(em, en)| *em == m && *en == n)
-                    .and_then(|(shape, _member)| AppSurface::from_segment(shape));
-            }
-            _ => return None,
-        }
-    }
+    let canon::Expr_::VarKernel { module, name, .. } = &main_result_head(body).value else {
+        return None;
+    };
+    let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
+    TEA_APP_ENTRIES
+        .iter()
+        .find(|(em, en)| *em == m && *en == n)
+        .and_then(|(shape, _member)| AppSurface::from_segment(shape))
 }
 
 /// IPE-N0035: reject a TEA app that imports another shape's `Cmd` / `Sub`.
@@ -2067,22 +2084,20 @@ fn check_input_fields_are_subscriptions(
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the entry call the shape classifier reads.
+    // Walk `main_result_step` to the entry call the shape classifier reads.
     let mut node = body;
     let (entry, surface, cfg) = loop {
-        match &node.value {
-            canon::Expr_::Call(callee, args) => {
-                if let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
-                    && let Some(surface) = k.app_entry_surface()
-                    && let [cfg] = args.as_slice()
-                {
-                    break (*k, surface, cfg);
-                }
-                node = callee;
-            }
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            _ => return Ok(()),
+        if let canon::Expr_::Call(callee, args) = &node.value
+            && let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
+            && let Some(surface) = k.app_entry_surface()
+            && let [cfg] = args.as_slice()
+        {
+            break (*k, surface, cfg);
         }
+        let Some(next) = main_result_step(node) else {
+            return Ok(());
+        };
+        node = next;
     };
     // The config record: inline, or a same-module top-level binding.
     let fields = match &cfg.value {
@@ -2261,9 +2276,9 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 /// ([`crate::env::is_kernel_stdlib_module`]) or a compiled-source module the
 /// build driver supplied as a dep (`is_known_dep`). Anything else is a typo
 /// (`Ipe.Strng`) that must fail closed at the boundary rather than being
-/// silently dropped. Suggestions are ranked over the kernel dot-paths plus
-/// `extra_candidates` (the project's known user + compiled-source module
-/// dot-paths), strings only — never interning.
+/// silently dropped. Suggestions are ranked over the importable-module
+/// `catalog` (kernel, compiled-source, and project dot-paths), strings only —
+/// never interning.
 ///
 /// Only the project entry (which carries the resolved `deps` universe) can
 /// classify a compiled-source `Ipe.*` module, so this runs there. The bare
@@ -2276,7 +2291,7 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 fn reject_unknown_ipe_import_with_candidates(
     imports: &[src::Import],
     is_known_dep: impl Fn(&[Symbol]) -> bool,
-    extra_candidates: &[Box<str>],
+    catalog: &crate::ModuleCatalog,
     interner: &mut Interner,
 ) -> DResult<()> {
     let ipe_sym = interner.intern("Ipe")?;
@@ -2289,14 +2304,12 @@ fn reject_unknown_ipe_import_with_candidates(
             continue;
         }
         let name = path_to_dot_string(interner, dep_path);
-        let mut candidates: Vec<Box<str>> = crate::env::stdlib_module_dot_paths();
-        candidates.extend(extra_candidates.iter().cloned());
-        let sugg = rank_suggestions(&name, candidates.iter().map(Box::as_ref));
+        let sugg = rank_suggestions(&name, catalog.paths());
         return Err(Diagnostic::Name {
             span: import.name.span,
             msg: NameError::ModuleNotFound {
+                suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                 name,
-                suggestions: sugg,
             },
         });
     }
@@ -2402,9 +2415,13 @@ fn register_stdlib_import_aliases(
         // closed: skip the mark for that foreign-canonical case. The member-clone
         // below still runs, so the bare import's own members resolve, and its
         // canonical is still marked via the `import.alias.is_none()` branch.
+        // The same predicate decides which modules an IPE-N0034 lists for an
+        // unimported qualifier (`crate::env::bare_import_binds`).
         let alias_is_foreign_gated_canonical = import.alias.is_none()
-            && alias != canonical
-            && crate::env::is_stdlib_canonical_qualifier(interner, alias);
+            && !crate::env::kernel_import_binds_last_segment(
+                &name_str(interner, alias)?,
+                &name_str(interner, canonical)?,
+            );
         if !alias_is_foreign_gated_canonical {
             env.mark_stdlib_qualifier_imported(alias);
         }
@@ -2505,15 +2522,19 @@ fn bind_stdlib_kernel_import(
                             .find(|(n, _)| *n == name)
                             .map(|(_, h)| h.clone())
                         else {
+                            let name_s = name_str(interner, name)?;
                             return Err(Diagnostic::Name {
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: path_to_dot_string(interner, dep_path),
-                                    name: name_str(interner, name)?,
-                                    suggestions: suggestions(
-                                        name,
-                                        members.iter().map(|(n, _)| *n),
-                                        interner,
+                                    name: name_s.clone(),
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        suggestions(
+                                            name,
+                                            members.iter().map(|(n, _)| *n),
+                                            interner,
+                                        ),
                                     ),
                                 },
                             });
@@ -3092,6 +3113,14 @@ fn canonicalise_with_env(
     // annotation and expanded in place at every use site by `canonicalise_type`;
     // an imported one arrives canonical from its defining module. Either way no
     // later stage ever sees an alias.
+    let slots = alias_param_slots(
+        m.aliases
+            .iter()
+            .map(|a| a.value.vars.len())
+            .max()
+            .unwrap_or(0),
+        interner,
+    )?;
     for a in &m.aliases {
         let alias_name = a.value.name.value;
         let alias_span = a.value.name.span;
@@ -3099,7 +3128,7 @@ fn canonicalise_with_env(
         // alias shadowing a built-in would be silently overridden too.
         reject_reserved_builtin_type(alias_name, alias_span, origin, interner)?;
         let body = AliasBody::Local {
-            params: a.value.vars.iter().map(|v| v.value).collect(),
+            params: alias_params(&a.value, &slots),
             body: a.value.body.value.clone(),
         };
         let origin = declared(
@@ -3114,6 +3143,7 @@ fn canonicalise_with_env(
     // importer receives through `ModuleExports::aliases`.
     let own_aliases = resolve_own_aliases(
         m,
+        &slots,
         env,
         qualifier_paths,
         qualified_aliases,
@@ -3261,26 +3291,27 @@ fn canonicalise_with_env(
 /// resolution of source names against the importer's imports. An alias whose
 /// body names something this module cannot see is refused here, at its
 /// declaration, whether or not any module uses it.
+///
+/// # Errors
+/// Any refusal the body's canonicalisation raises, and
+/// [`Diagnostic::CompilerBug`] when a resolved body mentions a variable that is
+/// neither one of its slots nor a variable it leaves free.
 #[allow(clippy::too_many_arguments)] // the resolution context `canonicalise_type` reads
 fn resolve_own_aliases(
     m: &src::Module,
+    slots: &[Symbol],
     env: &Env,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
-    interner: &mut Interner,
+    interner: &Interner,
     ui_wildcard_msg: Symbol,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
-    let max_params = m
-        .aliases
-        .iter()
-        .map(|a| a.value.vars.len())
-        .max()
-        .unwrap_or(0);
-    let slots = alias_param_slots(max_params, interner)?;
-    let interner: &Interner = interner;
     let mut resolved = BTreeMap::new();
     for a in &m.aliases {
         let decl = &a.value;
+        // The same pairing the scope registered, so the exported body and every
+        // local use site name the same slot symbols.
+        let params = alias_params(decl, slots);
         let ctx = TypeCtx {
             env,
             qualifier_paths,
@@ -3289,13 +3320,7 @@ fn resolve_own_aliases(
             ui_wildcard_msg,
             ann_span: decl.body.span,
         };
-        let param_slots: Vec<Symbol> = slots.iter().copied().take(decl.vars.len()).collect();
-        let subst: BTreeMap<Symbol, canon::Type> = decl
-            .vars
-            .iter()
-            .map(|v| v.value)
-            .zip(param_slots.iter().copied().map(canon::Type::Var))
-            .collect();
+        let param_slots: Vec<Symbol> = params.iter().map(|&(_, slot)| slot).collect();
         let mut free_vars = BTreeSet::new();
         // Seeded with the alias itself, exactly as a use-site expansion pushes
         // it, so a self-reference stops rather than recursing.
@@ -3304,12 +3329,17 @@ fn resolve_own_aliases(
         let body = canonicalise_type(
             &decl.body.value,
             &ctx,
-            &subst,
+            &ParamSlots::new(&params),
             &mut free_vars,
             &mut visited,
             &mut budget,
             0,
         )?;
+        // The check walks the finished body, which the canonicalisation above
+        // already bounded by the node ceiling, so it gets a ceiling of its own
+        // rather than halving the one the body may use.
+        let mut check_budget = TYPE_EXPANSION_NODE_LIMIT;
+        refuse_unbound_alias_body_vars(&body, &param_slots, &free_vars, &ctx, &mut check_budget)?;
         resolved.insert(
             decl.name.value,
             crate::ExportedAlias {
@@ -3324,6 +3354,64 @@ fn resolve_own_aliases(
     Ok(resolved)
 }
 
+/// Check that every variable a resolved alias body mentions is one of its slots or left free.
+///
+/// Each `Var` and each open record's row must be a parameter slot, a variable
+/// the body leaves free (quantified at a use site), or the `any` wildcard. A
+/// body holding any other variable would carry a name no use site binds, so it
+/// fails closed here, at the declaration. The walk uses an explicit stack and
+/// spends one node of `budget` per body node.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] on a variable outside that set;
+/// [`NameError::TypeExpansionTooDeep`] when the walk exhausts the budget.
+fn refuse_unbound_alias_body_vars(
+    body: &canon::Type,
+    param_slots: &[Symbol],
+    free_vars: &BTreeSet<Symbol>,
+    ctx: &TypeCtx,
+    budget: &mut u32,
+) -> DResult<()> {
+    let bound =
+        |v: &Symbol| param_slots.contains(v) || free_vars.contains(v) || *v == ctx.ui_wildcard_msg;
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        spend_budget_node(ctx, budget)?;
+        let var = match node {
+            canon::Type::Var(v) => Some(v),
+            canon::Type::RecordOpen(row, fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                Some(row)
+            }
+            canon::Type::Record(fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                None
+            }
+            canon::Type::Lambda(a, b) => {
+                pending.push(a);
+                pending.push(b);
+                None
+            }
+            canon::Type::Con { args, .. } | canon::Type::Tuple(args) => {
+                pending.extend(args);
+                None
+            }
+            canon::Type::Unit => None,
+        };
+        if let Some(v) = var.filter(|v| !bound(v)) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::resolve_own_aliases::body_closed",
+                detail: format!(
+                    "the resolved alias body mentions `{}`, which is neither a parameter nor a \
+                     free variable",
+                    ctx.interner.resolve(*v).unwrap_or("?")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The placeholder variables standing for an exported alias's parameters, by position.
 ///
 /// Each name contains spaces, which no source type variable can spell, so a
@@ -3336,19 +3424,64 @@ fn alias_param_slots(count: usize, interner: &mut Interner) -> DResult<Vec<Symbo
     Ok(slots)
 }
 
-/// Expand an imported alias at a use site by substituting `args` for its parameter slots.
+/// Pair each of `decl`'s type parameters, in source order, with its slot.
 ///
-/// The body is already canonical in its defining module, so this is a pure
-/// structural substitution: no name is resolved against the importer's scope.
-/// Every node spends from the same `budget` and `depth` ceilings as a source
-/// expansion, so a body that grows across a chain of modules stays bounded.
+/// The one pairing both the scope entry and [`resolve_own_aliases`] use, so a
+/// local use site and the exported body rename a parameter to the same slot.
+/// `slots` holds at least as many slots as the module's widest alias declares.
+fn alias_params(decl: &src::TypeAlias, slots: &[Symbol]) -> Vec<(Symbol, Symbol)> {
+    decl.vars
+        .iter()
+        .map(|v| v.value)
+        .zip(slots.iter().copied())
+        .collect()
+}
+
+/// The slot each in-scope alias parameter is renamed to while its body is canonicalised.
+///
+/// [`canonicalise_type`] only renames: a parameter becomes `Var(slot)`, in
+/// value and row position alike, and [`instantiate_alias`] is the one walker
+/// that replaces a slot with an argument. The map's codomain is a symbol, never
+/// a type, so no source walk can substitute half of an alias's positions.
+struct ParamSlots(BTreeMap<Symbol, Symbol>);
+
+impl ParamSlots {
+    /// No parameters in scope: every type variable is free.
+    const fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The parameters of one alias, each paired with its slot.
+    fn new(params: &[(Symbol, Symbol)]) -> Self {
+        Self(params.iter().copied().collect())
+    }
+
+    /// The slot `param` is renamed to, when it is a parameter in scope.
+    fn slot(&self, param: Symbol) -> Option<Symbol> {
+        self.0.get(&param).copied()
+    }
+}
+
+/// Expand an alias at a use site by substituting `args` for its parameter slots.
+///
+/// `body` is canonical with its parameters already renamed to their slots: an
+/// imported alias's exported body, or a local alias's body renamed at this use
+/// site. This is the one walker that substitutes an alias argument, and every
+/// variable-carrying arm (`Var` and an open record's row) consults `args`. The
+/// substitution is simultaneous and an argument is copied without being
+/// walked, so an argument that itself holds a slot (an enclosing alias's
+/// parameter, mid-rename) is never substituted again. Every node spends from
+/// the same `budget` and `depth` ceilings as a source expansion, so a body
+/// that grows across a chain of modules stays bounded.
 ///
 /// # Errors
 /// [`NameError::TypeExpansionTooDeep`] when the expansion exceeds the depth or
-/// node ceiling.
-fn instantiate_imported_alias(
+/// node ceiling; [`NameError::AliasRowArgument`] when a row argument is not a
+/// record or repeats one of the alias's labels.
+fn instantiate_alias(
+    alias: Symbol,
     body: &canon::Type,
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3356,19 +3489,23 @@ fn instantiate_imported_alias(
     spend_expansion_node(ctx, budget, depth)?;
     let next = depth.saturating_add(1);
     Ok(match body {
-        canon::Type::Var(v) => match slots.get(v) {
+        canon::Type::Var(v) => match args.get(v) {
             Some(arg) => copy_substituted_arg(arg, ctx, budget)?,
             None => canon::Type::Var(*v),
         },
         canon::Type::Unit => canon::Type::Unit,
         canon::Type::Lambda(a, b) => canon::Type::Lambda(
-            Box::new(instantiate_imported_alias(a, slots, ctx, budget, next)?),
-            Box::new(instantiate_imported_alias(b, slots, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, a, args, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, b, args, ctx, budget, next)?),
         ),
-        canon::Type::Con { home, name, args } => {
-            let mut can_args = Vec::with_capacity(args.len());
-            for a in args {
-                can_args.push(instantiate_imported_alias(a, slots, ctx, budget, next)?);
+        canon::Type::Con {
+            home,
+            name,
+            args: con_args,
+        } => {
+            let mut can_args = Vec::with_capacity(con_args.len());
+            for a in con_args {
+                can_args.push(instantiate_alias(alias, a, args, ctx, budget, next)?);
             }
             canon::Type::Con {
                 home: home.clone(),
@@ -3379,25 +3516,28 @@ fn instantiate_imported_alias(
         canon::Type::Tuple(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(instantiate_imported_alias(e, slots, ctx, budget, next)?);
+                can_elems.push(instantiate_alias(alias, e, args, ctx, budget, next)?);
             }
             canon::Type::Tuple(can_elems)
         }
         canon::Type::Record(fields) => {
-            canon::Type::Record(instantiate_fields(fields, slots, ctx, budget, next)?)
+            canon::Type::Record(instantiate_fields(alias, fields, args, ctx, budget, next)?)
         }
-        // The row variable is kept as declared, matching a source expansion,
-        // which never substitutes an open record's row variable.
         canon::Type::RecordOpen(row, fields) => {
-            canon::Type::RecordOpen(*row, instantiate_fields(fields, slots, ctx, budget, next)?)
+            let own = instantiate_fields(alias, fields, args, ctx, budget, next)?;
+            match args.get(row) {
+                None => canon::Type::RecordOpen(*row, own),
+                Some(arg) => extend_row(alias, copy_substituted_arg(arg, ctx, budget)?, own, ctx)?,
+            }
         }
     })
 }
 
 /// Substitute parameter slots through each field type of a record body.
 fn instantiate_fields(
+    alias: Symbol,
     fields: &[(Symbol, canon::Type)],
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3406,10 +3546,85 @@ fn instantiate_fields(
     for (name, ty) in fields {
         out.push((
             *name,
-            instantiate_imported_alias(ty, slots, ctx, budget, depth)?,
+            instantiate_alias(alias, ty, args, ctx, budget, depth)?,
         ));
     }
     Ok(out)
+}
+
+/// Fill an alias's open-record row with its argument, extending the argument by `own`.
+///
+/// A type variable stays the row; a closed or open record contributes its
+/// fields ahead of the alias's own. Anything else has no fields to extend.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] when `arg` is not a record or a type
+/// variable, or shares a label with `own`.
+fn extend_row(
+    alias: Symbol,
+    arg: canon::Type,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<canon::Type> {
+    match arg {
+        canon::Type::Var(row) => Ok(canon::Type::RecordOpen(row, own)),
+        canon::Type::Record(fields) => Ok(canon::Type::Record(join_row_fields(
+            alias, fields, own, ctx,
+        )?)),
+        canon::Type::RecordOpen(row, fields) => Ok(canon::Type::RecordOpen(
+            row,
+            join_row_fields(alias, fields, own, ctx)?,
+        )),
+        found @ (canon::Type::Unit
+        | canon::Type::Tuple(_)
+        | canon::Type::Lambda(..)
+        | canon::Type::Con { .. }) => Err(alias_row_refusal(
+            alias,
+            AliasRowFault::NotARecord {
+                found: canon_type_display(&found, ctx.interner),
+            },
+            ctx,
+        )?),
+    }
+}
+
+/// The row argument's fields followed by the alias's own, refusing a shared label.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] ([`AliasRowFault::FieldClash`]) when a
+/// label of `own` is already in `arg`.
+fn join_row_fields(
+    alias: Symbol,
+    mut arg: Vec<(Symbol, canon::Type)>,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<Vec<(Symbol, canon::Type)>> {
+    let arg_labels: BTreeSet<Symbol> = arg.iter().map(|(label, _)| *label).collect();
+    if let Some((label, _)) = own.iter().find(|(label, _)| arg_labels.contains(label)) {
+        return Err(alias_row_refusal(
+            alias,
+            AliasRowFault::FieldClash {
+                field: name_str(ctx.interner, *label)?,
+            },
+            ctx,
+        )?);
+    }
+    arg.extend(own);
+    Ok(arg)
+}
+
+/// The IPE-N0053 refusal of `alias`'s row argument, at the enclosing annotation.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when `alias` is not interned.
+fn alias_row_refusal(alias: Symbol, fault: AliasRowFault, ctx: &TypeCtx) -> DResult<Diagnostic> {
+    Ok(Diagnostic::Name {
+        span: ctx.ann_span,
+        msg: NameError::AliasRowArgument {
+            alias: name_str(ctx.interner, alias)?,
+            fault,
+        },
+    })
 }
 
 /// Does any `import` name an `Ipe.<M>.Unsafe` submodule?
@@ -3730,7 +3945,10 @@ fn witness_record_fields(
         }
         _ => return Ok(None),
     };
-    let subst = BTreeMap::new();
+    // The fields are canonicalised one by one, not through the `TRecord` arm,
+    // so the label check that arm makes is made here too.
+    refuse_duplicate_record_labels(src_fields, interner)?;
+    let no_params = ParamSlots::empty();
     let mut free_set = BTreeSet::new();
     let mut visited = seed;
     let mut can_fields = Vec::with_capacity(src_fields.len());
@@ -3739,7 +3957,7 @@ fn witness_record_fields(
         let cty = canonicalise_type(
             fty,
             &ctx,
-            &subst,
+            &no_params,
             &mut free_set,
             &mut visited,
             &mut budget,
@@ -4393,7 +4611,7 @@ fn synthesize_record_alias_ctors(
         }
 
         // Canonicalise every field type ONCE, in declared (source) order. The
-        // alias's own params fall through to `Type::Var` (empty `subst`), so a
+        // alias's own params fall through to `Type::Var` (no parameters in scope), so a
         // param used in a field generalises and a phantom param drops out. The
         // alias name is pre-seeded into `visited` so a self-referential field
         // (`{ next : List T }`) expands exactly as `x : T` would — the ctor's
@@ -4406,7 +4624,7 @@ fn synthesize_record_alias_ctors(
             ui_wildcard_msg,
             ann_span: a.value.body.span,
         };
-        let subst = BTreeMap::new();
+        let no_params = ParamSlots::empty();
         let mut free_set = BTreeSet::new();
         let mut visited = vec![alias_name];
         let mut can_fields: Vec<(Symbol, canon::Type)> = Vec::with_capacity(fields.len());
@@ -4415,7 +4633,7 @@ fn synthesize_record_alias_ctors(
             let cty = canonicalise_type(
                 fty,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_set,
                 &mut visited,
                 &mut budget,
@@ -4671,8 +4889,11 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
@@ -4690,8 +4911,11 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::prefix(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
@@ -5089,19 +5313,19 @@ fn canonicalise_union(
         };
         let mut args = Vec::with_capacity(c.value.args.len());
         for a in &c.value.args {
-            // A constructor field type is canonicalised under an empty
-            // substitution: each free type variable it mentions is one of the
+            // A constructor field type is canonicalised with no alias
+            // parameters in scope: each free type variable it mentions is one of the
             // union's `vars` and resolves to a `Type::Var`. The `free_vars` set is
             // local (the union's quantification, not a binding's), so it is
             // discarded — the declared `vars` are the authoritative parameter list.
             let mut free_vars = BTreeSet::new();
             let mut visited = Vec::new();
-            let subst = BTreeMap::new();
+            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             args.push(canonicalise_type(
                 a,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -5181,12 +5405,12 @@ fn canonicalise_value(
                 ui_wildcard_msg,
                 ann_span: ann.span,
             };
-            let subst = BTreeMap::new();
+            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             let ty = canonicalise_type(
                 &ann.value,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -5397,9 +5621,11 @@ fn collect_binders_no_dup(
 /// Resolve a constructor pattern's bare name. A pattern reads the expression
 /// namespace's one ladder: a value its first answering tier binds (a record
 /// alias's auto-constructor) shadows any lower-tier constructor, and is no
-/// constructor to match on.
+/// constructor to match on. `unqualified` is whether the pattern's source token
+/// is the bare name, so a did-you-mean may edit it.
 fn resolve_pattern_ctor<'e>(
     name: Symbol,
+    unqualified: bool,
     span: Span,
     env: &'e Env,
     interner: &Interner,
@@ -5416,19 +5642,13 @@ fn resolve_pattern_ctor<'e>(
             let modules = importer_names(&importers, interner);
             Err(ambiguous_import(name, span, modules, interner)?)
         }
-        Resolved::Found(..) | Resolved::Missing => {
-            let ctor_names = env
-                .module_scope
-                .expr
-                .names_where(|target| matches!(target, ExprTarget::Ctor(_)));
-            Err(Diagnostic::Name {
-                span,
-                msg: NameError::ConstructorNotFound {
-                    name: name_str(interner, name)?,
-                    suggestions: suggestions(name, ctor_names, interner),
-                },
-            })
-        }
+        Resolved::Found(..) | Resolved::Missing => Err(ctor_pattern_not_found(
+            name,
+            unqualified,
+            span,
+            env,
+            interner,
+        )?),
     }
 }
 
@@ -5444,8 +5664,8 @@ fn canonicalise_pattern(
         src::Pattern_::PDebugAnything => canon::Pattern_::PDebugAnything,
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
-        src::Pattern_::PCtor(name, _, args) => {
-            let ctor = resolve_pattern_ctor(*name, span, env, interner)?;
+        src::Pattern_::PCtor(name, segments, args) => {
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, interner)?;
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
             let index = ctor.index;
@@ -5791,18 +6011,22 @@ fn value_not_found(
     env: &Env,
     interner: &Interner,
 ) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
     Ok(Diagnostic::Name {
         span,
         msg: NameError::ValueNotFound {
-            name: name_str(interner, name)?,
-            suggestions: suggestions(
-                name,
-                env.vars
-                    .keys()
-                    .copied()
-                    .chain(env.module_scope.expr.names()),
-                interner,
+            suggestions: Candidates::at(
+                EditTarget::whole(span, &name_s),
+                suggestions(
+                    name,
+                    env.vars
+                        .keys()
+                        .copied()
+                        .chain(env.module_scope.expr.names()),
+                    interner,
+                ),
             ),
+            name: name_s,
         },
     })
 }
@@ -5850,6 +6074,154 @@ fn reject_bare_reserved_constructor(
         });
     }
     None
+}
+
+/// The diagnostic for a constructor pattern naming no constructor in scope.
+///
+/// An unqualified constructor pattern starts with its name, so a sole
+/// did-you-mean may overwrite that prefix; a qualified one starts with the
+/// module, so it has no edit region.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `name` is not interned.
+fn ctor_pattern_not_found(
+    name: Symbol,
+    unqualified: bool,
+    span: Span,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
+    let region = if unqualified {
+        EditTarget::prefix(span, &name_s)
+    } else {
+        None
+    };
+    let ctor_names = env
+        .module_scope
+        .expr
+        .names_where(|target| matches!(target, ExprTarget::Ctor(_)));
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::ConstructorNotFound {
+            suggestions: Candidates::at(region, suggestions(name, ctor_names, interner)),
+            name: name_s,
+        },
+    })
+}
+
+/// `span` when it is exactly the source token `qualifier.member`.
+///
+/// A reference the parser synthesised (an operator desugared to a qualified
+/// name) carries a span of a different width; it gets no edit region.
+fn qualified_token(span: Span, qualifier: Option<&str>, member: Option<&str>) -> Option<Span> {
+    let width = qualifier?
+        .len()
+        .checked_add(1)?
+        .checked_add(member?.len())?;
+    (usize::try_from(span.hi.checked_sub(span.lo)?).ok()? == width).then_some(span)
+}
+
+/// The diagnostic for a qualifier no import or ambient table binds.
+///
+/// A qualifier a bare `import` of some catalog module would bind is IPE-N0034
+/// naming every such module; anything else is IPE-N0004 ranked over the
+/// qualifiers this module can actually use. `token` is the `qualifier.member`
+/// source token when one exists (value position), giving the did-you-mean its
+/// edit region; a type annotation has none.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `qualifier` is not interned.
+fn unbound_qualifier(
+    qualifier: Symbol,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let qualifier_s = name_str(interner, qualifier)?;
+    let home = path_to_dot_string(interner, &env.home);
+    let modules = env.module_catalog.modules_bound_by(&qualifier_s, &home);
+    if !modules.is_empty() {
+        return Ok(import_required(qualifier_s, modules, span, token, env));
+    }
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::UnknownModule {
+            suggestions: Candidates::at(
+                token.and_then(|t| EditTarget::prefix(t, &qualifier_s)),
+                suggestions(qualifier, env.usable_qualifiers(), interner),
+            ),
+            qualifier: qualifier_s,
+        },
+    })
+}
+
+/// Every module a bare `import` of which binds the Tier-C gated `qualifier`.
+///
+/// The catalog ([`crate::ModuleCatalog::modules_bound_by`]) is the one source:
+/// it lists every kernel AND compiled-source module the qualifier names, so a
+/// compiled `Ipe.Ui.Tui` stands beside the kernel `Ipe.Tea.Tui` for `Tui`.
+/// `gate_path`, the gate's own kernel path, is always one of them; it is
+/// unioned in so the set is never empty even over a kernel-only catalog.
+/// Sorted and deduplicated.
+fn gated_import_candidates(
+    qualifier: &str,
+    gate_path: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) -> Box<[Box<str>]> {
+    let home = path_to_dot_string(interner, &env.home);
+    let mut modules: BTreeSet<Box<str>> = env
+        .module_catalog
+        .modules_bound_by(qualifier, &home)
+        .into_vec()
+        .into_iter()
+        .collect();
+    modules.insert(path_to_dot_string(interner, gate_path));
+    modules.into_iter().collect()
+}
+
+/// The verdict for `qualifier`, which a bare `import` of each of `modules`
+/// (non-empty, sorted) would bind but no import in this module binds.
+///
+/// A module already imported under an `as` alias is not missing an import: the
+/// use site spelled the module's name instead of its alias, so the verdict is
+/// IPE-N0004 offering the alias (an applicable edit only when exactly one
+/// module and one alias answer). Otherwise it is IPE-N0034 naming `modules`.
+fn import_required(
+    qualifier: Box<str>,
+    modules: Box<[Box<str>]>,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+) -> Diagnostic {
+    let aliases: BTreeSet<&Box<str>> = modules
+        .iter()
+        .filter_map(|module| env.import_aliases.get(module))
+        .flatten()
+        .collect();
+    if aliases.is_empty() {
+        return Diagnostic::Name {
+            span,
+            msg: NameError::ImportRequired {
+                qualifier,
+                candidates: modules,
+            },
+        };
+    }
+    let region = if modules.len() == 1 && aliases.len() == 1 {
+        token.and_then(|t| EditTarget::prefix(t, &qualifier))
+    } else {
+        None
+    };
+    Diagnostic::Name {
+        span,
+        msg: NameError::UnknownModule {
+            suggestions: Candidates::at(region, aliases.into_iter().cloned().collect()),
+            qualifier,
+        },
+    }
 }
 
 /// Resolve a qualified name `Qualifier.name`. Distinguishes an unknown
@@ -5925,25 +6297,14 @@ fn resolve_qual_var(
     // catalog, and NOT the generic "unknown module" (the module is known; the
     // import is missing). Checked before the member lookup, since the catalog
     // members are present regardless of import.
+    let token = qualified_token(span, qualifier_text, name_text);
     if let Some(import_path) = env.stdlib_import_required(qualifier) {
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::StdlibImportRequired {
-                qualifier: name_str(interner, qualifier)?,
-                import_path: path_to_dot_string(interner, import_path),
-            },
-        });
+        let qualifier_s = name_str(interner, qualifier)?;
+        let modules = gated_import_candidates(&qualifier_s, import_path, env, interner);
+        return Err(import_required(qualifier_s, modules, span, token, env));
     }
     let Some(members) = env.qual_members(qualifier) else {
-        // The qualifier itself is unknown: suggest from the known qualifiers
-        // (kernel modules + import aliases).
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::UnknownModule {
-                qualifier: name_str(interner, qualifier)?,
-                suggestions: suggestions(qualifier, env.qual_vars.keys().copied(), interner),
-            },
-        });
+        return Err(unbound_qualifier(qualifier, span, token, env, interner)?);
     };
     match members.get(&name) {
         Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
@@ -5976,19 +6337,23 @@ fn resolve_qual_var(
                     index: ch.index,
                 });
             }
+            let member = name_str(interner, name)?;
             Err(Diagnostic::Name {
                 span,
                 msg: NameError::NoSuchMember {
                     module: name_str(interner, qualifier)?,
-                    member: name_str(interner, name)?,
-                    suggestions: suggestions(
-                        name,
-                        members
-                            .keys()
-                            .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
-                            .copied(),
-                        interner,
+                    suggestions: Candidates::at(
+                        token.and_then(|t| EditTarget::suffix(t, &member)),
+                        suggestions(
+                            name,
+                            members
+                                .keys()
+                                .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
+                                .copied(),
+                            interner,
+                        ),
                     ),
+                    member,
                 },
             })
         }
@@ -6270,7 +6635,7 @@ fn resolve_op_func(op: Symbol, interner: &mut Interner) -> DResult<Symbol> {
 enum ResolvedAlias<'a> {
     /// Declared in this module: its source body expands in this module's scope.
     Local {
-        params: &'a [Symbol],
+        params: &'a [(Symbol, Symbol)],
         body: &'a src::TypeAnnotation,
     },
     /// Exported by a dependency, its body already canonical.
@@ -6348,7 +6713,7 @@ fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
         span: ctx.ann_span,
         msg: NameError::TypeNotFound {
             name: name_s.into(),
-            suggestions: suggestions(name, candidates, ctx.interner),
+            suggestions: Candidates::hints(suggestions(name, candidates, ctx.interner)),
         },
     })
 }
@@ -6514,6 +6879,34 @@ fn copy_substituted_arg(
     Ok(arg.clone())
 }
 
+/// Refuse a record type that repeats a label, at the repeated label (IPE-N0010).
+///
+/// A canonical record type has unique labels; checking at the source arms that
+/// build one keeps a later `BTreeMap` collect of its fields from silently
+/// dropping a label.
+///
+/// # Errors
+/// [`NameError::DuplicateValue`] on the second occurrence of a label.
+fn refuse_duplicate_record_labels(
+    fields: &[(Located<Symbol>, src::TypeAnnotation)],
+    interner: &Interner,
+) -> DResult<()> {
+    let mut seen: BTreeMap<Symbol, Span> = BTreeMap::new();
+    for (label, _) in fields {
+        if let Some(&first) = seen.get(&label.value) {
+            return Err(Diagnostic::Name {
+                span: label.span,
+                msg: NameError::DuplicateValue {
+                    name: name_str(interner, label.value)?,
+                    first,
+                },
+            });
+        }
+        seen.insert(label.value, label.span);
+    }
+    Ok(())
+}
+
 /// The `qualified_aliases` key a type reference `qualifier.name` expands
 /// through, if any.
 ///
@@ -6547,9 +6940,11 @@ fn alias_lookup_key(
 /// body, with the use site's type arguments substituted for the alias's declared
 /// parameters, so no later stage observes the alias name.
 ///
-/// `subst` maps an in-scope alias parameter to the (already canonicalised) type
-/// argument bound to it; a `TVar` found in `subst` resolves to that type instead
-/// of remaining free. `visited` carries the chain of aliases currently being
+/// `params` renames each in-scope alias parameter to its slot, in value and
+/// open-record row position alike; a variable not in `params` is free. The
+/// arguments are substituted for the slots afterwards by [`instantiate_alias`],
+/// the one walker that substitutes, so this walk never copies an argument.
+/// `visited` carries the chain of aliases currently being
 /// expanded along this path — a name already in the chain is a recursive alias,
 /// whose expansion stops (the name is left as an opaque constructor) rather than
 /// recursing forever (soundness over completeness: a cyclic alias is exotic, but
@@ -6559,12 +6954,15 @@ fn alias_lookup_key(
 /// [`Diagnostic::Name`] ([`NameError::AliasArity`]) when an alias is applied to a
 /// number of type arguments that differs from its declared parameter count; the
 /// span is the enclosing annotation (the type AST carries no inner spans).
+/// [`NameError::DuplicateValue`] when a record type repeats a label, at the
+/// repeated label; [`NameError::AliasRowArgument`] when an alias's row argument
+/// cannot extend its record.
 /// [`Diagnostic::CompilerBug`] if a name symbol is not interned.
 #[allow(clippy::too_many_lines)] // exhaustive type-annotation walker
 fn canonicalise_type(
     t: &src::TypeAnnotation,
     ctx: &TypeCtx,
-    subst: &BTreeMap<Symbol, canon::Type>,
+    params: &ParamSlots,
     free_vars: &mut BTreeSet<Symbol>,
     visited: &mut Vec<Symbol>,
     budget: &mut u32,
@@ -6576,7 +6974,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 a,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -6585,7 +6983,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 b,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -6593,17 +6991,13 @@ fn canonicalise_type(
             )?),
         )),
         src::TypeAnnotation::TVar(v) => {
-            // A variable bound to an alias argument resolves to that argument; its
-            // own free variables were recorded when the argument was canonicalised
-            // at the use site, so it does not re-enter `free_vars` here. An unbound
+            // An alias parameter is renamed to its slot and never enters
+            // `free_vars`: the use site's argument replaces it. Any other
             // variable is genuinely free and is quantified by the binding.
-            subst.get(v).map_or_else(
-                || {
-                    free_vars.insert(*v);
-                    Ok(canon::Type::Var(*v))
-                },
-                |arg| copy_substituted_arg(arg, ctx, budget),
-            )
+            Ok(canon::Type::Var(params.slot(*v).unwrap_or_else(|| {
+                free_vars.insert(*v);
+                *v
+            })))
         }
         src::TypeAnnotation::TUnit => Ok(canon::Type::Unit),
         src::TypeAnnotation::TTuple(elems) => {
@@ -6612,7 +7006,7 @@ fn canonicalise_type(
                 can_elems.push(canonicalise_type(
                     e,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -6622,10 +7016,12 @@ fn canonicalise_type(
             Ok(canon::Type::Tuple(can_elems))
         }
         src::TypeAnnotation::TRecord(fields) => {
-            // Each field type is canonicalised under the current substitution, so
-            // a field variable bound by an enclosing alias argument resolves to it
-            // and an unbound one is collected into `free_vars` (quantified by the
-            // binding) — exactly the [`TVar`] handling above, applied per field.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            // Each field type is canonicalised with the same parameters in
+            // scope, so a field variable that is an alias parameter is renamed
+            // to its slot and any other is collected into `free_vars`
+            // (quantified by the binding) — exactly the [`TVar`] handling above,
+            // applied per field.
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -6633,7 +7029,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -6644,15 +7040,16 @@ fn canonicalise_type(
             Ok(canon::Type::Record(can_fields))
         }
         src::TypeAnnotation::TRecordOpen(row_var, fields) => {
-            // The row variable names the open tail; like any unbound annotation
-            // variable it is quantified by the binding, so it is collected into
-            // `free_vars` (unless an enclosing alias argument already bound it,
-            // in which case the substitution resolves it). Each constrained
-            // field type is canonicalised exactly as in the closed `TRecord`
-            // arm above.
-            if !subst.contains_key(row_var) {
+            // The row variable names the open tail. An alias parameter is
+            // renamed to its slot, exactly as in the `TVar` arm, so the use
+            // site's argument fills the row; any other row variable is free and
+            // quantified by the binding. Each constrained field type is
+            // canonicalised exactly as in the closed `TRecord` arm above.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            let row = params.slot(*row_var).unwrap_or_else(|| {
                 free_vars.insert(*row_var);
-            }
+                *row_var
+            });
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -6660,7 +7057,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -6668,7 +7065,7 @@ fn canonicalise_type(
                     )?,
                 ));
             }
-            Ok(canon::Type::RecordOpen(*row_var, can_fields))
+            Ok(canon::Type::RecordOpen(row, can_fields))
         }
         src::TypeAnnotation::TType(qualifier, segments, args) => {
             let name = segments.last().copied().unwrap_or_else(|| {
@@ -6698,24 +7095,22 @@ fn canonicalise_type(
                 // before the unknown-qualifier fallback, since the catalog
                 // qualifier is present in `qual_vars` regardless of import.
                 if let Some(import_path) = ctx.env.stdlib_import_required(*qualifier) {
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::StdlibImportRequired {
-                            qualifier: qualifier_str.into(),
-                            import_path: path_to_dot_string(ctx.interner, import_path),
-                        },
-                    });
+                    return Err(import_required(
+                        qualifier_str.into(),
+                        gated_import_candidates(qualifier_str, import_path, ctx.env, ctx.interner),
+                        ctx.ann_span,
+                        None,
+                        ctx.env,
+                    ));
                 }
                 if !ctx.env.qual_vars.contains_key(qualifier) {
-                    let sugg =
-                        suggestions(*qualifier, ctx.env.qual_vars.keys().copied(), ctx.interner);
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::UnknownModule {
-                            qualifier: qualifier_str.into(),
-                            suggestions: sugg,
-                        },
-                    });
+                    return Err(unbound_qualifier(
+                        *qualifier,
+                        ctx.ann_span,
+                        None,
+                        ctx.env,
+                        ctx.interner,
+                    )?);
                 }
             }
             // `View engine msg` — the engine-tagged view carrier and SSOT view
@@ -6731,8 +7126,8 @@ fn canonicalise_type(
             // The engine tag is read syntactically here (never routed through
             // type-home resolution); any tag outside the closed set has no view
             // denotation and is rejected fail-closed as an unresolved type name.
-            // Only the `msg` argument is a real type, canonicalised under the
-            // current substitution.
+            // Only the `msg` argument is a real type, canonicalised with the
+            // current parameters in scope.
             if qualifier_str.is_empty()
                 && ctx.interner.resolve(name) == Some("View")
                 && args.len() == 2
@@ -6757,18 +7152,18 @@ fn canonicalise_type(
                             span: ctx.ann_span,
                             msg: NameError::TypeNotFound {
                                 name: name_str(ctx.interner, engine)?,
-                                suggestions: Box::new([]),
+                                suggestions: Candidates::default(),
                             },
                         });
                     }
                 }
-                // The message argument is canonicalised under the current
-                // substitution exactly as any use-site argument; the engine tag
+                // The message argument is canonicalised with the current
+                // parameters in scope exactly as any use-site argument; the engine tag
                 // becomes a nullary `Con` carrying the interned engine name.
                 let msg = canonicalise_type(
                     msg_ann,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -6834,7 +7229,7 @@ fn canonicalise_type(
                     Some(msg_ann) => canonicalise_type(
                         msg_ann,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -6855,15 +7250,15 @@ fn canonicalise_type(
                     ],
                 });
             }
-            // Type arguments are canonicalised under the current substitution
-            // (they appear at the use site) regardless of whether `name` is an
+            // Type arguments are canonicalised with the current parameters in
+            // scope (they appear at the use site) regardless of whether `name` is an
             // alias or an ordinary constructor.
             let mut can_args = Vec::with_capacity(args.len());
             for a in args {
                 can_args.push(canonicalise_type(
                     a,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -6913,26 +7308,45 @@ fn canonicalise_type(
                         })
                     };
                     return match alias {
-                        // A local alias: its declared parameters are bound to the
-                        // canonicalised arguments and the source body is
-                        // canonicalised under that fresh substitution, in this
-                        // module's own scope.
-                        ResolvedAlias::Local { params, body } => {
-                            check_arity(params.len())?;
-                            let body_subst: BTreeMap<Symbol, canon::Type> =
-                                params.iter().copied().zip(can_args).collect();
+                        // A local alias: its source body is canonicalised in this
+                        // module's own scope with its parameters renamed to their
+                        // slots, then the arguments are substituted for the slots
+                        // by the same walker an imported alias expands through.
+                        ResolvedAlias::Local {
+                            params: alias_params,
+                            body,
+                        } => {
+                            check_arity(alias_params.len())?;
                             visited.push(alias_key);
-                            let expanded = canonicalise_type(
+                            let slotted = canonicalise_type(
                                 body,
                                 ctx,
-                                &body_subst,
+                                &ParamSlots::new(alias_params),
                                 free_vars,
                                 visited,
                                 budget,
                                 depth.saturating_add(1),
                             );
                             visited.pop();
-                            expanded
+                            // With no parameters there is nothing to substitute:
+                            // the renamed body is the expansion, and walking it
+                            // again would charge its nodes to the ceiling twice.
+                            if alias_params.is_empty() {
+                                return slotted;
+                            }
+                            let args: BTreeMap<Symbol, canon::Type> = alias_params
+                                .iter()
+                                .map(|&(_, slot)| slot)
+                                .zip(can_args)
+                                .collect();
+                            instantiate_alias(
+                                alias_key,
+                                &slotted?,
+                                &args,
+                                ctx,
+                                budget,
+                                depth.saturating_add(1),
+                            )
                         }
                         // An imported alias: its body is already canonical in the
                         // defining module's scope, so the arguments are
@@ -6941,11 +7355,12 @@ fn canonicalise_type(
                         ResolvedAlias::Imported(exported) => {
                             check_arity(exported.param_slots.len())?;
                             free_vars.extend(exported.free_vars.iter().copied());
-                            let slots: BTreeMap<Symbol, canon::Type> =
+                            let args: BTreeMap<Symbol, canon::Type> =
                                 exported.param_slots.iter().copied().zip(can_args).collect();
-                            instantiate_imported_alias(
+                            instantiate_alias(
+                                alias_key,
                                 &exported.body,
-                                &slots,
+                                &args,
                                 ctx,
                                 budget,
                                 depth.saturating_add(1),
@@ -7476,12 +7891,12 @@ fn detect_custom_element_constructor(
         ui_wildcard_msg,
         ann_span: ann.span,
     };
-    let subst = BTreeMap::new();
+    let no_params = ParamSlots::empty();
     let mut budget = TYPE_EXPANSION_NODE_LIMIT;
     let ty = canonicalise_type(
         &ann.value,
         &ctx,
-        &subst,
+        &no_params,
         &mut free_vars,
         &mut visited,
         &mut budget,
@@ -8792,6 +9207,140 @@ mod config_threading_tests {
             untouched,
             "no config threaded when none is declared (single cfg arg stands)"
         );
+    }
+}
+
+#[cfg(test)]
+mod main_result_head_tests {
+    //! Unit coverage for [`main_result_step`] / [`main_result_head`]: a `do`
+    //! bind (`Task.andThen (\p -> rest) task`) steps into its continuation body
+    //! only, and only when the callee is the `Task.andThen` kernel by id.
+
+    use super::*;
+    use ipe_diagnostics::Located;
+
+    fn sym(i: &mut Interner, s: &str) -> Symbol {
+        i.intern(s).expect("intern must succeed")
+    }
+
+    const fn at(e: canon::Expr_) -> canon::Expr {
+        Located::new(Span::DUMMY, e)
+    }
+
+    const fn unit() -> canon::Expr {
+        at(canon::Expr_::Unit)
+    }
+
+    fn kernel(i: &mut Interner, id: Option<StdlibKernel>, module: &str, name: &str) -> canon::Expr {
+        let module = sym(i, module);
+        let name = sym(i, name);
+        at(canon::Expr_::VarKernel { id, module, name })
+    }
+
+    fn call(callee: canon::Expr, args: Vec<canon::Expr>) -> canon::Expr {
+        at(canon::Expr_::Call(Box::new(callee), args))
+    }
+
+    fn lambda(params: usize, body: canon::Expr) -> canon::Expr {
+        let params =
+            std::iter::repeat_with(|| Located::new(Span::DUMMY, canon::Pattern_::PAnything))
+                .take(params)
+                .collect();
+        at(canon::Expr_::Lambda(params, Box::new(body)))
+    }
+
+    fn and_then(i: &mut Interner) -> canon::Expr {
+        kernel(i, Some(StdlibKernel::TaskAndThen), "Task", "andThen")
+    }
+
+    /// `Task.andThen (\_ -> rest) task` — the parser's `do` bind desugar.
+    fn bind(i: &mut Interner, rest: canon::Expr, task: canon::Expr) -> canon::Expr {
+        call(and_then(i), vec![lambda(1, rest), task])
+    }
+
+    /// `Server.listen () ()` — the listen entry applied to two stand-in args.
+    fn listen(i: &mut Interner) -> canon::Expr {
+        let head = kernel(i, Some(StdlibKernel::ServerListen), "Server", "listen");
+        call(head, vec![unit(), unit()])
+    }
+
+    #[test]
+    fn bind_follows_continuation_to_listen() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn nested_binds_and_runs_reach_tail() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let inner = bind(&mut i, tail, unit());
+        let run = at(canon::Expr_::Let(Vec::new(), Box::new(inner)));
+        let body = bind(&mut i, run, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn task_argument_is_never_followed() {
+        let mut i = Interner::new();
+        let task = listen(&mut i);
+        let body = bind(&mut i, unit(), task);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(matches!(main_result_head(&body).value, canon::Expr_::Unit));
+    }
+
+    #[test]
+    fn user_and_then_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let main_mod = sym(&mut i, "Main");
+        let name = sym(&mut i, "andThen");
+        let user = at(canon::Expr_::VarTopLevel {
+            module: vec![main_mod],
+            name,
+        });
+        let body = call(user, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn unbacked_and_then_name_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let unbacked = kernel(&mut i, None, "Task", "andThen");
+        let body = call(unbacked, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn partial_and_then_stops_on_kernel() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(1, tail)]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn two_param_continuation_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(2, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn bind_tail_tea_entry_classifies_as_app() {
+        let mut i = Interner::new();
+        let entry = kernel(&mut i, None, "Web", "tea");
+        let tail = call(entry, vec![unit()]);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_tea_entry(&body, &i));
+        assert!(app_shape_name(&body, &i).is_some());
+        assert!(!main_head_is_server_listen(&body));
     }
 }
 

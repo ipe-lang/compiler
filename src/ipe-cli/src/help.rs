@@ -21,6 +21,7 @@ use std::io::IsTerminal;
 use crate::CliError;
 use crate::help_page::{self, CommandText, SectionText};
 use crate::style::{Palette, gutter};
+use crate::verb::{Umbrella, Verb};
 
 /// A command's dispatch handler: it receives the arguments after the command
 /// name and runs the command.
@@ -31,7 +32,7 @@ pub(crate) type Handler = fn(&[String]) -> Result<(), CliError>;
 /// and the help renderer both read this one table, a command that is dispatched
 /// but undescribed — or described but undispatched — cannot exist.
 pub(crate) struct Command {
-    /// The subcommand name (e.g. `build`).
+    /// The command name (e.g. `fmt`).
     name: &'static str,
     /// The handler that runs the command, given the arguments after its name.
     run: Handler,
@@ -46,42 +47,83 @@ pub(crate) struct Command {
     hidden: bool,
 }
 
-/// A command group: a named node (e.g. `dev`) that owns a set of member
-/// subcommands, invoked as `ipe <group> <verb>`. The group makes a posture a
-/// namespace rather than a flag: a verb reachable only under `dev` cannot be
-/// typed under any other group, so `release`-on-save (`watch` under a shipping
-/// posture) is structurally unrepresentable — there is no group that pairs
-/// `release` with `watch`.
+/// A grouped verb's help entry: the typed [`Verb`] and its `.md` page.
 ///
-/// A group carries no handler of its own: invoked bare, or with an unknown next
-/// token, it renders its own subpage (progressive help). Each member is an
-/// ordinary [`Command`] in the one [`COMMANDS`] table, so a grouped verb is
-/// dispatched and described from the same source as a bare one — the two cannot
-/// drift.
-pub(crate) struct Group {
-    /// The group name (e.g. `dev`).
-    name: &'static str,
-    /// The group's `.md` page (`help/<name>.md`), holding its one-line summary.
+/// A member carries no handler: [`crate::driver::dispatch`] matches the typed
+/// [`Verb`] exhaustively, so a grouped verb is described here and dispatched
+/// there from the one [`Verb::ALL`] set.
+pub(crate) struct Member {
+    /// The verb this entry describes.
+    verb: Verb,
+    /// The verb's `.md` help page (`help/<group>-<verb>.md`).
     page: &'static str,
-    /// The member subcommand names, in display order. Each names a [`Command`]
-    /// in [`COMMANDS`].
-    members: &'static [&'static str],
 }
 
-/// Every `ipe` command group. Today the sole axis is dev/release: `dev` groups
-/// the development-posture verbs (`Debug.*` permitted, unsigned, hot-reload
-/// allowed); `release` stays a distinct top-level command (the shipping
-/// posture). `watch` is a member of `dev` only, so hot-reloading a shipping
-/// build cannot be expressed.
-const GROUPS: &[Group] = &[Group {
-    name: "dev",
-    page: include_str!("../help/dev.md"),
-    members: &["build", "run", "watch"],
-}];
+/// A command group: an umbrella (`dev`, `release`) owning its member verbs.
+///
+/// A group is invoked as `ipe <group> <verb>`. The umbrella fixes the build
+/// posture of every member ([`Umbrella::intent`]), so a posture is a namespace
+/// rather than a flag: `watch` is a member of `dev` only, so hot-reloading a
+/// shipping build cannot be expressed. A group carries no handler of its own:
+/// `ipe <group> --help` renders its subpage, and a bare `ipe <group>` is refused
+/// with [`CliError::GroupRequired`].
+pub(crate) struct Group {
+    /// The umbrella this group is.
+    umbrella: Umbrella,
+    /// The group's `.md` page (`help/<name>.md`), holding its one-line summary.
+    page: &'static str,
+    /// The member verbs, in display order.
+    members: &'static [Member],
+}
+
+/// Every `ipe` command group: one per [`Umbrella`].
+const GROUPS: &[Group] = &[
+    Group {
+        umbrella: Umbrella::Dev,
+        page: include_str!("../help/dev.md"),
+        members: &[
+            Member {
+                verb: Verb::DEV_BUILD,
+                page: include_str!("../help/dev-build.md"),
+            },
+            Member {
+                verb: Verb::DEV_RUN,
+                page: include_str!("../help/dev-run.md"),
+            },
+            Member {
+                verb: Verb::DEV_WATCH,
+                page: include_str!("../help/dev-watch.md"),
+            },
+        ],
+    },
+    Group {
+        umbrella: Umbrella::Release,
+        page: include_str!("../help/release.md"),
+        members: &[
+            Member {
+                verb: Verb::RELEASE_BUILD,
+                page: include_str!("../help/release-build.md"),
+            },
+            Member {
+                verb: Verb::RELEASE_RUN,
+                page: include_str!("../help/release-run.md"),
+            },
+            Member {
+                verb: Verb::RELEASE_EJECT,
+                page: include_str!("../help/release-eject.md"),
+            },
+        ],
+    },
+];
 
 /// Look up a group by name.
 fn find_group(name: &str) -> Option<&'static Group> {
-    GROUPS.iter().find(|g| g.name == name)
+    GROUPS.iter().find(|g| g.name() == name)
+}
+
+/// Every grouped verb's help entry, in group then display order.
+fn members() -> impl Iterator<Item = &'static Member> {
+    GROUPS.iter().flat_map(|g| g.members.iter())
 }
 
 /// Whether `name` is a known command group (drives group-aware dispatch and
@@ -91,18 +133,24 @@ pub fn is_group(name: &str) -> bool {
     find_group(name).is_some()
 }
 
-/// Whether `verb` is a member subcommand of the group `group`.
+/// The verb `sub` of the group `group`, or `None` when either is unknown.
 #[must_use]
-pub fn is_group_member(group: &str, verb: &str) -> bool {
-    find_group(group).is_some_and(|g| g.members.contains(&verb))
+pub fn group_member(group: &str, sub: &str) -> Option<Verb> {
+    find_group(group)?
+        .members
+        .iter()
+        .map(|m| m.verb)
+        .find(|v| v.sub() == sub)
 }
 
-/// The member subcommand names of `group`, in display order, or `None` when
-/// `group` is not a known group. The candidate set for suggesting a near-miss
-/// when an unknown verb follows a group name.
+/// The member verb words of `group`, in display order, or `None` when `group`
+/// is not a known group.
+///
+/// The candidate set for suggesting a near-miss when an unknown verb follows a
+/// group name.
 #[must_use]
-pub fn group_members(group: &str) -> Option<&'static [&'static str]> {
-    find_group(group).map(|g| g.members)
+pub fn group_members(group: &str) -> Option<Vec<&'static str>> {
+    find_group(group).map(|g| g.members.iter().map(|m| m.verb.sub()).collect())
 }
 
 /// The canonical `'static` name for a known group, or `None` when `name` is not
@@ -112,18 +160,7 @@ pub fn group_members(group: &str) -> Option<&'static [&'static str]> {
 /// without leaking a runtime `String` where a `&'static str` is required.
 #[must_use]
 pub fn group_name(name: &str) -> Option<&'static str> {
-    find_group(name).map(|g| g.name)
-}
-
-/// Whether the command `name` is a member of some group.
-///
-/// A grouped command is
-/// advertised on the top-level screen through its group's node (e.g. `ipe dev`),
-/// not as its own top-level line, so the "appears in exactly one section"
-/// invariant excuses it.
-#[must_use]
-pub fn is_grouped_command(name: &str) -> bool {
-    GROUPS.iter().any(|g| g.members.contains(&name))
+    find_group(name).map(Group::name)
 }
 
 /// A flag entry exposed to coverage surfaces: the flag synopsis and its
@@ -143,7 +180,7 @@ pub struct FlagSpec {
 /// coverage surface.
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
-    /// The subcommand name (e.g. `"build"`).
+    /// The command name (`"fmt"`), or a grouped verb's full name (`"dev build"`).
     pub name: &'static str,
     /// The one-line description shown at the top of `ipe <command> --help`.
     pub summary: &'static str,
@@ -182,7 +219,8 @@ pub struct GroupSpec {
     pub name: &'static str,
     /// The one-line description shown on the group's subpage.
     pub summary: &'static str,
-    /// The member subcommand names, in display order.
+    /// The member verbs' full names (`"dev build"`), in display order; each
+    /// names a [`CommandSpec`].
     pub members: Vec<&'static str>,
 }
 
@@ -192,19 +230,20 @@ pub struct GroupSpec {
 /// The CLI coverage surface reads this instead of the private table so that
 /// command names, summaries, and flag lists have one source and the coverage
 /// columns can enumerate the full surface without duplicating the registry.
+///
+/// A grouped verb is listed under its full name (`"dev build"`).
 #[must_use]
 pub fn all_command_specs() -> Vec<CommandSpec> {
-    COMMANDS
-        .iter()
+    entries()
         .map(|c| {
             let text = c.text();
             CommandSpec {
-                name: c.name,
+                name: c.name(),
                 summary: text.summary,
                 args: text.args,
                 args_desc: text.args_desc,
                 output_desc: text.output_desc,
-                hidden: c.hidden,
+                hidden: c.hidden(),
                 options: text
                     .options
                     .iter()
@@ -241,37 +280,23 @@ pub fn all_group_specs() -> Vec<GroupSpec> {
     GROUPS
         .iter()
         .map(|g| GroupSpec {
-            name: g.name,
+            name: g.name(),
             summary: g.summary(),
-            members: g.members.to_vec(),
+            members: g.members.iter().map(|m| m.verb.name()).collect(),
         })
         .collect()
 }
 
-/// Every `ipe` command, each bound to its handler and its `.md` help page.
+/// Every top-level `ipe` command, each bound to its handler and its `.md` help
+/// page.
+///
+/// A build-producing verb is not here: it lives under its umbrella in
+/// [`GROUPS`], and its bare legacy name is refused by the dispatcher.
 const COMMANDS: &[Command] = &[
     Command {
         name: "init",
         run: crate::init::run_init,
         page: include_str!("../help/init.md"),
-        hidden: false,
-    },
-    Command {
-        name: "build",
-        run: crate::run_build,
-        page: include_str!("../help/build.md"),
-        hidden: false,
-    },
-    Command {
-        name: "eject",
-        run: crate::run_eject,
-        page: include_str!("../help/eject.md"),
-        hidden: false,
-    },
-    Command {
-        name: "release",
-        run: crate::run_release,
-        page: include_str!("../help/release.md"),
         hidden: false,
     },
     Command {
@@ -290,24 +315,6 @@ const COMMANDS: &[Command] = &[
         name: "verify",
         run: crate::run_verify,
         page: include_str!("../help/verify.md"),
-        hidden: false,
-    },
-    Command {
-        name: "run",
-        run: crate::run_run,
-        page: include_str!("../help/run.md"),
-        hidden: false,
-    },
-    Command {
-        name: "exec",
-        run: crate::run_exec,
-        page: include_str!("../help/exec.md"),
-        hidden: false,
-    },
-    Command {
-        name: "watch",
-        run: crate::run_watch,
-        page: include_str!("../help/watch.md"),
         hidden: false,
     },
     Command {
@@ -412,18 +419,74 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
-impl Command {
-    /// The command's parsed help page.
-    fn text(&self) -> CommandText {
-        help_page::parse_command_page(self.name, self.page).0
-    }
-}
-
 impl Group {
+    /// The group word (`dev`, `release`).
+    const fn name(&self) -> &'static str {
+        self.umbrella.name()
+    }
+
     /// The group's one-line summary.
     fn summary(&self) -> &'static str {
         help_page::summary_of(self.page)
     }
+}
+
+/// One help page: a top-level command or a grouped verb.
+#[derive(Clone, Copy)]
+enum Entry {
+    /// A top-level command.
+    Command(&'static Command),
+    /// A grouped verb.
+    Member(&'static Member),
+}
+
+impl Entry {
+    /// The name the page's synopsis spells after `ipe` (`fmt`, `dev build`).
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Command(c) => c.name,
+            Self::Member(m) => m.verb.name(),
+        }
+    }
+
+    /// The `.md` page.
+    const fn page(self) -> &'static str {
+        match self {
+            Self::Command(c) => c.page,
+            Self::Member(m) => m.page,
+        }
+    }
+
+    /// Whether the page is withheld from the top-level screen.
+    const fn hidden(self) -> bool {
+        match self {
+            Self::Command(c) => c.hidden,
+            Self::Member(_) => false,
+        }
+    }
+
+    /// The parsed help page.
+    fn text(self) -> CommandText {
+        help_page::parse_command_page(self.name(), self.page()).0
+    }
+}
+
+/// Every help page: the top-level commands, then each group's verbs.
+fn entries() -> impl Iterator<Item = Entry> {
+    COMMANDS
+        .iter()
+        .map(Entry::Command)
+        .chain(members().map(Entry::Member))
+}
+
+/// The help page for `name`: a top-level command, or a grouped verb by its full
+/// name (`dev build`) or help key (`dev-build`).
+fn find_entry(name: &str) -> Option<Entry> {
+    find(name).map(Entry::Command).or_else(|| {
+        Verb::from_name(name)
+            .and_then(|verb| members().find(|m| m.verb == verb))
+            .map(Entry::Member)
+    })
 }
 
 /// The overview's sections, in display order (from `help/index.md`).
@@ -443,11 +506,25 @@ pub fn is_command(name: &str) -> bool {
     find(name).is_some()
 }
 
-/// Every known command name, in table order — the candidate set for suggesting
-/// a near-miss when an unknown command is typed.
+/// Every top-level command name, in table order — the candidate set for
+/// suggesting a near-miss when an unknown command is typed.
 #[must_use]
 pub fn command_names() -> Vec<&'static str> {
     COMMANDS.iter().map(|c| c.name).collect()
+}
+
+/// Every documented page key: each top-level command name, then each grouped
+/// verb's help key (`dev-build`).
+///
+/// The documentation index keys one page per entry, so `ipe doc dev-build`
+/// resolves from the same table as `ipe dev build --help`.
+#[must_use]
+pub fn documented_command_keys() -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .map(|c| c.name)
+        .chain(members().map(|m| m.verb.help_key()))
+        .collect()
 }
 
 /// The canonical static name and handler that run `name`, or `None` when `name`
@@ -460,13 +537,14 @@ pub(crate) fn handler(name: &str) -> Option<(&'static str, Handler)> {
     find(name).map(|c| (c.name, c.run))
 }
 
-/// The one-line summary for `name`, or `None` when `name` is not a known command.
+/// The one-line summary for `name`, or `None` when `name` is not a known command
+/// or grouped verb.
 ///
 /// Used to inject command metadata into the documentation index so that
 /// `ipe doc <command>` resolves from the same SSOT as `ipe <command> --help`.
 #[must_use]
 pub fn command_summary(name: &str) -> Option<&'static str> {
-    find(name).map(|c| c.text().summary)
+    find_entry(name).map(|c| c.text().summary)
 }
 
 /// Render a command's full help as Markdown, or `None` when `name` is unknown.
@@ -478,16 +556,16 @@ pub fn command_summary(name: &str) -> Option<&'static str> {
 /// source and cannot drift. No ANSI colour is emitted.
 #[must_use]
 pub fn command_doc_markdown(name: &str) -> Option<String> {
-    find(name).map(render_command_markdown)
+    find_entry(name).map(render_command_markdown)
 }
 
 /// Render one command's help page as Markdown from its parsed `.md` page, with
 /// shared flags expanded in place.
-fn render_command_markdown(cmd: &Command) -> String {
+fn render_command_markdown(cmd: Entry) -> String {
     let text = cmd.text();
     let mut out = String::new();
     let _ = writeln!(out, "{}\n", text.summary);
-    let _ = write!(out, "```\nipe {}", cmd.name);
+    let _ = write!(out, "```\nipe {}", cmd.name());
     if !text.args.is_empty() {
         let _ = write!(out, " {}", text.args);
     }
@@ -515,19 +593,20 @@ pub fn top_level(stream: &impl IsTerminal) -> String {
     render_top_level(Palette::for_stream(stream))
 }
 
-/// Render a single command's `--help` page, or `None` if `name` is unknown.
+/// Render a single command's or grouped verb's `--help` page, or `None` if
+/// `name` is unknown.
 #[must_use]
 pub fn command(name: &str, stream: &impl IsTerminal) -> Option<String> {
     let p = Palette::for_stream(stream);
-    find(name).map(|cmd| render_command(cmd, p))
+    find_entry(name).map(|cmd| render_command(cmd, p))
 }
 
 /// Render a command group's subpage — its summary, then each member subcommand
 /// as a ready-to-run `ipe <group> <verb> --help` line — or `None` if `name` is
 /// not a known group.
 ///
-/// This is the `ipe dev` / `ipe dev --help` screen, and the
-/// body of the misuse page shown for `ipe dev <unknown>`.
+/// This is the `ipe dev --help` screen, and the body of the misuse page shown
+/// for `ipe dev <unknown>`.
 #[must_use]
 pub fn group(name: &str, stream: &impl IsTerminal) -> Option<String> {
     let p = Palette::for_stream(stream);
@@ -541,30 +620,28 @@ fn render_group(g: &Group, p: &Palette) -> String {
     out.push('\n');
     let _ = writeln!(out, "{}{}{}", p.dim, g.summary(), p.reset);
     out.push('\n');
-    let _ = writeln!(out, "{}ipe {} <verb>{}", p.yellow, g.name, p.reset);
+    let _ = writeln!(out, "{}ipe {} <verb>{}", p.yellow, g.name(), p.reset);
     out.push('\n');
     out.push_str(crate::text::verbs_label());
     out.push('\n');
     let name_w = g
         .members
         .iter()
-        .filter_map(|n| find(n))
-        .map(|c| c.name.len())
+        .map(|m| m.verb.name().len())
         .max()
         .unwrap_or(0);
-    for &verb in g.members {
-        let Some(cmd) = find(verb) else { continue };
-        let pad = name_w - cmd.name.len();
+    for member in g.members {
+        let entry = Entry::Member(member);
+        let pad = name_w.saturating_sub(entry.name().len());
         let _ = writeln!(
             out,
-            "  {}ipe {} {}{}{:pad$}  {}{}{}",
+            "  {}ipe {}{}{:pad$}  {}{}{}",
             p.yellow,
-            g.name,
-            cmd.name,
+            entry.name(),
             p.reset,
             "",
             p.dim,
-            cmd.text().summary,
+            entry.text().summary,
             p.reset,
         );
     }
@@ -667,8 +744,7 @@ pub fn help_json() -> String {
         })
         .collect();
 
-    let commands_arr: Vec<String> = COMMANDS
-        .iter()
+    let commands_arr: Vec<String> = entries()
         .map(|c| {
             let text = c.text();
             let opts: Vec<String> = text
@@ -682,13 +758,13 @@ pub fn help_json() -> String {
                 })
                 .collect();
             json::object(&[
-                ("name", json::string(c.name)),
+                ("name", json::string(c.name())),
                 ("summary", json::string(text.summary)),
                 ("args", json::string(text.args)),
                 ("args_desc", json::string(text.args_desc)),
                 (
                     "hidden",
-                    if c.hidden {
+                    if c.hidden() {
                         "true".to_owned()
                     } else {
                         "false".to_owned()
@@ -705,10 +781,10 @@ pub fn help_json() -> String {
             let members = g
                 .members
                 .iter()
-                .map(|m| json::string(m))
+                .map(|m| json::string(m.verb.sub()))
                 .collect::<Vec<_>>();
             json::object(&[
-                ("name", json::string(g.name)),
+                ("name", json::string(g.name())),
                 ("summary", json::string(g.summary())),
                 ("members", json::array(&members)),
             ])
@@ -732,7 +808,7 @@ pub fn help_json() -> String {
 #[must_use]
 pub fn command_json(name: &str) -> Option<String> {
     use crate::cli_args::json;
-    let c = find(name)?;
+    let c = find_entry(name)?;
     let text = c.text();
     let opts: Vec<String> = text
         .options
@@ -746,13 +822,13 @@ pub fn command_json(name: &str) -> Option<String> {
         .collect();
     let obj = json::object(&[
         ("schema", json::string("ipe.cli.help/1")),
-        ("name", json::string(c.name)),
+        ("name", json::string(c.name())),
         ("summary", json::string(text.summary)),
         ("args", json::string(text.args)),
         ("args_desc", json::string(text.args_desc)),
         (
             "hidden",
-            if c.hidden {
+            if c.hidden() {
                 "true".to_owned()
             } else {
                 "false".to_owned()
@@ -771,13 +847,13 @@ pub fn command_json(name: &str) -> Option<String> {
 /// terminal edge at the one SSOT width. Within the gutter, `Arguments:` /
 /// `Options:` bodies carry a further two-space indent so they read as nested
 /// under their heading.
-fn render_command(cmd: &Command, p: &Palette) -> String {
+fn render_command(cmd: Entry, p: &Palette) -> String {
     let text = cmd.text();
     let mut out = String::new();
     out.push('\n');
     let _ = writeln!(out, "{}{}{}", p.dim, text.summary, p.reset);
     out.push('\n');
-    out.push_str(&command_line(cmd.name, text.args, p));
+    out.push_str(&command_line(cmd.name(), text.args, p));
     out.push('\n');
     if !text.args_desc.is_empty() {
         out.push('\n');
@@ -804,6 +880,9 @@ fn render_command(cmd: &Command, p: &Palette) -> String {
 mod tests {
     use super::*;
 
+    /// The bare build-producing names that live only in the refusal table.
+    const LEGACY: [&str; 6] = ["build", "run", "watch", "exec", "eject", "release"];
+
     #[test]
     fn plain_top_level_names_every_command_and_section() {
         let plain = render_top_level(&Palette::PLAIN);
@@ -823,11 +902,6 @@ mod tests {
                 );
                 continue;
             }
-            // A grouped command is advertised through its group's node
-            // (e.g. `ipe dev`), not as its own top-level line.
-            if is_grouped_command(cmd.name) {
-                continue;
-            }
             assert!(
                 plain.contains(&format!("ipe {}", cmd.name)),
                 "missing command {}",
@@ -837,9 +911,9 @@ mod tests {
         // Every group is advertised on the top-level screen as its own node.
         for g in GROUPS {
             assert!(
-                plain.contains(&format!("ipe {}", g.name)),
+                plain.contains(&format!("ipe {}", g.name())),
                 "missing group {}",
-                g.name
+                g.name()
             );
         }
         assert!(!plain.contains('\x1b'), "plain output must carry no ANSI");
@@ -862,9 +936,9 @@ mod tests {
 
     #[test]
     fn every_command_has_help_page() {
-        for cmd in COMMANDS {
+        for cmd in entries() {
             let page = render_command(cmd, &Palette::PLAIN);
-            assert!(page.contains(&format!("ipe {}", cmd.name)));
+            assert!(page.contains(&format!("ipe {}", cmd.name())));
             assert!(page.contains(cmd.text().summary));
         }
     }
@@ -875,19 +949,24 @@ mod tests {
     /// well-formed options, and only shared flags `help/flags.md` defines.
     #[test]
     fn every_help_page_parses_without_defects() {
-        for cmd in COMMANDS {
-            let (_, defects) = help_page::parse_command_page(cmd.name, cmd.page);
-            assert!(defects.is_empty(), "help/{}.md: {defects:?}", cmd.name);
+        for cmd in entries() {
+            let (_, defects) = help_page::parse_command_page(cmd.name(), cmd.page());
+            assert!(defects.is_empty(), "`ipe {}` page: {defects:?}", cmd.name());
         }
         for g in GROUPS {
-            assert!(!g.summary().is_empty(), "help/{}.md has no summary", g.name);
+            assert!(
+                !g.summary().is_empty(),
+                "help/{}.md has no summary",
+                g.name()
+            );
         }
     }
 
     /// Every `.md` under `help/` is embedded.
     ///
-    /// Each is a command page, a group page, the shared flags, or the overview
-    /// layout — no orphan text a dev could edit to no effect.
+    /// Each is a command page, a grouped verb page, a group page, the shared
+    /// flags, or the overview layout — no orphan text a dev could edit to no
+    /// effect.
     #[test]
     fn every_help_md_file_is_embedded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("help");
@@ -897,7 +976,7 @@ mod tests {
             let path = entry.path();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             assert!(
-                is_command(stem) || is_group(stem) || stem == "index" || stem == "flags",
+                find_entry(stem).is_some() || is_group(stem) || stem == "index" || stem == "flags",
                 "help/{stem}.md is not embedded by any command, group, or page"
             );
         }
@@ -907,17 +986,17 @@ mod tests {
     /// the synopsis, and every option's flag and description.
     #[test]
     fn the_terminal_page_carries_the_md_wording() {
-        for cmd in COMMANDS {
+        for cmd in entries() {
             let text = cmd.text();
             let page = render_command(cmd, &Palette::PLAIN);
-            let first_line = cmd.page.lines().next().unwrap_or_default();
-            assert_eq!(text.summary, first_line.trim(), "help/{}.md", cmd.name);
+            let first_line = cmd.page().lines().next().unwrap_or_default();
+            assert_eq!(text.summary, first_line.trim(), "`ipe {}`", cmd.name());
             assert!(page.contains(first_line.trim()), "{page}");
             for opt in &text.options {
                 assert!(
                     page.contains(opt.flag) && page.contains(opt.desc),
                     "`ipe {} --help` omits {opt:?}",
-                    cmd.name
+                    cmd.name()
                 );
             }
         }
@@ -925,7 +1004,7 @@ mod tests {
 
     #[test]
     fn commands_with_an_argument_describe_it() {
-        for cmd in COMMANDS {
+        for cmd in entries() {
             let text = cmd.text();
             if text.args_desc.is_empty() {
                 continue;
@@ -934,7 +1013,7 @@ mod tests {
             assert!(
                 page.contains("Arguments:") && page.contains(text.args_desc),
                 "missing argument description for {}",
-                cmd.name
+                cmd.name()
             );
         }
     }
@@ -983,52 +1062,20 @@ mod tests {
     }
 
     #[test]
-    fn every_command_appears_in_exactly_one_section_or_group() {
+    fn every_command_appears_in_exactly_one_section() {
         for cmd in COMMANDS {
             let in_sections = sections()
                 .iter()
                 .flat_map(|s| s.commands.iter())
                 .filter(|&&n| n == cmd.name)
                 .count();
-            // A visible command is advertised exactly once — either directly in a
-            // section, or under exactly one group (which the section advertises).
-            // A hidden command is advertised nowhere. A grouped command must not
-            // ALSO sit in a section.
-            if cmd.hidden {
-                assert_eq!(
-                    in_sections, 0,
-                    "hidden command {} must not appear in a section",
-                    cmd.name
-                );
-                assert!(
-                    !is_grouped_command(cmd.name),
-                    "hidden command {} must not appear in a group",
-                    cmd.name
-                );
-                continue;
-            }
-            if is_grouped_command(cmd.name) {
-                let in_groups = GROUPS
-                    .iter()
-                    .filter(|g| g.members.contains(&cmd.name))
-                    .count();
-                assert_eq!(
-                    in_groups, 1,
-                    "grouped command {} must belong to exactly one group",
-                    cmd.name
-                );
-                assert_eq!(
-                    in_sections, 0,
-                    "grouped command {} must not also sit in a section",
-                    cmd.name
-                );
-            } else {
-                assert_eq!(
-                    in_sections, 1,
-                    "ungrouped command {} must appear in exactly one section, found {in_sections}",
-                    cmd.name
-                );
-            }
+            // A visible command is advertised exactly once; a hidden one nowhere.
+            let expected = usize::from(!cmd.hidden);
+            assert_eq!(
+                in_sections, expected,
+                "command {} must appear in {expected} section(s), found {in_sections}",
+                cmd.name
+            );
         }
     }
 
@@ -1038,34 +1085,40 @@ mod tests {
             let count = sections()
                 .iter()
                 .flat_map(|s| s.commands.iter())
-                .filter(|&&n| n == g.name)
+                .filter(|&&n| n == g.name())
                 .count();
             assert_eq!(
-                count, 1,
+                count,
+                1,
                 "group {} must appear in exactly one section, found {count}",
-                g.name
+                g.name()
             );
         }
     }
 
+    /// Every [`Verb`] is described exactly once, under its own umbrella's
+    /// group, and no group lists a verb of another umbrella.
     #[test]
-    fn group_members_are_known_dispatchable_commands() {
-        // The single-source invariant extended to groups: every verb a group
-        // lists is a real, dispatchable command in the one table — a group can
-        // neither advertise a phantom verb nor hide a described one.
-        for g in GROUPS {
-            for &verb in g.members {
-                assert!(
-                    is_command(verb),
-                    "group {} lists unknown verb {verb}",
-                    g.name
-                );
-                assert!(
-                    handler(verb).is_some(),
-                    "group {} verb {verb} has no dispatch handler",
-                    g.name
-                );
-            }
+    fn every_verb_belongs_to_exactly_its_umbrella_group() {
+        for verb in Verb::ALL {
+            let owners: Vec<&Group> = GROUPS
+                .iter()
+                .filter(|g| g.members.iter().any(|m| m.verb == verb))
+                .collect();
+            assert!(
+                matches!(owners.as_slice(), [g] if g.umbrella == verb.umbrella()),
+                "verb {verb} must be in exactly its umbrella's group"
+            );
+            assert_eq!(group_member(verb.umbrella().name(), verb.sub()), Some(verb));
+        }
+        assert_eq!(members().count(), Verb::ALL.len());
+        for umbrella in Umbrella::ALL {
+            assert_eq!(
+                GROUPS.iter().filter(|g| g.umbrella == umbrella).count(),
+                1,
+                "umbrella {} must have exactly one group",
+                umbrella.name()
+            );
         }
     }
 
@@ -1073,12 +1126,13 @@ mod tests {
     fn group_subpage_lists_every_verb() {
         for g in GROUPS {
             let page = render_group(g, &Palette::PLAIN);
-            assert!(page.contains(&format!("ipe {} <verb>", g.name)));
-            for &verb in g.members {
+            assert!(page.contains(&format!("ipe {} <verb>", g.name())));
+            for m in g.members {
                 assert!(
-                    page.contains(&format!("ipe {} {}", g.name, verb)),
-                    "group {} subpage omits verb {verb}",
-                    g.name
+                    page.contains(&format!("ipe {}", m.verb)),
+                    "group {} subpage omits verb {}",
+                    g.name(),
+                    m.verb
                 );
             }
             assert!(!page.contains('\x1b'), "plain subpage must carry no ANSI");
@@ -1091,14 +1145,18 @@ mod tests {
     #[test]
     fn add_and_remove_are_hidden_but_dispatchable() {
         for name in ["add", "remove"] {
-            let cmd = find(name).expect("command still in the registry");
+            let found = find(name);
+            assert!(found.is_some(), "{name} must stay in the registry");
+            let Some(cmd) = found else {
+                return;
+            };
             assert!(
                 cmd.hidden,
                 "{name} must be hidden from the top-level screen"
             );
             assert!(handler(name).is_some(), "{name} must stay dispatchable");
             // Its per-command help page still renders (documentation survives).
-            let page = render_command(cmd, &Palette::PLAIN);
+            let page = render_command(Entry::Command(cmd), &Palette::PLAIN);
             assert!(page.contains(&format!("ipe {name}")));
         }
         // Neither appears on the top-level screen.
@@ -1124,12 +1182,55 @@ mod tests {
         }
     }
 
+    /// A bare build-producing name has no help page, no handler, and no doc
+    /// key: the refusal table is its only representation.
     #[test]
-    fn exec_is_both_advertised_and_dispatchable() {
-        assert!(is_command("exec"), "exec must be an advertised command");
+    fn legacy_names_have_no_page_and_no_handler() {
+        for name in LEGACY {
+            assert!(!is_command(name), "`{name}` must not be a command");
+            assert!(handler(name).is_none(), "`{name}` must not dispatch");
+            assert!(
+                command(name, &std::io::stdout()).is_none(),
+                "`{name}` must have no help page"
+            );
+            assert!(command_json(name).is_none());
+            assert!(!documented_command_keys().contains(&name));
+        }
+    }
+
+    /// A bare `build --help` (and every other legacy name with a help flag) is
+    /// refused with [`CliError::GroupRequired`] naming the grouped forms — it
+    /// never renders a page.
+    #[test]
+    fn legacy_help_is_refusal() {
+        for name in ["build", "run", "watch", "exec", "eject"] {
+            let argv = [name.to_owned(), "--help".to_owned()];
+            let result = crate::driver::run_cli(&argv);
+            assert!(
+                matches!(
+                    &result,
+                    Err(CliError::GroupRequired { attempted, forms, .. })
+                        if attempted.as_str() == name && !forms.is_empty()
+                ),
+                "`ipe {name} --help` must be refused naming a grouped form, got {result:?}"
+            );
+        }
+    }
+
+    /// `exec` is refused, its hint naming `release run`.
+    #[test]
+    fn exec_is_refused_with_release_run_hint() {
+        assert!(!is_command("exec"));
+        let result = crate::driver::run_cli(&["exec".to_owned()]);
         assert!(
-            handler("exec").is_some(),
-            "exec must resolve to a dispatch handler"
+            matches!(
+                result,
+                Err(CliError::GroupRequired {
+                    forms: [Verb::RELEASE_RUN],
+                    ..
+                })
+            ),
+            "got {result:?}"
         );
     }
 
@@ -1156,7 +1257,9 @@ mod tests {
         command: &str,
         parse: impl Fn(&[String]) -> Result<(), crate::CliError>,
     ) {
-        let Some(cmd) = COMMANDS.iter().find(|c| c.name == command) else {
+        let found = find_entry(command);
+        assert!(found.is_some(), "`ipe {command}` has no help page");
+        let Some(cmd) = found else {
             return;
         };
         for opt in &cmd.text().options {
@@ -1179,9 +1282,21 @@ mod tests {
 
     #[test]
     fn advertised_flags_are_accepted_by_their_parser() {
-        assert_help_flags_are_accepted("build", |a| crate::cli_args::parse_build(a).map(|_| ()));
-        assert_help_flags_are_accepted("run", |a| crate::cli_args::parse_run(a).map(|_| ()));
-        assert_help_flags_are_accepted("watch", |a| crate::cli_args::parse_watch(a).map(|_| ()));
+        assert_help_flags_are_accepted(Verb::DEV_BUILD.name(), |a| {
+            crate::cli_args::parse_build(a).map(|_| ())
+        });
+        assert_help_flags_are_accepted(Verb::DEV_RUN.name(), |a| {
+            crate::cli_args::parse_run(a).map(|_| ())
+        });
+        assert_help_flags_are_accepted(Verb::DEV_WATCH.name(), |a| {
+            crate::cli_args::parse_watch(a).map(|_| ())
+        });
+        assert_help_flags_are_accepted(Verb::RELEASE_BUILD.name(), |a| {
+            crate::cli_args::parse_release_build(a).map(|_| ())
+        });
+        assert_help_flags_are_accepted(Verb::RELEASE_EJECT.name(), |a| {
+            crate::cli_args::parse_eject(a).map(|_| ())
+        });
         assert_help_flags_are_accepted("fix", |a| crate::cli_args::parse_fix(a).map(|_| ()));
         assert_help_flags_are_accepted("type-check", |a| {
             crate::cli_args::parse_type_check(a).map(|_| ())
@@ -1202,11 +1317,11 @@ mod tests {
             "schema tag missing from help_json"
         );
         // Every command name must appear.
-        for cmd in COMMANDS {
+        for cmd in entries() {
             assert!(
-                json.contains(&format!("\"{}\"", cmd.name)),
+                json.contains(&format!("\"{}\"", cmd.name())),
                 "command {} missing from help_json",
-                cmd.name
+                cmd.name()
             );
         }
         // Every section title must appear.
@@ -1226,14 +1341,26 @@ mod tests {
     }
 
     /// `command_json` returns a per-command object for every known command and
-    /// `None` for an unknown name.
+    /// grouped verb, and `None` for an unknown name.
     #[test]
     fn command_json_returns_per_command_object() {
-        // Known command produces JSON with schema tag and the command name.
-        let j = command_json("version").expect("version must be known");
-        assert!(j.contains("\"ipe.cli.help/1\""), "schema tag missing");
-        assert!(j.contains("\"version\""), "command name missing");
-        assert!(j.ends_with('\n'), "command_json must end with a newline");
+        let version = command_json("version");
+        assert!(
+            version
+                .as_deref()
+                .is_some_and(|j| j.contains("\"ipe.cli.help/1\"")
+                    && j.contains("\"version\"")
+                    && j.ends_with('\n')),
+            "version must be a known command with a schema-tagged page"
+        );
+        for verb in Verb::ALL {
+            let by_name = command_json(verb.name());
+            assert!(
+                by_name.as_deref().is_some_and(|j| j.contains(verb.name())),
+                "{verb} must have a JSON page"
+            );
+            assert_eq!(command_json(verb.help_key()), by_name);
+        }
         // Unknown command returns None.
         assert!(command_json("no-such-command").is_none());
     }

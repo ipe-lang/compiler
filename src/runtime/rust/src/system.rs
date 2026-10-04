@@ -160,9 +160,11 @@ impl EnvCeiling {
                     CeilingDefect::NotDecimal
                 } else {
                     match v.parse::<u64>() {
-                        Ok(0) if self.zero == ZeroCeiling::Refused => CeilingDefect::Zero,
-                        Ok(n) if n <= self.max => return Ok(n),
-                        Ok(_) | Err(_) => CeilingDefect::TooLarge,
+                        Ok(n) => match self.check(n) {
+                            Ok(n) => return Ok(n),
+                            Err(defect) => defect,
+                        },
+                        Err(_) => CeilingDefect::TooLarge,
                     }
                 };
                 (shown_env_value(v.as_bytes()), defect)
@@ -185,13 +187,34 @@ impl EnvCeiling {
         T::try_from(n).map_err(|_| self.refusal(n.to_string(), CeilingDefect::TooLarge))
     }
 
+    /// The raw lookup of this ceiling's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// [`std::env::VarError::NotPresent`] while the variable is unset, or
+    /// `NotUnicode` for a non-UTF-8 value; [`Self::parse`] judges either.
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        read_env_var(self.name)
+    }
+
     /// Reads and parses this ceiling from the live environment (overlay first).
     ///
     /// # Errors
     ///
     /// Returns the [`Self::parse_as`] refusal for a present, malformed value.
     pub fn read<T: TryFrom<u64>>(self) -> Result<T, EnvCeilingRefusal> {
-        self.parse_as(read_env_var(self.name))
+        self.parse_as(self.lookup())
+    }
+
+    /// A parsed value under this ceiling's zero rule and bound.
+    const fn check(self, n: u64) -> Result<u64, CeilingDefect> {
+        if n == 0 && matches!(self.zero, ZeroCeiling::Refused) {
+            Err(CeilingDefect::Zero)
+        } else if n > self.max {
+            Err(CeilingDefect::TooLarge)
+        } else {
+            Ok(n)
+        }
     }
 
     const fn refusal(self, shown: String, defect: CeilingDefect) -> EnvCeilingRefusal {
@@ -202,6 +225,152 @@ impl EnvCeiling {
             defect,
         }
     }
+}
+
+/// One operator-tunable duration read from the environment, in whole seconds.
+///
+/// A present value is a bare decimal second count or one to three `<n>h`,
+/// `<n>m`, `<n>s` segments, each unit at most once and in that order (`90s`,
+/// `30m`, `1h30m`), ASCII only and unpadded. It then obeys the bound of
+/// [`Self::at_most`] and a positive total, so every refusal is the
+/// [`EnvCeilingRefusal`] an [`EnvCeiling`] raises, with the same escaped echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvDuration {
+    ceiling: EnvCeiling,
+}
+
+impl EnvDuration {
+    /// A duration read from `name`, with its default in seconds and unit phrase.
+    ///
+    /// `unit` completes the refusal "`name` must be a …", e.g. `"duration"`.
+    #[must_use]
+    pub const fn new(name: &'static str, default_secs: u64, unit: &'static str) -> Self {
+        Self {
+            ceiling: EnvCeiling::new(name, default_secs, ZeroCeiling::Refused, unit),
+        }
+    }
+
+    /// This duration with the largest total, in seconds, its consumer can apply.
+    #[must_use]
+    pub const fn at_most(self, max_secs: u64) -> Self {
+        Self {
+            ceiling: self.ceiling.at_most(max_secs),
+        }
+    }
+
+    /// The environment variable this duration reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.ceiling.name()
+    }
+
+    /// The largest accepted total, in seconds.
+    #[must_use]
+    pub const fn max_value(self) -> u64 {
+        self.ceiling.max_value()
+    }
+
+    /// The seconds applied while the variable is absent.
+    #[must_use]
+    pub const fn default_value(self) -> u64 {
+        self.ceiling.default_value()
+    }
+
+    /// Parses a raw lookup of this duration's variable into whole seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal naming the variable when the value is present but not
+    /// in the duration grammar, totals zero, or exceeds [`Self::max_value`].
+    pub fn parse(self, raw: Result<String, std::env::VarError>) -> Result<u64, EnvCeilingRefusal> {
+        let (shown, defect) = match raw {
+            Err(std::env::VarError::NotPresent) => return Ok(self.ceiling.default),
+            Err(std::env::VarError::NotUnicode(os)) => (
+                shown_env_value(os.as_encoded_bytes()),
+                CeilingDefect::NotDecimal,
+            ),
+            Ok(v) => match duration_secs(&v).and_then(|n| self.ceiling.check(n)) {
+                Ok(n) => return Ok(n),
+                Err(defect) => (shown_env_value(v.as_bytes()), defect),
+            },
+        };
+        Err(self.ceiling.refusal(shown, defect))
+    }
+
+    /// The raw lookup of this duration's variable in the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// As [`EnvCeiling::lookup`].
+    pub fn lookup(self) -> Result<String, std::env::VarError> {
+        self.ceiling.lookup()
+    }
+
+    /// Reads and parses this duration from the live environment (overlay first).
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::parse`] refusal for a present, malformed value.
+    pub fn read(self) -> Result<u64, EnvCeilingRefusal> {
+        self.parse(self.lookup())
+    }
+}
+
+/// The seconds of a bare second count or `h`/`m`/`s` segments.
+///
+/// Each unit appears at most once, largest first, so the loop runs at most
+/// three times.
+fn duration_secs(raw: &str) -> Result<u64, CeilingDefect> {
+    let (mut digits, mut tail) = split_digits(raw);
+    if digits.is_empty() {
+        return Err(CeilingDefect::NotDecimal);
+    }
+    if tail.is_empty() {
+        return digits_value(digits);
+    }
+    let mut total: u64 = 0;
+    let mut previous = u64::MAX;
+    loop {
+        let mut chars = tail.chars();
+        let unit: u64 = match chars.next() {
+            Some('h') => 3600,
+            Some('m') => 60,
+            Some('s') => 1,
+            _ => return Err(CeilingDefect::NotDecimal),
+        };
+        if unit >= previous {
+            return Err(CeilingDefect::NotDecimal);
+        }
+        previous = unit;
+        total = digits_value(digits)?
+            .checked_mul(unit)
+            .and_then(|segment| total.checked_add(segment))
+            .ok_or(CeilingDefect::TooLarge)?;
+        let after = chars.as_str();
+        if after.is_empty() {
+            return Ok(total);
+        }
+        (digits, tail) = split_digits(after);
+        if digits.is_empty() {
+            return Err(CeilingDefect::NotDecimal);
+        }
+    }
+}
+
+/// `text` split after its leading run of ASCII digits.
+fn split_digits(text: &str) -> (&str, &str) {
+    let run = text.bytes().take_while(u8::is_ascii_digit).count();
+    text.split_at_checked(run).unwrap_or(("", text))
+}
+
+/// The value of a run of ASCII digits, or too large when it overflows `u64`.
+fn digits_value(digits: &str) -> Result<u64, CeilingDefect> {
+    digits
+        .chars()
+        .try_fold(0u64, |acc, c| {
+            acc.checked_mul(10)?.checked_add(u64::from(c.to_digit(10)?))
+        })
+        .ok_or(CeilingDefect::TooLarge)
 }
 
 /// Why a present ceiling value was refused.
@@ -331,9 +500,9 @@ fn home_dir_from_var(raw: Result<String, std::env::VarError>) -> Option<std::pat
 /// downstream `contains(...)` matchers see the bare line. The `is_terminal`
 /// decision is a parameter so the indent rule is testable without a pty.
 ///
-/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe watch`, these
+/// Four spaces, not the CLI's plain 2-space `GUTTER`: under `ipe dev watch`, these
 /// lines are the spawned app's own output, printed one level deeper than the
-/// `[ipe watch] ...` status lines that frame it (which themselves render at
+/// `[ipe dev watch] ...` status lines that frame it (which themselves render at
 /// two gutter-widths) — so this nests under them rather than under the
 /// top-level banner.
 ///
@@ -621,13 +790,13 @@ impl ResolvedPort {
         match self.origin {
             PortOrigin::Relocated => format!(
                 "port {port} is already in use — another application is bound to it.\n\
-                 The port was chosen by the supervisor (`ipe watch` or the dev console); \
+                 The port was chosen by the supervisor (`ipe dev watch` or the dev console); \
                  restart it to pick a free port."
             ),
             PortOrigin::Operator | PortOrigin::Source => format!(
                 "port {port} is already in use — another application is bound to it.\n\
                  Set a different port with the {var} environment variable, e.g.:\n\
-                 {var}=8123 ipe run"
+                 {var}=8123 ipe dev run"
             ),
         }
     }
@@ -978,7 +1147,7 @@ fn apply_env_directives(
     builder.env_remove(crate::LISTEN_PORT_RELOCATION_ENV);
 }
 
-/// Env var a supervisor (`ipe watch`, the dev console proxy) sets on the child
+/// Env var a supervisor (`ipe dev watch`, the dev console proxy) sets on the child
 /// it spawns to place that child's HTTP listener on a port the supervisor chose.
 ///
 /// Internal plumbing, never operator configuration: it outranks the operator
@@ -2681,11 +2850,75 @@ pub fn system_load_env<E: Send + 'static>(_: ()) -> IpeTask<E, ()> {
 /// [`ZeroCeiling`].
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn assert_env_ceiling_contract(ceiling: EnvCeiling) {
+    assert_decimal_contract(ceiling, |raw| ceiling.parse(raw));
+}
+
+/// Asserts the [`EnvCeiling`] contract on an [`EnvDuration`].
+///
+/// A bare second count honours every clause of the decimal contract, and the
+/// duration grammar adds its own refusals.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn assert_env_duration_contract(duration: EnvDuration) {
+    assert_decimal_contract(duration.ceiling, |raw| duration.parse(raw));
+    let name = duration.name();
+    let parse = |raw: &str| duration.parse(Ok(raw.to_owned()));
+    for refused in [
+        "1h30",
+        "1d",
+        "m",
+        "h",
+        "1h ",
+        "1H",
+        "1hm",
+        "h1",
+        "1m1h",
+        "1h1h",
+        "1h 30m",
+        "1h-30m",
+        "1h\u{FF11}m",
+        "0s",
+        "0h0m",
+    ] {
+        assert!(
+            parse(refused).is_err_and(|r| r.name() == name),
+            "{name}: {refused:?} must be refused naming the variable"
+        );
+    }
+    for (spelled, secs) in [
+        ("1s", 1),
+        ("90s", 90),
+        ("30m", 1800),
+        ("1h", 3600),
+        ("1h30m", 5400),
+        ("1h30m15s", 5415),
+        ("1h15s", 3615),
+        ("0h30m", 1800),
+    ] {
+        if secs <= duration.max_value() {
+            assert_eq!(
+                parse(spelled),
+                Ok(secs),
+                "{name}: {spelled:?} is {secs} seconds"
+            );
+        }
+    }
+    assert!(
+        parse("18446744073709551615h").is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+        "{name}: an overflowing segment is refused as too large"
+    );
+}
+
+/// The decimal clauses of the ceiling contract over one parser of raw lookups.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn assert_decimal_contract(
+    ceiling: EnvCeiling,
+    parse_raw: impl Fn(Result<String, std::env::VarError>) -> Result<u64, EnvCeilingRefusal>,
+) {
     use std::env::VarError;
     let name = ceiling.name();
-    let parse = |raw: &str| ceiling.parse(Ok(raw.to_owned()));
+    let parse = |raw: &str| parse_raw(Ok(raw.to_owned()));
     assert_eq!(
-        ceiling.parse(Err(VarError::NotPresent)),
+        parse_raw(Err(VarError::NotPresent)),
         Ok(ceiling.default_value()),
         "{name}: an absent value yields the default"
     );
@@ -2724,8 +2957,7 @@ pub(crate) fn assert_env_ceiling_contract(ceiling: EnvCeiling) {
         use std::os::unix::ffi::OsStringExt as _;
         let not_unicode = std::ffi::OsString::from_vec(vec![b'1', 0xFF]);
         assert!(
-            ceiling
-                .parse(Err(VarError::NotUnicode(not_unicode)))
+            parse_raw(Err(VarError::NotUnicode(not_unicode)))
                 .is_err_and(|r| r.defect() == CeilingDefect::NotDecimal),
             "{name}: a non-Unicode value is refused"
         );
@@ -2764,9 +2996,69 @@ pub(crate) fn assert_env_ceiling_contract(ceiling: EnvCeiling) {
 #[cfg(not(target_arch = "wasm32"))]
 mod env_ceiling_tests {
     use super::{
-        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, PROCESS_OUTPUT_CEILING, ZeroCeiling,
-        assert_env_ceiling_contract, locked_remove_var, locked_set_var, process_output_ceiling,
+        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, PROCESS_OUTPUT_CEILING,
+        ZeroCeiling, assert_env_ceiling_contract, assert_env_duration_contract, locked_remove_var,
+        locked_set_var, process_output_ceiling,
     };
+
+    #[test]
+    fn a_duration_honours_the_contract_at_every_bound() {
+        let base = EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+        for duration in [
+            base,
+            base.at_most(59),
+            base.at_most(86_400),
+            base.at_most(34_560_000),
+        ] {
+            assert_env_duration_contract(duration);
+        }
+    }
+
+    #[test]
+    fn a_duration_total_past_its_bound_is_refused_whatever_the_spelling() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration").at_most(5400);
+        let parse = |raw: &str| duration.parse(Ok(raw.to_owned()));
+        assert_eq!(parse("1h30m"), Ok(5400));
+        assert_eq!(parse("5400"), Ok(5400));
+        for past in ["1h30m1s", "5401", "2h", "91m"] {
+            assert!(
+                parse(past).is_err_and(|r| r.defect() == CeilingDefect::TooLarge),
+                "{past:?} is past the bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duration_echo_is_truncated_and_escaped() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+        let shown = duration
+            .parse(Ok(format!("\u{1b}[31m{}", "9x".repeat(64))))
+            .map_err(|r| r.to_string())
+            .expect_err("a malformed duration is refused");
+        assert!(
+            !shown.contains('\u{1b}'),
+            "a control byte is escaped: {shown}"
+        );
+        assert!(
+            shown.starts_with("IPE_TEST_DURATION must be a duration"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_duration_reads_the_live_environment() {
+        let duration = EnvDuration::new("IPE_TEST_DURATION_LIVE", 30, "duration");
+        locked_remove_var("IPE_TEST_DURATION_LIVE");
+        let absent = duration.read();
+        locked_set_var("IPE_TEST_DURATION_LIVE", "1h30m");
+        let set = duration.read();
+        locked_set_var("IPE_TEST_DURATION_LIVE", "1h30");
+        let malformed = duration.read();
+        locked_remove_var("IPE_TEST_DURATION_LIVE");
+        assert_eq!(absent, Ok(30));
+        assert_eq!(set, Ok(5400));
+        assert!(malformed.is_err_and(|r| r.name() == "IPE_TEST_DURATION_LIVE"));
+    }
 
     #[test]
     fn both_zero_rules_honour_the_contract() {
@@ -2840,7 +3132,7 @@ mod env_ceiling_tests {
 
     /// The functions that read the environment and parse a number without
     /// [`EnvCeiling`], as `(file, fn, why)`.
-    const NON_CEILING_READS: [(&str, &str, &str); 10] = [
+    const NON_CEILING_READS: [(&str, &str, &str); 5] = [
         (
             "control.rs",
             "control_port_from_env",
@@ -2865,31 +3157,6 @@ mod env_ceiling_tests {
             "core.rs",
             "recursion_limit",
             "pending: the depth guard has no error channel to refuse through",
-        ),
-        (
-            "web/mod.rs",
-            "web_ttl",
-            "pending: a duration grammar (`30m`, `1h`), not a decimal ceiling",
-        ),
-        (
-            "app_config.rs",
-            "resolve_auth_max_lifetime",
-            "pending: an auth-config ceiling outside this parser's sites",
-        ),
-        (
-            "app_config.rs",
-            "resolve_auth_slide_window",
-            "pending: an auth-config ceiling outside this parser's sites",
-        ),
-        (
-            "app_config.rs",
-            "resolve_revocation_capacity",
-            "pending: an auth-config ceiling outside this parser's sites",
-        ),
-        (
-            "ssrf.rs",
-            "dns_timeout",
-            "pending: a resolver deadline outside this parser's sites",
         ),
     ];
 
@@ -3116,7 +3383,7 @@ mod gutter_line_tests {
     #[test]
     fn indents_only_under_a_terminal() {
         // Terminal stderr → 4-space gutter for the human dev loop (nests under
-        // the CLI's own `[ipe watch] ...` status lines).
+        // the CLI's own `[ipe dev watch] ...` status lines).
         assert_eq!(
             gutter_line("[ipe.http.server] listening on http://127.0.0.1:8000", true),
             "    [ipe.http.server] listening on http://127.0.0.1:8000"
@@ -3917,7 +4184,7 @@ mod listen_port_tests {
             for r in [resolve(None, var, Some("9200")), resolve(None, var, None)] {
                 let msg = r.addr_in_use_message();
                 assert!(
-                    msg.contains(&format!("{var}=8123 ipe run")),
+                    msg.contains(&format!("{var}=8123 ipe dev run")),
                     "the advice must name {var}: {msg}"
                 );
                 assert!(

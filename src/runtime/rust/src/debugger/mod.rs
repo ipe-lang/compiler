@@ -1,6 +1,6 @@
 //! Shape-agnostic TEA debugger core — recorder, re-fold, export, and import.
 //!
-//! Enabled only when the `debugger` feature is active (`ipe build/run --debugger`).
+//! Enabled only when the `debugger` feature is active (`ipe dev build/run --debugger`).
 //! A non-`--debugger` build carries zero code from this module.
 //!
 //! ## Data model
@@ -52,7 +52,7 @@ pub mod tui;
 pub mod record_sink;
 
 // Typed session log: the replayable form of a recorded cli/worker session
-// (`ipe run --record` writes it, `ipe run --replay` re-folds it).
+// (`ipe dev run --record` writes it, `ipe dev run --replay` re-folds it).
 // Gated on `feature = "debugger"` via the inner `#![cfg(...)]`.
 pub mod session_log;
 

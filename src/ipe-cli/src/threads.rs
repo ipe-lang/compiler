@@ -16,19 +16,19 @@ use crate::{CliError, text};
 /// The job a thread an `ipe` command starts does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThreadRole {
-    /// Runs an `ipe watch` session.
+    /// Runs an `ipe dev watch` session.
     WatchSession,
-    /// Coalesces `ipe watch` file events into one rebuild.
+    /// Coalesces `ipe dev watch` file events into one rebuild.
     WatchCoalesce,
-    /// Relays filesystem events into the `ipe watch` orchestrator.
+    /// Relays filesystem events into the `ipe dev watch` orchestrator.
     WatchFsRelay,
-    /// Relays a stop request into the `ipe watch` orchestrator.
+    /// Relays a stop request into the `ipe dev watch` orchestrator.
     WatchStopRelay,
-    /// Retries an `ipe watch` dependency resolve after a delay.
+    /// Retries an `ipe dev watch` dependency resolve after a delay.
     WatchResolveRetry,
-    /// Runs one `ipe watch` compile.
+    /// Runs one `ipe dev watch` compile.
     WatchCompile,
-    /// Waits on an `ipe watch` cargo build and reports its exit.
+    /// Waits on an `ipe dev watch` cargo build and reports its exit.
     WatchCargoWaiter,
     /// Enforces a WASI run's wall-clock ceiling.
     WasiWallClock,

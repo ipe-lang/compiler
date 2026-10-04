@@ -94,7 +94,7 @@ lineItem pair =
             label ++ "(no price on file)"
 ```
 
-Running it (`ipe run`) prints a receipt sorted by SKU — `Dict.toList` order is
+Running it (`ipe dev run`) prints a receipt sorted by SKU — `Dict.toList` order is
 unspecified, so the rows are sorted before printing:
 
 ```

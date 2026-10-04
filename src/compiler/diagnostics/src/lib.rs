@@ -19,14 +19,15 @@ pub mod terminal;
 // reachable through this re-export.
 pub use code::*;
 pub use diagnostic::{
-    AliasExpansionKind, AppShape, Applicability, CaseDefect, CmdSubShapeMismatch,
-    CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic, Expected, ExpectedSet,
-    ExposingDefect, Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HeaderDefect,
-    HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, InterceptContext, LetDefect,
-    LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection, NameError,
-    ParseError, RoutePatternDefect, RustNameFoldKind, SandboxError, SealRejection, SortedNames,
-    SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
-    TypeDeclDefect, TypeError, WildcardDependence,
+    AliasExpansionKind, AliasRowFault, AppShape, Applicability, Candidates, CaseDefect,
+    CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic,
+    EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
+    HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
+    IfDefect, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
+    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, RoutePatternDefect,
+    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
+    WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};
@@ -374,7 +375,7 @@ mod tests {
             span: Span::DUMMY,
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into(), "list".into()]),
+                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
             },
         };
         assert_eq!(
@@ -392,17 +393,99 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into()]),
+                suggestions: Candidates::at(
+                    EditTarget::whole(Span::new(0, 6), "lenght"),
+                    Box::new(["length".into()]),
+                ),
             },
         };
         assert_eq!(
             d.help(),
             vec![HelpLine::Suggest(Suggestion {
                 span: Span::new(0, 6),
+                replaces: "lenght".into(),
                 replacement: "length".into(),
                 applicability: Applicability::MachineApplicable,
             })]
         );
+    }
+
+    /// `Lsit.map` at `10..18`: the applicable edit overwrites only `Lsit`.
+    #[test]
+    fn unknown_module_suggestion_region_is_the_qualifier() {
+        let token = Span::new(10, 18);
+        let d = Diagnostic::Name {
+            span: token,
+            msg: NameError::UnknownModule {
+                qualifier: "Lsit".into(),
+                suggestions: Candidates::at(
+                    EditTarget::prefix(token, "Lsit"),
+                    Box::new(["List".into()]),
+                ),
+            },
+        };
+        assert_eq!(
+            d.help(),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(10, 14),
+                replaces: "Lsit".into(),
+                replacement: "List".into(),
+                applicability: Applicability::MachineApplicable,
+            })]
+        );
+    }
+
+    /// `List.mpa` at `10..18`: the applicable edit overwrites only `mpa`.
+    #[test]
+    fn no_such_member_region_is_the_member() {
+        let token = Span::new(10, 18);
+        let d = Diagnostic::Name {
+            span: token,
+            msg: NameError::NoSuchMember {
+                module: "List".into(),
+                member: "mpa".into(),
+                suggestions: Candidates::at(
+                    EditTarget::suffix(token, "mpa"),
+                    Box::new(["map".into()]),
+                ),
+            },
+        };
+        assert_eq!(
+            d.help(),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(15, 18),
+                replaces: "mpa".into(),
+                replacement: "map".into(),
+                applicability: Applicability::MachineApplicable,
+            })]
+        );
+    }
+
+    /// A type-annotation site has no provable sub-span: a sole candidate stays a hint.
+    #[test]
+    fn type_position_candidates_are_not_applicable() {
+        let d = Diagnostic::Name {
+            span: Span::new(0, 30),
+            msg: NameError::TypeNotFound {
+                name: "Strng".into(),
+                suggestions: Candidates::hints(Box::new(["String".into()])),
+            },
+        };
+        assert_eq!(d.help(), vec![HelpLine::DidYouMean("String".into())]);
+    }
+
+    /// A region wider, narrower, or outside its token is refused, never clamped.
+    #[test]
+    fn edit_target_refuses_a_region_that_leaves_its_token() {
+        let token = Span::new(10, 14);
+        assert!(EditTarget::whole(token, "Lsit").is_some());
+        assert!(EditTarget::whole(token, "Lsi").is_none());
+        assert!(EditTarget::whole(token, "Lsit.map").is_none());
+        assert!(EditTarget::prefix(token, "Lsit.map").is_none());
+        assert!(EditTarget::suffix(token, "Lsit.map").is_none());
+        assert!(EditTarget::prefix(token, "").is_none());
+        assert!(EditTarget::suffix(Span::new(0, 2), "abc").is_none());
+        assert!(EditTarget::prefix(Span::new(u32::MAX - 1, u32::MAX), "abc").is_none());
     }
 
     #[test]

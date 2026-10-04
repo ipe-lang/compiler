@@ -584,7 +584,13 @@ where
             // credentials; the client manages re-issue itself via re-auth).
             let reissue_cookie: Option<String> = if let TokenSource::Cookie(ref name) = cfg.source {
                 if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                    let slide_window_secs = crate::app_config::resolve_auth_slide_window();
+                    // A malformed window refuses the request rather than
+                    // re-issuing under an unknown bound; the detail stays out of
+                    // the response.
+                    let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                    else {
+                        return ok_res(plain_resp(503, "service unavailable", &[]));
+                    };
                     let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
                     let now = crate::jwt::now_unix_seconds();
                     // Throttle: re-issue only once past exp - slide_window/2.
@@ -884,6 +890,8 @@ struct ListenCeilings {
 fn listen_ceilings() -> Result<ListenCeilings, crate::system::EnvCeilingRefusal> {
     max_body()?;
     ws_ceilings()?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings()?;
     Ok(ListenCeilings {
         request_timeout_secs: REQUEST_TIMEOUT_CEILING.read()?,
         max_inflight: MAX_INFLIGHT_CEILING.read()?,
@@ -1595,7 +1603,7 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             .layer(tower_http::timeout::TimeoutLayer::new(
                 std::time::Duration::from_secs(ceilings.request_timeout_secs),
             ));
-        // Port precedence: the supervisor's relocation var (`ipe watch` placing
+        // Port precedence: the supervisor's relocation var (`ipe dev watch` placing
         // the app behind its proxy) > `IPE_SERVER_PORT` (operator) > the port the
         // program passed to `Server.listen`. A malformed env layer falls through,
         // never to `0`.
@@ -2976,7 +2984,7 @@ mod tests {
         assert!(
             resolve(None, None)
                 .addr_in_use_message()
-                .contains("IPE_SERVER_PORT=8123 ipe run")
+                .contains("IPE_SERVER_PORT=8123 ipe dev run")
         );
         assert!(
             !resolve(Some("9100"), None)
@@ -3949,6 +3957,24 @@ mod tests {
         );
         assert!(zero_timeout.is_err_and(|r| r.name() == "IPE_HTTP_REQUEST_TIMEOUT"));
         assert!(zero_inflight.is_err_and(|r| r.name() == "IPE_HTTP_MAX_INFLIGHT"));
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn a_malformed_auth_ceiling_refuses_listen() {
+        for (name, raw) in [
+            ("IPE_AUTH_MAX_LIFETIME", "8h"),
+            ("IPE_AUTH_SLIDE_WINDOW", "0"),
+            ("IPE_REVOCATION_CAPACITY", " 1024"),
+        ] {
+            crate::system::locked_set_var(name, raw);
+            let refused = listen_ceilings();
+            crate::system::locked_remove_var(name);
+            assert!(
+                refused.is_err_and(|r| r.name() == name),
+                "{name}={raw:?} must refuse Server.listen"
+            );
+        }
     }
 
     #[tokio::test]

@@ -237,7 +237,7 @@ impl std::fmt::Display for DesktopRefusal {
             Self::HostNotDesktop { host } => write!(
                 f,
                 "error[IPE-P0012]: this host ({host:?}) is not a desktop packaging target — \
-                 use `ipe build web desktop` (the host OS's bundle)"
+                 use `ipe dev build web desktop` (the host OS's bundle)"
             ),
         }
     }

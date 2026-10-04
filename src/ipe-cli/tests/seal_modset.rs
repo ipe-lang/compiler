@@ -51,7 +51,7 @@ fn emit_and_build(name: &str, ipe_source: &str) -> Result<(), BoxError> {
 
     // ipe accept — a codegen bug or a rejection surfaces here.
     ipe::build(&entry, &out_dir, &runtime)
-        .map_err(|e| -> BoxError { format!("{name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{name}: ipe dev build failed: {e}").into() })?;
 
     // THE real test: the emitted crate must `cargo build` (exit 0). A missing
     // runtime-module append reads as E0425/E0412 in this step.
@@ -91,8 +91,9 @@ fn emit_and_build_vendored(name: &str, ipe_source: &str) -> Result<(), BoxError>
         runtime_dep: false,
         ..ipe::BuildOptions::default()
     };
-    ipe::build_with_options(&entry, &out_dir, &runtime, options)
-        .map_err(|e| -> BoxError { format!("{name}: ipe build (vendored) failed: {e}").into() })?;
+    ipe::build_with_options(&entry, &out_dir, &runtime, options).map_err(|e| -> BoxError {
+        format!("{name}: ipe dev build (vendored) failed: {e}").into()
+    })?;
 
     e2e_support::build_rust_binary(name, &out_dir)
         .map(|_| ())

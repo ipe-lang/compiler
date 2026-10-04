@@ -259,15 +259,16 @@ impl SandboxProfile {
     /// from these), so a tampered `ipe.profile` can neither claim fewer axes nor
     /// swap *which* env vars it grants below what the binary was built for.
     ///
-    /// Format: `ipe-capfloor 1 net=<b> fs=<isolated|rw> sub=<b> env=<names>` where
-    /// `<names>` is the sorted, comma-joined set of granted env names (empty when
-    /// none). The names are bound by identity, so the floor compares env by the
+    /// Format: `ipe-capfloor 1 net=<b> fs=<isolated|rw> sub=<b> env=<names>
+    /// intent=<release|development>` where `<names>` is the sorted, comma-joined
+    /// set of granted env names (empty when none) and `intent` names the build
+    /// pipeline that embedded the floor ([`FloorIntent`]). The names are bound by identity, so the floor compares env by the
     /// SAME ⊆ subset check as the other axes — a same-count name swap no longer
     /// passes. Env var names are POSIX identifiers (`[A-Za-z_][A-Za-z0-9_]*`), so
     /// they never contain a comma or whitespace; [`parse_capfloor`] fails closed
     /// on any name that does.
     #[must_use]
-    pub fn to_capfloor_line(&self) -> String {
+    pub fn to_capfloor_line(&self, intent: FloorIntent) -> String {
         let fs = match self.filesystem {
             FilesystemScope::Isolated => "isolated",
             FilesystemScope::WorkingTreeReadWrite => "rw",
@@ -276,11 +277,109 @@ impl SandboxProfile {
         names.sort_unstable();
         names.dedup();
         format!(
-            "ipe-capfloor 1 net={} fs={fs} sub={} env={}",
+            "ipe-capfloor 1 net={} fs={fs} sub={} env={} intent={}",
             self.network,
             self.subprocess,
-            names.join(",")
+            names.join(","),
+            intent.token()
         )
+    }
+}
+
+/// The build pipeline that embedded an app's capability floor.
+///
+/// `ipe release run` and the release wrapper run only a [`FloorIntent::Release`]
+/// app: a development build carries debug assertions, an unoptimised profile
+/// and development-only behaviour that a deployment must not ship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorIntent {
+    /// Embedded by `ipe dev build` (or by a floor line that names no intent).
+    Development,
+    /// Embedded by `ipe release build`.
+    Release,
+}
+
+impl FloorIntent {
+    /// The `intent=` token of the capfloor line.
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// A capability floor read from a binary: the axes it grants at most, and
+/// the pipeline that embedded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapFloor {
+    /// The grants the floor caps a profile at (limits are not part of a floor).
+    pub axes: SandboxProfile,
+    /// The build pipeline that embedded the floor.
+    pub intent: FloorIntent,
+}
+
+/// Why a release app was refused against its profile before it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorRefusal {
+    /// The app carries no readable capability floor.
+    Unreadable,
+    /// The floor was embedded by a development build, not `ipe release build`.
+    NotRelease,
+    /// The profile grants more than the floor the app was built with.
+    ProfileWider,
+}
+
+impl std::fmt::Display for FloorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = super::RunJailDefect::ProfileWeakerThanFloor.code();
+        match self {
+            Self::Unreadable => write!(
+                f,
+                "{}: the binary embeds no readable capability floor — refusing to run an \
+                 artifact whose confinement cannot be verified",
+                code.as_str()
+            ),
+            Self::NotRelease => write!(
+                f,
+                "{}: the app was built by `ipe dev build`, not `ipe release build` — a \
+                 release runs only a release build: rebuild it with `ipe release build`",
+                code.as_str()
+            ),
+            Self::ProfileWider => {
+                write!(f, "{}", super::RunJailDefect::ProfileWeakerThanFloor)
+            }
+        }
+    }
+}
+
+impl std::error::Error for FloorRefusal {}
+
+/// Verify a release app's bytes against the profile it is to run under.
+///
+/// The one check `ipe release run` and the release wrapper both apply: the
+/// app must embed a readable floor ([`scan_capfloor`]), that floor must be a
+/// release build's, and the profile must grant no more than it
+/// ([`SandboxProfile::satisfies_capfloor`]).
+///
+/// # Errors
+///
+/// [`FloorRefusal::Unreadable`] with no readable floor;
+/// [`FloorRefusal::NotRelease`] for a development build's floor;
+/// [`FloorRefusal::ProfileWider`] when the profile exceeds the floor.
+pub fn verify_release_floor(
+    profile: &SandboxProfile,
+    app_bytes: &[u8],
+) -> Result<(), FloorRefusal> {
+    let floor = scan_capfloor(app_bytes).ok_or(FloorRefusal::Unreadable)?;
+    match floor.intent {
+        FloorIntent::Release => {}
+        FloorIntent::Development => return Err(FloorRefusal::NotRelease),
+    }
+    if profile.satisfies_capfloor(&floor.axes) {
+        Ok(())
+    } else {
+        Err(FloorRefusal::ProfileWider)
     }
 }
 
@@ -373,8 +472,10 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
 
 /// Strictly parse a capfloor line into the *comparison floor*.
 ///
-/// The result is a [`SandboxProfile`] whose axes AND env allowlist are the floor
-/// the binary was built with. The env names are parsed from the sorted,
+/// The result's [`CapFloor::axes`] is a [`SandboxProfile`] whose axes AND env
+/// allowlist are the floor the binary was built with; its
+/// [`CapFloor::intent`] is the pipeline that embedded it, and a line naming
+/// no intent is a [`FloorIntent::Development`] floor, never a release one. The env names are parsed from the sorted,
 /// comma-joined `env=<names>` field ([`SandboxProfile::to_capfloor_line`]), so
 /// the launcher can verify the profile grants only env vars the floor also
 /// grants — an exact name subset, not a count.
@@ -385,8 +486,8 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
 /// parsed means the binary's authoritative floor is unreadable, so the launcher
 /// must refuse (never treat an unreadable floor as "no floor"). An env name that
 /// is empty or carries a comma/whitespace (impossible for a POSIX env name) is a
-/// malformed floor and refuses.
-pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
+/// malformed floor and refuses, as is an unknown or repeated `intent`.
+pub fn parse_capfloor(line: &str) -> Result<CapFloor, ParseError> {
     let malformed = |detail: String| ParseError::Malformed { detail };
     let line = line.trim();
     let mut parts = line.split_whitespace();
@@ -397,6 +498,7 @@ pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
     let mut filesystem = FilesystemScope::Isolated;
     let mut subprocess = false;
     let mut env_allowlist: Vec<String> = Vec::new();
+    let mut intent: Option<FloorIntent> = None;
     for field in parts {
         let (k, v) = field
             .split_once('=')
@@ -414,15 +516,28 @@ pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
             "env" => {
                 env_allowlist = parse_capfloor_env_names(v)?;
             }
+            "intent" => {
+                let parsed = match v {
+                    "release" => FloorIntent::Release,
+                    "development" => FloorIntent::Development,
+                    other => return Err(malformed(format!("unknown intent {other:?}"))),
+                };
+                if intent.replace(parsed).is_some() {
+                    return Err(malformed("repeated intent field".to_owned()));
+                }
+            }
             other => return Err(malformed(format!("unknown capfloor field {other:?}"))),
         }
     }
-    Ok(SandboxProfile {
-        network,
-        filesystem,
-        subprocess,
-        env_allowlist,
-        limits: RunResourceLimits::default(),
+    Ok(CapFloor {
+        axes: SandboxProfile {
+            network,
+            filesystem,
+            subprocess,
+            env_allowlist,
+            limits: RunResourceLimits::default(),
+        },
+        intent: intent.unwrap_or(FloorIntent::Development),
     })
 }
 
@@ -565,6 +680,15 @@ pub fn profile_from_capabilities(
 /// this marker, which survives `strip` (`.rodata` is allocated).
 pub const CAPFLOOR_MARKER: &str = "ipe-capfloor 1 ";
 
+/// Ceiling on the bytes of a release app read for its floor scan.
+///
+/// 512 MiB is far above any statically-linked app while refusing a planted
+/// device node or multi-GiB file before it is buffered whole.
+pub const APP_READ_CAP: u64 = 512 * 1024 * 1024;
+
+/// Ceiling on the bytes of a release bundle's `ipe.profile`.
+pub const PROFILE_READ_CAP: u64 = 1024 * 1024;
+
 /// Scan a binary's bytes for the embedded capability-floor line and parse it —
 /// the tamper-safe floor read that does NOT execute the binary and survives
 /// `strip`.
@@ -582,11 +706,14 @@ pub const CAPFLOOR_MARKER: &str = "ipe-capfloor 1 ";
 /// permissive floor line cannot raise the ceiling and relax the jail. Concretely
 /// the floors are intersected (an axis is in the merged floor only if EVERY
 /// occurrence grants it, and an env name survives only if EVERY occurrence grants
-/// it — the name-set intersection).
+/// it — the name-set intersection). The merged intent is
+/// [`FloorIntent::Release`] only if every occurrence names it, so a forged
+/// release line beside a development floor cannot pass a development build
+/// off as a release one.
 #[must_use]
-pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
+pub fn scan_capfloor(bytes: &[u8]) -> Option<CapFloor> {
     let marker = CAPFLOOR_MARKER.as_bytes();
-    let mut floors: Vec<SandboxProfile> = Vec::new();
+    let mut floors: Vec<CapFloor> = Vec::new();
     // Every window that starts with the marker begins a candidate floor line.
     for (start, _) in bytes
         .windows(marker.len())
@@ -610,9 +737,22 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
     // occurrence grants it; the env ceiling is the NAME-SET intersection (a name
     // survives only if every occurrence grants it). A forged permissive copy
     // cannot raise the ceiling nor swap in a name the legitimate floor omits.
-    let mut merged = first.clone();
-    let mut env_names: BTreeSet<&str> = first.env_allowlist.iter().map(String::as_str).collect();
-    for f in rest {
+    let mut merged = first.axes.clone();
+    let mut intent = first.intent;
+    let mut env_names: BTreeSet<&str> = first
+        .axes
+        .env_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for CapFloor {
+        axes: f,
+        intent: occurrence_intent,
+    } in rest
+    {
+        if *occurrence_intent == FloorIntent::Development {
+            intent = FloorIntent::Development;
+        }
         if !f.network {
             merged.network = false;
         }
@@ -626,7 +766,10 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
         env_names.retain(|n| occurrence.contains(n));
     }
     merged.env_allowlist = env_names.into_iter().map(str::to_owned).collect();
-    Some(merged)
+    Some(CapFloor {
+        axes: merged,
+        intent,
+    })
 }
 
 #[cfg(test)]

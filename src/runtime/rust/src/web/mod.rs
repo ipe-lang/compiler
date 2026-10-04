@@ -442,7 +442,7 @@ fn web_client_config_js() -> String {
     // dev-watch blue-green proxy, so a reconnect is an expected rebuild cutover,
     // not an outage. The client then greets a reconnect with a brief positive
     // "updated ✓" toast instead of the amber "Reconnecting…" banner. Only the
-    // `ipe watch` blue-green path sets this; a release/`ipe run` server never
+    // `ipe dev watch` blue-green path sets this; a release/`ipe dev run` server never
     // does, so the flag defaults off there.
     let swap_toast = matches!(
         crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
@@ -646,7 +646,7 @@ struct PatchEnvelope<'a> {
 
 /// Body for the dev-only `POST /_ipe/watch/status` endpoint.
 ///
-/// Sent by `ipe watch` to push build state to connected browsers.
+/// Sent by `ipe dev watch` to push build state to connected browsers.
 /// Only mounted when the dev banner is active (non-production, root-mounted,
 /// and `IPE_WEB_BANNER` not explicitly disabled).
 #[derive(serde::Deserialize)]
@@ -662,7 +662,7 @@ struct WatchStatusBody {
     phase: Option<String>,
 }
 
-/// Latest build status from `ipe watch`, held in the server's shared state.
+/// Latest build status from `ipe dev watch`, held in the server's shared state.
 ///
 /// `None` = no status yet (initial state or production). Set by the
 /// `/_ipe/watch/status` endpoint and replayed to new SSE connections so a
@@ -1005,7 +1005,7 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// an unbounded number of sessions. Decremented ONLY via `SessionSlot::drop`,
     /// so the leak fix (mortal driver) and this cap share one mechanism.
     session_count: Arc<AtomicUsize>,
-    /// Latest build status from `ipe watch`. `None` until the first status
+    /// Latest build status from `ipe dev watch`. `None` until the first status
     /// POST arrives. Replayed to new SSE connections so a browser refresh
     /// during a failed build immediately shows the sticky error banner.
     /// Populated only when the dev watch/status endpoint is mounted;
@@ -1634,7 +1634,10 @@ fn page_response(
     // Max-Age: persist the cookie for the store TTL so a
     // tab-close doesn't drop a still-live server session. Without it the cookie is
     // session-scoped and the user loses state on tab close.
-    let max_age = web_ttl().as_secs();
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let max_age = ttl.as_secs();
     let session_cookie = format!(
         "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
         session_cookie_name(),
@@ -1689,7 +1692,10 @@ fn page_response_with_overlay(
     } else {
         "Lax"
     };
-    let max_age = web_ttl().as_secs();
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let max_age = ttl.as_secs();
     let session_cookie = format!(
         "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
         session_cookie_name(),
@@ -1755,62 +1761,44 @@ mod web_max_body_bytes_tests {
     }
 }
 
+/// The session idle-TTL the environment may set: `IPE_WEB_TTL`, whole seconds
+/// or `h` / `m` / `s` segments (`30m`, `1h30m`), at most 400 days.
+#[cfg(feature = "server")]
+const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
+    "IPE_WEB_TTL",
+    1800,
+    "duration (whole seconds, or h/m/s segments such as 30m or 1h30m)",
+)
+.at_most(400 * 24 * 60 * 60);
+
 /// Session idle-TTL under the one config precedence `env > setting-in-code >
 /// fallback`: `IPE_WEB_TTL` wins, else an installed `Web.sessionTtl` setting,
 /// else the default 1800 (30 min).
+///
+/// # Errors
+///
+/// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
+/// duration within the bound; a present value is never replaced by a default.
 #[cfg(feature = "server")]
-fn web_ttl() -> std::time::Duration {
-    let secs = crate::system::read_env_var("IPE_WEB_TTL")
-        .ok()
-        .and_then(|s| parse_duration_secs(&s))
-        .or_else(crate::app_config::resolve_session_ttl_override)
-        .unwrap_or(1800u64);
-    std::time::Duration::from_secs(secs)
+fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
+    let raw = WEB_TTL.lookup();
+    if matches!(raw, Err(std::env::VarError::NotPresent))
+        && let Some(secs) = crate::app_config::resolve_session_ttl_override()
+    {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    WEB_TTL.parse(raw).map(std::time::Duration::from_secs)
 }
 
-/// Parse a duration string: a bare integer is seconds (legacy), otherwise one
-/// or more `<number><unit>` segments with units `h` / `m` / `s`
-/// (e.g. `30m`, `1h`, `24h`, `90s`, `1h30m`). Total: any malformed input
-/// returns `None` (caller falls back to the default) — never panics.
+/// The `503` a request answers when the session TTL cannot be resolved.
 #[cfg(feature = "server")]
-fn parse_duration_secs(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Bare integer → seconds (legacy form).
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
-    }
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    let mut saw_unit = false;
-    let mut saw_digit = false;
-    for ch in s.chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.checked_mul(10)?.checked_add(d as u64)?;
-            saw_digit = true;
-        } else {
-            let unit_secs = match ch {
-                'h' => 3600,
-                'm' => 60,
-                's' => 1,
-                _ => return None, // unknown unit / stray char → malformed
-            };
-            if !saw_digit {
-                return None; // a unit with no preceding number
-            }
-            total = total.checked_add(num.checked_mul(unit_secs)?)?;
-            num = 0;
-            saw_digit = false;
-            saw_unit = true;
-        }
-    }
-    // A trailing number with no unit (e.g. `1h30`) is malformed.
-    if saw_digit || !saw_unit {
-        return None;
-    }
-    Some(total)
+fn ttl_unavailable_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        FAIL_CLOSED_BODY,
+    )
+        .into_response()
 }
 
 /// Graceful-drain grace window: how long the pure axum graceful drain is allowed
@@ -1823,7 +1811,7 @@ fn parse_duration_secs(raw: &str) -> Option<u64> {
 /// When `true`, the web request handler skips the session-checkpoint lookup
 /// (`get_reconstructing`) and forces every returning session to a fresh `init`,
 /// bypassing the additive-splice algorithm entirely. This is the escape hatch
-/// for `ipe watch --reset-state`: the watch process sets the flag in the child's
+/// for `ipe dev watch --reset-state`: the watch process sets the flag in the child's
 /// env for the lifetime of that binary. Dev-only; a release binary is never
 /// launched with this flag by the CLI.
 ///
@@ -2189,10 +2177,16 @@ where
         // A fail-closed store config (e.g. prod `IPE_WEB_STORE=sqlite` in a
         // build with no `db` feature) surfaces as a task error → stderr + exit
         // 1, never a silent downgrade to a different backend.
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -2287,17 +2281,17 @@ where
             // router that answers every path with the fixed 503 body (the
             // operator detail goes to the runtime log) — never a silent downgrade to a different backend and never a mount
             // that quietly serves real sessions on the wrong store.
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2390,17 +2384,17 @@ where
                 routed_resolvers(routes, not_found, set_page, render);
             // A mount has no task-error channel, so an unhonourable store config
             // fails closed as a 503-everywhere router (see `web_embed_router`).
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2715,10 +2709,16 @@ where
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
@@ -2995,7 +2995,7 @@ mod handlers {
             let (m, _cmd) = (st.init)(req);
             m
         };
-        // `IPE_WEB_RESET_STATE=1` (set by `ipe watch --reset-state` in the child
+        // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
         // evaluated once per request (cheap env read, cached by the OS) and is
@@ -3308,7 +3308,7 @@ mod handlers {
         // SSE open with a lightweight `swapped` frame. The client shows the
         // brief positive "updated ✓" toast only when it is a RECONNECT (it
         // already saw a prior `hello` this page-life), so a first page load is
-        // silent. A release / `ipe run` server never sets the env, so this
+        // silent. A release / `ipe dev run` server never sets the env, so this
         // frame is never emitted there.
         if crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
             .ok()
@@ -3320,7 +3320,7 @@ mod handlers {
 
         // Reconnect-resync.
         // A session restored from the store on a cold hit — or any process
-        // restart / `ipe watch` rebuild / redeploy paired with a persistent
+        // restart / `ipe dev watch` rebuild / redeploy paired with a persistent
         // store — has no live subscriptions from the previous process, so
         // nothing pushes until the next user Msg. Render the current view once
         // and ship it as a full-body `event: patch` frame; the client consumes
@@ -3342,7 +3342,7 @@ mod handlers {
 
         // Replay the latest build-status so a browser refresh during a failed
         // build immediately shows the sticky error banner without waiting for
-        // the next `ipe watch` status POST. A `None` status (no build has run
+        // the next `ipe dev watch` status POST. A `None` status (no build has run
         // yet, or production) sends nothing. Best-effort: a full channel is
         // fine — the next reload or real status event will catch up.
         {
@@ -3546,7 +3546,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-appearance (dev-only) ──────────────────────────
     // The running server's inbound leg of the appearance-hot-swap live socket.
-    // The `ipe watch` process (a SEPARATE process from the running app) computes
+    // The `ipe dev watch` process (a SEPARATE process from the running app) computes
     // an appearance-only table patch for an edited `view` and POSTs it here; the
     // handler registers it and re-renders every live session's `view(currentModel)`,
     // pushing the resulting VDOM diff over the existing SSE `patches` channel —
@@ -3612,7 +3612,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-transition (dev-only) ──────────────────────────
     // The running server's inbound leg of the `update`-arm transition-hot-swap
-    // live socket. The `ipe watch` process computes a transition patch for an
+    // live socket. The `ipe dev watch` process computes a transition patch for an
     // edited data-describable arm and POSTs it here; the handler registers the
     // replacement `Transition` under the arm's baked-datum signature, so the next
     // dispatch of that arm applies the edited transition through the SAME compiled
@@ -3690,7 +3690,7 @@ mod handlers {
     // ── POST /_ipe/hot-msg (dev-only) ─────────────────────────────────
     // The running server's inbound leg of the additive-`Msg`-variant hot-swap
     // live socket. When a source edit adds a `Msg` variant (plus its arm and a
-    // button firing it), `ipe watch` computes the edited program's `MsgSet`
+    // button firing it), `ipe dev watch` computes the edited program's `MsgSet`
     // descriptor and POSTs it here alongside the live baked descriptor. The
     // handler accepts it ONLY when it is a proven additive superset of the live
     // set (every live variant present, unchanged), so a returning session's live
@@ -3777,7 +3777,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-subs (dev-only) ────────────────────────────────
     // The running server's inbound leg of the `subscriptions`-entry hot-swap live
-    // socket. The `ipe watch` process computes a sub patch for an edited
+    // socket. The `ipe dev watch` process computes a sub patch for an edited
     // data-describable subscription (an interval or tick-message change) and POSTs
     // it here; the handler registers the replacement `SubDescription` under the
     // entry's baked-datum signature, so the next re-subscribe of that entry builds
@@ -3857,7 +3857,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-init (dev-only) ────────────────────────────────
     // The running server's inbound leg of the session-`init` hot-swap live
-    // socket. The `ipe watch` process computes an init patch for an edited
+    // socket. The `ipe dev watch` process computes an init patch for an edited
     // data-describable `init` and POSTs it here; the handler registers the
     // replacement `InitDatum` under the app's baked-datum signature, so the NEXT
     // NEW session decodes the edited init through the SAME compiled
@@ -3935,7 +3935,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-wiring (dev-only) ──────────────────────────────
     // The running server's inbound leg of the `update`-arm Cmd-WIRING hot-swap
-    // live socket. The `ipe watch` process computes a wiring patch for an edited
+    // live socket. The `ipe dev watch` process computes a wiring patch for an edited
     // arm (which compiled effect it fires) and POSTs it here; the handler
     // registers the replacement `CmdWiring` under the arm's baked-datum signature,
     // so the next dispatch of that arm fires the edited (already-compiled) effect
@@ -4013,12 +4013,12 @@ mod handlers {
     }
 
     // ── POST /_ipe/watch/status (dev-only) ───────────────────────────
-    // Inbound build-status notification from `ipe watch`. Guarded two ways
+    // Inbound build-status notification from `ipe dev watch`. Guarded two ways
     // so it is inert in production:
     //   1. The route is MOUNTED only when the dev banner is active (non-
     //      production + `IPE_WEB_BANNER` not disabled + root-mounted).
     //   2. The `X-Ipe-Hot-Token` header MUST match the per-process token
-    //      set by `ipe watch` (the same mechanism as `/_ipe/hot-appearance`).
+    //      set by `ipe dev watch` (the same mechanism as `/_ipe/hot-appearance`).
     //      A web page cannot obtain this token, so the token alone is the
     //      trust boundary (same model as `/_ipe/hot-appearance`).
     //
@@ -4941,6 +4941,9 @@ where
     let body_limit: usize = WEB_MAX_BODY_CEILING
         .read()
         .map_err(StartupRefusal::Ceiling)?;
+    let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
     if let Err(refusal) = client_tuning_js() {
@@ -5209,7 +5212,7 @@ where
         }
     };
     if !proxy_active && console::gate_allows() {
-        store::emit_memory_store_log(web_ttl());
+        store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
             &format!(
@@ -5652,28 +5655,70 @@ mod dev_banner_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod duration_parse_tests {
-    use super::parse_duration_secs;
+    use super::{WEB_TTL, web_ttl};
+    use crate::system::{locked_remove_var, locked_set_var};
+    use std::time::Duration;
 
-    #[test]
-    fn duration_formats_and_bare_seconds() {
-        assert_eq!(parse_duration_secs("1800"), Some(1800)); // bare seconds (legacy)
-        assert_eq!(parse_duration_secs("30m"), Some(1800));
-        assert_eq!(parse_duration_secs("1h"), Some(3600));
-        assert_eq!(parse_duration_secs("24h"), Some(86400));
-        assert_eq!(parse_duration_secs("90s"), Some(90));
-        assert_eq!(parse_duration_secs("1h30m"), Some(5400));
-        assert_eq!(parse_duration_secs("45m"), Some(2700)); // the e2e check (IPE_WEB_TTL=45m)
-        assert_eq!(parse_duration_secs("  1h  "), Some(3600));
+    fn ttl_with(raw: &str) -> Result<Duration, crate::system::EnvCeilingRefusal> {
+        locked_set_var("IPE_WEB_TTL", raw);
+        let resolved = web_ttl();
+        locked_remove_var("IPE_WEB_TTL");
+        resolved
     }
 
     #[test]
-    fn malformed_is_none_never_panics() {
-        assert_eq!(parse_duration_secs(""), None);
-        assert_eq!(parse_duration_secs("abc"), None);
-        assert_eq!(parse_duration_secs("1d"), None); // unsupported unit
-        assert_eq!(parse_duration_secs("1h30"), None); // trailing unit-less number
-        assert_eq!(parse_duration_secs("m"), None); // unit with no number
-        assert_eq!(parse_duration_secs("-5m"), None);
+    fn the_web_ttl_honours_the_duration_contract() {
+        crate::system::assert_env_duration_contract(WEB_TTL);
+    }
+
+    #[test]
+    fn duration_formats_and_bare_seconds() {
+        for (raw, secs) in [
+            ("1800", 1800),
+            ("30m", 1800),
+            ("1h", 3600),
+            ("24h", 86_400),
+            ("90s", 90),
+            ("1h30m", 5400),
+            ("45m", 2700),
+            ("34560000", 34_560_000),
+            ("9600h", 34_560_000),
+        ] {
+            assert_eq!(ttl_with(raw), Ok(Duration::from_secs(secs)), "{raw:?}");
+        }
+        assert_eq!(
+            web_ttl(),
+            Ok(Duration::from_secs(1800)),
+            "absent is the default"
+        );
+    }
+
+    #[test]
+    fn a_malformed_ttl_is_refused_never_defaulted() {
+        for raw in [
+            "",
+            "abc",
+            "1d",
+            "1h30",
+            "m",
+            "-5m",
+            "0",
+            "0s",
+            "0h0m",
+            " 1h",
+            "1h ",
+            "30m1h",
+            "1m1m",
+            "34560001",
+            "9601h",
+            "99999999999999999999",
+        ] {
+            let outcome = ttl_with(raw);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == "IPE_WEB_TTL"),
+                "{raw:?} must be refused naming IPE_WEB_TTL, got {outcome:?}"
+            );
+        }
     }
 }
 
@@ -8751,7 +8796,7 @@ mod bind_error_tests {
         };
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
             let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe run"), "{msg}");
+            assert!(msg.contains("IPE_WEB_PORT=8123 ipe dev run"), "{msg}");
         }
         let relocated = resolve(Some("9100"), Some("9200"));
         assert_eq!(relocated.port, 9100);
@@ -9129,6 +9174,40 @@ mod emitted_router_behavior_tests {
             .expect("multi-thread runtime");
         rt.block_on(body());
         crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// A malformed session TTL or auth ceiling refuses the router at startup,
+    /// naming the variable, instead of answering requests under a default.
+    #[tokio::test]
+    async fn a_malformed_ttl_or_auth_ceiling_refuses_the_router() {
+        let mut cases = vec![("IPE_WEB_TTL", "1h30")];
+        if cfg!(feature = "jwt") {
+            cases.extend([
+                ("IPE_AUTH_MAX_LIFETIME", "8h"),
+                ("IPE_AUTH_SLIDE_WINDOW", "0"),
+                ("IPE_REVOCATION_CAPACITY", " 1024"),
+            ]);
+        }
+        for (name, raw) in cases {
+            crate::system::locked_set_var(name, raw);
+            let refused = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(
+                make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+                false,
+            )
+            .err();
+            crate::system::locked_remove_var(name);
+            assert!(
+                matches!(&refused, Some(StartupRefusal::Ceiling(r)) if r.name() == name),
+                "{name}={raw:?} must refuse the router, got {refused:?}"
+            );
+        }
     }
 
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────

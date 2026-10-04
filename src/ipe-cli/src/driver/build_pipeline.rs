@@ -7,6 +7,7 @@ use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path,
     ffi, fs, project, render, runtime_embed, text,
 };
+use ipe_backend_rust::rust_str_lit;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -30,7 +31,7 @@ pub struct BuildOptions {
     /// normal dynamic build; also removes a stale generated static config.
     pub static_plan: Option<ipe_backend_rust::static_build::StaticPlan>,
     /// The compilation target (`Native` default; `WasmClient` under
-    /// `ipe build --target wasm`) — threaded into kernel resolution (the
+    /// `ipe dev build --target wasm`) — threaded into kernel resolution (the
     /// Layer-1 wasm gate), the emitted manifest, and both cache keys.
     pub target: ipe_ir::Target,
     /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
@@ -55,7 +56,7 @@ pub struct BuildOptions {
     /// `Release` (the default) rejects any development-only `Debug.*` escape
     /// hatch (IPE-L0140) and omits the runtime `dev-posture` feature, so the
     /// console stays closed until `IPE_CONSOLE_AUTH` is set. Only a dev verb
-    /// (`ipe build` / `run` / `test` / `watch`) states `Development`.
+    /// (`ipe dev build` / `run` / `test` / `watch`) states `Development`.
     pub intent: ipe_backend_rust::BuildIntent,
     /// `true` (the DEFAULT) selects the dependency-model emit: the emitted
     /// project declares the runtime as a path dependency with a
@@ -69,7 +70,7 @@ pub struct BuildOptions {
     /// a test).
     pub runtime_dep: bool,
     /// `true` tree-shakes the vendored runtime tree to only the modules the
-    /// program reaches — the `ipe eject` shape. The emitted `ipe_runtime/mod.rs`
+    /// program reaches — the `ipe release eject` shape. The emitted `ipe_runtime/mod.rs`
     /// already declares `pub mod X;` for exactly the reached top-level modules,
     /// so [`build_emit_manifest`] vendors only those source files instead of the
     /// whole runtime tree. Ignored unless the emit is the vendored shape (it has
@@ -85,7 +86,7 @@ pub struct BuildOptions {
     /// named accordingly. Empty string uses the safe `"ipe-app"` default
     /// (single-file builds with no manifest).
     pub cargo_name: String,
-    /// `true` when `ipe build --debugger` / `ipe run --debugger` was passed.
+    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed.
     /// Threaded through [`ipe_db::BuildConfig`] to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the
     /// `debugger` feature to the emitted project's runtime dependency so the TEA
@@ -96,8 +97,8 @@ pub struct BuildOptions {
     /// `true` routes style-value literals through a per-view `LiteralTable` and
     /// emits the `/_ipe/hot-appearance` endpoint, so an appearance-only source
     /// edit hot-swaps in the running app instead of forcing a recompile. Set
-    /// ONLY by the `ipe watch` entry (from [`hot_appearance_enabled`]); the
-    /// `ipe build` / `ipe run` / `ipe release` entries leave it `false` so a
+    /// ONLY by the `ipe dev watch` entry (from [`hot_appearance_enabled`]); the
+    /// `ipe dev build` / `ipe dev run` / `ipe release` entries leave it `false` so a
     /// release artifact never carries hot-swap scaffolding. Default `false`.
     pub hot_appearance: bool,
     /// `true` when the resolved delivery is `web desktop` (webview-native).
@@ -163,7 +164,7 @@ pub fn runtime_dep_from_env() -> bool {
 /// broken emit, defeating the seal the coverage sweep exists to hold. Setting a
 /// UNIQUE name per build gives each app crate its own fingerprint, so a broken
 /// emit still fails to build even against a warm target. Unset (every ordinary
-/// `ipe run` / `ipe build`), the name is empty and the emit keeps the `ipe-app`
+/// `ipe dev run` / `ipe dev build`), the name is empty and the emit keeps the `ipe-app`
 /// default — this lever changes nothing for a normal build.
 #[must_use]
 pub fn single_file_cargo_name_from_env() -> String {
@@ -188,16 +189,16 @@ fn canonical_project_dir(manifest_path: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Whether the dev-only appearance hot-swap emit is enabled for `ipe watch`.
+/// Whether the dev-only appearance hot-swap emit is enabled for `ipe dev watch`.
 ///
-/// Default ON: `ipe watch` hot-swaps appearance-only edits (e.g. `Ui.spacing`)
+/// Default ON: `ipe dev watch` hot-swaps appearance-only edits (e.g. `Ui.spacing`)
 /// without a recompile out of the box. Opt out with `IPE_WATCH_NO_HOT_APPEARANCE`
 /// (set to any non-empty value other than `0`), which forces the plain
 /// direct-literal emit. `IPE_WATCH_HOT_APPEARANCE`, when set, is honoured
 /// explicitly (`0` or empty = off, anything else = on) and overrides the
 /// default; the opt-out takes precedence over it.
 ///
-/// This lever exists ONLY in `ipe watch`. `ipe build` / `ipe run` / `ipe release`
+/// This lever exists ONLY in `ipe dev watch`. `ipe dev build` / `ipe dev run` / `ipe release`
 /// thread [`BuildOptions::hot_appearance`] `= false`, so a release artifact never
 /// carries hot-swap scaffolding regardless of these variables.
 #[must_use]
@@ -220,7 +221,7 @@ pub fn hot_appearance_from_env(no_var: Option<&str>, hot_var: Option<&str>) -> b
     hot_var.is_none_or(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether the dev-only browser build-status banner is enabled for `ipe watch`.
+/// Whether the dev-only browser build-status banner is enabled for `ipe dev watch`.
 ///
 /// Enabled unless `IPE_WEB_BANNER` is explicitly `off`/`0`/`false`. Mirrors the
 /// runtime's `watch_banner_active` disable semantics so the CLI-side poster and
@@ -235,9 +236,9 @@ pub fn watch_banner_enabled() -> bool {
     })
 }
 
-/// Whether the DEV-ONLY blue-green front proxy is enabled for `ipe watch`.
+/// Whether the DEV-ONLY blue-green front proxy is enabled for `ipe dev watch`.
 ///
-/// Default ON: `ipe watch` puts a persistent proxy on the user's port and cuts
+/// Default ON: `ipe dev watch` puts a persistent proxy on the user's port and cuts
 /// each rebuilt binary over behind it once it passes readiness, so a rebuild
 /// never drops the browser's connection (no "Reconnecting…" flash — the client
 /// gets a brief "updated ✓" toast instead). Opt out with `IPE_WATCH_NO_BLUEGREEN`
@@ -245,7 +246,7 @@ pub fn watch_banner_enabled() -> bool {
 /// kill-old-then-spawn-new path. The legacy `IPE_WATCH_BLUEGREEN` still forces a
 /// choice when set (`0`/empty ⇒ off, anything else ⇒ on) and takes precedence
 /// over the default but yields to the opt-out. This lever exists ONLY in
-/// `ipe watch`; it is never compiled into a release binary or an emitted app.
+/// `ipe dev watch`; it is never compiled into a release binary or an emitted app.
 #[must_use]
 pub fn bluegreen_enabled() -> bool {
     bluegreen_from_env_values(
@@ -278,7 +279,7 @@ impl BuildOptions {
     /// environment (dependency-model by default; vendored under
     /// `IPE_RUNTIME_VENDORED=1`). The zero-configuration entrypoints
     /// ([`build`], [`build_loose_file`], [`build_project`]) seed
-    /// this so a library caller gets the same default emit model a `ipe build`
+    /// this so a library caller gets the same default emit model a `ipe dev build`
     /// invocation does, rather than the raw `Default` (which is vendored — the
     /// fallback shape).
     #[must_use]
@@ -379,7 +380,7 @@ pub fn build_with_options_into(
 ///
 /// When no manifest is present, an import `A.B` resolves to `A/B.ipe` under
 /// the entry file's directory, so a multi-file program builds via the
-/// file-path shorthand (`ipe build src/Main.ipe`).
+/// file-path shorthand (`ipe dev build src/Main.ipe`).
 ///
 /// The module set is the entry plus the sibling modules its imports reach,
 /// resolved by [`crate::loose_file::resolve_loose_file`] (see
@@ -500,7 +501,7 @@ pub struct CollectedSources {
 /// single-entry analysis paths ([`lower_entry_via_graph`], [`emit_ir_text`]) so all
 /// three see the SAME module set. It delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
-/// `ipe watch` and `ipe lsp` also use — so every surface compiles the same
+/// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
 /// bounded closure: one probed path per import, regular files contained in
 /// the entry's directory only, within
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`], and no directory
@@ -527,7 +528,7 @@ pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, CliE
 
 /// Collect the sources for a manifest-governed file analysed by itself (e.g.
 /// `ipe type-check src/Api/Handlers.ipe`): the WHOLE `src_root` tree — the
-/// same [`project::discover_modules`] set `ipe build` compiles — rather than
+/// same [`project::discover_modules`] set `ipe dev build` compiles — rather than
 /// the loose closure rooted at the file's own directory.
 ///
 /// The loose closure ([`collect_entry_and_siblings`]) resolves an import
@@ -1341,7 +1342,7 @@ pub fn source_for_span_in_linked(
 /// error with a non-empty `home` resolves DIRECTLY via `home_to_source`; only
 /// one with an empty home falls back to the byte-offset heuristic over the
 /// linked program. This is the single attribution rule every post-link
-/// pipeline error shares, so `ipe build` and `ipe type-check` frame the
+/// pipeline error shares, so `ipe dev build` and `ipe type-check` frame the
 /// identical diagnostic against the identical source.
 pub fn attribute_post_link_error(
     linked: &ipe_canon::ast::Module,
@@ -1949,11 +1950,12 @@ pub fn compile_prepared(
 /// The registration is a single `ipe_runtime::web::widget_assets::register(&[…])`
 /// call spliced in right after `install_panic_classifier();` in the generated
 /// `main()` — the first line of the entry point, before any task runs. Each
-/// `(tag, content)` is rendered as a Rust string-literal pair; the content is
-/// emitted as a raw string literal with a hash fence wide enough to clear any run
-/// of `#` in the file, so arbitrary JS (including embedded `"` / `#`) is a valid
-/// literal and no author byte can break out of the string into code (the content
-/// is DATA in the emitted program, exactly as it is data in the browser).
+/// `(tag, content)` is rendered as a Rust string-literal pair through the
+/// backend's one literal owner, `rust_str_lit`, which escapes every scalar the
+/// literal grammar cannot carry raw (`"`, `\`, a lone CR, a bidi override), so
+/// arbitrary JS is a valid literal rustc accepts and no author byte can break
+/// out of the string into code (the content is DATA in the emitted program,
+/// exactly as it is data in the browser).
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `src/main.rs` is absent
@@ -1985,9 +1987,9 @@ pub fn inject_widget_registration(
     let mut entries = String::new();
     for (tag, content) in manifest {
         entries.push_str("        (");
-        entries.push_str(&rust_str_literal(tag));
+        entries.push_str(&rust_str_lit(tag));
         entries.push_str(", ");
-        entries.push_str(&rust_raw_str_literal(content));
+        entries.push_str(&rust_str_lit(content));
         entries.push_str("),\n");
     }
     let call = format!("\n    ipe_runtime::web::widget_assets::register(&[\n{entries}    ]);\n");
@@ -2102,36 +2104,6 @@ pub fn inject_wasm_widget_bundle(
     };
     index.insert_str(pos, &scripts);
     Ok(())
-}
-
-/// Render `s` as a double-quoted Rust string literal.
-///
-/// Rust's own `Debug` grammar escapes every character a literal cannot carry
-/// raw, bidi overrides included.
-pub fn rust_str_literal(s: &str) -> String {
-    format!("{s:?}")
-}
-
-/// Render `s` as a Rust RAW string literal `r#"…"#` with a hash fence wide enough
-/// to clear any `"#` run inside `s`, so arbitrary content (author JS with quotes
-/// and hashes) is emitted verbatim as data — it can never terminate the literal
-/// early and spill into code.
-pub fn rust_raw_str_literal(s: &str) -> String {
-    // The fence must be longer than the longest run of `#` that immediately
-    // follows a `"` in the content (that is the only sequence that could close a
-    // raw literal). Computing the max `#`-run overall is a safe over-approximation.
-    let mut max_hashes = 0usize;
-    let mut run = 0usize;
-    for ch in s.chars() {
-        if ch == '#' {
-            run += 1;
-            max_hashes = max_hashes.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    let fence = "#".repeat(max_hashes + 1);
-    format!("r{fence}\"{s}\"{fence}")
 }
 
 /// Write an emitted project to `target`, vendoring the runtime module tree
@@ -2308,7 +2280,41 @@ pub fn build_emit_manifest(
     for (rel, contents) in &emitted.files {
         manifest.insert(PathBuf::from(rel.as_str()), contents.clone());
     }
+    refuse_unlexable_rust(&manifest)?;
     Ok(manifest)
+}
+
+/// Refuse a manifest whose `.rs` text holds a character the Rust lexer refuses raw.
+///
+/// The scan covers the FINAL manifest — vendored runtime, backend emit, post-emit
+/// injections and a cache-deserialized project alike — so no text reaches
+/// `cargo` that would make it fail a program `ipe` accepted. The detail names the
+/// file, byte offset and code point through the hazard's own rendering, never the
+/// raw character.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying [`Diagnostic::CompilerBug`] on the first hit.
+fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), CliError> {
+    let hit = manifest
+        .iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        })
+        .find_map(|(path, text)| ipe_intern::find_lexer_hazard(text).map(|hazard| (path, hazard)));
+    hit.map_or(Ok(()), |(path, hazard)| {
+        let shown = path.to_string_lossy();
+        Err(CliError::Pipeline {
+            file: path.clone(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::CompilerBug {
+                where_: ipe_intern::EMIT_LEXABLE,
+                detail: format!(
+                    "emitted {shown:?} holds {hazard}, which the Rust lexer refuses raw"
+                ),
+            }),
+        })
+    })
 }
 
 /// Vendor only the runtime source files the emitted `mod.rs` reaches.
@@ -2668,7 +2674,7 @@ pub fn build_project_into(
         &canonical_project_dir(manifest_path),
     );
     let options = BuildOptions {
-        wasm_public_env: manifest.wasm.public_env.clone(),
+        wasm_public_env: manifest.wasm.public_env.to_names(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,
@@ -2746,9 +2752,100 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A widget's JS reaches the emitted `main.rs` with every bidi override and
+    /// lone CR escaped, since rustc refuses either raw inside any string literal.
     #[test]
-    fn rust_str_literal_escapes_quotes_backslashes_and_bidi_overrides() {
-        assert_eq!(rust_str_literal("a\u{202E}\"b\\"), r#""a\u{202e}\"b\\""#);
+    fn widget_registration_escapes_bidi_and_lone_cr_in_content() {
+        let mut files = BTreeMap::new();
+        let rel = ipe_backend::RelPath::new("src/main.rs").expect("valid rel path");
+        files.insert(
+            rel,
+            "fn main() {\n    install_panic_classifier();\n}\n".to_owned(),
+        );
+        let mut emitted = ipe_backend::EmittedProject {
+            files,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        };
+        let manifest = BTreeMap::from([(
+            "x-w\u{202E}".to_owned(),
+            "/* \u{202E}evil\u{2066} */ a\rb \"#\"## c\\d".to_owned(),
+        )]);
+        assert!(inject_widget_registration(&mut emitted, &manifest).is_ok());
+        let main = emitted.files.get("src/main.rs").map_or("", String::as_str);
+        assert!(
+            !main.contains(['\u{202E}', '\u{2066}', '\r']),
+            "a raw bidi override or lone CR reached the emitted literal: {main}"
+        );
+        assert!(
+            main.contains(
+                r###"("x-w\u{202e}", "/* \u{202e}evil\u{2066} */ a\rb \"#\"## c\\d"),"###
+            ),
+            "the widget pair is not the Debug-escaped literal pair: {main}"
+        );
+    }
+
+    /// An emitted project for the manifest: a vendored `mod.rs` that declares
+    /// no runtime module, so the scan sees only `files` and reads no disk.
+    fn vendored_project(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
+        let mut map = BTreeMap::new();
+        for (path, body) in files.iter().chain(&[("src/ipe_runtime/mod.rs", "")]) {
+            let rel = ipe_backend::RelPath::new(*path).expect("valid rel path");
+            map.insert(rel, (*body).to_owned());
+        }
+        ipe_backend::EmittedProject {
+            files: map,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        }
+    }
+
+    /// The manifest refuses `.rs` text holding a raw bidi control or a bare CR,
+    /// past every renderer, and names the hazard without echoing it.
+    #[test]
+    fn manifest_refuses_a_raw_lexer_hazard() {
+        let missing = Path::new("/nonexistent-runtime-dir");
+        for (path, body) in [
+            ("src/main.rs", "fn main() { let _ = \"a\u{202E}b\"; }\n"),
+            ("src/ipe_runtime/x.rs", "// a\rb\n"),
+            ("src/ipe_mods/upper.RS", "// a\u{2066}b\n"),
+        ] {
+            let refused = build_emit_manifest(&vendored_project(&[(path, body)]), missing, true);
+            assert!(
+                matches!(&refused, Err(CliError::Pipeline { .. })),
+                "a raw hazard in {path} passed the manifest"
+            );
+            let Err(CliError::Pipeline { file, diag, .. }) = refused else {
+                return;
+            };
+            assert_eq!(file, PathBuf::from(path));
+            assert!(
+                matches!(
+                    &*diag,
+                    Diagnostic::CompilerBug {
+                        where_: ipe_intern::EMIT_LEXABLE,
+                        ..
+                    }
+                ),
+                "not the lexability refusal: {diag:?}"
+            );
+            let Diagnostic::CompilerBug { detail, .. } = *diag else {
+                return;
+            };
+            assert!(
+                !detail.contains(['\u{202E}', '\r']),
+                "the refusal echoed the raw hazard: {detail:?}"
+            );
+        }
+        for (path, body) in [
+            ("src/main.rs", "fn main() {}\r\n// \u{200E}\u{FEFF} é 𝄞\r\n"),
+            ("www/index.html", "<p>\u{202E}\r</p>"),
+        ] {
+            assert!(
+                build_emit_manifest(&vendored_project(&[(path, body)]), missing, true).is_ok(),
+                "lexable or non-Rust text in {path} was refused"
+            );
+        }
     }
 
     /// A build whose caller states no intent is a release build.

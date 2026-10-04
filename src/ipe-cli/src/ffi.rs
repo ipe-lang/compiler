@@ -702,7 +702,7 @@ fn merge_cargo_dep(
 
 /// All FFI seam outputs produced from a single project-scoped catalog load.
 ///
-/// Returned by [`prepare_ffi`]; consumed by the build pipeline, `ipe watch`,
+/// Returned by [`prepare_ffi`]; consumed by the build pipeline, `ipe dev watch`,
 /// and `ipe lsp` so all three go through exactly the same injection steps.
 pub struct FfiPrep {
     /// The parsed per-crate entries — used to assemble [`ipe_backend_rust::FfiEmit`].
@@ -720,7 +720,7 @@ pub struct FfiPrep {
 
 /// Load, inject, and assemble the FFI catalog for a project in one step.
 ///
-/// This is the shared seam used by `run_build`, `ipe watch`, and `ipe lsp` so
+/// This is the shared seam used by `run_build`, `ipe dev watch`, and `ipe lsp` so
 /// all three compilation paths go through the SAME catalog-load → interface-
 /// inject → emit-assemble sequence. Each caller was previously duplicating
 /// these steps independently, or (in `watch`/`lsp`) skipping them entirely —
@@ -1792,7 +1792,7 @@ fn install_wrapper(
 /// The refuse-until-jail → admit-and-isolate hand-off is per-target: a
 /// runtime-enforced axis is admitted only where the jail actually holds. The
 /// deploy target is unknown at install, so the honest proxy is this host's jail
-/// capability — `ipe add` and `ipe run` typically run on the same machine. It is
+/// capability — `ipe add` and `ipe dev run` typically run on the same machine. It is
 /// built from [`ipe_sandbox::run_jail::platform_confined_axes`] — the SET of
 /// runtime-enforced axes the compiled-in `exec_in_run_jail` arm actually confines
 /// on this host, single-sourced to that arm by the `on_jailed_target!` macro. So
@@ -5000,6 +5000,31 @@ version = \"1\"
                 })
             ),
             "a direct-crate conflict must refuse even when its lib ident differs: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_underscore_named_direct_crate_conflict_is_refused() {
+        // The direct set and the dependency keys compare one typed package-name
+        // spelling, so `foo_bar` is direct on both sides and never deferred.
+        let refused = emit_of(&[
+            typed_crate("foo_bar", "foo_bar", &["foo_bar = \"=1.0.0\""]),
+            typed_crate(
+                "other",
+                "other",
+                &["other = \"=1.0.0\"", "foo_bar = \"=2.0.0\""],
+            ),
+        ]);
+        assert!(
+            refused_as(
+                &refused,
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                    name: "foo_bar".to_owned(),
+                    first: "1.0.0".to_owned(),
+                    second: "2.0.0".to_owned(),
+                })
+            ),
+            "a direct crate named with `_` must refuse its conflict: {refused:?}"
         );
     }
 

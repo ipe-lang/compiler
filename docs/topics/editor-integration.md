@@ -48,7 +48,7 @@ Two pieces make an editor understand Ipê:
 Completion is type-directed: where the context expects a type (a function
 argument, a typed binding's body, a branch, a list element), candidates of that
 type come first and the type's constructors are surfaced. Every suggestion comes
-from the type-checker `ipe build` runs. After a qualifier (`Font.`, an alias
+from the type-checker `ipe dev build` runs. After a qualifier (`Font.`, an alias
 `F.`, or a full dotted path `Ipe.Ui.Font.`), completion is scoped to exactly
 that module's exposed members — never the whole in-scope list — and accepting
 an item replaces whatever member name is already typed rather than appending to
@@ -63,7 +63,7 @@ project loads (a broken `package.ipe`, say) gets no lint findings and no
 project did not configure.
 
 A project the compiler refuses to load (an untrusted FFI or manifest, a source
-past a size limit) shows one error — the refusal `ipe build` would print — on
+past a size limit) shows one error — the refusal `ipe dev build` would print — on
 the file that triggered the load, and every earlier finding is withdrawn: the
 editor never keeps showing analysis of a project the compiler rejects.
 

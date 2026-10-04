@@ -3,7 +3,7 @@
 //! Decision record: `docs/adr/0007-build-incrementality-and-release-infra.md`.
 //!
 //! Everything in-process is memoized, but nothing survives ACROSS process
-//! invocations — every `ipe build` starts a cold [`ipe_db::IpeDatabase`].
+//! invocations — every `ipe dev build` starts a cold [`ipe_db::IpeDatabase`].
 //! This module closes that gap for the coarse, whole-project granularity
 //! that genuinely exists (`ipe_db::emit_project`'s output — see this
 //! module's own doc section below for why that is a deliberate, documented
@@ -37,7 +37,7 @@
 //! `files` maps `RelPath -> String`, `cargo_toml` is a `String`), so it
 //! serializes and deserializes losslessly with zero cross-process identity
 //! risk. The practical win is AT LEAST as large as literal IR caching would
-//! give for `ipe build`'s actual use case (a cold-start cache hit skips
+//! give for `ipe dev build`'s actual use case (a cold-start cache hit skips
 //! parse -> canon -> link -> infer -> lower -> emit ENTIRELY, not just
 //! infer -> lower -> emit), at the cost of not serving a hypothetical
 //! future interpreter tier that wants to consume `ipe_ir` directly (design
@@ -88,8 +88,8 @@
 //! guess, never a build failure: a compile just runs uncached, exactly as
 //! every build did before this module existed.
 //!
-//! **Not yet ported**: `ipe watch`'s specific mid-session UX (hard-refuse a
-//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe watch'`
+//! **Not yet ported**: `ipe dev watch`'s specific mid-session UX (hard-refuse a
+//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe dev watch'`
 //! while keeping the last-good binary alive) needs a live watch session to
 //! refuse INTO. The sound foundation that UX builds on is the version-epoch
 //! gate itself.
@@ -1087,13 +1087,13 @@ pub fn try_load(site: &CacheSite, epoch: &str, key: &str) -> Option<EmittedProje
 /// `key`/`epoch`. Every failure (directory creation, serialize, write,
 /// rename) is silently swallowed — a cache-write failure must never turn a
 /// successful build into a reported failure. Writes atomically (tmp file +
-/// rename) so a concurrent reader (a second `ipe build` racing this one)
+/// rename) so a concurrent reader (a second `ipe dev build` racing this one)
 /// never observes a partially-written entry; a torn read is impossible, a
 /// missing-then-appearing file is the only visible race, which `try_load`
 /// already treats as an ordinary miss.
 ///
 /// The tmp file name is unique to this process, so two concurrent
-/// `ipe build` invocations computing the same key never write to the same
+/// `ipe dev build` invocations computing the same key never write to the same
 /// tmp path and so never interleave into one entry a third reader could load.
 ///
 /// An in-output root writes through [`OwnedDir::path_to`]: a symlink planted
@@ -2326,7 +2326,7 @@ mod tests {
     /// **Cross-process id-drift proof, at the on-disk cache boundary.**
     /// Stores a `Program` written through one interner, then loads it
     /// through a COMPLETELY DIFFERENT, differently-polluted interner (the
-    /// scenario a real `ipe build` -> `ipe build` sequence produces: a
+    /// scenario a real `ipe dev build` -> `ipe dev build` sequence produces: a
     /// fresh `Interner::new()` per invocation). Asserts the relocated
     /// `Program`'s structural content (via `ipe_ir::pretty::pretty`,
     /// resolved-name comparison — not raw `Symbol` equality, which is not

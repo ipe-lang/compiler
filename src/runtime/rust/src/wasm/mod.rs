@@ -304,7 +304,7 @@ struct App<Model, Msg> {
     router: Option<Box<WasmRouter<Model, Msg>>>,
     /// Development-only time-travelling debugger recorder. Passive: records
     /// each live-pass `update` step without re-firing any `Cmd`. Present only
-    /// when the `debugger` feature is active (`ipe build/run --debugger`).
+    /// when the `debugger` feature is active (`ipe dev build/run --debugger`).
     #[cfg(feature = "debugger")]
     recorder: RefCell<crate::debugger::RecordBuffer<Msg, Model>>,
     /// Pre-rendered string labels for each recorded step, newest at the back.

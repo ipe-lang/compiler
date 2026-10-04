@@ -1,7 +1,7 @@
-Compile a program and run the resulting binary.
+Compile a program as a development build and run the resulting binary.
 
 ```
-ipe run [<path>]
+ipe dev run [<path>]
 ```
 
 ## Arguments

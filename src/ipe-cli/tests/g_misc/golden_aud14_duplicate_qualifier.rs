@@ -58,7 +58,7 @@ import Ipe.Io
     let Err(err) = built else {
         panic!(
             "expected DuplicateQualifier rejection for two modules sharing alias `Utils`, \
-             but ipe build SUCCEEDED — the last import silently won"
+             but ipe dev build SUCCEEDED — the last import silently won"
         )
     };
     let ipe::CliError::Pipeline { diag, .. } = &err else {

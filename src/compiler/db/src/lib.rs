@@ -29,10 +29,10 @@
 //! query-demand order; the one-shot `ipe` driver demands queries in a fixed
 //! topological order against a cold database, so emitted bytes are identical
 //! to the non-incremental pipeline (enforced by the golden-oracle suite).
-//! Warm-db reuse in production (`ipe watch`, the LSP session) is covered by
+//! Warm-db reuse in production (`ipe dev watch`, the LSP session) is covered by
 //! the clean-vs-incremental parity gate
 //! (`src/ipe-cli/tests/clean_vs_incremental_parity.rs`), which drives the
-//! same [`sync_source_root`] + `compile_prepared` primitives `ipe watch`
+//! same [`sync_source_root`] + `compile_prepared` primitives `ipe dev watch`
 //! calls and proves warm output byte-identical to a cold build across the
 //! full golden corpus plus a dedicated identifier-adding edit sequence. The
 //! LSP session never reaches emission (diagnostics-only), so the byte-level
@@ -364,15 +364,22 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         }
     }
 
-    // Known-module universe for the IPE-N0020 did-you-mean list. Strings
-    // only: interning module paths here (before their own canonicalize runs)
-    // would perturb the build-wide symbol numbering the byte-identity SEAL
-    // pins.
-    let known_modules: BTreeSet<Box<str>> = root
-        .files(db)
-        .keys()
-        .map(|path| path.join(".").into_boxed_str())
-        .collect();
+    // The importable-module catalog: project files plus compiled-source stdlib
+    // modules (the kernel paths are seeded by the catalog itself). Read only on
+    // diagnostic paths (IPE-N0020 did-you-mean, IPE-N0034 for an unbound
+    // qualifier). Strings only: interning module paths here (before their own
+    // canonicalize runs) would perturb the build-wide symbol numbering the
+    // byte-identity SEAL pins.
+    let catalog = ipe_canon::ModuleCatalog::new(
+        root.files(db)
+            .keys()
+            .map(|path| path.join(".").into_boxed_str())
+            .chain(
+                ipe_stdlib::COMPILED_STD_MODULES
+                    .iter()
+                    .map(|module| Box::<str>::from(module.dotted)),
+            ),
+    );
     let origin = file.origin(db);
 
     // One lock scope covers expected-path interning + canonicalisation — the
@@ -397,7 +404,7 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         &parsed,
         &expected_path,
         &deps,
-        &known_modules,
+        &catalog,
         *origin,
         &mut interner,
     )?;
@@ -1288,7 +1295,7 @@ pub struct BuildConfig {
     #[returns(ref)]
     pub ffi: Option<ipe_backend_rust::FfiEmit>,
     /// The compilation target (`Native` | `WasmClient` under
-    /// `ipe build --target wasm`) — selects the emitted manifest template,
+    /// `ipe dev build --target wasm`) — selects the emitted manifest template,
     /// vendored runtime module set, and entry shape.
     pub target: ipe_ir::Target,
     /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
@@ -1316,7 +1323,7 @@ pub struct BuildConfig {
     /// project. Threaded to [`ipe_backend_rust::RustBackend::with_runtime_dep`].
     #[returns(ref)]
     pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
-    /// `true` when `ipe build/run --debugger` selected the development-only
+    /// `true` when `ipe dev build/run --debugger` selected the development-only
     /// time-travelling debugger. Threaded to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the runtime
     /// `debugger` feature to the emitted project's dependency feature list so the

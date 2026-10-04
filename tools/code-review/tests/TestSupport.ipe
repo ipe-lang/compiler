@@ -70,9 +70,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -89,8 +89,6 @@ import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 
 
-
-
 tableExists : Db -> String -> Task.Task Error Bool
 tableExists db name =
     Db.findWhere db
@@ -100,7 +98,6 @@ tableExists db name =
             (Sql.eq (Sql.column "name") (Sql.string name))
         )
         |> Task.map (\rows -> List.length rows == 1)
-
 
 
 countReviewRows : Db -> String -> String -> Task.Task Error Int
@@ -114,7 +111,6 @@ countReviewRows db uid bodyHash =
         |> Task.map List.length
 
 
-
 expectErr : Task.Task Error Int -> Task.Task Error Bool
 expectErr t =
     t
@@ -122,13 +118,11 @@ expectErr t =
         |> Task.onError (\_ -> Task.succeed True)
 
 
-
 -- A refusal decision exists only with a parsed reason; a reason the test
 -- expects to be valid that `parseReason` refuses fails the run.
 refuse : String -> Task.Task Error Decision
 refuse text =
     Task.fromResult (Result.map Refused (LibDb.parseReason text))
-
 
 
 seedIndex : String -> String -> Task.Task Error ()
@@ -146,12 +140,10 @@ seedIndex indexDb repo =
         |> Task.andThen (\_ -> setIndexEnv indexDb repo)
 
 
-
 writeFileText : String -> String -> Task.Task Error ()
 writeFileText path text =
     Task.fromResult (Path.fromString path)
         |> Task.andThen (\p -> File.writeFile p text)
-
 
 
 fixtureLibRs : String
@@ -159,11 +151,9 @@ fixtureLibRs =
     "// fixture library\n\npub fn answer() -> i32 {\n    // the answer to everything\n    42\n}\n\npub fn other() -> i32 {\n    7\n}\n"
 
 
-
 fixtureMainIpe : String
 fixtureMainIpe =
     "module Main exposing (main)\n\nmain = ()\n"
-
 
 
 -- Lines 3..6 of `fixtureLibRs`, the source unit `u-a` attests.
@@ -172,12 +162,10 @@ viewA =
     "pub fn answer() -> i32 {\n    // the answer to everything\n    42\n}"
 
 
-
 -- Lines 1..2 of `fixtureMainIpe`, the source unit `u-b` attests.
 viewB : String
 viewB =
     "module Main exposing (main)\n"
-
 
 
 -- A source view's state as one comparable word; `Unreadable` carries the
@@ -201,7 +189,6 @@ viewTag view =
             "unreadable: " ++ Error.toString e
 
 
-
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =
     case view of
@@ -215,7 +202,6 @@ shownTextOf view =
             Nothing
 
 
-
 shownOf : Index.SourceView -> Maybe Index.ShownSource
 shownOf view =
     case view of
@@ -227,7 +213,6 @@ shownOf view =
 
         Unreadable _ ->
             Nothing
-
 
 
 -- The ipe-index vectors' name for a highlight language.
@@ -247,7 +232,6 @@ langName lang =
             "Unknown"
 
 
-
 unitViewTag : String -> List PageEntry -> String
 unitViewTag uid units =
     case List.find (\u -> u.uid == uid) units of
@@ -258,7 +242,6 @@ unitViewTag uid units =
             "absent"
 
 
-
 -- Runs one statement against a seeded scratch index database.
 execIndex : String -> String -> List SqlValue -> Task.Task Error ()
 execIndex indexDb sql params =
@@ -266,7 +249,6 @@ execIndex indexDb sql params =
         conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
         Db.exec conn sql params
         Task.succeed ()
-
 
 
 -- Like `execIndex`, with the schema's CHECK constraints off on the one
@@ -285,7 +267,6 @@ execIndexUnchecked indexDb sql params =
             )
 
 
-
 -- ── source attestation ──────────────────────────────────────────────────
 --
 -- A unit's source is shown only when its lines re-hash to the stored
@@ -293,7 +274,6 @@ execIndexUnchecked indexDb sql params =
 -- page.
 type alias Scratch =
     { repo : String, indexDb : String, reviewDb : String }
-
 
 
 -- A directory `File.tempDir` creates for this one call, named after `name`.
@@ -305,13 +285,11 @@ freshDir name =
     File.tempDir (name ++ "-")
 
 
-
 -- The scratch paths of one check, under its own `freshDir`.
 freshScratch : String -> Task.Task Error Scratch
 freshScratch name =
     freshDir name
         |> Task.map (\base -> { repo = base ++ "/repo", indexDb = base ++ "/index.db", reviewDb = base ++ "/review.db" })
-
 
 
 -- A migrated review store of its own, under a `freshDir` named `name`, handed
@@ -320,7 +298,6 @@ onFreshReview : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
 onFreshReview name f =
     freshDir name
         |> Task.andThen (\base -> onReviewAt (base ++ "/review.db") f)
-
 
 
 onReviewAt : String -> (Db -> Task.Task Error Bool) -> Task.Task Error Bool
@@ -334,7 +311,6 @@ onReviewAt reviewDb f =
         Task.succeed ok
 
 
-
 -- One named check. A check whose task fails is reported by name with its
 -- error and counted as failed; the run goes on to every later check and still
 -- exits non-zero, so one error neither hides which check raised it nor
@@ -342,7 +318,6 @@ onReviewAt reviewDb f =
 check : String -> Task.Task Error Bool -> Task.Task Error ( String, Bool )
 check name task =
     checkReporting Io.println name task
-
 
 
 -- `check` with the line naming a failed check's error sent to `report`.
@@ -353,13 +328,11 @@ checkReporting report name task =
         |> Task.onError (\e -> report (checkErrorLine name e) |> Task.map (\_ -> ( name, False )))
 
 
-
 -- The error is foreign text (a database or OS message), so it reaches the
 -- terminal rendered, never raw.
 checkErrorLine : String -> Error -> String
 checkErrorLine name e =
     "ERROR " ++ name ++ ": " ++ SafeText.toString (SafeText.renderForeign (Error.toString e))
-
 
 
 -- The real index schema, read verbatim from ipe-index's own fixture
@@ -379,7 +352,6 @@ indexSchemaStatements cwd =
             )
 
 
-
 -- Runs every statement of the real schema, in file order, on one connection.
 execIndexSchema : Db -> List String -> Task.Task Error ()
 execIndexSchema conn statements =
@@ -387,7 +359,6 @@ execIndexSchema conn statements =
         (\stmt acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Db.exec conn stmt [])) acc)
         (Task.succeed ())
         statements
-
 
 
 seedIndexDb : String -> Task.Task Error ()
@@ -401,7 +372,6 @@ seedIndexDb indexDb =
                     |> Task.andThen (\_ -> insertUnitRows conn)
             )
         |> Task.map (\_ -> ())
-
 
 
 insertUnitRows : Db -> Task.Task Error Int
@@ -474,12 +444,10 @@ insertUnitRows conn =
             )
 
 
-
 setIndexEnv : String -> String -> Task.Task Error ()
 setIndexEnv indexDb repo =
     System.setenv "IPE_INDEX_DB" indexDb
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
-
 
 
 -- One first-page unit with its queue row's change and the view
@@ -490,7 +458,6 @@ type alias PageEntry =
     , queued : Index.QueuedChange
     , view : Index.SourceView
     }
-
 
 
 -- The first queue page's units, each with its view read afterwards the one
@@ -505,7 +472,6 @@ loadFirstPage =
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) rows)
         total <- Index.countPending conn
         Task.succeed { units = entries, total = total }
-
 
 
 -- The queued change comes from the page's queue row, the one place it
@@ -528,12 +494,10 @@ pageEntry conn roots row =
             )
 
 
-
 -- The index read connection from the current `IPE_INDEX_*` environment.
 indexConn : Task.Task Error Db
 indexConn =
     Settings.indexSettings |> Task.andThen Index.readConnection
-
 
 
 -- The view of unit `uid` loaded from the index the current environment names.
@@ -543,7 +507,6 @@ loadUnitNow uid =
         settings <- Settings.indexSettings
         conn <- Index.readConnection settings
         Index.loadView conn settings.roots uid
-
 
 
 -- A decision on unit `uid` made the one way the app makes it: through
@@ -561,7 +524,6 @@ decideNow db uid decision =
                     Nothing ->
                         Task.fail (Error.conflict ("unit " ++ uid ++ " is not shown"))
             )
-
 
 
 checkUnits : Int -> List PageEntry -> Bool
@@ -583,7 +545,6 @@ checkUnits total units =
                         isUnitA a && isUnitB b
 
 
-
 listSecond : List a -> Maybe a
 listSecond items =
     case items of
@@ -592,7 +553,6 @@ listSecond items =
 
         [] ->
             Nothing
-
 
 
 isUnitA : PageEntry -> Bool
@@ -633,7 +593,6 @@ isUnitA entry =
         == Just viewA
 
 
-
 isUnitB : PageEntry -> Bool
 isUnitB entry =
     let
@@ -658,7 +617,6 @@ isUnitB entry =
         == Just viewB
 
 
-
 cleanupIndex : String -> String -> Task.Task Error ()
 cleanupIndex indexDb repo =
     Task.sequence
@@ -671,13 +629,11 @@ cleanupIndex indexDb repo =
         |> Task.map (\_ -> ())
 
 
-
 removeFileIfAny : String -> Task.Task Error ()
 removeFileIfAny path =
     Task.fromResult (Path.fromString path)
         |> Task.andThen File.remove
         |> Task.onError (\_ -> Task.succeed ())
-
 
 
 -- One character as a string, by code point: the language has no `\u{}`
@@ -687,11 +643,9 @@ codeText code =
     String.fromChar (Char.fromCode code)
 
 
-
 noHazard : String -> Bool
 noHazard text =
     not (String.any SafeText.isHazard text)
-
 
 
 rendered : String -> String
@@ -699,17 +653,14 @@ rendered raw =
     SafeText.toString (SafeText.render raw)
 
 
-
 renderedForeign : String -> String
 renderedForeign raw =
     SafeText.toString (SafeText.renderForeign raw)
 
 
-
 describeText : PathError -> String
 describeText err =
     SafeText.toString (RepoPath.describe err)
-
 
 
 -- A parse that failed, and failed for `reason` rather than an unrelated one.
@@ -723,7 +674,6 @@ refusedFor reason refusal =
             False
 
 
-
 -- The review database at a test file path, migrated through `LibDb.probe`,
 -- the app's one migrate, then opened.
 migratedReviewAt : String -> Task.Task Error Db
@@ -732,7 +682,6 @@ migratedReviewAt path =
         loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
         LibDb.probe loc
         LibDb.openAt loc
-
 
 
 -- A database's table names, SQLite's own excluded, in name order.
@@ -744,13 +693,11 @@ tableNames db =
         (Db.Decode.succeed identity |> Db.Decode.required "name" (Db.Decode.string "name"))
 
 
-
 -- Every table of a database with its row count, in name order.
 tableRowCounts : Db -> Task.Task Error (List ( String, Int ))
 tableRowCounts db =
     tableNames db
         |> Task.andThen (\names -> Task.sequence (List.map (tableRowCount db) names))
-
 
 
 tableRowCount : Db -> String -> Task.Task Error ( String, Int )
@@ -762,7 +709,6 @@ tableRowCount db name =
         |> Task.map (\rows -> ( name, List.sum rows ))
 
 
-
 -- The `Attested` proof for fixture unit `uid`, built the one way the app
 -- builds it: the unit is loaded from a seeded scratch index, its shown
 -- source re-verified by `Index.reverify`, and the scratch index removed. A
@@ -770,7 +716,6 @@ tableRowCount db name =
 attestedFor : String -> String -> Task.Task Error Index.Attested
 attestedFor name uid =
     freshScratch name |> Task.andThen (\at -> attestedIn at uid)
-
 
 
 attestedIn : Scratch -> String -> Task.Task Error Index.Attested
@@ -781,7 +726,6 @@ attestedIn at uid =
         attested <- reverifyShown uid found
         cleanupIndex at.indexDb at.repo
         Task.succeed attested
-
 
 
 reverifyShown : String -> Maybe Index.UnitView -> Task.Task Error Index.Attested
@@ -802,7 +746,6 @@ reverifyShown uid found =
             Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is not in the index"))
 
 
-
 -- A test file path opened read-only through the app's read URL builder, so
 -- every write on it fails without a key conflict.
 openReadOnlyAt : String -> Task.Task Error Db
@@ -811,13 +754,11 @@ openReadOnlyAt path =
         |> Task.andThen (\loc -> Db.open "sqlite" (Settings.indexReadUrl loc))
 
 
-
 -- The vectors file beside this package: `tools/ipe-index/tests`, reached from
 -- the `tools/code-review` working directory without a `..` segment.
 vectorsPath : String -> String
 vectorsPath cwd =
     ipeIndexTestFile cwd "view_hash_vectors.json"
-
 
 
 -- A file in `tools/ipe-index/tests`, reached from the `tools/code-review`
@@ -831,7 +772,6 @@ ipeIndexTestFile cwd name =
     String.join "/" (List.take (List.length segments - 1) segments) ++ "/ipe-index/tests/" ++ name
 
 
-
 -- A file at `rel` under the repository root, reached from the
 -- `tools/code-review` working directory without a `..` segment.
 repoFile : String -> String -> String
@@ -843,13 +783,11 @@ repoFile cwd rel =
     String.join "/" (List.take (List.length segments - 2) segments) ++ "/" ++ rel
 
 
-
 probeMessage : Task.Task Error () -> Task.Task Error (Maybe String)
 probeMessage task =
     task
         |> Task.map (\_ -> Nothing)
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
-
 
 
 -- The probe refusal starts with the variable, names the file, and is clean.
@@ -861,7 +799,6 @@ probeNames var file message =
 
         Nothing ->
             False
-
 
 
 maybeContains : String -> Maybe String -> Bool

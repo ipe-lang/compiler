@@ -77,9 +77,16 @@ fn on_navigate_dispatches_matched_page_through_update() {
          got:\n{main_rs}",
     );
     assert!(
-        main_rs.contains("(__update)((__on_navigate)(__page), __model)"),
+        main_rs.contains("(*__update)((__on_navigate)(__page), __model)"),
         "onNavigate present ⇒ the matched page must flow \
          `update(onNavigate(page), model)`, got:\n{main_rs}",
+    );
+    assert_eq!(
+        main_rs
+            .matches("let __update_shared = ::std::sync::Arc::new(")
+            .count(),
+        1,
+        "onNavigate present ⇒ `update` is emitted once and shared, got:\n{main_rs}",
     );
     assert!(
         !main_rs.contains(", _cmd) = (__update)"),

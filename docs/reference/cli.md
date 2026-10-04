@@ -43,37 +43,13 @@ Verbs:
 
 ### `ipe release`
 
-Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
+Build, run, or eject the production artifact — optimised, Debug.* gated.
 
-```
-ipe release [<path>] [<shape>] [<runtime>] [<host>]
-```
+Verbs:
 
-**Arguments:** A source file, a project directory, or a package.ipe (default: the current project). shape/runtime/host are the delivery grammar shared with `build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). With no delivery args, `release` builds every delivery declared in package.ipe (`build` builds only the default one). Signing is release-time env, never in package.ipe.
-
-**Flags:**
-
-- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
-- `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
-- `[--bundle]` — native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
-- `[--embed]` — native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
-- `[--capabilities|--show-profile] [--plain|--json]` — print the inferred capability model for the app without building
-
-### `ipe exec`
-
-Run a built artifact, jailing native-bearing code to its embedded capability floor.
-
-```
-ipe exec [<artifact-dir>]
-```
-
-**Arguments:** The build output directory to run (defaults to out/rust). A native-bearing artifact is confined to its embedded capability floor; a pure Ipê artifact runs directly.
-
-**Flags:**
-
-- `[-- <args>...]` — forward <args> to the artifact
+- `ipe release build`
+- `ipe release run`
+- `ipe release eject`
 
 ## Quality
 
@@ -304,21 +280,6 @@ ipe fix <path>
 
 - `[--yes|-y]` — apply every fix without per-edit confirmation
 
-### `ipe eject`
-
-Emit a self-contained Rust project with a tree-shaken runtime.
-
-```
-ipe eject [<path>]
-```
-
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
-
-**Flags:**
-
-- `--out <dir>` — write the standalone project to <dir>, which must be absent or empty and outside out/, .ipe/ and any other ipe-owned tree (required)
-- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
-
 ### `ipe upgrade`
 
 Self-update ipe to the latest release (re-runs the installer).
@@ -351,19 +312,19 @@ ipe version
 
 ## Command groups
 
-A group is invoked as `ipe <group> <verb>`; each verb is an ordinary command dispatched and described from the one registry, so a grouped verb and a bare one cannot drift.
+A group is invoked as `ipe <group> <verb>`; the group fixes the verb's build posture, and each verb is dispatched and described from the one registry.
 
 ### `ipe dev` verbs
 
-### `ipe build`
+### `ipe dev build`
 
-Compile a program to a native or WebAssembly artifact.
+Compile a program to a native or WebAssembly development artifact, with Debug.* on.
 
 ```
-ipe build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
+ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** path: a source file, a project directory, or a package.ipe (default: the current project). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release web <host>` produces the production distributable). With no delivery args, `build` builds the default delivery — the fast one-artifact inner loop; `release` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** path: a source file, a project directory, or a package.ipe (default: the current project). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web solo` = self-contained browser client, and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build web <host>` produces the production distributable). With no delivery args, `dev build` builds the default delivery — the fast one-artifact inner loop; `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project.
 
@@ -375,20 +336,19 @@ ipe build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 - `[--fix]` — apply machine-applicable fixes before building
 - `[--accept-risks]` — accept every disclosed .Unsafe escape-hatch import and proceed without prompting
 - `[--static]` — produce a statically linked binary
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
-- `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the built app
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
 - `[--json]` — emit each diagnostic as a stable JSON object (one per line) instead of the human layout
 
-### `ipe run`
+### `ipe dev run`
 
-Compile a program and run the resulting binary.
+Compile a program as a development build and run the resulting binary.
 
 ```
-ipe run [<path>]
+ipe dev run [<path>]
 ```
 
 **Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
@@ -398,7 +358,7 @@ ipe run [<path>]
 - `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary
-- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on build and run, release is always static (default: x86_64-unknown-linux-musl); run cannot execute `wasm`, and release does not produce `wasi`
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
 - `[--allocator <auto|system|dlmalloc|talc|mimalloc>]` — select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--accept-risks]` — accept every disclosed .Unsafe escape-hatch import and proceed without prompting
@@ -409,12 +369,12 @@ ipe run [<path>]
 - `[--json]` — emit each diagnostic as a stable JSON object (one per line) instead of the human layout
 - `[-- <args>...]` — forward <args> to the compiled program
 
-### `ipe watch`
+### `ipe dev watch`
 
-Rebuild and re-run a program on every source change.
+Rebuild and re-run a development build on every source change.
 
 ```
-ipe watch [<path>]
+ipe dev watch [<path>]
 ```
 
 **Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
@@ -427,4 +387,59 @@ ipe watch [<path>]
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the served app
 - `[--reset-state]` — force every returning session to a fresh init instead of preserving prior state
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
+
+### `ipe release` verbs
+
+### `ipe release build`
+
+Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
+
+```
+ipe release build [<path>] [<shape>] [<runtime>] [<host>]
+```
+
+**Arguments:** A source file, a project directory, or a package.ipe (default: the current project). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+
+**Flags:**
+
+- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--static]` — produce a statically linked binary
+- `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
+- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[--bundle]` — native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
+- `[--embed]` — native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
+- `[--plain|--json]` — the layout of a refusal: the terse flush-left record or one stable JSON object
+
+### `ipe release run`
+
+Build the production artifact (cached), then run exactly that artifact, jailed to its capabilities.
+
+```
+ipe release run [<path>|<artifact-dir>]
+```
+
+**Arguments:** A source file, a project directory, or a package.ipe (default: the current project), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
+
+**Flags:**
+
+- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[-- <args>...]` — forward <args> to the artifact
+
+### `ipe release eject`
+
+Emit a self-contained production Rust project with a tree-shaken runtime.
+
+```
+ipe release eject [<path>]
+```
+
+**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+
+**Flags:**
+
+- `--out <dir>` — write the standalone project to <dir>, which must be absent or empty and outside out/, .ipe/ and any other ipe-owned tree (required)
+- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
 

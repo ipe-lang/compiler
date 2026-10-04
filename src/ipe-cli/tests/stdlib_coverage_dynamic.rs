@@ -20,7 +20,7 @@ use ipe::coverage::surface::StdlibSurface;
 
 /// The bounded worker count for the parallel build+run sweep.
 ///
-/// Each probe shells out to `ipe run`, which cargo-builds the emitted crate; the
+/// Each probe shells out to `ipe dev run`, which cargo-builds the emitted crate; the
 /// probes are independent (a unique per-symbol snippet dir and a unique emitted
 /// crate name), so the sweep fans them across a bounded pool to fit the CI
 /// deadline instead of paying every build back-to-back. The bound is read from

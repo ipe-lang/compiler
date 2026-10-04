@@ -64,7 +64,7 @@ priorityCodec =
     Codec.enum priorityEq [ ( Low, "low" ), ( High, "high" ) ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 encoded [3,1,4,1,5] ; decoded == original: yes

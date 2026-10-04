@@ -88,18 +88,18 @@ for dir in "$GOLDEN_ROOT"/*/; do
     # golden ships. Both land the emitted crate at "$out/rust/src/main.rs".
     built=0
     if [[ -f "$dir/Main.ipe" ]]; then
-        if ( cd "$dir" && timeout 120 "$IPE_BIN" build "Main.ipe" --out "$out" ) \
+        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build "Main.ipe" --out "$out" ) \
                 > "$scratch/$name.log" 2>&1; then
             built=1
         fi
     elif [[ -f "$dir/ipe.toml" ]]; then
-        if ( cd "$dir" && timeout 120 "$IPE_BIN" build --out "$out" ) \
+        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build --out "$out" ) \
                 > "$scratch/$name.log" 2>&1; then
             built=1
         fi
     fi
     if [[ "$built" != 1 ]]; then
-        echo "SKIP $name: ipe build failed or no buildable source (not a plain-emit golden?)" >&2
+        echo "SKIP $name: ipe dev build failed or no buildable source (not a plain-emit golden?)" >&2
         skipped=$((skipped + 1))
         continue
     fi
