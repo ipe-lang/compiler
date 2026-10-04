@@ -466,7 +466,7 @@ impl fmt::Display for ConfigSetting {
 pub enum Unprovable {
     /// The value runs a command substitution (`$(` or a backtick).
     CommandSubstitution,
-    /// The value expands a variable (`$NAME`, `%NAME%`).
+    /// The value expands a variable (`$NAME`, `%NAME%`) or interpolates a path (`%(prefix)`).
     Expansion,
     /// A path-shaped word names another user's home (`~user`).
     TildeUser,
@@ -488,6 +488,8 @@ pub enum Unprovable {
     HardLinked,
     /// The value splits into more than [`MAX_WORDS`] words.
     TooManyWords,
+    /// The value holds a carriage return, vertical tab, or form feed, which tools split words at differently.
+    OddSpace,
 }
 
 impl fmt::Display for Unprovable {
@@ -527,6 +529,10 @@ impl fmt::Display for Unprovable {
                  grant",
             ),
             Self::TooManyWords => write!(f, "it splits into more than {MAX_WORDS} words"),
+            Self::OddSpace => f.write_str(
+                "it holds a carriage return, vertical tab, or form feed, which the shell and the \
+                 tool split words at differently",
+            ),
         }
     }
 }
@@ -859,6 +865,7 @@ pub fn scan(
         bytes: 0,
         paths: 0,
         pending: Vec::new(),
+        scopes: 0,
         remotes: BTreeSet::new(),
         deferred: Vec::new(),
     };
@@ -880,6 +887,35 @@ enum Syntax {
     Toml,
     /// Darcs's line-per-preference files.
     Darcs,
+    /// A Git `remotes/` or `branches/` file naming a remote's URL.
+    GitRemote,
+}
+
+/// The configuration a Git remote name is looked up in.
+///
+/// A remote defined in one repository's configuration does not exist in
+/// another's: the tool reads a name no remote of its own carries as a URL or
+/// local path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    /// The repository the tool runs in: its common `config` and its own
+    /// `config.worktree`, with every file they include.
+    Main,
+    /// Another worktree's `config.worktree`, read with the common `config`.
+    Worktree(u32),
+    /// A configuration read on its own: a submodule's, a Jujutsu store's, or
+    /// a file the tool running here never reads.
+    Own(u32),
+}
+
+impl Scope {
+    /// The scope whose remotes a name looked up in `self` also sees.
+    const fn parent(self) -> Option<Self> {
+        match self {
+            Self::Worktree(_) => Some(Self::Main),
+            Self::Main | Self::Own(_) => None,
+        }
+    }
 }
 
 /// A configuration file waiting to be read.
@@ -891,6 +927,8 @@ struct Pending {
     depth: u32,
     /// Its syntax.
     syntax: Syntax,
+    /// The configuration its Git remotes belong to.
+    scope: Scope,
 }
 
 /// A configuration file being judged.
@@ -904,6 +942,8 @@ struct FileCtx {
     depth: u32,
     /// Its syntax.
     syntax: Syntax,
+    /// The configuration its Git remotes belong to.
+    scope: Scope,
 }
 
 /// How a value is judged.
@@ -1258,8 +1298,10 @@ struct Scan<'s> {
     paths: u32,
     /// Files still to read.
     pending: Vec<Pending>,
-    /// The Git remotes defined with a URL.
-    remotes: BTreeSet<String>,
+    /// Scopes opened so far besides [`Scope::Main`].
+    scopes: u32,
+    /// The Git remotes defined with a URL, by the configuration defining them.
+    remotes: BTreeSet<(Scope, String)>,
     /// Remote-name values waiting for every remote to be known.
     deferred: Vec<Deferred>,
 }
@@ -1302,13 +1344,29 @@ impl Scan<'_> {
         }
     }
 
-    /// Queue a root file.
+    /// Queue a root file of the repository the tool runs in.
     fn queue(&mut self, path: PathBuf, syntax: Syntax) {
+        self.queue_in(path, syntax, Scope::Main);
+    }
+
+    /// Queue a root file whose Git remotes belong to `scope`.
+    fn queue_in(&mut self, path: PathBuf, syntax: Syntax, scope: Scope) {
         self.pending.push(Pending {
             path,
             depth: 0,
             syntax,
+            scope,
         });
+    }
+
+    /// A scope no file has yet.
+    ///
+    /// Besides at most two seeded scopes, every scope is opened for a listed
+    /// directory entry, so the listing and path ceilings keep the count far
+    /// below `u32::MAX`.
+    const fn fresh_scope(&mut self) -> u32 {
+        self.scopes = self.scopes.saturating_add(1);
+        self.scopes
     }
 
     /// Require a root directory to exist and open.
@@ -1328,11 +1386,17 @@ impl Scan<'_> {
                 self.require(gitdir)?;
                 let common = commondir.unwrap_or(gitdir);
                 self.require(common)?;
-                self.queue(gitdir.join("config"), Syntax::Git);
                 self.queue(gitdir.join("config.worktree"), Syntax::Git);
-                if common != gitdir {
+                if common == gitdir {
+                    self.queue(gitdir.join("config"), Syntax::Git);
+                } else {
+                    // A linked worktree's own `config` is never read, and the
+                    // common `config.worktree` belongs to the main worktree.
+                    let unread = Scope::Own(self.fresh_scope());
+                    self.queue_in(gitdir.join("config"), Syntax::Git, unread);
                     self.queue(common.join("config"), Syntax::Git);
-                    self.queue(common.join("config.worktree"), Syntax::Git);
+                    let primary = Scope::Worktree(self.fresh_scope());
+                    self.queue_in(common.join("config.worktree"), Syntax::Git, primary);
                 }
                 self.list_hooks(&gitdir.join("hooks"))?;
                 if common != gitdir {
@@ -1340,6 +1404,7 @@ impl Scan<'_> {
                 }
                 self.seed_worktrees(common, gitdir)?;
                 self.seed_modules(common)?;
+                self.seed_remote_files(common)?;
             }
             ConfigRoots::Mercurial { dot_hg, shared } => {
                 self.require(dot_hg)?;
@@ -1353,13 +1418,69 @@ impl Scan<'_> {
             ConfigRoots::Jujutsu { dot_jj, repo } => {
                 self.queue_toml(dot_jj)?;
                 self.queue_toml(repo)?;
-                self.queue(repo.join("store/git/config"), Syntax::Git);
+                self.seed_jj_git(&repo.join("store"))?;
             }
             ConfigRoots::Darcs { dot_darcs } => {
                 self.require(dot_darcs)?;
                 let prefs = dot_darcs.join("prefs");
                 self.queue(prefs.join("defaults"), Syntax::Darcs);
                 self.queue(prefs.join("prefs"), Syntax::Darcs);
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue the Git repository a Jujutsu store keeps its commits in, and list its hooks.
+    ///
+    /// The store names the repository in `git_target`, relative to the store;
+    /// without that file it is the store's `git` directory. Text holding a
+    /// control character names no path the scan can judge as the tool reads it.
+    fn seed_jj_git(&mut self, store: &Path) -> Result<(), ConfigRefusal> {
+        let target = store.join("git_target");
+        let gitdir = match self.open(&target)? {
+            None => store.join("git"),
+            Some(opened) => {
+                let text = opened
+                    .file
+                    .read_utf8(self.limits.file_bytes)
+                    .map_err(|refusal| self.unreadable(&target, fault_of(refusal)))?;
+                if text.is_empty() || text.contains(char::is_control) {
+                    return Err(self.unreadable(&target, ConfigFault::Malformed { line: 1 }));
+                }
+                store.join(text)
+            }
+        };
+        if self.open_dir(&gitdir)?.is_some() {
+            let scope = Scope::Own(self.fresh_scope());
+            self.queue_in(gitdir.join("config"), Syntax::Git, scope);
+            self.queue_in(gitdir.join("config.worktree"), Syntax::Git, scope);
+            self.list_hooks(&gitdir.join("hooks"))?;
+        }
+        Ok(())
+    }
+
+    /// Queue every file of `common/remotes` and `common/branches`, each defining the remote it is named for.
+    ///
+    /// A directory there would name a remote holding a `/`, read from a file
+    /// below it; it is refused rather than walked.
+    fn seed_remote_files(&mut self, common: &Path) -> Result<(), ConfigRefusal> {
+        for listed in ["remotes", "branches"] {
+            let Some((dir, real)) = self.open_dir(&common.join(listed))? else {
+                continue;
+            };
+            let entries = dir
+                .entries(self.limits.listing)
+                .map_err(|refusal| self.unreadable(&real, fault_of(refusal)))?;
+            for (name, kind) in entries {
+                let path = real.join(name.as_os_str());
+                if kind == FileKind::Dir {
+                    let fault = ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Dir));
+                    return Err(self.unreadable(&path, fault));
+                }
+                if let Some(remote) = name.as_os_str().to_str() {
+                    self.remotes.insert((Scope::Main, remote.to_owned()));
+                }
+                self.queue(path, Syntax::GitRemote);
             }
         }
         Ok(())
@@ -1378,7 +1499,8 @@ impl Scan<'_> {
             if matches!(kind, FileKind::Dir | FileKind::Symlink) {
                 let entry = real.join(name.as_os_str());
                 if entry != own {
-                    self.queue(entry.join("config.worktree"), Syntax::Git);
+                    let scope = Scope::Worktree(self.fresh_scope());
+                    self.queue_in(entry.join("config.worktree"), Syntax::Git, scope);
                 }
             }
         }
@@ -1409,8 +1531,9 @@ impl Scan<'_> {
                 .any(|(name, kind)| name.as_os_str() == "config" && *kind != FileKind::Dir);
             let below = depth.saturating_add(1);
             if gitdir {
-                self.queue(real.join("config"), Syntax::Git);
-                self.queue(real.join("config.worktree"), Syntax::Git);
+                let module = Scope::Own(self.fresh_scope());
+                self.queue_in(real.join("config"), Syntax::Git, module);
+                self.queue_in(real.join("config.worktree"), Syntax::Git, module);
                 self.list_hooks(&real.join("hooks"))?;
                 self.count_path(&real)?;
                 stack.push((real.join("modules"), below));
@@ -1772,12 +1895,14 @@ impl Scan<'_> {
             },
         };
         self.single_link(path, &file)?;
-        let mut bases = Vec::with_capacity(2);
-        if let Some(dir) = path.parent() {
-            bases.push(lexical(dir));
-        }
-        if let Some(dir) = found.path.parent() {
-            let dir = dir.to_path_buf();
+        // The directory as named, followed through its links and `..`
+        // steps as the tool's own open does; that directory with `..` folded
+        // lexically; and the directory the walk reached.
+        let mut bases: Vec<PathBuf> = Vec::with_capacity(3);
+        let named = path.parent().map(Path::to_path_buf);
+        let folded = path.parent().map(lexical);
+        let walked = found.path.parent().map(Path::to_path_buf);
+        for dir in [named, folded, walked].into_iter().flatten() {
             if !bases.contains(&dir) {
                 bases.push(dir);
             }
@@ -1811,6 +1936,7 @@ impl Scan<'_> {
             bases: opened.bases,
             depth: item.depth,
             syntax: item.syntax,
+            scope: item.scope,
         };
         let malformed = |line| ConfigFault::Malformed { line };
         match ctx.syntax {
@@ -1826,6 +1952,7 @@ impl Scan<'_> {
             }
             Syntax::Toml => self.judge_toml(&ctx, &text),
             Syntax::Darcs => self.judge_entries(&ctx, &parse_darcs(&text)),
+            Syntax::GitRemote => self.judge_entries(&ctx, &parse_git_remote(&text)),
         }
     }
 
@@ -1839,11 +1966,12 @@ impl Scan<'_> {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
                         .map_err(&refuse)?;
-                    self.note_remote(&entry.setting);
+                    self.note_remote(ctx.scope, &entry.setting);
                     git_route(&entry.setting, &entry.value)
                 }
                 Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
+                Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
             match route {
                 Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
@@ -1880,8 +2008,8 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Record the remote a `remote.<name>.url` setting defines.
-    fn note_remote(&mut self, setting: &Setting) {
+    /// Record the remote a `remote.<name>.url` setting in `scope` defines.
+    fn note_remote(&mut self, scope: Scope, setting: &Setting) {
         if let Setting::Key {
             section,
             subsection: Some(name),
@@ -1890,15 +2018,20 @@ impl Scan<'_> {
             && &**section == "remote"
             && key.eq_ignore_ascii_case("url")
         {
-            self.remotes.insert(String::from(&**name));
+            self.remotes.insert((scope, String::from(&**name)));
         }
     }
 
-    /// Judge every remote-name value naming no defined remote as a URL.
+    /// Judge every remote-name value naming no remote its scope sees as a URL.
     fn judge_deferred(&mut self) -> Result<(), ConfigRefusal> {
         let kind = self.kind;
         for item in std::mem::take(&mut self.deferred) {
-            if self.remotes.contains(&item.value) {
+            let looked_up = item.ctx.scope;
+            let defined = [Some(looked_up), looked_up.parent()]
+                .into_iter()
+                .flatten()
+                .any(|scope| self.remotes.contains(&(scope, item.value.clone())));
+            if defined {
                 continue;
             }
             self.judge(&item.ctx, &Role::Url { scp: true }, &item.value)
@@ -1984,10 +2117,13 @@ impl Scan<'_> {
                 self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
             Role::Include => {
+                // Queued as named, not as walked: the tool resolves the
+                // included file's own relative includes against the directory
+                // it named, which a link at the end does not change.
                 let mut queued: Vec<PathBuf> = Vec::new();
-                for found in self.judge_forced(ctx, value, Reach::Include)? {
-                    if matches!(found.end, End::Entry(..)) && !queued.contains(&found.path) {
-                        queued.push(found.path);
+                for (named, found) in self.judge_forced(ctx, value, Reach::Include)? {
+                    if matches!(found.end, End::Entry(..)) && !queued.contains(&named) {
+                        queued.push(named);
                     }
                 }
                 for path in queued {
@@ -1995,13 +2131,14 @@ impl Scan<'_> {
                         path,
                         depth: ctx.depth.saturating_add(1),
                         syntax: ctx.syntax,
+                        scope: ctx.scope,
                     });
                 }
                 Ok(())
             }
             Role::HooksPath => {
                 self.judge_words(ctx, value)?;
-                for found in self.judge_forced(ctx, value, Reach::Command)? {
+                for (_, found) in self.judge_forced(ctx, value, Reach::Command)? {
                     if let End::Dir(dir) = found.end {
                         self.list_held(&dir, &found.path).map_err(Stop::Refused)?;
                     }
@@ -2093,7 +2230,7 @@ impl Scan<'_> {
         ctx: &FileCtx,
         text: &str,
         reach: Reach,
-    ) -> Result<Vec<Resolved>, Stop> {
+    ) -> Result<Vec<(PathBuf, Resolved)>, Stop> {
         let path = strip_runners(text.trim_matches(is_c_space));
         if path.is_empty() {
             return Ok(Vec::new());
@@ -2102,12 +2239,14 @@ impl Scan<'_> {
     }
 
     /// Walk `word` from every base, refusing a place inside a grant reached lexically or by the walk.
+    ///
+    /// Each candidate path comes back with what its walk reached.
     fn judge_path(
         &mut self,
         ctx: &FileCtx,
         word: &str,
         reach: Reach,
-    ) -> Result<Vec<Resolved>, Stop> {
+    ) -> Result<Vec<(PathBuf, Resolved)>, Stop> {
         self.count_path(&ctx.source).map_err(Stop::Refused)?;
         let candidates = self.candidates(word, &ctx.bases, reach).map_err(unproven)?;
         let mut resolved = Vec::with_capacity(candidates.len());
@@ -2116,7 +2255,7 @@ impl Scan<'_> {
             if self.grants.covers(&candidate) {
                 return Err(Stop::Named(Named::InGrant(lexical(&candidate))));
             }
-            resolved.push(found);
+            resolved.push((candidate, found));
         }
         Ok(resolved)
     }
@@ -2131,7 +2270,7 @@ impl Scan<'_> {
         if word.len() > MAX_PATH_BYTES {
             return Err(Unprovable::TooLong);
         }
-        if word.contains('$') || word.split('%').nth(2).is_some() {
+        if word.contains('$') || word.contains("%(") || word.split('%').nth(2).is_some() {
             return Err(Unprovable::Expansion);
         }
         if let Some(rest) = word.strip_prefix('~') {
@@ -2202,12 +2341,45 @@ impl Words {
         Ok(())
     }
 
-    /// Push the pieces of `word` between its separators, each at `position`.
+    /// Push the pieces of `word` between its separators.
+    ///
+    /// The first piece stands at `position`; each later one at the position
+    /// the separator before it leaves: [`piece_after`].
     fn push_pieces(&mut self, word: &str, position: Position) -> Result<(), Unprovable> {
-        for piece in word.split(is_word_separator).rev() {
-            self.push(piece.to_owned(), position)?;
+        let mut pieces: Vec<(&str, Position)> = Vec::new();
+        let mut next = position;
+        for chunk in word.split_inclusive(is_word_separator) {
+            let mut chars = chunk.chars();
+            let separator = chars.next_back().filter(|c| is_word_separator(*c));
+            let piece = if separator.is_some() {
+                chars.as_str()
+            } else {
+                chunk
+            };
+            pieces.push((piece, next));
+            if let Some(separator) = separator {
+                next = piece_after(separator, position);
+            }
+        }
+        for (piece, at) in pieces.into_iter().rev() {
+            self.push(piece.to_owned(), at)?;
         }
         Ok(())
+    }
+}
+
+/// The position of the piece after `separator` in a word standing at `word`.
+///
+/// A redirection (`<`, `>`), an assignment (`=`), and a closing parenthesis
+/// are followed by a file or value the program reads, so an argument
+/// whatever the word's position. A shell operator that starts a command (`;`,
+/// `&`, `|`, `(`) and a `:` or `,` joining parts of one name keep the word's
+/// own position: a piece is never judged more leniently than its word.
+const fn piece_after(separator: char, word: Position) -> Position {
+    match separator {
+        ')' | '<' | '>' | '=' => Position::Argument,
+        // `; & | ( : ,`, and any other character: never more lenient than the word.
+        _ => word,
     }
 }
 
@@ -2258,13 +2430,16 @@ fn has_ext(text: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"ext::"))
 }
 
-/// The checks every judged value passes first: no substitution, expansion, or `ext::` transport.
+/// The checks every judged value passes first: no substitution, expansion, odd space, or `ext::` transport.
 fn value_checks(value: &str) -> Result<(), Unprovable> {
     if value.contains("$(") || value.contains('`') {
         return Err(Unprovable::CommandSubstitution);
     }
     if value.contains('$') {
         return Err(Unprovable::Expansion);
+    }
+    if value.contains(['\r', '\u{b}', '\u{c}']) {
+        return Err(Unprovable::OddSpace);
     }
     if has_ext(value) {
         return Err(Unprovable::ExtTransport);
@@ -2319,9 +2494,18 @@ const fn is_word_separator(c: char) -> bool {
     matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>' | '=' | ':' | ',')
 }
 
-/// C's `isspace`, which Git and Mercurial both split on.
+/// Git's `isspace`: space, tab, newline, and carriage return, never a vertical tab or form feed.
+///
+/// A judged value still holding a carriage return, vertical tab, or form
+/// feed is refused ([`Unprovable::OddSpace`]), so a tool splitting at more or
+/// fewer of them than this never sees words the scan did not.
 const fn is_c_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r')
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Python's and Haskell's `isspace`, which Mercurial and Darcs split on: Git's and a vertical tab or form feed.
+const fn is_wide_space(c: char) -> bool {
+    is_c_space(c) || matches!(c, '\u{b}' | '\u{c}')
 }
 
 /// `word` without the prefixes that make a tool run what follows (`=`, `!`, `ext::`, `python:`).
@@ -2706,23 +2890,23 @@ fn hg_section(line: &str) -> Option<&str> {
 /// The key and value of an item line (`key = value`).
 fn hg_item(line: &str) -> Option<(String, String)> {
     let first = line.chars().next()?;
-    if first == '=' || is_c_space(first) {
+    if first == '=' || is_wide_space(first) {
         return None;
     }
     let (key, value) = line.split_once('=')?;
     Some((
-        key.trim_end_matches(is_c_space).to_owned(),
-        value.trim_matches(is_c_space).to_owned(),
+        key.trim_end_matches(is_wide_space).to_owned(),
+        value.trim_matches(is_wide_space).to_owned(),
     ))
 }
 
 /// The text after a directive (`%include`, `%unset`) and its separating space, when non-empty.
 fn hg_directive<'l>(line: &'l str, directive: &str) -> Option<&'l str> {
     let rest = line.strip_prefix(directive)?;
-    if !rest.starts_with(is_c_space) {
+    if !rest.starts_with(is_wide_space) {
         return None;
     }
-    let argument = rest.trim_matches(is_c_space);
+    let argument = rest.trim_matches(is_wide_space);
     (!argument.is_empty()).then_some(argument)
 }
 
@@ -2738,12 +2922,12 @@ fn parse_hg(text: &str) -> Result<Vec<Entry>, usize> {
     let mut continues = false;
     for (index, line) in hg_lines(text).enumerate() {
         let number = index.saturating_add(1);
-        let trimmed = line.trim_matches(is_c_space);
+        let trimmed = line.trim_matches(is_wide_space);
         if continues {
             if line.starts_with([';', '#']) {
                 continue;
             }
-            if line.starts_with(is_c_space) && !trimmed.is_empty() {
+            if line.starts_with(is_wide_space) && !trimmed.is_empty() {
                 if let Some(last) = entries.last_mut() {
                     last.value.push('\n');
                     last.value.push_str(trimmed);
@@ -2789,12 +2973,43 @@ fn parse_hg(text: &str) -> Result<Vec<Entry>, usize> {
 fn parse_darcs(text: &str) -> Vec<Entry> {
     text.lines()
         .enumerate()
-        .filter(|(_, line)| !line.trim_matches(is_c_space).is_empty())
+        .filter(|(_, line)| !line.trim_matches(is_wide_space).is_empty())
         .map(|(index, line)| Entry {
             setting: Setting::Line(index.saturating_add(1)),
             value: line.to_owned(),
         })
         .collect()
+}
+
+/// The URLs a Git `remotes/` or `branches/` file names, one entry per URL.
+///
+/// A `remotes/` file names its URL on a `URL:` line, and its refspecs on
+/// `Push:` and `Pull:` lines, which name no file. A `branches/` file holds a
+/// URL followed by `#` and a branch; the URL before the `#` is judged, and the
+/// whole line too. Any other line is judged as a URL.
+fn parse_git_remote(text: &str) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim_matches(is_c_space);
+        if line.is_empty() || line.starts_with("Push:") || line.starts_with("Pull:") {
+            continue;
+        }
+        let url = line
+            .strip_prefix("URL:")
+            .map_or(line, |rest| rest.trim_matches(is_c_space));
+        let setting = Setting::Line(index.saturating_add(1));
+        if let Some((head, _)) = url.split_once('#') {
+            entries.push(Entry {
+                setting: setting.clone(),
+                value: head.to_owned(),
+            });
+        }
+        entries.push(Entry {
+            setting,
+            value: url.to_owned(),
+        });
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -3057,6 +3272,20 @@ mod tests {
         assert_eq!(in_grant(&result), Some(f.other.join("bin/run").as_path()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nested_include_resolves_against_the_named_directory() {
+        let f = fixture("includenamed");
+        let real = f.out.join("deep/real.inc");
+        write(&real, "[include]\n\tpath = team.cfg\n");
+        link(&real, &f.out.join("inc"));
+        link(&f.tree.join("team.cfg"), &f.out.join("team.cfg"));
+        let shown = f.out.join("inc");
+        git_config(&f, &format!("[include]\n\tpath = {}\n", shown.display()));
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("team.cfg").as_path()));
+    }
+
     #[test]
     fn unknown_key_with_in_tree_path_refused() {
         let f = fixture("unknownkey");
@@ -3092,6 +3321,43 @@ mod tests {
     }
 
     #[test]
+    fn program_word_pieces_after_redirect_or_assignment_are_arguments() {
+        let f = fixture("programpieces");
+        for text in [
+            "[alias]\n\tx = !sh<evil\n",
+            "[alias]\n\tx = !BASH_ENV=evil;bash\n",
+            "[core]\n\tpager = sh<evil\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::BareWord),
+                "{text:?}"
+            );
+        }
+        git_config(&f, "[alias]\n\tx = !status;log\n");
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn odd_space_in_value_refused() {
+        let f = fixture("oddspace");
+        let out = f.out.display();
+        for space in ['\u{b}', '\u{c}'] {
+            git_config(&f, &format!("[alias]\n\tx = !evil{space}{out}/x\n"));
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::OddSpace),
+                "{space:?}"
+            );
+        }
+        git_config(&f, &format!("[alias]\n\tx = \"!evil\r{out}/x\"\n"));
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::OddSpace));
+        git_config(&f, &format!("[alias]\n\tx = !{out}/x\r\n"));
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
     fn command_substitution_refused() {
         let f = fixture("cmdsubst");
         git_config(&f, "[alias]\n\tx = !echo $(id -u)\n");
@@ -3105,6 +3371,8 @@ mod tests {
             Some(Unprovable::CommandSubstitution)
         );
         git_config(&f, "[alias]\n\tx = !$HOME/bin/x\n");
+        assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::Expansion));
+        git_config(&f, "[include]\n\tpath = %(prefix)/etc/team.cfg\n");
         assert_eq!(unprovable(&scan_git(&f)), Some(Unprovable::Expansion));
     }
 
@@ -3171,6 +3439,25 @@ mod tests {
         git_config(&f, "[branch \"main\"]\n\tremote = sub/repo\n");
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("sub/repo").as_path()));
+    }
+
+    #[test]
+    fn remote_name_defined_only_in_another_repository_judged() {
+        let f = fixture("remotescope");
+        write(
+            &f.tree.join(".git/modules/sub/config"),
+            "[remote \"evil\"]\n\turl = https://example.com/r\n",
+        );
+        git_config(&f, "[branch \"main\"]\n\tremote = evil\n");
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+
+        git_config(&f, "[remote \"up\"]\n\turl = https://example.com/r\n");
+        write(
+            &f.tree.join(".git/worktrees/wt/config.worktree"),
+            "[branch \"topic\"]\n\tremote = up\n",
+        );
+        assert_eq!(scan_git(&f), Ok(()));
     }
 
     #[test]
@@ -3323,6 +3610,75 @@ mod tests {
         write(&dot_hg.join("hgrc"), "[ui]\nnot an item\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(fault(&result), Some(ConfigFault::Malformed { line: 2 }));
+    }
+
+    #[test]
+    fn jj_git_target_repository_scanned() {
+        let f = fixture("jjtarget");
+        let dot_jj = f.tree.join(".jj");
+        let repo = dot_jj.join("repo");
+        make_dir(&repo);
+        let roots = ConfigRoots::Jujutsu {
+            dot_jj: &dot_jj,
+            repo: &repo,
+        };
+        let tree = f.tree.display();
+        let target = f.out.join("gitrepo");
+        write(
+            &target.join("config"),
+            &format!("[core]\n\thooksPath = {tree}/h\n"),
+        );
+        write(
+            &repo.join("store/git_target"),
+            &target.display().to_string(),
+        );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(in_grant(&result), Some(f.tree.join("h").as_path()));
+
+        let granted = f.other.join("gitrepo");
+        make_dir(&granted);
+        write(
+            &repo.join("store/git_target"),
+            &granted.display().to_string(),
+        );
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert!(
+            matches!(&result, Err(ConfigRefusal::ConfigInGrant { .. })),
+            "{result:?}"
+        );
+
+        write(&repo.join("store/git_target"), "git\n");
+        let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+        assert_eq!(fault(&result), Some(ConfigFault::Malformed { line: 1 }));
+    }
+
+    #[test]
+    fn git_remote_and_branch_files_judged() {
+        let f = fixture("remotefiles");
+        let tree = f.tree.display();
+        let other = f.other.display();
+        let remotes = f.tree.join(".git/remotes/origin");
+        write(
+            &remotes,
+            &format!("URL: {tree}/repo\nPull: refs/heads/*:refs/remotes/origin/*\n"),
+        );
+        let result = scan_git(&f);
+        assert_eq!(source(&result), Some(remotes.as_path()));
+        assert_eq!(in_grant(&result), Some(f.tree.join("repo").as_path()));
+
+        write(
+            &remotes,
+            "URL: https://example.com/r\nPull: refs/heads/*:refs/remotes/origin/*\n",
+        );
+        git_config(&f, "[branch \"main\"]\n\tremote = origin\n");
+        assert_eq!(scan_git(&f), Ok(()));
+
+        write(
+            &f.tree.join(".git/branches/b"),
+            &format!("{other}/r#main\n"),
+        );
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.other.join("r").as_path()));
     }
 
     #[test]
