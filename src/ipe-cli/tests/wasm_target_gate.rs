@@ -285,6 +285,63 @@ fn routed_web_app_emits_wasm_app_routed() {
     );
 }
 
+/// A routed wasm app with `onNavigate` evaluates `update` once and shares it
+/// between the runtime entry and the generated `set_page`.
+#[test]
+fn routed_web_app_with_on_navigate_emits_update_once() {
+    let dir = scratch("wasm_gate_routed_on_navigate");
+    let entry = write_entry(
+        &dir.join("srcdir"),
+        "module Main exposing (main)\n\
+         import Ipe.String as String\n\
+         import Ipe.Tea.Web exposing (tea, route)\n\
+         import Ipe.Tea.Web.Cmd as Cmd\n\
+         import Ipe.Tea.Web.Sub as Sub\n\
+         import Ipe.Ui as Ui\n\
+         \n\
+         type Page = Home | About\n\
+         type Msg = Navigate Page\n\
+         type alias Model = { page : Page, count : Int }\n\
+         \n\
+         init : WebReq -> ( Model, Cmd Msg )\n\
+         init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
+         \n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update msg model =\n\
+         \x20   case msg of\n\
+         \x20       Navigate page -> ( { model | page = page }, Cmd.none )\n\
+         \n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model = Sub.none\n\
+         \n\
+         view : Model -> Element Msg\n\
+         view _model = Ui.text \"hello\"\n\
+         \n\
+         main =\n\
+         \x20   tea\n\
+         \x20       { init = init\n\
+         \x20       , update = update\n\
+         \x20       , view = view\n\
+         \x20       , subscriptions = subscriptions\n\
+         \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
+         \x20       , notFound = Home\n\
+         \x20       , onNavigate = Navigate\n\
+         \x20       }\n",
+    );
+    let out = dir.join("out");
+    build_wasm(&entry, &out)
+        .expect("routed Web.tea with onNavigate must build under --target wasm");
+
+    let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
+    assert_eq!(
+        main_rs
+            .matches("let __update_shared = ::std::sync::Arc::new(")
+            .count(),
+        1,
+        "onNavigate present ⇒ `update` is emitted once and shared, got:\n{main_rs}"
+    );
+}
+
 /// Naming a server-only kernel under `--target wasm` is a compile error
 /// (IPE-N0029) — the kernel has no denotation, so no secret can gain a
 /// client consumer and no cargo-time failure can occur (THE SEAL).
