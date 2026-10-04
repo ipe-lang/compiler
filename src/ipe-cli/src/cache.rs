@@ -413,9 +413,9 @@ pub enum KeptFile {
 
 /// One budgeted walk of a source tree: its digest and the bytes it kept.
 ///
-/// The digest is computed over the same bytes [`TreeCapture::kept`] holds, so a
-/// verdict over the kept bytes and the digest that pins them can never describe
-/// two reads.
+/// The digest is computed over the same bytes the kept files hold, so a verdict
+/// over the kept bytes and the digest that pins them can never describe two
+/// reads.
 pub struct TreeCapture {
     digest: TreeDigest,
     kept: BTreeMap<String, KeptFile>,
@@ -423,25 +423,15 @@ pub struct TreeCapture {
 }
 
 impl TreeCapture {
-    /// The [`hash_tree`] digest of the walked tree.
-    #[must_use]
-    pub const fn digest(&self) -> &TreeDigest {
-        &self.digest
-    }
-
-    /// The kept files, keyed by forward-slash path relative to the tree root.
-    #[must_use]
-    pub const fn kept(&self) -> &BTreeMap<String, KeptFile> {
-        &self.kept
-    }
-
     /// Whether the walk met a visible directory at this tree-relative path.
     #[must_use]
     pub fn has_dir(&self, rel: &str) -> bool {
         self.dirs.contains(rel)
     }
 
-    /// The digest and the kept files, taken out of the capture.
+    /// The [`hash_tree`] digest of the walked tree and the kept files.
+    ///
+    /// The files are keyed by forward-slash path relative to the tree root.
     #[must_use]
     pub fn into_parts(self) -> (TreeDigest, BTreeMap<String, KeptFile>) {
         (self.digest, self.kept)
@@ -2943,18 +2933,15 @@ mod tests {
         });
         let expected = hash_tree(&base);
         let _ = std::fs::remove_dir_all(&base);
-        let capture = capture.expect("capture ok");
+        let (digest, kept) = capture.expect("capture ok").into_parts();
         assert_eq!(
-            capture.digest().to_hex(),
+            digest.to_hex(),
             expected.expect("hash_tree ok"),
             "the capture digest must equal hash_tree over the same tree"
         );
+        assert_eq!(kept.get("sub/b"), Some(&KeptFile::Bytes(vec![b'b'; 6])));
         assert_eq!(
-            capture.kept().get("sub/b"),
-            Some(&KeptFile::Bytes(vec![b'b'; 6]))
-        );
-        assert_eq!(
-            capture.kept().len(),
+            kept.len(),
             1,
             "only the named file is kept, never the whole tree"
         );
@@ -2969,13 +2956,10 @@ mod tests {
         });
         let expected = hash_tree(&base);
         let _ = std::fs::remove_dir_all(&base);
-        let capture = capture.expect("capture ok");
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Oversize { cap: 9 }));
         assert_eq!(
-            capture.kept().get("a"),
-            Some(&KeptFile::Oversize { cap: 9 })
-        );
-        assert_eq!(
-            capture.digest().to_hex(),
+            digest.to_hex(),
             expected.expect("hash_tree ok"),
             "an oversize file still contributes its bytes to the digest"
         );
@@ -2989,10 +2973,8 @@ mod tests {
             (rel == "a").then_some(10)
         });
         let _ = std::fs::remove_dir_all(&base);
-        assert_eq!(
-            capture.expect("capture ok").kept().get("a"),
-            Some(&KeptFile::Bytes(vec![b'a'; 10]))
-        );
+        let (_, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Bytes(vec![b'a'; 10])));
     }
 
     /// The capture lists visible directories and never a hidden one.
