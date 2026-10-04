@@ -104,14 +104,15 @@ struct UnknownFlag(OsString);
 /// `--show-profile`: an app argument given without the separator is refused,
 /// never dropped, so the app never runs with arguments silently missing.
 fn split_args(args: &[OsString]) -> Result<WrapperArgs<'_>, UnknownFlag> {
-    let (wrapper_flags, app_args) = match args.iter().position(|a| a == "--") {
-        Some(at) => args
-            .split_at_checked(at)
-            .map_or((args, &[][..]), |(flags, rest)| {
-                (flags, rest.get(1..).unwrap_or(&[]))
-            }),
-        None => (args, &[][..]),
-    };
+    let (wrapper_flags, app_args) = args.iter().position(|a| a == "--").map_or_else(
+        || (args, &[][..]),
+        |at| {
+            args.split_at_checked(at)
+                .map_or((args, &[][..]), |(flags, rest)| {
+                    (flags, rest.get(1..).unwrap_or(&[]))
+                })
+        },
+    );
     let mut show_profile = false;
     for flag in wrapper_flags {
         if flag == "--show-profile" {
@@ -567,10 +568,9 @@ mod tests {
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo failed");
         let (tx, rx) = std::sync::mpsc::channel();
-        let path = fifo.clone();
         std::thread::Builder::new()
             .spawn(move || {
-                let _ = tx.send(super::read_capped(&path, 1024));
+                let _ = tx.send(super::read_capped(&fifo, 1024));
             })
             .expect("spawn the reader");
         let outcome = rx
