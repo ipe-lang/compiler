@@ -57,14 +57,7 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[OsString]) -> ExitCode {
-    // --show-profile: dump the embedded or on-disk profile text and exit.
-    // Only meaningful in embed mode (the profile is separately readable in
-    // bundle mode), but accepted in both so a script can always query it.
-    let show_profile = args.iter().any(|a| a == "--show-profile");
-
-    // Split `[wrapper-flags] [-- <app-args>...]`.
-    let dash_dash = args.iter().position(|a| a == "--");
-    let app_args: &[OsString] = dash_dash.map_or(&[], |i| args.get(i + 1..).unwrap_or(&[]));
+    let (show_profile, app_args) = split_args(args);
 
     // Dispatch to the compile-time selected mode.
     #[cfg(embed_mode)]
@@ -75,6 +68,26 @@ fn run(args: &[OsString]) -> ExitCode {
     {
         run_bundle(show_profile, app_args)
     }
+}
+
+/// Split `[wrapper-flags] [-- <app-args>...]` at the first `--`.
+///
+/// Returns whether `--show-profile` (dump the embedded or on-disk profile text
+/// and exit) is among the wrapper flags, and the app arguments. Only the
+/// segment before the first `--` is the wrapper's: everything after it,
+/// another `--` or `--show-profile` included, belongs to the app.
+fn split_args(args: &[OsString]) -> (bool, &[OsString]) {
+    let (wrapper_flags, app_args) =
+        args.iter()
+            .position(|a| a == "--")
+            .map_or((args, &[][..]), |i| {
+                (
+                    args.get(..i).unwrap_or(&[]),
+                    args.get(i + 1..).unwrap_or(&[]),
+                )
+            });
+    let show_profile = wrapper_flags.iter().any(|a| a == "--show-profile");
+    (show_profile, app_args)
 }
 
 // ── Bundle mode ─────────────────────────────────────────────────────────────
@@ -392,33 +405,32 @@ mod tests {
         assert!(matches!(recovered.filesystem, FilesystemScope::Isolated));
     }
 
-    /// --show-profile exits SUCCESS without exec-ing anything (bundle mode
-    /// path: just parse+print then return).
+    /// `--show-profile` is a wrapper flag only before the first `--`.
     #[test]
-    fn show_profile_flag_recognized() {
-        // We test the argument parsing logic, not the exec path.
+    fn show_profile_flag_recognized_only_before_the_separator() {
         let args: Vec<std::ffi::OsString> = vec!["--show-profile".into()];
-        let show = args.iter().any(|a| a == "--show-profile");
-        assert!(show);
+        assert_eq!(super::split_args(&args), (true, &[][..]));
+        let args: Vec<std::ffi::OsString> = vec!["--".into(), "--show-profile".into()];
+        let (show, app_args) = super::split_args(&args);
+        assert!(!show, "an app's `--show-profile` is not the wrapper's");
+        assert_eq!(Some(app_args), args.get(1..));
     }
 
-    /// App args after `--` are correctly split.
+    /// App args after the first `--` are passed through whole, a second `--`
+    /// included.
     #[test]
-    fn app_args_split_after_dash_dash() {
+    fn app_args_split_after_first_dash_dash() {
         let args: Vec<std::ffi::OsString> = vec![
             "--show-profile".into(),
             "--".into(),
             "--port".into(),
+            "--".into(),
             "8080".into(),
         ];
-        let pos = args.iter().position(|a| a == "--");
-        assert_eq!(pos, Some(1));
-        // pos is Some(1) per the assertion above; get(2..) is safe on a 4-element vec.
-        let app_args: &[std::ffi::OsString] = pos.and_then(|i| args.get(i + 1..)).unwrap_or(&[]);
-        assert_eq!(app_args.len(), 2);
-        assert_eq!(
-            app_args.first().map(std::ffi::OsString::as_os_str),
-            Some(std::ffi::OsStr::new("--port"))
-        );
+        let (show, app_args) = super::split_args(&args);
+        assert!(show);
+        let expected: Vec<std::ffi::OsString> = vec!["--port".into(), "--".into(), "8080".into()];
+        assert_eq!(app_args, expected.as_slice());
+        assert_eq!(super::split_args(&[]), (false, &[][..]));
     }
 }

@@ -1951,6 +1951,10 @@ ipe release run: {dir} is a built artifact directory; it runs as built and takes
 
 ipe release run: the bundle at {dir} has no {missing}; a bundle runs only with its wrapper, app and profile together
 
+## release-run-wrapper-unverifiable
+
+ipe release run: {dir} holds a wrapper with no app and profile beside it, so there is nothing to verify; ipe release run runs a bundle directory or a project
+
 ## wasm-bindgen-failed
 
 wasm-bindgen failed (exit {code}); ensure wasm-bindgen-cli {version} is installed: cargo install wasm-bindgen-cli --version {version}

@@ -5110,8 +5110,8 @@ fn certify_versions_leaves_no_scratch_under_the_cache_base() {
 // ── Grouped verbs: the legacy names and bare groups refuse ──────────────────
 
 /// Run `ipe <args>` in process.
-fn run_argv(args: &[&str]) -> Result<(), CliError> {
-    let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+fn run_argv(words: &[&str]) -> Result<(), CliError> {
+    let argv: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
     run_cli(&argv)
 }
 
@@ -5442,11 +5442,11 @@ fn release_build_wasm_produces_artifact() {
         );
     }
     assert!(matches!(
-        release_artifact(native, CompileTarget::WasmClient),
+        release_artifact(native.clone(), CompileTarget::WasmClient),
         Ok(ReleaseArtifact::Browser)
     ));
     assert!(matches!(
-        release_artifact(native, CompileTarget::Native),
+        release_artifact(native.clone(), CompileTarget::Native),
         Ok(ReleaseArtifact::Native(StaticTriple::X8664LinuxMusl))
     ));
     let wasi = release_artifact(native, CompileTarget::WasmWasi);
@@ -5569,6 +5569,18 @@ fn release_run_host_bundle_refuses() {
     }
 }
 
+/// Assert `result` is a `release run` usage refusal whose reason contains `needle`.
+fn assert_release_run_refusal(result: &Result<(), CliError>, needle: &str, what: &str) {
+    assert!(
+        matches!(
+            result,
+            Err(CliError::CommandUsage { command, reason })
+                if *command == Verb::RELEASE_RUN.name() && reason.as_str().contains(needle)
+        ),
+        "{what}: {result:?}"
+    );
+}
+
 /// An artifact directory runs as built: a build option beside it refuses.
 ///
 /// A bundle missing its profile refuses naming it, before anything runs.
@@ -5584,14 +5596,46 @@ fn release_run_artifact_dir_refuses_build_flags_and_partial_bundles() {
     let with_flag = run_argv(&["release", "run", &dir, "--out", "x"]);
     let partial = run_argv(&["release", "run", &dir]);
     let _ = fs::remove_dir_all(&tmp);
-    assert!(
-        matches!(&with_flag, Err(CliError::Usage(reason)) if reason.to_string().contains(&dir)),
-        "an artifact directory takes no build option: {with_flag:?}"
+    assert_release_run_refusal(
+        &with_flag,
+        &dir,
+        "an artifact directory takes no build option",
     );
-    assert!(
-        matches!(&partial, Err(CliError::Usage(reason)) if reason.to_string().contains("ipe.profile")),
-        "a bundle without its profile refuses naming it: {partial:?}"
+    assert_release_run_refusal(
+        &partial,
+        "ipe.profile",
+        "a bundle without its profile refuses naming it",
     );
+}
+
+/// A directory holding only an `ipe-wrapper` is never executed: nothing
+/// outside the wrapper can be verified, so the run refuses before any exec.
+///
+/// The planted wrapper writes a marker when run; the marker must stay absent.
+#[cfg(unix)]
+#[test]
+fn release_run_refuses_a_lone_wrapper_without_running_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = ipe_test_temp::temp_root().join(format!(
+        "ipec-release-run-lone-wrapper-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("create artifact dir");
+    let marker = tmp.join("ran");
+    let wrapper = tmp.join("ipe-wrapper");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .expect("write wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+    let dir = tmp.to_string_lossy().into_owned();
+    let result = run_argv(&["release", "run", &dir]);
+    let ran = marker.exists();
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(!ran, "a lone planted wrapper must never be executed");
+    assert_release_run_refusal(&result, &dir, "a lone wrapper refuses naming its directory");
 }
 
 /// The wrapper source is the build-time workspace, never a planted ancestor.

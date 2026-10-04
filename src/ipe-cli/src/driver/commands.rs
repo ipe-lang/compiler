@@ -1308,7 +1308,7 @@ impl ReleaseArtifact {
 ///
 /// [`CliError::Usage`] when the resolved target is the WASI module, which has
 /// no release form.
-pub fn release_artifact(
+pub const fn release_artifact(
     target: cli_args::ReleaseTarget,
     resolved: CompileTarget,
 ) -> Result<ReleaseArtifact, CliError> {
@@ -3008,12 +3008,13 @@ pub fn run_release_run(rest: &[String]) -> Result<(), CliError> {
 }
 
 /// The built artifact directory `entry` names: a directory holding the
-/// `ipe-wrapper` a native-bearing release lays out.
+/// `ipe-wrapper` a native-bearing release lays out. A directory carrying a
+/// project manifest is a project, never an artifact, whatever else it holds.
 fn prebuilt_artifact_dir(entry: Option<&str>) -> Option<&Path> {
     let dir = Path::new(entry?);
-    std::fs::symlink_metadata(dir.join(RELEASE_WRAPPER))
-        .is_ok()
-        .then_some(dir)
+    let present = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
+    let project = present(package_manifest::PACKAGE_IPE) || present(project::IPE_TOML);
+    (!project && present(RELEASE_WRAPPER)).then_some(dir)
 }
 
 /// The wrapper's file name inside a release artifact directory.
@@ -3023,13 +3024,17 @@ const RELEASE_APP: &str = "ipe-app";
 /// The jail profile's file name inside a release bundle.
 const RELEASE_PROFILE: &str = "ipe.profile";
 
-/// Classify a built artifact directory: a bundle when it carries an app or a
-/// profile (then it must carry all three files), else the embed-mode wrapper.
+/// Classify a built artifact directory: a bundle when it carries an app and
+/// a profile. A lone wrapper (an embed-mode build) refuses: its app and
+/// profile are inside the wrapper, so nothing outside it can be verified, and
+/// a file named `ipe-wrapper` is never executed on trust.
 fn prebuilt_artifact(dir: &Path) -> Result<ReleaseOutput, CliError> {
     let present = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
     let (app, profile) = (present(RELEASE_APP), present(RELEASE_PROFILE));
     match (app, profile) {
-        (false, false) => Ok(ReleaseOutput::Embedded(dir.join(RELEASE_WRAPPER))),
+        (false, false) => Err(CliError::Usage(
+            text::msg::release_run_wrapper_unverifiable(&dir.display()),
+        )),
         (true, true) => Ok(ReleaseOutput::Bundle(dir.to_path_buf())),
         (true, false) | (false, true) => {
             let missing = if app { RELEASE_PROFILE } else { RELEASE_APP };
@@ -3043,42 +3048,63 @@ fn prebuilt_artifact(dir: &Path) -> Result<ReleaseOutput, CliError> {
 
 /// Run a release artifact, confined, with `app_args`.
 ///
-/// The embed-mode wrapper is executed as is: it verifies its embedded profile
-/// against its embedded floor and jails itself, failing closed. A bundle's app
-/// is verified against its profile, then jailed; a pure-native binary is
-/// jailed under the profile its consented capabilities lower to.
+/// The embed-mode wrapper the pipeline just built is executed with the app
+/// arguments behind its `--`: it verifies its embedded profile against its
+/// embedded floor and jails itself, failing closed. A bundle's app is read
+/// once, verified against its profile, and those verified bytes run jailed; a
+/// pure-native binary is jailed under the profile its consented capabilities
+/// lower to.
 fn run_release_output(
     output: ReleaseOutput,
     app_args: &[std::ffi::OsString],
 ) -> Result<(), CliError> {
-    let (app, profile) = match output {
+    let working_tree = || {
+        std::env::current_dir().map_err(|e| CliError::Io {
+            path: PathBuf::from("."),
+            source: e,
+        })
+    };
+    match output {
         ReleaseOutput::Distributable => {
             // The pipeline refuses every no-run target under `Run`; a
             // distributable here has nothing to execute.
-            return Err(CliError::NoRunForm {
+            Err(CliError::NoRunForm {
                 target: cli_args::NoRunTarget::Wasm,
-            });
+            })
         }
-        ReleaseOutput::Embedded(wrapper) => return exec_program(&wrapper, app_args),
+        ReleaseOutput::Embedded(wrapper) => exec_program(&wrapper, &wrapper_argv(app_args)),
         ReleaseOutput::Bundle(dir) => {
-            let app = dir.join(RELEASE_APP);
-            let profile = run_sandbox::load_and_verify_artifact(&dir.join(RELEASE_PROFILE), &app)?;
-            (app, profile)
+            let verified = run_sandbox::load_and_verify_artifact(
+                &dir.join(RELEASE_PROFILE),
+                &dir.join(RELEASE_APP),
+            )?;
+            let tmp = run_sandbox::make_scoped_tmp()?;
+            Err(run_sandbox::exec_verified_jailed(
+                &verified,
+                tmp.path(),
+                &working_tree()?,
+                app_args,
+            ))
         }
-        ReleaseOutput::PureNative { binary, profile } => (binary, profile),
-    };
-    let scoped_tmp = run_sandbox::make_scoped_tmp()?;
-    let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
-        path: PathBuf::from("."),
-        source: e,
-    })?;
-    Err(run_sandbox::exec_jailed(
-        &profile,
-        scoped_tmp.path(),
-        &working_tree,
-        &app,
-        app_args,
-    ))
+        ReleaseOutput::PureNative { binary, profile } => {
+            let tmp = run_sandbox::make_scoped_tmp()?;
+            Err(run_sandbox::exec_jailed(
+                &profile,
+                tmp.path(),
+                &working_tree()?,
+                &binary,
+                app_args,
+            ))
+        }
+    }
+}
+
+/// The embed-mode wrapper's argv for `app_args`: every app argument sits
+/// behind the wrapper's `--`, so none is read as a wrapper flag.
+fn wrapper_argv(app_args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    std::iter::once(std::ffi::OsString::from("--"))
+        .chain(app_args.iter().cloned())
+        .collect()
 }
 
 /// Execute `program` with `args`: replace this process on Unix, or wait for
@@ -4267,9 +4293,11 @@ mod held_crate_tests {
 
 #[cfg(test)]
 mod help_on_misuse_tests {
-    use super::with_help_on_misuse;
+    use super::{RELEASE_WRAPPER, prebuilt_artifact_dir, with_help_on_misuse, wrapper_argv};
     use crate::CliError;
     use crate::ffi::FfiPrepError;
+    use crate::verb::Verb;
+    use crate::{package_manifest, project};
 
     /// An FFI prep refusal is not command misuse: it passes through without the help page.
     #[test]
@@ -4283,5 +4311,44 @@ mod help_on_misuse_tests {
             matches!(&got, Err(CliError::FfiPrep(inner)) if **inner == refusal()),
             "{got:?}"
         );
+    }
+
+    /// A directory with a project manifest is a project, never an artifact:
+    /// a planted wrapper beside `package.ipe` or `ipe.toml` is not what
+    /// `release run` runs. The same directory without a manifest is one.
+    #[test]
+    fn a_project_dir_is_never_a_prebuilt_artifact() {
+        let tmp = ipe_test_temp::temp_root()
+            .join(format!("ipec-prebuilt-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create dir");
+        std::fs::write(tmp.join(RELEASE_WRAPPER), b"").expect("write wrapper");
+        let dir = tmp.to_string_lossy().into_owned();
+        let bare = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
+        std::fs::write(tmp.join(package_manifest::PACKAGE_IPE), b"").expect("write manifest");
+        let with_package = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
+        std::fs::remove_file(tmp.join(package_manifest::PACKAGE_IPE)).expect("remove manifest");
+        std::fs::write(tmp.join(project::IPE_TOML), b"").expect("write legacy manifest");
+        let with_toml = prebuilt_artifact_dir(Some(dir.as_str())).is_some();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            bare,
+            "a wrapper-bearing dir with no manifest is an artifact dir"
+        );
+        assert!(!with_package, "a dir with package.ipe is a project");
+        assert!(!with_toml, "a dir with ipe.toml is a project");
+    }
+
+    /// Every app argument reaches the embed-mode app, wrapper flags and a
+    /// second `--` included.
+    #[test]
+    fn wrapper_argv_puts_every_app_argument_behind_the_separator() {
+        let os = |words: &[&str]| -> Vec<std::ffi::OsString> {
+            words.iter().map(std::ffi::OsString::from).collect()
+        };
+        let argv = wrapper_argv(&os(&["--show-profile", "a", "--", "b"]));
+        let expected = os(&["--", "--show-profile", "a", "--", "b"]);
+        assert_eq!(argv, expected);
+        assert_eq!(wrapper_argv(&[]), vec![std::ffi::OsString::from("--")]);
     }
 }

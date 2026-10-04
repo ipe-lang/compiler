@@ -440,21 +440,42 @@ fn inject_floor_reference(src: &str) -> Result<String, CliError> {
     Ok(out)
 }
 
+/// A deployed release app read once and verified against its `ipe.profile`.
+///
+/// Holds the exact bytes the floor scan judged, so the jailed exec runs those
+/// bytes ([`exec_verified_jailed`]) rather than re-opening the path the scan
+/// read.
+pub struct VerifiedArtifact {
+    profile: SandboxProfile,
+    bytes: Vec<u8>,
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for VerifiedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedArtifact")
+            .field("profile", &self.profile)
+            .field("path", &self.path)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Read and verify the deployed artifact's floor against its `ipe.profile`.
 ///
-/// Returns the profile to jail with. The authoritative floor is the binary's
-/// embedded `.rodata` capfloor line, scanned passively (the binary is never
-/// executed).
+/// The authoritative floor is the binary's embedded `.rodata` capfloor line,
+/// scanned passively (the binary is never executed) over bytes read once
+/// under [`crate::io_bounded::RELEASE_APP_READ_CAP`].
 ///
 /// # Errors
 ///
 /// [`CliError::Usage`] on a missing/tampered profile or a profile weaker
 /// than the embedded floor (both refuse-to-run); [`CliError::FileTooLarge`]
-/// on a binary past [`crate::io_bounded::RELEASE_APP_READ_CAP`].
+/// on a binary past the cap.
 pub fn load_and_verify_artifact(
     profile_path: &Path,
     binary_path: &Path,
-) -> Result<SandboxProfile, CliError> {
+) -> Result<VerifiedArtifact, CliError> {
     verify_artifact_under(
         profile_path,
         binary_path,
@@ -469,9 +490,7 @@ fn verify_artifact_under(
     profile_path: &Path,
     binary_path: &Path,
     binary_cap: u64,
-) -> Result<SandboxProfile, CliError> {
-    use ipe_sandbox::run_jail;
-
+) -> Result<VerifiedArtifact, CliError> {
     // Parse the profile mirror strictly (parse-fail ⇒ refuse).
     let profile_text = crate::io_bounded::read_to_string_capped(
         profile_path,
@@ -487,8 +506,8 @@ fn verify_artifact_under(
     // Read the authoritative floor from the binary's embedded `.rodata` bytes
     // (passively — the binary is NOT executed). A binary with no readable floor
     // refuses.
-    let binary = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
-    let floor = run_jail::scan_capfloor(&binary).ok_or_else(|| {
+    let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
+    let floor = run_jail::scan_capfloor(&bytes).ok_or_else(|| {
         CliError::Usage(crate::text::msg::run_floor_unreadable(
             &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
         ))
@@ -500,7 +519,69 @@ fn verify_artifact_under(
             &RunJailDefect::ProfileWeakerThanFloor,
         )));
     }
-    Ok(profile)
+    Ok(VerifiedArtifact {
+        profile,
+        bytes,
+        path: binary_path.to_path_buf(),
+    })
+}
+
+/// Run a [`VerifiedArtifact`] inside the run jail. Returns only on failure.
+///
+/// Where the jail takes a sealed delivery (Linux, macOS) the app runs from
+/// the verified bytes themselves, so a file swapped in at the path after the
+/// scan is never what runs. Elsewhere the jail execs the path.
+#[must_use]
+pub fn exec_verified_jailed(
+    artifact: &VerifiedArtifact,
+    scoped_tmp: &Path,
+    working_tree: &Path,
+    app_args: &[OsString],
+) -> CliError {
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        let wants_wall_clock = artifact.profile.limits.wall_secs.is_some();
+        let defect = match run_jail::probe_run_jail_tools(wants_wall_clock) {
+            Ok(tools) => match run_jail::write_sealed_app_memfd(&artifact.bytes) {
+                Ok(sealed) => match run_jail::exec_embedded_in_run_jail(
+                    &tools,
+                    &artifact.profile,
+                    scoped_tmp,
+                    working_tree,
+                    &sealed,
+                    app_args,
+                ) {
+                    Err(defect) => defect,
+                    Ok(never) => match never {},
+                },
+                Err(defect) => defect,
+            },
+            Err(defect) => defect,
+        };
+        defect_error(defect)
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )))]
+    {
+        exec_jailed(
+            &artifact.profile,
+            scoped_tmp,
+            working_tree,
+            &artifact.path,
+            app_args,
+        )
+    }
 }
 
 /// Build the sandbox-override warning string from a resolved palette.

@@ -1515,6 +1515,8 @@ messages! {
     release_run_artifact_flags(dir) = "release-run-artifact-flags";
     /// `ipe release run <dir>` found a bundle missing one of its three files.
     release_run_bundle_incomplete(dir, missing) = "release-run-bundle-incomplete";
+    /// `ipe release run <dir>` found a lone wrapper with no app and profile to verify.
+    release_run_wrapper_unverifiable(dir) = "release-run-wrapper-unverifiable";
     /// `wasm-bindgen` failed while bundling a `--target wasm` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.
