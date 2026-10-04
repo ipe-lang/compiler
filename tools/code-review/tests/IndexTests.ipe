@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,58 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , indexConn
-    , loadUnitNow
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , langName
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -92,7 +41,6 @@ import TestSupport exposing
 indexBridge : Task.Task Error Bool
 indexBridge =
     freshDir "ipe-index-b3-test" |> Task.andThen indexBridgeIn
-
 
 
 indexBridgeIn : String -> Task.Task Error Bool
@@ -112,7 +60,6 @@ indexBridgeIn base =
         |> Task.andThen (\ok -> cleanupIndex indexDb repo |> Task.map (\_ -> ok))
 
 
-
 -- Seeds the bridge fixture at `name`, runs `mutate`, loads the first page and
 -- returns the view tag of each queued unit as `uid=tag`.
 viewTagsAfter : String -> (Scratch -> Task.Task Error ()) -> Task.Task Error (List String)
@@ -127,22 +74,20 @@ viewTagsAfter name mutate =
         Task.succeed (List.map (\u -> u.uid ++ "=" ++ viewTag u.view) r.units)
 
 
-
 -- True for an `Unreadable` view tag whose rendered error contains `needle`.
 unreadableNaming : String -> String -> Bool
 unreadableNaming needle tag =
     String.startsWith "unreadable: " tag && String.contains needle tag
 
 
-
 -- R1: one line inserted above the unit moves its bytes; the stored hash no
 -- longer matches. Red if the hash comparison is removed (the view is shown).
 driftedSourceNotShown : Task.Task Error Bool
 driftedSourceNotShown =
-    viewTagsAfter "ipe-index-attest-drift"
+    viewTagsAfter
+        "ipe-index-attest-drift"
         (\at -> writeFileText (at.repo ++ "/src/Lib.rs") ("// inserted above\n" ++ fixtureLibRs))
         |> Task.map (\tags -> List.member "u-a=drifted" tags && List.member "u-b=shown" tags)
-
 
 
 -- R2: a span one line past the 10-line file, stored with the hash of the
@@ -159,7 +104,6 @@ rangePastFileIsStale =
         |> Task.map (\tags -> List.member "u-a=range 10" tags)
 
 
-
 -- R3: a stored value with no exact `sha256:` prefix is never re-proved, even
 -- when it is the right digest. Red if the scheme parse is removed (each
 -- value would read as drifted).
@@ -171,7 +115,8 @@ legacyHashUnverifiable =
     ]
         |> List.map
             (\stored ->
-                viewTagsAfter "ipe-index-attest-legacy"
+                viewTagsAfter
+                    "ipe-index-attest-legacy"
                     (\at -> execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString stored, SqlString "u-a" ])
                     |> Task.map (\tags -> List.member "u-a=unverifiable" tags)
             )
@@ -179,13 +124,13 @@ legacyHashUnverifiable =
         |> Task.map (List.all identity)
 
 
-
 -- R8: one queued unit's file is gone; that unit alone is unreadable, naming
 -- its stored path, and the page still loads. Red if the per-unit error
 -- capture is removed (the whole page fails).
 oneMissingFileIsolated : Task.Task Error Bool
 oneMissingFileIsolated =
-    viewTagsAfter "ipe-index-attest-missing"
+    viewTagsAfter
+        "ipe-index-attest-missing"
         (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
         |> Task.map
             (\tags ->
@@ -194,14 +139,12 @@ oneMissingFileIsolated =
             )
 
 
-
 -- A queued unit whose source file is one byte past the 16 MiB read ceiling
 -- is unreadable for that reason, rather than read whole; the page still
 -- loads.
 oversizedSourceRefused : Task.Task Error Bool
 oversizedSourceRefused =
     freshDir "ipe-index-oversized-source" |> Task.andThen oversizedSourceRefusedIn
-
 
 
 oversizedSourceRefusedIn : String -> Task.Task Error Bool
@@ -222,14 +165,12 @@ oversizedSourceRefusedIn base =
         Task.succeed (unreadableNaming "16777216-byte limit" (unitViewTag "u-a" r.units))
 
 
-
 -- The unit page's data path: a uid that exists loads with its source and
 -- qualified name, and links nothing its source does not name; a bogus uid
 -- loads Nothing.
 unitPageLoad : Task.Task Error Bool
 unitPageLoad =
     freshDir "ipe-index-b9-unit" |> Task.andThen unitPageLoadIn
-
 
 
 unitPageLoadIn : String -> Task.Task Error Bool
@@ -301,7 +242,6 @@ unitPageLoadIn base =
             )
 
 
-
 -- ── shared view/hash vectors ──────────────────────────────────────────────
 --
 -- The Ipê view rule and attestation agree with ipe-index's on every row of
@@ -318,7 +258,6 @@ type alias HashVector =
     }
 
 
-
 viewHashVectors : Task.Task Error Bool
 viewHashVectors =
     do
@@ -327,7 +266,6 @@ viewHashVectors =
         text <- File.readFileLimit path (ByteSize.kib 64)
         vectors <- Task.fromResult (Decode.decodeString (Decode.list vectorDecoder) text)
         Task.succeed (List.length vectors >= 13 && List.all vectorHolds vectors)
-
 
 
 vectorDecoder : Decode.Decoder HashVector
@@ -351,7 +289,6 @@ vectorDecoder =
             (Decode.field "view" (Decode.nullable Decode.string))
             (Decode.field "hash" (Decode.nullable Decode.string))
         )
-
 
 
 vectorHolds : HashVector -> Bool
@@ -398,7 +335,6 @@ pageReadsNoSource =
             )
 
 
-
 loadedViewTag : Maybe Index.UnitView -> String
 loadedViewTag found =
     case found of
@@ -407,7 +343,6 @@ loadedViewTag found =
 
         Nothing ->
             "absent"
-
 
 
 -- A unit's highlighting language is its file's language as ipe-index
@@ -426,7 +361,6 @@ langFromFilesTable =
         Task.succeed (List.map (\r -> r.unit.uid ++ "=" ++ langName r.unit.lang) rows == [ "u-a=Rust", "u-b=Unknown" ])
 
 
-
 -- An index with no `files` table stops startup naming `IPE_INDEX_DB`. Red if
 -- the probe stops reading the language join a queue page reads.
 probeRefusesIndexWithoutFiles : Task.Task Error Bool
@@ -439,7 +373,6 @@ probeRefusesIndexWithoutFiles =
         message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
         cleanupIndex at.indexDb at.repo
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
-
 
 
 checks : Task.Task Error (List ( String, Bool ))

@@ -13,9 +13,9 @@ import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Set as Set
 import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
@@ -30,55 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-
-import TestSupport exposing
-    ( tableExists
-    , countReviewRows
-    , expectErr
-    , refuse
-    , seedIndex
-    , writeFileText
-    , fixtureLibRs
-    , fixtureMainIpe
-    , viewA
-    , viewB
-    , viewTag
-    , shownTextOf
-    , unitViewTag
-    , execIndex
-    , execIndexUnchecked
-    , Scratch
-    , freshScratch
-    , freshDir
-    , check
-    , indexSchemaStatements
-    , execIndexSchema
-    , seedIndexDb
-    , insertUnitRows
-    , setIndexEnv
-    , loadFirstPage
-    , checkUnits
-    , listSecond
-    , isUnitA
-    , isUnitB
-    , cleanupIndex
-    , removeFileIfAny
-    , codeText
-    , noHazard
-    , rendered
-    , renderedForeign
-    , describeText
-    , refusedFor
-    , openReadOnlyAt
-    , vectorsPath
-    , ipeIndexTestFile
-    , repoFile
-    , probeMessage
-    , probeNames
-    , maybeContains
-    )
-
-
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
@@ -94,14 +46,13 @@ dbRefusalNamesOnlyVariable =
                 && not (refusedFor "]0;pwn" refusal)
                 && not (refusedFor "postgres://" refusal)
                 && (case refusal of
-                        Just message ->
-                            noHazard message
+                    Just message ->
+                        noHazard message
 
-                        Nothing ->
-                            False
-                   )
+                    Nothing ->
+                        False
+                )
             )
-
 
 
 settingsRefusal : String -> Task.Task Error (Maybe String)
@@ -112,11 +63,9 @@ settingsRefusal indexDb =
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
 
 
-
 settingsRefused : String -> String -> Task.Task Error Bool
 settingsRefused indexDb reason =
     settingsRefusal indexDb |> Task.map (refusedFor reason)
-
 
 
 -- `IPE_INDEX_DB` values that cannot name a SQLite database stop at the parse,
@@ -186,7 +135,6 @@ badIndexDbRefused =
             )
 
 
-
 -- Every open URL carries exactly the app's mode, for a file path and a
 -- `sqlite://` URL alike, and a `sqlite://` URL parses to the same location as
 -- the plain path it names; a `+` in the URL path is a literal `+`, never a
@@ -227,7 +175,6 @@ dbUrlsCarryAppMode =
             )
 
 
-
 -- A working directory can hold `%`, `?` or `#`; each is escaped so the joined
 -- file path survives the URL as the same name, with `%` escaped first so the
 -- other escapes are not re-encoded.
@@ -239,7 +186,6 @@ filePathsEncodeUrlSpecials =
         == "/w/%253F"
         && Settings.encodeFilePath "/w/plain.db"
         == "/w/plain.db"
-
 
 
 -- ── required resources probed before listen ─────────────────────────────
@@ -263,7 +209,6 @@ probesNameTheirVariable =
         Task.succeed (good == Nothing && missing && notIndex && review)
 
 
-
 -- A nonexistent index is refused with the build hint and is not created.
 missingIndexProbed : Scratch -> Task.Task Error Bool
 missingIndexProbed at =
@@ -277,7 +222,6 @@ missingIndexProbed at =
         message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
         created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
         Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
-
 
 
 -- A SQLite file with none of the index tables is refused.
@@ -296,7 +240,6 @@ foreignDbProbed at =
         Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
 
 
-
 -- A review location under a missing directory is refused with its own fix.
 reviewProbed : Scratch -> Task.Task Error Bool
 reviewProbed at =
@@ -310,7 +253,6 @@ reviewProbed at =
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && not (maybeContains "ipe-index index" message))
 
 
-
 -- Each `IPE_INDEX_DB` refusal states its problem and exactly one fix. Red if
 -- a problem that carries its own fix gets the generic one appended again.
 dbRefusalsStateOneFix : Task.Task Error Bool
@@ -318,20 +260,19 @@ dbRefusalsStateOneFix =
     do
         cwd <- System.cwd ()
         System.setenv "IPE_INDEX_ROOT" cwd
-        refusals <-
-            [ ""
-            , "postgres://localhost/index"
-            , "sqlite:index.db"
-            , "index.db?mode=rwc"
-            , "sqlite:///tmp/index.db?mode=rwc"
-            , "sqlite:///tmp/index%zz.db"
-            , "sqlite://"
-            , "sqlite:///tmp/index%00.db"
-            , "sqlite://rel.db"
-            , "sqlite:///"
-            ]
-                |> List.map settingsRefusal
-                |> Task.sequence
+        refusals <- [ ""
+        , "postgres://localhost/index"
+        , "sqlite:index.db"
+        , "index.db?mode=rwc"
+        , "sqlite:///tmp/index.db?mode=rwc"
+        , "sqlite:///tmp/index%zz.db"
+        , "sqlite://"
+        , "sqlite:///tmp/index%00.db"
+        , "sqlite://rel.db"
+        , "sqlite:///"
+        ]
+            |> List.map settingsRefusal
+            |> Task.sequence
         Task.succeed
             (List.all
                 (\refusal ->
