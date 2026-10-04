@@ -612,6 +612,17 @@ fn the_admitted_sites_alone_pass() {
     }
 }
 
+fn assert_every_sample_is_refused(refused: &[(&str, &str)]) {
+    for (rel, sample) in refused {
+        let (drift, refusals) =
+            scan_source(rel, &admitted_with(rel, sample)).expect("sample parses");
+        assert!(
+            !refusals.is_empty() || !drift.is_empty(),
+            "the scan must refuse in {rel}: {sample}"
+        );
+    }
+}
+
 #[test]
 fn a_held_act_elsewhere_is_refused() {
     let refused = [
@@ -663,6 +674,13 @@ fn a_held_act_elsewhere_is_refused() {
             "driver/commands_pkg.rs",
             "fn assemble_desktop() { let _ = Self::Emitted(d); }",
         ),
+    ];
+    assert_every_sample_is_refused(&refused);
+}
+
+#[test]
+fn a_watch_build_constructed_elsewhere_is_refused() {
+    let refused = [
         // The watch build, constructed outside the watch loop.
         (
             "watch.rs",
@@ -685,6 +703,13 @@ fn a_held_act_elsewhere_is_refused() {
             "watch.rs",
             "type W<'a> = crate::cargo_step::WatchBuild<'a>;",
         ),
+    ];
+    assert_every_sample_is_refused(&refused);
+}
+
+#[test]
+fn the_cargo_build_command_built_elsewhere_is_refused() {
+    let refused = [
         // The cargo build command, built outside the two admitted commands.
         (
             "cargo_step.rs",
@@ -700,11 +725,15 @@ fn a_held_act_elsewhere_is_refused() {
         ),
         ("cargo_step.rs", "fn f() { let g = build_command; }"),
         ("cargo_step.rs", "fn f() { let _ = x.build_command(); }"),
-        (
-            "cargo_step.rs",
-            "fn f() { let _ = format!(\"{:?}\", build_command(a, b)); }",
-        ),
+        ("cargo_step.rs", "fn f() { dbg!(build_command(a, b)); }"),
         ("watch.rs", "use crate::cargo_step::build_command;"),
+    ];
+    assert_every_sample_is_refused(&refused);
+}
+
+#[test]
+fn a_floor_witness_constructed_elsewhere_is_refused() {
+    let refused = [
         // The floor witnesses, constructed outside the code that proves them.
         (
             "driver/commands.rs",
@@ -728,14 +757,7 @@ fn a_held_act_elsewhere_is_refused() {
             "impl Tr for X { type W<'a> = DevMarkedCrate<'a>; }",
         ),
     ];
-    for (rel, sample) in refused {
-        let (drift, refusals) =
-            scan_source(rel, &admitted_with(rel, sample)).expect("sample parses");
-        assert!(
-            !refusals.is_empty() || !drift.is_empty(),
-            "the scan must refuse in {rel}: {sample}"
-        );
-    }
+    assert_every_sample_is_refused(&refused);
 }
 
 #[test]
