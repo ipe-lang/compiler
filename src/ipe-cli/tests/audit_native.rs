@@ -1336,7 +1336,7 @@ mod real_jail {
             &[
                 dir.clone().into_os_string(),
                 "--".into(),
-                secret.clone().into_os_string(),
+                secret.into_os_string(),
             ],
         );
         assert!(
@@ -1465,7 +1465,7 @@ mod real_jail {
         let (granted, _) = floor_bundle(&base.join("granted"), &[Capability::Network]);
         std::fs::copy(granted.join("ipe.profile"), dir.join("ipe.profile"))
             .expect("tamper the profile");
-        let (ok, stdout, stderr) = release_run(&work, &[dir.clone().into_os_string()]);
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
         assert!(
             !ok && !stdout.contains("started"),
             "a profile granting more than the floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
