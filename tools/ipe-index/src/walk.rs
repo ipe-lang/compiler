@@ -8,7 +8,7 @@
 //! checked on disk without following links (`symlink_metadata` on the leaf and
 //! on each directory above it), so a working-tree link, tracked or untracked,
 //! never leads a read outside the repository. Reading goes through
-//! [`read_indexed`] only: it re-parses the name, repeats the no-follow check,
+//! [`read_owned`] only: it re-parses the name, repeats the no-follow check,
 //! refuses a handle whose file is not the one that check saw, and reads at
 //! most [`MAX_FILE_BYTES`] from the held handle.
 
@@ -811,7 +811,7 @@ fn classify(
     (upserts, deletes, refused)
 }
 
-/// Why [`read_indexed`] returned no text for a path.
+/// Why [`read_owned`] returned no text for a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadRefusal {
     /// The name is not a plain repository-relative UTF-8 path.
@@ -867,17 +867,19 @@ impl fmt::Display for ReadRefusal {
     }
 }
 
+/// [`read_owned`] of a root with no root declared inside it.
+#[cfg(test)]
+pub fn read_indexed(root: &Path, rel: &str) -> Result<String, ReadRefusal> {
+    read_owned(root, rel, &[])
+}
+
 /// Reads the regular file `root/rel` as text, refusing anything the walk would.
 ///
 /// `rel` is parsed again, so a stored name never escapes `root`; the leaf and
 /// every directory above it are checked without following links; the opened
 /// handle must be the file that check saw; at most [`MAX_FILE_BYTES`] are read.
-pub fn read_indexed(root: &Path, rel: &str) -> Result<String, ReadRefusal> {
-    read_owned(root, rel, &[])
-}
-
-/// [`read_indexed`] for a walked root: a path under one of the `claimed` roots
-/// declared inside `root` is refused, since only the root that owns it reads it.
+/// A path under one of the `claimed` roots declared inside `root` is refused,
+/// since only the root that owns it reads it.
 pub fn read_owned(
     root: &Path,
     rel: &str,

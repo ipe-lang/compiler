@@ -3,7 +3,7 @@ use crate::store::Store;
 use crate::walk::{ReadRefusal, shown};
 use anyhow::Result;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 /// Escapes `text` so it matches only itself inside a `LIKE ... ESCAPE '\'` pattern.
@@ -414,80 +414,71 @@ pub fn cmd_changed(db: &str, repo: &str, range: &str) -> Result<()> {
 pub fn cmd_rdeps(db: &str, module: &str, count: bool, subtree: bool) -> Result<()> {
     use std::io::Write;
     let s = Store::open(db)?;
-    // Determine whether the arg looks like a file path (contains '/' or ends with a
-    // file extension) so we can match on `resolved` instead of `dst`.
-    let looks_like_path = module.contains('/') || module.contains('.');
-    // Build the WHERE clause:
-    //   - exact dst match (default): `dst = ?`
-    //   - exact resolved match when arg is path-shaped: `resolved = ?`
-    //   - subtree: additionally `dst LIKE 'module.%'` with `module` escaped
-    // We do NOT use unanchored LIKE so `rdeps "List"` can't accidentally
-    // fold in `Data.List`, `container/list`, or `*ListSpec` files.
+    let sources = rdeps_sources(&s, module, subtree)?;
     if count {
-        let n: i64 = if subtree {
-            s.conn.query_row(
-                "SELECT COUNT(DISTINCT src) FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved=?1)",
-                rusqlite::params![module, format!("{}.%", like_literal(module))],
-                |r| r.get(0),
-            )?
-        } else if looks_like_path {
-            s.conn.query_row(
-                "SELECT COUNT(DISTINCT src) FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR resolved=?1)",
-                rusqlite::params![module],
-                |r| r.get(0),
-            )?
-        } else {
-            s.conn.query_row(
-                "SELECT COUNT(DISTINCT src) FROM edges \
-                 WHERE kind='import' AND dst=?1",
-                rusqlite::params![module],
-                |r| r.get(0),
-            )?
-        };
-        println!("{n}");
-    } else {
-        let stdout = std::io::stdout();
-        let sql_and_params: (&str, Vec<String>);
-        let (sql, params) = if subtree {
-            sql_and_params = (
-                "SELECT DISTINCT src FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved=?1) ORDER BY src",
-                vec![module.to_string(), format!("{}.%", like_literal(module))],
-            );
-            (&sql_and_params.0, &sql_and_params.1)
-        } else if looks_like_path {
-            sql_and_params = (
-                "SELECT DISTINCT src FROM edges \
-                 WHERE kind='import' AND (dst=?1 OR resolved=?1) ORDER BY src",
-                vec![module.to_string()],
-            );
-            (&sql_and_params.0, &sql_and_params.1)
-        } else {
-            sql_and_params = (
-                "SELECT DISTINCT src FROM edges \
-                 WHERE kind='import' AND dst=?1 ORDER BY src",
-                vec![module.to_string()],
-            );
-            (&sql_and_params.0, &sql_and_params.1)
-        };
-        let mut st = s.conn.prepare(sql)?;
-        let rows = st.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-            r.get::<_, String>(0)
-        })?;
-        let mut locked = stdout.lock();
-        for r in rows {
-            let src = r?;
-            if let Err(e) = writeln!(locked, "{src}") {
-                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    return Ok(());
-                }
-                return Err(e.into());
+        println!("{}", sources.len());
+        return Ok(());
+    }
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    for src in sources {
+        if let Err(e) = writeln!(locked, "{src}") {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
             }
+            return Err(e.into());
         }
     }
     Ok(())
+}
+
+/// The files importing `module`, sorted and distinct.
+///
+/// - an exact `dst` match (default);
+/// - also an exact `resolved` match when `module` is path-shaped (holds a `/`
+///   or a `.`);
+/// - `subtree`: also every dotted module below `module`, whole segments only.
+///
+/// No match is unanchored, so `rdeps "List"` never folds in `Data.List`,
+/// `container/list`, or `*ListSpec` files. A SQL `LIKE` is ASCII
+/// case-insensitive, so the subtree rows it selects are filtered again by an
+/// exact, case-sensitive comparison.
+fn rdeps_sources(s: &Store, module: &str, subtree: bool) -> Result<BTreeSet<String>> {
+    let looks_like_path = module.contains('/') || module.contains('.');
+    let mut sources = BTreeSet::new();
+    if subtree {
+        let mut st = s.conn.prepare(
+            "SELECT src, dst, resolved FROM edges \
+             WHERE kind='import' AND (dst=?1 OR dst LIKE ?2 ESCAPE '\\' OR resolved=?1)",
+        )?;
+        let rows = st.query_map(
+            rusqlite::params![module, format!("{}.%", like_literal(module))],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (src, dst, resolved) = row?;
+            if resolved.as_deref() == Some(module) || below_module(&dst, module).is_some() {
+                sources.insert(src);
+            }
+        }
+        return Ok(sources);
+    }
+    let sql = if looks_like_path {
+        "SELECT DISTINCT src FROM edges WHERE kind='import' AND (dst=?1 OR resolved=?1)"
+    } else {
+        "SELECT DISTINCT src FROM edges WHERE kind='import' AND dst=?1"
+    };
+    let mut st = s.conn.prepare(sql)?;
+    for src in st.query_map([module], |r| r.get::<_, String>(0))? {
+        sources.insert(src?);
+    }
+    Ok(sources)
 }
 
 pub fn cmd_deps(db: &str, module: &str) -> Result<()> {
@@ -795,7 +786,7 @@ fn find_crate_root(src_file: &std::path::Path) -> Option<String> {
     None
 }
 
-/// A5 `links <uid>`: outgoing links and callgraph calls of one unit.
+/// `links <uid>`: outgoing links and callgraph calls of one unit.
 /// Internal link targets resolve to the callee unit's qualified name (via the
 /// `to_uid` join); external refs keep the raw URL. One text line per row.
 pub fn cmd_links(db: &str, uid: &str) -> Result<()> {
@@ -846,7 +837,7 @@ pub fn cmd_links(db: &str, uid: &str) -> Result<()> {
     Ok(())
 }
 
-/// A5 `neighbors <uid>`: links + callgraph edges in BOTH directions around a
+/// `neighbors <uid>`: links + callgraph edges in BOTH directions around a
 /// unit. `link-out`/`call` originate at the unit; `link-in`/`called-by` point
 /// at it. One text line per row.
 pub fn cmd_neighbors(db: &str, uid: &str) -> Result<()> {
@@ -899,7 +890,7 @@ pub fn cmd_neighbors(db: &str, uid: &str) -> Result<()> {
     Ok(())
 }
 
-/// A6 `pending`: change-queue rows as JSON lines (one object per queued unit).
+/// `pending`: change-queue rows as JSON lines (one object per queued unit).
 /// `--since <sha>` excludes rows enqueued by that update run (empty matches
 /// everything); `--limit N` caps the result. Deleted units join to NULL unit
 /// columns (their `units` row is gone), so `qualified`/`path`/`kind` are null.
@@ -1189,7 +1180,7 @@ fn rename_path_sites(s: &Store, old: &str, to: Option<&str>) -> Result<Vec<serde
     Ok(sites)
 }
 
-/// A7 `rename-path <old> [--to <new>]`: whole-segment path match across
+/// `rename-path <old> [--to <new>]`: whole-segment path match across
 /// files, symbols, units, import edges (dst/resolved), and links (to_ref).
 /// Outputs JSON lines: {kind,path,line,col,context,replacement?}.
 /// kind ∈ {file,symbol,unit,import,link}. Read-only.
@@ -1211,8 +1202,12 @@ enum SourceRefusal {
     Locate(LocateRefusal),
     /// The owning root refused the file.
     Read(ReadRefusal),
-    /// The unit's recorded lines start past the end of the file as it is now.
-    SpanPastFile { line_start: i64, lines: usize },
+    /// The unit's recorded lines end past the end of the file as it is now.
+    SpanPastFile {
+        line_start: i64,
+        line_end: i64,
+        lines: usize,
+    },
     /// A recorded or computed line or column number is outside the line-count range.
     LineNumber,
 }
@@ -1222,9 +1217,13 @@ impl fmt::Display for SourceRefusal {
         match self {
             Self::Locate(why) => write!(f, "{why}"),
             Self::Read(why) => write!(f, "{why}"),
-            Self::SpanPastFile { line_start, lines } => write!(
+            Self::SpanPastFile {
+                line_start,
+                line_end,
+                lines,
+            } => write!(
                 f,
-                "a unit starts at line {line_start}, past the {lines} lines the file has now; re-run `index`"
+                "a unit spans lines {line_start}-{line_end}, past the {lines} lines the file has now; re-run `index`"
             ),
             Self::LineNumber => f.write_str("a line or column number is out of range"),
         }
@@ -1247,10 +1246,18 @@ struct RenamePlan {
 }
 
 /// The lines of a unit's file, read through the root that owns its tagged path.
+///
+/// Split as the index split them when it recorded the unit spans, so a span
+/// and the lines it is checked against count lines the same way.
 fn source_lines(set: &RepoSet, tagged: &str) -> Result<Vec<String>, SourceRefusal> {
     let (root, rel) = set.locate(tagged).map_err(SourceRefusal::Locate)?;
     crate::walk::read_owned(root.root(), rel.as_str(), &set.claimed_in(root))
-        .map(|text| text.lines().map(str::to_string).collect())
+        .map(|text| {
+            crate::extract::view::view_lines(&text)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
         .map_err(SourceRefusal::Read)
 }
 
@@ -1407,9 +1414,6 @@ fn rename_symbol_plan(
         let Some(Some(lines)) = line_cache.get(&path) else {
             continue;
         };
-        if lines.is_empty() {
-            continue;
-        }
         let Some((first, last)) = span_lines(line_start, line_end) else {
             unread.push(UnreadFile {
                 path,
@@ -1417,17 +1421,22 @@ fn rename_symbol_plan(
             });
             continue;
         };
-        if lines.len() < first {
+        // An empty span (the `file` unit of an empty file) holds no line.
+        if last < first {
+            continue;
+        }
+        if lines.len() < last {
             unread.push(UnreadFile {
                 path,
                 why: SourceRefusal::SpanPastFile {
                     line_start,
+                    line_end,
                     lines: lines.len(),
                 },
             });
             continue;
         }
-        let count = last.max(first).saturating_sub(first).saturating_add(1);
+        let count = last.saturating_sub(first).saturating_add(1);
 
         for (index, line) in lines
             .iter()
@@ -1520,7 +1529,7 @@ fn write_sites(sites: &[serde_json::Value]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A8 `rename-symbol <old> [--to <new>] [--preserve <regex>...] [--map k=v,...]`:
+/// `rename-symbol <old> [--to <new>] [--preserve <regex>...] [--map k=v,...]`:
 /// finds resolved occurrences of a symbol name (units/links). Outputs JSON lines:
 /// {kind,path,line,col,context,replacement?}. kind ∈ {symbol,occurrence}.
 /// --preserve: user regexes + baked defaults (URL-ish, kebab-case attrs).
@@ -1595,6 +1604,32 @@ mod tests {
         assert_eq!(et, "%:tools/x");
         assert_eq!(s, "tools/x/%");
         assert_eq!(st, "%:tools/x/%");
+    }
+
+    // A subtree matches whole dotted segments of the exact, case-sensitive
+    // name, though the SQL `LIKE` selecting its rows ignores ASCII case.
+    #[test]
+    fn rdeps_subtree_is_case_sensitive_and_whole_segment() {
+        let s = Store::open(":memory:").unwrap();
+        for (src, dst) in [
+            ("a.ipe", "Foo.Bar"),
+            ("b.ipe", "foo.bar"),
+            ("c.ipe", "Foo"),
+            ("d.ipe", "FooX.Y"),
+            ("e.ipe", "FOO.Bar"),
+        ] {
+            s.put_edge(src, dst, "import").unwrap();
+        }
+        let got: Vec<String> = rdeps_sources(&s, "Foo", true)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got, ["a.ipe", "c.ipe"]);
+        let exact: Vec<String> = rdeps_sources(&s, "Foo", false)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(exact, ["c.ipe"]);
     }
 
     #[test]
@@ -1879,6 +1914,39 @@ mod tests {
             plan.unread
                 .iter()
                 .any(|u| matches!(u.why, SourceRefusal::SpanPastFile { .. })),
+            "{:?}",
+            plan.unread
+        );
+    }
+
+    // A unit whose first line is still there but whose last line is not is
+    // stale too: its scan is refused, never cut short at the end of the file.
+    #[cfg(unix)]
+    #[test]
+    fn rename_symbol_span_ending_past_the_file_fails_the_plan() {
+        let fx = crate::walk::fixture::Fixture::new("query-rename-shrunk");
+        fx.write("x.rs", "pub fn a() {}\npub fn old_name() {\n}\n");
+        fx.write("empty.rs", "");
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        crate::cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        fx.write("x.rs", "pub fn a() {}\npub fn old_name() {\n");
+        let s = Store::open(&db).unwrap();
+        let set = s.repo_set().unwrap();
+        let plan = rename_symbol_plan(&s, &set, "old_name", None, &[], None).unwrap();
+        assert!(
+            plan.unread.iter().any(|u| u.why
+                == SourceRefusal::SpanPastFile {
+                    line_start: 2,
+                    line_end: 3,
+                    lines: 2,
+                }),
+            "{:?}",
+            plan.unread
+        );
+        // An unchanged empty file is read whole, not refused.
+        assert!(
+            plan.unread.iter().all(|u| u.path == "ipe:x.rs"),
             "{:?}",
             plan.unread
         );

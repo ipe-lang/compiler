@@ -1,4 +1,4 @@
-//! The A6 change diff: what changed between two unit snapshots, expressed as
+//! The change diff: what changed between two unit snapshots, expressed as
 //! review-queue operations.
 
 use crate::repo_set::DeclaredRoot;
