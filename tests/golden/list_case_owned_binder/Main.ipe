@@ -70,7 +70,7 @@ pick ts n =
             Task.succeed "none"
 
 
--- The first arm's string guard fails for `Just "stop"`; the next arm binds.
+-- The first arm's string guard fails for the flag `"stop"`; the next arm binds.
 gated : List (Task Error String) -> String -> Task Error String
 gated ts flag =
     case ( ts, flag ) of
