@@ -488,10 +488,10 @@ fn entries_hinted_charges_cap_at_listing() {
     );
 }
 
-/// The listing alone refuses an over-cap directory whose entries no child act could reach.
+/// An over-cap directory of dangling links is refused by its listing; the cap is charged per listed entry.
 #[cfg(unix)]
 #[test]
-fn entries_hinted_refuses_over_cap_without_touching_children() {
+fn entries_hinted_refuses_over_cap_at_listing() {
     let dir = scratch("hinted_cap_dangling");
     for entry in ["a", "b", "c"] {
         std::os::unix::fs::symlink(dir.join("absent"), dir.join(entry)).unwrap();
@@ -505,10 +505,10 @@ fn entries_hinted_refuses_over_cap_without_touching_children() {
     );
 }
 
-/// A listing takes its kinds from the directory entry: a dangling link a following stat would fail on is still typed.
+/// A dangling link a following stat would fail on is still typed from the directory entry.
 #[cfg(unix)]
 #[test]
-fn entries_hinted_never_stats() {
+fn entries_hinted_types_a_dangling_link_without_following() {
     let dir = scratch("hinted_no_stat");
     std::fs::create_dir(dir.join("sub")).unwrap();
     std::fs::write(dir.join("file"), "x").unwrap();

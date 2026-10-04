@@ -237,3 +237,24 @@ impl Dir {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{FileType, HintedKind, hint_of_dirent_type};
+
+    #[test]
+    fn every_dirent_type_maps_to_its_own_hint() {
+        for (file_type, hint) in [
+            (FileType::RegularFile, HintedKind::Regular),
+            (FileType::Directory, HintedKind::Dir),
+            (FileType::Symlink, HintedKind::Link),
+            (FileType::Fifo, HintedKind::Other),
+            (FileType::Socket, HintedKind::Other),
+            (FileType::CharacterDevice, HintedKind::Other),
+            (FileType::BlockDevice, HintedKind::Other),
+            (FileType::Unknown, HintedKind::Unknown),
+        ] {
+            assert_eq!(hint_of_dirent_type(file_type), hint, "{file_type:?}");
+        }
+    }
+}
