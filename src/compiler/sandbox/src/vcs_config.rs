@@ -889,16 +889,7 @@ enum Syntax {
     /// Darcs's line-per-preference files.
     Darcs,
     /// A Git `remotes/` or `branches/` file naming a remote's URL.
-    GitRemote(RemoteFile),
-}
-
-/// Which of Git's two per-remote file layouts a remote file follows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteFile {
-    /// A `remotes/` file: `URL:`, `Push:`, and `Pull:` lines.
-    Remotes,
-    /// A `branches/` file: a URL on its first line, then `#` and a branch.
-    Branches,
+    GitRemote,
 }
 
 /// What the files read so far say of one Git remote's URLs.
@@ -906,7 +897,8 @@ enum RemoteFile {
 /// Git uses a remote's name as a URL, so as a path relative to the directory
 /// it runs in, when the remote has no URL. An empty `url` value clears the
 /// URLs set before it; the scan does not read files in the tool's order, so a
-/// cleared remote stays undefined whatever is set after it.
+/// cleared remote stays undefined whatever is set after it. Only a file read
+/// [`Reading::Always`] sets a URL; a clearing value counts from any file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteUrls {
     /// A non-empty URL is set, and no empty `url` value was seen.
@@ -942,6 +934,31 @@ impl Scope {
     }
 }
 
+/// Whether the tool reads a file whenever it reads the configuration of the file's scope.
+///
+/// The scan reads every file the tool may read, so every value is judged;
+/// only a file the tool always reads may define what another value relies on
+/// (a remote's URL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// Always read: a root `config`, or a file an unconditional include names.
+    Always,
+    /// Read only when a condition holds: a `config.worktree` (read with
+    /// `extensions.worktreeConfig`), an `includeIf` target, or a file one of
+    /// them includes.
+    Conditional,
+}
+
+impl Reading {
+    /// The reading of a file named by an include read as `include` from a file read as `self`.
+    const fn then(self, include: Self) -> Self {
+        match self {
+            Self::Always => include,
+            Self::Conditional => Self::Conditional,
+        }
+    }
+}
+
 /// A configuration file waiting to be read.
 #[derive(Debug)]
 struct Pending {
@@ -953,6 +970,8 @@ struct Pending {
     syntax: Syntax,
     /// The configuration its Git remotes belong to.
     scope: Scope,
+    /// Whether the tool always reads it.
+    reading: Reading,
 }
 
 /// A configuration file being judged.
@@ -968,6 +987,8 @@ struct FileCtx {
     syntax: Syntax,
     /// The configuration its Git remotes belong to.
     scope: Scope,
+    /// Whether the tool always reads it.
+    reading: Reading,
 }
 
 /// How a value is judged.
@@ -979,8 +1000,8 @@ enum Role {
     Words,
     /// Every word, and this text as one command path whatever its shape.
     Forced(String),
-    /// The whole value as one path to a file that is then read.
-    Include,
+    /// The whole value as one path to a file that is then read, as this include reads it.
+    Include(Reading),
     /// Every word, and the whole value as one directory that is then listed for links.
     HooksPath,
     /// Admitted when a network URL (also in `host:path` form when `scp`), judged as [`Role::Forced`] otherwise.
@@ -1368,18 +1389,19 @@ impl Scan<'_> {
         }
     }
 
-    /// Queue a root file of the repository the tool runs in.
+    /// Queue a root file of the repository the tool runs in, which the tool always reads.
     fn queue(&mut self, path: PathBuf, syntax: Syntax) {
-        self.queue_in(path, syntax, Scope::Main);
+        self.queue_in(path, syntax, Scope::Main, Reading::Always);
     }
 
-    /// Queue a root file whose Git remotes belong to `scope`.
-    fn queue_in(&mut self, path: PathBuf, syntax: Syntax, scope: Scope) {
+    /// Queue a root file whose Git remotes belong to `scope`, read as `reading`.
+    fn queue_in(&mut self, path: PathBuf, syntax: Syntax, scope: Scope, reading: Reading) {
         self.pending.push(Pending {
             path,
             depth: 0,
             syntax,
             scope,
+            reading,
         });
     }
 
@@ -1410,17 +1432,19 @@ impl Scan<'_> {
                 self.require(gitdir)?;
                 let common = commondir.unwrap_or(gitdir);
                 self.require(common)?;
-                self.queue(gitdir.join("config.worktree"), Syntax::Git);
+                let own_worktree = gitdir.join("config.worktree");
+                self.queue_in(own_worktree, Syntax::Git, Scope::Main, Reading::Conditional);
                 if common == gitdir {
                     self.queue(gitdir.join("config"), Syntax::Git);
                 } else {
                     // A linked worktree's own `config` is never read, and the
                     // common `config.worktree` belongs to the main worktree.
                     let unread = Scope::Own(self.fresh_scope());
-                    self.queue_in(gitdir.join("config"), Syntax::Git, unread);
+                    self.queue_in(gitdir.join("config"), Syntax::Git, unread, Reading::Always);
                     self.queue(common.join("config"), Syntax::Git);
                     let primary = Scope::Worktree(self.fresh_scope());
-                    self.queue_in(common.join("config.worktree"), Syntax::Git, primary);
+                    let primary_worktree = common.join("config.worktree");
+                    self.queue_in(primary_worktree, Syntax::Git, primary, Reading::Conditional);
                 }
                 self.list_hooks(&gitdir.join("hooks"))?;
                 if common != gitdir {
@@ -1476,25 +1500,23 @@ impl Scan<'_> {
         };
         if self.open_dir(&gitdir)?.is_some() {
             let scope = Scope::Own(self.fresh_scope());
-            self.queue_in(gitdir.join("config"), Syntax::Git, scope);
-            self.queue_in(gitdir.join("config.worktree"), Syntax::Git, scope);
+            self.queue_in(gitdir.join("config"), Syntax::Git, scope, Reading::Always);
+            let worktree = gitdir.join("config.worktree");
+            self.queue_in(worktree, Syntax::Git, scope, Reading::Conditional);
             self.list_hooks(&gitdir.join("hooks"))?;
             self.seed_remote_files(&gitdir, scope)?;
         }
         Ok(())
     }
 
-    /// Queue every file of `common/remotes` and `common/branches` in `scope`, each naming the remote it is named for.
+    /// Queue every file of `common/remotes` and `common/branches` in `scope`, each judged as the URLs it names.
     ///
-    /// A file defines its remote only once read, when it holds a URL. A
-    /// directory there would name a remote holding a `/`, read from a file
+    /// A file never defines the remote it is named for: a Git built with its
+    /// breaking changes reads neither directory, and uses the name as a path.
+    /// A directory there would name a remote holding a `/`, read from a file
     /// below it; it is refused rather than walked.
     fn seed_remote_files(&mut self, common: &Path, scope: Scope) -> Result<(), ConfigRefusal> {
-        let layouts = [
-            ("remotes", RemoteFile::Remotes),
-            ("branches", RemoteFile::Branches),
-        ];
-        for (listed, layout) in layouts {
+        for listed in ["remotes", "branches"] {
             let Some((dir, real)) = self.open_dir(&common.join(listed))? else {
                 continue;
             };
@@ -1507,7 +1529,7 @@ impl Scan<'_> {
                     let fault = ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Dir));
                     return Err(self.unreadable(&path, fault));
                 }
-                self.queue_in(path, Syntax::GitRemote(layout), scope);
+                self.queue_in(path, Syntax::GitRemote, scope, Reading::Conditional);
             }
         }
         Ok(())
@@ -1527,7 +1549,8 @@ impl Scan<'_> {
                 let entry = real.join(name.as_os_str());
                 if entry != own {
                     let scope = Scope::Worktree(self.fresh_scope());
-                    self.queue_in(entry.join("config.worktree"), Syntax::Git, scope);
+                    let config = entry.join("config.worktree");
+                    self.queue_in(config, Syntax::Git, scope, Reading::Conditional);
                 }
             }
         }
@@ -1559,8 +1582,9 @@ impl Scan<'_> {
             let below = depth.saturating_add(1);
             if gitdir {
                 let module = Scope::Own(self.fresh_scope());
-                self.queue_in(real.join("config"), Syntax::Git, module);
-                self.queue_in(real.join("config.worktree"), Syntax::Git, module);
+                self.queue_in(real.join("config"), Syntax::Git, module, Reading::Always);
+                let worktree = real.join("config.worktree");
+                self.queue_in(worktree, Syntax::Git, module, Reading::Conditional);
                 self.list_hooks(&real.join("hooks"))?;
                 self.seed_remote_files(&real, module)?;
                 self.count_path(&real)?;
@@ -1965,6 +1989,7 @@ impl Scan<'_> {
             depth: item.depth,
             syntax: item.syntax,
             scope: item.scope,
+            reading: item.reading,
         };
         let malformed = |line| ConfigFault::Malformed { line };
         match ctx.syntax {
@@ -1980,13 +2005,7 @@ impl Scan<'_> {
             }
             Syntax::Toml => self.judge_toml(&ctx, &text),
             Syntax::Darcs => self.judge_entries(&ctx, &parse_darcs(&text)),
-            Syntax::GitRemote(layout) => {
-                let remote = ctx.source.file_name().and_then(OsStr::to_str);
-                if let Some(name) = remote.filter(|_| remote_file_has_url(&text, layout)) {
-                    self.note_urls(ctx.scope, name, RemoteUrls::Set);
-                }
-                self.judge_entries(&ctx, &parse_git_remote(&text))
-            }
+            Syntax::GitRemote => self.judge_entries(&ctx, &parse_git_remote(&text)),
         }
     }
 
@@ -2000,12 +2019,12 @@ impl Scan<'_> {
                 Syntax::Git => {
                     self.judge_git_subsection(ctx, &entry.setting)
                         .map_err(&refuse)?;
-                    self.note_remote(ctx.scope, &entry.setting, &entry.value);
+                    self.note_remote(ctx, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
                 Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
-                Syntax::GitRemote(_) => Route::Judge(Role::Url { scp: true }),
+                Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
             match route {
                 Route::Judge(role) => self.judge(ctx, &role, &entry.value).map_err(&refuse)?,
@@ -2042,8 +2061,12 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Record what a `remote.<name>.url` setting in `scope` says of the remote: an empty value clears its URLs.
-    fn note_remote(&mut self, scope: Scope, setting: &Setting, value: &str) {
+    /// Record what a `remote.<name>.url` setting in `ctx` says of the remote.
+    ///
+    /// An empty value clears its URLs, from any file; a non-empty one sets a
+    /// URL only from a file the tool always reads, since a value the tool may
+    /// never read cannot make the name stop naming a path.
+    fn note_remote(&mut self, ctx: &FileCtx, setting: &Setting, value: &str) {
         if let Setting::Key {
             section,
             subsection: Some(name),
@@ -2052,12 +2075,12 @@ impl Scan<'_> {
             && &**section == "remote"
             && key.eq_ignore_ascii_case("url")
         {
-            let urls = if value.is_empty() {
-                RemoteUrls::Cleared
-            } else {
-                RemoteUrls::Set
+            let urls = match (value.is_empty(), ctx.reading) {
+                (true, Reading::Always | Reading::Conditional) => RemoteUrls::Cleared,
+                (false, Reading::Always) => RemoteUrls::Set,
+                (false, Reading::Conditional) => return,
             };
-            self.note_urls(scope, name, urls);
+            self.note_urls(ctx.scope, name, urls);
         }
     }
 
@@ -2171,7 +2194,7 @@ impl Scan<'_> {
                 self.judge_words(ctx, value)?;
                 self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
-            Role::Include => {
+            Role::Include(include) => {
                 // Queued as named, not as walked: the tool resolves the
                 // included file's own relative includes against the directory
                 // it named, which a link at the end does not change.
@@ -2187,6 +2210,7 @@ impl Scan<'_> {
                         depth: ctx.depth.saturating_add(1),
                         syntax: ctx.syntax,
                         scope: ctx.scope,
+                        reading: ctx.reading.then(*include),
                     });
                 }
                 Ok(())
@@ -2237,6 +2261,12 @@ impl Scan<'_> {
     /// (`sh -c '...'`), also has its shell words pushed back as one: each
     /// re-split drops a quote or a space, so the text shrinks and
     /// [`MAX_WORDS`] bounds the pushes.
+    ///
+    /// No word leaves the loop unjudged: an option is only a word whose text
+    /// beside its argument is option characters ([`option_argument`]), which
+    /// name no file and split into no further word, so pushing its argument
+    /// back judges all of it; a compound word leaves only its separators,
+    /// every piece pushed back.
     fn judge_queue(&mut self, ctx: &FileCtx, words: &mut Words) -> Result<(), Stop> {
         while let Some((word, position)) = words.stack.pop() {
             if word.len() > MAX_PATH_BYTES {
@@ -2246,19 +2276,7 @@ impl Scan<'_> {
                 return Err(unproven(Unprovable::Glob));
             }
             let text = strip_runners(&word);
-            if let Some(long) = text.strip_prefix("--") {
-                if let Some((_, argument)) = long.split_once('=') {
-                    words
-                        .push_split(argument, Position::Argument)
-                        .map_err(unproven)?;
-                }
-                continue;
-            }
-            if let Some(short) = text.strip_prefix('-') {
-                let mut chars = short.chars();
-                chars.next();
-                let rest = chars.as_str();
-                let argument = rest.strip_prefix('=').unwrap_or(rest);
+            if let Some(argument) = option_argument(text) {
                 words
                     .push_split(argument, Position::Argument)
                     .map_err(unproven)?;
@@ -2585,6 +2603,33 @@ const fn is_wide_space(c: char) -> bool {
     is_c_space(c) || matches!(c, '\u{b}' | '\u{c}')
 }
 
+/// Whether `name` is an option name: ASCII letters, digits, and `-`, starting with a letter or digit.
+fn is_option_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The argument the option `word` carries, or `None` when `word` is not an option.
+///
+/// An option is `-` or `--` alone (no argument); `--name`, or `--name=` and
+/// an argument, with an [`is_option_name`] name; or `-`, one ASCII letter or
+/// digit, and an attached argument after an optional `=`. The text beside the
+/// argument is then only those characters. Any other word starting with `-`
+/// (`--x;/tree/evil.sh`, `-;evil`) is not an option and is judged whole.
+fn option_argument(word: &str) -> Option<&str> {
+    if word == "-" || word == "--" {
+        return Some("");
+    }
+    if let Some(long) = word.strip_prefix("--") {
+        let (name, argument) = long.split_once('=').unwrap_or((long, ""));
+        return is_option_name(name).then_some(argument);
+    }
+    let rest = word
+        .strip_prefix('-')?
+        .strip_prefix(|c: char| c.is_ascii_alphanumeric())?;
+    Some(rest.strip_prefix('=').unwrap_or(rest))
+}
+
 /// `word` without the prefixes that make a tool run what follows (`=`, `!`, `ext::`, `python:`).
 fn strip_runners(word: &str) -> &str {
     let mut rest = word;
@@ -2666,11 +2711,11 @@ fn git_route(setting: &Setting, value: &str) -> Route {
     let key = key.to_ascii_lowercase();
     let subsection = subsection.as_deref();
     let shape = (&**section, subsection.is_some(), key.as_str());
-    if matches!(
-        shape,
-        ("include", false, "path") | ("includeif", true, "path")
-    ) {
-        return Route::Judge(Role::Include);
+    if shape == ("include", false, "path") {
+        return Route::Judge(Role::Include(Reading::Always));
+    }
+    if shape == ("includeif", true, "path") {
+        return Route::Judge(Role::Include(Reading::Conditional));
     }
     if shape == ("core", false, "hookspath") {
         return Route::Judge(Role::HooksPath);
@@ -2703,7 +2748,7 @@ fn git_route(setting: &Setting, value: &str) -> Route {
 fn hg_role(setting: &Setting, value: &str) -> Role {
     let (section, key) = match setting {
         Setting::Key { section, key, .. } => (section, key),
-        Setting::Include => return Role::Include,
+        Setting::Include => return Role::Include(Reading::Always),
         Setting::Line(_) => return Role::Words,
     };
     if &**section == "extensions" {
@@ -3087,27 +3132,6 @@ fn parse_git_remote(text: &str) -> Vec<Entry> {
         });
     }
     entries
-}
-
-/// Whether a remote file in `layout` gives its remote a non-empty URL, read as Git reads it.
-///
-/// Git reads a `remotes/` file's `URL:` lines only, each trimmed at the end
-/// and after the prefix, and a `branches/` file's first line, trimmed, up to
-/// a `#`. A file giving no URL leaves the remote undefined, so Git reads its
-/// name as a URL.
-fn remote_file_has_url(text: &str, layout: RemoteFile) -> bool {
-    match layout {
-        RemoteFile::Remotes => text.lines().any(|line| {
-            line.trim_end_matches(is_c_space)
-                .strip_prefix("URL:")
-                .is_some_and(|url| !url.trim_start_matches(is_c_space).is_empty())
-        }),
-        RemoteFile::Branches => text.lines().next().is_some_and(|line| {
-            let line = line.trim_matches(is_c_space);
-            let url = line.split_once('#').map_or(line, |(url, _)| url);
-            !url.is_empty()
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -3768,7 +3792,6 @@ mod tests {
             &remotes,
             "URL: https://example.com/r\nPull: refs/heads/*:refs/remotes/origin/*\n",
         );
-        git_config(&f, "[branch \"main\"]\n\tremote = origin\n");
         assert_eq!(scan_git(&f), Ok(()));
 
         write(
@@ -3795,28 +3818,95 @@ mod tests {
                 "{remote:?}"
             );
         }
+    }
 
-        git_config(&f, branch);
+    #[test]
+    fn remote_files_never_define_their_remote() {
+        let f = fixture("remotefiledef");
+        git_config(&f, "[branch \"main\"]\n\tremote = evil\n");
         let remotes = f.tree.join(".git/remotes/evil");
-        for text in ["", "Pull: refs/heads/*:refs/remotes/evil/*\n", "URL:  \n"] {
-            write(&remotes, text);
+        let branches = f.tree.join(".git/branches/evil");
+        let cases = [
+            (&remotes, ""),
+            (&remotes, "Pull: refs/heads/*:refs/remotes/evil/*\n"),
+            (&remotes, "URL:  \n"),
+            (&remotes, "URL: https://example.com/r\n"),
+            (&branches, "\nhttps://example.com/r\n"),
+            (&branches, "https://example.com/r#main\n"),
+        ];
+        for (file, text) in cases {
+            write(file, text);
             let result = scan_git(&f);
             assert_eq!(
                 in_grant(&result),
                 Some(f.tree.join("evil").as_path()),
-                "{text:?}"
+                "{file:?} {text:?}"
             );
+            std::fs::remove_file(file).expect("remove fixture file");
         }
+        git_config(
+            &f,
+            "[remote \"evil\"]\n\turl = https://example.com/r\n[branch \"main\"]\n\tremote = evil\n",
+        );
         write(&remotes, "URL: https://example.com/r\n");
         assert_eq!(scan_git(&f), Ok(()));
-        std::fs::remove_file(&remotes).expect("remove fixture file");
+    }
 
-        let branches = f.tree.join(".git/branches/evil");
-        write(&branches, "\nhttps://example.com/r\n");
+    #[test]
+    fn remote_defined_only_in_a_conditionally_read_file_judged_by_name() {
+        let f = fixture("conditionalremote");
+        let defs = f.out.join("defs.cfg");
+        let nested = f.out.join("nested.cfg");
+        let define = "[remote \"evil\"]\n\turl = https://example.com/r\n";
+        let branch = "[branch \"main\"]\n\tremote = evil\n";
+        let shown = defs.display();
+        write(&defs, define);
+        write(&nested, &format!("[include]\n\tpath = {shown}\n"));
+        let nested_shown = nested.display();
+        for config in [
+            format!("[includeIf \"gitdir:/no/such/place/\"]\n\tpath = {shown}\n{branch}"),
+            format!("[includeIf \"gitdir:/no/such/place/\"]\n\tpath = {nested_shown}\n{branch}"),
+        ] {
+            git_config(&f, &config);
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{config:?}"
+            );
+        }
+
+        git_config(&f, branch);
+        let worktree_config = f.tree.join(".git/config.worktree");
+        write(&worktree_config, define);
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
-        write(&branches, "https://example.com/r#main\n");
-        assert_eq!(scan_git(&f), Ok(()));
+        std::fs::remove_file(&worktree_config).expect("remove fixture file");
+
+        for config in [
+            format!("[include]\n\tpath = {shown}\n{branch}"),
+            format!("[include]\n\tpath = {nested_shown}\n{branch}"),
+        ] {
+            git_config(&f, &config);
+            assert_eq!(scan_git(&f), Ok(()), "{config:?}");
+        }
+    }
+
+    #[test]
+    fn remote_cleared_after_an_include_that_sets_it_judged_by_name() {
+        let f = fixture("clearedafterinclude");
+        let defs = f.out.join("defs.cfg");
+        write(&defs, "[remote \"evil\"]\n\turl = https://example.com/r\n");
+        let shown = defs.display();
+        git_config(
+            &f,
+            &format!(
+                "[include]\n\tpath = {shown}\n[remote \"evil\"]\n\turl =\n\
+                 [branch \"main\"]\n\tremote = evil\n"
+            ),
+        );
+        let result = scan_git(&f);
+        assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
     }
 
     #[test]
@@ -3841,13 +3931,15 @@ mod tests {
 
         // A module's remote is defined for the module, never for the repository above it.
         write(&remotes, "URL: https://example.com/r\n");
+        let define = "[remote \"origin\"]\n\turl = https://example.com/r\n";
+        write(&module.join("config"), define);
         git_config(&f, "[branch \"main\"]\n\tremote = origin\n");
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("origin").as_path()));
         git_config(&f, "");
         write(
             &module.join("config"),
-            "[branch \"main\"]\n\tremote = origin\n",
+            &format!("{define}[branch \"main\"]\n\tremote = origin\n"),
         );
         assert_eq!(scan_git(&f), Ok(()));
 
@@ -3901,6 +3993,83 @@ mod tests {
             );
             git_config(&f, &format!("{key}sh -c '{out}/run {out}/x.sh'\n"));
             assert_eq!(scan_git(&f), Ok(()), "{key:?}");
+        }
+    }
+
+    /// `value` as a double-quoted Git config value that parses back to `value`.
+    fn git_quoted(value: &str) -> String {
+        let mut quoted = String::from("\"");
+        for c in value.chars() {
+            match c {
+                '\\' => quoted.push_str("\\\\"),
+                '"' => quoted.push_str("\\\""),
+                '\n' => quoted.push_str("\\n"),
+                '\t' => quoted.push_str("\\t"),
+                other => quoted.push(other),
+            }
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    #[test]
+    fn option_shaped_word_with_a_command_tail_judged() {
+        let f = fixture("optiontail");
+        let tree = f.tree.display();
+        let pager = "[core]\n\tpager";
+        let alias = "[alias]\n\tx";
+        let value = git_quoted(&format!("less --x;{tree}/evil.sh"));
+        git_config(&f, &format!("{pager} = {value}\n"));
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        for (line, value) in [
+            (pager, format!("less --x;{tree}/evil=1")),
+            (alias, format!("!sh -c -- '--x&{tree}/evil'")),
+            (pager, format!("less '--x\n{tree}/evil'")),
+        ] {
+            git_config(&f, &format!("{line} = {}\n", git_quoted(&value)));
+            let result = scan_git(&f);
+            assert!(
+                matches!(result, Err(ConfigRefusal::NamesWritableCode { .. })),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_option_branch_judges_its_tail() {
+        let f = fixture("optionbranches");
+        let tree = f.tree.display();
+        let out = f.out.display();
+        let heads = [
+            ("--x", ""),
+            ("--x", "=1"),
+            ("--x=1", ""),
+            ("-x", ""),
+            ("-", ""),
+            ("!--x", ""),
+            ("=--x", ""),
+        ];
+        for (line, runner) in [("[core]\n\tpager", ""), ("[alias]\n\tx", "!")] {
+            for (head, tail) in heads {
+                for smuggled in [";", "&", "|", "\n", "\"", "'", " "] {
+                    let word = format!("{head}{smuggled}{tree}/evil.sh{tail}");
+                    let value = git_quoted(&format!("{runner}less '{word}'"));
+                    git_config(&f, &format!("{line} = {value}\n"));
+                    let result = scan_git(&f);
+                    assert!(
+                        matches!(result, Err(ConfigRefusal::NamesWritableCode { .. })),
+                        "{line:?} {word:?}: {result:?}"
+                    );
+                }
+            }
+            let admitted =
+                format!("{runner}less -R -n5 --quit-if-one-screen --pattern={out}/x -- -");
+            git_config(&f, &format!("{line} = {}\n", git_quoted(&admitted)));
+            assert_eq!(scan_git(&f), Ok(()), "{line:?}");
         }
     }
 
