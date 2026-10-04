@@ -391,14 +391,9 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() {
                 .find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied()))
                 .map(|(_, f)| *f)
         };
-        let (lib_file, main_file) = (file_at(lib), file_at(main));
-        assert!(
-            lib_file.is_some() && main_file.is_some(),
-            "[{label}] fixture must carry Lib and Main"
-        );
-        let (Some(lib_file), Some(main_file)) = (lib_file, main_file) else {
-            return;
-        };
+        let lib_file = file_at(lib).unwrap_or_else(|| panic!("[{label}] fixture must carry Lib"));
+        let main_file =
+            file_at(main).unwrap_or_else(|| panic!("[{label}] fixture must carry Main"));
         assert!(
             ipe_db::typecheck(&db, root, main_file).is_ok(),
             "[{label}] program must type-check"
