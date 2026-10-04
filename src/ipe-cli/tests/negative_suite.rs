@@ -789,6 +789,52 @@ fn canon_type_alias_expansion_depth_limit() {
     assert_rejected("canon_alias_depth_limit", &src, "IPE-N0032");
 }
 
+/// A row alias applied to `{ age : Int }`, with its own fields.
+const NAMED_AGE: &str = "type alias Named r = { r | name : String }\n\
+                         f : Named { age : Int } -> Int\n\
+                         f p =\n    p.age\n";
+
+/// A record missing the alias's own `name` field is not a `Named { age : Int }`.
+#[test]
+fn alias_row_arg_missing_base_field() {
+    let src = format!("{HEAD}{NAMED_AGE}main =\n    f {{ age = 1 }}\n");
+    assert_rejected("alias_row_arg_missing_base_field", &src, "IPE-T0001");
+}
+
+/// A record missing the row argument's `age` field is not a `Named { age : Int }`.
+#[test]
+fn alias_row_arg_missing_extension_field() {
+    let src = format!("{HEAD}{NAMED_AGE}main =\n    f {{ name = \"x\", other = True }}\n");
+    assert_rejected("alias_row_arg_missing_extension_field", &src, "IPE-T0001");
+}
+
+/// A row alias argument that is not a record has no fields to extend.
+#[test]
+fn alias_row_arg_not_record() {
+    let src = format!(
+        "{HEAD}type alias Named r = {{ r | name : String }}\n\
+         f : Named Int -> Int\nf p =\n    1\nmain =\n    1\n"
+    );
+    assert_rejected("alias_row_arg_not_record", &src, "IPE-N0053");
+}
+
+/// A row alias argument repeating one of the alias's own labels.
+#[test]
+fn alias_row_arg_label_clash() {
+    let src = format!(
+        "{HEAD}type alias Named r = {{ r | name : String }}\n\
+         f : Named {{ name : Int }} -> Int\nf p =\n    1\nmain =\n    1\n"
+    );
+    assert_rejected("alias_row_arg_label_clash", &src, "IPE-N0053");
+}
+
+/// A record type naming the same label twice.
+#[test]
+fn record_type_duplicate_label() {
+    let src = format!("{HEAD}f : {{ a : Int, a : String }} -> Int\nf p =\n    1\nmain =\n    1\n");
+    assert_rejected("record_type_duplicate_label", &src, "IPE-N0010");
+}
+
 /// A user type that reuses a built-in type name (`Int`).
 #[test]
 fn canon_reserved_builtin_type_name() {
@@ -4189,6 +4235,106 @@ fn pinned_msg_web_embed_compiles() {
         "the fixture must carry the message-ignoring update this test replaces"
     );
     assert_compiles("pinned_msg_web_embed", &src);
+}
+
+/// A server program mounting a well-typed `Web.embed` app; `{main}` is the
+/// `main` binding under test.
+fn mounted_web_app_with(main: &str) -> String {
+    format!(
+        r#"module Main exposing (main)
+import Ipe.Server.Http as Server
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+type alias Model = {{ count : Int }}
+type Msg = Noop
+app : Web.WebApp
+app =
+    Web.embed
+        {{ init = \_ -> ( {{ count = 0 }}, Cmd.none )
+        , update = \msg m -> case msg of
+            Noop -> ( m, Cmd.none )
+        , view = \_ -> Ui.text "hi"
+        , subscriptions = \_ -> Sub.none
+        , routes = []
+        , notFound = Noop
+        }}
+{main}"#
+    )
+}
+
+/// A `do` block that binds before its `Server.listen` tail is the same server
+/// program as its bind-free spelling, so its `Ipe.Tea.Web` import is admitted.
+#[test]
+fn server_listen_after_do_bind_with_mounted_web_app_compiles() {
+    let src = mounted_web_app_with(
+        "main : Task Error ()
+main =
+    do
+        port <- Task.succeed 8000
+        Server.listen port [ Server.mountApp \"/\" app ]
+",
+    );
+    assert_compiles("server_listen_after_do_bind", &src);
+}
+
+/// A `do` bind whose tail is a plain `Task` is a Program; importing
+/// `Ipe.Tea.Web` stays IPE-N0033.
+#[test]
+fn do_bind_tail_plain_task_importing_tea_web_rejected_n0033() {
+    let src = mounted_web_app_with(
+        "main : Task Error ()
+main =
+    do
+        port <- Task.succeed 8000
+        Task.succeed ()
+",
+    );
+    assert_rejected("do_bind_tail_plain_task", &src, "IPE-N0033");
+}
+
+/// The bare-run spelling of the same Program is refused the same way.
+#[test]
+fn do_run_tail_plain_task_importing_tea_web_rejected_n0033() {
+    let src = mounted_web_app_with(
+        "main : Task Error ()
+main =
+    do
+        Task.succeed 8000
+        Task.succeed ()
+",
+    );
+    assert_rejected("do_run_tail_plain_task", &src, "IPE-N0033");
+}
+
+/// Only the `Task.andThen` kernel is followed: a user function of the same
+/// name and shape leaves `main`'s head on that function.
+#[test]
+fn user_and_then_to_listen_importing_tea_web_rejected_n0033() {
+    let src = mounted_web_app_with(
+        "andThen : (a -> Task Error b) -> Task Error a -> Task Error b
+andThen f t = Task.andThen f t
+main : Task Error ()
+main =
+    andThen (\\port -> Server.listen port [ Server.mountApp \"/\" app ]) (Task.succeed 8000)
+",
+    );
+    assert_rejected("user_and_then_to_listen", &src, "IPE-N0033");
+}
+
+/// `Server.listen` as the task `Task.andThen` runs first is not `main`'s
+/// result: only the continuation body is followed.
+#[test]
+fn listen_in_and_then_task_position_importing_tea_web_rejected_n0033() {
+    let src = mounted_web_app_with(
+        "main : Task Error ()
+main =
+    Task.andThen (\\_ -> Task.succeed ()) (Server.listen 8000 [ Server.mountApp \"/\" app ])
+",
+    );
+    assert_rejected("listen_in_and_then_task_position", &src, "IPE-N0033");
 }
 
 /// A point-free `let` alias of `Web.embed` inside a msg-generic helper is refused.

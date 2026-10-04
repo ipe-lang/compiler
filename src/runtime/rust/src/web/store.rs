@@ -620,6 +620,7 @@ impl StoreOpenError {
                     | SsrfRefusal::Unresolvable { .. }
                     | SsrfRefusal::NoAddresses { .. }
                     | SsrfRefusal::Timeout { .. }
+                    | SsrfRefusal::Deadline(_)
                     | SsrfRefusal::LocalSocket
                     | SsrfRefusal::UnprovenTarget
                     | SsrfRefusal::UnpinnableTlsName { .. } => true,
@@ -1674,6 +1675,16 @@ mod tests {
                 host: HostShown::Named("db.invalid".to_owned()),
                 after: Duration::from_secs(1),
             })),
+            StoreOpenError::Connect(DbConnectError::HostRefused(SsrfRefusal::Deadline(
+                crate::system::EnvCeiling::new(
+                    "IPE_HTTP_DNS_TIMEOUT_MS",
+                    5_000,
+                    crate::system::ZeroCeiling::Refused,
+                    "decimal millisecond count",
+                )
+                .parse(Ok("5s".to_owned()))
+                .expect_err("a suffixed deadline is refused"),
+            ))),
             StoreOpenError::Connect(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget)),
             StoreOpenError::Connect(DbConnectError::HostRefused(
                 SsrfRefusal::UnpinnableTlsName {

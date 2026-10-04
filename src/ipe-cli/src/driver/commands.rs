@@ -1568,7 +1568,7 @@ pub fn release_pipeline(
                 target: ipe_ir::Target::WasmClient,
                 wasm_public_env: manifest_parsed
                     .as_ref()
-                    .map(|m| m.wasm.public_env.clone())
+                    .map(|m| m.wasm.public_env.to_names())
                     .unwrap_or_default(),
                 wasm_hydrate_mode: manifest_wasm
                     .as_ref()

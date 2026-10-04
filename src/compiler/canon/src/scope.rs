@@ -303,10 +303,12 @@ pub enum ExprTarget {
 /// no importer ever re-resolves another module's alias source text.
 #[derive(Clone, Debug)]
 pub enum AliasBody {
-    /// Declared in the module being canonicalised: its type parameters in source
-    /// order and its source body.
+    /// Declared in the module being canonicalised: each type parameter, in
+    /// source order, paired with its parameter slot, and its source body. A use
+    /// site renames the parameters to their slots while it canonicalises the
+    /// body, then substitutes its arguments for the slots.
     Local {
-        params: Vec<Symbol>,
+        params: Vec<(Symbol, Symbol)>,
         body: src::TypeAnnotation,
     },
     /// Exported by a dependency, its body canonical in the dependency's scope.

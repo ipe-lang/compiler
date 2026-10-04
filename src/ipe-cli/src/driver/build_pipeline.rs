@@ -2674,7 +2674,7 @@ pub fn build_project_into(
         &canonical_project_dir(manifest_path),
     );
     let options = BuildOptions {
-        wasm_public_env: manifest.wasm.public_env.clone(),
+        wasm_public_env: manifest.wasm.public_env.to_names(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,

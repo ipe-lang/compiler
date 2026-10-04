@@ -406,7 +406,7 @@ fn has_drive_prefix(raw: &str) -> bool {
 /// mode      = "solo"             # solo (MVP) | hydrate (MVP+1) | off (default)
 /// entry     = "src/Client.ipe"   # client entry; its reachability closure is the bundle
 /// mount     = "#app"             # SPA mount node
-/// publicEnv = ["API_BASE_URL"]   # default-deny allowlist; rejects IPE_* / secret patterns
+/// publicEnv = ["API_BASE_URL"]   # default-deny allowlist; see `PublicEnvName`
 /// optLevel  = "z"
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -422,10 +422,10 @@ pub struct WasmConfig {
     /// The SPA mount selector (e.g. `"#app"`).
     pub mount: Option<String>,
     /// The `Ipe.Env.public` default-deny allowlist: environment variable
-    /// names the wasm bundle may read at build time. Validated against the
-    /// secret-name denylist at PARSE time (below) — listing a denylisted
-    /// name here is a build error, never a runtime refusal.
-    pub public_env: Vec<String>,
+    /// names the wasm bundle may read at build time. Parsed at manifest read
+    /// time into [`PublicEnvName`]s — a refused name is a build error, never
+    /// a runtime refusal.
+    pub public_env: PublicEnvAllowlist,
     /// `wasm-opt` optimisation level (`"z"`/`"s"`/`"0"`..`"3"`).
     pub opt_level: Option<String>,
 }
@@ -487,6 +487,169 @@ pub fn is_denylisted_public_env_name(name: &str) -> bool {
         || upper
             .split('_')
             .any(|component| SECRET_WORDS.contains(&component))
+}
+
+/// Whether `name` is a portable environment variable name.
+///
+/// The portable grammar is ASCII letters, digits and `_`, not starting with a
+/// digit (POSIX `name`): every such name survives the emitted `option_env!`
+/// literal and the native `std::env::var` lookup unchanged.
+fn is_portable_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// One `[wasm] publicEnv` entry, parsed once at the manifest boundary.
+///
+/// A held value is a portable environment variable name that is neither
+/// secret-bearing ([`is_denylisted_public_env_name`]) nor a name the
+/// compiler's audited environment reader refuses ([`ipe_env::is_refused_key`]:
+/// a temp-root or home variable). [`PublicEnvName::parse`] is the only mint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicEnvName(String);
+
+impl PublicEnvName {
+    /// Parse one allowlist entry.
+    ///
+    /// # Errors
+    ///
+    /// A [`PublicEnvRefusal`] naming `raw` and the rule it breaks.
+    pub fn parse(raw: &str) -> Result<Self, PublicEnvRefusal> {
+        let held = || raw.to_owned();
+        if !is_portable_env_name(raw) {
+            return Err(PublicEnvRefusal::IllFormed(held()));
+        }
+        if is_denylisted_public_env_name(raw) {
+            return Err(PublicEnvRefusal::Secret(held()));
+        }
+        let key = std::ffi::OsStr::new(raw);
+        if ipe_env::is_temp_root_key(key) {
+            return Err(PublicEnvRefusal::TempRoot(held()));
+        }
+        if ipe_env::is_refused_key(key) {
+            return Err(PublicEnvRefusal::Home(held()));
+        }
+        Ok(Self(held()))
+    }
+
+    /// The variable name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a `[wasm] publicEnv` entry was refused; each arm carries the entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicEnvRefusal {
+    /// Not a portable environment variable name (empty, a leading digit, or a
+    /// character outside ASCII letters, digits and `_`).
+    IllFormed(String),
+    /// Matches the secret-name denylist ([`is_denylisted_public_env_name`]).
+    Secret(String),
+    /// Names the process temp root ([`ipe_env::TEMP_ROOT_NAMES`]).
+    TempRoot(String),
+    /// Names the user's home directory ([`ipe_env::HOME_NAMES`]).
+    Home(String),
+    /// Repeats an earlier entry, compared ignoring ASCII case.
+    Duplicate {
+        /// The repeated entry.
+        name: String,
+        /// The earlier entry it repeats.
+        first: String,
+    },
+}
+
+impl PublicEnvRefusal {
+    /// The author-facing reason: the offending entry, the rule, and the fix.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::IllFormed(name) => format!(
+                "`publicEnv` lists {name:?}, which is not an environment variable name \
+                 — a name is ASCII letters, digits and `_`, and does not start with a digit"
+            ),
+            Self::Secret(name) => format!(
+                "`publicEnv` lists {name:?}, which matches the secret-name denylist \
+                 (a SECRET / TOKEN / KEY / PASSWORD / PASSWD / CREDENTIAL / AUTH / APIKEY \
+                 word, DATABASE_URL, or the internal IPE_* namespace) — a secret \
+                 environment variable can never be allowlisted into the public wasm bundle"
+            ),
+            Self::TempRoot(name) => format!(
+                "`publicEnv` lists {name:?}, which names the process temp root ({}, any case) \
+                 — it steers where the runtime creates scratch directories, so it can never \
+                 be allowlisted into the public wasm bundle; remove it from `publicEnv`",
+                ipe_env::TEMP_ROOT_NAMES.join(" / ")
+            ),
+            Self::Home(name) => format!(
+                "`publicEnv` lists {name:?}, which names the user's home directory ({}, any \
+                 case) — it steers where caches live and would publish a build-machine path, \
+                 so it can never be allowlisted into the public wasm bundle; remove it from \
+                 `publicEnv`",
+                ipe_env::HOME_NAMES.join(" / ")
+            ),
+            Self::Duplicate { name, first } => format!(
+                "`publicEnv` lists {name:?}, which repeats {first:?} (names are compared \
+                 ignoring ASCII case) — list each variable once"
+            ),
+        }
+    }
+}
+
+/// The `[wasm] publicEnv` allowlist: distinct [`PublicEnvName`]s in manifest
+/// order.
+///
+/// No two entries are equal ignoring ASCII case: [`Self::insert`] refuses the
+/// repeat, so the emitted lookup never carries a second arm for one name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublicEnvAllowlist {
+    names: Vec<PublicEnvName>,
+    folded: BTreeMap<String, usize>,
+}
+
+impl PublicEnvAllowlist {
+    /// Append `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`PublicEnvRefusal::Duplicate`] when an entry equal to `name` ignoring
+    /// ASCII case is already held; the allowlist is then unchanged.
+    pub fn insert(&mut self, name: PublicEnvName) -> Result<(), PublicEnvRefusal> {
+        let folded = name.as_str().to_ascii_uppercase();
+        if let Some(first) = self.folded.get(&folded) {
+            let first = self
+                .names
+                .get(*first)
+                .map_or_else(String::new, |held| held.0.clone());
+            return Err(PublicEnvRefusal::Duplicate {
+                name: name.0,
+                first,
+            });
+        }
+        self.folded.insert(folded, self.names.len());
+        self.names.push(name);
+        Ok(())
+    }
+
+    /// Whether no name is allowlisted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The entries in manifest order.
+    pub fn iter(&self) -> impl Iterator<Item = &PublicEnvName> {
+        self.names.iter()
+    }
+
+    /// The names as plain text, for the compile pipeline outside this crate.
+    #[must_use]
+    pub fn to_names(&self) -> Vec<String> {
+        self.names.iter().map(|n| n.0.clone()).collect()
+    }
 }
 
 /// A discovered Ipê source file with its resolved module path.
@@ -1693,6 +1856,65 @@ import String
                 "{allowed} must NOT match the secret-name denylist"
             );
         }
+    }
+
+    #[test]
+    fn public_env_name_parse_classifies_each_refusal() {
+        /// Whether a refusal is the expected arm for its entry.
+        type RefusalCheck = fn(&PublicEnvRefusal) -> bool;
+        let cases: [(&str, RefusalCheck); 6] = [
+            (
+                "TMPDIR",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "TMPDIR"),
+            ),
+            (
+                "tmp",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "tmp"),
+            ),
+            (
+                "TEMP",
+                |r| matches!(r, PublicEnvRefusal::TempRoot(n) if n == "TEMP"),
+            ),
+            (
+                "HOME",
+                |r| matches!(r, PublicEnvRefusal::Home(n) if n == "HOME"),
+            ),
+            (
+                "API_TOKEN",
+                |r| matches!(r, PublicEnvRefusal::Secret(n) if n == "API_TOKEN"),
+            ),
+            (
+                "",
+                |r| matches!(r, PublicEnvRefusal::IllFormed(n) if n.is_empty()),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let refusal = PublicEnvName::parse(raw).err();
+            assert!(
+                refusal.as_ref().is_some_and(expected),
+                "{raw:?} refused as {refusal:?}"
+            );
+        }
+        assert_eq!(
+            PublicEnvName::parse("API_BASE_URL").map(|n| n.as_str().to_owned()),
+            Ok("API_BASE_URL".to_owned())
+        );
+    }
+
+    #[test]
+    fn public_env_allowlist_refuses_a_repeat_and_stays_unchanged() {
+        let mut allowlist = PublicEnvAllowlist::default();
+        let first = PublicEnvName::parse("APP_VERSION").expect("benign name parses");
+        assert_eq!(allowlist.insert(first), Ok(()));
+        let repeat = PublicEnvName::parse("App_Version").expect("benign name parses");
+        assert_eq!(
+            allowlist.insert(repeat),
+            Err(PublicEnvRefusal::Duplicate {
+                name: "App_Version".to_owned(),
+                first: "APP_VERSION".to_owned(),
+            })
+        );
+        assert_eq!(allowlist.to_names(), vec!["APP_VERSION"]);
     }
 
     // ── WasmConfig::implies_wasm_target ──────────────────────────────────────
