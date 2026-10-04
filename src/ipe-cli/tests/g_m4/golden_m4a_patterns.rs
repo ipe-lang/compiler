@@ -6,7 +6,7 @@
 //! right-nested `a :: b :: rest` — across the parser, canonicaliser, type
 //! constraints, Maranget exhaustiveness, and the Rust backend.
 //!
-//! Two programs exercise the surface:
+//! Three programs exercise the surface:
 //!
 //! * `cons_sum` (positive) — `sum xs = case xs of [] -> 0 ; x :: rest ->
 //!   x + sum rest` over `[1, 2, 3]`, printing `6`. The `case` lowers to a native
@@ -24,6 +24,12 @@
 //!   (the soundness floor — a non-exhaustive list `case` MUST be caught before
 //!   emit, never deferred to a rustc `E0004`). A gate golden has no program
 //!   output, so it carries no `oracle.meta`.
+//!
+//! * `list_case_owned_binder` (positive) — list `case`s over a non-`Clone`
+//!   element (`List (Task Error String)`, `List (Maybe (Task Error String))`).
+//!   The scrutinee is matched through the runtime's owned view
+//!   (`ipe_list_view_owned`), so every binder moves out and none is cloned; the
+//!   emitted project must build and print `expected.txt`.
 
 use std::path::{Path, PathBuf};
 
@@ -114,4 +120,20 @@ fn cons_sum_builds_and_prints_six() {
 #[test]
 fn non_exhaustive_list_case_is_ipe_t0010() {
     assert_gate("gate_list_nonexhaustive", ipe_diagnostics::IPE_T0010);
+}
+
+/// A list `case` over a non-`Clone` element (`Task`, `Maybe Task`) moves each
+/// binder out of the list: its emitted `main.rs` must be byte-identical to the
+/// checked-in golden.
+#[test]
+fn list_case_owned_binder_emits_byte_identical_main_rs() {
+    assert_byte_identical("list_case_owned_binder");
+}
+
+/// The owned list `case` builds and runs every arm shape — closed and open
+/// prefixes, a whole-list binder, a tuple column, a failed string guard, a
+/// constructor element and an element alias — to the expected output.
+#[test]
+fn list_case_owned_binder_builds_and_runs() {
+    assert_runs_and_matches_oracle("list_case_owned_binder");
 }

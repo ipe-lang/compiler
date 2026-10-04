@@ -413,9 +413,12 @@ impl PackageName {
 /// (`[dependencies.evil]`, a path override) into the generated file. Gating
 /// here at the decode boundary — the same surface [`PackageName`] and
 /// [`PkgPath`] are gated on — makes an injection-bearing version
-/// unrepresentable past decode; the charset mirrors the driver's `VersionPin`
-/// (the CLI-supplied version pin), so both halves of a `name@version` spec and
-/// every resolved dependency share one semver-value gate.
+/// unrepresentable past decode.
+///
+/// The value is parsed as a `SemVer` version, `MAJOR.MINOR.PATCH[-PRE][+BUILD]`,
+/// never as requirement text: the emitter prefixes `=`, and `=` followed by a
+/// `SemVer` version is always a requirement Cargo accepts, while requirement
+/// text (`*`, `=1`, `>=1, <2`) after that `=` is one Cargo refuses.
 ///
 /// An EMPTY version is legal here — the inspector reports an empty version on a
 /// probe failure, and the manifest emitter's own downstream check refuses to
@@ -427,13 +430,12 @@ pub struct CrateVersion(String);
 
 /// Whether `c` may appear in a crate-version requirement value.
 ///
-/// The single semver-value charset `[0-9A-Za-z.*=<>~^,+ -]`, shared by both
-/// version newtypes: [`CrateVersion`] (the wire-decode boundary) and
-/// [`crate::driver::VersionPin`] (the CLI `name@version` boundary). A version
-/// is spliced into a TOML value position in the emitted manifest; every
-/// character outside this set (quote, bracket, brace, backslash, control, …)
-/// is excluded so a value can never close its string and inject manifest
-/// content.
+/// The requirement charset `[0-9A-Za-z.*=<>~^,+ -]` of
+/// [`crate::driver::VersionPin`] (the CLI `name@version` boundary). A
+/// requirement is spliced into a TOML value position of the inspector's probe
+/// manifest; every character outside this set (quote, bracket, brace,
+/// backslash, control, …) is excluded so a value can never close its string
+/// and inject manifest content.
 pub(crate) const fn version_char_is_legal(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -443,15 +445,14 @@ pub(crate) const fn version_char_is_legal(c: char) -> bool {
 }
 
 impl CrateVersion {
-    /// Validate and wrap a crate version (possibly empty).
+    /// Parse a crate version: a `SemVer` version, or empty.
     ///
     /// # Errors
     ///
-    /// [`crate::diag::WireDefect::InvalidVersion`] when the text carries a
-    /// character outside the semver-value charset.
+    /// [`crate::diag::WireDefect::InvalidVersion`] when non-empty text is not a
+    /// `SemVer` version `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
     pub fn parse(s: &str) -> Result<Self, crate::diag::WireDefect> {
-        let legal = s.chars().all(version_char_is_legal);
-        if legal {
+        if s.is_empty() || is_semver_version(s) {
             Ok(Self(s.to_owned()))
         } else {
             Err(crate::diag::WireDefect::InvalidVersion { got: s.to_owned() })
@@ -469,6 +470,51 @@ impl CrateVersion {
     pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Whether `s` is a `SemVer` version `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
+///
+/// The grammar is the one Cargo's `semver` crate reads after `=`: three
+/// `u64` numeric identifiers without leading zeros, then optional dot-separated
+/// pre-release and build identifiers over `[0-9A-Za-z-]`, where a numeric
+/// pre-release identifier carries no leading zero.
+fn is_semver_version(s: &str) -> bool {
+    let (rest, build) = s.split_once('+').map_or((s, None), |(r, b)| (r, Some(b)));
+    let (core, pre) = rest
+        .split_once('-')
+        .map_or((rest, None), |(c, p)| (c, Some(p)));
+    let mut parts = core.split('.');
+    let core_legal = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if [major, minor, patch].into_iter().all(is_numeric_identifier)
+    );
+    core_legal
+        && pre.is_none_or(|p| p.split('.').all(is_prerelease_identifier))
+        && build.is_none_or(|b| b.split('.').all(is_build_identifier))
+}
+
+/// Whether `s` is a `SemVer` numeric identifier: a `u64` with no leading zero.
+fn is_numeric_identifier(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'))
+        && s.parse::<u64>().is_ok()
+}
+
+/// Whether `s` is a `SemVer` pre-release identifier.
+///
+/// A non-empty `[0-9A-Za-z-]` run; an all-digit one is a numeric identifier.
+fn is_prerelease_identifier(s: &str) -> bool {
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        is_numeric_identifier(s)
+    } else {
+        is_build_identifier(s)
+    }
+}
+
+/// Whether `s` is a `SemVer` build identifier: a non-empty `[0-9A-Za-z-]` run.
+fn is_build_identifier(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// A validated inspector-reported package path.
@@ -2501,12 +2547,20 @@ mod tests {
         ));
     }
 
-    // Legal semver requirement text (exact pins, ranges, prereleases, the
-    // empty unresolved-probe version) must still decode — the gate rejects
-    // only the TOML-breaking charset, never ordinary version syntax.
+    // Every `SemVer` version (pre-release and build metadata included) and the
+    // empty unresolved-probe version decode.
     #[test]
     fn legal_versions_decode() {
-        for ok in ["1.0.26", "=1.0.0-rc.6", ">=1, <2", "1.2.3+build.5", "*", ""] {
+        for ok in [
+            "1.0.26",
+            "0.0.0",
+            "1.0.0-rc.6",
+            "1.0.0-alpha-1.0.x",
+            "1.2.3+build.5",
+            "1.2.3+001",
+            "1.0.0-rc.1+exp.sha.5114f85",
+            "",
+        ] {
             let v = json!({
                 "pkg": "semver",
                 "name": "semver",
@@ -2515,6 +2569,61 @@ mod tests {
                 "errors": []
             });
             assert!(decode(&v).is_ok(), "{ok:?} must decode");
+        }
+    }
+
+    // Requirement text and malformed versions are refused at decode: the
+    // emitter renders `"=<version>"`, and each of these after `=` is a
+    // requirement Cargo rejects.
+    #[test]
+    fn requirement_text_and_malformed_versions_are_refused() {
+        for bad in [
+            "==1",
+            "=*",
+            "*",
+            "=1.0.0",
+            ">=1, <2",
+            "^1.2.3",
+            "1",
+            "1.0",
+            "1.0.0.0",
+            "01.0.0",
+            "1.00.0",
+            "1..0",
+            " 1.0.0",
+            "1.0.0 ",
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0-rc..1",
+            "1.0.0-01",
+            "1.0.0+a+b",
+            "18446744073709551616.0.0",
+        ] {
+            assert!(
+                matches!(
+                    CrateVersion::parse(bad),
+                    Err(WireDefect::InvalidVersion { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+            let transitive = json!({
+                "pkg": "semver",
+                "name": "semver",
+                "version": "1.0.26",
+                "functions": [],
+                "errors": [],
+                "transitiveDeps": [{"ident": "serde", "name": "serde", "version": bad}]
+            });
+            assert!(
+                matches!(
+                    decode(&transitive),
+                    Err(Diagnostic::WireMalformed {
+                        defect: WireDefect::InvalidVersion { .. },
+                        ..
+                    })
+                ),
+                "{bad:?} as a transitive version must fail the whole package"
+            );
         }
     }
 

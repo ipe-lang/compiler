@@ -5004,6 +5004,31 @@ version = \"1\"
     }
 
     #[test]
+    fn an_underscore_named_direct_crate_conflict_is_refused() {
+        // The direct set and the dependency keys compare one typed package-name
+        // spelling, so `foo_bar` is direct on both sides and never deferred.
+        let refused = emit_of(&[
+            typed_crate("foo_bar", "foo_bar", &["foo_bar = \"=1.0.0\""]),
+            typed_crate(
+                "other",
+                "other",
+                &["other = \"=1.0.0\"", "foo_bar = \"=2.0.0\""],
+            ),
+        ]);
+        assert!(
+            refused_as(
+                &refused,
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                    name: "foo_bar".to_owned(),
+                    first: "1.0.0".to_owned(),
+                    second: "2.0.0".to_owned(),
+                })
+            ),
+            "a direct crate named with `_` must refuse its conflict: {refused:?}"
+        );
+    }
+
+    #[test]
     fn a_legacy_member_transitive_conflict_is_refused() {
         // Without a typed package name no member can prove `syn` is transitive.
         let [a, mut b] = syn_split();

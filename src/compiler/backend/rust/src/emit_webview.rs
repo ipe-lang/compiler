@@ -51,12 +51,13 @@ pub fn emit_web_app_as_webview(
         Some(w) => (FALLBACK_TITLE, w.width, w.height),
         None => (FALLBACK_TITLE, FALLBACK_WIDTH, FALLBACK_HEIGHT),
     };
-    // `{title:?}` produces a valid Rust double-quoted literal with every escape
+    // `rust_str_lit` produces a valid Rust double-quoted literal with every escape
     // (quotes, backslashes, control characters) handled — the manifest title is
     // arbitrary text, so the Debug form is the fail-closed choice.
+    let title_lit = ipe_intern::rust_str_lit(title);
     format!(
         "ipe_runtime::tea::WebViewApp(ipe_runtime::webview::webview_app(\
          {init_s}, {update_s}, {view_s}, {subs_s}, \
-         ipe_runtime::webview::WebViewWindowCfg {{ title: {title:?}.to_string(), size: ({width}, {height}) }}))"
+         ipe_runtime::webview::WebViewWindowCfg {{ title: {title_lit}.to_string(), size: ({width}, {height}) }}))"
     )
 }

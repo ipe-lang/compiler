@@ -103,11 +103,11 @@ fn unrelated_alias_does_not_unlock_the_crypto_gate() {
         matches!(
             err,
             Diagnostic::Name {
-                msg: NameError::StdlibImportRequired { .. },
+                msg: NameError::ImportRequired { .. },
                 ..
             }
         ),
-        "expected StdlibImportRequired for un-imported Crypto, got: {err:?}"
+        "expected ImportRequired for un-imported Crypto, got: {err:?}"
     );
 }
 
@@ -143,11 +143,11 @@ fn bare_http_stream_import_does_not_unlock_server_stream_gate() {
         matches!(
             err,
             Diagnostic::Name {
-                msg: NameError::StdlibImportRequired { .. },
+                msg: NameError::ImportRequired { .. },
                 ..
             }
         ),
-        "expected StdlibImportRequired for smuggled server `Stream`, got: {err:?}"
+        "expected ImportRequired for smuggled server `Stream`, got: {err:?}"
     );
 }
 
@@ -165,11 +165,11 @@ fn bare_server_http_import_does_not_unlock_client_http_gate() {
         matches!(
             err,
             Diagnostic::Name {
-                msg: NameError::StdlibImportRequired { .. },
+                msg: NameError::ImportRequired { .. },
                 ..
             }
         ),
-        "expected StdlibImportRequired for smuggled client `Http`, got: {err:?}"
+        "expected ImportRequired for smuggled client `Http`, got: {err:?}"
     );
 }
 
@@ -184,11 +184,11 @@ fn bare_server_stream_use_is_gated_without_import() {
         matches!(
             err,
             Diagnostic::Name {
-                msg: NameError::StdlibImportRequired { .. },
+                msg: NameError::ImportRequired { .. },
                 ..
             }
         ),
-        "expected StdlibImportRequired for un-imported `Stream`, got: {err:?}"
+        "expected ImportRequired for un-imported `Stream`, got: {err:?}"
     );
 }
 
