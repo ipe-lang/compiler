@@ -13,9 +13,11 @@
 //! The scan fails closed. Every value is split into words, under every setting
 //! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
 //! resolved against the configuration file's directory and the working tree,
-//! `~` through the injected [`Home`]; an option's argument is split again; a
-//! program name passes; any other word, a command substitution, an expansion,
-//! a glob or brace expansion, another user's home, an `ext::` transport, or a relative `..` is
+//! `~` through the injected [`Home`]; an option's argument is judged as a word
+//! of its own and the option word whole besides; a program name, less any
+//! runner prefix (`!`, `=`), passes; any other word, a `--` or `-` ending a
+//! program's options, a command substitution, an expansion, a glob or brace
+//! expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
 //! grants, and by a walk that opens each component through a held directory
 //! handle, follows each link it meets (at most [`MAX_LINKS`]), and refuses a
@@ -478,8 +480,10 @@ pub enum Unprovable {
     Unresolvable,
     /// The word or a link target is longer than [`MAX_PATH_BYTES`] or has more than [`MAX_PATH_COMPONENTS`] components.
     TooLong,
-    /// A word is neither a program name, a path, an option, nor a number.
+    /// A word is neither a program name, a path, nor an option.
     BareWord,
+    /// A word is `--` or `-`, after which a program may read any later word, one shaped like an option included, as a file.
+    EndOfOptions,
     /// A word holds a glob character (`*`, `?`, `[`) or a brace (`{`, `}`), which the shell expands into words.
     Glob,
     /// The value or its subsection names Git's `ext::` transport, which runs a program.
@@ -517,8 +521,12 @@ impl fmt::Display for Unprovable {
                 "it is longer than {MAX_PATH_BYTES} bytes or {MAX_PATH_COMPONENTS} components"
             ),
             Self::BareWord => f.write_str(
-                "it holds a word that is not a path, an option, or a number, which may name a \
-                 file relative to the directory the tool runs in",
+                "it holds a word that is not a path or an option, which may name a file \
+                 relative to the directory the tool runs in",
+            ),
+            Self::EndOfOptions => f.write_str(
+                "it holds `--` or `-`, after which a program may read any word, one shaped like \
+                 an option included, as a file relative to the directory the tool runs in",
             ),
             Self::Glob => f.write_str(
                 "it holds a glob pattern or a brace expansion, which the shell expands into \
@@ -2253,34 +2261,45 @@ impl Scan<'_> {
 
     /// Judge every word on `words`, splitting options and compound words onto it.
     ///
-    /// A path-shaped word is resolved; an option's attached argument and a
-    /// compound word's pieces are pushed back to be judged in turn; a program
-    /// name, a number, and the empty word pass; any other word may name a file
-    /// relative to the directory the tool runs in, so it is unprovable. A word
-    /// holding whitespace, which a program may run again as a command line
-    /// (`sh -c '...'`), also has its shell words pushed back as one: each
-    /// re-split drops a quote or a space, so the text shrinks and
-    /// [`MAX_WORDS`] bounds the pushes.
+    /// Each word is judged whole by every rule its text triggers, and a
+    /// classification only adds judgments: an option's attached argument
+    /// ([`option_argument`]) is queued as one word of its own and judged first,
+    /// then the option word comes back and is judged whole like any other. A
+    /// path-shaped word is resolved; a word holding whitespace, which a program
+    /// may run again as a command line (`sh -c '...'`), also has its shell
+    /// words queued, the first as a program; a compound word also has its
+    /// pieces queued ([`Words::push_pieces`]). The whole word is then admitted
+    /// only when it is path-shaped (and resolved), empty, a program name, or an
+    /// option; any other word, a number included, may name a file relative to
+    /// the directory the tool runs in, so it is unprovable, and `--` or `-`
+    /// lets a program read any later word as such a file. Runner prefixes are
+    /// stripped from a program word only ([`command_text`]).
     ///
-    /// No word leaves the loop unjudged: an option is only a word whose text
-    /// beside its argument is option characters ([`option_argument`]), which
-    /// name no file and split into no further word, so pushing its argument
-    /// back judges all of it; a compound word leaves only its separators,
-    /// every piece pushed back.
+    /// Every queued word is strictly shorter than the word that queued it,
+    /// but an option word queued back once to be judged whole, and
+    /// [`MAX_WORDS`] bounds the pushes.
     fn judge_queue(&mut self, ctx: &FileCtx, words: &mut Words) -> Result<(), Stop> {
-        while let Some((word, position)) = words.stack.pop() {
+        while let Some((word, position, stage)) = words.stack.pop() {
             if word.len() > MAX_PATH_BYTES {
                 return Err(unproven(Unprovable::TooLong));
             }
             if word.contains(is_expansion_char) {
                 return Err(unproven(Unprovable::Glob));
             }
-            let text = strip_runners(&word);
-            if let Some(argument) = option_argument(text) {
+            if stage == Stage::Fresh
+                && let Some(argument) = option_argument(command_text(&word, position))
+                    .filter(|argument| !argument.is_empty())
+                    .map(str::to_owned)
+            {
                 words
-                    .push_split(argument, Position::Argument)
+                    .push_staged(word, position, Stage::ArgumentQueued)
                     .map_err(unproven)?;
+                words.push(argument, Position::Argument).map_err(unproven)?;
                 continue;
+            }
+            let text = command_text(&word, position);
+            if text == "-" || text == "--" {
+                return Err(unproven(Unprovable::EndOfOptions));
             }
             if text.contains(is_c_space) {
                 words
@@ -2293,12 +2312,11 @@ impl Scan<'_> {
             }
             if text.contains(is_word_separator) {
                 words.push_pieces(text, position).map_err(unproven)?;
-                continue;
             }
             let admitted = shaped
                 || text.is_empty()
-                || text.bytes().all(|b| b.is_ascii_digit())
-                || position == Position::Program;
+                || position == Position::Program
+                || option_argument(text).is_some();
             if !admitted {
                 return Err(unproven(Unprovable::BareWord));
             }
@@ -2310,7 +2328,9 @@ impl Scan<'_> {
     ///
     /// Surrounding whitespace is trimmed, which only moves the path within
     /// its directory or makes it absolute; text of whitespace alone (a quoted
-    /// `" "`) still names the entry of that name, so it is kept whole.
+    /// `" "`) still names the entry of that name, so it is kept whole. No
+    /// runner prefix is stripped: a tool opens the path a setting names
+    /// verbatim, so `!/x` is the relative path `!/x`.
     fn judge_forced(
         &mut self,
         ctx: &FileCtx,
@@ -2318,7 +2338,7 @@ impl Scan<'_> {
         reach: Reach,
     ) -> Result<Vec<(PathBuf, Resolved)>, Stop> {
         let trimmed = text.trim_matches(is_c_space);
-        let path = strip_runners(if trimmed.is_empty() { text } else { trimmed });
+        let path = if trimmed.is_empty() { text } else { trimmed };
         if path.is_empty() {
             return Ok(Vec::new());
         }
@@ -2395,23 +2415,42 @@ impl Scan<'_> {
     }
 }
 
+/// How far the judging of one queued word has gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Not yet looked at.
+    Fresh,
+    /// An option whose attached argument is already queued, so only the rules its whole text triggers remain.
+    ArgumentQueued,
+}
+
 /// The words of one value still to judge, bounded by [`MAX_WORDS`].
 #[derive(Default)]
 struct Words {
     /// The words left, next last.
-    stack: Vec<(String, Position)>,
+    stack: Vec<(String, Position, Stage)>,
     /// Words pushed so far.
     pushed: u32,
 }
 
 impl Words {
-    /// Push one word.
+    /// Push one word not yet looked at.
     fn push(&mut self, word: String, position: Position) -> Result<(), Unprovable> {
+        self.push_staged(word, position, Stage::Fresh)
+    }
+
+    /// Push one word judged as far as `stage`.
+    fn push_staged(
+        &mut self,
+        word: String,
+        position: Position,
+        stage: Stage,
+    ) -> Result<(), Unprovable> {
         self.pushed = self.pushed.saturating_add(1);
         if self.pushed > MAX_WORDS {
             return Err(Unprovable::TooManyWords);
         }
-        self.stack.push((word, position));
+        self.stack.push((word, position, stage));
         Ok(())
     }
 
@@ -2611,15 +2650,13 @@ fn is_option_name(name: &str) -> bool {
 
 /// The argument the option `word` carries, or `None` when `word` is not an option.
 ///
-/// An option is `-` or `--` alone (no argument); `--name`, or `--name=` and
-/// an argument, with an [`is_option_name`] name; or `-`, one ASCII letter or
-/// digit, and an attached argument after an optional `=`. The text beside the
-/// argument is then only those characters. Any other word starting with `-`
-/// (`--x;/tree/evil.sh`, `-;evil`) is not an option and is judged whole.
+/// An option is `--name`, or `--name=` and an argument, with an
+/// [`is_option_name`] name; or `-`, one ASCII letter or digit, and an attached
+/// argument after an optional `=`. The text beside the argument is then only
+/// those characters. Any other word starting with `-` (`--x;/tree/evil.sh`,
+/// `-;evil`, `--`, `-`) is not an option. Being an option only admits a word
+/// whose whole text no other rule refuses ([`Scan::judge_queue`]).
 fn option_argument(word: &str) -> Option<&str> {
-    if word == "-" || word == "--" {
-        return Some("");
-    }
     if let Some(long) = word.strip_prefix("--") {
         let (name, argument) = long.split_once('=').unwrap_or((long, ""));
         return is_option_name(name).then_some(argument);
@@ -2628,6 +2665,18 @@ fn option_argument(word: &str) -> Option<&str> {
         .strip_prefix('-')?
         .strip_prefix(|c: char| c.is_ascii_alphanumeric())?;
     Some(rest.strip_prefix('=').unwrap_or(rest))
+}
+
+/// The text of `word` judged at `position`: a program word without its runner prefixes.
+///
+/// Only a program word may carry a prefix a tool consumes before running what
+/// follows; an argument reaches its program verbatim, so `=/x` there is the
+/// relative path `=/x`, never `/x`.
+fn command_text(word: &str, position: Position) -> &str {
+    match position {
+        Position::Program => strip_runners(word),
+        Position::Argument => word,
+    }
 }
 
 /// `word` without the prefixes that make a tool run what follows (`=`, `!`, `ext::`, `python:`).
@@ -2752,7 +2801,8 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
         Setting::Line(_) => return Role::Words,
     };
     if &**section == "extensions" {
-        return Role::Forced(value.to_owned());
+        // A leading `!` disables the extension; the path after it is still judged.
+        return Role::Forced(value.strip_prefix('!').unwrap_or(value).to_owned());
     }
     if &**section == "hooks"
         && let Some((path, _)) = value
@@ -3684,8 +3734,8 @@ mod tests {
             &format!(
                 "[paths]\ndefault = https://example.com/repo\ndefault:pushrev = .\n\
                  [ui]\nusername = A <a@example.com>\n\
-                 [extensions]\nrebase =\n[hooks]\nx = python:hgext.hook.run\n\
-                 y = python:{out}/hook.py:run\n"
+                 [extensions]\nrebase =\nstrip = !\ngone = !{out}/gone.py\n\
+                 [hooks]\nx = python:hgext.hook.run\ny =python:{out}/hook.py:run\n"
             ),
         );
         assert_eq!(scan_with(&f, &roots, ConfigLimits::DEFAULT), Ok(()));
@@ -4027,7 +4077,7 @@ mod tests {
         );
         for (line, value) in [
             (pager, format!("less --x;{tree}/evil=1")),
-            (alias, format!("!sh -c -- '--x&{tree}/evil'")),
+            (alias, format!("!sh -c '--x&{tree}/evil'")),
             (pager, format!("less '--x\n{tree}/evil'")),
         ] {
             git_config(&f, &format!("{line} = {}\n", git_quoted(&value)));
@@ -4066,11 +4116,98 @@ mod tests {
                     );
                 }
             }
-            let admitted =
-                format!("{runner}less -R -n5 --quit-if-one-screen --pattern={out}/x -- -");
+            let admitted = format!("{runner}less -R -n --quit-if-one-screen --pattern {out}/x");
             git_config(&f, &format!("{line} = {}\n", git_quoted(&admitted)));
             assert_eq!(scan_git(&f), Ok(()), "{line:?}");
         }
+    }
+
+    #[test]
+    fn option_word_judged_whole_as_well_as_its_argument() {
+        let f = fixture("optionwhole");
+        let out = f.out.display();
+        let pager = "[core]\n\tpager";
+        let alias = "[alias]\n\tx";
+        for (line, value) in [
+            (pager, format!("-a{out}/less")),
+            (alias, format!("!-a{out}/less")),
+            (alias, format!("!sh -a{out}/x")),
+            (pager, format!("less -5{out}/x")),
+            (alias, format!("!sh --a={out}/x")),
+            (pager, format!("less {out}/y;-a{out}/x")),
+            (pager, "-ax/y".to_owned()),
+            (alias, "!sh -ax/y".to_owned()),
+            (pager, format!("less {out}/y;-ax/y")),
+        ] {
+            git_config(&f, &format!("{line} = {}\n", git_quoted(&value)));
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{value:?}: {result:?}"
+            );
+        }
+        for (line, value, why) in [
+            (alias, format!("!sh -- -a{out}/x"), Unprovable::EndOfOptions),
+            (alias, "!sh -- -ax/y".to_owned(), Unprovable::EndOfOptions),
+            (alias, "!sh - -e".to_owned(), Unprovable::EndOfOptions),
+            (pager, "less -- -".to_owned(), Unprovable::EndOfOptions),
+            (pager, "less 5".to_owned(), Unprovable::BareWord),
+            (alias, "!ssh -F5".to_owned(), Unprovable::BareWord),
+            (alias, "!sh ';'".to_owned(), Unprovable::BareWord),
+            (pager, "less ':'".to_owned(), Unprovable::BareWord),
+        ] {
+            git_config(&f, &format!("{line} = {}\n", git_quoted(&value)));
+            assert_eq!(unprovable(&scan_git(&f)), Some(why), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn runner_prefix_stripped_only_from_a_program_word() {
+        let f = fixture("runnerarg");
+        let out = f.out.display();
+        for text in [
+            format!("[core]\n\tpager = less ={out}/x\n"),
+            format!("[core]\n\tpager = less !{out}/x\n"),
+            format!("[alias]\n\tx = !sh python:{out}/x\n"),
+            format!("[core]\n\thooksPath = !{out}/h\n"),
+            format!("[core]\n\thooksPath = ={out}/h\n"),
+            format!("[init]\n\ttemplateDir = !{out}/t\n"),
+            format!("[include]\n\tpath = !{out}/inc\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        for value in ["!sh '='", "!sh '!'", "less =x"] {
+            git_config(&f, &format!("[alias]\n\tx = {}\n", git_quoted(value)));
+            assert_eq!(
+                unprovable(&scan_git(&f)),
+                Some(Unprovable::BareWord),
+                "{value:?}"
+            );
+        }
+        git_config(&f, &format!("[alias]\n\tx = !{out}/a\n"));
+        assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spaced_option_argument_judged_as_one_path() {
+        let f = fixture("optionspaced");
+        let out = f.out.display();
+        write(&f.tree.join("evil.sh"), "#!/bin/sh\n");
+        link(&f.tree.join("evil.sh"), &f.out.join("a 1"));
+        let value = git_quoted(&format!("less '-F{out}/a 1'"));
+        git_config(&f, &format!("[core]\n\tpager = {value}\n"));
+        let result = scan_git(&f);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil.sh").as_path()),
+            "{result:?}"
+        );
     }
 
     #[test]
