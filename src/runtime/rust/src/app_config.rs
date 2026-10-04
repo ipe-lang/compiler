@@ -639,6 +639,20 @@ pub fn resolve_revocation_capacity() -> Result<usize, crate::system::EnvCeilingR
     REVOCATION_CAPACITY_CEILING.read()
 }
 
+/// Resolves every auth ceiling once, so a malformed one refuses the app at
+/// startup (`Server.listen`, `Web.tea`) rather than a later request. The
+/// slide window reads the max lifetime its clamp needs.
+///
+/// # Errors
+///
+/// The first refusal among `IPE_AUTH_MAX_LIFETIME`, `IPE_AUTH_SLIDE_WINDOW`
+/// and `IPE_REVOCATION_CAPACITY`.
+pub fn auth_ceilings() -> Result<(), crate::system::EnvCeilingRefusal> {
+    resolve_auth_slide_window()?;
+    resolve_revocation_capacity()?;
+    Ok(())
+}
+
 /// The resolved database URL from the installed `Db.url` setting, if one was set
 /// and no `DATABASE_URL` env override applies. The secret is revealed only here,
 /// at the point of use, and returned to the caller that configures the pool; it

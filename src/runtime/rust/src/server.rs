@@ -891,10 +891,7 @@ fn listen_ceilings() -> Result<ListenCeilings, crate::system::EnvCeilingRefusal>
     max_body()?;
     ws_ceilings()?;
     #[cfg(feature = "jwt")]
-    {
-        crate::app_config::resolve_auth_slide_window()?;
-        crate::app_config::resolve_revocation_capacity()?;
-    }
+    crate::app_config::auth_ceilings()?;
     Ok(ListenCeilings {
         request_timeout_secs: REQUEST_TIMEOUT_CEILING.read()?,
         max_inflight: MAX_INFLIGHT_CEILING.read()?,

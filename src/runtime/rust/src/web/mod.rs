@@ -4942,6 +4942,8 @@ where
         .read()
         .map_err(StartupRefusal::Ceiling)?;
     let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
     if let Err(refusal) = client_tuning_js() {
@@ -9172,6 +9174,40 @@ mod emitted_router_behavior_tests {
             .expect("multi-thread runtime");
         rt.block_on(body());
         crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// A malformed session TTL or auth ceiling refuses the router at startup,
+    /// naming the variable, instead of answering requests under a default.
+    #[tokio::test]
+    async fn a_malformed_ttl_or_auth_ceiling_refuses_the_router() {
+        let mut cases = vec![("IPE_WEB_TTL", "1h30")];
+        if cfg!(feature = "jwt") {
+            cases.extend([
+                ("IPE_AUTH_MAX_LIFETIME", "8h"),
+                ("IPE_AUTH_SLIDE_WINDOW", "0"),
+                ("IPE_REVOCATION_CAPACITY", " 1024"),
+            ]);
+        }
+        for (name, raw) in cases {
+            crate::system::locked_set_var(name, raw);
+            let refused = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(
+                make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+                false,
+            )
+            .err();
+            crate::system::locked_remove_var(name);
+            assert!(
+                matches!(&refused, Some(StartupRefusal::Ceiling(r)) if r.name() == name),
+                "{name}={raw:?} must refuse the router, got {refused:?}"
+            );
+        }
     }
 
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────
