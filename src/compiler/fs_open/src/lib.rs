@@ -126,8 +126,12 @@ impl fmt::Display for FileKind {
 
 /// What a directory listing says an entry is, taken from the listing itself without a stat.
 ///
+/// A hint describes the entry as it was listed and proves nothing. Act only
+/// through [`HeldDir::child_dir`] and [`HeldDir::open_regular`], which re-prove
+/// the entry handle-relative without following a link.
+///
 /// [`HintedKind::Unknown`] is the listing declining to say; the one way to
-/// settle it is [`HeldDir::kind_of_unknown`].
+/// settle it is [`HeldDir::kind_of`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HintedKind {
     /// A directory.
@@ -311,23 +315,19 @@ impl HeldDir {
 
     /// Every entry of this directory and its kind, `.` and `..` excluded.
     ///
-    /// An entry that vanishes between the listing and its classification is
-    /// left out.
+    /// The whole listing is taken by [`HeldDir::entries_hinted`] first, so a
+    /// directory past `cap` is refused before any entry is stat'ed. An entry
+    /// that vanishes between the listing and its classification is left out.
     ///
     /// # Errors
-    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Link`] when
+    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Absent`]
+    /// when the held directory was removed; [`OpenRefusal::Link`] when
     /// the held directory turned into a reparse point (Windows);
     /// [`OpenRefusal::BadName`] for a listed name no handle-relative open can
     /// take; another refusal on another failure.
     pub fn entries(&self, cap: EntryCap) -> Result<Vec<(EntryName, FileKind)>, OpenRefusal> {
         let mut found = Vec::new();
-        let mut seen: u32 = 0;
-        for name in self.dir.names()? {
-            let name = name?;
-            seen = seen.saturating_add(1);
-            if seen > cap.get() {
-                return Err(OpenRefusal::TooManyEntries(cap));
-            }
+        for (name, _) in self.entries_hinted(cap)? {
             if let Some(kind) = self.dir.kind_of(&name)? {
                 found.push((name, kind));
             }
@@ -340,10 +340,13 @@ impl HeldDir {
     /// Never stats and never opens a child: the kind is read from the
     /// directory entry itself (`d_type` on Unix, the find data on Windows).
     /// The cap is charged as each entry is listed, so a directory holding more
-    /// than `cap` entries is refused before any entry is acted on.
+    /// than `cap` entries is refused before any entry is acted on. A removed
+    /// directory lists as empty, so the held handle is proven still linked
+    /// after the listing.
     ///
     /// # Errors
-    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Link`] when
+    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Absent`]
+    /// when the held directory was removed; [`OpenRefusal::Link`] when
     /// the held directory turned into a reparse point (Windows);
     /// [`OpenRefusal::BadName`] for a listed name no handle-relative open can
     /// take; another refusal on another failure.
@@ -361,17 +364,10 @@ impl HeldDir {
             }
             found.push(listed);
         }
+        // A Windows held handle denies delete sharing, so the directory cannot be removed under it.
+        #[cfg(unix)]
+        self.dir.require_live()?;
         Ok(found)
-    }
-
-    /// What the entry `name` is, by a no-follow stat; the way to settle a [`HintedKind::Unknown`].
-    ///
-    /// `None` when the entry vanished.
-    ///
-    /// # Errors
-    /// The refusal of a failure other than absence.
-    pub fn kind_of_unknown(&self, name: &EntryName) -> Result<Option<FileKind>, OpenRefusal> {
-        self.dir.kind_of(name)
     }
 
     /// Open the directory above this one through the handle, not a path; `None` at the root.

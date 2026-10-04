@@ -190,15 +190,6 @@ impl Dir {
         }
     }
 
-    /// The names of this directory's entries, `.` and `..` excluded.
-    pub fn names(
-        &self,
-    ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
-        Ok(self
-            .hinted_names()?
-            .map(|listed| listed.map(|(name, _)| name)))
-    }
-
     /// The names of this directory's entries with their `d_type` hint, `.` and `..` excluded; never stats.
     pub fn hinted_names(
         &self,
@@ -230,6 +221,16 @@ impl Dir {
             .metadata()
             .map(|meta| id_of(&meta))
             .map_err(|e| refusal_of(&e))
+    }
+
+    /// Refuse a held directory that was removed: its listing reads as empty, its link count as zero.
+    pub fn require_live(&self) -> Result<(), OpenRefusal> {
+        let meta = self.0.metadata().map_err(|e| refusal_of(&e))?;
+        if meta.nlink() == 0 {
+            Err(OpenRefusal::Absent)
+        } else {
+            Ok(())
+        }
     }
 
     /// The held descriptor.

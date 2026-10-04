@@ -34,6 +34,8 @@ const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
 const ATTR_DIRECTORY: u32 = 0x10;
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 const ATTR_REPARSE_POINT: u32 = 0x400;
+/// `FILE_ATTRIBUTE_DEVICE`.
+const ATTR_DEVICE: u32 = 0x40;
 /// `ERROR_REPARSE_POINT_ENCOUNTERED`: the typed refusal of a reparse point.
 const ERROR_REPARSE_POINT_ENCOUNTERED: i32 = 4395;
 /// `ERROR_SHARING_VIOLATION`: another open handle denies the access asked for.
@@ -72,13 +74,16 @@ const fn kind_of_attributes(attributes: u32) -> Option<FileKind> {
 
 /// The hint find-data `attributes` carry: a reparse point is a link, never a directory.
 ///
-/// A directory listing of a volume holds only files, directories and reparse
-/// points, so an entry that is neither of the last two is a regular file.
+/// A directory listing of a volume holds files, directories and reparse
+/// points; an entry marked a device is another kind, and any other entry is a
+/// regular file.
 pub const fn hint_of_attributes(attributes: u32) -> HintedKind {
     if attributes & ATTR_REPARSE_POINT != 0 {
         HintedKind::Link
     } else if attributes & ATTR_DIRECTORY != 0 {
         HintedKind::Dir
+    } else if attributes & ATTR_DEVICE != 0 {
+        HintedKind::Other
     } else {
         HintedKind::Regular
     }
@@ -268,22 +273,11 @@ impl Dir {
         }
     }
 
-    /// The names of this directory's entries.
+    /// The names of this directory's entries with the hint their find data carries; never opens an entry.
     ///
     /// The listing reads the real path, then the held handle is re-proven, so
     /// a directory that turned into a reparse point before the listing was
     /// read is refused rather than listed through.
-    pub fn names(
-        &self,
-    ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
-        Ok(self
-            .hinted_names()?
-            .map(|listed| listed.map(|(name, _)| name)))
-    }
-
-    /// The names of this directory's entries with the hint their find data carries; never opens an entry.
-    ///
-    /// Proven as [`Dir::names`] is, before any entry is read.
     pub fn hinted_names(
         &self,
     ) -> Result<impl Iterator<Item = Result<(EntryName, HintedKind), OpenRefusal>>, OpenRefusal>

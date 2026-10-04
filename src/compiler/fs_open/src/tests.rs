@@ -505,6 +505,44 @@ fn entries_hinted_refuses_over_cap_at_listing() {
     );
 }
 
+/// An over-cap directory of dangling links is refused by `entries` before any entry is stat'ed.
+#[cfg(unix)]
+#[test]
+fn entries_refuses_over_cap_before_classifying() {
+    let dir = scratch("entries_cap_dangling");
+    for entry in ["a", "b", "c"] {
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join(entry)).unwrap();
+    }
+    let held = held(&dir);
+    let entry_cap = EntryCap::new(2).unwrap();
+    let past = held.entries(entry_cap);
+    assert!(
+        matches!(past, Err(OpenRefusal::TooManyEntries(at)) if at == entry_cap),
+        "an over-cap directory is refused by its listing, got {past:?}"
+    );
+}
+
+/// A held directory removed from its parent is refused, never listed as empty.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removed_held_directory_is_absent() {
+    let dir = scratch("removed_held");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let sub = held(&dir.join("sub"));
+    std::fs::remove_dir(dir.join("sub")).unwrap();
+    let entry_cap = EntryCap::new(4).unwrap();
+    let hinted = sub.entries_hinted(entry_cap);
+    assert!(
+        matches!(hinted, Err(OpenRefusal::Absent)),
+        "a removed directory is absent, got {hinted:?}"
+    );
+    let entries = sub.entries(entry_cap);
+    assert!(
+        matches!(entries, Err(OpenRefusal::Absent)),
+        "a removed directory is absent to entries too, got {entries:?}"
+    );
+}
+
 /// A dangling link a following stat would fail on is still typed from the directory entry.
 #[cfg(unix)]
 #[test]
@@ -562,7 +600,7 @@ fn entries_hinted_reports_a_symlink_as_link_and_resolves_unknown() {
             "{entry} is {expected_hint:?} or unknown, got {hint:?}"
         );
         if hint == Some(HintedKind::Unknown) {
-            let settled = held.kind_of_unknown(&name(entry));
+            let settled = held.kind_of(&name(entry));
             assert!(
                 matches!(settled, Ok(Some(kind)) if kind == expected_kind),
                 "{entry} unknown settles to {expected_kind:?}, got {settled:?}"
@@ -573,7 +611,7 @@ fn entries_hinted_reports_a_symlink_as_link_and_resolves_unknown() {
 
 #[cfg(unix)]
 #[test]
-fn kind_of_unknown_classifies_without_following() {
+fn kind_of_classifies_without_following() {
     let dir = scratch("unknown_kinds");
     std::fs::create_dir(dir.join("sub")).unwrap();
     std::fs::write(dir.join("file"), "x").unwrap();
@@ -585,7 +623,7 @@ fn kind_of_unknown_classifies_without_following() {
         ("to_dir", Some(FileKind::Symlink)),
         ("missing", None),
     ] {
-        let kind = held.kind_of_unknown(&name(entry));
+        let kind = held.kind_of(&name(entry));
         assert!(
             matches!(kind, Ok(found) if found == expected),
             "{entry} is {expected:?}, got {kind:?}"
@@ -601,6 +639,7 @@ fn entries_hinted_reports_reparse_as_link() {
     const DIRECTORY: u32 = 0x10;
     const REPARSE_POINT: u32 = 0x400;
     const ARCHIVE: u32 = 0x20;
+    const DEVICE: u32 = 0x40;
     assert_eq!(
         hint_of_attributes(DIRECTORY | REPARSE_POINT),
         HintedKind::Link
@@ -608,6 +647,7 @@ fn entries_hinted_reports_reparse_as_link() {
     assert_eq!(hint_of_attributes(REPARSE_POINT), HintedKind::Link);
     assert_eq!(hint_of_attributes(DIRECTORY), HintedKind::Dir);
     assert_eq!(hint_of_attributes(ARCHIVE), HintedKind::Regular);
+    assert_eq!(hint_of_attributes(DEVICE), HintedKind::Other);
 
     let dir = scratch("hinted_junction");
     std::fs::create_dir(dir.join("real")).unwrap();
