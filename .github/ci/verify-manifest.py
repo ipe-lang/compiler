@@ -396,13 +396,18 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       workflow entry, the cargo step for a step entry).  Every expression in
       that region (the steps, the job keys, the local actions they use) may
       read only `matrix.<key>` and the pure functions, plus `inputs` and
-      `steps` inside a local action; every matrix key read is equal for each
-      target on both sides, and a literal `GITHUB_*` name other than the
-      command files is refused, so no event, ref, variable or secret can make
-      the two runs differ.  A cargo-carrying step with an `if:` or a
-      `continue-on-error`, or a ci.yml job with a `continue-on-error`, is
-      refused, since either lets the job succeed without the cargo command;
-      and release.yml's completeness `expected` list is exactly the
+      `steps` inside a local action (never `steps` inside its `run:`); the
+      matrix values and an action's input defaults read no context; every
+      matrix key read is a scalar equal for each target on both sides; and a
+      literal `GITHUB_*` or `ACTIONS_*` name other than the command files is
+      refused, in the text and in the matrix values alike, so no event, ref,
+      variable or secret can make the two runs differ.  A `${{ }}` whose value
+      lands in text may not touch a name character or another expression, nor
+      call `format`, `join` or `fromJSON`, so no name is assembled out of the
+      scans' sight; the FreeBSD jobs carry no `strategy`.  A cargo-carrying
+      step with an `if:` or a `continue-on-error`, or a ci.yml job with a
+      `continue-on-error`, is refused, since either lets the job succeed
+      without the cargo command; and release.yml's completeness `expected` list is exactly the
       artifacts its jobs publish.  A job, matrix, `env`, cargo line or VM
       step that is absent or not one literal is refused.  Both release
       builds carry `--features ipe/wasi_run`, so the shipped `ipe` has the
@@ -735,9 +740,9 @@ LEGACY_COMMAND_RE = re.compile(r"::\s*(?:set-env|add-path|save-state|set-output)
 # Bound on YAML nesting walked for string scalars; deeper is refused.
 STRING_SCALAR_DEPTH_LIMIT = 64
 
-# Bound on local-action nesting; a chain deeper than this is refused, never
-# assumed closed.
-LOCAL_ACTION_DEPTH_LIMIT = 20
+# Bound on local-action nesting (a composite whose steps use another local
+# action); a chain deeper than this is refused, never assumed closed.
+LOCAL_ACTION_DEPTH_LIMIT = 4
 
 
 VALID_DISPOSITIONS = {"gate", "gate-external", "nightly-gate", "informational", "delete"}
@@ -2904,8 +2909,6 @@ IPE_PACKAGE = "ipe"
 IPE_PACKAGE_DIR = "src/ipe-cli"
 # Cargo subcommands that compile the selected package's binary.
 _CARGO_COMPILES = frozenset({"build", "run", "rustc", "install"})
-# Nesting bound for a composite action whose steps use another local action.
-LOCAL_ACTION_DEPTH_LIMIT = 4
 WORKFLOW_PATTERNS = ("*.yml", "*.yaml")
 
 
@@ -5992,16 +5995,28 @@ _PARITY_FREE_WORKFLOW_KEYS = frozenset({"name", "run-name", "on", True, "permiss
 # Expression functions whose value depends on their arguments alone; a status
 # function (`success()`, `always()`), `hashFiles` and anything else is refused.
 _PURE_EXPRESSION_FUNCTIONS = frozenset({"contains", "startswith", "endswith", "format", "join", "tojson", "fromjson"})
+# Expression functions that build a string from parts (`format('{0}_REF',
+# 'GITHUB')`, a `fromJSON` escape): in a `${{ }}` whose value lands in text,
+# the name scans below would never see the name they build, so they are
+# refused there; in an `if:` they yield only a truth value.
+_STRING_BUILDING_FUNCTIONS = frozenset({"format", "join", "fromjson"})
 # Runner variables naming a per-step command file: read in equal text, they
 # point at the same kind of file on both sides. Every other `GITHUB_*` name
-# carries the run's event, ref, commit or workflow, which differ.
+# carries the run's event, ref, commit or workflow, and an `ACTIONS_*` name the
+# run's token grants (`ACTIONS_ID_TOKEN_REQUEST_URL` follows the parity-free
+# `permissions`), which differ.
 _COMMAND_FILE_VARS = frozenset({"GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE"})
-_GITHUB_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])GITHUB_[A-Za-z0-9_]*", re.IGNORECASE)
+_GITHUB_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])(?:GITHUB|ACTIONS)_[A-Za-z0-9_]*", re.IGNORECASE)
+_NAME_CHAR_RE = re.compile(r"[A-Za-z0-9_]")
 # The contexts a string of the region may read: a workflow's own strings the
 # matrix leg (compared key by key), a local action's its inputs (the compared
-# `with:`) and its own steps' outputs.
+# `with:`) and its own steps' outputs — the latter never inside a `run:`, where
+# a value the shell produced would become shell text no scan has read. The
+# matrix values and an action's input defaults read no context at all.
 _STEP_CONTEXTS = frozenset({"matrix"})
 _ACTION_CONTEXTS = frozenset({"inputs", "steps"})
+_ACTION_RUN_CONTEXTS = frozenset({"inputs"})
+_NO_CONTEXTS: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -6112,10 +6127,23 @@ def _local_action_strings(uses: str, repo: str, where: str, depth: int, errors: 
         errors.append(f"check 23: {where}: local action {uses!r} is not a composite of step mappings; refused")
         return []
     out: list[_RegionText] = []
+    inputs = doc.get("inputs")
+    defaults = (
+        {k: v.get("default") for k, v in inputs.items() if isinstance(v, dict) and "default" in v}
+        if isinstance(inputs, dict)
+        else inputs
+    )
+    out.extend(
+        _RegionText(w, t, b, _NO_CONTEXTS, False)
+        for w, t, b in _region_strings(defaults, f"{where} -> {uses} input defaults", False, errors)
+    )
     for n, st in enumerate(steps, start=1):
         swhere = f"{where} -> {uses} step {n}"
         body = {k: v for k, v in st.items() if k != "name"}
-        out.extend(_RegionText(w, t, b, _ACTION_CONTEXTS, False) for w, t, b in _region_strings(body, swhere, True, errors))
+        out.extend(
+            _RegionText(w, t, b, _ACTION_RUN_CONTEXTS if w == f"{swhere}.run" else _ACTION_CONTEXTS, False)
+            for w, t, b in _region_strings(body, swhere, True, errors)
+        )
         inner = st.get("uses")
         if isinstance(inner, str) and inner.startswith("./"):
             out.extend(_local_action_strings(inner, repo, swhere, depth + 1, errors))
@@ -6157,7 +6185,13 @@ def _cargo_region(
     texts.extend((w, t, b, False) for w, t, b in _region_strings(job_part, where, False, errors))
     steps = _steps_of(job)
     cut = next((i for i, s in enumerate(steps) if s is cargo.step), len(steps) - 1)
-    out: list[_RegionText] = []
+    # The matrix values: equal per target is not enough when a value is an
+    # expression or names a variable, so they are scanned as the cargo step's
+    # own text (any value can be spliced into it).
+    out: list[_RegionText] = [
+        _RegionText(w, t, b, _NO_CONTEXTS, True)
+        for w, t, b in _region_strings(job.get("strategy"), f"{where} strategy", False, errors)
+    ]
     for n, st in enumerate(steps[: cut + 1], start=1):
         is_cargo = st is cargo.step
         body = {k: v for k, v in st.items() if k != "name"}
@@ -6201,6 +6235,31 @@ def _parity_context_refusal(e: gha_expr.Expr, contexts: frozenset[str]) -> str |
     return None
 
 
+def _refuse_spliced_names(item: _RegionText, parsed: gha_expr.Template, errors: list[str]) -> None:
+    """The name scans read a string's text and, separately, every value an
+    expression there can yield (a matrix value, a compared `with:` input); a
+    variable name assembled across the two (`$${{ matrix.a }}_REF` with `a:
+    GITHUB`) is seen by neither. So an expression whose value lands in text
+    may not touch a name character or another expression, and may not build
+    a string from parts."""
+    for e, (start, end) in zip(parsed.exprs, parsed.spans):
+        before = item.text[start - 1 : start]
+        after = item.text[end : end + 1]
+        if _NAME_CHAR_RE.fullmatch(before) or _NAME_CHAR_RE.fullmatch(after) or item.text.startswith("${{", end):
+            errors.append(
+                f"check 23: {item.where}: {item.text!r} joins `{item.text[start:end]}` to a name character or "
+                "another expression, which can assemble a variable name no scan reads; refused"
+            )
+        built = sorted(
+            {n.name for n in gha_expr.walk(e) if isinstance(n, gha_expr.Call) and n.name.casefold() in _STRING_BUILDING_FUNCTIONS}
+        )
+        if built:
+            errors.append(
+                f"check 23: {item.where}: {item.text!r} builds text with {built!r}, whose result no name scan "
+                "reads; refused"
+            )
+
+
 def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
     """Refuse every string of `region` that can evaluate differently in the
     two workflows; the matrix keys it reads (case-folded)."""
@@ -6210,6 +6269,8 @@ def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
         if isinstance(parsed, gha_expr.Refusal):
             errors.append(f"check 23: {item.where}: {item.text!r} is not a readable expression ({parsed.why}); refused")
             continue
+        if not item.bare:
+            _refuse_spliced_names(item, parsed, errors)
         for e in parsed.exprs:
             why = _parity_context_refusal(e, item.contexts)
             if why is not None:
@@ -6318,6 +6379,11 @@ def _compare_matrix_reads(
         if ci_leg is None or rel_leg is None:
             continue
         for key in sorted(reads):
+            if any(isinstance(leg.get(key), (dict, list)) for leg in (ci_leg, rel_leg)):
+                errors.append(
+                    f"check 23: matrix `{key}` for target {target!r} is a mapping or list, whose keys no name "
+                    "scan reads; a matrix value read by a step that reaches the cargo command must be a scalar"
+                )
             _compare(
                 f"matrix `{key}` for target {target!r} (read by a step that reaches the cargo command)",
                 ci_leg.get(key),
@@ -6425,7 +6491,12 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo.tokens, rel_bsd_cargo.tokens, errors)
         _check_mirrored_steps(ci_bsd, rel_bsd, ci_bsd_cargo, rel_bsd_cargo, "FreeBSD", True, errors)
         # No matrix on either side, so `${{ matrix.k }}` reads one empty leg.
-        _compare("FreeBSD job `strategy`", ci_bsd.get("strategy"), rel_bsd.get("strategy"), errors)
+        for side, bsd in ((_Side.CI, ci_bsd), (_Side.RELEASE, rel_bsd)):
+            if "strategy" in bsd:
+                errors.append(
+                    f"check 23: {side.value}'s FreeBSD job has a `strategy`, whose matrix values no target "
+                    "comparison reads; refused"
+                )
         scope = _check_cargo_scope(
             "FreeBSD", docs, (ci_bsd, rel_bsd), (ci_bsd_cargo, rel_bsd_cargo), True, repo, errors
         )

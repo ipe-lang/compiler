@@ -6800,6 +6800,86 @@ class TestReleaseTargetParity(unittest.TestCase):
             check_release_target_parity(errors, root=root)
         self.assertTrue(any("has no single action.yml" in e for e in errors), errors)
 
+    # A value spliced into the region's text is scanned as that text is.
+
+    _MUSL_LEG = "            target: x86_64-unknown-linux-musl\n"
+    _APT = "        run: sudo apt-get update"
+
+    def both(self, old: str, new: str) -> tuple[str, str]:
+        return self.swap(_RT_CI, old, new), self.swap(_RT_RELEASE, old, new)
+
+    def with_leg_key(self, ci: str, release: str, line: str) -> tuple[str, str]:
+        leg = self._MUSL_LEG + f"            {line}\n"
+        return self.swap(ci, self._MUSL_LEG, leg), self.swap(release, self._MUSL_LEG, leg)
+
+    def test_matrix_value_scanned_as_cargo_step_text(self) -> None:
+        env_write = '        run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV" && sudo apt-get update'
+        for line, needle in (
+            ("flags: ${{ github.event_name == 'release' && '--cfg broken' || '' }}", "the `github` context"),
+            ("flags: --cfg $GITHUB_REF_NAME", "names the runner variable `GITHUB_REF_NAME`"),
+            ("flags: $CARGO_INCREMENTAL", "names `CARGO_INCREMENTAL`"),
+            ("flags: '$EXT'", "names `EXT`"),
+            ("flags: [--cfg, broken]", "is a mapping or list"),
+        ):
+            with self.subTest(line=line):
+                ci, release = self.with_leg_key(*self.both(self._APT, env_write), line)
+                self.assertRefused(needle, ci, release)
+
+    def test_name_spliced_across_an_expression_refused(self) -> None:
+        guard = '        run: test -z "{}" || sudo apt-get update'
+        for text, line in (
+            ("$${{ matrix.part }}_REF", "part: GITHUB"),
+            ("$GITHUB${{ matrix.part }}", "part: _REF"),
+            ("$${{ matrix.part }}${{ matrix.part }}", "part: GITHUB"),
+        ):
+            with self.subTest(text=text):
+                ci, release = self.with_leg_key(*self.both(self._APT, guard.format(text)), line)
+                self.assertRefused("to a name character or another expression", ci, release)
+        for call in ("format('${0}_REF', 'GITHUB')", "fromJSON('\"$GITHUB\\u005fREF\"')", "join(fromJSON('[1]'), 'x')"):
+            with self.subTest(call=call):
+                self.assertRefused("builds text with", *self.both(self._APT, guard.format(f"${{{{ {call} }}}}")))
+
+    def test_actions_runner_variable_refused(self) -> None:
+        guard = '        run: test -z "$ACTIONS_ID_TOKEN_REQUEST_URL" || sudo apt-get update'
+        self.assertRefused("names the runner variable `ACTIONS_ID_TOKEN_REQUEST_URL`", *self.both(self._APT, guard))
+
+    def test_local_action_defaults_and_run_read_no_unscanned_value(self) -> None:
+        defaults = _RT_ACTION.replace(
+            "runs:\n", "inputs:\n  targets:\n    default: ${{ github.ref_name }}\nruns:\n"
+        )
+        self.assertRefused("input defaults.targets", action=defaults)
+        spliced = _RT_ACTION + "    - shell: bash\n      run: echo ${{ steps.channel.outputs.channel }}\n"
+        self.assertRefused("reads the `steps` context", action=spliced)
+
+    def test_freebsd_strategy_refused(self) -> None:
+        strategy = "    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - flags: x\n    steps:\n      - uses: vmactions"
+        ci = _RT_CI.replace("    runs-on: ubuntu-latest\n    steps:\n      - uses: vmactions", strategy, 1)
+        release = _RT_RELEASE.replace("    runs-on: ubuntu-latest\n    steps:\n      - uses: vmactions", strategy, 1)
+        self.assertNotEqual(ci, _RT_CI)
+        self.assertNotEqual(release, _RT_RELEASE)
+        self.assertRefused("FreeBSD job has a `strategy`", ci, release)
+
+
+class TestModuleConstantsDefinedOnce(unittest.TestCase):
+    """A module-level constant of verify-manifest.py is bound once: a second
+    binding silently overrides the first for every reader."""
+
+    def test_no_constant_bound_twice(self) -> None:
+        import ast
+
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify-manifest.py")) as f:
+            tree = ast.parse(f.read())
+        seen: dict[str, int] = {}
+        twice: list[str] = []
+        for node in tree.body:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id.lstrip("_").isupper():
+                    if t.id in seen:
+                        twice.append(f"{t.id} (lines {seen[t.id]} and {node.lineno})")
+                    seen.setdefault(t.id, node.lineno)
+        self.assertEqual(twice, [])
+
 
 if __name__ == "__main__":
     unittest.main()
