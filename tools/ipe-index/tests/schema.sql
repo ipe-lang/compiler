@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 CREATE TABLE IF NOT EXISTS reviewed_stamp (
   one  INTEGER PRIMARY KEY CHECK (one = 1),
-  head TEXT NOT NULL
+  head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
 );
 DROP VIEW IF EXISTS open_units;
 CREATE VIEW open_units AS
