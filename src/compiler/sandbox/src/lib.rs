@@ -28,6 +28,11 @@ use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
 pub use covers::{JailMounts, bind_exposing, path_covers};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
+pub use vcs_config::{
+    ConfigFault, ConfigLimits, ConfigRefusal, ConfigRoots, ConfigSetting, Grants, Home, KeyMatch,
+    MAX_PATH_BYTES, MAX_PATH_COMPONENTS, NON_CODE, Named, NonCode, SubsectionMatch, Unprovable,
+    ValueMatch, scan as scan_vcs_config,
+};
 pub use vcs_metadata::{
     CarvePath, JailArm, POINTER_CAP, PointerFault, VcsCarve, VcsKind, WritableTree,
 };
@@ -42,6 +47,7 @@ pub mod scratch;
 pub mod seccomp;
 #[cfg(test)]
 mod test_dir;
+mod vcs_config;
 mod vcs_metadata;
 
 /// Why a jail could not be established or a jailed run failed.
