@@ -1051,7 +1051,7 @@ mod tests {
             "http://10.0.0.1/",
             crate::http_client::RedirectPolicy::NoRedirects,
             crate::ssrf::DialPolicy::DenyPrivate,
-            crate::http_client::VettingResolver::system(),
+            crate::http_client::VettingResolver::system().expect("the default deadline parses"),
         )
         .await
         .err()

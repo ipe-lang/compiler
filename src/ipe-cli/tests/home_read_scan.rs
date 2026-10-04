@@ -1284,8 +1284,8 @@ mod lexical {
         },
         Allowed {
             file: "src/runtime/rust/src/system.rs",
-            func: "read",
-            reason: "reads an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
+            func: "lookup",
+            reason: "the one raw reader of an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
         },
     ];
 
