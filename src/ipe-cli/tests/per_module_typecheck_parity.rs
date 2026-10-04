@@ -383,6 +383,50 @@ const MSG_LIB_TYPED: &str = "module Lib exposing (sharedRow)\n\n\
      sharedRow : Html msg\n\
      sharedRow =\n    Html.div [] [ Html.text \"shared\" ]\n";
 
+/// The module's own scoped solve read straight off [`ipe_types::infer_module`]
+/// over its deps' served interfaces: the facts an
+/// [`ipe_db::ScopedModuleTypes::InterfaceOnly`] verdict withholds.
+fn scoped_own_types(
+    db: &ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+    home: &[ipe_intern::Symbol],
+) -> Result<ipe_db::ModuleTypes, String> {
+    use ipe_db::Db as _;
+    let canonical = ipe_db::canonicalize(db, root, file)
+        .clone()
+        .map_err(|e| format!("canonicalize failed: {e:?}"))?;
+    let resolutions = ipe_db::resolve_imports(db, root, file)
+        .clone()
+        .map_err(|e| format!("import resolution failed: {e:?}"))?;
+    let mut dep_interfaces = Vec::new();
+    for (path, resolution) in resolutions.iter() {
+        if let ipe_db::ImportResolution::Resolved(dep) = resolution {
+            let interface = ipe_db::typed_interface(db, root, *dep)
+                .clone()
+                .ok_or_else(|| format!("dep {} has an open interface", path.join(".")))?;
+            dep_interfaces.push((path.clone(), interface));
+        }
+    }
+    let mut interner = db.interner().lock();
+    let mut deps = BTreeMap::new();
+    for (path, interface) in dep_interfaces {
+        let key = path
+            .iter()
+            .map(|segment| interner.intern(segment))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("interner append failed: {e:?}"))?;
+        deps.insert(key, interface);
+    }
+    let inference =
+        ipe_types::infer_module(&canonical.module, &canonical.exports, &deps, &mut interner)
+            .map_err(|e| format!("scoped solve failed: {e:?}"))?;
+    drop(interner);
+    Ok(ipe_db::normalize_module_types(
+        ipe_db::project_module_types(&inference.solved, home),
+    ))
+}
+
 /// An exported message-only UI slot keeps its module's own types on the
 /// whole-program solve, while its closed interface still serves the importer,
 /// and both agree with the joint solve.
@@ -391,11 +435,19 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
     use ipe_db::Db as _;
     let lib: &[&str] = &["Lib"];
     let main: &[&str] = &["Main"];
-    for (label, main_src, lib_src) in [
-        ("untyped", MSG_MAIN, MSG_LIB_UNTYPED),
-        ("typed", MSG_MAIN, MSG_LIB_TYPED),
-        ("untyped-unpinned", MSG_MAIN_UNPINNED, MSG_LIB_UNTYPED),
-        ("typed-unpinned", MSG_MAIN_UNPINNED, MSG_LIB_TYPED),
+    // `own_diverges`: Lib's own scoped facts disagree with the joint slice, so
+    // serving them (a `PerModule` verdict) would fail the served-types check
+    // below: the refusal is load-bearing, not merely conservative.
+    for (label, main_src, lib_src, own_diverges) in [
+        ("untyped", MSG_MAIN, MSG_LIB_UNTYPED, true),
+        ("typed", MSG_MAIN, MSG_LIB_TYPED, false),
+        (
+            "untyped-unpinned",
+            MSG_MAIN_UNPINNED,
+            MSG_LIB_UNTYPED,
+            false,
+        ),
+        ("typed-unpinned", MSG_MAIN_UNPINNED, MSG_LIB_TYPED, false),
     ] {
         let (sources, injected) = prepared(&sources_of(&[(main, main_src), (lib, lib_src)]));
         let db = ipe_db::IpeDatabase::new();
@@ -434,10 +486,28 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
         let lib_served = ipe_db::typecheck_module(&db, root, main_file, lib_file)
             .clone()
             .map_err(|e| format!("[{label}] Lib's types must be served: {e:?}"))?;
+        let lib_joint =
+            ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home));
         assert_eq!(
-            *lib_served,
-            ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home)),
+            *lib_served, lib_joint,
             "[{label}] Lib's served types must be the joint slice"
+        );
+        let shared_row = db
+            .interner()
+            .lock()
+            .intern("sharedRow")
+            .map_err(|e| format!("[{label}] interner append failed: {e:?}"))?;
+        let lib_own = scoped_own_types(&db, root, lib_file, &lib_home)?;
+        let own_entry = lib_own.env.get(&shared_row);
+        let joint_entry = lib_joint.env.get(&shared_row);
+        assert!(
+            own_entry.is_some() && joint_entry.is_some(),
+            "[{label}] both solves must type `sharedRow`"
+        );
+        assert_eq!(
+            own_entry != joint_entry,
+            own_diverges,
+            "[{label}] Lib's own scoped `sharedRow` {own_entry:?} vs joint {joint_entry:?}"
         );
         // The engaged set is the injected stdlib closure plus the importer:
         // Main solves against Lib's closed interface.
@@ -464,5 +534,131 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
             "[{label}] parity sweep and engaged set disagree"
         );
     }
+    Ok(())
+}
+
+// A message slot chained through two unannotated helpers: `Lib.nav` sits inside
+// `Mid.wrap`, whose slot only `Main.view` pins.
+const CHAIN_LIB: &str = "module Lib exposing (nav)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\n\
+     nav =\n    Html.div [] [ Html.text \"nav\" ]\n";
+const CHAIN_MID: &str = "module Mid exposing (wrap)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\
+     import Lib exposing (nav)\n\n\
+     wrap =\n    Html.div [] [ nav ]\n";
+const CHAIN_MAIN: &str = "module Main exposing (main)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\
+     import Ipe.Io as Io\n\
+     import Mid exposing (wrap)\n\n\
+     type Msg\n    = Click\n\n\
+     view : Html Msg\n\
+     view =\n    Html.div [] [ wrap ]\n\n\
+     main =\n    Io.println (Html.render view)\n";
+
+/// A module's scoped verdict, as a comparable name.
+const fn verdict_name(verdict: &ipe_db::ScopedModuleTypes) -> &'static str {
+    match verdict {
+        ipe_db::ScopedModuleTypes::PerModule { .. } => "PerModule",
+        ipe_db::ScopedModuleTypes::InterfaceOnly { .. } => "InterfaceOnly",
+        ipe_db::ScopedModuleTypes::WholeProgram => "WholeProgram",
+    }
+}
+
+/// Every module's scoped verdict, by dotted path.
+fn verdicts(db: &ipe_db::IpeDatabase, root: ipe_db::SourceRoot) -> BTreeMap<String, &'static str> {
+    root.files(db)
+        .iter()
+        .map(|(p, f)| {
+            (
+                p.join("."),
+                verdict_name(ipe_db::infer_module_scoped(db, root, *f)),
+            )
+        })
+        .collect()
+}
+
+/// Type-check `user` cold and return its database, root and verdicts.
+fn checked(
+    user: &UserSources,
+) -> Result<
+    (
+        ipe_db::IpeDatabase,
+        ipe_db::SourceRoot,
+        BTreeMap<String, &'static str>,
+    ),
+    String,
+> {
+    let (sources, injected) = prepared(user);
+    let db = ipe_db::IpeDatabase::new();
+    let root =
+        ipe::create_source_root(&db, &sources, &injected, &std::collections::BTreeSet::new());
+    let main_file = root
+        .files(&db)
+        .get(&entry_path())
+        .copied()
+        .ok_or("fixture must carry Main")?;
+    ipe_db::typecheck(&db, root, main_file)
+        .clone()
+        .map_err(|e| format!("program must type-check: {e:?}"))?;
+    let seen = verdicts(&db, root);
+    Ok((db, root, seen))
+}
+
+/// Both helpers of a chained message slot keep their own types on the
+/// whole-program solve, the importer that pins the slot solves against their
+/// closed interfaces, and every engaged module agrees with the joint solve.
+#[test]
+fn chained_msg_slot_serves_interfaces_only() -> Result<(), String> {
+    let (db, root, seen) = checked(&sources_of(&[
+        (&["Main"], CHAIN_MAIN),
+        (&["Mid"], CHAIN_MID),
+        (&["Lib"], CHAIN_LIB),
+    ]))?;
+    let user: Vec<(&str, Option<&&str>)> = ["Lib", "Mid", "Main"]
+        .into_iter()
+        .map(|m| (m, seen.get(m)))
+        .collect();
+    assert_eq!(
+        user,
+        [
+            ("Lib", Some(&"InterfaceOnly")),
+            ("Mid", Some(&"InterfaceOnly")),
+            ("Main", Some(&"PerModule")),
+        ],
+        "chained helpers serve interfaces only; the pinning importer engages"
+    );
+    let engaged = seen.values().filter(|v| **v == "PerModule").count();
+    let (swept, _) = assert_state_parity("chained-msg-slot", &db, root);
+    assert_eq!(swept, engaged, "parity sweep and engaged set disagree");
+    Ok(())
+}
+
+// An unannotated field-accessor export: its scheme carries an open row only an
+// importer's record closes.
+const ACCESSOR_LIB: &str = "module Lib exposing (getX)\n\n\
+     getX r =\n    r.x\n";
+const ACCESSOR_MAIN: &str = "module Main exposing (main)\n\n\
+     import Ipe.Io as Io\n\
+     import Ipe.String as String\n\
+     import Lib exposing (getX)\n\n\
+     main =\n    Io.println (String.fromInt (getX { x = 1, y = 2 }))\n";
+
+/// A field-accessor export's open-row scheme has no closed interface, so its
+/// module and every importer stay on the whole-program solve: the scoped tier
+/// never serves a scheme an importer's record still shapes.
+#[test]
+fn field_accessor_export_parity() -> Result<(), String> {
+    let (db, root, seen) = checked(&sources_of(&[
+        (&["Main"], ACCESSOR_MAIN),
+        (&["Lib"], ACCESSOR_LIB),
+    ]))?;
+    assert_eq!(
+        (seen.get("Lib"), seen.get("Main")),
+        (Some(&"WholeProgram"), Some(&"WholeProgram")),
+        "an open-row export keeps its module and importer on the whole-program solve"
+    );
+    let engaged = seen.values().filter(|v| **v == "PerModule").count();
+    let (swept, _) = assert_state_parity("field-accessor", &db, root);
+    assert_eq!(swept, engaged, "parity sweep and engaged set disagree");
     Ok(())
 }

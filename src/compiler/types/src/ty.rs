@@ -160,6 +160,12 @@ impl SolverVar {
     pub const fn raw(self) -> u32 {
         self.0
     }
+
+    /// The union-find variable this key names.
+    #[must_use]
+    pub const fn var(self) -> VarId {
+        self.0 & !SOLVER_VAR_TAG
+    }
 }
 
 /// The exclusive upper bound on the dense ids a renumbering may mint.

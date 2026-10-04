@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "g_issues/golden_cross_module_chained_msg_slot_seal.rs"]
+mod golden_cross_module_chained_msg_slot_seal;
 #[path = "g_issues/golden_embed_fn_param_capture_seal.rs"]
 mod golden_embed_fn_param_capture_seal;
 #[path = "g_issues/golden_generic_carrier_send_seal.rs"]
