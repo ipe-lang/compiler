@@ -1029,6 +1029,23 @@ mod cookie_octets {
         pub fn as_str(&self) -> &str {
             &self.0
         }
+
+        /// The line as a `Set-Cookie` header value.
+        ///
+        /// The one place a cookie line becomes a header: every response path
+        /// appends this, and answers `500` on `None` rather than send the
+        /// response without the cookie.
+        #[must_use]
+        pub fn header_value(&self) -> Option<axum::http::HeaderValue> {
+            axum::http::HeaderValue::from_str(&self.0).ok()
+        }
+
+        /// A line holding `raw` verbatim, bypassing the grammar.
+        #[cfg(test)]
+        #[must_use]
+        pub fn unchecked_for_test(raw: &str) -> Self {
+            Self(raw.to_owned())
+        }
     }
 
     impl std::ops::Deref for SetCookie {
@@ -1065,10 +1082,10 @@ pub fn server_cookie(name: String, value: String) -> IpeResult<IpeError, ServerC
 
 /// `Server.withCookie` — attach `c` with `Path=/; HttpOnly; SameSite=Lax`.
 ///
-/// `Secure` is added in production so an auth/session cookie never crosses the
-/// cleartext proxy-to-app hop; dev omits it so cookies work over plain-http
-/// localhost. The gate is the runtime's production detection (`ENV` /
-/// `IPE_ENV` via `productionFromEnv`).
+/// `Secure` is added unless the process holds a dev intent (a dev-intent
+/// binary in a dev posture), so an auth/session cookie never crosses a
+/// cleartext hop; only a dev-intent process omits it, so cookies work over
+/// plain-http localhost. The gate is `cookie_secure_floor`.
 #[must_use]
 pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerResponse {
     r.cookies.push(SetCookie::new(
@@ -1531,7 +1548,10 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     // single-valued `headers` map. `builder.header` APPENDS, so repeated calls
     // with the same key name produce separate header lines on the wire.
     for cookie_v in &r.cookies {
-        builder = builder.header("set-cookie", cookie_v.as_str());
+        let Some(value) = cookie_v.header_value() else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        builder = builder.header(axum::http::header::SET_COOKIE, value);
     }
     // Safe-by-default security headers — applied only when the handler hasn't
     // already set them, so an explicit handler override wins. Values are
@@ -3023,10 +3043,10 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// `server_with_cookie`'s gate and the session cookie's
 /// `csrf::cookies_secure()` half) OR `request_is_https` is true (THIS
 /// specific request arrived over TLS at a trusted proxy, opt-in via
-/// `IPE_TRUSTED_PROXY` — closes the gap where a dev process (`ENV` unset)
+/// `IPE_TRUSTED_PROXY` — closes the gap where a dev-intent process
 /// fronted by a TLS-terminating proxy would otherwise emit a non-Secure CSRF
 /// cookie even though the browser connection was HTTPS). Same OR-gate shape as
-/// the session cookie in `live/mod.rs::page_response`.
+/// the session cookie in `web/mod.rs::page_response`.
 ///
 /// `request_is_https` MUST be computed from the ORIGINAL request headers
 /// before the request is consumed — see the call site in
@@ -3355,7 +3375,7 @@ mod tests {
             "a malformed parameter name must refuse the listener"
         );
         let IpeResult::Err(msg) = listened else {
-            return;
+            panic!("a malformed parameter name must refuse the listener");
         };
         assert!(
             msg.contains("endpoint `GET /:id/:id` has a malformed path parameter")
@@ -3893,7 +3913,9 @@ mod tests {
             .expect("test request builds");
         let built = routed_build("/", wire).await;
         assert!(matches!(built, Some(Ok(_))), "a routed request must build");
-        let Some(Ok(req)) = built else { return };
+        let Some(Ok(req)) = built else {
+            panic!("a routed request must build");
+        };
         assert_eq!(
             req.headers.get("X-Trace-Id").map(String::as_str),
             Some("abc123")
@@ -4315,7 +4337,9 @@ mod tests {
     fn query_and_cookies() {
         let parsed = parse_query(Some("a=1&b=two%20words&a=ignored&flag"));
         assert!(parsed.is_ok(), "a well-formed query must parse");
-        let Ok(q) = parsed else { return };
+        let Ok(q) = parsed else {
+            panic!("a well-formed query must parse");
+        };
         assert_eq!(q.get("a").map(String::as_str), Some("1")); // first value wins
         assert_eq!(q.get("b").map(String::as_str), Some("two words"));
         assert_eq!(q.get("flag").map(String::as_str), Some(""));
@@ -4514,7 +4538,7 @@ mod tests {
             .collect();
         assert_eq!(cookies.len(), 1, "{cookies:?}");
         let Some(Ok(line)) = cookies.first() else {
-            return;
+            panic!("the Set-Cookie header must be visible ASCII: {cookies:?}");
         };
         assert!(
             line.starts_with("sid=%C3%A9%3B%20a%2C%20b%20%22c%22; Path=/; HttpOnly; SameSite=Lax"),
@@ -4612,7 +4636,7 @@ mod tests {
             for line in &lines {
                 assert!(!line.starts_with('='), "name {raw:?}: {line}");
                 let Some((wire, _)) = line.split_once('=') else {
-                    return;
+                    panic!("name {raw:?}: the Set-Cookie line has no `=`: {line}");
                 };
                 assert!(!wire.is_empty(), "name {raw:?}: {line}");
                 assert!(wire.bytes().all(is_tchar), "name {raw:?}: {line}");
@@ -4639,7 +4663,7 @@ mod tests {
                 ));
                 assert_eq!(lines.len(), 1, "name {name:?}: {lines:?}");
                 let Some((pair, _)) = lines.first().and_then(|l| l.split_once(';')) else {
-                    return;
+                    panic!("name {name:?} value {value:?}: no `name=value;` pair in {lines:?}");
                 };
                 let mut jar = HashMap::new();
                 parse_cookies(&format!("other=1; {pair}"), &mut jar);
@@ -4771,7 +4795,7 @@ mod tests {
             "DENY".to_owned(),
             server_text("ok".to_owned()),
         ) else {
-            return;
+            panic!("`X-Frame-Options: DENY` must be accepted by `withHeader`");
         };
         let resp = to_axum_response(r);
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -4808,6 +4832,19 @@ mod tests {
                 "{name:?}: {value:?}"
             );
         }
+    }
+
+    /// A cookie line with no header representation answers 500, never a
+    /// response that drops the cookie or splits the line.
+    #[tokio::test]
+    async fn to_axum_response_refuses_an_unrepresentable_cookie_line() {
+        let mut r = server_text("ok".to_owned());
+        r.cookies
+            .push(SetCookie::unchecked_for_test("sid=a\r\nX-Injected: 1"));
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
     }
 
     /// `redirect` percent-encodes CTLs, space, non-ASCII and the characters

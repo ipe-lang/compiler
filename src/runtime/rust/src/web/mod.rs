@@ -1651,7 +1651,7 @@ fn page_response(
     };
     let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1660,21 +1660,7 @@ fn page_response(
         html,
     )
         .into_response();
-    let h = resp.headers_mut();
-    // Two Set-Cookie headers — `append`, not `insert`, so both land.
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    // Security response headers — page GET only.
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
-    }
-    resp
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -1694,7 +1680,7 @@ fn page_response_with_overlay(
     };
     let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1703,19 +1689,101 @@ fn page_response_with_overlay(
         html,
     )
         .into_response();
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+}
+
+/// `resp` with one `Set-Cookie` header per line of `cookies`, then the page
+/// security headers.
+///
+/// A cookie line or a security header with no header representation answers
+/// `500`: a page never ships without the session or CSRF cookie it was built
+/// with, nor without its framing policy.
+#[cfg(feature = "server")]
+fn with_page_headers(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+) -> axum::response::Response {
+    with_page_headers_from(resp, cookies, csrf::security_headers())
+}
+
+/// [`with_page_headers`] over an explicit security-header set.
+#[cfg(feature = "server")]
+fn with_page_headers_from(
+    mut resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Vec<(&'static str, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let h = resp.headers_mut();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
+    // One header per cookie — `append`, not `insert`, so every line lands.
+    for cookie in cookies {
+        let Some(v) = cookie.header_value() else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
         h.append(axum::http::header::SET_COOKIE, v);
     }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
+    for (name, val) in security {
+        let Ok(v) = axum::http::HeaderValue::from_str(&val) else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        h.insert(axum::http::HeaderName::from_static(name), v);
     }
     resp
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+mod page_headers_tests {
+    use super::with_page_headers_from;
+    use crate::server::SetCookie;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    fn ok() -> axum::response::Response {
+        StatusCode::OK.into_response()
+    }
+
+    fn framing() -> Vec<(&'static str, String)> {
+        vec![("x-frame-options", "SAMEORIGIN".to_owned())]
+    }
+
+    /// Every cookie line lands as its own header, next to the security headers.
+    #[test]
+    fn page_headers_append_every_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lines: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(lines, ["ipe_sid=a; Path=/", "__ipe_csrf=b; Path=/"]);
+        assert!(resp.headers().get("x-frame-options").is_some());
+    }
+
+    /// A cookie line with no header representation answers 500: the page is
+    /// never sent without its session cookie.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a\r\nX-Injected: 1");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// A security header with no header representation answers 500: the page
+    /// is never sent without its framing policy.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_security_header() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csp = vec![(
+            "content-security-policy",
+            "frame-ancestors https://\u{e9}.example".to_owned(),
+        )];
+        let resp = with_page_headers_from(ok(), &[&session], csp);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("content-security-policy").is_none());
+    }
 }
 
 /// Maximum request body bytes for `/_ipe/event`: `IPE_WEB_MAX_BODY_BYTES`,
