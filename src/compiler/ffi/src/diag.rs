@@ -725,11 +725,12 @@ pub enum WireDefect {
         /// The offending path.
         got: String,
     },
-    /// A resolved crate version carries a character outside the semver charset
-    /// `[0-9A-Za-z.*=<>~^,+ -]`. The version is spliced into a TOML value
-    /// position of the emitted `Cargo.toml` (`<name> = "=<version>"`); a value
-    /// carrying a quote/brace/bracket/newline could break out of the string
-    /// and inject arbitrary manifest content.
+    /// A resolved crate version is not a `SemVer` version.
+    ///
+    /// The version is spliced into a TOML value position of the emitted
+    /// `Cargo.toml` (`<name> = "=<version>"`), so only `MAJOR.MINOR.PATCH`
+    /// with optional `-PRE` and `+BUILD` both stays inside its string and
+    /// forms a requirement Cargo accepts.
     InvalidVersion {
         /// The offending version string.
         got: String,
@@ -913,8 +914,8 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
             WireDefect::InvalidVersion { got } => {
                 write!(
                     f,
-                    "{got:?} is not a legal crate version (it must match the semver charset \
-                     [0-9A-Za-z.*=<>~^,+ -])"
+                    "{got:?} is not a legal crate version (it must be a SemVer version \
+                     MAJOR.MINOR.PATCH[-PRE][+BUILD])"
                 )
             }
             WireDefect::InvalidFeature { got } => {

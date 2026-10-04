@@ -4,7 +4,12 @@ use std::collections::{BTreeSet, HashMap};
 use ipe_diagnostics::{DResult, Diagnostic};
 
 mod rust_keywords;
+mod rust_literal;
 pub use rust_keywords::{RUST_KEYWORDS, is_rust_keyword};
+pub use rust_literal::{
+    EMIT_LEXABLE, LexerHazard, LexerHazardKind, find_lexer_hazard, rust_char_lit,
+    rust_comment_text, rust_fmt_str_lit, rust_str_lit,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Symbol(u32);

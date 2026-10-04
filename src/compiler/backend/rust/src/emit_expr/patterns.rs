@@ -10,20 +10,8 @@ use ipe_ir::free_vars::{
 use ipe_ir::{IrType, SliceOwnership};
 use std::collections::BTreeSet;
 
-/// Render `s` as a Rust double-quoted string literal through Rust's own
-/// `Debug` grammar for `str`.
-///
-/// `{s:?}` escapes every character the Rust string-literal grammar cannot
-/// carry raw: `\`, `"`, and every non-printable scalar (controls, format
-/// characters, bidi overrides) as `\u{..}`. The one-escaper-per-grammar
-/// property matters here because a raw bidi override (e.g. U+202E) in an
-/// emitted literal trips rustc's deny-by-default
-/// `text_direction_codepoint_in_literal` lint — an `ipe`-accepts-then-
-/// `cargo`-fails SEAL break — while a hand-picked `\`/`"`-only escaper lets
-/// it through. On printable ASCII, `Debug` escapes exactly `\` and `"`.
-pub fn rust_str_lit(s: &str) -> String {
-    format!("{s:?}")
-}
+use ipe_intern::rust_char_lit;
+pub use ipe_intern::rust_str_lit;
 
 /// Emit the scrutinee of a `Match` plus its two mode flags. A string scrutinee is
 /// matched as `&str` (so literal patterns apply) — the presence of a `Pat::Str`
@@ -1041,9 +1029,9 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // Literal leaves render as Rust literals. Int renders through
         // `int_pattern` (unsuffixed, unparenthesised: a pattern is never a
         // receiver, and the type comes from the `i64` scrutinee); Bool maps to
-        // the Rust keyword constant; Char and Str escape via the `{:?}` Debug
-        // form, which produces a valid Rust literal (quotes, backslashes and
-        // control chars escaped) and is deterministic.
+        // the Rust keyword constant; Char and Str render through
+        // `rust_char_lit` / `rust_str_lit`, a valid Rust literal with every
+        // lexer hazard escaped.
         Pat::Int(n) => Ok(int_pattern(*n)),
         Pat::Bool(b) => Ok(if *b { "true" } else { "false" }.to_owned()),
         // A well-formed Char pattern carries exactly one character → Rust char
@@ -1054,7 +1042,7 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         Pat::Char(c) => {
             let mut chars = c.chars();
             match (chars.next(), chars.next()) {
-                (Some(ch), None) => Ok(format!("{ch:?}")),
+                (Some(ch), None) => Ok(rust_char_lit(ch)),
                 _ => Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::emit_pat(Pat::Char)",
                     detail: format!(
@@ -1065,7 +1053,7 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
                 }),
             }
         }
-        Pat::Str(s) => Ok(format!("{s:?}")),
+        Pat::Str(s) => Ok(rust_str_lit(s)),
         // `inner as name` → Rust binding-with-subpattern `name @ <inner>`. The
         // inner sub-pattern recurses through this same total renderer.
         //
@@ -1251,7 +1239,7 @@ pub fn render_arm_pat_alias_safe(
         Pat::Str(s) => {
             let binder = format!("__sg{}", *counter);
             *counter += 1;
-            guards.push(format!("{binder}.as_str() == {s:?}"));
+            guards.push(format!("{binder}.as_str() == {}", rust_str_lit(s)));
             Ok(binder)
         }
         Pat::Alias(inner, _name) => {
