@@ -352,7 +352,7 @@ fn walk_pat(pat: &Pat, types: &mut BTreeSet<(ModPath, Symbol)>) {
                 walk_pat(sub, types);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 walk_pat(p, types);
             }

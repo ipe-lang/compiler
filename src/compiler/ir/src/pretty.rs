@@ -16,7 +16,7 @@ use ipe_intern::{Interner, Symbol};
 use crate::KernelFn;
 use crate::ir::{
     Arm, BinOp, BoundSet, Callee, EnumDef, Expr, Func, IrType, Match, ModPath, Module, Pat,
-    Program, TypeDef, UiCtor, UiPlain, Variant,
+    Program, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant,
 };
 
 /// Upper bound on the nesting depth `ir_type_name`/`pat_name`/`write_expr`
@@ -426,16 +426,20 @@ fn pat_name_at(interner: &Interner, pat: &Pat, depth: u16) -> String {
                 .join(", ");
             format!("{{ {inner} }}")
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, own } => {
             let parts = prefix
                 .iter()
                 .map(|p| pat_name_at(interner, p, depth))
                 .collect::<Vec<_>>()
                 .join(", ");
-            rest.as_ref().map_or_else(
+            let shape = rest.as_ref().map_or_else(
                 || format!("[{parts}]"),
                 |r| format!("[{parts}, {} @ ..]", pat_name_at(interner, r, depth)),
-            )
+            );
+            match own {
+                SliceOwnership::BorrowClone => shape,
+                SliceOwnership::OwnedMove => format!("own {shape}"),
+            }
         }
         Pat::Or(alts) => alts
             .iter()

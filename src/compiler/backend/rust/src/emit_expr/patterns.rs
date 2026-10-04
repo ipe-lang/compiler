@@ -468,7 +468,7 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
 pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
     let mut out = String::new();
     match pat {
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for sub in prefix {
                 collect_elem_rebinds(ctx, sub, &mut out)?;
             }
@@ -698,7 +698,7 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // (exact-length) pattern is `[p0, p1]`; an open cons tail is
         // `[p0, p1, rest @ ..]` (binding the rest) or `[p0, p1, ..]` (ignoring
         // it). The leading element patterns recurse through this same renderer.
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             let mut parts = Vec::with_capacity(prefix.len() + 1);
             for sub in prefix {
                 parts.push(render_pat(ctx, sub)?);
@@ -770,7 +770,7 @@ pub fn pat_contains_alias_in_arm(pat: &Pat) -> bool {
         Pat::Tuple(elems) => elems.iter().any(pat_contains_alias_in_arm),
         Pat::Ctor { args, .. } => args.iter().any(pat_contains_alias_in_arm),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_contains_alias_in_arm(p)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(pat_contains_alias_in_arm)
                 || rest.as_deref().is_some_and(pat_contains_alias_in_arm)
         }

@@ -29,7 +29,7 @@ use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
+    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
     ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
@@ -47,9 +47,10 @@ mod ty_templates;
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
 use clone_class::{
-    CloneClass, CloneEnv, HandlerCapture, classify_capture_clone, classify_handler_capture,
-    clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
+    CloneClass, CloneEnv, HandlerCapture, alias_rebuild_refusal, classify_capture_clone,
+    classify_handler_capture, clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
     reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
+    slice_element_alias_refusal, slice_ownership,
 };
 use generic_syms::{collect_ir_generic_syms, default_generics_to_unit};
 #[cfg(test)]
@@ -4207,7 +4208,7 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for h in prefix {
                 collect_ir_pat_syms(h, out);
             }
@@ -4806,7 +4807,7 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
                 pat_binder_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 pat_binder_syms(p, out);
             }
@@ -7968,6 +7969,41 @@ impl FlatNestedList {
     const fn closed(&self) -> bool {
         matches!(self.tail, NestedTail::Closed)
     }
+
+    /// Does any head element or the open tail bind a name?
+    fn binds_any(&self) -> bool {
+        self.prefix
+            .iter()
+            .any(|b| matches!(b, NestedBinder::Named(_)))
+            || matches!(self.tail, NestedTail::Rest(NestedBinder::Named(_)))
+    }
+}
+
+/// Refuse (IPE-L0116) a binding nested list in a constructor payload over a non-`Clone` element.
+///
+/// The nested-list desugaring copies each head out by index and takes the tail
+/// by `List.drop` of the copied binder; neither exists for an
+/// [`SliceOwnership::OwnedMove`] element.
+fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => Err(unsupported(span, Feature::NestedCtorDiscrimination)),
+    }
+}
+
+/// The ownership gates of one list arm head at `span` over `prefix`.
+///
+/// Under [`SliceOwnership::OwnedMove`] an element alias whose inner binds a name
+/// is refused (IPE-L0135), and the owned-move rendering itself is refused
+/// (IPE-L0116) until the emitter renders the owned view.
+fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => {
+            slice_element_alias_refusal(prefix, span)?;
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        }
+    }
 }
 
 /// Classify a single list-element / tail sub-pattern as a plain binder for the
@@ -9169,7 +9205,7 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 collect_pat_ir_type_refs(p, enums);
             }
@@ -9491,7 +9527,7 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
         }
         Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
                 || rest
                     .as_ref()
@@ -10216,7 +10252,7 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_symbol(p, target)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
@@ -13210,6 +13246,31 @@ impl<'a> Lowerer<'a> {
     fn region_ty(&self, span: Span) -> Option<&Ty> {
         let home = self.current_home.borrow().clone();
         self.types.regions.get(&(home, span))
+    }
+
+    /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
+    ///
+    /// The part's type is the solved region type at `ty_span`, on its storage
+    /// carriers. A span with no recorded region type leaves the alias to the
+    /// existing gates.
+    fn refuse_nonclone_alias_part(&self, inner: &Pat, ty_span: Span, span: Span) -> DResult<()> {
+        if !clone_class::pat_binds_any_name(inner) {
+            return Ok(());
+        }
+        let Some(ty) = self.region_ty(ty_span) else {
+            return Ok(());
+        };
+        let part = normalize_record_fun_carriers(self.ir_type_from_ty_json(ty, ty_span)?);
+        alias_rebuild_refusal(self.clone_env(), inner, &part, span)
+    }
+
+    /// The element type of the list at `span` on its storage carriers.
+    ///
+    /// A function directly in the element, or in a record field or tuple
+    /// component of it, is carried on the `Clone` `Arc` carrier, exactly as the
+    /// emitted `Vec` stores it, so the element's clone class is the stored one.
+    fn list_storage_elem_ir(&self, span: Span) -> DResult<IrType> {
+        Ok(normalize_record_fun_carriers(self.list_elem_ir(span)?))
     }
 
     /// The `Ipe.Db.Store` module home, or `None` when the program does not link
@@ -17706,10 +17767,11 @@ impl<'a> Lowerer<'a> {
                 })?;
                 self.lower_record_pat(fields, ty, pat.span)
             }
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_param_binder_pat(inner, param_span)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_param_binder_pat(inner, param_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, param_span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -29248,10 +29310,11 @@ impl<'a> Lowerer<'a> {
             // PList / PCons gate below. Class 4 item C2.
             canon::Pattern_::PStr(_) => Err(unsupported(p.span, Feature::NestedCtorDiscrimination)),
             // An alias `inner as name` lowers to the IR binding-with-subpattern.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_payload_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_payload_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
@@ -29358,10 +29421,11 @@ impl<'a> Lowerer<'a> {
             | canon::Pattern_::POr(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // An alias `inner as name` is irrefutable exactly when `inner` is, so
             // it recurses: a refutable inner surfaces the same IPE-L0115 gap.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_destructure_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_destructure_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             // A record pattern nested inside a tuple destructure (`(Ok {name}, y)`
             // single-arm form, `({ x }, y) = e`). The element's complete record
             // type is recovered from the per-sub-pattern region the constraint
@@ -29409,10 +29473,11 @@ impl<'a> Lowerer<'a> {
             // scrutinee's type — so a nested record still recovers its full
             // field set. Lowers to Rust's binding-with-subpattern
             // `name @ <inner>`.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_binder_pat(inner, value)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_binder_pat(inner, value)?;
+                self.refuse_nonclone_alias_part(&inner_pat, value.span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -30659,7 +30724,7 @@ impl<'a> Lowerer<'a> {
                     let arms_s = branches_s
                         .iter()
                         .map(|br| {
-                            let arm_pat = self.lower_arm_pat(&br.pat)?;
+                            let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
                             self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
@@ -30749,7 +30814,7 @@ impl<'a> Lowerer<'a> {
                 let (arm_pat, arm_guard, nested_bindings) =
                     match self.desugar_ctor_nested_special_args(&br.pat)? {
                         Some((pat, guard, bindings)) => (pat, guard, bindings),
-                        None => (self.lower_arm_pat(&br.pat)?, None, Vec::new()),
+                        None => (self.lower_arm_pat(&br.pat, scrut.span)?, None, Vec::new()),
                     };
                 // A pattern binder that binds a fn-typed value (the `varN`
                 // projection `Codec f -> …` case) is a promotable fn binder for
@@ -30915,7 +30980,7 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .any(|(_, p)| Self::arm_has_dispatch_needing_alias(p)),
             Pat::Ctor { args, .. } => args.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Slice { prefix, rest } => {
+            Pat::Slice { prefix, rest, .. } => {
                 prefix.iter().any(Self::arm_has_dispatch_needing_alias)
                     || rest
                         .as_deref()
@@ -31005,7 +31070,11 @@ impl<'a> Lowerer<'a> {
     /// [`Self::lower_payload_pat`]). A tuple / record head is the destructure
     /// path (handled by the single-arm branch of [`Self::lower_case`]); reaching
     /// it here is a multi-arm product `case`, the tuple-pattern gap (IPE-L0115).
-    fn lower_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// `ty_span` is the span whose solved region type is `p`'s scrutinee type:
+    /// the `case` scrutinee for a root head, the element sub-pattern for a tuple
+    /// column. An alias or or-pattern keeps it, since neither changes the type.
+    fn lower_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
         match &p.value {
             canon::Pattern_::PVar(s) => Ok(Pat::Var(*s)),
             // `()` is irrefutable and its scrutinee is unit-typed; a wildcard arm
@@ -31020,7 +31089,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PChar(c) => Ok(Pat::Char(c.clone())),
             canon::Pattern_::PStr(s) => Ok(Pat::Str(s.clone())),
             canon::Pattern_::PAlias(inner, name) => {
-                Ok(Pat::Alias(Box::new(self.lower_arm_pat(inner)?), name.value))
+                let inner_pat = self.lower_arm_pat(inner, ty_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, ty_span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
             }
             canon::Pattern_::PCtor {
                 home,
@@ -31050,7 +31121,7 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
-                    .map(|e| self.lower_arm_pat(e))
+                    .map(|e| self.lower_arm_pat(e, e.span))
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(Pat::Tuple(subs))
             }
@@ -31060,7 +31131,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PRecord(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // A list (`[a, b]`) or cons (`x :: xs`) case-arm head flattens to the
             // slice-shaped IR [`Pat::Slice`].
-            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => self.lower_list_arm_pat(p),
+            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
+                self.lower_list_arm_pat(p, ty_span)
+            }
             // An or-pattern `p1 | p2 | …` lowers each alternative through this
             // same arm lowerer into a single [`Pat::Or`]. The backend renders it
             // as the native Rust or-pattern `p1 | p2 | …` with the arm body
@@ -31070,7 +31143,7 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
-                    .map(|a| self.lower_arm_pat(a))
+                    .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(Pat::Or(lowered))
             }
@@ -31185,6 +31258,15 @@ impl<'a> Lowerer<'a> {
                 // is the root-cause fix — `flat` itself still supplies the
                 // prefix/tail shape used below, so it stays in scope.
                 //
+                // The prelude copies each head out by `ListIndexClone` and takes
+                // the tail by `List.drop`, so a binding shape over a non-`Clone`
+                // element has no sound rendering here. [IPE-L0116]
+                if flat.binds_any() {
+                    nested_cons_ownership_refusal(
+                        slice_ownership(self.clone_env(), &self.list_storage_elem_ir(a.span)?),
+                        a.span,
+                    )?;
+                }
                 // Replace this ctor arg with a fresh `Vec` binder and record the
                 // guard + per-element prelude bindings against it.
                 let fresh = self.fresh_nested_cons_binder()?;
@@ -31303,7 +31385,18 @@ impl<'a> Lowerer<'a> {
     /// sub-pattern lowers through [`Self::lower_payload_pat`] (variable /
     /// wildcard / literal / alias / nested tuple / constructor); the open tail
     /// binds a variable / wildcard / alias via [`Self::lower_rest_pat`].
-    fn lower_list_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// The slice's [`SliceOwnership`] is decided here, once, from the element
+    /// type of the list at `ty_span` (see [`slice_ownership`]).
+    fn lower_list_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
+        let own = slice_ownership(self.clone_env(), &self.list_storage_elem_ir(ty_span)?);
+        let (prefix, rest) = self.lower_list_arm_shape(p)?;
+        owned_slice_refusal(own, &prefix, p.span)?;
+        Ok(Pat::Slice { prefix, rest, own })
+    }
+
+    /// Flatten a list / cons arm head into its element prefix and its open tail binder.
+    fn lower_list_arm_shape(&self, p: &canon::Pattern) -> DResult<(Vec<Pat>, Option<Box<Pat>>)> {
         let mut prefix = Vec::new();
         let mut cur = p;
         loop {
@@ -31313,7 +31406,7 @@ impl<'a> Lowerer<'a> {
                     for e in elems {
                         prefix.push(self.lower_payload_pat(e)?);
                     }
-                    return Ok(Pat::Slice { prefix, rest: None });
+                    return Ok((prefix, None));
                 }
                 canon::Pattern_::PCons(head, tail) => {
                     prefix.push(self.lower_payload_pat(head)?);
@@ -31327,10 +31420,7 @@ impl<'a> Lowerer<'a> {
                         // the remaining list.
                         canon::Pattern_::PVar(_) | canon::Pattern_::PAnything => {
                             let rest = Self::lower_rest_pat(tail)?;
-                            return Ok(Pat::Slice {
-                                prefix,
-                                rest: Some(Box::new(rest)),
-                            });
+                            return Ok((prefix, Some(Box::new(rest))));
                         }
                         // Any other tail shape (an alias / literal / constructor /
                         // tuple / record in tail position) is not a list pattern
@@ -36880,6 +36970,355 @@ mod tests {
         assert!(
             super::instance_tvars(&[], &IrType::Int, msg, &instance(vec![], vec![]), &caller)
                 .is_empty()
+        );
+    }
+
+    /// The shared fixture of the list-`case` ownership tests: an interner and empty FFI and payload tables.
+    struct OwnFixture {
+        interner: Interner,
+        transparent: BTreeSet<(ipe_ir::ModPath, ipe_intern::Symbol)>,
+        payloads: ipe_ir::EnumPayloadTable,
+    }
+
+    impl OwnFixture {
+        fn new() -> Self {
+            Self {
+                interner: Interner::new(),
+                transparent: BTreeSet::new(),
+                payloads: ipe_ir::EnumPayloadTable::new(),
+            }
+        }
+
+        fn sym(&mut self, name: &str) -> ipe_intern::Symbol {
+            self.interner.intern(name).expect("intern")
+        }
+
+        const fn env(&self) -> super::CloneEnv<'_> {
+            super::CloneEnv {
+                interner: &self.interner,
+                transparent_ffi: &self.transparent,
+                payloads: &self.payloads,
+            }
+        }
+    }
+
+    /// `case ts of x :: r -> 1 ; _ -> 0` over the list binding `ts`, with the given ownership.
+    fn cons_case(
+        ts: ipe_intern::Symbol,
+        x: ipe_intern::Symbol,
+        r: ipe_intern::Symbol,
+        own: ipe_ir::SliceOwnership,
+    ) -> ipe_ir::Expr {
+        use ipe_ir::{Arm, Expr, Match, Pat};
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: Some(Box::new(Pat::Var(r))),
+            own,
+        };
+        Expr::Match(
+            Match::new_flat(
+                Expr::Var(ts),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        )
+    }
+
+    /// A list `case` moves its binders out of an owned view exactly when the element is non-`Clone`.
+    #[test]
+    fn slice_ownership_follows_the_element_clone_class() {
+        use ipe_ir::{IrType, ModPath, SliceOwnership};
+
+        use super::{flip_fun_in_storage_element, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let a = fx.sym("a");
+        let env = fx.env();
+        let task = IrType::Task(Box::new(IrType::Int));
+        let ffi_handle = IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        };
+        let fun = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+        let owned = [
+            task.clone(),
+            IrType::Maybe(Box::new(task)),
+            ffi_handle,
+            IrType::Tuple(vec![IrType::Int, IrType::Cmd(Box::new(IrType::Unit))]),
+        ];
+        for elem in &owned {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::OwnedMove,
+                "{elem:?}"
+            );
+        }
+        // A function element sits on the `Arc` storage carrier, as `list_elem_ir` stores it.
+        let borrowed = [
+            IrType::Int,
+            IrType::Str,
+            flip_fun_in_storage_element(fun),
+            IrType::Generic(a),
+        ];
+        for elem in &borrowed {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
+    /// A second use of a `List (Task ..)` moved by a list `case` is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::DUMMY;
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let case = cons_case(ts, x, r, SliceOwnership::OwnedMove);
+        let reused = Expr::Tuple(vec![case.clone(), Expr::Var(ts)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &reused, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // The case alone is one consume and is accepted.
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &case, span),
+            Ok(())
+        );
+    }
+
+    /// A field-path read of a `List (Task ..)` after a list `case` moved it is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_field_read_after_move_fails_closed() {
+        use std::collections::BTreeMap;
+
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Arm, Expr, IrType, Match, Pat, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let model = fx.sym("model");
+        let tasks = fx.sym("tasks");
+        let x = fx.sym("x");
+        let env = fx.env();
+        let span = Span::DUMMY;
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let record = IrType::Record(BTreeMap::from([(tasks, list_task.clone())]));
+        let field = || Expr::Access {
+            record: Box::new(Expr::Var(model)),
+            field: tasks,
+            field_ty: list_task.clone(),
+        };
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: None,
+            own: SliceOwnership::OwnedMove,
+        };
+        let case = Expr::Match(
+            Match::new_flat(
+                field(),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        );
+        let read_after = Expr::Tuple(vec![case, field()]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, model, &record, &read_after, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A second use of an FFI-handle list moved by a list `case` is refused by the foreign-handle gate.
+    #[test]
+    fn owned_ffi_handle_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, ModPath, SliceOwnership};
+
+        use super::{reject_foreign_handle_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let hs = fx.sym("hs");
+        let h = fx.sym("h");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::DUMMY;
+        let handles = IrType::List(Box::new(IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        }));
+        let reused = Expr::Tuple(vec![
+            cons_case(hs, h, r, SliceOwnership::OwnedMove),
+            Expr::Var(hs),
+        ]);
+        assert_eq!(
+            reject_foreign_handle_reuse(env, hs, &handles, &reused, span),
+            Err(unsupported(span, Feature::ForeignHandleReuse))
+        );
+    }
+
+    /// A list `case` over a non-`Clone` capture inside a re-callable closure is refused with IPE-L0126.
+    #[test]
+    fn owned_list_case_in_recallable_closure_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::SliceOwnership;
+        use ipe_ir::once_closure::CaptureScope;
+
+        use super::{CaptureWalk, rewrite_captured_clones, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let span = Span::DUMMY;
+        let noncl = BTreeSet::from([ts]);
+        let refused = rewrite_captured_clones(
+            &BTreeSet::new(),
+            &noncl,
+            &CaptureWalk::refusing(span),
+            cons_case(ts, x, r, SliceOwnership::OwnedMove),
+            CaptureScope::InRecallable,
+        );
+        assert_eq!(
+            refused.map(|_| ()),
+            Err(unsupported(span, Feature::NonCloneCapture))
+        );
+    }
+
+    /// An owned-move list element alias whose inner binds is refused with IPE-L0135.
+    #[test]
+    fn owned_slice_element_alias_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{ModPath, Pat, SliceOwnership};
+
+        use super::{owned_slice_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let maybe = fx.sym("Maybe");
+        let just = fx.sym("Just");
+        let t = fx.sym("t");
+        let m = fx.sym("m");
+        let span = Span::DUMMY;
+        let just_t = Pat::Ctor {
+            home: ModPath(vec![maybe]),
+            ty: maybe,
+            variant: just,
+            args: vec![Pat::Var(t)],
+        };
+        let aliased = [Pat::Alias(Box::new(just_t), m)];
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::OwnedMove, &aliased, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // A borrowed slice copies each element, so the alias stays accepted.
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::BorrowClone, &aliased, span),
+            Ok(())
+        );
+    }
+
+    /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.
+    #[test]
+    fn nested_owned_cons_in_ctor_payload_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::{nested_cons_ownership_refusal, slice_ownership, unsupported};
+
+        let fx = OwnFixture::new();
+        let span = Span::DUMMY;
+        let own = slice_ownership(fx.env(), &IrType::Task(Box::new(IrType::Int)));
+        assert_eq!(
+            nested_cons_ownership_refusal(own, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        assert_eq!(
+            nested_cons_ownership_refusal(SliceOwnership::BorrowClone, span),
+            Ok(())
+        );
+    }
+
+    /// An alias whose inner binds over a non-`Clone` part is refused with IPE-L0135.
+    #[test]
+    fn alias_rebuild_over_nonclone_part_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, Pat};
+
+        use super::{alias_rebuild_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let a = fx.sym("a");
+        let b = fx.sym("b");
+        let g = fx.sym("g");
+        let env = fx.env();
+        let span = Span::DUMMY;
+        let task = IrType::Task(Box::new(IrType::Int));
+        let pair = Pat::Tuple(vec![Pat::Var(a), Pat::Var(b)]);
+        let nonclone = IrType::Tuple(vec![task, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &nonclone, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // An inner that binds nothing takes no part.
+        let unbound = Pat::Tuple(vec![Pat::Wildcard, Pat::Wildcard]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &unbound, &nonclone, span),
+            Ok(())
+        );
+        // A `Clone` part and a generic part copy.
+        let clone_part = IrType::Tuple(vec![IrType::Str, IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &clone_part, span), Ok(()));
+        assert_eq!(
+            alias_rebuild_refusal(env, &Pat::Var(a), &IrType::Generic(g), span),
+            Ok(())
+        );
+    }
+
+    /// A borrowed list `case` over `List Int` leaves the list owned, so a later reuse stays accepted.
+    #[test]
+    fn borrowed_list_case_reuse_is_accepted() {
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{owned_slice_refusal, reject_nonclone_value_reuse, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let xs = fx.sym("xs");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::DUMMY;
+        let list_int = IrType::List(Box::new(IrType::Int));
+        let own = slice_ownership(env, &IrType::Int);
+        assert_eq!(own, SliceOwnership::BorrowClone);
+        assert_eq!(owned_slice_refusal(own, &[], span), Ok(()));
+        let reused = Expr::Tuple(vec![cons_case(xs, x, r, own), Expr::Var(xs)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, xs, &list_int, &reused, span),
+            Ok(())
         );
     }
 }

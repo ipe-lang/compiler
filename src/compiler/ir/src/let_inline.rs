@@ -108,7 +108,7 @@ pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_target(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_target(p, target)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_target(p, target)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_target(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_target(p, target))
         }

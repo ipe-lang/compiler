@@ -786,7 +786,7 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
                 collect_pat_binders(sub, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 collect_pat_binders(p, out);
             }
@@ -1110,7 +1110,7 @@ fn match_pat(pat: &Pat, value: &ConstValue, out: &mut BTreeMap<Symbol, ConstValu
         (Pat::Record(entries), ConstValue::Record(map)) => entries
             .iter()
             .all(|(name, sub)| map.get(name).is_some_and(|v| match_pat(sub, v, out))),
-        (Pat::Slice { prefix, rest }, ConstValue::List(items)) => {
+        (Pat::Slice { prefix, rest, .. }, ConstValue::List(items)) => {
             match_slice(prefix, rest.as_deref(), items, out)
         }
         _ => false,
