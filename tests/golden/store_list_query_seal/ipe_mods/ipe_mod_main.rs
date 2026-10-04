@@ -6,6 +6,7 @@ pub(crate) fn main_read_name(
     let _ipe_recursion_guard = crate::recursion_guard();
     crate::user_ipe_db_store_read_text("name".to_string(), row)
 }
+
 pub(crate) fn main_fetch_names(
     db: Db,
     store: IpeDbStoreStore<HashMap<String, String>>,
@@ -18,6 +19,7 @@ pub(crate) fn main_fetch_names(
         __ipe_fn
     })
 }
+
 pub(crate) fn main_decode_names(rows: Vec<HashMap<String, String>>) -> IpeTask<Vec<String>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match result_combine(list_map_consume({ let __ipe_fn: Box<dyn Fn(HashMap<String, String>) -> IpeResult<ipe_runtime::error::IpeError, String> + Send + Sync + 'static> = Box::new(crate::main_read_name); __ipe_fn }, rows))
@@ -26,6 +28,7 @@ pub(crate) fn main_decode_names(rows: Vec<HashMap<String, String>>) -> IpeTask<V
         IpeResult::Err(e) => task_fail(e),
     }
 }
+
 pub(crate) fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(
