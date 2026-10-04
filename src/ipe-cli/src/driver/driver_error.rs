@@ -252,8 +252,8 @@ pub enum CliError {
     /// (the dispatcher wraps a raw [`Self::Usage`] into
     /// this only for a command it recognised).
     CommandUsage {
-        /// The command whose help page to show (a known command name).
-        command: &'static str,
+        /// The command whose help page to show (a known command or grouped verb).
+        command: crate::verb::CommandName,
         /// The specific reason for the misuse (e.g. an unknown flag).
         reason: TerminalSafe,
     },
@@ -267,6 +267,21 @@ pub enum CliError {
         group: &'static str,
         /// The token the user typed after the group name.
         attempted: TerminalSafe,
+    },
+    /// A verb name typed without the umbrella group it lives under (`ipe
+    /// build`), or a group typed with no member verb (`ipe release`).
+    ///
+    /// The legacy names have no handler: this refusal is their one
+    /// representation. [`fmt::Display`] names what was typed, then one hint
+    /// per grouped form.
+    GroupRequired {
+        /// What the user typed: the legacy verb or the bare group word.
+        attempted: TerminalSafe,
+        /// The grouped forms the hint offers; empty for a bare `ipe dev`.
+        forms: &'static [crate::verb::Verb],
+        /// The arguments that followed `attempted`, carried onto each hinted
+        /// form; empty when there were none.
+        tail: TerminalSafe,
     },
     /// A stage of `ipe verify` failed. Carries the stage name and the stage's
     /// own already-rendered report. Like [`Self::DocCoverage`], this is a
@@ -634,6 +649,7 @@ impl CliError {
             Self::DocExamplesFailed(_) => "doc-examples-failed",
             Self::CommandUsage { .. } => "command-usage",
             Self::UnknownGroupSub { .. } => "unknown-group-sub",
+            Self::GroupRequired { .. } => "group-required",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
@@ -716,6 +732,7 @@ impl CliError {
             | Self::DocExamplesFailed(_)
             | Self::CommandUsage { .. }
             | Self::UnknownGroupSub { .. }
+            | Self::GroupRequired { .. }
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
@@ -763,6 +780,7 @@ impl CliError {
             Self::UnknownCommand { .. }
                 | Self::CommandUsage { .. }
                 | Self::UnknownGroupSub { .. }
+                | Self::GroupRequired { .. }
                 | Self::DocCoverage(_)
                 | Self::DocExamplesFailed(_)
                 | Self::VerifyFailed { .. }
@@ -890,7 +908,7 @@ impl std::fmt::Display for CliError {
             // top-level screen rather than panicking.
             Self::CommandUsage { command, reason } => {
                 writeln!(f, "{}", crate::style::gutter(reason.as_str()))?;
-                let page = help::command(command, &std::io::stderr())
+                let page = help::command(command.as_str(), &std::io::stderr())
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
@@ -914,6 +932,33 @@ impl std::fmt::Display for CliError {
                 let page = help::group(group, &std::io::stderr())
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
+            }
+            // What was typed, then one hint per grouped form. A bare group
+            // states it needs a subcommand; its members stay discoverable
+            // through `ipe <group> --help`.
+            Self::GroupRequired {
+                attempted,
+                forms,
+                tail,
+            } => {
+                let headline = if help::is_group(attempted.as_str()) {
+                    text::cli_subcommand_required(attempted)
+                } else {
+                    text::cli_group_required(attempted)
+                };
+                f.write_str(&crate::style::gutter(&headline))?;
+                for form in *forms {
+                    let shown = if tail.as_str().is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{form} {tail}")
+                    };
+                    writeln!(f)?;
+                    f.write_str(&crate::style::gutter(&text::cli_group_required_form(
+                        &shown,
+                    )))?;
+                }
+                Ok(())
             }
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;

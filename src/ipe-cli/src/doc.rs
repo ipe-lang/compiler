@@ -697,7 +697,7 @@ fn build_index() -> Result<Index, CliError> {
     }
 
     // Commands: sourced from the COMMANDS registry so the index never drifts.
-    let commands: Vec<CommandInfo> = crate::help::command_names()
+    let commands: Vec<CommandInfo> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             crate::help::command_doc_markdown(name).map(|help| CommandInfo { name, help })
@@ -771,7 +771,7 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
     // list reads `<command>  <summary>` in an aligned table); the body is the
     // command's full help rendered as Markdown from the same registry, so the
     // HTML command page mirrors `ipe <command> --help`.
-    let cli_sources: Vec<BundleSource> = crate::help::command_names()
+    let cli_sources: Vec<BundleSource> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             let summary = crate::help::command_summary(name)?;
@@ -3243,7 +3243,8 @@ fn run_example_and_check(
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
     let mut cmd = Command::new(&ipe_bin);
-    cmd.arg("run").arg(snippet_path);
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
+        .arg(snippet_path);
     // Forward the warm shared target into the `ipe run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
     // `ipe run` never reads; without this translation the child cold-builds the
@@ -6264,8 +6265,9 @@ mod tests {
     /// terminal help omits.
     #[test]
     fn html_command_page_mirrors_command_help_ssot() {
-        let command = "build";
-        let markdown = crate::help::command_doc_markdown(command).expect("build has help");
+        let verb = crate::verb::Verb::DEV_BUILD;
+        let command = verb.help_key();
+        let markdown = crate::help::command_doc_markdown(command).expect("dev build has help");
         let entry = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
@@ -6276,10 +6278,12 @@ mod tests {
         let html = render_entry_page(crate::doc_bundle::DocKind::Cli, &entry, "");
 
         // Every option flag and its description from the SSOT appears on the page.
+        let mut seen = false;
         for spec in crate::help::all_command_specs() {
-            if spec.name != command {
+            if spec.name != verb.name() {
                 continue;
             }
+            seen = true;
             for opt in &spec.options {
                 assert!(
                     html.contains(&html::escape(opt.flag)),
@@ -6288,8 +6292,9 @@ mod tests {
                 );
             }
         }
+        assert!(seen, "no command spec is named {verb}");
         // The synopsis and the Arguments/Options headings are present.
-        assert!(html.contains("ipe build"), "synopsis present: {html}");
+        assert!(html.contains("ipe dev build"), "synopsis present: {html}");
         assert!(html.contains("Arguments"), "arguments section present");
         assert!(html.contains("Options"), "options section present");
         // No raw Markdown leaks through the renderer.
@@ -7384,7 +7389,7 @@ withBaseMs = something
         let bundle = build_doc_bundle(&docs_root).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
-        for name in crate::help::command_names() {
+        for name in crate::help::documented_command_keys() {
             let Some(md) = crate::help::command_doc_markdown(name) else {
                 continue;
             };

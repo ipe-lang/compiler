@@ -123,6 +123,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::DocExamplesFailed(_)
         | CliError::CommandUsage { .. }
         | CliError::UnknownGroupSub { .. }
+        | CliError::GroupRequired { .. }
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }

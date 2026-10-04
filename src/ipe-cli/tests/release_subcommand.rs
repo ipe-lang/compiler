@@ -1,8 +1,8 @@
-//! Tests for the `ipe release` subcommand — argument parsing and dispatch
+//! Tests for the `ipe release build` subcommand — argument parsing and dispatch
 //! checks. The full end-to-end release (compile + cargo build + bundle layout)
 //! requires the musl target installed and is gated on `IPE_E2E=1`.
 
-use ipe::cli_args::{ReleaseMode, ReleaseTarget, StaticTriple, parse_release};
+use ipe::cli_args::{ReleaseMode, ReleaseTarget, StaticTriple, parse_release_build};
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -11,7 +11,7 @@ use ipe::cli_args::{ReleaseMode, ReleaseTarget, StaticTriple, parse_release};
 #[test]
 fn release_no_args_defaults() {
     let args: Vec<String> = vec![];
-    let parsed = parse_release(&args).expect("no-arg parse must succeed");
+    let parsed = parse_release_build(&args).expect("no-arg parse must succeed");
     assert!(parsed.entry.is_none());
     assert!(parsed.out.is_none());
     assert_eq!(
@@ -20,14 +20,13 @@ fn release_no_args_defaults() {
     );
     assert!(parsed.runtime.is_none());
     assert_eq!(parsed.mode, ReleaseMode::Embed);
-    assert!(!parsed.capabilities_only);
 }
 
 /// `--embed` is the default single-file mode.
 #[test]
 fn release_embed_flag() {
     let args: Vec<String> = vec!["--embed".into()];
-    let parsed = parse_release(&args).expect("--embed parse must succeed");
+    let parsed = parse_release_build(&args).expect("--embed parse must succeed");
     assert_eq!(parsed.mode, ReleaseMode::Embed);
 }
 
@@ -35,7 +34,7 @@ fn release_embed_flag() {
 #[test]
 fn release_bundle_flag() {
     let args: Vec<String> = vec!["--bundle".into()];
-    let parsed = parse_release(&args).expect("--bundle parse must succeed");
+    let parsed = parse_release_build(&args).expect("--bundle parse must succeed");
     assert_eq!(parsed.mode, ReleaseMode::Bundle);
 }
 
@@ -44,24 +43,34 @@ fn release_bundle_flag() {
 fn release_embed_and_bundle_mutually_exclusive() {
     let args: Vec<String> = vec!["--embed".into(), "--bundle".into()];
     assert!(
-        parse_release(&args).is_err(),
+        parse_release_build(&args).is_err(),
         "--embed with --bundle must be rejected"
     );
 }
 
-/// `--capabilities` requests a dry capability inspection.
+/// `--static` names the posture a native release build already has, so it
+/// parses to the default static musl target; `--capabilities` is no flag of
+/// `release build` and refuses.
 #[test]
-fn release_capabilities_flag() {
-    let args: Vec<String> = vec!["--capabilities".into()];
-    let parsed = parse_release(&args).expect("--capabilities parse must succeed");
-    assert!(parsed.capabilities_only);
+fn release_build_accepts_static_and_refuses_capabilities() {
+    let args: Vec<String> = vec!["--static".into()];
+    let parsed = parse_release_build(&args).expect("--static parse must succeed");
+    assert_eq!(
+        parsed.target,
+        ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
+    );
+    let caps: Vec<String> = vec!["--capabilities".into()];
+    assert!(
+        parse_release_build(&caps).is_err(),
+        "`release build --capabilities` must be refused as an unknown flag"
+    );
 }
 
 /// `--out <dir>` is accepted.
 #[test]
 fn release_out_flag() {
     let args: Vec<String> = vec!["--out".into(), "dist/".into()];
-    let parsed = parse_release(&args).expect("--out parse must succeed");
+    let parsed = parse_release_build(&args).expect("--out parse must succeed");
     assert_eq!(parsed.out.as_deref(), Some("dist/"));
 }
 
@@ -69,7 +78,7 @@ fn release_out_flag() {
 #[test]
 fn release_target_flag_native() {
     let args: Vec<String> = vec!["--target".into(), "x86_64-unknown-linux-musl".into()];
-    let parsed = parse_release(&args).expect("--target parse must succeed");
+    let parsed = parse_release_build(&args).expect("--target parse must succeed");
     assert_eq!(
         parsed.target,
         ReleaseTarget::Native(StaticTriple::X8664LinuxMusl)
@@ -80,7 +89,7 @@ fn release_target_flag_native() {
 #[test]
 fn release_target_flag_wasm() {
     let args: Vec<String> = vec!["--target".into(), "wasm".into()];
-    let parsed = parse_release(&args).expect("--target wasm parse must succeed");
+    let parsed = parse_release_build(&args).expect("--target wasm parse must succeed");
     assert_eq!(parsed.target, ReleaseTarget::Wasm);
 }
 
@@ -88,7 +97,7 @@ fn release_target_flag_wasm() {
 #[test]
 fn release_positional_entry() {
     let args: Vec<String> = vec!["src/Main.ipe".into()];
-    let parsed = parse_release(&args).expect("entry parse must succeed");
+    let parsed = parse_release_build(&args).expect("entry parse must succeed");
     assert_eq!(parsed.entry.as_deref(), Some("src/Main.ipe"));
 }
 
@@ -96,7 +105,7 @@ fn release_positional_entry() {
 #[test]
 fn release_unknown_flag_is_usage_error() {
     let args: Vec<String> = vec!["--no-such-flag".into()];
-    let result = parse_release(&args);
+    let result = parse_release_build(&args);
     assert!(
         result.is_err(),
         "unknown flag must yield a parse error, got: {result:?}"
@@ -108,7 +117,7 @@ fn release_unknown_flag_is_usage_error() {
 fn release_optimize_flag_removed() {
     let args: Vec<String> = vec!["--optimize".into()];
     assert!(
-        parse_release(&args).is_err(),
+        parse_release_build(&args).is_err(),
         "--optimize must be rejected (it has been removed)"
     );
 }
@@ -117,7 +126,7 @@ fn release_optimize_flag_removed() {
 #[test]
 fn release_out_twice_is_usage_error() {
     let args: Vec<String> = vec!["--out".into(), "a/".into(), "--out".into(), "b/".into()];
-    let result = parse_release(&args);
+    let result = parse_release_build(&args);
     assert!(
         result.is_err(),
         "--out twice must yield a parse error, got: {result:?}"
@@ -133,7 +142,7 @@ fn release_target_twice_is_usage_error() {
         "--target".into(),
         "aarch64-unknown-linux-musl".into(),
     ];
-    let result = parse_release(&args);
+    let result = parse_release_build(&args);
     assert!(
         result.is_err(),
         "--target twice must yield a parse error, got: {result:?}"
@@ -154,7 +163,7 @@ fn release_no_project_returns_usage_error() {
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&dir).unwrap();
 
-    let result = ipe::run_cli(&["release".to_owned()]);
+    let result = ipe::run_cli(&["release".to_owned(), "build".to_owned()]);
 
     std::env::set_current_dir(&prev).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -162,12 +171,9 @@ fn release_no_project_returns_usage_error() {
     assert!(
         matches!(
             result,
-            Err(ipe::CliError::CommandUsage {
-                command: "release",
-                ..
-            })
+            Err(ipe::CliError::CommandUsage { command, .. }) if command == "release build"
         ),
-        "bare `ipe release` in an empty dir must yield a release command-usage error, got: {result:?}"
+        "bare `ipe release build` in an empty dir must yield a release build command-usage error, got: {result:?}"
     );
 }
 
@@ -178,7 +184,7 @@ fn release_no_project_returns_usage_error() {
 fn release_pure_app_parse_is_accepted() {
     // The pure-app refusal has been removed: parse_release accepts any entry.
     let args: Vec<String> = vec!["src/Main.ipe".into()];
-    let parsed = parse_release(&args).expect("pure-app entry must parse without error");
+    let parsed = parse_release_build(&args).expect("pure-app entry must parse without error");
     assert_eq!(parsed.entry.as_deref(), Some("src/Main.ipe"));
 }
 
@@ -209,6 +215,7 @@ fn release_unsupported_native_target_is_usage_error() {
 
     let result = ipe::run_cli(&[
         "release".to_owned(),
+        "build".to_owned(),
         "--target".to_owned(),
         "totally-bogus-triple".to_owned(),
     ]);

@@ -19,12 +19,12 @@ use std::path::PathBuf;
 /// error naming `run` — so the caller shows `run`'s help page — not panic.
 #[test]
 fn run_no_args_returns_usage_error() {
-    let args: Vec<String> = vec!["run".to_owned()];
+    let args: Vec<String> = vec!["dev".to_owned(), "run".to_owned()];
     let result = ipe::run_cli(&args);
     assert!(
         matches!(
-            result,
-            Err(ipe::CliError::CommandUsage { command: "run", .. })
+            &result,
+            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
         ),
         "expected a `run` command-usage error for bare `ipe run`, got: {result:?}"
     );
@@ -36,6 +36,7 @@ fn run_no_args_returns_usage_error() {
 #[test]
 fn run_unknown_flag_returns_usage_error() {
     let args: Vec<String> = vec![
+        "dev".to_owned(),
         "run".to_owned(),
         "Main.ipe".to_owned(),
         "--bogus-flag".to_owned(),
@@ -45,7 +46,7 @@ fn run_unknown_flag_returns_usage_error() {
         matches!(
             &result,
             Err(ipe::CliError::CommandUsage { command, reason })
-                if *command == "run" && reason.as_str().contains("--bogus-flag")
+                if *command == "dev run" && reason.as_str().contains("--bogus-flag")
         ),
         "expected a `run` command-usage error naming the offending flag, got: {result:?}"
     );

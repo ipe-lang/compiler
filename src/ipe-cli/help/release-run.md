@@ -1,7 +1,7 @@
 Run a built artifact, jailing native-bearing code to its embedded capability floor.
 
 ```
-ipe exec [<artifact-dir>]
+ipe release run [<artifact-dir>]
 ```
 
 ## Arguments

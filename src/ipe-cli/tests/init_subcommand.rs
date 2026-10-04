@@ -150,11 +150,8 @@ fn init_unknown_flag_returns_usage_error() {
     let result = ipe::run_cli(&["init".to_owned(), "--bogus".to_owned()]);
     assert!(
         matches!(
-            result,
-            Err(ipe::CliError::CommandUsage {
-                command: "init",
-                ..
-            })
+            &result,
+            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "init"
         ),
         "unknown flag must yield a command-usage error, got: {result:?}"
     );

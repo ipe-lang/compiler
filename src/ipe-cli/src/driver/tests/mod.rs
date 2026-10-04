@@ -2,6 +2,7 @@ use super::*;
 use crate::contained_path::ResolvedPath;
 use crate::io_bounded::SourceRefusal;
 use crate::output_dir::{EmitTarget, OutputRefusal, ProjectPaths};
+use crate::verb::Verb;
 use crate::{
     ALL_CODES, Applicability, BTreeMap, Diagnostic, Path, PathBuf, Suggestion, cli_args, fs,
     project, style,
@@ -5104,4 +5105,361 @@ fn certify_versions_leaves_no_scratch_under_the_cache_base() {
         "{refused:?}"
     );
     assert_eq!(leftovers(), 0, "a fetch refusal leaves no scratch dir");
+}
+
+// ── Grouped verbs: the legacy names and bare groups refuse ──────────────────
+
+/// Run `ipe <args>` in process.
+fn run_argv(args: &[&str]) -> Result<(), CliError> {
+    let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    run_cli(&argv)
+}
+
+/// Assert `ipe <args>` refuses with [`CliError::GroupRequired`].
+///
+/// The refusal names exactly `forms` and carries `tail`, as a user fault whose
+/// screen gives one hint per form and no other.
+fn assert_group_required(args: &[&str], attempted: &str, forms: &[Verb], tail: &str) {
+    let result = run_argv(args);
+    assert!(
+        matches!(
+            &result,
+            Err(CliError::GroupRequired { attempted: a, forms: f, tail: t })
+                if a.as_str() == attempted && *f == forms && t.as_str() == tail
+        ),
+        "`ipe {}` must refuse naming {forms:?} with tail {tail:?}: {result:?}",
+        args.join(" ")
+    );
+    let Err(err) = result else {
+        return;
+    };
+    assert!(
+        matches!(err.fault(), crate::screen::Fault::User),
+        "a group refusal is the user's to fix: {err:?}"
+    );
+    let screen = err.to_string();
+    for form in forms {
+        let hint = if tail.is_empty() {
+            format!("ipe {form}")
+        } else {
+            format!("ipe {form} {tail}")
+        };
+        assert!(
+            screen.contains(&hint),
+            "`ipe {}` must hint `{hint}`: {screen}",
+            args.join(" ")
+        );
+    }
+    assert_eq!(
+        screen.matches("help:").count(),
+        forms.len(),
+        "one hint line per grouped form: {screen}"
+    );
+}
+
+#[test]
+fn bare_build_refuses() {
+    assert_group_required(
+        &["build"],
+        "build",
+        &[Verb::DEV_BUILD, Verb::RELEASE_BUILD],
+        "",
+    );
+    assert_group_required(
+        &["build", "--help"],
+        "build",
+        &[Verb::DEV_BUILD, Verb::RELEASE_BUILD],
+        "--help",
+    );
+}
+
+#[test]
+fn bare_run_refuses() {
+    assert_group_required(&["run"], "run", &[Verb::DEV_RUN, Verb::RELEASE_RUN], "");
+}
+
+#[test]
+fn bare_watch_refuses() {
+    assert_group_required(&["watch"], "watch", &[Verb::DEV_WATCH], "");
+}
+
+#[test]
+fn bare_exec_refuses() {
+    assert_group_required(&["exec"], "exec", &[Verb::RELEASE_RUN], "");
+}
+
+#[test]
+fn bare_eject_refuses() {
+    assert_group_required(
+        &["eject", "--out", "x"],
+        "eject",
+        &[Verb::RELEASE_EJECT],
+        "--out x",
+    );
+}
+
+/// A bare `ipe release` lists its three members and fails.
+///
+/// `--help` on the group is a help request, never this refusal.
+#[test]
+fn bare_release_refuses_nonzero() {
+    assert_group_required(
+        &["release"],
+        "release",
+        &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+        "",
+    );
+    assert!(intercept_help(&["release".to_owned()]).is_none());
+    assert!(intercept_help(&["release".to_owned(), "--help".to_owned()]).is_some());
+}
+
+/// A non-member token after `ipe release` refuses towards `release build`.
+///
+/// The target and inspection forms of the ungrouped command are not members.
+#[test]
+fn release_target_form_refuses() {
+    assert_group_required(
+        &["release", "web", "android"],
+        "release",
+        &[Verb::RELEASE_BUILD],
+        "web android",
+    );
+    assert_group_required(
+        &["release", "--capabilities"],
+        "release",
+        &[Verb::RELEASE_BUILD],
+        "--capabilities",
+    );
+    assert_group_required(
+        &["release", "--show-profile"],
+        "release",
+        &[Verb::RELEASE_BUILD],
+        "--show-profile",
+    );
+}
+
+/// `release build` has no capability-inspection flags.
+///
+/// Each refuses as an unknown flag of `release build`, and the screen points
+/// nowhere else.
+#[test]
+fn release_build_capabilities_flag_is_unknown() {
+    for flag in ["--capabilities", "--show-profile"] {
+        let result = run_argv(&["release", "build", flag]);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::CommandUsage { command, reason })
+                    if *command == Verb::RELEASE_BUILD.name() && reason.as_str().contains(flag)
+            ),
+            "`release build {flag}` must refuse as an unknown flag: {result:?}"
+        );
+        let Err(err) = result else {
+            return;
+        };
+        assert!(
+            !err.to_string().contains("ipe capabilities"),
+            "the refusal must not redirect to another command: {err}"
+        );
+    }
+}
+
+/// A bare `ipe dev` fails with no hint line; `ipe dev --help` is its page.
+#[test]
+fn bare_dev_refuses_nonzero() {
+    assert_group_required(&["dev"], "dev", &[], "");
+    assert!(intercept_help(&["dev".to_owned()]).is_none());
+    assert!(intercept_help(&["dev".to_owned(), "--help".to_owned()]).is_some());
+}
+
+/// A token after `ipe dev` that names no member is an unknown subcommand.
+#[test]
+fn dev_unknown_member_is_unknown_group_sub() {
+    let result = run_argv(&["dev", "eject"]);
+    assert!(
+        matches!(
+            &result,
+            Err(CliError::UnknownGroupSub { group: "dev", attempted }) if attempted.as_str() == "eject"
+        ),
+        "{result:?}"
+    );
+}
+
+/// `--emit-permissions` is a `release build` flag only.
+///
+/// `dev build` refuses it as unknown; `release build` parses it.
+#[test]
+fn dev_build_emit_permissions_is_unknown() {
+    let result = run_argv(&["dev", "build", "--emit-permissions", "ios"]);
+    assert!(
+        matches!(
+            &result,
+            Err(CliError::CommandUsage { command, reason })
+                if *command == Verb::DEV_BUILD.name()
+                    && reason.as_str().contains("--emit-permissions")
+        ),
+        "`dev build --emit-permissions` must refuse as an unknown flag: {result:?}"
+    );
+    let release =
+        cli_args::parse_release_build(&["--emit-permissions".to_owned(), "ios".to_owned()]);
+    assert!(
+        release.is_ok(),
+        "`release build --emit-permissions ios` parses: {release:?}"
+    );
+}
+
+/// Every argv echo in a group refusal is sanitized.
+///
+/// A control or bidi sequence in the tail never reaches the screen raw.
+#[test]
+fn group_required_sanitizes_attempted() {
+    let hostile = "\u{1b}[2Jweb\u{202e}android";
+    for args in [["release", hostile], ["build", hostile]] {
+        let result = run_argv(&args);
+        assert!(
+            matches!(&result, Err(CliError::GroupRequired { tail, .. })
+                if !tail.as_str().contains('\u{1b}') && !tail.as_str().contains('\u{202e}')
+                    && tail.as_str().contains("web")),
+            "the tail must be stored sanitized: {result:?}"
+        );
+        let Err(err) = result else {
+            return;
+        };
+        let screen = err.to_string();
+        assert!(
+            !screen.contains('\u{1b}') && !screen.contains('\u{202e}'),
+            "the refusal screen must carry no raw control or bidi character: {screen:?}"
+        );
+    }
+}
+
+// ── Grouped verbs: posture comes from the verb ──────────────────────────────
+
+/// A console program that calls `Debug.log`.
+const DEBUG_LOG_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Debug as Debug\n\nshout : String -> String\nshout s =\n    Debug.log \"shout\" s\n\nmain : Task Error ()\nmain =\n    Io.println (shout \"hi\")\n";
+
+/// Compile [`DEBUG_LOG_MAIN`] under `verb`'s posture, uncached.
+fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::output_dir::OwnedDir, CliError> {
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let tmp = ipe_test_temp::temp_root()
+        .join(format!("ipec-verb-posture-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("create scratch dir");
+    let entry_path = vec!["Main".to_owned()];
+    let entry_file = tmp.join("Main.ipe");
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    sources.insert(
+        entry_path.clone(),
+        (entry_file.clone(), DEBUG_LOG_MAIN.to_owned()),
+    );
+    let discovered = vec![project::DiscoveredModule::user(
+        entry_file.clone(),
+        entry_path.clone(),
+    )];
+    let (result, _) = compile_modules_observed(
+        sources,
+        discovered,
+        &entry_path,
+        &emit_target(&tmp.join("out")),
+        &runtime,
+        &entry_file,
+        ipe_backend_rust::DbDriver::Sqlite,
+        None,
+        BuildOptions {
+            intent: verb.intent(),
+            ..BuildOptions::default()
+        },
+    );
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// `dev build` admits `Debug.*`; `release build` refuses it.
+///
+/// The gate reads the posture each verb fixes, nothing else.
+#[test]
+fn dev_build_allows_debug() {
+    let dev = compile_debug_log_as(Verb::DEV_BUILD, "dev");
+    assert!(dev.is_ok(), "a dev build admits Debug.log: {:?}", dev.err());
+    let release = compile_debug_log_as(Verb::RELEASE_BUILD, "release");
+    assert!(
+        matches!(&release, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        "a release build refuses Debug.log with IPE-L0140: {release:?}"
+    );
+}
+
+/// A release desktop bundle refuses `Debug.*`.
+///
+/// The bundle compiles under the release posture, so IPE-L0140 fires before
+/// any cargo build.
+#[test]
+fn release_desktop_bundle_gates_debug() {
+    let tmp = ipe_test_temp::temp_root()
+        .join(format!("ipec-release-desktop-debug-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(tmp.join("src")).expect("create project dir");
+    fs::write(
+        tmp.join("package.ipe"),
+        "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\npackage : Package\npackage =\n    { name = \"desktop-debug\"\n    , version = \"0.1.0\"\n    }\n",
+    )
+    .expect("write package.ipe");
+    fs::write(
+        tmp.join("src").join("Main.ipe"),
+        "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n",
+    )
+    .expect("write Main.ipe");
+    let project = tmp.to_string_lossy().into_owned();
+    let result = bundle_delivery(
+        BundleHost::Desktop,
+        Verb::RELEASE_BUILD.bundle_profile(),
+        Some(&project),
+    );
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0140"),
+        "a release desktop bundle refuses Debug.log with IPE-L0140: {result:?}"
+    );
+}
+
+/// Every `release build` target yields an artifact or a typed refusal.
+///
+/// `--target wasm` and a manifest-selected browser client are the browser
+/// bundle, a native target is the static binary, and a WASI resolution, which
+/// has no release form, refuses.
+#[test]
+fn release_build_wasm_produces_artifact() {
+    use cli_args::{ReleaseTarget, StaticTriple};
+    let native = ReleaseTarget::Native(StaticTriple::X8664LinuxMusl);
+    for resolved in [
+        CompileTarget::Native,
+        CompileTarget::WasmClient,
+        CompileTarget::WasmWasi,
+    ] {
+        let artifact = release_artifact(ReleaseTarget::Wasm, resolved);
+        assert!(
+            matches!(artifact, Ok(ReleaseArtifact::Browser)),
+            "--target wasm is the browser bundle whatever the environment says: {artifact:?}"
+        );
+    }
+    assert!(matches!(
+        release_artifact(native, CompileTarget::WasmClient),
+        Ok(ReleaseArtifact::Browser)
+    ));
+    assert!(matches!(
+        release_artifact(native, CompileTarget::Native),
+        Ok(ReleaseArtifact::Native(StaticTriple::X8664LinuxMusl))
+    ));
+    let wasi = release_artifact(native, CompileTarget::WasmWasi);
+    assert!(
+        matches!(&wasi, Err(CliError::Usage(reason)) if reason.to_string().contains("ipe dev build --target wasi")),
+        "a WASI resolution has no release form: {wasi:?}"
+    );
+    assert_eq!(
+        ReleaseArtifact::Browser.compile_target(),
+        CompileTarget::WasmClient
+    );
+    assert_eq!(
+        ReleaseArtifact::Native(StaticTriple::X8664LinuxMusl).compile_target(),
+        CompileTarget::Native
+    );
 }

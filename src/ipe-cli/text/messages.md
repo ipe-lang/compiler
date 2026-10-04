@@ -82,7 +82,7 @@ ipe eject: --out <dir> is required (the directory to write the standalone projec
 
 ## release-no-wasi
 
-ipe release produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe build --target wasi`
+ipe release build produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe dev build --target wasi`
 
 ## release-embed-bundle-exclusive
 
@@ -595,6 +595,18 @@ unknown `ipe {group}` verb `{attempted}`
 ## cli-unknown-group-suggestion
 
 = help: maybe `ipe {group} {sugg}`?
+
+## cli-group-required
+
+`ipe {attempted}` is not a command on its own — it lives under a group
+
+## cli-subcommand-required
+
+`ipe {group}` needs a subcommand
+
+## cli-group-required-form
+
+= help: `ipe {form}`
 
 ## cli-verify-failed
 
