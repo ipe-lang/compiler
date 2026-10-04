@@ -55,11 +55,13 @@ solves a single module against its dependencies' `typed_interface` schemes, so a
 scheme-preserving edit to a dependency does not re-solve its dependents; the
 editor features read it through `typecheck_module`. A module is served
 per-module only when every solved fact it carries is independent of its
-importers: an importer-pinnable scheme (an unannotated numeric export) or an
-exported UI-message-defaulting slot (whose default reads every use site,
-importers' included) marks its interface open, and it and its importers fall
-back to the joint `typecheck` projection, as do import cycles and red
-dependencies. The build commands (`build`, `run`, `watch`, `check`, `test`,
+importers. An importer-pinnable scheme (an unannotated numeric export) marks
+its interface open, and it and its importers fall back to the joint `typecheck`
+projection, as do import cycles and red dependencies. An exported
+UI-message-defaulting slot (whose default reads every use site, importers'
+included) leaves the exported scheme closed (the annotation, or the scheme
+reified before defaulting), so its importers still solve per-module against
+the interface while the module's own types come from the joint projection. The build commands (`build`, `run`, `watch`, `check`, `test`,
 `pkg`) lower from the joint `typecheck` solve: the lowerer also consumes
 whole-program solver facts (warnings, the polymorphic-variable map keyed by
 solver ids, untyped type parameters, signature wildcards, message-defaulted

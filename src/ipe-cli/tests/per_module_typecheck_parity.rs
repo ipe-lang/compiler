@@ -115,7 +115,8 @@ fn assert_state_parity(
                     );
                 }
             }
-            ipe_db::ScopedModuleTypes::WholeProgram => {}
+            ipe_db::ScopedModuleTypes::InterfaceOnly { .. }
+            | ipe_db::ScopedModuleTypes::WholeProgram => {}
         }
     }
     (engaged, files.len())
@@ -351,7 +352,8 @@ fn scoped_parity_adversarial_edits_warm() {
 
 // ---------------------------------------------------------------------------
 // Importer-pinnable UI-msg slots: a module whose own solved facts depend on
-// its importers' use sites never takes the scoped path.
+// its importers' use sites never serves its own types from the scoped path;
+// its exported schemes do not depend on those use sites, so its importers do.
 // ---------------------------------------------------------------------------
 
 const MSG_MAIN: &str = "module Main exposing (main)\n\n\
@@ -362,6 +364,13 @@ const MSG_MAIN: &str = "module Main exposing (main)\n\n\
      view : Html Msg\n\
      view =\n    Html.div [] [ sharedRow ]\n\n\
      main =\n    Io.println (Html.render view)\n";
+// The importer renders the slot without pinning it, so the joint solve
+// defaults it.
+const MSG_MAIN_UNPINNED: &str = "module Main exposing (main)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\
+     import Ipe.Io as Io\n\
+     import Lib exposing (sharedRow)\n\n\
+     main =\n    Io.println (Html.render sharedRow)\n";
 // Unannotated: the msg-only quantified root defaults to `()` unless a
 // cross-module use pins it, and only the joint solve sees that use.
 const MSG_LIB_UNTYPED: &str = "module Lib exposing (sharedRow)\n\n\
@@ -374,14 +383,21 @@ const MSG_LIB_TYPED: &str = "module Lib exposing (sharedRow)\n\n\
      sharedRow : Html msg\n\
      sharedRow =\n    Html.div [] [ Html.text \"shared\" ]\n";
 
-/// An exported message-only UI slot refuses the scoped path for its module
-/// and every importer, and the fallback still agrees with the joint solve.
+/// An exported message-only UI slot keeps its module's own types on the
+/// whole-program solve, while its closed interface still serves the importer,
+/// and both agree with the joint solve.
 #[test]
 fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
+    use ipe_db::Db as _;
     let lib: &[&str] = &["Lib"];
     let main: &[&str] = &["Main"];
-    for (label, lib_src) in [("untyped", MSG_LIB_UNTYPED), ("typed", MSG_LIB_TYPED)] {
-        let (sources, injected) = prepared(&sources_of(&[(main, MSG_MAIN), (lib, lib_src)]));
+    for (label, main_src, lib_src) in [
+        ("untyped", MSG_MAIN, MSG_LIB_UNTYPED),
+        ("typed", MSG_MAIN, MSG_LIB_TYPED),
+        ("untyped-unpinned", MSG_MAIN_UNPINNED, MSG_LIB_UNTYPED),
+        ("typed-unpinned", MSG_MAIN_UNPINNED, MSG_LIB_TYPED),
+    ] {
+        let (sources, injected) = prepared(&sources_of(&[(main, main_src), (lib, lib_src)]));
         let db = ipe_db::IpeDatabase::new();
         let root =
             ipe::create_source_root(&db, &sources, &injected, &std::collections::BTreeSet::new());
@@ -394,25 +410,37 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
         let lib_file = file_at(lib).ok_or_else(|| format!("[{label}] fixture must carry Lib"))?;
         let main_file =
             file_at(main).ok_or_else(|| format!("[{label}] fixture must carry Main"))?;
+        let joint = ipe_db::typecheck(&db, root, main_file)
+            .clone()
+            .map_err(|e| format!("[{label}] program must type-check: {e:?}"))?;
         assert!(
-            ipe_db::typecheck(&db, root, main_file).is_ok(),
-            "[{label}] program must type-check"
+            matches!(
+                ipe_db::infer_module_scoped(&db, root, lib_file),
+                ipe_db::ScopedModuleTypes::InterfaceOnly { .. }
+            ),
+            "[{label}] Lib's own types must come from the whole-program solve"
         );
         assert!(
-            ipe_db::typed_interface(&db, root, lib_file).is_none(),
-            "[{label}] an exported message-only UI slot must yield an OPEN interface"
+            ipe_db::typed_interface(&db, root, lib_file).is_some(),
+            "[{label}] Lib's exported schemes are closed, so its interface must be served"
         );
-        for (who, module) in [("Lib", lib_file), ("Main", main_file)] {
-            assert!(
-                matches!(
-                    ipe_db::infer_module_scoped(&db, root, module),
-                    ipe_db::ScopedModuleTypes::WholeProgram
-                ),
-                "[{label}] {who} must fall back to the whole-program solve"
-            );
-        }
-        // The engaged set is exactly the injected stdlib closure: it imports
-        // nothing user-side, so the user's message-only slot cannot reach it.
+        let lib_home: Vec<ipe_intern::Symbol> = {
+            let mut interner = db.interner().lock();
+            lib.iter()
+                .map(|segment| interner.intern(segment))
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("[{label}] interner append failed: {e:?}"))?
+        };
+        let lib_served = ipe_db::typecheck_module(&db, root, main_file, lib_file)
+            .clone()
+            .map_err(|e| format!("[{label}] Lib's types must be served: {e:?}"))?;
+        assert_eq!(
+            *lib_served,
+            ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home)),
+            "[{label}] Lib's served types must be the joint slice"
+        );
+        // The engaged set is the injected stdlib closure plus the importer:
+        // Main solves against Lib's closed interface.
         let engaged_set: Vec<String> = root
             .files(&db)
             .iter()
@@ -426,8 +454,8 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
             .collect();
         assert_eq!(
             engaged_set,
-            ["Ipe.Html", "Ipe.Io"],
-            "[{label}] only the stdlib closure may engage the scoped tier"
+            ["Ipe.Html", "Ipe.Io", "Main"],
+            "[{label}] the stdlib closure and the importer engage the scoped tier"
         );
         let (engaged, _) = assert_state_parity(label, &db, root);
         assert_eq!(

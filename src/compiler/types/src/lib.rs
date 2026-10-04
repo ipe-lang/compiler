@@ -533,8 +533,15 @@ pub struct TypedInterface {
 /// disagrees with.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InterfaceStatus {
-    /// Every exported scheme is closed; the interface is faithful.
+    /// Every exported scheme is closed and the module's own solved facts
+    /// read no importer's use site: the interface and the module's own
+    /// result are both faithful.
     Closed(TypedInterface),
+    /// Every exported scheme is closed, so the interface is faithful for
+    /// importers, but the module's own solved facts read its importers' use
+    /// sites (an exported UI-message slot whose default depends on every
+    /// use): only the whole-program solve is faithful for the module itself.
+    ImporterDependent(TypedInterface),
     /// Some exported scheme is open; only the whole-program solve is
     /// faithful for this module and its importers.
     Open,
@@ -821,6 +828,9 @@ fn infer_core(
     // nor a kernel-alias route, marks the whole interface open — fail closed.
     let mut reified_untyped: BTreeMap<Symbol, Ty> = BTreeMap::new();
     let mut interface_open = false;
+    // Scoped solve only: whether the module's own solved facts read a use
+    // site in an importer, which the scoped solve cannot see.
+    let mut own_facts_importer_dependent = false;
     // Scoped solve only: whether `key` is one of this module's exported values
     // (a binding an importer's use sites can reach).
     let exported_by_scoped_module = |key: &(Vec<Symbol>, Symbol)| {
@@ -1067,9 +1077,10 @@ fn infer_core(
             }
             // Whether a candidate defaults depends on EVERY use site, importers'
             // included, so an exported candidate makes this module's own solved
-            // facts importer-dependent: no per-module result is faithful.
+            // facts importer-dependent. Its exported scheme is the annotation,
+            // which no use site changes.
             if exported_by_scoped_module(key) {
-                interface_open = true;
+                own_facts_importer_dependent = true;
             }
             let empty = Vec::new();
             let apps = apps_by_binding.get(key).unwrap_or(&empty);
@@ -1315,9 +1326,11 @@ fn infer_core(
             let msg_only = ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym);
             if msg_only {
                 // A cross-module use may pin this slot in the joint solve, so an
-                // exported msg-only root leaves no per-module result faithful.
+                // exported msg-only root makes this module's own solved facts
+                // importer-dependent. Its exported scheme was reified before
+                // this pin.
                 if exported_by_scoped_module(key) {
-                    interface_open = true;
+                    own_facts_importer_dependent = true;
                 }
                 let rep = lift!(uf.find(root));
                 lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
@@ -1440,10 +1453,15 @@ fn infer_core(
                 );
             }
         }
-        InterfaceStatus::Closed(TypedInterface {
+        let interface = TypedInterface {
             values,
             unions: m.unions.iter().map(erase_union_spans).collect(),
-        })
+        };
+        if own_facts_importer_dependent {
+            InterfaceStatus::ImporterDependent(interface)
+        } else {
+            InterfaceStatus::Closed(interface)
+        }
     });
 
     // Read back every region's resolved type — AFTER numeric/SQL defaulting, so
@@ -7347,7 +7365,8 @@ h x =
                 ipe_canon::canonicalise_module(&parsed, &path, &exports_by_path, &mut i).ok()?;
             let result = infer_module(&cm, &exports, &interfaces, &mut i);
             if let Ok(ModuleInference {
-                interface: InterfaceStatus::Closed(iface),
+                interface:
+                    InterfaceStatus::Closed(iface) | InterfaceStatus::ImporterDependent(iface),
                 ..
             }) = &result
             {
