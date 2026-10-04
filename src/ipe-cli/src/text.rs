@@ -1479,6 +1479,8 @@ messages! {
     run_profile_unparsable(code, detail) = "run-profile-unparsable";
     /// A binary carries no readable capability floor.
     run_floor_unreadable(code) = "run-floor-unreadable";
+    /// A binary's capability floor was embedded by a development build.
+    run_floor_not_release(code) = "run-floor-not-release";
     /// A declared program entry outside `Main` is not yet buildable.
     build_entry_not_main(module) = "build-entry-not-main";
     /// `ipe pack` is retired.
@@ -1489,6 +1491,8 @@ messages! {
     release_binary_missing(path) = "release-binary-missing";
     /// `ipe release` found no app binary after a successful `cargo build`.
     release_app_binary_missing(path) = "release-app-binary-missing";
+    /// An emitted crate's `Cargo.toml` names no plain `[package] name`.
+    emitted_crate_name_unreadable(path) = "emitted-crate-name-unreadable";
     /// A native-bearing release refused the `ipe_wrapper` source it builds.
     cli_wrapper_source_refused(root, reason) = "cli-wrapper-source-refused";
     /// The wrapper source's build-time crate path has no workspace root.

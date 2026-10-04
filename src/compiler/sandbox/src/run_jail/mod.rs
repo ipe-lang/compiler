@@ -260,26 +260,71 @@ pub fn run_jail_argv<'fd>(
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
 ) -> JailArgv<'fd> {
-    run_jail_argv_with_delivery(tools, profile, mounts, seccomp_fd, None, host_env, payload)
+    jail_argv(tools, profile, mounts, seccomp_fd, None, host_env, payload)
 }
 
-/// [`run_jail_argv`] plus optional in-jail materialisation of the app binary
-/// from an inherited descriptor.
+/// The directory, under the scoped tempdir, the delivered app is materialised in.
 ///
-/// When `app_delivery` is `Some((fd, dest))`, a `--perms 0700 --file <fd>
-/// <dest>` pair is emitted AFTER every mount op (so `dest`'s parent tmpfs/bind
-/// already exists) and BEFORE the payload separator. bwrap reads the app bytes
-/// from the inherited (sealed, non-cloexec) `fd` and writes an owner-execute
-/// copy at `dest` inside the sandbox — the delivered bytes are exactly the
-/// sealed bytes the caller verified, with no host path lookup to race. The
-/// caller then runs `dest` as the payload.
+/// It is a mount point for a jail-private tmpfs, so the delivered copy lives
+/// only in the jail's memory: nothing of the app is ever written to the host
+/// directory `scoped_tmp` binds. The scoped tempdir is created fresh per run,
+/// so no other bind can lie beneath it and be shadowed by the tmpfs.
+const DELIVERY_DIR: &str = ".ipe-app";
+
+/// The delivered app's file name inside [`DELIVERY_DIR`].
+const DELIVERY_FILE: &str = "ipe-app";
+
+/// The in-jail path the delivered app is materialised at and run from.
+#[must_use]
+pub fn delivered_app_path(mounts: &JailMounts) -> PathBuf {
+    mounts
+        .scoped_tmp()
+        .as_path()
+        .join(DELIVERY_DIR)
+        .join(DELIVERY_FILE)
+}
+
+/// [`run_jail_argv`] for an app delivered from an inherited sealed descriptor.
+///
+/// The builder owns the destination: it mounts a jail-private tmpfs at
+/// `<scoped_tmp>/.ipe-app` AFTER every bind, copies the app from `app_fd`
+/// into it owner-executable (`--perms 0700 --file`), remounts the tmpfs
+/// read-only, and runs `[<delivered path>, app_args...]` as the payload. bwrap
+/// reads the bytes from the inherited (sealed, non-cloexec) descriptor, so
+/// the delivered file is exactly the bytes the caller verified, with no host
+/// path lookup to race and no copy left on the host when the jail exits.
 #[must_use]
 pub fn run_jail_argv_with_delivery<'fd>(
     tools: &RunJailTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
-    app_delivery: Option<(SealedFdNumber<'fd>, &Path)>,
+    app_fd: SealedFdNumber<'fd>,
+    host_env: &dyn Fn(&str) -> Option<OsString>,
+    app_args: &[OsString],
+) -> JailArgv<'fd> {
+    let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len().saturating_add(1));
+    payload.push(delivered_app_path(mounts).into_os_string());
+    payload.extend(app_args.iter().cloned());
+    jail_argv(
+        tools,
+        profile,
+        mounts,
+        seccomp_fd,
+        Some(app_fd),
+        host_env,
+        &payload,
+    )
+}
+
+/// The one run-jail argv builder behind [`run_jail_argv`] and
+/// [`run_jail_argv_with_delivery`].
+fn jail_argv<'fd>(
+    tools: &RunJailTools,
+    profile: &SandboxProfile,
+    mounts: &JailMounts,
+    seccomp_fd: Option<SealedFdNumber<'fd>>,
+    app_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
 ) -> JailArgv<'fd> {
@@ -381,17 +426,22 @@ pub fn run_jail_argv_with_delivery<'fd>(
     }
 
     // Materialise the app inside the jail from the inherited sealed descriptor,
-    // AFTER all mounts (so the destination's parent exists) and BEFORE the
-    // payload. `--perms 0700` applies to the `--file` copy that follows it,
-    // making the delivered binary owner-executable. bwrap reads the bytes from
-    // `fd` (inherited, non-cloexec, sealed) — the delivered file cannot differ
-    // from the verified bytes.
-    if let Some((fd, dest)) = app_delivery {
+    // AFTER all mounts and BEFORE the payload: a fresh tmpfs at the delivery
+    // dir (jail memory, never the host dir `scoped_tmp` binds), the
+    // owner-execute copy from `fd` into it, then the tmpfs remounted read-only
+    // so the app cannot rewrite its own image. `--perms 0700` applies to the
+    // `--file` that follows it.
+    if let Some(fd) = app_fd {
+        let dir = scoped_tmp.as_path().join(DELIVERY_DIR);
+        argv.push("--tmpfs".into());
+        argv.push(dir.clone().into());
         argv.push("--perms".into());
         argv.push("0700".into());
         argv.push("--file".into());
         argv.push(fd.render());
-        argv.push(dest.into());
+        argv.push(dir.join(DELIVERY_FILE).into());
+        argv.push("--remount-ro".into());
+        argv.push(dir.into());
     }
 
     // Resource caps via prlimit, then the payload with NO shell. The wall clock
@@ -1314,52 +1364,89 @@ mod tests {
         assert!(!joined.contains("sh -c"), "{joined}");
     }
 
+    /// Every bwrap mount op before the payload separator, as `(op, target)` in argv order.
+    fn mount_targets(argv: &[String]) -> Vec<(String, String)> {
+        let mut ops = Vec::new();
+        let mut rest = argv.iter();
+        while let Some(token) = rest.next() {
+            let operands = match token.as_str() {
+                "--" => break,
+                "--bind" | "--ro-bind" | "--dev-bind" | "--bind-try" | "--ro-bind-try"
+                | "--file" => 2,
+                "--tmpfs" | "--proc" | "--dev" | "--dir" | "--remount-ro" => 1,
+                _ => continue,
+            };
+            let target = rest.by_ref().take(operands).last().cloned();
+            ops.push((token.clone(), target.expect("mount op operand")));
+        }
+        ops
+    }
+
     #[cfg(unix)]
     #[test]
-    fn app_delivery_emits_perms_file_after_mounts_before_payload() {
+    fn app_delivery_lands_on_a_jail_private_tmpfs_never_the_host_scratch_bind() {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let (filter, app) = (stand_in_fd(), stand_in_fd());
         let no_env = |_: &str| None;
-        let dest = Path::new("/work/tmp-1/ipe-app");
+        let mounts = work_mounts();
+        let dest = delivered_app_path(&mounts);
         let argv: Vec<String> = run_jail_argv_with_delivery(
             &tools(),
             &SandboxProfile::maximally_isolated(),
-            &work_mounts(),
+            &mounts,
             Some(SealedFdNumber::for_test(filter.as_fd())),
-            Some((SealedFdNumber::for_test(app.as_fd()), dest)),
+            SealedFdNumber::for_test(app.as_fd()),
             &no_env,
-            &[OsString::from("/work/tmp-1/ipe-app")],
+            &[OsString::from("--port"), OsString::from("8080")],
         )
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
         let joined = argv.join(" ");
-        let file_op = format!("--file {}", app.as_raw_fd());
-        // The sealed-fd delivery pair: owner-execute perms then a copy from the
-        // inherited fd to the in-jail app path.
+        let dest_str = dest.to_string_lossy().into_owned();
+        let dir = dest.parent().expect("delivery dir");
         assert!(
-            joined.contains(&format!("--perms 0700 {file_op} /work/tmp-1/ipe-app")),
-            "delivery pair missing: {joined}"
+            dir.starts_with("/work/tmp-1") && dir != Path::new("/work/tmp-1"),
+            "the delivery dir must be its own mount point beneath the scratch dir: {joined}"
         );
-        // It must come AFTER the writable bind (so the dest parent exists) and
-        // BEFORE the `-- /usr/bin/prlimit` payload separator.
-        let bind = joined
-            .find("--bind /work/tmp-1 /work/tmp-1")
-            .expect("scratch bind");
-        let file = joined.find(&file_op).expect("delivery");
-        let payload = joined.find("-- /usr/bin/prlimit").expect("payload sep");
-        assert!(
-            file > bind,
-            "delivery must follow the scratch bind: {joined}"
+        let ops = mount_targets(&argv);
+        let file_at = ops
+            .iter()
+            .position(|(op, target)| op == "--file" && *target == dest_str)
+            .expect("delivery --file op");
+        // The mount the copy lands on is the LAST op before it whose target
+        // contains the destination: it must be a fresh tmpfs, never the
+        // host-bound scratch dir (whose writes reach the host and outlive the run).
+        let (landing_op, landing) = ops
+            .get(..file_at)
+            .expect("ops before the copy")
+            .iter()
+            .rev()
+            .find(|(op, target)| op != "--remount-ro" && dest.starts_with(target))
+            .expect("a mount covering the destination");
+        assert_eq!(
+            (landing_op.as_str(), Path::new(landing)),
+            ("--tmpfs", dir),
+            "the delivered app must land on a jail-private tmpfs: {joined}"
         );
         assert!(
-            file < payload,
-            "delivery must precede the payload: {joined}"
+            ops.iter()
+                .any(|(op, target)| op == "--bind" && target == "/work/tmp-1"),
+            "the scratch dir stays bound writable: {joined}"
         );
-        // The payload execs the delivered in-jail path, not any host path.
+        // Owner-execute perms on the copy, then the tmpfs remounted read-only.
         assert!(
-            joined.ends_with("-- /work/tmp-1/ipe-app"),
+            joined.contains(&format!(
+                "--perms 0700 --file {} {dest_str} --remount-ro {}",
+                app.as_raw_fd(),
+                dir.display()
+            )),
+            "delivery sequence missing: {joined}"
+        );
+        // The payload execs the delivered in-jail path with the app args.
+        assert!(
+            joined.ends_with(&format!("-- {dest_str} --port 8080")),
             "payload must exec the delivered path: {joined}"
         );
     }
@@ -1528,10 +1615,10 @@ mod tests {
         };
         // Simulate a binary: arbitrary bytes, the floor line in .rodata, more bytes.
         let mut buf: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
-        buf.extend_from_slice(p.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0); // NUL-terminated as in .rodata
         buf.extend_from_slice(&[0x11, 0x22]);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         assert!(floor.network);
         assert_eq!(floor.filesystem, FilesystemScope::WorkingTreeReadWrite);
         assert_eq!(floor.env_allowlist, vec!["A".to_owned(), "B".to_owned()]);
@@ -1551,11 +1638,11 @@ mod tests {
             ..SandboxProfile::maximally_isolated()
         };
         let mut buf = Vec::new();
-        buf.extend_from_slice(legit.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(legit.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(b'\n');
-        buf.extend_from_slice(forged.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(forged.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         assert_eq!(floor.env_allowlist, vec!["B".to_owned()]);
         // A profile granting C is refused: C is not in the intersected floor.
         let wants_c = SandboxProfile {
@@ -1578,11 +1665,11 @@ mod tests {
             ..SandboxProfile::maximally_isolated()
         };
         let mut buf = Vec::new();
-        buf.extend_from_slice(strict.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(strict.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(b'\n');
-        buf.extend_from_slice(forged.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(forged.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         // The strict floor wins: no axis granted.
         assert!(!floor.network);
         assert!(!floor.subprocess);
@@ -1634,9 +1721,12 @@ mod tests {
             subprocess: false,
             limits: RunResourceLimits::default(),
         };
-        let line = p.to_capfloor_line();
-        assert_eq!(line, "ipe-capfloor 1 net=true fs=rw sub=false env=A,B");
-        let floor = parse_capfloor(&line).expect("round-trips");
+        let line = p.to_capfloor_line(FloorIntent::Release);
+        assert_eq!(
+            line,
+            "ipe-capfloor 1 net=true fs=rw sub=false env=A,B intent=release"
+        );
+        let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.network);
         assert_eq!(floor.filesystem, FilesystemScope::WorkingTreeReadWrite);
         assert!(!floor.subprocess);
@@ -1647,17 +1737,23 @@ mod tests {
     #[test]
     fn capfloor_line_empty_env_round_trips() {
         let p = SandboxProfile::maximally_isolated();
-        let line = p.to_capfloor_line();
-        assert_eq!(line, "ipe-capfloor 1 net=false fs=isolated sub=false env=");
-        let floor = parse_capfloor(&line).expect("round-trips");
+        let line = p.to_capfloor_line(FloorIntent::Release);
+        assert_eq!(
+            line,
+            "ipe-capfloor 1 net=false fs=isolated sub=false env= intent=release"
+        );
+        let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.env_allowlist.is_empty());
     }
 
     #[test]
     fn satisfies_capfloor_refuses_a_widened_profile() {
         // floor = maximally isolated; a profile granting network must be refused.
-        let floor = parse_capfloor(&SandboxProfile::maximally_isolated().to_capfloor_line())
-            .expect("floor");
+        let floor = parse_capfloor(
+            &SandboxProfile::maximally_isolated().to_capfloor_line(FloorIntent::Release),
+        )
+        .expect("floor")
+        .axes;
         let widened = SandboxProfile {
             network: true,
             ..SandboxProfile::maximally_isolated()
@@ -1673,7 +1769,9 @@ mod tests {
             env_allowlist: vec!["A".to_owned()],
             ..SandboxProfile::maximally_isolated()
         };
-        let floor = parse_capfloor(&floor_profile.to_capfloor_line()).expect("floor");
+        let floor = parse_capfloor(&floor_profile.to_capfloor_line(FloorIntent::Release))
+            .expect("floor")
+            .axes;
         let two_env = SandboxProfile {
             env_allowlist: vec!["A".to_owned(), "B".to_owned()],
             ..SandboxProfile::maximally_isolated()
@@ -1699,7 +1797,9 @@ mod tests {
             env_allowlist: vec!["PATH".to_owned(), "HOME".to_owned()],
             ..SandboxProfile::maximally_isolated()
         };
-        let floor = parse_capfloor(&floor_profile.to_capfloor_line()).expect("floor");
+        let floor = parse_capfloor(&floor_profile.to_capfloor_line(FloorIntent::Release))
+            .expect("floor")
+            .axes;
         let swapped = SandboxProfile {
             env_allowlist: vec![
                 "AWS_SECRET_ACCESS_KEY".to_owned(),
@@ -1737,6 +1837,68 @@ mod tests {
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=,A").is_err());
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=1BAD").is_err());
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=A-B").is_err());
+    }
+
+    #[test]
+    fn capfloor_intent_round_trips_and_absent_is_development() {
+        let p = SandboxProfile::maximally_isolated();
+        for intent in [FloorIntent::Release, FloorIntent::Development] {
+            let floor = parse_capfloor(&p.to_capfloor_line(intent)).expect("round-trips");
+            assert_eq!(floor.intent, intent);
+        }
+        // A floor naming no intent never counts as a release build's.
+        let bare =
+            parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=").expect("parses");
+        assert_eq!(bare.intent, FloorIntent::Development);
+        // An unknown or repeated intent is a malformed floor.
+        assert!(parse_capfloor("ipe-capfloor 1 env= intent=prod").is_err());
+        assert!(parse_capfloor("ipe-capfloor 1 env= intent=release intent=release").is_err());
+    }
+
+    #[test]
+    fn scan_capfloor_is_release_only_when_every_copy_is() {
+        let p = SandboxProfile::maximally_isolated();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Development).as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Release).as_bytes());
+        buf.push(0);
+        let floor = scan_capfloor(&buf).expect("found");
+        assert_eq!(
+            floor.intent,
+            FloorIntent::Development,
+            "a release line beside a development floor must not make it a release build"
+        );
+    }
+
+    #[test]
+    fn verify_release_floor_refuses_a_development_build() {
+        let p = SandboxProfile::maximally_isolated();
+        let dev = p.to_capfloor_line(FloorIntent::Development).into_bytes();
+        assert_eq!(
+            verify_release_floor(&p, &dev),
+            Err(FloorRefusal::NotRelease)
+        );
+        assert!(
+            FloorRefusal::NotRelease
+                .to_string()
+                .contains("rebuild it with `ipe release build`"),
+            "the refusal names the remedy"
+        );
+        let release = p.to_capfloor_line(FloorIntent::Release).into_bytes();
+        assert_eq!(verify_release_floor(&p, &release), Ok(()));
+        assert_eq!(
+            verify_release_floor(&p, b"no floor"),
+            Err(FloorRefusal::Unreadable)
+        );
+        let widened = SandboxProfile {
+            network: true,
+            ..SandboxProfile::maximally_isolated()
+        };
+        assert_eq!(
+            verify_release_floor(&widened, &release),
+            Err(FloorRefusal::ProfileWider)
+        );
     }
 
     #[test]

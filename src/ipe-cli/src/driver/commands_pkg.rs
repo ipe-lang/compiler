@@ -423,7 +423,7 @@ impl<'a> BundleAssembler<'a> {
         // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
         // (macOS/Windows).
         let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
-        let bin_name = emitted_bin_filename(crate_dir.path());
+        let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
             .join(self.profile.target_subdir())
             .join(&bin_name);
@@ -1586,7 +1586,7 @@ pub fn build_and_run_test_entry(
     // Locate the compiled binary via `cargo metadata` so a user-level
     // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
     // name matches the emitted crate's package name (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir);
+    let test_bin_name = emitted_bin_filename(out_dir)?;
     let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
     bin.push("debug");
     bin.push(&test_bin_name);

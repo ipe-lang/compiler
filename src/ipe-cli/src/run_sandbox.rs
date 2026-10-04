@@ -26,7 +26,9 @@ use std::path::Path;
 
 use ipe_diagnostics::Diagnostic as SharedDiag;
 use ipe_ir::Capability;
-use ipe_sandbox::run_jail::{self, DatabaseAxis, RunJailDefect, SandboxProfile};
+use ipe_sandbox::run_jail::{
+    self, DatabaseAxis, FloorIntent, FloorRefusal, RunJailDefect, SandboxProfile,
+};
 
 use crate::CliError;
 use crate::project::ProjectManifest;
@@ -317,9 +319,12 @@ pub fn profile_axes(profile: &SandboxProfile) -> BTreeSet<Capability> {
 /// [`ipe_sandbox::run_jail::scan_capfloor`] finds it by its
 /// [`ipe_sandbox::run_jail::CAPFLOOR_MARKER`] prefix. The floor lands in
 /// `.rodata` (referenced from `fn main`) so it survives linker GC and `strip`.
+///
+/// `intent` records which pipeline built the binary, so `ipe release run`
+/// can refuse a development build.
 #[must_use]
-pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
-    let mut line = profile.to_capfloor_line();
+pub fn capfloor_static_source(profile: &SandboxProfile, intent: FloorIntent) -> String {
+    let mut line = profile.to_capfloor_line(intent);
     // A trailing newline TERMINATES the floor line inside `.rodata`. `scan_capfloor`
     // reads from the marker to the first NUL or newline; without an explicit
     // terminator the scanner would run on into whatever bytes the linker places
@@ -358,6 +363,16 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
     )
 }
 
+/// The floor intent a build of `intent` embeds: only a release build's floor
+/// lets `ipe release run` run the app.
+#[must_use]
+pub const fn floor_intent(intent: ipe_backend_rust::BuildIntent) -> FloorIntent {
+    match intent {
+        ipe_backend_rust::BuildIntent::Development => FloorIntent::Development,
+        ipe_backend_rust::BuildIntent::Release => FloorIntent::Release,
+    }
+}
+
 /// Write the deployable enforcement artifacts into an emitted native project.
 ///
 /// Two artifacts: the strictly-parsed `ipe.profile` next to the crate, and the
@@ -365,7 +380,9 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
 /// the binary). The profile is a *convenience mirror* the launcher parses; the
 /// authoritative floor is the embedded static. A profile weaker than the floor
 /// is refused at launch (`ipe release run`), so tampering the mirror alone cannot
-/// under-isolate.
+/// under-isolate. The floor names `intent`, the pipeline about to build the
+/// crate: the artifacts are written before the build, so the binary carries
+/// exactly this floor.
 ///
 /// # Errors
 ///
@@ -374,6 +391,7 @@ pub fn capfloor_static_source(profile: &SandboxProfile) -> String {
 pub fn write_build_artifacts(
     crate_dir: &crate::output_dir::OwnedDir,
     profile: &SandboxProfile,
+    intent: FloorIntent,
 ) -> Result<(), CliError> {
     // 1. The ipe.profile mirror.
     crate_dir
@@ -394,7 +412,7 @@ pub fn write_build_artifacts(
     )?;
     let base = strip_capfloor_block(&existing);
     let referenced = inject_floor_reference(&base)?;
-    let with_floor = format!("{referenced}{}", capfloor_static_source(profile));
+    let with_floor = format!("{referenced}{}", capfloor_static_source(profile, intent));
     main_rs.write(with_floor.as_bytes())
 }
 
@@ -502,20 +520,19 @@ fn verify_artifact_under(
     })?;
 
     // Read the authoritative floor from the binary's embedded `.rodata` bytes
-    // (passively — the binary is NOT executed). A binary with no readable floor
-    // refuses.
+    // (passively — the binary is NOT executed). The floor must be readable,
+    // a release build's, and no narrower than the profile — the one check the
+    // release wrapper applies too.
     let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
-    let floor = run_jail::scan_capfloor(&bytes).ok_or_else(|| {
-        CliError::Usage(crate::text::msg::run_floor_unreadable(
-            &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
-        ))
-    })?;
-
-    // The profile MUST isolate at least as much as the embedded floor.
-    if !profile.satisfies_capfloor(&floor) {
-        return Err(CliError::Usage(crate::text::Message::relay(
-            &RunJailDefect::ProfileWeakerThanFloor,
-        )));
+    if let Err(refusal) = run_jail::verify_release_floor(&profile, &bytes) {
+        let code = RunJailDefect::ProfileWeakerThanFloor.code();
+        return Err(CliError::Usage(match refusal {
+            FloorRefusal::Unreadable => crate::text::msg::run_floor_unreadable(&code.as_str()),
+            FloorRefusal::NotRelease => crate::text::msg::run_floor_not_release(&code.as_str()),
+            FloorRefusal::ProfileWider => {
+                crate::text::Message::relay(&RunJailDefect::ProfileWeakerThanFloor)
+            }
+        }));
     }
     Ok(VerifiedArtifact {
         profile,
@@ -729,13 +746,13 @@ mod tests {
             network: true,
             ..SandboxProfile::maximally_isolated()
         };
-        let src = capfloor_static_source(&p);
+        let src = capfloor_static_source(&p, FloorIntent::Release);
         // The floor LINE is encoded as byte values, not literal text — so assert
         // on the static shape and confirm the byte array decodes to the marker.
         assert!(src.contains("IPE_CAPABILITY_FLOOR"), "{src}");
         assert!(src.contains("#[used]"), "{src}");
         // The bytes are the exact `to_capfloor_line()` output.
-        let line = p.to_capfloor_line();
+        let line = p.to_capfloor_line(FloorIntent::Release);
         let first_byte = line.as_bytes().first().copied().unwrap_or(0).to_string();
         assert!(
             src.contains(&format!("[{first_byte}, ")),
@@ -750,10 +767,10 @@ mod tests {
             network: true,
             ..SandboxProfile::maximally_isolated()
         };
-        let src = capfloor_static_source(&p);
+        let src = capfloor_static_source(&p, FloorIntent::Release);
         // The emitted byte array is exactly `to_capfloor_line()` + a terminating
         // newline, so the last array element is the newline's byte value (10).
-        let line = p.to_capfloor_line();
+        let line = p.to_capfloor_line(FloorIntent::Release);
         let len = line.len() + 1;
         assert!(
             src.contains(&format!("[u8; {len}]")),
@@ -773,7 +790,7 @@ mod tests {
             network: false,
             ..SandboxProfile::maximally_isolated()
         };
-        let mut rodata = profile.to_capfloor_line().into_bytes();
+        let mut rodata = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
         rodata.push(b'\n'); // the emitter's terminator
         // Adjacent bytes an attacker-linked static could place next — including a
         // second, more-permissive floor marker. The terminator must stop the scan
@@ -785,7 +802,7 @@ mod tests {
         // The recovered floor is the strict legitimate one — the trailing permissive
         // bytes did not extend it into a wider grant.
         assert!(
-            !recovered.network,
+            !recovered.axes.network,
             "adjacent permissive bytes cannot raise the network ceiling"
         );
     }
@@ -796,7 +813,7 @@ mod tests {
         let profile = SandboxProfile::maximally_isolated();
         let profile_path = dir.path().join("ipe.profile");
         std::fs::write(&profile_path, profile.to_profile_string()).expect("write profile");
-        let mut binary = profile.to_capfloor_line().into_bytes();
+        let mut binary = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
         binary.push(b'\n');
         let binary_path = dir.path().join("ipe-app");
         std::fs::write(&binary_path, &binary).expect("write binary");
@@ -822,7 +839,10 @@ mod tests {
         let profile = SandboxProfile::maximally_isolated();
         // First injection: reference inside main + static appended.
         let referenced = inject_floor_reference(base).expect("anchor present");
-        let once = format!("{referenced}{}", capfloor_static_source(&profile));
+        let once = format!(
+            "{referenced}{}",
+            capfloor_static_source(&profile, FloorIntent::Release)
+        );
         assert!(once.contains("black_box(&IPE_CAPABILITY_FLOOR)"));
         // Re-emitting: strip then re-inject must not stack a second block.
         let stripped = strip_capfloor_block(&once);
@@ -831,7 +851,10 @@ mod tests {
             "strip removed the ref+static"
         );
         let re = inject_floor_reference(&stripped).expect("anchor present");
-        let twice = format!("{re}{}", capfloor_static_source(&profile));
+        let twice = format!(
+            "{re}{}",
+            capfloor_static_source(&profile, FloorIntent::Release)
+        );
         assert_eq!(
             twice.matches("static IPE_CAPABILITY_FLOOR").count(),
             1,

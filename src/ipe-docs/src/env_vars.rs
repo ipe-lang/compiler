@@ -336,8 +336,8 @@ pub static ENV_VARS: &[EnvVar] = &[
                   machine-level sccache config cannot force non-incremental), which \
                   speeds the warm view/update-body edit loop and is \
                   behaviour-identical. This restores the machine's normal build \
-                  configuration for the watch rebuild. Dev-only; no effect on `ipe \
-                  build` or a release build.",
+                  configuration for the watch rebuild. Dev-only; no effect on \
+                  `ipe dev build` or `ipe release build`.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },

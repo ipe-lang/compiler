@@ -1194,8 +1194,21 @@ mod real_jail {
     /// Run `ipe release run <args>` from `cwd`, returning (success, stdout, stderr).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn release_run(cwd: &std::path::Path, args: &[std::ffi::OsString]) -> (bool, String, String) {
+        release_run_with_tmpdir(cwd, args, None)
+    }
+
+    /// [`release_run`] with `TMPDIR` pointed at `tmpdir` when given.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn release_run_with_tmpdir(
+        cwd: &std::path::Path,
+        args: &[std::ffi::OsString],
+        tmpdir: Option<&std::path::Path>,
+    ) -> (bool, String, String) {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ipe"));
         cmd.arg("release").arg("run").args(args).current_dir(cwd);
+        if let Some(tmpdir) = tmpdir {
+            cmd.env("TMPDIR", tmpdir);
+        }
         let out = super::run_child(cmd).expect("run ipe release run");
         (
             out.status.success(),
@@ -1233,9 +1246,9 @@ mod real_jail {
         executable(
             "ipe-app",
             format!(
-                "#!/bin/sh\n# {}\necho started\nif [ -n \"$2\" ]; then cat \"$2\"; echo; fi\n\
+                "#!/bin/sh\n# {}\necho started\necho \"tmpdir=$TMPDIR\"\nif [ -n \"$2\" ]; then cat \"$2\"; echo; fi\n\
                  cat \"$1\" 2>/dev/null && echo LEAKED\nexit 0\n",
-                profile.to_capfloor_line()
+                profile.to_capfloor_line(ipe_sandbox::run_jail::FloorIntent::Release)
             ),
         );
         std::fs::write(dir.join("ipe.profile"), profile.to_profile_string()).expect("profile");
@@ -1344,6 +1357,61 @@ mod real_jail {
         );
     }
 
+    /// Every regular file beneath `dir` whose bytes carry the capability-floor marker.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn floor_bearing_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).expect("list tmpdir").flatten() {
+                let path = entry.path();
+                let kind = entry.file_type().expect("entry type");
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file()
+                    && std::fs::read(&path)
+                        .is_ok_and(|bytes| bytes.windows(13).any(|w| w == b"ipe-capfloor "))
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The app `ipe release run` delivers into the jail leaves no copy on the host.
+    ///
+    /// The run's scratch dir lands in the `TMPDIR` the test names (the app
+    /// reports it), yet no file carrying the app's floor is left beneath it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_leaves_no_app_copy_in_tmp() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-no-copy");
+        let (dir, _) = floor_bundle(&base, &[]);
+        let work = base.join("work");
+        let tmpdir = base.join("tmp");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::create_dir_all(&tmpdir).expect("tmp dir");
+        let tmpdir = std::fs::canonicalize(&tmpdir).expect("canonical tmp dir");
+        let (ok, stdout, stderr) =
+            release_run_with_tmpdir(&work, &[dir.into_os_string()], Some(&tmpdir));
+        let left = floor_bearing_files(&tmpdir);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            ok && stdout.contains("started")
+                && stdout.contains(&format!("tmpdir={}", tmpdir.display())),
+            "the app runs with its scratch dir under the named TMPDIR (control):\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            left.is_empty(),
+            "the delivered app must never be copied to the host: {left:?}"
+        );
+    }
+
     /// A floor-bearing app run by `ipe release run` is jailed to its grants.
     ///
     /// Its granted working tree is readable; a path outside it is not.
@@ -1410,6 +1478,38 @@ mod real_jail {
         assert!(
             !ok && !stdout.contains("started"),
             "an app with no embedded floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// `ipe release run` refuses an app a development build produced, naming
+    /// the release build that would make it runnable.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_a_development_build() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-dev-build");
+        let (dir, profile) = floor_bundle(&base, &[]);
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::write(
+            dir.join("ipe-app"),
+            format!(
+                "#!/bin/sh\n# {}\necho started\n",
+                profile.to_capfloor_line(ipe_sandbox::run_jail::FloorIntent::Development)
+            ),
+        )
+        .expect("a development build's app");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("started"),
+            "a development build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("ipe release build"),
+            "the refusal names the remedy:\nstderr:\n{stderr}"
         );
     }
 }

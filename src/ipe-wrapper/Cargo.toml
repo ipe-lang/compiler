@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 ipe_sandbox = { path = "../compiler/sandbox" }
+# The non-blocking, handle-proven regular-file open of the bundle's files.
+ipe_fs_open = { path = "../compiler/fs_open" }
 
 [build-dependencies]
 ipe_env = { path = "../compiler/env" }

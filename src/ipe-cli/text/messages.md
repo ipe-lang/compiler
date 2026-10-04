@@ -1879,6 +1879,10 @@ ipe dev build: the emitted `fn main` anchor is absent, so the capability floor c
 
 {code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
 
+## run-floor-not-release
+
+{code}: the app was built by `ipe dev build`, not `ipe release build` — `ipe release run` runs only a release build: rebuild it with `ipe release build`
+
 ## build-entry-not-main
 
 program entry module `{module}` is not yet buildable — a declared `programs` entry outside module `Main` type-checks (`ipe type-check`) but native emission still assumes a `Main` entry. Name the entry file `Main.ipe`, or track the multi-program emit follow-up
@@ -1898,6 +1902,10 @@ ipe release: expected binary at {path} — cargo build succeeded but binary is m
 ## release-app-binary-missing
 
 ipe release: expected app binary at {path} — cargo build succeeded but binary is missing
+
+## emitted-crate-name-unreadable
+
+the emitted crate manifest {path} names no plain `[package] name`, so its built binary cannot be located — rebuild the program to re-emit the crate
 
 ## cli-wrapper-source-refused
 

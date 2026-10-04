@@ -996,6 +996,26 @@ pub fn compile_and_finalize_native_build(
     } else {
         None
     };
+    let manifest_parsed = match manifest {
+        Some(m) => Some(project::parse_manifest(m)?),
+        None => None,
+    };
+    // The enforcement artifacts (the `ipe.profile` mirror and the embedded
+    // floor) are written BEFORE the build, so the binary cargo produces
+    // carries exactly this floor — never a stale one left by an earlier build.
+    let driver = manifest_parsed
+        .as_ref()
+        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
+    let resolved = consented.resolved();
+    if run_sandbox::is_native_bearing(&resolved.union()) {
+        let profile = run_sandbox::build_profile(resolved, driver)?;
+        run_sandbox::write_build_artifacts(
+            crate_dir,
+            &profile,
+            run_sandbox::floor_intent(Verb::DEV_BUILD.intent()),
+        )?;
+    }
+
     CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
@@ -1008,11 +1028,6 @@ pub fn compile_and_finalize_native_build(
         runtime,
     }
     .run()?;
-
-    let manifest_parsed = match manifest {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
 
     // Copy the just-built binary into a stable per-project location. With the
     // Ipê-recommended shared `CARGO_TARGET_DIR`, the artifact lands in the
@@ -1028,14 +1043,6 @@ pub fn compile_and_finalize_native_build(
         static_plan.as_ref(),
         manifest_parsed.as_ref(),
     )?;
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved = consented.resolved();
-    if run_sandbox::is_native_bearing(&resolved.union()) {
-        let profile = run_sandbox::build_profile(resolved, driver)?;
-        run_sandbox::write_build_artifacts(crate_dir, &profile)?;
-    }
     Ok(artifact)
 }
 
@@ -1061,7 +1068,7 @@ fn copy_native_artifact(
     // `<friendly>_<hash>` cargo actually produces); DELIVER it under the plain
     // friendly project name, so the user-facing artifact stays `out/bin/<name>`
     // regardless of the internal per-project identity hash.
-    let bin_name = emitted_bin_filename(out_dir);
+    let bin_name = emitted_bin_filename(out_dir)?;
     let friendly = friendly_artifact_filename(manifest);
     let mut src = target_dir;
     if let Some(plan) = static_plan {
@@ -1623,7 +1630,7 @@ pub fn release_pipeline(
         // identity; it is delivered under the plain FRIENDLY name so the hash the
         // crate carries only to own a unique shared-target slot never leaks into a
         // distributed filename.
-        let bin_name = emitted_bin_filename(&out_dir);
+        let bin_name = emitted_bin_filename(&out_dir)?;
         let bin_path = app_target_dir
             .join(triple.as_str())
             .join("release")
@@ -1705,6 +1712,15 @@ pub fn release_pipeline(
         options,
     )?;
 
+    // Write the capability enforcement artifacts (ipe.profile + embedded floor)
+    // BEFORE the build, so the binary cargo produces carries exactly this floor.
+    let profile = run_sandbox::build_profile(resolved, driver)?;
+    run_sandbox::write_build_artifacts(
+        &app_dir,
+        &profile,
+        run_sandbox::floor_intent(verb.intent()),
+    )?;
+
     CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(&app_dir),
@@ -1716,15 +1732,11 @@ pub fn release_pipeline(
     }
     .run()?;
 
-    // Write the capability enforcement artifacts (ipe.profile + embedded floor).
-    let profile = run_sandbox::build_profile(resolved, driver)?;
-    run_sandbox::write_build_artifacts(&app_dir, &profile)?;
-
     // Locate the compiled app binary. The target dir may be a global
     // `CARGO_TARGET_DIR` (set by the user or the agent lane), so we resolve
     // it via cargo metadata rather than assuming `app_out/target/`.
     let app_target_dir = crate::cargo_step::target_directory(&cargo_bin, &app_out)?;
-    let release_bin_name = emitted_bin_filename(&app_out);
+    let release_bin_name = emitted_bin_filename(&app_out)?;
     let app_binary = app_target_dir
         .join(triple.as_str())
         .join("release")
@@ -2870,13 +2882,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // --- Step 3: exec the emitted binary, forwarding args and exit code ---
     // The binary name is read from the emitted crate's `Cargo.toml` — the
     // same file cargo just built from, so there is ONE source of truth and
-    // no independent re-derivation can drift. Falls back to `"ipe-app"` when
-    // the manifest is absent or unparseable.
+    // no independent re-derivation can drift. A manifest that names no plain
+    // package name refuses, never guessing a default another build may own.
     // The target directory is asked of cargo itself (`cargo metadata`) — a
     // `CARGO_TARGET_DIR` env or a user-level `[build] target-dir` pin
     // relocates the artifact, so a hardcoded `<out>/target` would exec a
     // missing or stale binary.
-    let bin_name = emitted_bin_filename(&out_dir);
+    let bin_name = emitted_bin_filename(&out_dir)?;
     let mut bin = crate::cargo_step::target_directory(&cargo_bin, &out_dir)?;
     if let Some(plan) = &static_plan {
         bin.push(plan.triple.as_str());
@@ -3142,38 +3154,62 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
 /// `[package] name` so `ipe dev run` / `ipe release run` / `ipe test` locate the correct
 /// built binary — cargo names the binary artifact after the crate, so this is
 /// the per-project path-uniquified identity (`<friendly>_<hash>`), NOT the
-/// user-facing friendly name. Falls back to `"ipe-app"` when the manifest is
-/// absent, past [`crate::io_bounded::MANIFEST_READ_CAP`], unparseable, or names
-/// anything but a plain file name (letters, digits, `_`, `-`), so the result
-/// joins onto a target directory as one path component and a missing binary
-/// is then refused by name. For a user-facing artifact filename or message use
-/// [`friendly_artifact_name`], which never carries the hash.
-pub fn emitted_bin_name(crate_dir: &Path) -> String {
+/// user-facing friendly name. The name must be a quoted plain file name
+/// (letters, digits, `_`, `-`) under `[package]`, so it joins onto a target
+/// directory as one path component. For a user-facing artifact filename or
+/// message use [`friendly_artifact_name`], which never carries the hash.
+///
+/// # Errors
+///
+/// The read error for a manifest that is absent or past
+/// [`crate::io_bounded::MANIFEST_READ_CAP`]; [`CliError::Usage`] when it names
+/// no plain package name. Never a default name: in a shared target directory
+/// a default would locate another program's binary.
+pub fn emitted_bin_name(crate_dir: &Path) -> Result<String, CliError> {
     let manifest = crate_dir.join("Cargo.toml");
-    let Ok(text) =
-        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::MANIFEST_READ_CAP)
-    else {
-        return "ipe-app".to_owned();
-    };
+    let source =
+        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::MANIFEST_READ_CAP)?;
+    emitted_package_name(&source)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CliError::Usage(text::msg::emitted_crate_name_unreadable(
+                &manifest.display(),
+            ))
+        })
+}
+
+/// The `[package] name` of an emitted `Cargo.toml`, when it is one quoted
+/// plain file name.
+fn emitted_package_name(manifest: &str) -> Option<&str> {
     let plain = |value: &str| {
         !value.is_empty()
             && value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     };
-    text.lines()
-        .find_map(|line| {
-            let value = line
-                .trim()
-                .strip_prefix("name")?
-                .trim_start()
-                .strip_prefix('=')?
-                .trim()
-                .trim_matches('"');
-            (!value.is_empty()).then_some(value)
-        })
-        .filter(|value| plain(*value))
-        .map_or_else(|| "ipe-app".to_owned(), str::to_owned)
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(value) = line
+            .strip_prefix("name")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('='))
+        else {
+            continue;
+        };
+        return value
+            .trim()
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|v| plain(v));
+    }
+    None
 }
 
 /// The on-disk filename cargo gives the emitted crate's executable, ready to
@@ -3182,12 +3218,16 @@ pub fn emitted_bin_name(crate_dir: &Path) -> String {
 /// elsewhere. Locating the built artifact by the bare identity misses the file
 /// on Windows, where cargo appends `.exe`; every caller that resolves a built
 /// binary path uses this so the locate is host-correct on all targets.
-pub fn emitted_bin_filename(crate_dir: &Path) -> String {
-    format!(
+///
+/// # Errors
+///
+/// As [`emitted_bin_name`].
+pub fn emitted_bin_filename(crate_dir: &Path) -> Result<String, CliError> {
+    Ok(format!(
         "{}{}",
-        emitted_bin_name(crate_dir),
+        emitted_bin_name(crate_dir)?,
         std::env::consts::EXE_SUFFIX
-    )
+    ))
 }
 
 /// The user-facing artifact name for a project — the plain (sanitized) friendly
@@ -4300,6 +4340,72 @@ mod held_crate_tests {
         assert!(bundle.is_file(), "the bundle lands in the owned crate");
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// The enforcement artifacts are written before cargo builds the crate, so
+    /// the binary cargo produces embeds this build's floor (a development
+    /// build's), never none and never a stale one from an earlier build.
+    #[test]
+    fn the_dev_build_embeds_its_floor_before_cargo_runs() {
+        use std::collections::BTreeSet;
+
+        use super::{ConsentedCapabilities, NativeBuild, compile_and_finalize_native_build};
+        use crate::output_dir::{OutputRoot, ProjectPaths};
+        use crate::run_sandbox::{self, ResolvedCapabilities};
+        use ipe_ir::Capability;
+        use ipe_sandbox::run_jail::FloorIntent;
+
+        let (base, crate_dir) = scratch("floor-first");
+        let src = crate_dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(src.join("main.rs"), "fn main() {\n}\n").expect("main.rs");
+        // The stub records the `main.rs` cargo was handed, then fails the build.
+        let seen = base.join("seen-main.rs");
+        let cargo = stub(
+            &base,
+            "cargo",
+            &format!(
+                "[ \"$1\" = generate-lockfile ] && exit 0\ncat '{}' > '{}'\nexit 1",
+                src.join("main.rs").display(),
+                seen.display()
+            ),
+        );
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
+        let output = OutputRoot::at(&base.join("out"), &paths).expect("output root");
+        let native = BTreeSet::from([Capability::NativeFfi]);
+        let consented = ConsentedCapabilities {
+            resolved: ResolvedCapabilities {
+                inferred: native.clone(),
+                declared: native,
+            },
+        };
+        let built = compile_and_finalize_native_build(
+            &output,
+            &crate_dir,
+            NativeBuild {
+                cargo: Some(CargoBin::stub(cargo)),
+                static_plan: None,
+                runtime_dep: false,
+                quiet: true,
+            },
+            None,
+            &consented,
+        );
+        assert!(built.is_err(), "the stub fails the build: {built:?}");
+        let profile =
+            run_sandbox::build_profile(consented.resolved(), ipe_backend_rust::DbDriver::Sqlite)
+                .expect("profile");
+        let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        assert!(
+            handed.contains(&run_sandbox::capfloor_static_source(
+                &profile,
+                FloorIntent::Development
+            )),
+            "cargo must build a main.rs already carrying the development floor:\n{handed}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 #[cfg(test)]
@@ -4328,9 +4434,11 @@ mod help_on_misuse_tests {
     /// a planted wrapper beside `package.ipe` or `ipe.toml` is not what
     /// `release run` runs. The same directory without a manifest is one.
     /// The crate name joins onto a target dir as one plain component; a
-    /// traversal, a separator, or an oversized manifest yields the default.
+    /// traversal, a separator, an unquoted or misplaced name, an oversized or
+    /// an absent manifest is refused, never replaced by a default name that
+    /// would locate another program's binary.
     #[test]
-    fn emitted_bin_name_is_one_plain_component_or_the_default() {
+    fn emitted_bin_name_is_one_plain_component_or_refused() {
         let dir = crate::scratch::ScratchDir::new("emitted-bin-name").expect("scratch dir");
         let manifest = dir.path().join("Cargo.toml");
         let named = |text: &str| {
@@ -4338,26 +4446,42 @@ mod help_on_misuse_tests {
             super::emitted_bin_name(dir.path())
         };
         assert_eq!(
-            named("[package]\nname = \"shop_ab12-cd\"\n"),
+            named("[package]\nname = \"shop_ab12-cd\"\n").expect("plain name"),
             "shop_ab12-cd"
         );
-        for hostile in ["../../escape", "a/b", "a\\\\b", "..", "x.exe"] {
-            assert_eq!(
-                named(&format!("[package]\nname = \"{hostile}\"\n")),
-                "ipe-app",
-                "{hostile:?} is not one plain path component"
+        assert_eq!(
+            named("[dependencies]\nname = \"dep\"\n[package]\nname = \"app\"\n")
+                .expect("package name"),
+            "app",
+            "only the `[package]` name is the crate's"
+        );
+        for hostile in ["../../escape", "a/b", "a\\\\b", "..", "x.exe", ""] {
+            let got = named(&format!("[package]\nname = \"{hostile}\"\n"));
+            assert!(
+                matches!(got, Err(CliError::Usage(_))),
+                "{hostile:?} is not one plain path component: {got:?}"
+            );
+        }
+        for unnamed in [
+            "[package]\nname = app\n",
+            "[package]\nversion = \"1\"\n[bin]\nname = \"app\"\n",
+            "name = \"app\"\n",
+        ] {
+            let got = named(unnamed);
+            assert!(
+                matches!(got, Err(CliError::Usage(_))),
+                "{unnamed:?} names no quoted package name: {got:?}"
             );
         }
         let cap = usize::try_from(crate::io_bounded::MANIFEST_READ_CAP).expect("cap fits usize");
         let oversized = format!("[package]\nname = \"big\"\n{}", "#".repeat(cap));
-        assert_eq!(
-            named(&oversized),
-            "ipe-app",
+        assert!(
+            named(&oversized).is_err(),
             "a manifest past the cap is not read"
         );
-        assert_eq!(
-            super::emitted_bin_name(&dir.path().join("absent")),
-            "ipe-app"
+        assert!(
+            super::emitted_bin_name(&dir.path().join("absent")).is_err(),
+            "an absent manifest is refused"
         );
     }
 
