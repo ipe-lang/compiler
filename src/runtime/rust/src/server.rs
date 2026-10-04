@@ -1368,11 +1368,30 @@ fn strict_serve_dir_with(
     )
 }
 
-/// Add the decoded cookies of one `Cookie` header to `out`; the first value of a name wins.
-fn parse_cookies(header: &str, out: &mut HashMap<String, String>) {
-    for (name, value) in request_cookies(header) {
+/// Add the decoded cookies of one request's jar to `out`; the first value of a name wins.
+fn parse_cookies<'a, I>(jar: I, out: &mut HashMap<String, String>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    I::IntoIter: 'a,
+{
+    for (name, value) in request_cookies(jar) {
         out.entry(name).or_insert(value);
     }
+}
+
+/// The decoded `(name, value)` pairs of every `Cookie` header in `headers`, in order.
+///
+/// Read from the raw header bytes through [`request_cookies`], so a pair with
+/// a byte outside visible ASCII drops only itself, never the other cookies.
+pub fn request_cookie_jar(
+    headers: &axum::http::HeaderMap,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    request_cookies(
+        headers
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+    )
 }
 
 /// The decoded value of the request cookie `name`, read from every `Cookie` header.
@@ -1380,12 +1399,7 @@ fn parse_cookies(header: &str, out: &mut HashMap<String, String>) {
 /// The first value of `name` wins, as in `parse_cookies`.
 #[must_use]
 pub fn request_cookie(headers: &axum::http::HeaderMap, name: &CookieName) -> Option<String> {
-    headers
-        .get_all(axum::http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(request_cookies)
-        .find_map(|(k, v)| (k == name.text()).then_some(v))
+    request_cookie_jar(headers).find_map(|(k, v)| (k == name.text()).then_some(v))
 }
 
 /// Build the Ipê `ServerRequest` from the axum request.
@@ -1404,11 +1418,17 @@ async fn build_request(
     let query = strict_url_query(&uri)?;
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
+    // Read from the raw bytes of every `Cookie` header, outside the text gate
+    // below, so one pair with a non-ASCII byte drops only itself.
+    parse_cookies(
+        req.headers()
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+        &mut cookies,
+    );
     for (k, v) in req.headers() {
         if let Ok(s) = v.to_str() {
-            if k.as_str().eq_ignore_ascii_case("cookie") {
-                parse_cookies(s, &mut cookies);
-            }
             // Store under  canonical MIME casing (`content-type` ->
             // `Content-Type`), aligning with  request-header storage and the
             // Ipe.Web path, so `server_header` (which canonicalises its lookup
@@ -1556,7 +1576,12 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     // Safe-by-default security headers — applied only when the handler hasn't
     // already set them, so an explicit handler override wins. Values are
     // env/static (no request-derived strings → no header-injection surface).
-    for (name, value) in crate::telemetry::security_headers() {
+    // A refused framing policy answers 500: `Server.listen` refuses to start on
+    // it, and this second check keeps a response from ever shipping without it.
+    let Ok(security) = crate::telemetry::security_headers() else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    for (name, value) in security {
         if !r.headers.keys().any(|k| k.eq_ignore_ascii_case(name)) {
             builder = builder.header(name, value);
         }
@@ -1781,6 +1806,11 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             Ok(ceilings) => ceilings,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
         };
+        // The framing policy every response carries is parsed before bind, so
+        // a value with no header representation refuses the listener.
+        if let Err(refusal) = crate::telemetry::frame_ancestors_config() {
+            return IpeResult::Err(format!("Server.listen: {refusal}").into());
+        }
         let mut app: axum::Router = axum::Router::new();
         // At most ONE mounted web app per server: the embedded app's cookie /
         // CSRF / asset paths are scoped through the process-wide base path
@@ -3538,6 +3568,27 @@ mod tests {
         ));
     }
 
+    /// A `Cookie` header with one non-ASCII byte keeps every other cookie: the
+    /// pair holding the byte is skipped, the session cookie beside it is read.
+    #[tokio::test]
+    async fn build_request_keeps_the_cookies_beside_a_non_ascii_pair() {
+        let tossed = axum::http::HeaderValue::from_bytes(b"x=\x80; sid=v")
+            .expect("obs-text is a valid header value");
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(axum::http::header::COOKIE, tossed)
+            .header(axum::http::header::COOKIE, "csrf=t")
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let Some(Ok(req)) = routed_build("/", wire).await else {
+            panic!("the request builds");
+        };
+        assert_eq!(req.cookies.get("sid").map(String::as_str), Some("v"));
+        assert_eq!(req.cookies.get("csrf").map(String::as_str), Some("t"));
+        assert!(!req.cookies.contains_key("x"), "{:?}", req.cookies);
+    }
+
     /// Serve `uri` through a real `method_router` routed on `/u/:id`.
     ///
     /// The handler answers `"{id}|{q}"` from its path parameter and query, and
@@ -4350,7 +4401,7 @@ mod tests {
         );
 
         let mut c = std::collections::HashMap::new();
-        parse_cookies("sid=abc; theme=dark", &mut c);
+        parse_cookies([b"sid=abc; theme=dark".as_slice()], &mut c);
         assert_eq!(c.get("sid").map(String::as_str), Some("abc"));
         assert_eq!(c.get("theme").map(String::as_str), Some("dark"));
     }
@@ -4666,7 +4717,7 @@ mod tests {
                     panic!("name {name:?} value {value:?}: no `name=value;` pair in {lines:?}");
                 };
                 let mut jar = HashMap::new();
-                parse_cookies(&format!("other=1; {pair}"), &mut jar);
+                parse_cookies([format!("other=1; {pair}").as_bytes()], &mut jar);
                 let req = mk_req("GET", jar, HashMap::new());
                 assert_eq!(
                     server_get_cookie(name.clone(), req),
@@ -4693,7 +4744,10 @@ mod tests {
             Some("é%".to_owned())
         );
         let mut jar = HashMap::new();
-        parse_cookies("a=%ZZ; b=%C3; c=%FF%FE; d=%4; e=ok; =v; s%69d=v", &mut jar);
+        parse_cookies(
+            [b"a=%ZZ; b=%C3; c=%FF%FE; d=%4; e=ok; =v; s%69d=v".as_slice()],
+            &mut jar,
+        );
         assert_eq!(jar.len(), 1, "{jar:?}");
         assert_eq!(jar.get("e").map(String::as_str), Some("ok"));
         for name in ["a", "b", "c", "d", "", "sid", "s%69d"] {

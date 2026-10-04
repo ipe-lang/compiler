@@ -732,7 +732,7 @@ fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, String> {
         && let Ok(cookie_str) = html_doc.cookie()
     {
         // The server's `Cookie` grammar: decoded, canonical names only, first value wins.
-        for (k, v) in crate::http_header::cookie::request_cookies(&cookie_str) {
+        for (k, v) in crate::http_header::cookie::request_cookies([cookie_str.as_bytes()]) {
             cookies.entry(k).or_insert(v);
         }
     }

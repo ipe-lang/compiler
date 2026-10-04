@@ -1703,7 +1703,11 @@ fn with_page_headers(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
 ) -> axum::response::Response {
-    with_page_headers_from(resp, cookies, csrf::security_headers())
+    use axum::response::IntoResponse;
+    let Ok(security) = csrf::security_headers() else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    with_page_headers_from(resp, cookies, security)
 }
 
 /// [`with_page_headers`] over an explicit security-header set.
@@ -1778,7 +1782,7 @@ mod page_headers_tests {
         let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
         let csp = vec![(
             "content-security-policy",
-            "frame-ancestors https://\u{e9}.example".to_owned(),
+            "frame-ancestors https://a.example\r\nX-Injected: 1".to_owned(),
         )];
         let resp = with_page_headers_from(ok(), &[&session], csp);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -2653,6 +2657,8 @@ pub(crate) enum StartupRefusal {
     },
     /// An environment ceiling the app applies is present but malformed.
     Ceiling(crate::system::EnvCeilingRefusal),
+    /// `IPE_WEB_FRAME_ANCESTORS` has no `frame-ancestors` representation.
+    FrameAncestors(crate::telemetry::FrameAncestorsRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -2665,6 +2671,7 @@ impl std::fmt::Display for StartupRefusal {
                 write!(f, "web base path `{base}` is malformed: {refusal}")
             }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
+            Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -5009,6 +5016,9 @@ where
     if let Err(refusal) = client_tuning_js() {
         return Err(StartupRefusal::Ceiling(refusal.clone()));
     }
+    // The framing policy every page carries is parsed here, so a value with no
+    // header representation refuses the router; the page path re-checks it.
+    crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               uri: axum::http::Uri,
@@ -9643,6 +9653,10 @@ mod emitted_router_behavior_tests {
                     .to_string(),
             )),
             parse_route_base("/%zz").expect_err("the base is malformed"),
+            StartupRefusal::FrameAncestors(
+                crate::telemetry::FrameAncestors::parse("https://a.example\r\n")
+                    .expect_err("a CR/LF source list is refused"),
+            ),
         ];
         for cause in causes {
             let detail = cause.to_string();

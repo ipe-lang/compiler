@@ -1011,7 +1011,8 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Space-separated `Content-Security-Policy: frame-ancestors` allow-list, \
                   e.g. `https://app.example.com`. Enables embedding this app in a \
                   third-party iframe; also sets `SameSite=None; Secure` on session \
-                  cookies.",
+                  cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
+                  or only whitespace refuses to start the server.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },

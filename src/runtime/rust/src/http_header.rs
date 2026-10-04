@@ -251,37 +251,64 @@ pub mod cookie {
         crate::encoding::decode_component(wire, crate::encoding::UrlGrammar::Path).ok()
     }
 
-    /// The decoded `(name, value)` pairs of one `Cookie` header or of
-    /// `document.cookie`, in order.
+    /// The most `;`-separated pieces read from one request's cookie jar.
     ///
-    /// A pair is kept only when its wire name is exactly the encoding of a
-    /// non-empty name, so a lookup by name matches only what a `Set-Cookie`
-    /// line would have written for it, and when its value decodes. Every other
-    /// pair is skipped. Each name is the program's text.
-    pub fn request_cookies(header: &str) -> impl Iterator<Item = (String, String)> + '_ {
-        header.split(';').filter_map(|pair| {
-            let (wire_name, wire_value) = pair.split_once('=')?;
-            let wire_name = wire_name.trim();
-            let name = CookieName::parse(&decode(wire_name)?)?;
-            if name.as_str() != wire_name {
-                return None;
-            }
-            let value = decode(wire_value.trim())?;
-            Some((name.text, value))
-        })
+    /// Counted over every `Cookie` header of the request together, before any
+    /// piece is decoded, so the work a jar costs is bounded. Pieces past the
+    /// ceiling are dropped: a browser keeps fewer cookies per domain than
+    /// this, so only a jar no browser sends loses them.
+    pub const MAX_REQUEST_COOKIES: std::num::NonZeroUsize =
+        std::num::NonZeroUsize::MIN.saturating_add(255);
+
+    /// The decoded `(name, value)` pairs of one request's cookie jar, in order:
+    /// the raw bytes of every `Cookie` header, or of `document.cookie`.
+    ///
+    /// Each `;`-separated pair is judged on its own bytes: a pair holding a
+    /// byte outside visible ASCII and tab is skipped, never the whole header,
+    /// so a cookie another party set cannot drop the session or CSRF cookie
+    /// beside it. A pair is kept only when its wire name is exactly the
+    /// encoding of a non-empty name, so a lookup by name matches only what a
+    /// `Set-Cookie` line would have written for it, and when its value
+    /// decodes. Every other pair is skipped. Each name is the program's text.
+    /// At most [`MAX_REQUEST_COOKIES`] pieces are read.
+    pub fn request_cookies<'a, I>(jar: I) -> impl Iterator<Item = (String, String)> + 'a
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+        I::IntoIter: 'a,
+    {
+        jar.into_iter()
+            .flat_map(|header| header.split(|b| *b == b';'))
+            .take(MAX_REQUEST_COOKIES.get())
+            .filter_map(request_cookie_pair)
+    }
+
+    /// One decoded `name=value` pair of a `Cookie` header, or `None` to skip it.
+    fn request_cookie_pair(pair: &[u8]) -> Option<(String, String)> {
+        if !pair.iter().all(|&b| matches!(b, b'\t' | b' '..=b'~')) {
+            return None;
+        }
+        let (wire_name, wire_value) = std::str::from_utf8(pair).ok()?.split_once('=')?;
+        let wire_name = wire_name.trim();
+        let name = CookieName::parse(&decode(wire_name)?)?;
+        if name.as_str() != wire_name {
+            return None;
+        }
+        let value = decode(wire_value.trim())?;
+        Some((name.text, value))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{CookieName, CookieValue, decode, request_cookies};
+        use super::{CookieName, CookieValue, MAX_REQUEST_COOKIES, decode, request_cookies};
 
         /// The browser reader and the server parser are one function: a pair
         /// decodes, and a non-canonical or undecodable pair is skipped.
         #[test]
         fn request_cookies_decodes_and_skips_non_canonical_pairs() {
-            let pairs: Vec<(String, String)> = request_cookies(
-                "my%20sid=%C3%A9%3B%25; ipe%5Fsid=forged; a=%ZZ; =v; theme=dark; theme=light",
-            )
+            let pairs: Vec<(String, String)> = request_cookies([
+                b"my%20sid=%C3%A9%3B%25; ipe%5Fsid=forged; a=%ZZ; =v; theme=dark; theme=light"
+                    .as_slice(),
+            ])
             .collect();
             assert_eq!(
                 pairs,
@@ -290,6 +317,48 @@ pub mod cookie {
                     ("theme".to_owned(), "dark".to_owned()),
                     ("theme".to_owned(), "light".to_owned()),
                 ]
+            );
+        }
+
+        /// A pair holding a byte outside visible ASCII is skipped on its own:
+        /// the session cookie beside it survives, in every header of the jar.
+        #[test]
+        fn request_cookies_skip_only_the_pair_with_a_non_ascii_byte() {
+            let jar: [&[u8]; 3] = [
+                b"x=\xC3\xA9; ipe_sid=abc",
+                b"y=\x80; z=\x01v; csrf=t",
+                b"w=\x7F",
+            ];
+            let pairs: Vec<(String, String)> = request_cookies(jar).collect();
+            assert_eq!(
+                pairs,
+                [
+                    ("ipe_sid".to_owned(), "abc".to_owned()),
+                    ("csrf".to_owned(), "t".to_owned()),
+                ]
+            );
+        }
+
+        /// A jar reads at most the ceiling's pieces, counted across headers.
+        #[test]
+        fn request_cookies_read_at_most_the_ceiling() {
+            let max = MAX_REQUEST_COOKIES.get();
+            let first = (1..max)
+                .map(|i| format!("c{i}=v"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let second = "last=v; over=v";
+            let pairs: Vec<(String, String)> =
+                request_cookies([first.as_bytes(), second.as_bytes()]).collect();
+            assert_eq!(pairs.len(), max, "{} pairs read", pairs.len());
+            assert_eq!(
+                pairs.last().map(|(k, _)| k.as_str()),
+                Some("last"),
+                "the pair at the ceiling is read"
+            );
+            assert!(
+                pairs.iter().all(|(k, _)| k != "over"),
+                "a pair past the ceiling is dropped"
             );
         }
 
