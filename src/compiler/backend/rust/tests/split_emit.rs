@@ -18,6 +18,7 @@
 //! `SqlValue`/`SqlField` Prelude built-ins the lowerer injects, carrying the
 //! empty canonical home — see design doc §2.2).
 
+use ipe_backend::Backend;
 use ipe_backend_rust::RustBackend;
 use ipe_diagnostics::DResult;
 use ipe_intern::Interner;

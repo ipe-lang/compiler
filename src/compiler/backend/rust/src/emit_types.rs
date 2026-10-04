@@ -1234,40 +1234,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     // would be an `ipe`-0-then-cargo-fail `E0599`. A fully-derivable record takes
     // the derive above instead, so the two paths never both emit a `Clone` impl.
     let clone_impl = if rec.is_clone && !rec.is_derivable {
-        let field_clones: Vec<String> = rec
-            .fields
-            .iter()
-            .map(|(field_name, _)| {
-                let ident = mangle_reserved(field_name.clone());
-                format!("            {ident}: self.{ident}.clone(),")
-            })
-            .collect();
-        // Every type parameter carries a `Clone` bound: the bare-variable
-        // admission in the `is_clone` fixpoint (`field_is_clone`) is sound
-        // only under it — a record may carry a bare-`Tn` field (or a `SharedFun`
-        // slot keyed on `Tn`) whose per-`Tn` clone rides this bound, exactly as
-        // the sibling function-carrier enum's hand-written `impl<Tn: Clone> Clone`.
-        let impl_clone_bounds = if params.is_empty() {
-            String::new()
-        } else {
-            let bounds: Vec<String> = params
-                .iter()
-                .map(|p| format!("{p}: Clone{bound_static}"))
-                .collect();
-            format!("<{}>", bounds.join(", "))
-        };
-        let clone_head = impl_header(&impl_clone_bounds, "Clone", &format!("{name}{use_clause}"));
-        format!(
-            "{clone_head}
-    fn clone(&self) -> Self {{
-        Self {{
-{}
-        }}
-    }}
-}}
-",
-            field_clones.join("\n"),
-        )
+        emit_record_clone_impl(rec, &params, bound_static, &format!("{name}{use_clause}"))
     } else {
         String::new()
     };
@@ -1286,6 +1253,52 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
 }}"
     ));
     Ok(items.render())
+}
+
+/// The hand-written `impl Clone` of a record that is `Clone` but not derivable,
+/// cloning every field. `params` are the struct's `T1..Tn` names and
+/// `for_type` is the impl's `for` type (`Name<T1, ..>`).
+///
+/// Every type parameter carries a `Clone` bound: the bare-variable admission in
+/// the `is_clone` fixpoint (`field_is_clone`) is sound only under it — a record
+/// may carry a bare-`Tn` field (or a `SharedFun` slot keyed on `Tn`) whose
+/// per-`Tn` clone rides this bound, exactly as the sibling function-carrier
+/// enum's hand-written `impl<Tn: Clone> Clone`.
+fn emit_record_clone_impl(
+    rec: &RecordStruct,
+    params: &[String],
+    bound_static: &str,
+    for_type: &str,
+) -> String {
+    let field_clones: Vec<String> = rec
+        .fields
+        .iter()
+        .map(|(field_name, _)| {
+            let ident = mangle_reserved(field_name.clone());
+            format!("            {ident}: self.{ident}.clone(),")
+        })
+        .collect();
+    let impl_clone_bounds = if params.is_empty() {
+        String::new()
+    } else {
+        let bounds: Vec<String> = params
+            .iter()
+            .map(|p| format!("{p}: Clone{bound_static}"))
+            .collect();
+        format!("<{}>", bounds.join(", "))
+    };
+    let clone_head = impl_header(&impl_clone_bounds, "Clone", for_type);
+    format!(
+        "{clone_head}
+    fn clone(&self) -> Self {{
+        Self {{
+{}
+        }}
+    }}
+}}
+",
+        field_clones.join("\n"),
+    )
 }
 
 /// Every distinct field name required by any row-polymorphic function's
