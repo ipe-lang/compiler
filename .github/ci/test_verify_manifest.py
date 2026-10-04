@@ -6376,7 +6376,7 @@ jobs:
       - shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
   release-targets-freebsd:
     runs-on: ubuntu-latest
     steps:
@@ -6385,7 +6385,7 @@ jobs:
           usesh: true
           prepare: pkg install -y rust
           run: |
-            cargo check --release --locked -p ipe -p ipe-ffi-inspector
+            cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 """
 _RT_RELEASE = """\
 on: workflow_dispatch
@@ -6413,7 +6413,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          cargo build --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+          cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
           mkdir -p dist
   build-freebsd:
     runs-on: ubuntu-latest
@@ -6423,7 +6423,7 @@ jobs:
           usesh: true
           prepare: pkg install -y rust
           run: |
-            cargo build --release --locked -p ipe -p ipe-ffi-inspector
+            cargo build --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
             mkdir -p dist
       - uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
@@ -6491,18 +6491,30 @@ class TestReleaseTargetParity(unittest.TestCase):
             ("--release --locked", "--locked"),
             ("--release --locked", "--release"),
             ("--release --locked", "--release --locked --features wasi_run"),
+            (" --features ipe/wasi_run", " --features ipe/signing"),
             (" -p ipe -p ipe-ffi-inspector", " -p ipe"),
-            ("--release --locked --target", "--release --locked --offline --target"),
+            ("--release --locked --features", "--release --locked --offline --features"),
         ):
             with self.subTest(change=new):
                 self.assertRefused("native cargo command", self.swap(_RT_CI, old, new))
 
     def test_release_dropping_locked_is_refused(self) -> None:
-        release = self.swap(_RT_RELEASE, "cargo build --release --locked --target", "cargo build --release --target")
+        release = self.swap(_RT_RELEASE, "cargo build --release --locked --features", "cargo build --release --features")
         self.assertRefused("native cargo command", release=release)
 
+    def test_release_builds_must_ship_the_feature(self) -> None:
+        # Dropped from both workflows alike: still equal, still refused.
+        ci = _RT_CI.replace(" --features ipe/wasi_run", "")
+        release = _RT_RELEASE.replace(" --features ipe/wasi_run", "")
+        self.assertRefused("job 'build' builds without `--features ipe/wasi_run`", ci, release)
+        self.assertRefused("job 'build-freebsd' builds without `--features ipe/wasi_run`", ci, release)
+        # The `=` spelling is the same switch.
+        ci = _RT_CI.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
+        release = _RT_RELEASE.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
+        self.assertEqual(self.errors(ci, release), [])
+
     def test_ci_must_check_not_build(self) -> None:
-        self.assertRefused("must run `cargo check`", self.swap(_RT_CI, "cargo check --release --locked --target", "cargo build --release --locked --target"))
+        self.assertRefused("must run `cargo check`", self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features"))
 
     def test_toolchain_or_musl_drift_refused(self) -> None:
         self.assertRefused("native toolchain step", self.swap(_RT_CI, "targets: ${{ matrix.target }}", "targets: x86_64-unknown-linux-musl"))
@@ -6530,7 +6542,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         )
 
     def test_freebsd_cargo_drift_refused(self) -> None:
-        for old, new in (("--release --locked -p", "--release -p"), (" -p ipe-ffi-inspector\n", "\n")):
+        for old, new in (("--release --locked --features", "--release --features"), (" -p ipe-ffi-inspector\n", "\n")):
             with self.subTest(change=new):
                 ci = _RT_CI.rsplit(old, 1)
                 self.assertRefused("FreeBSD cargo command", new.join(ci))

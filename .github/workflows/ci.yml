@@ -488,7 +488,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
 
   # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
   # that leg's check, with release.yml's `uses`, prelude and cargo line.
@@ -504,7 +504,7 @@ jobs:
           usesh: true
           prepare: pkg install -y rust
           run: |
-            cargo check --release --locked -p ipe -p ipe-ffi-inspector
+            cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 
   # Required context for the release-target jobs: the phase verdict (see the header).
   release-targets:

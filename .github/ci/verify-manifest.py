@@ -378,7 +378,9 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       (`build` there, `check` here); and release.yml's completeness
       `expected` list is exactly the artifacts its jobs publish.  A job,
       matrix, cargo line or VM step that is absent or not one literal
-      is refused.  LIMIT: `cargo check` does not link, so a link-time
+      is refused.  Both release builds carry `--features ipe/wasi_run`, so
+      the shipped `ipe` has the embedded WASI run its refusal text promises.
+      LIMIT: `cargo check` does not link, so a link-time
       failure of a target is not seen; the FreeBSD toolchain is the VM's
       unpinned `pkg install rust`.
 
@@ -5656,6 +5658,9 @@ CI_RELEASE_NATIVE_JOB = "release-targets-run"
 CI_RELEASE_FREEBSD_JOB = "release-targets-freebsd"
 _TOOLCHAIN_ACTION = "./.github/actions/rust-toolchain-pinned"
 _RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
+# The feature release binaries ship: `ipe dev run --target wasi` needs it, and
+# its refusal text promises it "in release packaging".
+RELEASE_FEATURE = "ipe/wasi_run"
 
 
 def _steps_of(job: dict) -> list[dict]:
@@ -5701,6 +5706,20 @@ def _cargo_tokens(job: dict, where: str, verb: str, errors: list[str], vm_run: b
         errors.append(f"check 23: {where}: `{line}` must run `cargo {verb}`")
         return None
     return [tokens[0], "<verb>", *tokens[2:]]
+
+
+def _require_feature(tokens: list[str] | None, where: str, errors: list[str]) -> None:
+    """A release build's cargo command switches on `RELEASE_FEATURE`."""
+    if tokens is None:
+        return
+    spelled = any(
+        t == f"--features={RELEASE_FEATURE}" or (t == "--features" and nxt == RELEASE_FEATURE)
+        for t, nxt in zip(tokens, [*tokens[1:], ""])
+    )
+    if not spelled:
+        errors.append(
+            f"check 23: {where} builds without `--features {RELEASE_FEATURE}`; release binaries must ship it"
+        )
 
 
 def _matrix_legs(job: dict, where: str, errors: list[str]) -> dict[str, dict] | None:
@@ -5783,6 +5802,7 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     rel_cargo = _cargo_tokens(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", "build", errors)
     if ci_cargo is not None and rel_cargo is not None:
         _compare("native cargo command (verb aside)", ci_cargo, rel_cargo, errors)
+    _require_feature(rel_cargo, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
     ci_tc = [s.get("with") for s in _steps_of(ci_native) if s.get("uses") == _TOOLCHAIN_ACTION]
     rel_tc = [s.get("with") for s in _steps_of(rel_native) if s.get("uses") == _TOOLCHAIN_ACTION]
     _compare("native toolchain step", ci_tc, rel_tc, errors)
@@ -5808,6 +5828,7 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     )
     if ci_bsd_cargo is not None and rel_bsd_cargo is not None:
         _compare("FreeBSD cargo command (verb aside)", ci_bsd_cargo, rel_bsd_cargo, errors)
+    _require_feature(rel_bsd_cargo, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors)
 
     if rel_legs is None:
         return
