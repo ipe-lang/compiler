@@ -3143,26 +3143,37 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
 /// built binary — cargo names the binary artifact after the crate, so this is
 /// the per-project path-uniquified identity (`<friendly>_<hash>`), NOT the
 /// user-facing friendly name. Falls back to `"ipe-app"` when the manifest is
-/// absent or unparseable — never panics. For a user-facing artifact filename or
-/// message use [`friendly_artifact_name`], which never carries the hash.
+/// absent, past [`crate::io_bounded::MANIFEST_READ_CAP`], unparseable, or names
+/// anything but a plain file name (letters, digits, `_`, `-`), so the result
+/// joins onto a target directory as one path component and a missing binary
+/// is then refused by name. For a user-facing artifact filename or message use
+/// [`friendly_artifact_name`], which never carries the hash.
 pub fn emitted_bin_name(crate_dir: &Path) -> String {
     let manifest = crate_dir.join("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
+    let Ok(text) =
+        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::MANIFEST_READ_CAP)
+    else {
         return "ipe-app".to_owned();
     };
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("name") {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix('=') {
-                let value = rest.trim().trim_matches('"');
-                if !value.is_empty() {
-                    return value.to_owned();
-                }
-            }
-        }
-    }
-    "ipe-app".to_owned()
+    let plain = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    text.lines()
+        .find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("name")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim()
+                .trim_matches('"');
+            (!value.is_empty()).then_some(value)
+        })
+        .filter(|value| plain(*value))
+        .map_or_else(|| "ipe-app".to_owned(), str::to_owned)
 }
 
 /// The on-disk filename cargo gives the emitted crate's executable, ready to
@@ -4316,6 +4327,40 @@ mod help_on_misuse_tests {
     /// A directory with a project manifest is a project, never an artifact:
     /// a planted wrapper beside `package.ipe` or `ipe.toml` is not what
     /// `release run` runs. The same directory without a manifest is one.
+    /// The crate name joins onto a target dir as one plain component; a
+    /// traversal, a separator, or an oversized manifest yields the default.
+    #[test]
+    fn emitted_bin_name_is_one_plain_component_or_the_default() {
+        let dir = crate::scratch::ScratchDir::new("emitted-bin-name").expect("scratch dir");
+        let manifest = dir.path().join("Cargo.toml");
+        let named = |text: &str| {
+            std::fs::write(&manifest, text).expect("write Cargo.toml");
+            super::emitted_bin_name(dir.path())
+        };
+        assert_eq!(
+            named("[package]\nname = \"shop_ab12-cd\"\n"),
+            "shop_ab12-cd"
+        );
+        for hostile in ["../../escape", "a/b", "a\\\\b", "..", "x.exe"] {
+            assert_eq!(
+                named(&format!("[package]\nname = \"{hostile}\"\n")),
+                "ipe-app",
+                "{hostile:?} is not one plain path component"
+            );
+        }
+        let cap = usize::try_from(crate::io_bounded::MANIFEST_READ_CAP).expect("cap fits usize");
+        let oversized = format!("[package]\nname = \"big\"\n{}", "#".repeat(cap));
+        assert_eq!(
+            named(&oversized),
+            "ipe-app",
+            "a manifest past the cap is not read"
+        );
+        assert_eq!(
+            super::emitted_bin_name(&dir.path().join("absent")),
+            "ipe-app"
+        );
+    }
+
     #[test]
     fn a_project_dir_is_never_a_prebuilt_artifact() {
         let tmp = ipe_test_temp::temp_root()
