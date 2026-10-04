@@ -348,3 +348,75 @@ fn scoped_parity_adversarial_edits_warm() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Importer-pinnable UI-msg slots: a module whose own solved facts depend on
+// its importers' use sites never takes the scoped path.
+// ---------------------------------------------------------------------------
+
+const MSG_MAIN: &str = "module Main exposing (main)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\
+     import Ipe.Io as Io\n\
+     import Lib exposing (sharedRow)\n\n\
+     type Msg\n    = Click\n\n\
+     view : Html Msg\n\
+     view =\n    Html.div [] [ sharedRow ]\n\n\
+     main =\n    Io.println (Html.render view)\n";
+// Unannotated: the msg-only quantified root defaults to `()` unless a
+// cross-module use pins it, and only the joint solve sees that use.
+const MSG_LIB_UNTYPED: &str = "module Lib exposing (sharedRow)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\n\
+     sharedRow =\n    Html.div [] [ Html.text \"shared\" ]\n";
+// Annotated: `msg` is a message-only result slot whose defaulting reads every
+// use site, importers' included.
+const MSG_LIB_TYPED: &str = "module Lib exposing (sharedRow)\n\n\
+     import Ipe.Html as Html exposing (Html)\n\n\
+     sharedRow : Html msg\n\
+     sharedRow =\n    Html.div [] [ Html.text \"shared\" ]\n";
+
+/// An exported message-only UI slot refuses the scoped path for its module
+/// and every importer, and the fallback still agrees with the joint solve.
+#[test]
+fn importer_pinnable_msg_slot_refuses_scoped_path() {
+    let lib: &[&str] = &["Lib"];
+    let main: &[&str] = &["Main"];
+    for (label, lib_src) in [("untyped", MSG_LIB_UNTYPED), ("typed", MSG_LIB_TYPED)] {
+        let (sources, injected) = prepared(&sources_of(&[(main, MSG_MAIN), (lib, lib_src)]));
+        let db = ipe_db::IpeDatabase::new();
+        let root =
+            ipe::create_source_root(&db, &sources, &injected, &std::collections::BTreeSet::new());
+        let file_at = |path: &[&str]| {
+            root.files(&db)
+                .iter()
+                .find(|(p, _)| p.iter().map(String::as_str).eq(path.iter().copied()))
+                .map(|(_, f)| *f)
+        };
+        let (lib_file, main_file) = (file_at(lib), file_at(main));
+        assert!(
+            lib_file.is_some() && main_file.is_some(),
+            "[{label}] fixture must carry Lib and Main"
+        );
+        let (Some(lib_file), Some(main_file)) = (lib_file, main_file) else {
+            return;
+        };
+        assert!(
+            ipe_db::typecheck(&db, root, main_file).is_ok(),
+            "[{label}] program must type-check"
+        );
+        assert!(
+            ipe_db::typed_interface(&db, root, lib_file).is_none(),
+            "[{label}] an exported message-only UI slot must yield an OPEN interface"
+        );
+        for (who, module) in [("Lib", lib_file), ("Main", main_file)] {
+            assert!(
+                matches!(
+                    ipe_db::infer_module_scoped(&db, root, module),
+                    ipe_db::ScopedModuleTypes::WholeProgram
+                ),
+                "[{label}] {who} must fall back to the whole-program solve"
+            );
+        }
+        let (engaged, _) = assert_state_parity(label, &db, root);
+        assert_eq!(engaged, 0, "[{label}] no module may engage the scoped tier");
+    }
+}

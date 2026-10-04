@@ -8,36 +8,26 @@
 //! `lower_lambda`'s own return-type inference (`ir_type_from_ty_json`,
 //! `lower.rs` around line 5537).
 //!
-//! Root cause: `ir_type_from_ty_json`'s `Ty::Var` arm mapped EVERY free
-//! solver variable straight to `IrType::Json`, with no check against
-//! `current_poly_tvars` — unlike the sibling helpers `ir_type_from_ty` and
-//! `ir_type_from_ty_ui_msg`, which both check `current_poly_tvars` FIRST.  A
-//! nested lambda's return-type slot inside a polymorphic `Def::Typed` body
-//! solves to the SAME free var as the enclosing function's own quantified
-//! `a` — so the unconditional Json fallback emitted a closure typed
-//! `Fn(..) -> IpeTask<JsonVal>` at a call site expecting `IpeTask<T1>`: a
-//! clean exit-0-then-cargo-fail (2x E0308).
+//! The rule this pins: a nested lambda's return-type slot inside a
+//! polymorphic `Def::Typed` body solves to the SAME free var as the enclosing
+//! function's own quantified `a`, so `ir_type_from_ty_json` resolves a
+//! `Ty::Var` against `current_poly_tvars` before its `IrType::Json`
+//! fallback, exactly as `ir_type_from_ty` and `ir_type_from_ty_ui_msg` do.
+//! A Json fallback here types the closure `Fn(..) -> IpeTask<JsonVal>` at a
+//! call site expecting `IpeTask<T1>` (2x E0308, exit-0-then-cargo-fail).
 //!
-//! A second, independent layer of the SAME bug was found while chasing this:
-//! `SolvedTypes::poly_var_map`'s "typed-rigids" entries are keyed by the BARE
-//! union-find representative (a typed binding's own `params`/`ret` are read
-//! from its annotation, never zonked) — but a `Ty::Var` read back from a
-//! ZONKED region (`region_ty`, used by every nested-lambda return-type
-//! lookup) is ALWAYS tagged via `ipe_types::tag_solver_var`.  So even after
-//! adding the `current_poly_tvars` check to `ir_type_from_ty_json`, the
-//! lookup still silently missed for every TYPED enclosing binding (it only
-//! matched for boundary-scheme-promoted UNTYPED bindings, whose
-//! `poly_var_map` entries ARE tagged).  Fixed by a shared
-//! `Lowerer::poly_tvar_symbol` helper that probes both the tagged and
-//! untagged form before giving up — used by all three `Ty::Var`-vs-
-//! `current_poly_tvars` call sites (`ir_type_from_ty`, `ir_type_from_ty_ui_msg`,
-//! `ir_type_from_ty_json`) for consistency.
+//! The lookup is exact over one key form: every `SolvedTypes::poly_var_map`
+//! key, typed and boundary-promoted untyped bindings alike, is the
+//! solver-tagged representative (`ipe_types::tag_solver_var`), the form a
+//! zonked region `Ty::Var` (`region_ty`, read by every nested-lambda
+//! return-type lookup) carries. `Lowerer::poly_tvar_symbol`, shared by all
+//! three `Ty::Var`-vs-`current_poly_tvars` sites, answers a tagged raw by
+//! exact lookup and an untagged raw (an annotation symbol) with no generic.
 //!
-//! Post-fix: ipe build succeeds; the emitted `main_with_error_reporting`
-//! is generic over `T1` throughout (no `JsonVal`); cargo build + run confirm
+//! Expected: ipe build succeeds; the emitted `main_with_error_reporting` is
+//! generic over `T1` throughout (no `JsonVal`); cargo build + run confirm
 //! BOTH the success path (untouched result) and Task.onError's fallback path
-//! (original error is replaced by the "ref <token>" wrapper) work correctly
-//! at runtime.
+//! (original error is replaced by the "ref <token>" wrapper) at runtime.
 //!
 //! ```text
 //! # gate check always (no IPE_E2E needed):

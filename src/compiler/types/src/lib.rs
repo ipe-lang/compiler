@@ -52,7 +52,8 @@ pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
-    RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var, untag_solver_var,
+    RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, VarCeiling, is_solver_var,
+    tag_solver_var,
 };
 
 use constrain::{
@@ -129,13 +130,16 @@ pub struct SolvedTypes {
     /// severity is refused at construction and returned as the inference error,
     /// so a `SolvedTypes` witnesses a program that compiles.
     pub warnings: Vec<HomedWarning>,
-    /// Per-typed-binding map from union-find representative id to annotation
-    /// variable symbol, keyed by `(home, def_name)`.
+    /// Per-binding map from solver-tagged union-find representative to
+    /// annotation variable symbol, keyed by `(home, def_name)`.
     ///
     /// After solving, every annotation type variable for a `Def::Typed` binding
     /// is represented as a `Ty::Var(u32)` in the zonked region types, where the
-    /// `u32` is the union-find representative of the rigid (skolem) that was
-    /// used while checking the binding's body.  This map records that
+    /// `u32` is [`tag_solver_var`] of the union-find representative of the
+    /// rigid (skolem) that was used while checking the binding's body.  Every
+    /// key is in that tagged form, for typed and boundary-promoted untyped
+    /// bindings alike, so a lookup is exact: an untagged raw is an annotation
+    /// symbol and never names a key.  This map records that
     /// correspondence so the lowerer can tell apart a "this `Ty::Var` is a
     /// generic type parameter of the enclosing function" from a "this `Ty::Var`
     /// is a truly unconstrained, message-free subtree placeholder".
@@ -146,7 +150,7 @@ pub struct SolvedTypes {
     /// map the lowerer fell back to `IrType::Unit` (the `Attribute<()>` path),
     /// producing E0308 in the emitted Rust.  With it, the lowerer emits
     /// `IrType::Generic(parentMsg_sym)` → `Attribute<T1>`.
-    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>>,
+    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>>,
     /// Generalized type-variable symbols of each untyped top-level binding
     /// that Boundary Scheme Promotion generalized, in synthesis order (`"a"`,
     /// `"b"`, …), keyed by `(home, def_name)`. Absent or empty for a def that
@@ -192,6 +196,253 @@ pub struct SignatureWildcards {
     /// ([`ty_is_ground`]). A pinned wildcard lowers to that concrete type, so
     /// every use must instantiate it at exactly that type.
     pub pins: BTreeMap<usize, Ty>,
+}
+
+/// Which solver variables a renumbering treats as one variable.
+///
+/// A solver variable's raw id is only meaningful inside the solve that
+/// minted it, so the same raw in two modules' slices names two variables
+/// unless those slices came from one joint solve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarScope {
+    /// One raw id is one variable across every module: the joint solve's
+    /// numbering, where a variable shared by two modules stays one variable.
+    Program,
+    /// One raw id is one variable only within its owning module: slices that
+    /// were solved separately and merged, so equal raws in different modules
+    /// are distinct variables.
+    PerHome,
+}
+
+/// A renumbering ran out of ids below its [`VarCeiling`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CanonicalizeError {
+    /// More distinct solver variables than the ceiling admits.
+    VarSpaceExhausted,
+}
+
+/// A [`SolvedTypes`] in canonical form.
+///
+/// Its solver variables are densely numbered in the first-encounter order of
+/// [`canonicalize`] and its warnings are in canonical order. Built only by
+/// [`canonicalize`], so two producers of the same typed program that both pass
+/// through it agree byte for byte.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CanonicalTypes(SolvedTypes);
+
+impl CanonicalTypes {
+    /// The canonical typed program.
+    #[must_use]
+    pub const fn as_solved(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CanonicalTypes {
+    type Target = SolvedTypes;
+
+    fn deref(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+/// Dense ids for the solver variables of one typed program.
+///
+/// The one walker over every position that holds a solver-variable id: `Ty`
+/// values and the `poly_var_map` keys are renumbered through the same table.
+struct Renumbering {
+    scope: VarScope,
+    ceiling: VarCeiling,
+    /// Dense index of each owning-module key; under [`VarScope::Program`]
+    /// every module shares the one empty key.
+    homes: BTreeMap<Vec<Symbol>, u32>,
+    /// The dense variable assigned to each `(home index, original variable)`.
+    assigned: BTreeMap<(u32, SolverVar), SolverVar>,
+}
+
+impl Renumbering {
+    const fn new(scope: VarScope, ceiling: VarCeiling) -> Self {
+        Self {
+            scope,
+            ceiling,
+            homes: BTreeMap::new(),
+            assigned: BTreeMap::new(),
+        }
+    }
+
+    /// The dense index of the module owning a key.
+    fn home(&mut self, home: &[Symbol]) -> Result<u32, CanonicalizeError> {
+        let key: &[Symbol] = match self.scope {
+            VarScope::Program => &[],
+            VarScope::PerHome => home,
+        };
+        if let Some(&index) = self.homes.get(key) {
+            return Ok(index);
+        }
+        let index =
+            u32::try_from(self.homes.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        self.homes.insert(key.to_vec(), index);
+        Ok(index)
+    }
+
+    /// The dense variable for `var` in module `home`, minting the next id on first sight.
+    fn var(&mut self, home: u32, var: SolverVar) -> Result<SolverVar, CanonicalizeError> {
+        if let Some(&dense) = self.assigned.get(&(home, var)) {
+            return Ok(dense);
+        }
+        let next =
+            u32::try_from(self.assigned.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        if next >= self.ceiling.get() {
+            return Err(CanonicalizeError::VarSpaceExhausted);
+        }
+        let dense = SolverVar::from_var(next);
+        self.assigned.insert((home, var), dense);
+        Ok(dense)
+    }
+
+    /// A raw id from the [`Ty::Var`] id space.
+    ///
+    /// A solver variable is renumbered; an annotation-symbol raw is kept.
+    fn raw(&mut self, home: u32, raw: u32) -> Result<u32, CanonicalizeError> {
+        let Some(var) = SolverVar::from_raw(raw) else {
+            return Ok(raw);
+        };
+        Ok(self.var(home, var)?.raw())
+    }
+
+    /// Renumber every solver variable of `ty` in place, in pre-order.
+    fn ty(&mut self, home: u32, ty: &mut Ty) -> Result<(), CanonicalizeError> {
+        match ty {
+            Ty::Var(raw) => *raw = self.raw(home, *raw)?,
+            Ty::Unit => {}
+            Ty::Fun(arg, result) => {
+                self.ty(home, arg)?;
+                self.ty(home, result)?;
+            }
+            Ty::Tuple(elems) => {
+                for elem in elems {
+                    self.ty(home, elem)?;
+                }
+            }
+            Ty::Record(fields, tail) => {
+                for field in fields.values_mut() {
+                    self.ty(home, field)?;
+                }
+                match tail {
+                    RowTail::Closed => {}
+                    RowTail::Open(raw) => *raw = self.raw(home, *raw)?,
+                }
+            }
+            Ty::Con {
+                module: _,
+                name: _,
+                args,
+            } => {
+                for arg in args {
+                    self.ty(home, arg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Renumber in place every `Ty` value of a map keyed by `(home, _)`.
+    fn ty_map<K>(
+        &mut self,
+        map: &mut BTreeMap<(Vec<Symbol>, K), Ty>,
+    ) -> Result<(), CanonicalizeError> {
+        for ((home, _), ty) in map {
+            let home = self.home(home)?;
+            self.ty(home, ty)?;
+        }
+        Ok(())
+    }
+}
+
+/// The canonical order of warnings: owning module, then span, then code.
+fn sort_warnings(mut warnings: Vec<HomedWarning>) -> Vec<HomedWarning> {
+    fn key(warning: &HomedWarning) -> (&[Symbol], u32, u32, &'static str) {
+        let span = warning.diagnostic().primary_span();
+        (
+            warning.home(),
+            span.lo,
+            span.hi,
+            warning.diagnostic().code().as_str(),
+        )
+    }
+    warnings.sort_by(|a, b| key(a).cmp(&key(b)));
+    warnings
+}
+
+/// Put a typed program into canonical form.
+///
+/// Solver variables are renumbered densely from 0 in first-encounter order
+/// over a fixed traversal: `env`, `regions`, `expected`, the
+/// `signature_wildcards` pins, then the `poly_var_map` keys, each in map
+/// order. The `Ty` values and the `poly_var_map` keys share one table, so a
+/// generic keyed in `poly_var_map` stays the variable its region types name.
+/// Only solver-tagged raws are renumbered; an untagged raw is an annotation
+/// symbol and is kept. Warnings are put in canonical order.
+///
+/// `scope` decides whether equal raws in different modules are one variable
+/// ([`VarScope::Program`]) or two ([`VarScope::PerHome`]); a program in which
+/// a variable is shared between modules numbers differently under the two.
+///
+/// # Errors
+/// [`CanonicalizeError::VarSpaceExhausted`] when the program holds more
+/// distinct solver variables than `ceiling` admits. The count never
+/// saturates, so no two variables ever share an id.
+pub fn canonicalize(
+    types: SolvedTypes,
+    scope: VarScope,
+    ceiling: VarCeiling,
+) -> Result<CanonicalTypes, CanonicalizeError> {
+    let SolvedTypes {
+        mut env,
+        mut regions,
+        mut expected,
+        bounds,
+        warnings,
+        mut poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        mut signature_wildcards,
+    } = types;
+    let mut table = Renumbering::new(scope, ceiling);
+    table.ty_map(&mut env)?;
+    table.ty_map(&mut regions)?;
+    table.ty_map(&mut expected)?;
+    for ((home, _), wildcards) in &mut signature_wildcards {
+        let SignatureWildcards {
+            param_counts: _,
+            pins,
+        } = wildcards;
+        let home = table.home(home)?;
+        for pin in pins.values_mut() {
+            table.ty(home, pin)?;
+        }
+    }
+    for ((home, _), vars) in &mut poly_var_map {
+        let home = table.home(home)?;
+        // Injective per home, so no two keys collapse into one entry.
+        *vars = std::mem::take(vars)
+            .into_iter()
+            .map(|(var, name)| -> Result<_, CanonicalizeError> {
+                Ok((table.var(home, var)?, name))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+    }
+    Ok(CanonicalTypes(SolvedTypes {
+        env,
+        regions,
+        expected,
+        bounds,
+        warnings: sort_warnings(warnings),
+        poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        signature_wildcards,
+    }))
 }
 
 /// Infer the types of a canonical module.
@@ -570,6 +821,11 @@ fn infer_core(
     // nor a kernel-alias route, marks the whole interface open — fail closed.
     let mut reified_untyped: BTreeMap<Symbol, Ty> = BTreeMap::new();
     let mut interface_open = false;
+    // Scoped solve only: whether `key` is one of this module's exported values
+    // (a binding an importer's use sites can reach).
+    let exported_by_scoped_module = |key: &(Vec<Symbol>, Symbol)| {
+        scoped.is_some_and(|ctx| key.0 == m.name && ctx.exports.values.contains(&key.1))
+    };
     if let Some(ctx) = scoped {
         for name in &ctx.exports.values {
             if ctx.exports.kernel_aliases.contains_key(name) {
@@ -809,6 +1065,12 @@ fn infer_core(
             if candidates.is_empty() {
                 continue;
             }
+            // Whether a candidate defaults depends on EVERY use site, importers'
+            // included, so an exported candidate makes this module's own solved
+            // facts importer-dependent: no per-module result is faithful.
+            if exported_by_scoped_module(key) {
+                interface_open = true;
+            }
             let empty = Vec::new();
             let apps = apps_by_binding.get(key).unwrap_or(&empty);
             let mut defaulted = BTreeSet::new();
@@ -848,20 +1110,23 @@ fn infer_core(
     // the skolems its body constrained. A variable the body never constrained
     // stays a plain rigid (no obligation, absent from the map).
     //
-    // Also build `poly_var_map`: the reverse mapping from union-find representative
-    // id → annotation var symbol, keyed by `(home, def_name)`.  The lowerer uses
+    // Also build `poly_var_map`: the reverse mapping from the solver-tagged
+    // union-find representative (`tag_solver_var(rep)`, the raw `zonk` writes
+    // into every region `Ty::Var`) → annotation var symbol, keyed by
+    // `(home, def_name)`.  The lowerer uses
     // this to distinguish "this `Ty::Var` is a generic type parameter of the
     // enclosing function" from "this `Ty::Var` is a message-free UI subtree
     // placeholder" when lowering attribute-list element types inside polymorphic
     // functions.
     let mut bounds: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>> = BTreeMap::new();
-    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>> = BTreeMap::new();
+    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>> =
+        BTreeMap::new();
     for ((home, def_name), var_rigids) in &generated.typed_rigids {
         let mut var_bounds = BTreeMap::new();
-        let mut rep_to_sym: BTreeMap<u32, Symbol> = BTreeMap::new();
+        let mut rep_to_sym: BTreeMap<SolverVar, Symbol> = BTreeMap::new();
         for (var_sym, rigid) in var_rigids {
             let rep = lift!(uf.find(*rigid));
-            rep_to_sym.insert(rep, *var_sym);
+            rep_to_sym.insert(SolverVar::from_var(rep), *var_sym);
             if let Content::Super { bounds: b, .. } = lift!(uf.content(*rigid))
                 && !b.is_empty()
             {
@@ -962,14 +1227,9 @@ fn infer_core(
 
     // Fold each Boundary-Scheme-Promoted untyped def's quantified vars into
     // `untyped_type_params` / `poly_var_map`, alongside the typed bindings'
-    // entries above. Region/env `Ty::Var`s for these defs come from `zonk`
-    // (see the `env` read-back below), which always tags a solver
-    // representative with `tag_solver_var` before storing it — so these
-    // `poly_var_map` keys must be tagged too, or `current_poly_tvars` lookups
-    // in the lowerer would never match (unlike the typed-rigids loop above,
-    // which is keyed by the untagged skolem representative because a typed
-    // binding's own `params`/`ret` are read from its ANNOTATION type, never
-    // zonked).
+    // entries above. Every `poly_var_map` key is a solver-tagged raw, the one
+    // form `zonk` writes into region/env `Ty::Var`s, so the lowerer's lookup is
+    // exact and an annotation-symbol raw can never match a variable key.
     // Unconstrained UI-msg defaulting for UNTYPED bindings -- the counterpart of
     // the typed `msg_defaulted_vars` computation above. A fully unannotated
     // message-free view helper (`nav = Html.div [] [ Html.text "x" ]`, no
@@ -1054,6 +1314,11 @@ fn infer_core(
             let tagged_sym = Symbol::from_raw(tag_solver_var(root));
             let msg_only = ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym);
             if msg_only {
+                // A cross-module use may pin this slot in the joint solve, so an
+                // exported msg-only root leaves no per-module result faithful.
+                if exported_by_scoped_module(key) {
+                    interface_open = true;
+                }
                 let rep = lift!(uf.find(root));
                 lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
             }
@@ -1079,9 +1344,9 @@ fn infer_core(
         if quantified.is_empty() {
             continue;
         }
-        let tagged: BTreeMap<u32, Symbol> = quantified
+        let tagged: BTreeMap<SolverVar, Symbol> = quantified
             .iter()
-            .map(|(&root, &sym)| (tag_solver_var(root), sym))
+            .map(|(&root, &sym)| (SolverVar::from_var(root), sym))
             .collect();
         untyped_type_params.insert(key.clone(), quantified.values().copied().collect());
         poly_var_map.insert(key.clone(), tagged);
@@ -1647,13 +1912,14 @@ enum WildcardFact {
 
 /// Classify one parameter wildcard by its solved root.
 ///
-/// `rigid_names` maps the binding's signature-variable roots to their names;
+/// `rigid_names` maps the binding's solver-tagged signature-variable roots to
+/// their names;
 /// `bare` says whether the wildcard is the parameter's whole annotation.
 fn classify_param_wildcard(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
-    rigid_names: Option<&BTreeMap<u32, Symbol>>,
+    rigid_names: Option<&BTreeMap<SolverVar, Symbol>>,
     wildcard: VarId,
     bare: bool,
 ) -> DResult<WildcardFact> {
@@ -1662,7 +1928,7 @@ fn classify_param_wildcard(
         Content::Rigid | Content::Super { rigid: true, .. } => {
             let root = uf.find(wildcard)?;
             let name = rigid_names
-                .and_then(|names| names.get(&root))
+                .and_then(|names| names.get(&SolverVar::from_var(root)))
                 .and_then(|sym| interner.resolve(*sym))
                 .map(Box::from);
             Ok(WildcardFact::Dependent(WildcardDependence::TypeVariable {
@@ -3054,6 +3320,45 @@ mod tests {
     }
 
     const M2C_HDR: &str = "module Main exposing (main)\n\n";
+
+    /// A typed binding's generic-variable keys are solver-tagged, the form its zonked regions carry.
+    ///
+    /// The lowerer looks a region `Ty::Var` up by exact key, so an untagged
+    /// key would leave the binding's generic unfound in its own body.
+    #[test]
+    fn typed_binding_poly_var_keys_are_solver_tagged_region_vars() {
+        let src = format!("{M2C_HDR}identity : a -> a\nidentity x =\n    x\n\nmain = identity 1\n");
+        let (solved, i, m) = infer_src(&src);
+        assert!(
+            matches!((&solved, &m), (Ok(_), Some(_))),
+            "identity must typecheck: {solved:?}"
+        );
+        let (Ok(solved), Some(m)) = (solved, m) else {
+            return;
+        };
+        let identity = def_key(&i, &m, "identity");
+        assert!(identity.is_some(), "identity must be defined in canon");
+        let Some(identity) = identity else { return };
+        let keys = solved.poly_var_map.get(&identity);
+        assert!(
+            keys.is_some_and(|k| !k.is_empty()),
+            "identity's generic must be recorded"
+        );
+        let Some(keys) = keys else { return };
+        let region_vars: BTreeSet<SolverVar> = solved
+            .regions
+            .iter()
+            .filter(|((home, _), _)| *home == identity.0)
+            .filter_map(|(_, ty)| match ty {
+                Ty::Var(raw) => SolverVar::from_raw(*raw),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.keys().any(|key| region_vars.contains(key)),
+            "the body's region var is a key verbatim: keys {keys:?}, region vars {region_vars:?}"
+        );
+    }
 
     #[test]
     fn generic_record_signature_typechecks() {
@@ -7535,5 +7840,435 @@ h x =
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::*;
+    use ipe_diagnostics::{NameError, ParseError};
+    use std::num::NonZeroU32;
+
+    fn syms<const N: usize>(names: [&str; N]) -> Result<[Symbol; N], String> {
+        let mut interner = Interner::new();
+        let minted = names
+            .iter()
+            .map(|name| interner.intern(name).map_err(|e| format!("{e:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        minted
+            .try_into()
+            .map_err(|_| "symbol count drifted".to_owned())
+    }
+
+    const fn empty() -> SolvedTypes {
+        SolvedTypes {
+            env: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            expected: BTreeMap::new(),
+            bounds: BTreeMap::new(),
+            warnings: Vec::new(),
+            poly_var_map: BTreeMap::new(),
+            untyped_type_params: BTreeMap::new(),
+            msg_defaulted_vars: BTreeMap::new(),
+            signature_wildcards: BTreeMap::new(),
+        }
+    }
+
+    /// The `Ty::Var` of solver variable `id`.
+    const fn tv(id: u32) -> Ty {
+        Ty::Var(SolverVar::from_var(id).raw())
+    }
+
+    const fn at(lo: u32) -> Span {
+        Span { lo, hi: lo + 1 }
+    }
+
+    fn ceiling(n: u32) -> Result<VarCeiling, String> {
+        NonZeroU32::new(n)
+            .map(VarCeiling::at_most)
+            .ok_or_else(|| "zero ceiling".to_owned())
+    }
+
+    fn run(
+        types: SolvedTypes,
+        scope: VarScope,
+        ceiling: VarCeiling,
+    ) -> Result<CanonicalTypes, String> {
+        canonicalize(types, scope, ceiling).map_err(|e| format!("{e:?}"))
+    }
+
+    fn region_values(types: &CanonicalTypes) -> Vec<Ty> {
+        types.regions.values().cloned().collect()
+    }
+
+    /// Equal raws in two modules are one variable under `Program` and two under `PerHome`.
+    ///
+    /// The two scopes therefore disagree exactly when a variable is shared
+    /// between modules, which is what makes an equality oracle between a
+    /// joint solve and a per-module merge catch cross-module sharing.
+    #[test]
+    fn a_variable_shared_between_homes_numbers_differently_per_scope() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        let mut shared = empty();
+        shared.regions.insert((vec![a], at(0)), tv(5));
+        shared.regions.insert((vec![b], at(0)), tv(5));
+
+        let program = run(shared.clone(), VarScope::Program, VarCeiling::SOLVER)?;
+        let per_home = run(shared, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(region_values(&program), vec![tv(0), tv(0)]);
+        assert_eq!(region_values(&per_home), vec![tv(0), tv(1)]);
+        assert_ne!(program, per_home);
+
+        let mut distinct = empty();
+        distinct.regions.insert((vec![a], at(0)), tv(5));
+        distinct.regions.insert((vec![b], at(0)), tv(6));
+        assert_eq!(
+            run(distinct.clone(), VarScope::Program, VarCeiling::SOLVER)?,
+            run(distinct, VarScope::PerHome, VarCeiling::SOLVER)?,
+            "without sharing the two scopes agree"
+        );
+        Ok(())
+    }
+
+    /// More distinct variables than the ceiling admits is refused, never wrapped or saturated.
+    #[test]
+    fn a_program_with_more_variables_than_the_ceiling_is_refused() -> Result<(), String> {
+        let [a, f] = syms(["A", "f"])?;
+        let mut types = empty();
+        types.regions.insert((vec![a], at(0)), tv(1));
+        types.regions.insert((vec![a], at(1)), tv(2));
+        types.regions.insert((vec![a], at(2)), tv(3));
+
+        let refused = canonicalize(types.clone(), VarScope::Program, ceiling(2)?);
+        assert_eq!(refused, Err(CanonicalizeError::VarSpaceExhausted));
+        assert!(canonicalize(types, VarScope::Program, ceiling(3)?).is_ok());
+
+        let mut keyed = empty();
+        keyed.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([
+                (SolverVar::from_var(1), f),
+                (SolverVar::from_var(2), f),
+                (SolverVar::from_var(3), f),
+            ]),
+        );
+        assert_eq!(
+            canonicalize(keyed, VarScope::Program, ceiling(2)?),
+            Err(CanonicalizeError::VarSpaceExhausted),
+            "a `poly_var_map` key counts against the ceiling"
+        );
+        Ok(())
+    }
+
+    /// A `poly_var_map` key is renumbered through the table its region types use.
+    #[test]
+    fn poly_var_keys_and_region_vars_share_one_table() -> Result<(), String> {
+        let [a, f, g, name] = syms(["A", "f", "g", "t"])?;
+        let mut types = empty();
+        types
+            .regions
+            .insert((vec![a], at(0)), Ty::Fun(Box::new(tv(9)), Box::new(tv(4))));
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(4), name)]),
+        );
+        types.poly_var_map.insert(
+            (vec![a], g),
+            BTreeMap::from([(SolverVar::from_var(77), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![Ty::Fun(Box::new(tv(0)), Box::new(tv(1)))]
+        );
+        let keys_of = |def: Symbol| -> Vec<SolverVar> {
+            canonical
+                .poly_var_map
+                .get(&(vec![a], def))
+                .map(|vars| vars.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            keys_of(f),
+            vec![SolverVar::from_var(1)],
+            "the key stays the variable its region type names"
+        );
+        assert_eq!(
+            keys_of(g),
+            vec![SolverVar::from_var(2)],
+            "a key no region names takes the next fresh id"
+        );
+        Ok(())
+    }
+
+    /// An annotation-symbol raw is kept and takes no dense id; a row tail shares the variable table.
+    #[test]
+    fn untagged_raws_are_kept_and_row_tails_are_renumbered() -> Result<(), String> {
+        let [a, field, con] = syms(["A", "x", "T"])?;
+        let mut types = empty();
+        types.regions.insert(
+            (vec![a], at(0)),
+            Ty::Con {
+                module: Vec::new(),
+                name: con,
+                args: vec![Ty::Var(7), tv(3)],
+            },
+        );
+        types.regions.insert(
+            (vec![a], at(1)),
+            Ty::Record(
+                BTreeMap::from([(field, tv(4))]),
+                RowTail::Open(SolverVar::from_var(4).raw()),
+            ),
+        );
+        types.regions.insert(
+            (vec![a], at(2)),
+            Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![
+                Ty::Con {
+                    module: Vec::new(),
+                    name: con,
+                    args: vec![Ty::Var(7), tv(0)],
+                },
+                Ty::Record(
+                    BTreeMap::from([(field, tv(1))]),
+                    RowTail::Open(SolverVar::from_var(1).raw()),
+                ),
+                Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Two programs that differ only in their raw solver ids canonicalize equal, and the form is a fixed point.
+    #[test]
+    fn canonical_form_ignores_raw_ids_and_is_idempotent() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let build = |first: u32, second: u32| {
+            let mut types = empty();
+            types.regions.insert(
+                (vec![a], at(0)),
+                Ty::Fun(Box::new(tv(first)), Box::new(tv(second))),
+            );
+            types.poly_var_map.insert(
+                (vec![a], f),
+                BTreeMap::from([(SolverVar::from_var(second), name)]),
+            );
+            types
+        };
+        let one = run(build(5, 9), VarScope::PerHome, VarCeiling::SOLVER)?;
+        let other = run(build(100, 3), VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(one, other);
+        let again = run(
+            one.as_solved().clone(),
+            VarScope::PerHome,
+            VarCeiling::SOLVER,
+        )?;
+        assert_eq!(one, again);
+        Ok(())
+    }
+
+    /// Every var-bearing position is renumbered through the one table, in the documented traversal order.
+    ///
+    /// `env`, `regions`, `expected`, the `signature_wildcards` pins and the
+    /// `poly_var_map` keys each hold one distinct variable, numbered so the
+    /// traversal meets them in reverse raw order: a skipped position keeps
+    /// its raw and a reordered traversal assigns a different dense id.
+    #[test]
+    fn every_var_position_is_renumbered_in_traversal_order() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let mut types = empty();
+        types.env.insert((vec![a], f), tv(50));
+        types.regions.insert((vec![a], at(0)), tv(40));
+        types.expected.insert((vec![a], at(0)), tv(30));
+        types.signature_wildcards.insert(
+            (vec![a], f),
+            SignatureWildcards {
+                param_counts: vec![1],
+                pins: BTreeMap::from([(0, tv(20))]),
+            },
+        );
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(10), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            canonical.env.values().cloned().collect::<Vec<_>>(),
+            vec![tv(0)]
+        );
+        assert_eq!(region_values(&canonical), vec![tv(1)]);
+        assert_eq!(
+            canonical.expected.values().cloned().collect::<Vec<_>>(),
+            vec![tv(2)]
+        );
+        assert_eq!(
+            canonical
+                .signature_wildcards
+                .get(&(vec![a], f))
+                .map(|wildcards| wildcards.pins.values().cloned().collect::<Vec<_>>()),
+            Some(vec![tv(3)])
+        );
+        assert_eq!(
+            canonical
+                .poly_var_map
+                .get(&(vec![a], f))
+                .map(|vars| vars.keys().copied().collect::<Vec<_>>()),
+            Some(vec![SolverVar::from_var(4)])
+        );
+        Ok(())
+    }
+
+    fn warning(diagnostic: Diagnostic, home: Symbol) -> Result<HomedWarning, String> {
+        HomedWarning::new(diagnostic, &[home]).map_err(|e| format!("{e:?}"))
+    }
+
+    fn redundant(lo: u32, hi: u32) -> Diagnostic {
+        Diagnostic::Type {
+            span: Span { lo, hi },
+            msg: TypeError::RedundantCaseBranch {
+                constructor: "Red".into(),
+            },
+        }
+    }
+
+    /// Warnings come out ordered by home, then span, then code, whatever order they arrived in.
+    #[test]
+    fn warnings_are_sorted_by_home_span_then_code() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        assert!(a < b, "the ordering below relies on interning order");
+        let mut types = empty();
+        types.warnings = vec![
+            warning(redundant(0, 1), b)?,
+            warning(redundant(5, 6), a)?,
+            warning(redundant(0, 9), a)?,
+            warning(redundant(0, 2), a)?,
+            warning(
+                Diagnostic::Parse {
+                    span: Span { lo: 0, hi: 2 },
+                    msg: ParseError::DocOnUnexported { name: "f".into() },
+                },
+                a,
+            )?,
+        ];
+        let canonical = run(types, VarScope::Program, VarCeiling::SOLVER)?;
+        let order: Vec<(Symbol, u32, u32, &str)> = canonical
+            .warnings
+            .iter()
+            .map(|w| {
+                let span = w.diagnostic().primary_span();
+                let home = w.home().first().copied().unwrap_or(a);
+                (home, span.lo, span.hi, w.diagnostic().code().as_str())
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (a, 0, 2, "IPE-P0066"),
+                (a, 0, 2, "IPE-T0011"),
+                (a, 0, 9, "IPE-T0011"),
+                (a, 5, 6, "IPE-T0011"),
+                (b, 0, 1, "IPE-T0011"),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Reads every field of each warning-severity variant with its concrete type.
+    ///
+    /// `canonicalize` carries warnings through without renumbering, so no
+    /// payload may depend on solver-variable ids: the diagnostics crate cannot
+    /// name [`Ty`], and a rendered type names its variables in first-seen order
+    /// ([`VarNamer`]). Adding a field to one of these variants breaks this
+    /// destructure (it names every field, with no `..`), so the new field has
+    /// to be classified here before it can ship. A new warning variant is
+    /// classified by [`Diagnostic::severity`], not here.
+    fn warning_payload_is_ty_free(diagnostic: &Diagnostic) -> bool {
+        match diagnostic {
+            Diagnostic::Parse {
+                span: _,
+                msg: ParseError::DocOnUnexported { name } | ParseError::MissingDocString { name },
+            } => {
+                let _: &str = name;
+                true
+            }
+            Diagnostic::Name {
+                span: _,
+                msg:
+                    NameError::ScriptImportsShapeView {
+                        shape_ui_module,
+                        shape,
+                        entry,
+                    },
+            } => {
+                let _: [&str; 3] = [shape_ui_module, shape, entry];
+                true
+            }
+            Diagnostic::Type {
+                span: _,
+                msg: TypeError::RedundantCaseBranch { constructor },
+            } => {
+                let _: &str = constructor;
+                true
+            }
+            Diagnostic::Lower {
+                span: _,
+                msg: LowerError::RoutedAppMissingPageField { route_count },
+            } => {
+                let _: &usize = route_count;
+                true
+            }
+            Diagnostic::Parse { .. }
+            | Diagnostic::Name { .. }
+            | Diagnostic::Type { .. }
+            | Diagnostic::Lower { .. }
+            | Diagnostic::CompilerBug { .. }
+            | Diagnostic::Ffi { .. }
+            | Diagnostic::Sandbox { .. }
+            | Diagnostic::Consent { .. }
+            | Diagnostic::RegistryUnreachable { .. } => false,
+        }
+    }
+
+    /// Each of the five warning-severity variants is accepted as a warning and has a `Ty`-free payload.
+    #[test]
+    fn no_warning_variant_embeds_a_ty() -> Result<(), String> {
+        let [home] = syms(["A"])?;
+        let span = Span { lo: 0, hi: 1 };
+        let warnings = [
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::DocOnUnexported { name: "f".into() },
+            },
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::MissingDocString { name: "f".into() },
+            },
+            Diagnostic::Name {
+                span,
+                msg: NameError::ScriptImportsShapeView {
+                    shape_ui_module: "M".into(),
+                    shape: "S".into(),
+                    entry: "e".into(),
+                },
+            },
+            redundant(0, 1),
+            Diagnostic::Lower {
+                span,
+                msg: LowerError::RoutedAppMissingPageField { route_count: 2 },
+            },
+        ];
+        for diagnostic in warnings {
+            assert!(warning_payload_is_ty_free(&diagnostic), "{diagnostic:?}");
+            warning(diagnostic, home)?;
+        }
+        Ok(())
     }
 }
