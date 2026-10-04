@@ -416,7 +416,29 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() {
                 "[{label}] {who} must fall back to the whole-program solve"
             );
         }
+        // The engaged set is exactly the injected stdlib closure: it imports
+        // nothing user-side, so the user's message-only slot cannot reach it.
+        let engaged_set: Vec<String> = root
+            .files(&db)
+            .iter()
+            .filter(|(_, f)| {
+                matches!(
+                    ipe_db::infer_module_scoped(&db, root, **f),
+                    ipe_db::ScopedModuleTypes::PerModule { .. }
+                )
+            })
+            .map(|(p, _)| p.join("."))
+            .collect();
+        assert_eq!(
+            engaged_set,
+            ["Ipe.Html", "Ipe.Io"],
+            "[{label}] only the stdlib closure may engage the scoped tier"
+        );
         let (engaged, _) = assert_state_parity(label, &db, root);
-        assert_eq!(engaged, 0, "[{label}] no module may engage the scoped tier");
+        assert_eq!(
+            engaged,
+            engaged_set.len(),
+            "[{label}] parity sweep and engaged set disagree"
+        );
     }
 }
