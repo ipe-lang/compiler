@@ -520,6 +520,12 @@ showsNoStateText html =
 
 
 -- ── a hostile source token ──────────────────────────────────────────────
+-- The text a comment token opens with: the line's indent and the marker.
+commentLead : String
+commentLead =
+    "    // "
+
+
 -- The fixture unit's four lines with a comment holding `hostileText`, then the
 -- six ASCII characters of an escape spelling and the real U+200B it names.
 hostileView : String
@@ -547,7 +553,8 @@ hostileSourceChecks =
         Task.succeed
             [ ( "the hostile fixture source is verified and shown", isShown loaded )
             , ( "a hostile source token is escaped on the queue page", escapesHostile (page (cardModel loaded)) )
-            , ( "a hostile source token draws in byte order", hostileInByteOrder "// " (page (cardModel loaded)) && hostileInByteOrder "// " (page (unitPageModel loaded)) )
+            , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel loaded)) )
+            , ( "a hostile source token draws in byte order", hostileInByteOrder commentLead (page (cardModel loaded)) && hostileInByteOrder commentLead (page (unitPageModel loaded)) )
             , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             ]
