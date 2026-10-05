@@ -351,7 +351,7 @@ impl<'ast> Visit<'ast> for ShowImplScan<'_> {
         if cfg_test_only(&node.attrs) {
             return;
         }
-        let shows = node.trait_.as_ref().is_some_and(|(_, path, _)| {
+        let shows = node.trait_.as_ref().is_some_and(|(path, _)| {
             path.segments
                 .last()
                 .is_some_and(|seg| seg.ident == "IpeStringify")

@@ -1912,7 +1912,7 @@ fn check_scheme_applications(
                 },
             };
             let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
-            if !emitted_bound_satisfied(interner, *b, &ty, &enum_embeds) {
+            if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
                     &app.use_home,
