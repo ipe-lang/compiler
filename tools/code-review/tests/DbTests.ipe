@@ -93,8 +93,10 @@ openDoesNotMigrateIn base =
 -- A second decision on the same attested pair is `AlreadyDecided`: one
 -- row, the first decision kept, and the log's head where the first decision
 -- moved it. The first decision links the head from the one read before it
--- to the one read after it. Red if the dedupe is a read before the insert
--- or if a duplicate moves the head.
+-- to the one read after it. Red if a duplicate inserts a second row,
+-- replaces the first decision, is reported as `Inserted`, or moves the head.
+-- The two decisions run one after the other, so this does not tell a
+-- dedupe in the insert from a read before it.
 duplicateDecisionAlreadyDecided : Task.Task Error Bool
 duplicateDecisionAlreadyDecided =
     onFreshReview "ipe-review-duplicate"
@@ -143,23 +145,26 @@ isAlreadyDecided written =
 
 
 -- The review log is append-only: deleting or updating a review row, and
--- deleting the head, are each refused by the database, and the row and the
+-- deleting the head, are each refused by a trigger, and the row and the
 -- head are left as they were. Re-inserting a decided pair with a replacing
 -- conflict clause (SQLite's REPLACE deletes the old row without firing a
 -- delete trigger) or an upsert changes nothing: the first decision stays.
--- Red with any of the four triggers dropped.
+-- A refusal counts only as a trigger's `RAISE(ABORT)`, so a statement that
+-- fails for another reason (a typo, a missing table) is red, and a rewrite
+-- either runs or is refused by a trigger. Red with any of the four
+-- triggers dropped.
 reviewLogAppendOnly : Db -> Task.Task Error Bool
 reviewLogAppendOnly db =
     let
         refused sql =
             Db.exec db sql []
                 |> Task.map (\_ -> False)
-                |> Task.onError (\_ -> Task.succeed True)
+                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
 
         rewrite sql =
             Db.exec db sql [ SqlString "u-a", SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0 ]
-                |> Task.map (\_ -> ())
-                |> Task.onError (\_ -> Task.succeed ())
+                |> Task.map (\_ -> True)
+                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
     in
     do
         attested <- attestedFor "ipe-review-append-only-index" "u-a"
@@ -169,13 +174,36 @@ reviewLogAppendOnly db =
         updateRefused <- refused "UPDATE review SET decision = 'approve', reason = NULL"
         rekeyRefused <- refused "UPDATE review SET body_hash = 'other'"
         headDeleteRefused <- refused "DELETE FROM review_head"
-        rewrite "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
-        rewrite "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
-        rewrite "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
+        orReplaceRan <- rewrite "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+        replaceRan <- rewrite "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+        upsertRan <- rewrite "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
         n <- countReviewRows db "u-a" (Index.attest viewA)
         kept <- LibDb.findDecision db "u-a" (Index.attest viewA)
         headAfter <- reviewHeadOf db
-        Task.succeed (deleteRefused && updateRefused && rekeyRefused && headDeleteRefused && n == 1 && isApproved kept && headAfter == head)
+        Task.succeed
+            (deleteRefused
+                && updateRefused
+                && rekeyRefused
+                && headDeleteRefused
+                && orReplaceRan
+                && replaceRan
+                && upsertRan
+                && n
+                == 1
+                && isApproved kept
+                && headAfter
+                == head
+            )
+
+
+-- The error a trigger's `RAISE(ABORT, ...)` surfaces as: SQLite's extended
+-- code `SQLITE_CONSTRAINT_TRIGGER` (1811). The runtime keeps a database
+-- error's code and never its driver text, so the trigger's own message is
+-- not observable and the code is what tells its refusal from any other
+-- failure.
+triggerAbortError : String
+triggerAbortError =
+    "db: database error [1811]"
 
 
 -- The head moves only from the head it was read as: a compare-and-set from a

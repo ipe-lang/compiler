@@ -497,7 +497,7 @@ dbSizeAndMissingDbIn base =
         setIndexEnv indexDb repo
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
-        bytes <- indexConn |> Task.andThen Index.dbBytes
+        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot conn Index.Start) |> Task.map (\snap -> snap.bytes)
         setIndexEnv (base ++ "/missing.db") repo
         result <- loadPageNow Index.Start
             |> Task.map Ok
@@ -1348,6 +1348,70 @@ replacedReviewDbReopensDrained =
             )
 
 
+-- Two freshly migrated review databases start at different genesis heads:
+-- the genesis is random, never a constant every log shares. Red if the
+-- migration seeds the head with a fixed value.
+freshReviewDbsHaveDistinctGenesis : Task.Task Error Bool
+freshReviewDbsHaveDistinctGenesis =
+    do
+        base <- freshDir "ipe-review-distinct-genesis"
+        first <- migratedReviewAt (base ++ "/first.db")
+        second <- migratedReviewAt (base ++ "/second.db")
+        firstHead <- reviewHeadOf first
+        secondHead <- reviewHeadOf second
+        [ "/first.db", "/second.db" ]
+            |> List.concatMap (\name -> [ base ++ name, base ++ name ++ "-wal", base ++ name ++ "-shm" ])
+            |> List.map removeFileIfAny
+            |> Task.sequence
+        Task.succeed
+            (String.startsWith "genesis:" firstHead
+                && String.startsWith "genesis:" secondHead
+                && firstHead
+                /= secondHead
+            )
+
+
+-- A copy stamped at one review database's genesis is rebuilt against
+-- another fresh database: both logs hold only directly inserted rows, so
+-- neither head has moved past its genesis, and only the random genesis
+-- tells the two apart. The unit decided in the first log leaves the page,
+-- then is open again once the environment names the second. Red if the
+-- genesis is a constant, which would let the first log's stamp match the
+-- second log's head.
+genesisStampMismatchReopens : Task.Task Error Bool
+genesisStampMismatchReopens =
+    do
+        at <- freshScratch "ipe-index-genesis-swap"
+        db <- seedProgressScratch at
+        insertReviewRow db "u-a" (Index.attest viewA)
+        firstHead <- reviewHeadOf db
+        decided <- loadPageNow Index.Start
+        firstStamp <- stampOf at.indexDb
+        other <- Task.succeed (String.replace "review.db" "review-other.db" at.reviewDb)
+        removeFileIfAny other
+        fresh <- migratedReviewAt other
+        insertReviewRow fresh "u-elsewhere" "h-elsewhere"
+        otherHead <- reviewHeadOf fresh
+        System.setenv "IPE_REVIEW_DB" other
+        reopened <- loadPageNow Index.Start
+        otherStamp <- stampOf at.indexDb
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        cleanupProgressScratch at
+        removeFileIfAny other
+        removeFileIfAny (other ++ "-wal")
+        removeFileIfAny (other ++ "-shm")
+        Task.succeed
+            (String.startsWith "genesis:" firstHead
+                && String.startsWith "genesis:" otherHead
+                && firstStamp
+                == Just firstHead
+                && otherStamp
+                == Just otherHead
+                && not (List.any (\q -> q.unit.uid == "u-a") decided.units)
+                && List.any (\q -> q.unit.uid == "u-a") reopened.units
+            )
+
+
 -- Deciding and draining one pair twice keeps one copy row and counts it
 -- once: the second decision is `AlreadyDecided` and moves nothing. Red with
 -- a plain `INSERT` (the second drain fails on the key).
@@ -1654,9 +1718,9 @@ resyncCeilingLeavesStamp =
 -- open units (`total - reviewed`) are the same count, before a decision,
 -- after it is recorded with no drain, and after its drain. Red if the
 -- count or progress counts a different set than the page lists. The test
--- runs no writer between the reads, so the isolation itself (one
--- transaction in `Index.readSnapshot`) is held by that function's shape,
--- not driven here.
+-- runs no writer between the reads; that the rows and counts share one
+-- transaction is held by `Lib.Index` exposing `Index.readSnapshot` as their
+-- only reader, which the exposing scan in `IndexTests` pins.
 pageCountProgressOneSnapshot : Task.Task Error Bool
 pageCountProgressOneSnapshot =
     do
@@ -1785,6 +1849,8 @@ checks =
         , check "a copy with the log's pair count but other pairs is rebuilt" sameCountDifferentPairsResyncs
         , check "a drain whose stamp moved elsewhere drops the stamp" drainCasMismatchDropsStamp
         , check "a replaced review database re-opens every drained unit" replacedReviewDbReopensDrained
+        , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis
+        , check "a copy stamped at another log's genesis is rebuilt and re-opens its units" genesisStampMismatchReopens
         , check "a pair decided and drained twice counts once" secondDecisionOfPairCountsOnce
         , check "a failed drain keeps the queue row" drainIsAtomic
         , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling

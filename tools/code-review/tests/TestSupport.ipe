@@ -531,18 +531,17 @@ type alias PageEntry =
     }
 
 
--- The first queue page's units, each with its view read afterwards the one
--- way the app reads a selected unit's source, and the whole queue's count,
--- all on one index connection.
+-- The first queue page's units and the whole queue's count, from one
+-- `Index.readSnapshot`, each unit with its view read afterwards the one way
+-- the app reads a selected unit's source, all on one index connection.
 loadFirstPage : Task.Task Error { units : List PageEntry, total : Int }
 loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        rows <- Index.loadPendingPage conn Index.Start
-        entries <- Task.sequence (List.map (pageEntry conn settings.roots) rows)
-        total <- Index.countPending conn
-        Task.succeed { units = entries, total = total }
+        snap <- Index.readSnapshot conn Index.Start
+        entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
+        Task.succeed { units = entries, total = snap.open }
 
 
 -- The change comes from the page's `open_units` row, the one place it

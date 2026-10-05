@@ -323,7 +323,7 @@ pageReadsNoSource =
         removeFileIfAny (at.repo ++ "/src/Lib.rs")
         removeFileIfAny (at.repo ++ "/src/Main.ipe")
         conn <- indexConn
-        rows <- Index.loadPendingPage conn Index.Start
+        rows <- pendingRows conn
         settings <- envSettings
         found <- Index.loadView conn settings.roots "u-b"
         cleanupIndex at.indexDb at.repo
@@ -355,7 +355,7 @@ langFromFilesTable =
         seedIndex at.indexDb at.repo
         execIndex at.indexDb "INSERT INTO files (path, lang) VALUES (?, ?)" [ SqlString "ipe:src/Lib.rs", SqlString "rs" ]
         conn <- indexConn
-        rows <- Index.loadPendingPage conn Index.Start
+        rows <- pendingRows conn
         cleanupIndex at.indexDb at.repo
         Task.succeed (List.map (\r -> r.unit.uid ++ "=" ++ langName r.unit.lang) rows == [ "u-a=Rust", "u-b=Unknown" ])
 
@@ -465,7 +465,7 @@ pageReadFailsAfter name sql =
         seedIndex at.indexDb at.repo
         execIndexScript at.indexDb sql
         conn <- indexConn
-        failed <- Index.loadPendingPage conn Index.Start
+        failed <- pendingRows conn
             |> Task.map (\_ -> False)
             |> Task.onError (\_ -> Task.succeed True)
         cleanupIndex at.indexDb at.repo
@@ -479,6 +479,105 @@ execIndexScript indexDb sql =
         |> List.map (\stmt -> execIndex indexDb stmt [])
         |> Task.sequence
         |> Task.map (\_ -> ())
+
+
+-- The first page's rows on `conn`, read through `Index.readSnapshot`, the
+-- one reader of a page `Lib.Index` exposes.
+pendingRows : Db -> Task.Task Error (List Index.PendingRow)
+pendingRows conn =
+    Index.readSnapshot conn Index.Start |> Task.map (\snap -> snap.rows)
+
+
+-- ── one reader of a page ───────────────────────────────────────────────
+--
+-- A page's rows, its open and unit counts and the index size are read only
+-- through `Index.readSnapshot`, in one transaction. `Lib.Index` exposes
+-- exactly `indexExposes`, name for name, and no reader in `snapshotReaders`
+-- is among them, so a reader of one of them alone, or a wrapper around one
+-- under a new name, cannot be exposed without turning this red.
+indexExposesOnlySnapshotReader : Task.Task Error Bool
+indexExposesOnlySnapshotReader =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
+        source <- File.readFileLimit path (ByteSize.kib 64)
+        Task.succeed
+            (exposesAdmitted source
+                && List.all (\reader -> not (List.member reader indexExposes)) snapshotReaders
+                && List.member "readSnapshot" indexExposes
+            )
+
+
+-- The scan refuses each way around it: one of the four readers re-exposed,
+-- a wrapper exposed under a new name, an `exposing (..)` header, and a
+-- reader on a continuation line of a multi-line header. The same header
+-- written over several lines without a reader is admitted, so the
+-- multi-line refusal is the reader's. Red while the scan reads only the
+-- header's first line or matches a fixed spelling.
+indexExposingScanRefusesEvasions : Task.Task Error Bool
+indexExposingScanRefusesEvasions =
+    let
+        multiLine names =
+            "module Lib.Index exposing\n    ( " ++ String.join "\n    , " names ++ "\n    )\n\nimport Ipe.Db\n"
+    in
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
+        source <- File.readFileLimit path (ByteSize.kib 64)
+        Task.succeed
+            (exposesAdmitted source
+                && List.all (\reader -> not (exposesAdmitted (String.replace "readSnapshot," ("readSnapshot, " ++ reader ++ ",") source))) snapshotReaders
+                && not (exposesAdmitted (String.replace "readSnapshot," "readSnapshot, pendingPage," source))
+                && not (exposesAdmitted "module Lib.Index exposing (..)\n\nimport Ipe.Db\n")
+                && exposesAdmitted (multiLine indexExposes)
+                && not (exposesAdmitted (multiLine (indexExposes ++ [ "dbBytes" ])))
+            )
+
+
+-- Every name `Lib.Index` exposes, a type's constructors written bare.
+indexExposes : List String
+indexExposes =
+    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "pageSize", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownText", "storedHash", "viewText" ]
+
+
+-- The readers `Index.readSnapshot` runs in its transaction.
+snapshotReaders : List String
+snapshotReaders =
+    [ "loadPendingPage", "countPending", "countUnits", "dbBytes" ]
+
+
+-- True when the module header of `source` exposes exactly `indexExposes`.
+exposesAdmitted : String -> Bool
+exposesAdmitted source =
+    case exposedNames source of
+        Just names ->
+            List.all (\name -> List.member name indexExposes) names
+                && List.all (\name -> List.member name names) indexExposes
+
+        Nothing ->
+            False
+
+
+-- The names a module header exposes, each constructor list `(..)` dropped.
+-- The header is the source up to its first blank line, its lines joined, so
+-- a list written over several lines is read whole. Nothing when the source
+-- does not open with an `exposing (` header.
+exposedNames : String -> Maybe (List String)
+exposedNames source =
+    let
+        header =
+            String.join " " (List.map String.trim (String.lines (Maybe.withDefault "" (List.head (String.split "\n\n" source)))))
+    in
+    case String.split " exposing ( " (String.replace "exposing (" "exposing ( " header) of
+        [ start, list ] ->
+            if String.startsWith "module " start then
+                Just (List.map String.trim (String.split "," (String.replace ")" "" (String.replace "(..)" "" list))))
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
 
 
 checks : Task.Task Error (List ( String, Bool ))
@@ -499,4 +598,6 @@ checks =
         , check "a unit with no change row is still listed" unrecordedUnitListed
         , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
         , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
+        , check "the page snapshot is the only reader of a page, its counts and size Lib.Index exposes" indexExposesOnlySnapshotReader
+        , check "the exposing scan refuses a re-exposed reader, a wrapper, an open list and a multi-line header" indexExposingScanRefusesEvasions
         ]

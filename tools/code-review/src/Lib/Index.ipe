@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, countPending, countUnits, dbBytes, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadPendingPage, loadView, nameFor, pageSize, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, pageSize, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Crypto as Crypto
@@ -514,7 +514,9 @@ singleInt what rows =
 
 -- Everything one queue page shows, read in one index transaction, so the
 -- page rows, the open count and the unit count describe the same index
--- state and no write between two reads can make them disagree. `stamp` is
+-- state and no write between two reads can make them disagree. The module
+-- exposes no other reader of the page, the counts or the size, so no
+-- caller can read one of them outside this transaction. `stamp` is
 -- the review-log head the `reviewed` copy was last brought up to, or
 -- Nothing when the copy has never been stamped or was marked stale; the
 -- caller compares it with the review database's head before trusting the
