@@ -2984,10 +2984,12 @@ mod tests {
 
         let (send, receive) = std::sync::mpsc::channel();
         let hashed_base = base.clone();
-        std::thread::spawn(move || {
-            let result = hash_walked(&held, &hashed_base, &files, PACKAGE_SOURCE.tree());
-            let _ = send.send(result.map(|_| ()));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let result = hash_walked(&held, &hashed_base, &files, PACKAGE_SOURCE.tree());
+                let _ = send.send(result.map(|_| ()));
+            })
+            .expect("spawn hashing thread");
         let answer = receive.recv_timeout(std::time::Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&base);
         assert!(
