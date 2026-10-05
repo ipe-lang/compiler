@@ -208,12 +208,27 @@ type alias Withheld =
     }
 
 
--- Every way a source is withheld, with a fragment of the text that says why.
+-- The fragment of text that says why a stale source is withheld. The match is
+-- exhaustive, so a new `StaleReason` does not compile until it is pinned here.
+staleCase : StaleReason -> Withheld
+staleCase reason =
+    case reason of
+        Drifted ->
+            { view = Stale reason, reason = "Source changed since it was indexed" }
+
+        RangeOutOfFile { lineCount } ->
+            { view = Stale reason, reason = "The file now has " ++ String.fromInt lineCount ++ " lines" }
+
+        UnverifiableHash ->
+            { view = Stale reason, reason = "predates source attestation" }
+
+
+-- Every way a source is withheld.
 withheldCases : List Withheld
 withheldCases =
-    [ { view = Stale Drifted, reason = "Source changed since it was indexed" }
-    , { view = Stale (RangeOutOfFile { lineCount = 2 }), reason = "The file now has 2 lines" }
-    , { view = Stale UnverifiableHash, reason = "predates source attestation" }
+    [ staleCase Drifted
+    , staleCase (RangeOutOfFile { lineCount = 2 })
+    , staleCase UnverifiableHash
     , { view = Unreadable (Error.invalidInput "gone"), reason = "Source unreadable: " }
     ]
 
