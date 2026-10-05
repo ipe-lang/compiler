@@ -389,7 +389,7 @@ fn jail_argv<'fd>(
     // `CARGO_TARGET_DIR` in `~/.cache`); the caller binds the app FILE itself,
     // never its parent directory.
     let binds = crate::mounts::jail_binds(mounts, &tree);
-    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds);
+    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds)?;
     argv.push("--chdir".into());
     argv.push(tree.chdir(mounts).as_path().into());
 
@@ -1554,7 +1554,8 @@ mod tests {
                 &mut expected,
                 mounts.homes(),
                 &crate::mounts::jail_binds(&mounts, &bind),
-            );
+            )
+            .expect("the plan builds");
             expected.push("--chdir".into());
             expected.push(bind.chdir(&mounts).as_path().into());
             let start = argv

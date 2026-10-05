@@ -15,7 +15,16 @@
 //! Every path a jail binds, and every path it hands the payload (`--chdir`,
 //! `PATH`, `TMPDIR`, `RUSTUP_HOME`, the app), is one [`CanonicalPath`] value:
 //! resolved once, so the path the payload is told about is the path bound.
+//!
+//! A carve is mounted read-only by path, so a writable directory between its
+//! bind and the carve could be renamed away from under it and the carved path
+//! recreated writable. bwrap therefore mounts every such directory over itself
+//! first ([`PinnedCarve`]): a mount point cannot be renamed (`EBUSY`) and no
+//! entry can be renamed across one (`EXDEV`). The child holds no capability
+//! (bwrap drops them all) and every mount it inherits into its user namespace
+//! is `MNT_LOCKED`, so it can neither unmount a pin nor move one.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -26,7 +35,7 @@ use ipe_diagnostics::terminal::is_display_hazard;
 use ipe_fs_open::OpenRefusal;
 
 use crate::vcs_config::ConfigRefusal;
-use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WalkCeiling, WritableTree};
+use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WalkCeiling, WalkLimits, WritableTree};
 
 /// Directories masked in every jail, whoever the invoker is.
 const STATIC_MASKS: [&str; 3] = ["/home", "/root", "/tmp"];
@@ -464,6 +473,78 @@ pub enum MountStep<'a> {
     Mask(PathBuf),
     /// The path re-exposed at the same location.
     Bind(Bind<'a>),
+    /// A carve bound read-only, each of its pins bound over itself before it.
+    Carve(PinnedCarve<'a>),
+}
+
+/// A carve with every directory between its writable bind and it pinned.
+///
+/// The only form a carve takes in a mount plan, so no renderer can bind a
+/// carve whose ancestors could still be renamed away from under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedCarve<'a> {
+    pins: Vec<CanonicalPath>,
+    carve: &'a CanonicalPath,
+}
+
+impl<'a> PinnedCarve<'a> {
+    /// `carve` with every directory strictly between `grant` and it pinned,
+    /// shallowest first; none when `grant` does not contain it.
+    ///
+    /// A prefix of a canonical path is canonical, so each pin is the path the
+    /// jail binds.
+    ///
+    /// # Errors
+    /// [`JailPathError::VcsWalkCeiling`] with [`WalkCeiling::Pins`] when the
+    /// carve needs more pins than `limits` admits.
+    pub fn under(
+        grant: &CanonicalPath,
+        carve: &'a CanonicalPath,
+        limits: &WalkLimits,
+    ) -> Result<Self, JailPathError> {
+        let grant = grant.as_path();
+        let mut pins: Vec<CanonicalPath> = carve
+            .as_path()
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != grant && dir.starts_with(grant))
+            .map(|dir| CanonicalPath(dir.to_path_buf()))
+            .collect();
+        pins.reverse();
+        within_pin_ceiling(pins.len(), limits, carve)?;
+        Ok(Self { pins, carve })
+    }
+
+    /// The directories pinned, shallowest first.
+    #[must_use]
+    pub fn pins(&self) -> &[CanonicalPath] {
+        &self.pins
+    }
+
+    /// The carve bound read-only.
+    #[must_use]
+    pub const fn carve(&self) -> &'a CanonicalPath {
+        self.carve
+    }
+}
+
+/// `Ok` when `count` pins fit the ceiling of `limits`.
+fn within_pin_ceiling(
+    count: usize,
+    limits: &WalkLimits,
+    at: &CanonicalPath,
+) -> Result<(), JailPathError> {
+    let limit = limits.pins();
+    if u32::try_from(count)
+        .ok()
+        .is_none_or(|count| count > limit.get())
+    {
+        return Err(JailPathError::VcsWalkCeiling {
+            ceiling: WalkCeiling::Pins(limit),
+            at: at.as_path().to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// The masks and `binds` of one jail, in the order a jail applies them.
@@ -475,13 +556,19 @@ pub enum MountStep<'a> {
 /// their relative order within one mask; a path bound twice appears once, at
 /// its first position, read-only when any of its binds is.
 ///
-/// Each carve path of a [`Bind::WorkingTree`] is bound read-only right after
-/// the last writable bind that contains it, so no writable bind re-exposes it
-/// and every later mask that contains it still hides it: the carve is the last
-/// word over each carved path. A carve no writable bind contains is already
-/// read-only or hidden, and adds no step.
-#[must_use]
-pub fn mount_plan<'a>(homes: &HomeMasks, binds: &[Bind<'a>]) -> Vec<MountStep<'a>> {
+/// Each carve path of a [`Bind::WorkingTree`] is a [`MountStep::Carve`] right
+/// after the last writable bind that contains it, so no writable bind
+/// re-exposes it and every later mask that contains it still hides it: the
+/// carve is the last word over each carved path. A carve no writable bind
+/// contains or lies inside is already read-only or hidden, and adds no step.
+///
+/// # Errors
+/// [`JailPathError::VcsWalkCeiling`] with [`WalkCeiling::Pins`] when the carves
+/// need more distinct pins than their tree admits.
+pub fn mount_plan<'a>(
+    homes: &HomeMasks,
+    binds: &[Bind<'a>],
+) -> Result<Vec<MountStep<'a>>, JailPathError> {
     let mut masks: Vec<PathBuf> = STATIC_MASKS
         .iter()
         .map(|mask| canonical_or_given(Path::new(mask)))
@@ -532,44 +619,81 @@ pub fn mount_plan<'a>(homes: &HomeMasks, binds: &[Bind<'a>]) -> Vec<MountStep<'a
     with_carves(plan, &unique)
 }
 
-/// `plan` with each working-tree carve of `binds` bound read-only right after
-/// the last writable step that contains it or lies inside it, so no writable
-/// bind, not even one nested in a carved path, lands after its carve.
-fn with_carves<'a>(plan: Vec<MountStep<'a>>, binds: &[Bind<'a>]) -> Vec<MountStep<'a>> {
-    let carves: Vec<&'a CanonicalPath> = binds
+/// `plan` with each working-tree carve of `binds` as a [`PinnedCarve`] right
+/// after the last writable step that contains it, pinned below that step, and
+/// again after a later writable step that lies inside it, so no writable bind,
+/// not even one nested in a carved path, lands after its carve.
+///
+/// At one step the deepest carve comes first, so no pin of a later carve is
+/// bound over an earlier one.
+fn with_carves<'a>(
+    plan: Vec<MountStep<'a>>,
+    binds: &[Bind<'a>],
+) -> Result<Vec<MountStep<'a>>, JailPathError> {
+    let carves: Vec<(&'a CanonicalPath, &'a WalkLimits)> = binds
         .iter()
         .filter_map(|bind| match bind {
-            Bind::WorkingTree(tree) => Some(tree.carve().paths()),
+            Bind::WorkingTree(tree) => {
+                let tree: &'a WritableTree = *tree;
+                Some(
+                    tree.carve()
+                        .paths()
+                        .map(move |carve| (carve, tree.limits())),
+                )
+            }
             Bind::ReadOnly(_) | Bind::ReadWrite(_) => None,
         })
         .flatten()
         .collect();
     if carves.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    let anchors: Vec<Option<usize>> = carves
-        .iter()
-        .map(|carve| {
-            plan.iter().rposition(|step| {
-                matches!(step, MountStep::Bind(bind)
-                    if bind.is_writable()
-                        && (carve.as_path().starts_with(bind.path().as_path())
-                            || bind.path().as_path().starts_with(carve.as_path())))
-            })
-        })
-        .collect();
-    let mut out: Vec<MountStep<'a>> = Vec::with_capacity(plan.len() + carves.len());
+    let mut units: Vec<(usize, PinnedCarve<'a>)> = Vec::with_capacity(carves.len());
+    let mut pinned: HashSet<PathBuf> = HashSet::new();
+    for (carve, limits) in carves {
+        let path = carve.as_path();
+        let container = plan
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(at, step)| match step {
+                MountStep::Bind(bind)
+                    if bind.is_writable() && path.starts_with(bind.path().as_path()) =>
+                {
+                    Some((at, bind.path()))
+                }
+                MountStep::Mask(_) | MountStep::Bind(_) | MountStep::Carve(_) => None,
+            });
+        let inner = plan.iter().rposition(|step| {
+            matches!(step, MountStep::Bind(bind)
+                if bind.is_writable()
+                    && bind.path().as_path() != path
+                    && bind.path().as_path().starts_with(path))
+        });
+        let unit = PinnedCarve::under(container.map_or(carve, |(_, grant)| grant), carve, limits)?;
+        pinned.extend(unit.pins.iter().map(|pin| pin.as_path().to_path_buf()));
+        within_pin_ceiling(pinned.len(), limits, carve)?;
+        let first = container.map(|(at, _)| at);
+        if let Some(at) = inner.filter(|inner| first.is_none_or(|first| *inner > first)) {
+            units.push((at, unit.clone()));
+        }
+        if let Some(at) = first {
+            units.push((at, unit));
+        }
+    }
+    units.sort_by(|(a, x), (b, y)| {
+        a.cmp(b)
+            .then_with(|| depth(y.carve.as_path()).cmp(&depth(x.carve.as_path())))
+    });
+    let mut out: Vec<MountStep<'a>> = Vec::with_capacity(plan.len() + units.len());
+    let mut units = units.into_iter().peekable();
     for (index, step) in plan.into_iter().enumerate() {
         out.push(step);
-        out.extend(
-            carves
-                .iter()
-                .zip(&anchors)
-                .filter(|(_, anchor)| **anchor == Some(index))
-                .map(|(carve, _)| MountStep::Bind(Bind::ReadOnly(carve))),
-        );
+        while let Some((_, unit)) = units.next_if(|(at, _)| *at == index) {
+            out.push(MountStep::Carve(unit));
+        }
     }
-    out
+    Ok(out)
 }
 
 /// How a jail binds its working tree.
@@ -646,31 +770,132 @@ pub fn jail_binds<'a>(mounts: &'a crate::JailMounts, tree: &'a TreeBind) -> Vec<
 /// `argv`.
 ///
 /// Each mask is `--tmpfs <mask>` and each bind `--ro-bind`/`--bind <path>
-/// <path>`, in [`mount_plan`] order.
-pub fn push_mounts(argv: &mut Vec<OsString>, homes: &HomeMasks, binds: &[Bind<'_>]) {
-    for step in mount_plan(homes, binds) {
-        match step {
-            MountStep::Mask(mask) => {
-                argv.push("--tmpfs".into());
-                argv.push(mask.into());
+/// <path>`, in [`mount_plan`] order. A carve is `--bind <pin> <pin>` for each
+/// of its pins not already bound, then `--ro-bind <carve> <carve>`.
+///
+/// # Errors
+/// Any error of [`mount_plan`].
+pub fn push_mounts(
+    argv: &mut Vec<OsString>,
+    homes: &HomeMasks,
+    binds: &[Bind<'_>],
+) -> Result<(), JailPathError> {
+    let plan = mount_plan(homes, binds)?;
+    let mut pinned: HashSet<&Path> = HashSet::new();
+    for step in &plan {
+        push_step(argv, &mut pinned, step);
+    }
+    Ok(())
+}
+
+/// Push the bwrap rendering of one plan `step`, recording each pin it binds
+/// in `pinned` and skipping those already there.
+fn push_step<'p>(
+    argv: &mut Vec<OsString>,
+    pinned: &mut HashSet<&'p Path>,
+    step: &'p MountStep<'_>,
+) {
+    match step {
+        MountStep::Mask(mask) => {
+            argv.push("--tmpfs".into());
+            argv.push(mask.into());
+        }
+        MountStep::Bind(bind) => push_bind(argv, bind.flag(), bind.path().as_path()),
+        MountStep::Carve(unit) => {
+            for pin in &unit.pins {
+                if pinned.insert(pin.as_path()) {
+                    push_bind(argv, "--bind", pin.as_path());
+                }
             }
-            MountStep::Bind(bind) => {
-                let path = bind.path().as_path().as_os_str();
-                argv.push(bind.flag().into());
-                argv.push(path.to_owned());
-                argv.push(path.to_owned());
-            }
+            push_bind(argv, "--ro-bind", unit.carve.as_path());
         }
     }
+}
+
+/// Push `flag <path> <path>`.
+fn push_bind(argv: &mut Vec<OsString>, flag: &str, path: &Path) {
+    argv.push(flag.into());
+    argv.push(path.as_os_str().to_owned());
+    argv.push(path.as_os_str().to_owned());
+}
+
+/// Test oracle: the first carve of `plan` that, once bwrap has rendered it, has
+/// a directory between its writable bind and it that is not a mount point, so
+/// renaming that directory would carry the carve away.
+#[cfg(test)]
+pub fn plan_carve_unpinned(plan: &[MountStep<'_>]) -> Option<PathBuf> {
+    let mut argv: Vec<OsString> = Vec::new();
+    let mut pinned: HashSet<&Path> = HashSet::new();
+    for (at, step) in plan.iter().enumerate() {
+        push_step(&mut argv, &mut pinned, step);
+        let MountStep::Carve(unit) = step else {
+            continue;
+        };
+        let carve = unit.carve.as_path();
+        let Some(grant) =
+            plan.get(..at)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .find_map(|step| match step {
+                    MountStep::Bind(bind)
+                        if bind.is_writable() && carve.starts_with(bind.path().as_path()) =>
+                    {
+                        Some(bind.path().as_path())
+                    }
+                    MountStep::Mask(_) | MountStep::Bind(_) | MountStep::Carve(_) => None,
+                })
+        else {
+            continue;
+        };
+        let renamable = carve
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(grant))
+            .any(|dir| matches!(last_cover(&argv, dir), Some(("--bind", target)) if target != dir));
+        if renamable {
+            return Some(carve.to_path_buf());
+        }
+    }
+    None
+}
+
+/// The last step of a rendered `argv` that covers `dir`, as `(flag, target)`.
+#[cfg(test)]
+fn last_cover<'v>(argv: &'v [OsString], dir: &Path) -> Option<(&'v str, &'v Path)> {
+    let mut cover = None;
+    let mut ops = argv.iter();
+    while let Some(op) = ops.next() {
+        let (flag, target) = match op.to_str() {
+            Some(flag @ "--tmpfs") => (flag, ops.next()),
+            Some(flag @ ("--bind" | "--ro-bind")) => (flag, ops.nth(1)),
+            _ => continue,
+        };
+        if let Some(target) = target
+            .map(Path::new)
+            .filter(|target| dir.starts_with(target))
+        {
+            cover = Some((flag, target));
+        }
+    }
+    cover
 }
 
 /// Test oracle: the first bind of `plan` that follows a mask it equals or
 /// contains (which would re-expose the masked tree), as `(mask, bind)`.
 #[cfg(test)]
 pub fn plan_bind_after_covered_mask(plan: &[MountStep<'_>]) -> Option<(PathBuf, PathBuf)> {
-    first_bind_after_covered_mask(plan.iter().map(|step| match step {
-        MountStep::Mask(mask) => OracleStep::Mask(mask.as_path()),
-        MountStep::Bind(bind) => OracleStep::Bind(bind.path().as_path()),
+    first_bind_after_covered_mask(plan.iter().flat_map(|step| {
+        match step {
+            MountStep::Mask(mask) => vec![OracleStep::Mask(mask.as_path())],
+            MountStep::Bind(bind) => vec![OracleStep::Bind(bind.path().as_path())],
+            MountStep::Carve(unit) => unit
+                .pins
+                .iter()
+                .chain(std::iter::once(unit.carve))
+                .map(|path| OracleStep::Bind(path.as_path()))
+                .collect(),
+        }
     }))
     .map(|(mask, bind)| (mask.to_path_buf(), bind.to_path_buf()))
 }
@@ -778,7 +1003,7 @@ mod tests {
 
     fn rendered(homes: &HomeMasks, binds: &[Bind<'_>]) -> Vec<String> {
         let mut argv = Vec::new();
-        push_mounts(&mut argv, homes, binds);
+        push_mounts(&mut argv, homes, binds).expect("the plan builds");
         argv.into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -1066,7 +1291,8 @@ mod tests {
                 Bind::ReadWrite(&above),
                 Bind::ReadWrite(&tree),
             ],
-        );
+        )
+        .expect("the plan builds");
         assert_eq!(plan_bind_after_covered_mask(&plan), None, "{plan:?}");
         let mask_at = |mask: &str| {
             plan.iter()
@@ -1327,5 +1553,171 @@ mod tests {
             Mode::ReadOnly,
             "{argv:?}"
         );
+    }
+
+    /// The carve steps of `plan`.
+    fn carve_steps<'p, 'a>(plan: &'p [MountStep<'a>]) -> Vec<&'p PinnedCarve<'a>> {
+        plan.iter()
+            .filter_map(|step| match step {
+                MountStep::Carve(unit) => Some(unit),
+                MountStep::Mask(_) | MountStep::Bind(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_carve_renders_with_its_pins() {
+        let scratch = CanonicalPath::assumed("/srv/scratch");
+        let nested_scratch = CanonicalPath::assumed("/srv/u/proj/build/scratch");
+        let in_carve = CanonicalPath::assumed("/srv/tree/a/.git/scratch");
+        let depths = [
+            "/srv/tree/.git",
+            "/srv/tree/a/.git",
+            "/srv/tree/a/b/.hg",
+            "/srv/tree/a/b/c/.jj",
+            "/srv/tree/a/b/c/d/_darcs",
+            "/srv/tree/x/y/z/.git",
+        ];
+        let layouts: [(&str, HomeMasks, &str, Vec<&str>, Vec<Bind<'_>>); 4] = [
+            (
+                "carves at depths one to five",
+                HomeMasks::unmasked(),
+                "/srv/tree",
+                depths.to_vec(),
+                vec![Bind::ReadWrite(&scratch)],
+            ),
+            (
+                "a tree under a masked home",
+                assumed_homes("/srv/u", "/srv/u/.cargo"),
+                "/srv/u/proj",
+                vec!["/srv/u/proj/.git", "/srv/u/proj/vendor/lib/.git"],
+                vec![Bind::ReadWrite(&scratch)],
+            ),
+            (
+                "a writable bind nested in the tree",
+                assumed_homes("/srv/u", "/srv/u/.cargo"),
+                "/srv/u/proj",
+                vec!["/srv/u/proj/build/scratch/gd", "/srv/u/proj/sub/.git"],
+                vec![Bind::ReadWrite(&nested_scratch)],
+            ),
+            (
+                "a writable bind nested in a carve",
+                HomeMasks::unmasked(),
+                "/srv/tree",
+                depths.to_vec(),
+                vec![Bind::ReadWrite(&in_carve)],
+            ),
+        ];
+        for (layout, homes, tree, carve, others) in layouts {
+            let tree = WritableTree::assumed(
+                CanonicalPath::assumed(tree),
+                carve
+                    .iter()
+                    .map(|path| CanonicalPath::assumed(path))
+                    .collect(),
+            );
+            let mut binds = others;
+            binds.push(Bind::WorkingTree(&tree));
+            let plan = mount_plan(&homes, &binds).expect("the plan builds");
+            assert_eq!(plan_carve_unpinned(&plan), None, "{layout}: {plan:?}");
+            let argv = rendered(&homes, &binds);
+            for unit in carve_steps(&plan) {
+                let carve = unit.carve().as_path().to_string_lossy();
+                let at = position(&argv, &["--ro-bind", &carve, &carve]);
+                assert!(at.is_some(), "{layout}: {carve} is rendered: {argv:?}");
+                let Some(at) = at else {
+                    continue;
+                };
+                for pin in unit.pins() {
+                    let pin = pin.as_path().to_string_lossy();
+                    assert!(
+                        position(&argv, &["--bind", &pin, &pin]).is_some_and(|pin_at| pin_at < at),
+                        "{layout}: {pin} is bound before {carve}: {argv:?}"
+                    );
+                }
+                assert!(
+                    matches!(
+                        effective_mode(&argv, &unit.carve().as_path().join("hooks")),
+                        Mode::ReadOnly | Mode::Hidden
+                    ),
+                    "{layout}: {carve} stays read-only: {argv:?}"
+                );
+            }
+            assert_eq!(bind_after_covered_mask(&argv), None, "{layout}: {argv:?}");
+        }
+        let tree = CanonicalPath::assumed("/srv/tree");
+        let carve = CanonicalPath::assumed("/srv/tree/a/b/.git");
+        let bare = [
+            MountStep::Bind(Bind::ReadWrite(&tree)),
+            MountStep::Carve(PinnedCarve {
+                pins: Vec::new(),
+                carve: &carve,
+            }),
+        ];
+        let inner = CanonicalPath::assumed("/srv/tree/a/b/.git/scratch");
+        let later = WritableTree::assumed(tree.clone(), vec![carve.clone()]);
+        let binds = [Bind::WorkingTree(&later), Bind::ReadWrite(&inner)];
+        let plan = mount_plan(&HomeMasks::unmasked(), &binds).expect("the plan builds");
+        assert_eq!(plan_carve_unpinned(&plan), None, "{plan:?}");
+        let argv = rendered(&HomeMasks::unmasked(), &binds);
+        assert_eq!(
+            effective_mode(&argv, Path::new("/srv/tree/a/b/.git/scratch/hooks")),
+            Mode::ReadOnly,
+            "a writable bind inside a carve is covered again: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|op| *op == "/srv/tree/a").count(),
+            2,
+            "a pin is bound once: {argv:?}"
+        );
+        assert_eq!(
+            plan_carve_unpinned(&bare),
+            Some(PathBuf::from("/srv/tree/a/b/.git")),
+            "the oracle flags a carve bound without its pins"
+        );
+    }
+
+    #[test]
+    fn pins_over_the_ceiling_refuse() {
+        let limits = WalkLimits::sized(1000, 64, 256, 3);
+        let plan_of = |carve: &[&str]| {
+            let tree = WritableTree::assumed(
+                CanonicalPath::assumed("/srv/tree"),
+                carve
+                    .iter()
+                    .map(|path| CanonicalPath::assumed(path))
+                    .collect(),
+            )
+            .under_limits(limits);
+            mount_plan(&HomeMasks::unmasked(), &[Bind::WorkingTree(&tree)]).map(|plan| plan.len())
+        };
+        for admitted in [
+            vec!["/srv/tree/a/b/c/.git"],
+            vec!["/srv/tree/a/b/.git", "/srv/tree/a/c/.git"],
+        ] {
+            assert!(
+                plan_of(&admitted).is_ok(),
+                "three pins at a ceiling of three are admitted: {admitted:?}"
+            );
+        }
+        for (refused, at) in [
+            (vec!["/srv/tree/a/b/c/d/.git"], "/srv/tree/a/b/c/d/.git"),
+            (
+                vec!["/srv/tree/a/b/.git", "/srv/tree/x/y/.git"],
+                "/srv/tree/x/y/.git",
+            ),
+        ] {
+            let planned = plan_of(&refused);
+            assert!(
+                matches!(
+                    &planned,
+                    Err(JailPathError::VcsWalkCeiling {
+                        ceiling: WalkCeiling::Pins(limit),
+                        at: path,
+                    }) if limit.get() == 3 && *path == Path::new(at)
+                ),
+                "a fourth pin refuses: {planned:?}"
+            );
+        }
     }
 }

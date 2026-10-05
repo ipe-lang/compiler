@@ -110,8 +110,15 @@ Finding nested metadata means reading every directory of the tree once at each
 start of the jail. A tree too large to read in full (too many entries, nested
 too deep, or holding too many repositories), a directory in it that cannot be
 read, or a directory on another filesystem refuses the jail, since metadata
-past it could go unprotected. The refusal names the place and the limit: run `ipe clean` to drop build output, run from a directory
-that holds fewer files, or run without the filesystem grant.
+past it could go unprotected. The refusal names the place and the limit: run
+`ipe clean` to drop build output, run from a directory that holds fewer files,
+or run without the filesystem grant.
+
+On Linux, each directory between the top of the tree and a nested
+repository's metadata is held in place for the run, so the program cannot
+rename it away and recreate the metadata writable. Inside the jail, renaming
+such a directory fails with `EBUSY`, and moving a file across one fails with
+`EXDEV`; tools that move files fall back to copying them.
 
 Keeping the metadata read-only is not enough when its configuration points
 back into a writable path: a `core.hooksPath` of `.husky`, a hook that is a

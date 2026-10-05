@@ -322,14 +322,16 @@ pub struct JailSpec {
 /// clock or the rlimits is unrepresentable, so untrusted code can never run
 /// uncapped. A host missing either helper is refused upstream
 /// ([`missing_caps`]) before this is reached.
-#[must_use]
+///
+/// # Errors
+/// Any error of [`mounts::push_mounts`].
 pub fn bwrap_argv(
     bwrap: &Path,
     prlimit: &Path,
     timeout: &Path,
     spec: &JailSpec,
     payload: &[OsString],
-) -> Vec<OsString> {
+) -> Result<Vec<OsString>, JailPathError> {
     // The wall clock wraps everything: `timeout --kill-after=5s <wall> bwrap …`.
     let mut argv: Vec<OsString> = vec![
         timeout.into(),
@@ -376,7 +378,7 @@ pub fn bwrap_argv(
     binds.extend(spec.path_prepend.iter().map(mounts::Bind::ReadOnly));
     binds.extend(spec.rustup_home.iter().map(mounts::Bind::ReadOnly));
     binds.push(mounts::Bind::ReadWrite(&spec.scoped_tmp));
-    mounts::push_mounts(&mut argv, &spec.homes, &binds);
+    mounts::push_mounts(&mut argv, &spec.homes, &binds)?;
     let scoped_tmp = spec.scoped_tmp.as_path();
     argv.push("--chdir".into());
     argv.push(scoped_tmp.into());
@@ -420,7 +422,7 @@ pub fn bwrap_argv(
     argv.push(format!("--fsize={}", spec.limits.out_cap_bytes).into());
     argv.push("--".into());
     argv.extend(payload.iter().cloned());
-    argv
+    Ok(argv)
 }
 
 // ── jailed execution ────────────────────────────────────────────────────────
@@ -702,7 +704,9 @@ fn bwrap_argv_with_seccomp<'fd>(
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'fd>>,
 ) -> Result<run_jail::JailArgv<'fd>, SandboxDefect> {
-    let mut argv = run_jail::JailArgv::fd_free(bwrap_argv(bwrap, prlimit, timeout, spec, payload));
+    let mut argv = run_jail::JailArgv::fd_free(
+        bwrap_argv(bwrap, prlimit, timeout, spec, payload).map_err(SandboxDefect::Path)?,
+    );
     let Some(fd) = seccomp_fd else {
         return Ok(argv);
     };
@@ -759,6 +763,7 @@ mod tests {
             spec,
             &payload,
         )
+        .expect("the argv builds")
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect()

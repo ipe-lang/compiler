@@ -280,6 +280,54 @@ fn a_jailed_git_status_still_reads_the_repo() {
     );
 }
 
+#[test]
+fn nested_carve_ancestor_rename_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = std::fs::canonicalize(git_tree("vcs-pins")).expect("tree resolves");
+    let store = tree.join("store");
+    let repo = store.join("repo");
+    std::fs::create_dir_all(repo.join(".git").join("hooks")).expect("nested git dir");
+    let moved = tree.join("store2");
+    let rename = vec![
+        OsString::from("/bin/mv"),
+        store.clone().into_os_string(),
+        moved.clone().into_os_string(),
+    ];
+    let rename_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &rename);
+    let mounted = |dir: &Path| -> Vec<OsString> {
+        vec![
+            OsString::from("/bin/grep"),
+            OsString::from("-qF"),
+            OsString::from(format!(" {} ", dir.display())),
+            OsString::from("/proc/self/mountinfo"),
+        ]
+    };
+    let pinned: Vec<(std::path::PathBuf, Option<i32>)> = [store.clone(), repo.clone()]
+        .into_iter()
+        .map(|dir| {
+            let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &mounted(&dir));
+            (dir, code)
+        })
+        .collect();
+    let store_kept = store.is_dir();
+    let moved_exists = moved.exists();
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_ne!(
+        rename_code,
+        Some(0),
+        "an ancestor of a nested carve cannot be renamed inside the jail"
+    );
+    assert!(store_kept && !moved_exists, "the host tree kept its layout");
+    for (dir, code) in pinned {
+        assert_eq!(
+            code,
+            Some(0),
+            "{} is a mount point inside the jail",
+            dir.display()
+        );
+    }
+}
+
 fn isolated() -> SandboxProfile {
     SandboxProfile::maximally_isolated()
 }

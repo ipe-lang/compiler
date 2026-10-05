@@ -1356,7 +1356,8 @@ impl FreebsdMountOp {
 /// # Errors
 ///
 /// [`RunJailDefect::MountFailed`] when a step's path is not absolute or carries
-/// a `..`/`.` component, so it cannot be re-rooted inside the jail.
+/// a `..`/`.` component, so it cannot be re-rooted inside the jail;
+/// [`RunJailDefect::Path`] when the plan holds a working tree with a carve.
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) fn freebsd_mount_ops(
     root: &Path,
@@ -1390,6 +1391,14 @@ pub(crate) fn freebsd_mount_ops(
                         target: under_root(root, &safe),
                         source: safe.0,
                     }
+                }
+                MountStep::Carve(unit) => {
+                    return Err(RunJailDefect::Path(
+                        crate::JailPathError::VcsMetadataUncarvable {
+                            arm: crate::JailArm::Freebsd,
+                            path: unit.carve().as_path().to_path_buf(),
+                        },
+                    ));
                 }
             })
         })
@@ -2150,7 +2159,8 @@ mod freebsd_jail {
             //    filesystem axis is granted. A step that cannot mount refuses the
             //    whole jail, so no bind ever runs over an unmasked home.
             let binds = jail_binds(mounts, tree);
-            let ops = freebsd_mount_ops(&mount.root, &mount_plan(mounts.homes(), &binds))?;
+            let plan = mount_plan(mounts.homes(), &binds).map_err(RunJailDefect::Path)?;
+            let ops = freebsd_mount_ops(&mount.root, &plan)?;
             apply_mount_ops(&ops, |op| {
                 mount.mount_op(&mount_nullfs_bin, &mount_devfs_bin, op)
             })?;
@@ -3937,7 +3947,7 @@ mod tests {
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
         let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
-        let plan = mount_plan(fixture.mounts.homes(), &binds);
+        let plan = mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds");
         assert_eq!(plan_bind_after_covered_mask(&plan), None, "{plan:?}");
         let rendered = freebsd_mount_ops(root, &plan);
         assert!(rendered.is_ok(), "{rendered:?}");
@@ -3993,7 +4003,10 @@ mod tests {
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
         let binds = jail_binds(&fixture.mounts, &TreeBind::Unbound);
-        let rendered = freebsd_mount_ops(root, &mount_plan(fixture.mounts.homes(), &binds));
+        let rendered = freebsd_mount_ops(
+            root,
+            &mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds"),
+        );
         assert!(rendered.is_ok(), "{rendered:?}");
         let Ok(ops) = rendered else {
             return;
@@ -4028,7 +4041,10 @@ mod tests {
         .expect("a tree with a git dir parses");
         let root = Path::new("/jailroot");
         let granted_binds = jail_binds(&mounts, &granted(&mounts));
-        let rendered = freebsd_mount_ops(root, &mount_plan(mounts.homes(), &granted_binds));
+        let rendered = freebsd_mount_ops(
+            root,
+            &mount_plan(mounts.homes(), &granted_binds).expect("the plan builds"),
+        );
         assert!(
             matches!(
                 &rendered,
@@ -4040,7 +4056,10 @@ mod tests {
             "a writable tree holding metadata is refused: {rendered:?}"
         );
         let unbound = jail_binds(&mounts, &TreeBind::Unbound);
-        let isolated = freebsd_mount_ops(root, &mount_plan(mounts.homes(), &unbound));
+        let isolated = freebsd_mount_ops(
+            root,
+            &mount_plan(mounts.homes(), &unbound).expect("the plan builds"),
+        );
         assert!(
             isolated.is_ok(),
             "an ungranted tree holding metadata still jails: {isolated:?}"
@@ -4053,7 +4072,10 @@ mod tests {
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
         let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
-        let rendered = freebsd_mount_ops(root, &mount_plan(fixture.mounts.homes(), &binds));
+        let rendered = freebsd_mount_ops(
+            root,
+            &mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds"),
+        );
         assert!(rendered.is_ok(), "{rendered:?}");
         let Ok(ops) = rendered else {
             return;
@@ -4095,7 +4117,10 @@ mod tests {
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
         let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
-        let rendered = freebsd_mount_ops(root, &mount_plan(fixture.mounts.homes(), &binds));
+        let rendered = freebsd_mount_ops(
+            root,
+            &mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds"),
+        );
         assert!(rendered.is_ok(), "{rendered:?}");
         let Ok(ops) = rendered else {
             return;

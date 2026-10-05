@@ -441,6 +441,14 @@ impl WritableTree {
             limits: WalkLimits::DEFAULT,
         }
     }
+
+    /// Test-only: this tree under `limits` instead of the defaults.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn under_limits(mut self, limits: WalkLimits) -> Self {
+        self.limits = limits;
+        self
+    }
 }
 
 /// The directories one carved entry's tool reads its configuration from.
