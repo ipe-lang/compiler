@@ -523,8 +523,10 @@ pub struct TypedInterface {
     /// An importer's case-analysis and equality checks meet a union through
     /// any value it reaches, not only through a direct import, so the closure
     /// travels with the interface; `reachable_dep_unions` builds it from the
-    /// direct deps alone.
-    pub reachable_unions: Vec<canon::Union>,
+    /// direct deps alone. Each entry is shared with every other interface
+    /// that reaches the same union, so a long import chain holds one copy of
+    /// each definition rather than one per importer.
+    pub reachable_unions: Vec<Arc<canon::Union>>,
 }
 
 /// Whether a module's typed interface can stand for it in a dependency-first
@@ -686,8 +688,9 @@ fn infer_core(
     // cross-module constructor references, patterns, equality, and
     // exhaustiveness see full definitions from ONE closure. The union list
     // stays alive past constraint generation — `exhaust::check` reads it below.
-    let dep_unions: Vec<&canon::Union> =
+    let dep_union_closure: Vec<Arc<canon::Union>> =
         scoped.map_or_else(Vec::new, |ctx| reachable_dep_unions(ctx.deps));
+    let dep_unions: Vec<&canon::Union> = dep_union_closure.iter().map(Arc::as_ref).collect();
     // The user enums whose definition embeds a function payload — consulted by
     // every concrete equality / stringify obligation so a `==` / `{{…}}` on a
     // function-carrying enum fails closed (the payload arrow is invisible in a
@@ -1441,7 +1444,7 @@ fn infer_core(
         let interface = TypedInterface {
             values,
             unions: m.unions.iter().map(erase_union_spans).collect(),
-            reachable_unions: dep_unions.iter().map(|u| (*u).clone()).collect(),
+            reachable_unions: dep_union_closure,
         };
         if own_facts_importer_dependent {
             InterfaceStatus::ImporterDependent(interface)
@@ -2306,14 +2309,25 @@ fn canon_type_embeds_lambda(t: &canon::Type) -> bool {
 /// reach, so one pass over the direct deps yields the transitive closure:
 /// each interface is read exactly once (the map is keyed by module path), no
 /// recursion runs, and the work is bounded by the deps' union counts. A
-/// diamond reaching one union along two paths keeps one copy.
-fn reachable_dep_unions(deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>) -> Vec<&canon::Union> {
-    let mut by_id: BTreeMap<(&[Symbol], Symbol), &canon::Union> = BTreeMap::new();
+/// diamond reaching one union along two paths keeps one copy. A union
+/// already in a dependency's closure is shared, never copied; only a direct
+/// dependency's own unions are cloned, once each.
+fn reachable_dep_unions(
+    deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
+) -> Vec<Arc<canon::Union>> {
+    let mut by_id: BTreeMap<(&[Symbol], Symbol), Arc<canon::Union>> = BTreeMap::new();
     for iface in deps.values() {
-        for union in iface.unions.iter().chain(iface.reachable_unions.iter()) {
+        for union in &iface.reachable_unions {
             by_id
                 .entry((union.home.as_slice(), union.name))
-                .or_insert(union);
+                .or_insert_with(|| Arc::clone(union));
+        }
+    }
+    for iface in deps.values() {
+        for union in &iface.unions {
+            by_id
+                .entry((union.home.as_slice(), union.name))
+                .or_insert_with(|| Arc::new(union.clone()));
         }
     }
     by_id.into_values().collect()
