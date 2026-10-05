@@ -816,12 +816,39 @@ pub fn server_with_header(
 ) -> IpeResult<IpeError, ServerResponse> {
     match parse_response_header(&k, &v) {
         Ok(_) => {
-            r.headers.retain(|name, _| !name.eq_ignore_ascii_case(&k));
-            r.headers.insert(k, v);
+            set_header_replacing(&mut r.headers, k, v);
             IpeResult::Ok(r)
         }
         Err(refusal) => IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
     }
+}
+
+/// Sets header `name` to `value` in a response's headers, replacing every
+/// header of the same name in any case, so the map holds one value per header
+/// name. Every runtime write of a response header by name goes through here.
+fn set_header_replacing(headers: &mut HashMap<String, String>, name: String, value: String) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(&name));
+    headers.insert(name, value);
+}
+
+/// Every value of header `name` in any case, joined by `, ` in name order so
+/// the result does not depend on map iteration order; `None` when absent.
+fn header_values_ci(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    let mut found: Vec<(&String, &String)> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    Some(
+        found
+            .into_iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 pub use response_head::ServerResponseHead;
@@ -1015,8 +1042,9 @@ const LOCATION_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
 #[must_use]
 pub fn server_redirect(location: String) -> ServerResponse {
     let mut r = resp(302, String::new(), "text/plain");
-    r.headers.insert(
-        "Location".to_string(),
+    set_header_replacing(
+        &mut r.headers,
+        "Location".to_owned(),
         percent_encoding::utf8_percent_encode(&location, LOCATION_ESCAPE).to_string(),
     );
     r
@@ -2889,7 +2917,7 @@ fn header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a
 fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse {
     let mut headers = HashMap::new();
     for (k, v) in extra {
-        headers.insert(k.to_string(), v.to_string());
+        set_header_replacing(&mut headers, (*k).to_owned(), (*v).to_owned());
     }
     ServerResponse {
         status,
@@ -2898,6 +2926,36 @@ fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse
         contentType: "text/plain".to_string(),
         cookies: Vec::new(),
     }
+}
+
+/// Tags `resp` with the allowed origin `allow`, replacing any
+/// `Access-Control-Allow-Origin` the handler set in any case. A specific
+/// origin (not `*`) makes the response origin-dependent, so `Origin` joins the
+/// handler's `Vary` (merged in any case, never clobbered) and a shared cache
+/// cannot serve one origin's grant to another.
+fn tag_cors(resp: &mut ServerResponse, allow: Option<String>) {
+    let Some(a) = allow else {
+        return;
+    };
+    if a != "*" {
+        let vary = match header_values_ci(&resp.headers, "Vary") {
+            Some(prev)
+                if prev
+                    .split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
+            {
+                prev
+            }
+            Some(prev) => format!("{prev}, Origin"),
+            None => "Origin".to_owned(),
+        };
+        set_header_replacing(&mut resp.headers, "Vary".to_owned(), vary);
+    }
+    set_header_replacing(
+        &mut resp.headers,
+        "access-control-allow-origin".to_owned(),
+        a,
+    );
 }
 
 /// Middleware.withCors : List String -> Handler -> Handler. Echoes an allowed
@@ -2932,58 +2990,14 @@ where
                     ),
                 ],
             );
-            if let Some(a) = allow {
-                // A reflected SPECIFIC origin (not `*`) makes the response
-                // origin-dependent — emit `Vary: Origin` so a shared/intermediary
-                // cache can't serve one origin's ACAO to another (CORS cache
-                // poisoning). `*` is origin-independent, so no Vary needed.
-                if a != "*" {
-                    // MERGE, don't clobber: a handler may already have set Vary
-                    // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                    let vary = match resp.headers.get("Vary") {
-                        Some(prev)
-                            if !prev
-                                .split(',')
-                                .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                        {
-                            format!("{}, Origin", prev)
-                        }
-                        Some(prev) => prev.clone(),
-                        None => "Origin".to_string(),
-                    };
-                    resp.headers.insert("Vary".to_string(), vary);
-                }
-                resp.headers
-                    .insert("access-control-allow-origin".to_string(), a);
-            }
+            tag_cors(&mut resp, allow);
             return Box::pin(async move { ok_res(resp) });
         }
         let task = h(req);
         Box::pin(async move {
             match task.await {
                 IpeResult::Ok(mut resp) => {
-                    if let Some(a) = allow {
-                        // See preflight branch: a reflected specific origin needs
-                        // `Vary: Origin` to be cache-safe.
-                        if a != "*" {
-                            // MERGE, don't clobber: a handler may already have set Vary
-                            // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                            let vary = match resp.headers.get("Vary") {
-                                Some(prev)
-                                    if !prev
-                                        .split(',')
-                                        .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                                {
-                                    format!("{}, Origin", prev)
-                                }
-                                Some(prev) => prev.clone(),
-                                None => "Origin".to_string(),
-                            };
-                            resp.headers.insert("Vary".to_string(), vary);
-                        }
-                        resp.headers
-                            .insert("access-control-allow-origin".to_string(), a);
-                    }
+                    tag_cors(&mut resp, allow);
                     ok_res(resp)
                 }
                 other => other,
@@ -5324,6 +5338,78 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
         assert_eq!(single_header(&resp, "location"), Some("/b"));
         assert_eq!(single_header(&resp, "x-custom"), Some("2"));
+    }
+
+    /// The response `middleware_with_cors` allowing `origins` makes of a GET
+    /// from `https://a.example` whose handler set `headers`, as it is sent.
+    async fn cors_tagged(origins: &[&str], headers: &[(&str, &str)]) -> axum::response::Response {
+        let set: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let h = middleware_with_cors::<String, _>(
+            origins.iter().map(|o| (*o).to_owned()).collect(),
+            move |_req: ServerRequest| {
+                let mut r = server_text("ok".into());
+                for (k, v) in set.clone() {
+                    r = match server_with_header(k, v, r) {
+                        IpeResult::Ok(r) => r,
+                        IpeResult::Err(e) => panic!("handler header refused: {e:?}"),
+                    };
+                }
+                Box::pin(ready(ok_res::<String, _>(r))) as IpeTask<String, ServerResponse>
+            },
+        );
+        let mut req_headers = HashMap::new();
+        req_headers.insert("Origin".to_owned(), "https://a.example".to_owned());
+        let IpeResult::Ok(r) = h(mk_req("GET", HashMap::new(), req_headers)).await else {
+            panic!("the CORS middleware must pass the handler's response through");
+        };
+        to_axum_response_with(r, framed_security())
+    }
+
+    /// A handler's `Access-Control-Allow-Origin` in any case is replaced by
+    /// the middleware's grant: the sent head carries exactly one value.
+    #[tokio::test]
+    async fn cors_replaces_a_handler_allow_origin_in_any_case() {
+        for name in [
+            "Access-Control-Allow-Origin",
+            "ACCESS-CONTROL-ALLOW-ORIGIN",
+            "access-control-allow-origin",
+        ] {
+            for (origins, granted) in [
+                (&["https://a.example"][..], "https://a.example"),
+                (&["*"][..], "*"),
+            ] {
+                let resp = cors_tagged(origins, &[(name, "https://evil.example")]).await;
+                assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+                assert_eq!(
+                    single_header(&resp, "access-control-allow-origin"),
+                    Some(granted),
+                    "{name} / {origins:?}"
+                );
+            }
+        }
+    }
+
+    /// A handler's `Vary` in any case is merged with `Origin` into one value,
+    /// and a `Vary` already naming `Origin` is kept as is.
+    #[tokio::test]
+    async fn cors_merges_a_handler_vary_in_any_case_into_one_value() {
+        for name in ["Vary", "VARY", "vary"] {
+            let resp = cors_tagged(&["https://a.example"], &[(name, "Accept-Encoding")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(
+                single_header(&resp, "vary"),
+                Some("Accept-Encoding, Origin"),
+                "{name}"
+            );
+            let resp = cors_tagged(&["https://a.example"], &[(name, "origin")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(single_header(&resp, "vary"), Some("origin"), "{name}");
+        }
+        let resp = cors_tagged(&["https://a.example"], &[]).await;
+        assert_eq!(single_header(&resp, "vary"), Some("Origin"));
     }
 
     /// More handler header names than a header map holds is a typed refusal,
