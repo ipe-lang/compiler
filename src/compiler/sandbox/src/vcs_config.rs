@@ -2542,7 +2542,7 @@ impl Scan<'_> {
                 self.judge_words(ctx, value, Runner::None)
             }
             Role::Unknown => {
-                if is_git_scalar(value) {
+                if is_scalar(ctx.syntax, value) {
                     Ok(())
                 } else {
                     Err(unproven(Unprovable::UnknownSetting))
@@ -3270,6 +3270,27 @@ fn is_git_scalar(value: &str) -> bool {
     is_git_bool(value) || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Whether `value` is one no reading of an unknown `syntax` setting makes a path.
+fn is_scalar(syntax: Syntax, value: &str) -> bool {
+    match syntax {
+        Syntax::Git => is_git_scalar(value),
+        Syntax::Hg => is_hg_scalar(value),
+        // Every setting of these files has a decided route, so none is unknown.
+        Syntax::GitRemote | Syntax::Toml | Syntax::Darcs => false,
+    }
+}
+
+/// Whether `value` is empty, a Mercurial boolean, or a decimal integer.
+fn is_hg_scalar(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    [
+        "", "1", "yes", "true", "on", "always", "0", "no", "false", "off", "never",
+    ]
+    .iter()
+    .any(|word| value.eq_ignore_ascii_case(word))
+        || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What Git does with a value of `setting`.
 fn git_route(setting: &Setting, value: &str) -> Route {
     let Setting::Key {
@@ -3379,9 +3400,10 @@ fn holds_nul(entry: &Entry) -> bool {
 /// What Mercurial does with a value of `setting`.
 fn hg_route(setting: &Setting, value: &str) -> Route {
     match setting {
-        Setting::Key { section, key, .. } => {
-            route_of(vcs_keys::hg(section, key).unwrap_or(Consume::Inert), value)
-        }
+        Setting::Key { section, key, .. } => vcs_keys::hg(section, key)
+            .map_or(Route::Judge(Role::Unknown), |consume| {
+                route_of(consume, value)
+            }),
         Setting::Include => Route::Judge(Role::Include(Reading::Always)),
         Setting::Line(_) => Route::Judge(Role::Words(Runner::None)),
     }
@@ -4491,6 +4513,88 @@ mod tests {
         write(&dot_hg.join("hgrc"), "[ui]\nnot an item\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(fault(&result), Some(ConfigFault::Malformed { line: 2 }));
+    }
+
+    fn scan_hg(f: &Fixture, text: &str) -> Result<(), ConfigRefusal> {
+        let dot_hg = f.tree.join(".hg");
+        write(&dot_hg.join("hgrc"), text);
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        scan_with(f, &roots, ConfigLimits::DEFAULT)
+    }
+
+    #[test]
+    fn unknown_hg_key_refused() {
+        let f = fixture("hgunknown");
+        let tree = f.tree.display();
+        for text in [
+            "[frob]\nx = /usr/bin/true\n".to_owned(),
+            "[ui]\nfrobnicate = ~/x\n".to_owned(),
+            "[frob]\nn = 1x\n".to_owned(),
+            format!("[defaults]\npull = --ssh {tree}/evil\n"),
+            "[ui]\ndebugger = evil\n".to_owned(),
+            "[acl.allow]\nfoo = alice\n".to_owned(),
+            "[merge-tools]\nkdiff3.regkey = SoftwareKDiff3\n".to_owned(),
+            "[hooks]\ncommit:frob = x\n".to_owned(),
+            "[pager]\nattend- = x\n".to_owned(),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::UnknownSetting),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Controls: a value no reading makes a path, and documented settings with a row.
+        for text in [
+            "[frob]\nn = 1\n",
+            "[frob]\nn = -3\n",
+            "[frob]\non = Never\n",
+            "[frob]\ne =\n",
+            "[phases]\npublish = False\n",
+            "[ui]\nmergemarkers = basic\n",
+            "[extensions]\nrebase =\nrebase:required = True\n",
+            "[paths]\ndefault = https://example.com/r\ndefault:bookmarks.mode = mirror\n",
+            "[hooks]\npriority.commit = 5\ncommit:run-with-plain = auto\n",
+            "[alias]\nst = status\nst:doc = status\n",
+        ] {
+            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_tool_paths_judged() {
+        let f = fixture("hgtools");
+        let tree = f.tree.display();
+        for text in [
+            format!("[merge-tools]\nx.executable = {tree}/evil\n"),
+            "[merge-tools]\nx.executable = evil\n".to_owned(),
+            "[ui]\nmerge = evil\n".to_owned(),
+            format!("[merge-tools]\nx.args = {tree}/evil\n"),
+            format!("[extdiff]\nopts.vd = {tree}/evil\n"),
+            format!("[extdiff]\nvd = {tree}/evil\n"),
+            format!("[fix]\nblack:command = {tree}/evil\n"),
+            format!("[email]\nmethod = {tree}/evil\n"),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Mercurial expands `~` in a tool's executable; a program run without a shell does not.
+        assert_eq!(
+            scan_hg(&f, "[merge-tools]\nx.executable = ~/evil\n"),
+            Ok(())
+        );
+        let result = scan_hg(&f, "[profiling]\npy-spy.exe = ~/evil\n");
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
     }
 
     #[test]
