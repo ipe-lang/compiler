@@ -40,9 +40,7 @@ impl IpeStringify for MainRChain {
     fn ipe_show(&self) -> String {
         match self {
             MainRChain::REnd => "REnd".to_string(),
-            MainRChain::RNode(p0) => {
-                format!("RNode {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainRChain::RNode(p0) => format!("RNode {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -57,8 +55,8 @@ impl IpeStringify for RecRestVal {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.rest)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.val)).dispatch()
+            IpeStringify::ipe_show(&self.rest),
+            IpeStringify::ipe_show(&self.val)
         )
     }
 }

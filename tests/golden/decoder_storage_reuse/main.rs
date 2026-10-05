@@ -43,10 +43,10 @@ impl<T1: Clone + 'static> Clone for MainDecBox<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for MainDecBox<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for MainDecBox<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainDecBox::DecBox(_) => format!("DecBox {}", "<fn>"),
+            MainDecBox::DecBox(p0) => format!("DecBox {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -63,9 +63,9 @@ impl<T1: Clone + 'static> Clone for RecDec<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for RecDec<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for RecDec<T1> {
     fn ipe_show(&self) -> String {
-        format!("{{{}}}", "<fn>")
+        format!("{{{}}}", IpeStringify::ipe_show(&self.dec))
     }
 }
 

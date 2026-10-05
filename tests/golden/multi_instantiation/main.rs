@@ -35,12 +35,9 @@ pub struct RecValue<T1> {
     value: T1,
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecValue<T1> {
+impl<T1: IpeStringify> IpeStringify for RecValue<T1> {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{}}}",
-            (&ipe_runtime::stringify::Wrap(&self.value)).dispatch()
-        )
+        format!("{{{}}}", IpeStringify::ipe_show(&self.value))
     }
 }
 

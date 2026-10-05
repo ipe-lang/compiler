@@ -37,10 +37,7 @@ pub struct RecValue {
 
 impl IpeStringify for RecValue {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{}}}",
-            (&ipe_runtime::stringify::Wrap(&self.value)).dispatch()
-        )
+        format!("{{{}}}", IpeStringify::ipe_show(&self.value))
     }
 }
 

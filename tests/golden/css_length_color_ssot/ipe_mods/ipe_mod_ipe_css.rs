@@ -19,38 +19,18 @@ pub(crate) enum IpeCssLength {
 impl IpeStringify for IpeCssLength {
     fn ipe_show(&self) -> String {
         match self {
-            IpeCssLength::Px(p0) => {
-                format!("Px {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Rem(p0) => {
-                format!("Rem {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Em(p0) => {
-                format!("Em {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Pct(p0) => {
-                format!("Pct {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Vh(p0) => {
-                format!("Vh {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Vw(p0) => {
-                format!("Vw {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Ch(p0) => {
-                format!("Ch {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Fr(p0) => {
-                format!("Fr {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            IpeCssLength::Num(p0) => {
-                format!("Num {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeCssLength::Px(p0) => format!("Px {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Rem(p0) => format!("Rem {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Em(p0) => format!("Em {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Pct(p0) => format!("Pct {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Vh(p0) => format!("Vh {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Vw(p0) => format!("Vw {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Ch(p0) => format!("Ch {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Fr(p0) => format!("Fr {}", IpeStringify::ipe_show(p0)),
+            IpeCssLength::Num(p0) => format!("Num {}", IpeStringify::ipe_show(p0)),
             IpeCssLength::LenAuto => "LenAuto".to_string(),
             IpeCssLength::LenZero => "LenZero".to_string(),
-            IpeCssLength::LenRaw(p0) => {
-                format!("LenRaw {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeCssLength::LenRaw(p0) => format!("LenRaw {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -70,41 +50,36 @@ pub(crate) enum IpeCssColor {
 impl IpeStringify for IpeCssColor {
     fn ipe_show(&self) -> String {
         match self {
-            IpeCssColor::Hex(p0) => {
-                format!("Hex {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeCssColor::Hex(p0) => format!("Hex {}", IpeStringify::ipe_show(p0)),
             IpeCssColor::Rgb(p0, p1, p2) => format!(
                 "Rgb {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2)
             ),
             IpeCssColor::Rgba(p0, p1, p2, p3) => format!(
                 "Rgba {} {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p3)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2),
+                IpeStringify::ipe_show(p3)
             ),
             IpeCssColor::Hsl(p0, p1, p2) => format!(
                 "Hsl {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2)
             ),
             IpeCssColor::Hsla(p0, p1, p2, p3) => format!(
                 "Hsla {} {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p3)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2),
+                IpeStringify::ipe_show(p3)
             ),
             IpeCssColor::ColorTransparent => "ColorTransparent".to_string(),
             IpeCssColor::ColorCurrent => "ColorCurrent".to_string(),
-            IpeCssColor::ColorRaw(p0) => format!(
-                "ColorRaw {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeCssColor::ColorRaw(p0) => format!("ColorRaw {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -117,9 +92,7 @@ pub(crate) enum IpeCssOpacity {
 impl IpeStringify for IpeCssOpacity {
     fn ipe_show(&self) -> String {
         match self {
-            IpeCssOpacity::Opacity(p0) => {
-                format!("Opacity {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeCssOpacity::Opacity(p0) => format!("Opacity {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
