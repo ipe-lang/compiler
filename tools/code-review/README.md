@@ -8,11 +8,18 @@ the program stands on its own — no wrapper script.
 
 ## Prerequisites
 
-This app is written in Ipê, so the `ipe` compiler must be installed and on your
-`PATH`, at release `ipe-v0.4.0` or later: the queue loader uses `Task.loop`,
-which first ships in that release, so an older compiler refuses to build the
-app. Install it from the repo root with `./install.sh`, which installs the
-latest release; confirm with `ipe version`.
+This app is written in Ipê, so the `ipe` compiler must be on your `PATH` at
+release `ipe-v0.5.0` or later. Confirm with `ipe version`. Install the latest
+release from the repo root with `./install.sh`.
+
+A compiler built from a checkout of this repository also works. From the repo
+root:
+
+```bash
+cargo build --release -p ipe      # → target/release/ipe
+```
+
+Put `target/release` on your `PATH`, or call that binary by its path.
 
 The app reviews an `ipe-index` database, so you also need one. Build it once
 from the repo root:
@@ -104,6 +111,19 @@ and startup always rebuilds it once.
 The index DB is opened read-only for listing and read-write (never created) only
 to drain a decided unit: in one transaction its pair enters `reviewed` and its
 consumed `change_queue` row is deleted. The app creates and owns the review DB.
+
+## Checks
+
+From this directory, run the app's tests and the formatter check:
+
+```bash
+ipe test            # builds and runs tests/Main.ipe, reports pass/fail
+ipe fmt --check     # lists unformatted files without rewriting them
+```
+
+`tests/Main.ipe` gathers every test module's checks into one run; `ipe test`
+exits non-zero on a failing check. `ipe fmt` without `--check` rewrites the
+files.
 
 ## Running
 
