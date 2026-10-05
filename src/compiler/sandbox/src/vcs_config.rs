@@ -14,9 +14,11 @@
 //! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
 //! resolved against the configuration file's directory and the working tree,
 //! `~` through the injected [`Home`]; an option's argument is judged as a word
-//! of its own and the option word whole besides; a program name passes, less
-//! only the one runner prefix (`!`, `python:`) its setting's tool consumes
-//! (anywhere else `!/x` is a relative path); any other word, a `--` or `-` ending a
+//! of its own and the option word whole besides; a program name passes, as the
+//! setting's tool composes it: less only the one runner prefix (`!`,
+//! `python:`) that tool consumes (anywhere else `!/x` is a relative path), and
+//! with the `git-` a Git alias or credential helper names a program by; any
+//! other word, a `--` or `-` ending a
 //! program's options, a command substitution, an expansion, a glob or brace
 //! expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
@@ -27,6 +29,7 @@
 //! is bounded by [`ConfigLimits`] or a declared constant, and every
 //! unreadable, oversized, or malformed file refuses.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
@@ -1075,30 +1078,58 @@ enum Role {
     UrlList,
 }
 
-/// The prefix a tool consumes from the start of a setting's value before running the rest as a command line.
+/// How a tool turns a setting's value into the command line it runs.
 ///
-/// A tool strips it once, from the first character of the value as written,
-/// and only for the settings that declare it. Everywhere else a runner-shaped
-/// word (`!/x`, `=/x`) is run as written: a relative path.
+/// A tool strips a runner prefix once, from the first character of the value
+/// as written, and only for the settings that declare it. Everywhere else a
+/// runner-shaped word (`!/x`, `=/x`) is run as written: a relative path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Runner {
-    /// No prefix is consumed.
+    /// The value is the command line.
     None,
-    /// One leading `!` makes the rest a shell command: a Git `alias.*` or `credential.helper`, a Mercurial `[alias]`.
+    /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`.
     Bang,
+    /// A Git `alias.*`: one leading `!` makes the rest a shell command;
+    /// otherwise the first word names a Git command, which Git runs as the
+    /// program `git-<word>` (`execv_dashed_external`), relative to its working
+    /// directory once the word holds a `/`.
+    GitAlias,
+    /// A Git `credential.helper`: one leading `!` makes the rest a shell
+    /// command, an absolute path runs as written, and anything else runs as
+    /// `git credential-<value>`, the program `git-credential-<word>`
+    /// (`credential.c`).
+    GitHelper,
     /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
     Python,
 }
 
 impl Runner {
-    /// `value` without the prefix this runner consumes, when it starts with it.
-    fn consume(self, value: &str) -> &str {
-        let prefix = match self {
-            Self::None => return value,
-            Self::Bang => "!",
-            Self::Python => "python:",
+    /// The command line the tool runs for `value`.
+    fn consume(self, value: &str) -> Cow<'_, str> {
+        let (prefix, program) = match self {
+            Self::None => return Cow::Borrowed(value),
+            Self::GitHelper if is_git_absolute(value) => return Cow::Borrowed(value),
+            Self::Bang => ("!", None),
+            Self::GitAlias => ("!", Some("git-")),
+            Self::GitHelper => ("!", Some("git-credential-")),
+            Self::Python => ("python:", None),
         };
-        value.strip_prefix(prefix).unwrap_or(value)
+        match (value.strip_prefix(prefix), program) {
+            (Some(rest), _) => Cow::Borrowed(rest),
+            (None, None) => Cow::Borrowed(value),
+            (None, Some(program)) => Cow::Owned(format!("{program}{value}")),
+        }
+    }
+}
+
+/// Git's `is_absolute_path`: a leading `/`, and on Windows a leading `\` or a drive prefix.
+fn is_git_absolute(value: &str) -> bool {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some('/'), _) => true,
+        (Some('\\'), _) => cfg!(windows),
+        (Some(letter), Some(':')) => cfg!(windows) && letter.is_ascii_alphabetic(),
+        (Some(_) | None, _) => false,
     }
 }
 
@@ -2649,7 +2680,7 @@ impl Scan<'_> {
         };
         let mut words = Words::default();
         words
-            .push_split(runner.consume(value), Position::Program, tilde)
+            .push_split(&runner.consume(value), Position::Program, tilde)
             .map_err(unproven)?;
         self.judge_queue(ctx, &mut words)
     }
@@ -3342,12 +3373,10 @@ fn git_route(setting: &Setting, value: &str) -> Route {
     if exempt(VcsKind::Git, (&**section, subsection, key.as_str())) {
         return Route::Judge(Role::Exempt);
     }
-    // Git strips one `!` from an alias (`git.c`) and a credential helper
-    // (`credential.c`), then runs the rest through the shell.
-    let runner = if matches!(shape, ("alias", false, _) | ("credential", _, "helper")) {
-        Runner::Bang
-    } else {
-        Runner::None
+    let runner = match shape {
+        ("alias", false, _) => Runner::GitAlias,
+        ("credential", _, "helper") => Runner::GitHelper,
+        _ => Runner::None,
     };
     Route::Judge(Role::Words(runner))
 }
@@ -4826,7 +4855,7 @@ mod tests {
                 "{value:?}"
             );
         }
-        git_config(&f, &format!("[alias]\n\tx = {out}/a\n"));
+        git_config(&f, &format!("[alias]\n\tx = !{out}/a\n"));
         assert_eq!(scan_git(&f), Ok(()));
 
         // An include path is a file name, never a command: `!` there is the
@@ -5511,6 +5540,36 @@ mod tests {
                 in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
                 "{text:?}: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn git_command_word_judged_as_the_program_git_runs() {
+        let f = fixture("gitdashed");
+        let out = f.out.display();
+        for text in [
+            format!("[alias]\n\tx = {out}/x\n"),
+            "[alias]\n\tx = ~/x\n".to_owned(),
+            "[credential]\n\thelper = ~/x\n".to_owned(),
+            "[credential \"https://example.com\"]\n\thelper = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[alias]\n\tco = checkout\n".to_owned(),
+            "[alias]\n\tx = !~/x\n".to_owned(),
+            "[credential]\n\thelper = store\n".to_owned(),
+            format!("[credential]\n\thelper = {out}/helper\n"),
+            "[credential]\n\thelper = !~/x\n".to_owned(),
+            "[core]\n\tpager = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
         }
     }
 
