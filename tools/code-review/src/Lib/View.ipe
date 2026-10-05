@@ -777,12 +777,15 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map (numberedLine loaded.unit.lang) (Format.numberedLines loaded.unit.lineStart (Index.shownText shown))
+                    List.map (numberedLine loaded.unit.lang) (Index.shownLines shown loaded.unit.lineStart)
 
                 Stale _ ->
                     withheldSource loaded.view
 
                 Unreadable _ ->
+                    withheldSource loaded.view
+
+                TooLarge _ ->
                     withheldSource loaded.view
             )
         )
