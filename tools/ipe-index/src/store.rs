@@ -369,9 +369,13 @@ impl Store {
              SELECT caller_uid, callee FROM ( \
                SELECT cs.caller_uid AS caller_uid, COALESCE( \
                  (SELECT u.uid FROM units u WHERE u.qualified = cs.exact \
-                   ORDER BY (u.path = cs.path) DESC, u.uid LIMIT 1), \
+                   AND u.path = cs.path ORDER BY u.uid LIMIT 1), \
+                 (SELECT u.uid FROM units u WHERE u.qualified = cs.exact \
+                   ORDER BY u.uid LIMIT 1), \
                  (SELECT u.uid FROM units u WHERE u.qualified = cs.local \
-                   ORDER BY (u.path = cs.path) DESC, u.uid LIMIT 1)) AS callee \
+                   AND u.path = cs.path ORDER BY u.uid LIMIT 1), \
+                 (SELECT u.uid FROM units u WHERE u.qualified = cs.local \
+                   ORDER BY u.uid LIMIT 1)) AS callee \
                FROM call_sites cs) \
              WHERE callee IS NOT NULL",
             [],
@@ -435,12 +439,12 @@ impl Store {
             .execute("INSERT OR REPLACE INTO meta VALUES (?,?)", [k, v])?;
         Ok(())
     }
-    #[cfg(test)]
     pub fn get_meta(&self, k: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT v FROM meta WHERE k=?", [k], |r| r.get(0))
-            .ok())
+        Ok(rusqlite::OptionalExtension::optional(self.conn.query_row(
+            "SELECT v FROM meta WHERE k=?",
+            [k],
+            |r| r.get(0),
+        ))?)
     }
     /// Records the root set this index is built under, replacing any earlier one.
     pub fn record_repos(&self, roots: &[RecordedRoot]) -> Result<()> {

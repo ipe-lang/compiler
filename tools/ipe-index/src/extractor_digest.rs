@@ -114,8 +114,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extractor_digest_refuses_a_symbolic_link() {
-        let root =
-            std::env::temp_dir().join(format!("ipe-index-digest-link-{}", std::process::id()));
+        let root = std::env::current_exe()
+            .unwrap()
+            .with_file_name(format!("ipe-index-digest-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         for name in MANIFEST_FILES {

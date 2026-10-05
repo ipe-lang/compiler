@@ -13,8 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for input in ["src", "Cargo.toml", "Cargo.lock", "build.rs"] {
         println!("cargo:rerun-if-changed={input}");
     }
-    let root = std::env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is unset")?;
-    let digest = extractor_digest::extractor_digest(&PathBuf::from(root))?;
+    let digest = extractor_digest::extractor_digest(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))?;
     println!("cargo:rustc-env=IPE_INDEX_EXTRACTOR={digest}");
     Ok(())
 }
