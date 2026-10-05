@@ -33,4 +33,30 @@ all =
     , { name = "0004_drop_drain_cursor"
       , sql = "DROP TABLE IF EXISTS drain_cursor;"
       }
+    , { name = "0005_review_append_only"
+      , sql = """CREATE TABLE review_head (
+    one  INTEGER PRIMARY KEY CHECK (one = 1),
+    head TEXT NOT NULL CHECK (head <> '')
+);
+INSERT INTO review_head (one, head) VALUES (1, 'genesis:' || lower(hex(randomblob(16))));
+CREATE TRIGGER review_no_delete BEFORE DELETE ON review
+BEGIN
+    SELECT RAISE(ABORT, 'review log is append-only');
+END;
+CREATE TRIGGER review_no_update BEFORE UPDATE ON review
+BEGIN
+    SELECT RAISE(ABORT, 'review log is append-only');
+END;
+CREATE TRIGGER review_head_no_delete BEFORE DELETE ON review_head
+BEGIN
+    SELECT RAISE(ABORT, 'review head cannot be removed');
+END;"""
+      }
+    , { name = "0006_review_no_replace"
+      , sql = """CREATE TRIGGER review_no_replace BEFORE INSERT ON review
+WHEN EXISTS (SELECT 1 FROM review WHERE uid = NEW.uid AND body_hash = NEW.body_hash)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;"""
+      }
     ]

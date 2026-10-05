@@ -70,6 +70,53 @@ def _substitutions(text: str, lo: int, hi: int, subs: list[int] | None) -> None:
             subs.append(j + 2)
 
 
+# How deep `"$(".."$(".."$(` may nest inside double quotes before the rest of
+# the text is read as one word.
+SUBSTITUTION_NESTING_LIMIT = 32
+
+
+def _substitution_end(text: str, i: int, nesting: int = 0) -> int:
+    """The index just past the `)` closing the command substitution whose
+    body starts at `text[i]`, or `len(text)` when it never closes or nests
+    past `SUBSTITUTION_NESTING_LIMIT`. Inside the body quotes delimit again
+    (`"$(sed 's/"//')"` is one word), so a quote there neither ends nor opens
+    the enclosing double-quoted span."""
+    depth, n = 1, len(text)
+    if nesting >= SUBSTITUTION_NESTING_LIMIT:
+        return n
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 2
+                elif text.startswith("$(", i):
+                    i = _substitution_end(text, i + 2, nesting + 1)
+                else:
+                    i += 1
+            i += 1
+        elif text.startswith("$(", i):
+            depth += 1
+            i += 2
+        elif c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return n
+
+
 def _lex(
     text: str, bodies: list[tuple[int, int]] | None = None, subs: list[int] | None = None,
     closer: str | None = None,
@@ -233,6 +280,11 @@ def _lex(
                     if text[i + 1] != "\n":
                         buf.append(text[i + 1])
                     i += 2
+                    continue
+                if text.startswith("$(", i):
+                    end = min(_substitution_end(text, i + 2), n)
+                    buf.append(text[i:end])
+                    i = end
                     continue
                 buf.append(text[i])
                 i += 1

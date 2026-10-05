@@ -206,9 +206,9 @@ impl BuildPosture {
 
 /// Whether one HTTP listener is reachable from beyond this host.
 ///
-/// Parsed from a resolved bind host. Only a literal loopback IP address is
-/// `Loopback`; a hostname (`localhost` included), a wildcard, any other
-/// address, or an unparsable value is `Exposed`.
+/// Classified from the IP address a listener binds. Only a loopback address is
+/// `Loopback`; a wildcard or any other address, an IPv4-mapped loopback
+/// included, is `Exposed`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ListenScope {
     /// Bound to a loopback address: reachable from this host only.
@@ -218,18 +218,14 @@ pub enum ListenScope {
 }
 
 impl ListenScope {
-    /// Classify a bind host (trimmed).
+    /// The scope of a listener bound to `ip`.
     #[must_use]
-    pub fn parse(host: &str) -> Self {
-        host.trim()
-            .parse::<std::net::IpAddr>()
-            .map_or(Self::Exposed, |ip| {
-                if ip.is_loopback() {
-                    Self::Loopback
-                } else {
-                    Self::Exposed
-                }
-            })
+    pub const fn of(ip: std::net::IpAddr) -> Self {
+        if ip.is_loopback() {
+            Self::Loopback
+        } else {
+            Self::Exposed
+        }
     }
 }
 
@@ -289,12 +285,12 @@ impl ProcessScope {
 /// The monotone [`ProcessScope`] of this process, as its byte encoding.
 static PROCESS_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Record an app listener's bind host before it binds, returning its scope.
+/// Record an app listener's bind address before it binds, returning its scope.
 ///
 /// Every app bind path (`serve_web`, `Server.listen`) calls this, so the
 /// process scope is the join of all of them.
-pub fn record_bind(host: &str) -> ListenScope {
-    let scope = ListenScope::parse(host);
+pub fn record_bind(host: std::net::IpAddr) -> ListenScope {
+    let scope = ListenScope::of(host);
     let byte = ProcessScope::Unbound.join(scope).to_byte();
     PROCESS_SCOPE.fetch_max(byte, std::sync::atomic::Ordering::SeqCst);
     scope
@@ -467,6 +463,10 @@ pub(crate) const fn test_dev_surface() -> DevSurface {
 /// A dev-only relaxation never negates this: it takes a [`DevIntent`] or
 /// [`DevSurface`]. The source inventory `tests/posture_read_inventory.rs`
 /// admits every caller by name.
+#[cfg(any(
+    feature = "server",
+    all(test, not(target_arch = "wasm32"), not(feature = "dev-posture"))
+))]
 #[must_use]
 pub(crate) fn posture_is_production() -> bool {
     Posture::from_env() == Posture::Production
@@ -1709,7 +1709,7 @@ mod tests {
     fn env_dev_on_release_binary_mints_no_token() {
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_set_var("IPE_ENV", "dev");
-        record_bind("127.0.0.1");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
         assert_eq!(Posture::from_env(), Posture::Production);
         assert!(dev_intent_from_env().is_none());
@@ -1728,10 +1728,10 @@ mod tests {
         crate::system::locked_remove_var("IPE_ENV");
         assert!(dev_intent_from_env().is_some());
         assert!(dev_surface_from_env().is_none(), "unbound: no surface");
-        record_bind("127.0.0.1");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert!(dev_surface_from_env().is_some());
         assert!(!dev_console_banner("").is_empty());
-        record_bind("0.0.0.0");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         assert!(dev_surface_from_env().is_none());
         assert_eq!(dev_console_banner(""), "");
         assert!(dev_intent_from_env().is_some());
@@ -1745,7 +1745,7 @@ mod tests {
         assert_eq!(dev_console_banner_with("", None), "");
         if !cfg!(feature = "dev-posture") {
             crate::system::locked_set_var("ENV", "dev");
-            record_bind("127.0.0.1");
+            record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
             assert_eq!(dev_console_banner(""), "");
             crate::system::locked_remove_var("ENV");
         }
@@ -2192,6 +2192,10 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod listen_scope_tests {
     use super::{ListenScope, ProcessScope, record_bind};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const UNSPECIFIED: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
     #[test]
     fn process_scope_bytes_decode_closed() {
@@ -2226,36 +2230,36 @@ mod listen_scope_tests {
             ProcessScope::Exposed
         );
         assert_eq!(ProcessScope::current(), ProcessScope::Unbound);
-        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(record_bind(LOOPBACK), ListenScope::Loopback);
         assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
-        assert_eq!(record_bind("0.0.0.0"), ListenScope::Exposed);
-        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(record_bind(UNSPECIFIED), ListenScope::Exposed);
+        assert_eq!(record_bind(LOOPBACK), ListenScope::Loopback);
         assert_eq!(ProcessScope::current(), ProcessScope::Exposed);
     }
 
     #[test]
-    fn only_a_literal_loopback_address_is_loopback() {
-        for host in [
-            "0.0.0.0",
-            "::",
-            "10.0.0.1",
-            "localhost",
-            "",
-            "not-an-ip",
-            "[::1]",
-            "::ffff:127.0.0.1",
+    fn only_a_loopback_address_is_loopback() {
+        for ip in [
+            UNSPECIFIED,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
         ] {
             assert_eq!(
-                ListenScope::parse(host),
+                ListenScope::of(ip),
                 ListenScope::Exposed,
-                "bind host {host:?} must read as exposed"
+                "bind address {ip} must read as exposed"
             );
         }
-        for host in ["127.0.0.1", "::1", " 127.0.0.1 ", "127.1.2.3"] {
+        for ip in [
+            LOOPBACK,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3)),
+        ] {
             assert_eq!(
-                ListenScope::parse(host),
+                ListenScope::of(ip),
                 ListenScope::Loopback,
-                "bind host {host:?} must read as loopback"
+                "bind address {ip} must read as loopback"
             );
         }
     }

@@ -142,6 +142,36 @@ class TestStrictSafeLoader(unittest.TestCase):
         with self.assertRaises(strict_yaml.StrictYAMLError):
             strict_yaml.safe_load("a: !!str x\n")
 
+    # ---- YAML 1.1-only plain scalars ----------------------------------------
+
+    def test_scalar_read_differently_by_yaml_1_2_is_refused(self) -> None:
+        # Each loads under YAML 1.1 as a value GitHub's YAML 1.2 reader does
+        # not produce: `yes` a bool (1.2: the string), `0x2`/`010`/`1_000`
+        # an int (1.2: another int or a string), `1:30` a sexagesimal int,
+        # `2001-01-01` a date, `1e3` a string (1.2: a float), `0o7` a string
+        # (1.2: an int).
+        for text in ("yes", "No", "on", "off", "0x2", "010", "1_000", "1:30", "2001-01-01", "1e3", "1.0e3", "0o7", "1_0.5"):
+            with self.subTest(text=text):
+                with self.assertRaises(strict_yaml.StrictYAMLError) as ctx:
+                    strict_yaml.safe_load(f"a: {text}\n")
+                self.assertIn("spell it as YAML 1.2 does", str(ctx.exception))
+        for text in ("yes", "0x2"):
+            with self.subTest(sequence=text):
+                with self.assertRaises(strict_yaml.StrictYAMLError):
+                    strict_yaml.safe_load(f"a: [{text}]\n")
+
+    def test_scalar_both_readers_agree_on_loads(self) -> None:
+        doc = strict_yaml.safe_load(
+            "a: true\nb: false\nc: null\nd: ~\ne:\nf: 0\ng: -12\nh: 1.5\ni: 'yes'\nj: \"0x2\"\nk: x86_64\nl: --cfg x\n"
+        )
+        self.assertEqual(
+            doc,
+            {"a": True, "b": False, "c": None, "d": None, "e": None, "f": 0, "g": -12, "h": 1.5,
+             "i": "yes", "j": "0x2", "k": "x86_64", "l": "--cfg x"},
+        )
+        # A mapping key keeps its YAML 1.1 reading: the workflow `on:` key.
+        self.assertEqual(strict_yaml.safe_load("on: push\n"), {True: "push"})
+
     # ---- bounded nesting ---------------------------------------------------
 
     def test_over_deep_nesting_is_a_typed_refusal(self) -> None:
