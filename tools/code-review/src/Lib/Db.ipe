@@ -226,18 +226,52 @@ reviewStore =
 
 
 -- The startup check of `IPE_REVIEW_DB`: the review database is opened
--- (created when absent) and migrated, and its log head is read, so an
--- unwritable location or a file whose head is missing stops the server
--- before it listens, naming the variable and the file.
+-- (created when absent) and migrated, its append-only guards are found on
+-- the tables they guard, and its log head is read, so an unwritable
+-- location, a file whose guards are gone, or one whose head is missing stops
+-- the server before it listens, naming the variable and the file.
 probe : DbLocation -> Task.Task Error ()
 probe loc =
     (do
         db <- openAt loc
         migrate db
+        requireGuards db
         currentHead db
         Task.succeed ()
     )
         |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
+
+
+-- The triggers that keep the review log append-only, each named with the
+-- table it guards. A migrated file can still lose one: a dropped trigger, or
+-- the log renamed away and recreated, which carries its triggers to the
+-- renamed table.
+appendOnlyGuards : List String
+appendOnlyGuards =
+    [ "review_head_no_delete on review_head"
+    , "review_no_delete on review"
+    , "review_no_replace on review"
+    , "review_no_update on review"
+    ]
+
+
+guardDecoder : Db.Decode.Decoder String
+guardDecoder =
+    Db.Decode.succeed (\entry -> entry)
+        |> Db.Decode.required "guard" (Db.Decode.string "guard")
+
+
+-- Every guard in `appendOnlyGuards` is present on its table; a file missing
+-- one is refused, since its review rows could be rewritten unseen.
+requireGuards : Db -> Task.Task Error ()
+requireGuards db =
+    do
+        present <- Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+        if List.all (\entry -> List.member entry present) appendOnlyGuards then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.unexpected "the review log's append-only triggers are not all in place")
 
 
 -- The review database at a parsed location, opened through the one review URL

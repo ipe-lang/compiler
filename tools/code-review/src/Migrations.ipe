@@ -52,4 +52,11 @@ BEGIN
     SELECT RAISE(ABORT, 'review head cannot be removed');
 END;"""
       }
+    , { name = "0006_review_no_replace"
+      , sql = """CREATE TRIGGER review_no_replace BEFORE INSERT ON review
+WHEN EXISTS (SELECT 1 FROM review WHERE uid = NEW.uid AND body_hash = NEW.body_hash)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;"""
+      }
     ]

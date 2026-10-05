@@ -1653,8 +1653,10 @@ resyncCeilingLeavesStamp =
 -- holds the whole queue, the rows listed are the count, and progress's
 -- open units (`total - reviewed`) are the same count, before a decision,
 -- after it is recorded with no drain, and after its drain. Red if the
--- count or progress is read outside the page's snapshot, or progress
--- counts a different set than the page lists.
+-- count or progress counts a different set than the page lists. The test
+-- runs no writer between the reads, so the isolation itself (one
+-- transaction in `Index.readSnapshot`) is held by that function's shape,
+-- not driven here.
 pageCountProgressOneSnapshot : Task.Task Error Bool
 pageCountProgressOneSnapshot =
     do

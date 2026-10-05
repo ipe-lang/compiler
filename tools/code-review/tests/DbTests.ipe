@@ -144,7 +144,10 @@ isAlreadyDecided written =
 
 -- The review log is append-only: deleting or updating a review row, and
 -- deleting the head, are each refused by the database, and the row and the
--- head are left as they were. Red with any of the three triggers dropped.
+-- head are left as they were. Re-inserting a decided pair with a replacing
+-- conflict clause (SQLite's REPLACE deletes the old row without firing a
+-- delete trigger) or an upsert changes nothing: the first decision stays.
+-- Red with any of the four triggers dropped.
 reviewLogAppendOnly : Db -> Task.Task Error Bool
 reviewLogAppendOnly db =
     let
@@ -152,6 +155,11 @@ reviewLogAppendOnly db =
             Db.exec db sql []
                 |> Task.map (\_ -> False)
                 |> Task.onError (\_ -> Task.succeed True)
+
+        rewrite sql =
+            Db.exec db sql [ SqlString "u-a", SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0 ]
+                |> Task.map (\_ -> ())
+                |> Task.onError (\_ -> Task.succeed ())
     in
     do
         attested <- attestedFor "ipe-review-append-only-index" "u-a"
@@ -161,9 +169,13 @@ reviewLogAppendOnly db =
         updateRefused <- refused "UPDATE review SET decision = 'approve', reason = NULL"
         rekeyRefused <- refused "UPDATE review SET body_hash = 'other'"
         headDeleteRefused <- refused "DELETE FROM review_head"
+        rewrite "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+        rewrite "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+        rewrite "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
         n <- countReviewRows db "u-a" (Index.attest viewA)
+        kept <- LibDb.findDecision db "u-a" (Index.attest viewA)
         headAfter <- reviewHeadOf db
-        Task.succeed (deleteRefused && updateRefused && rekeyRefused && headDeleteRefused && n == 1 && headAfter == head)
+        Task.succeed (deleteRefused && updateRefused && rekeyRefused && headDeleteRefused && n == 1 && isApproved kept && headAfter == head)
 
 
 -- The head moves only from the head it was read as: a compare-and-set from a
@@ -215,6 +227,44 @@ probeRefusesReviewWithoutHeadIn base =
         message <- probeMessage (LibDb.probe loc)
         removeReviewFiles dbPath
         Task.succeed (probeNames "IPE_REVIEW_DB" dbPath message)
+
+
+-- A review file whose append-only guards are gone fails the startup probe,
+-- naming the variable and the file: one trigger dropped, and the log renamed
+-- away and recreated bare (its triggers follow the renamed table). An intact
+-- file passes. Red if the probe does not check the guards on their table.
+probeRefusesReviewWithoutGuards : Task.Task Error Bool
+probeRefusesReviewWithoutGuards =
+    freshDir "ipe-review-probe-no-guards" |> Task.andThen probeRefusesReviewWithoutGuardsIn
+
+
+probeRefusesReviewWithoutGuardsIn : String -> Task.Task Error Bool
+probeRefusesReviewWithoutGuardsIn base =
+    let
+        dropped =
+            base ++ "/dropped.db"
+
+        renamed =
+            base ++ "/renamed.db"
+    in
+    do
+        intact <- probeAfterEdits (base ++ "/intact.db") []
+        droppedMessage <- probeAfterEdits dropped [ "DROP TRIGGER review_no_replace" ]
+        renamedMessage <- probeAfterEdits renamed [ "ALTER TABLE review RENAME TO review_old", "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" ]
+        Task.succeed (intact == Nothing && probeNames "IPE_REVIEW_DB" dropped droppedMessage && probeNames "IPE_REVIEW_DB" renamed renamedMessage)
+
+
+-- The probe's refusal message on a migrated review file at `dbPath` after
+-- `edits` ran on it; Nothing when the probe passes.
+probeAfterEdits : String -> List String -> Task.Task Error (Maybe String)
+probeAfterEdits dbPath edits =
+    do
+        db <- migratedReviewAt dbPath
+        Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        message <- probeMessage (LibDb.probe loc)
+        removeReviewFiles dbPath
+        Task.succeed message
 
 
 -- Re-reviewing the same pair must succeed (any Err here fails
@@ -614,6 +664,7 @@ checks =
         , check "the review log is append-only" (onFreshReview "ipe-review-reviewLogAppendOnly" reviewLogAppendOnly)
         , check "a head compare-and-set from a stale head is refused" (onFreshReview "ipe-review-concurrentHeadCasRefuses" concurrentHeadCasRefuses)
         , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead
+        , check "a review file without its append-only guards fails the probe" probeRefusesReviewWithoutGuards
         , check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)

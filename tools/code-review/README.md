@@ -114,12 +114,16 @@ Deciding a unit raises the first number and leaves the second unchanged, and
 a reload or a second tab shows the same numbers.
 
 The review DB's `review` table is append-only (deleting or updating a row is
-refused), and every new decision moves its `review_head`, a hash chain over
-the decided pairs that starts from a random genesis. The `reviewed` copy is
-trusted only when its `reviewed_stamp` equals that head: draining a decision
-moves the stamp along with the head, and any other stamp (a decision whose
-drain failed, a rebuilt index file, a decision made from another process)
-rebuilds the copy from the review DB before the page is read. A replaced
+refused, and re-inserting a decided pair, `REPLACE` included, changes
+nothing), and every decision the app records moves its `review_head`, a hash
+chain over the decided pairs that starts from a random genesis. Startup
+refuses a review DB whose append-only triggers are missing. The `reviewed`
+copy is trusted only when its `reviewed_stamp` equals that head: draining a
+decision moves the stamp along with the head, and any other stamp (a decision
+whose drain failed, an index file replaced by another, a decision made from
+another process) rebuilds the copy from the review DB before the page is
+read. A row written into `review` by hand, outside the app, does not move
+the head: its unit stays listed until the next rebuild. A replaced
 review DB has a new genesis, so it re-opens every unit the old one decided.
 Startup always rebuilds the copy once.
 
