@@ -21,6 +21,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::home::{HomeDir, HomeRefusal, RelativeToolHome, ToolHome};
+use crate::run_jail::FilesystemScope;
+use crate::vcs_config::ConfigRefusal;
 use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WritableTree};
 
 /// Directories masked in every jail, whoever the invoker is.
@@ -87,6 +89,10 @@ pub enum JailPathError {
         /// The first metadata path the tree holds.
         path: PathBuf,
     },
+    /// A configuration the version-control tool reads from a writable tree's
+    /// carved metadata names, or may name, code inside a writable grant, or
+    /// cannot be read.
+    VcsConfig(ConfigRefusal),
 }
 
 impl fmt::Display for JailPathError {
@@ -142,6 +148,7 @@ impl fmt::Display for JailPathError {
                  from a tree without version-control metadata; refusing to build the jail",
                 path.display()
             ),
+            Self::VcsConfig(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -488,39 +495,73 @@ fn with_carves<'a>(plan: Vec<MountStep<'a>>, binds: &[Bind<'a>]) -> Vec<MountSte
     out
 }
 
-/// Whether a jail binds its working tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkingTree {
+/// How a jail binds its working tree.
+///
+/// A writable tree exists only as the [`WritableTree`] of [`Self::ReadWrite`],
+/// so a jail that binds its tree writable has always carved its metadata and
+/// scanned the configuration that metadata holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeBind {
     /// Not bound: the jail sees only what the masks leave of it, read-only.
     Unbound,
-    /// Bound read-write.
-    ReadWrite,
+    /// Bound read-write, its version-control carve read-only over it.
+    ReadWrite(WritableTree),
 }
 
-impl WorkingTree {
-    /// The working-tree bind the filesystem axis `scope` grants.
-    #[must_use]
-    pub const fn granted_by(scope: &crate::run_jail::FilesystemScope) -> Self {
+impl TreeBind {
+    /// The working-tree bind the filesystem axis `scope` grants over `mounts`.
+    ///
+    /// The one reader of the filesystem axis for every jail that renders a
+    /// mount plan, run each time a jail is built: a granted tree is carved and
+    /// its configuration scanned here, against the tree and the scratch.
+    ///
+    /// # Errors
+    /// Any error of [`WritableTree::parse`] when `scope` grants the tree.
+    pub fn granted_by(
+        scope: &FilesystemScope,
+        mounts: &crate::JailMounts,
+    ) -> Result<Self, JailPathError> {
         match scope {
-            crate::run_jail::FilesystemScope::Isolated => Self::Unbound,
-            crate::run_jail::FilesystemScope::WorkingTreeReadWrite => Self::ReadWrite,
+            FilesystemScope::Isolated => Ok(Self::Unbound),
+            FilesystemScope::WorkingTreeReadWrite => WritableTree::parse(
+                mounts.working_tree().clone(),
+                &[mounts.scoped_tmp()],
+                mounts.vcs_home(),
+            )
+            .map(Self::ReadWrite),
+        }
+    }
+
+    /// The writable tree this bind exposes, if it binds one.
+    #[must_use]
+    pub const fn writable(&self) -> Option<&WritableTree> {
+        match self {
+            Self::ReadWrite(tree) => Some(tree),
+            Self::Unbound => None,
+        }
+    }
+
+    /// The directory the payload starts in: the bound tree, else the scratch.
+    #[must_use]
+    pub const fn chdir<'a>(&'a self, mounts: &'a crate::JailMounts) -> &'a CanonicalPath {
+        match self {
+            Self::ReadWrite(tree) => tree.tree(),
+            Self::Unbound => mounts.scoped_tmp(),
         }
     }
 }
 
 /// The bind set a jail over `mounts` exposes through its masks.
 ///
-/// The read-only binds, the scratch read-write, and the working tree
-/// read-write, its version-control carve read-only, only when `working_tree`
-/// is [`WorkingTree::ReadWrite`]. Every
-/// jail built from a [`crate::JailMounts`] binds exactly this set.
+/// The read-only binds, the scratch read-write, and, when `tree` is
+/// [`TreeBind::ReadWrite`], the working tree read-write with its
+/// version-control carve read-only. Every jail built from a
+/// [`crate::JailMounts`] binds exactly this set.
 #[must_use]
-pub fn jail_binds(mounts: &crate::JailMounts, working_tree: WorkingTree) -> Vec<Bind<'_>> {
-    let mut binds: Vec<Bind<'_>> = mounts.read_only().iter().map(Bind::ReadOnly).collect();
+pub fn jail_binds<'a>(mounts: &'a crate::JailMounts, tree: &'a TreeBind) -> Vec<Bind<'a>> {
+    let mut binds: Vec<Bind<'a>> = mounts.read_only().iter().map(Bind::ReadOnly).collect();
     binds.push(Bind::ReadWrite(mounts.scoped_tmp()));
-    if working_tree == WorkingTree::ReadWrite {
-        binds.push(Bind::WorkingTree(mounts.writable_tree()));
-    }
+    binds.extend(tree.writable().map(Bind::WorkingTree));
     binds
 }
 
@@ -610,6 +651,35 @@ fn first_bind_after_covered_mask<'p>(
 mod tests {
     use super::*;
     use crate::test_dir::TestDir;
+
+    /// Every renderer over [`crate::JailMounts`] reads the filesystem axis only
+    /// through [`TreeBind::granted_by`], so none binds the tree unparsed.
+    #[test]
+    fn only_granted_by_reads_the_filesystem_scope() {
+        let sources = [
+            ("run_jail/mod.rs", include_str!("run_jail/mod.rs")),
+            ("run_jail/linux.rs", include_str!("run_jail/linux.rs")),
+            ("run_jail/macos.rs", include_str!("run_jail/macos.rs")),
+            ("build_jail.rs", include_str!("build_jail.rs")),
+            ("covers.rs", include_str!("covers.rs")),
+            ("mounts.rs", include_str!("mounts.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source.split("\nmod tests {").next().unwrap_or(source);
+            for (at, _) in production.match_indices(".filesystem") {
+                let before: String = production
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                assert!(
+                    before.ends_with("granted_by(&profile"),
+                    "{name} reads the filesystem axis outside `TreeBind::granted_by` at byte {at}"
+                );
+            }
+        }
+    }
 
     /// A scratch dir holding a `bin` subdir, removed on drop.
     #[allow(clippy::expect_used)] // test fixture: the scratch dir must exist

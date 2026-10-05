@@ -617,8 +617,12 @@ mod windows_jail {
         if profile.filesystem == FilesystemScope::WorkingTreeReadWrite {
             let tree = crate::CanonicalPath::resolve(working_tree).map_err(RunJailDefect::Path)?;
             let tmp = crate::CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
+            let home = crate::home::home_dir().map_or_else(
+                |_| crate::Home::unknown(),
+                |home| crate::covers::vcs_home_of(&home),
+            );
             let writable =
-                crate::WritableTree::parse(tree, &[&tmp]).map_err(RunJailDefect::Path)?;
+                crate::WritableTree::parse(tree, &[&tmp], &home).map_err(RunJailDefect::Path)?;
             super::windows_working_tree_plan(&writable).map_err(RunJailDefect::Path)?;
         }
 
@@ -2074,8 +2078,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("tmp dir");
         let resolve = |path: &Path| crate::CanonicalPath::resolve(path).expect("canonical");
         let scratch = resolve(&tmp);
-        let writable =
-            crate::WritableTree::parse(resolve(&tree), &[&scratch]).expect("the tree parses");
+        let home = crate::Home::unknown();
+        let writable = crate::WritableTree::parse(resolve(&tree), &[&scratch], &home)
+            .expect("the tree parses");
         let planned = windows_working_tree_plan(&writable);
         assert!(
             matches!(
@@ -2088,8 +2093,8 @@ mod tests {
             "{planned:?}"
         );
         std::fs::remove_dir(tree.join(".hg")).expect("remove hg dir");
-        let plain =
-            crate::WritableTree::parse(resolve(&tree), &[&scratch]).expect("the tree parses");
+        let plain = crate::WritableTree::parse(resolve(&tree), &[&scratch], &home)
+            .expect("the tree parses");
         assert!(
             matches!(windows_working_tree_plan(&plain), Ok(path) if *path == resolve(&tree)),
             "a tree without metadata is granted"

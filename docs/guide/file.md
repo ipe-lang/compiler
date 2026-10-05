@@ -104,6 +104,16 @@ names (hooks, filters, configured commands), so a jailed program that could
 write it could run code outside the jail the next time you commit. The program
 still reads the repository, so `git status` and friends work inside it.
 
+Keeping the metadata read-only is not enough when its configuration points
+back into a writable path: a `core.hooksPath` of `.husky`, a hook that is a
+symlink to a script in the tree, or a configured command or included file kept
+in the tree. Each build of the jail reads that configuration, and the jail
+refuses to start while any setting names, or may name, code the program could
+write. The refusal names the file and the setting. Point the setting outside
+the writable paths, or run without the filesystem grant. Only the repository's
+own configuration is read; your global and system configuration lie outside
+the jail's writable paths.
+
 On Windows and FreeBSD the jail cannot yet keep that metadata read-only, so it
 refuses to run a granted program from a tree that holds it: run without the
 filesystem grant, or from a tree without version-control metadata. A

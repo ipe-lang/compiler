@@ -8,6 +8,9 @@
 //! tree parsed once against [`VcsKind::ALL`], carrying every metadata entry and
 //! every in-grant directory a pointer file names. The shared mount plan renders
 //! that carve read-only over the grant; an arm that cannot refuses the jail.
+//! The configuration each carved entry's tool reads is then scanned
+//! ([`crate::scan_vcs_config`]), so no carved setting names code the jail can
+//! write.
 //!
 //! The parse is bounded by construction: four entry names, one pointer read of
 //! at most [`POINTER_CAP`] bytes per pointer file, and a fixed chain of at most
@@ -18,6 +21,7 @@ use std::fmt;
 use std::io::Read as _;
 use std::path::Path;
 
+use crate::vcs_config::{ConfigLimits, ConfigRoots, Grants, Home, scan};
 use crate::{CanonicalPath, JailPathError, path_covers};
 
 /// The most bytes a version-control pointer file may hold.
@@ -197,7 +201,8 @@ impl VcsCarve {
 /// A working tree a jail grants read-write, with the carve it must render.
 ///
 /// Built only by [`Self::parse`], so no arm receives a writable tree whose
-/// version-control metadata was never looked for.
+/// version-control metadata was never looked for, nor one whose carved
+/// configuration names code inside a writable grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritableTree {
     tree: CanonicalPath,
@@ -209,6 +214,10 @@ impl WritableTree {
     /// and each directory a pointer file names that lies inside `tree` or one of
     /// `other_grants` (the jail's other writable paths).
     ///
+    /// The configuration each carved entry's tool reads is scanned against
+    /// those grants, with `home` the invoker's home the tool expands `~`
+    /// against.
+    ///
     /// # Errors
     /// - [`JailPathError::VcsEntryUnexpectedKind`] when an entry, or a pointer
     ///   file inside one, is a symlink, fifo, socket, or device, or a form the
@@ -218,24 +227,33 @@ impl WritableTree {
     ///   not resolve, is no directory, or covers a writable grant.
     /// - [`JailPathError::VcsEntryChanged`] when an entry changed while it was
     ///   read.
+    /// - [`JailPathError::VcsConfig`] when a configuration the tool reads names,
+    ///   or may name, code inside a writable grant, or cannot be read.
     pub fn parse(
         tree: CanonicalPath,
         other_grants: &[&CanonicalPath],
+        home: &Home,
     ) -> Result<Self, JailPathError> {
-        let carve = Carver::carve(&tree, other_grants)?;
+        let (carve, roots) = Carver::carve(&tree, other_grants)?;
+        scan_roots(&tree, other_grants, &carve, &roots, home)?;
         Ok(Self { tree, carve })
     }
 
-    /// Confirm the tree still holds exactly the carve it was parsed with.
+    /// Confirm the tree still holds exactly the carve it was parsed with, and
+    /// its configuration still names no code inside a writable grant.
     ///
     /// # Errors
     /// [`JailPathError::VcsEntryChanged`] when an entry appeared, vanished, or
     /// was replaced since the parse; any error of [`Self::parse`] the tree now
     /// raises.
-    pub fn recheck(&self, other_grants: &[&CanonicalPath]) -> Result<(), JailPathError> {
-        let now = Carver::carve(&self.tree, other_grants)?;
+    pub fn recheck(
+        &self,
+        other_grants: &[&CanonicalPath],
+        home: &Home,
+    ) -> Result<(), JailPathError> {
+        let (now, roots) = Carver::carve(&self.tree, other_grants)?;
         if now == self.carve {
-            return Ok(());
+            return scan_roots(&self.tree, other_grants, &now, &roots, home);
         }
         let changed = self
             .carve
@@ -282,29 +300,94 @@ impl WritableTree {
     }
 }
 
-/// One parse of a tree: its writable grants and the carve found so far.
+/// The directories one carved entry's tool reads its configuration from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VcsRoot {
+    /// A gitdir, and the common dir its `commondir` names.
+    Git {
+        gitdir: CanonicalPath,
+        commondir: Option<CanonicalPath>,
+    },
+    /// A `.hg` dir, and the share source its `sharedpath` names.
+    Mercurial {
+        dot_hg: CanonicalPath,
+        shared: Option<CanonicalPath>,
+    },
+    /// A `.jj` dir and the repository directory it uses.
+    Jujutsu {
+        dot_jj: CanonicalPath,
+        repo: CanonicalPath,
+    },
+    /// A `_darcs` dir.
+    Darcs { dot_darcs: CanonicalPath },
+}
+
+impl VcsRoot {
+    /// The roots the configuration scan starts from.
+    fn config_roots(&self) -> ConfigRoots<'_> {
+        match self {
+            Self::Git { gitdir, commondir } => ConfigRoots::Git {
+                gitdir: gitdir.as_path(),
+                commondir: commondir.as_ref().map(CanonicalPath::as_path),
+            },
+            Self::Mercurial { dot_hg, shared } => ConfigRoots::Mercurial {
+                dot_hg: dot_hg.as_path(),
+                shared: shared.as_ref().map(CanonicalPath::as_path),
+            },
+            Self::Jujutsu { dot_jj, repo } => ConfigRoots::Jujutsu {
+                dot_jj: dot_jj.as_path(),
+                repo: repo.as_path(),
+            },
+            Self::Darcs { dot_darcs } => ConfigRoots::Darcs {
+                dot_darcs: dot_darcs.as_path(),
+            },
+        }
+    }
+}
+
+/// Scan the configuration every one of `roots` reads against the writable
+/// grants `tree` and `other_grants`, with `carve` mounted read-only over them.
+fn scan_roots(
+    tree: &CanonicalPath,
+    other_grants: &[&CanonicalPath],
+    carve: &VcsCarve,
+    roots: &[VcsRoot],
+    home: &Home,
+) -> Result<(), JailPathError> {
+    let carves: Vec<&CanonicalPath> = carve.paths().collect();
+    let grants = Grants::new(tree, other_grants).with_carves(&carves);
+    roots.iter().try_for_each(|root| {
+        scan(&root.config_roots(), &grants, home, ConfigLimits::DEFAULT)
+            .map_err(JailPathError::VcsConfig)
+    })
+}
+
+/// One parse of a tree: its writable grants, the carve found so far, and the
+/// configuration roots of each carved entry.
 struct Carver<'g> {
     tree: &'g CanonicalPath,
     grants: Vec<&'g CanonicalPath>,
     carve: VcsCarve,
+    roots: Vec<VcsRoot>,
 }
 
 impl<'g> Carver<'g> {
     fn carve(
         tree: &'g CanonicalPath,
         other_grants: &[&'g CanonicalPath],
-    ) -> Result<VcsCarve, JailPathError> {
+    ) -> Result<(VcsCarve, Vec<VcsRoot>), JailPathError> {
         let mut carver = Self {
             tree,
             grants: std::iter::once(tree)
                 .chain(other_grants.iter().copied())
                 .collect(),
             carve: VcsCarve::default(),
+            roots: Vec::new(),
         };
         for kind in VcsKind::ALL {
             carver.entry(kind)?;
         }
-        Ok(carver.carve)
+        Ok((carver.carve, carver.roots))
     }
 
     /// Carve `kind`'s root entry, and follow the pointer files it holds.
@@ -317,16 +400,21 @@ impl<'g> Carver<'g> {
             kind,
             path: entry.clone(),
         };
-        match (kind, shape) {
-            (_, Shape::Other) | (VcsKind::Mercurial, Shape::File) => Err(unexpected()),
-            (VcsKind::Darcs, Shape::Dir) | (VcsKind::Jujutsu | VcsKind::Darcs, Shape::File) => {
-                self.add_entry(&entry, &meta)
+        let root = match (kind, shape) {
+            (_, Shape::Other) | (VcsKind::Mercurial, Shape::File) => return Err(unexpected()),
+            (VcsKind::Jujutsu | VcsKind::Darcs, Shape::File) => {
+                self.add_entry(&entry, &meta)?;
+                None
             }
+            (VcsKind::Darcs, Shape::Dir) => Some(VcsRoot::Darcs {
+                dot_darcs: self.add_entry(&entry, &meta)?,
+            }),
             (VcsKind::Git, Shape::Dir) => {
                 // Git reads `commondir` in every gitdir, the root `.git` dir
                 // included, and takes config and hooks from the dir it names.
-                self.add_entry(&entry, &meta)?;
-                self.inner_pointer(kind, &entry.join("commondir"), false)
+                let gitdir = self.add_entry(&entry, &meta)?;
+                let commondir = self.inner_pointer(kind, &entry.join("commondir"), false)?;
+                Some(VcsRoot::Git { gitdir, commondir })
             }
             (VcsKind::Git, Shape::File) => {
                 self.add_entry(&entry, &meta)?;
@@ -336,32 +424,46 @@ impl<'g> Carver<'g> {
                     .and_then(one_line)
                     .ok_or_else(|| pointer_fault(kind, &entry, PointerFault::Malformed))?;
                 let gitdir = self.target(kind, &entry, self.tree.as_path(), gitdir)?;
-                self.inner_pointer(kind, &gitdir.as_path().join("commondir"), false)
+                let commondir =
+                    self.inner_pointer(kind, &gitdir.as_path().join("commondir"), false)?;
+                Some(VcsRoot::Git { gitdir, commondir })
             }
             (VcsKind::Mercurial, Shape::Dir) => {
-                self.add_entry(&entry, &meta)?;
-                self.inner_pointer(kind, &entry.join("sharedpath"), false)
+                let dot_hg = self.add_entry(&entry, &meta)?;
+                let shared = self.inner_pointer(kind, &entry.join("sharedpath"), false)?;
+                Some(VcsRoot::Mercurial { dot_hg, shared })
             }
             (VcsKind::Jujutsu, Shape::Dir) => {
-                self.add_entry(&entry, &meta)?;
-                self.inner_pointer(kind, &entry.join("repo"), true)
+                // Without a repository directory Jujutsu reads no configuration.
+                let dot_jj = self.add_entry(&entry, &meta)?;
+                self.inner_pointer(kind, &entry.join("repo"), true)?
+                    .map(|repo| VcsRoot::Jujutsu { dot_jj, repo })
             }
-        }
+        };
+        self.roots.extend(root);
+        Ok(())
     }
 
     /// Follow the optional pointer file `pointer`, whose relative path resolves
     /// against its parent; a directory there is admitted only when `dir_ok`.
+    ///
+    /// The directory reached: the one the pointer names, the directory at
+    /// `pointer` itself, or `None` when nothing is there.
     fn inner_pointer(
         &mut self,
         kind: VcsKind,
         pointer: &Path,
         dir_ok: bool,
-    ) -> Result<(), JailPathError> {
+    ) -> Result<Option<CanonicalPath>, JailPathError> {
         let Some((shape, meta)) = classify(kind, pointer)? else {
-            return Ok(());
+            return Ok(None);
         };
         match shape {
-            Shape::Dir if dir_ok => Ok(()),
+            Shape::Dir if dir_ok => CanonicalPath::resolve(pointer).map(Some).map_err(|_| {
+                JailPathError::VcsEntryChanged {
+                    path: pointer.to_path_buf(),
+                }
+            }),
             Shape::Dir | Shape::Other => Err(JailPathError::VcsEntryUnexpectedKind {
                 kind,
                 path: pointer.to_path_buf(),
@@ -371,7 +473,7 @@ impl<'g> Carver<'g> {
                 let named = one_line(&text)
                     .ok_or_else(|| pointer_fault(kind, pointer, PointerFault::Malformed))?;
                 let base = pointer.parent().unwrap_or(pointer);
-                self.target(kind, pointer, base, named).map(drop)
+                self.target(kind, pointer, base, named).map(Some)
             }
         }
     }
@@ -412,8 +514,13 @@ impl<'g> Carver<'g> {
         Ok(target)
     }
 
-    /// Carve the root entry `entry`, classified with `meta`.
-    fn add_entry(&mut self, entry: &Path, meta: &std::fs::Metadata) -> Result<(), JailPathError> {
+    /// Carve the root entry `entry`, classified with `meta`, and return its
+    /// canonical path.
+    fn add_entry(
+        &mut self,
+        entry: &Path,
+        meta: &std::fs::Metadata,
+    ) -> Result<CanonicalPath, JailPathError> {
         let changed = || JailPathError::VcsEntryChanged {
             path: entry.to_path_buf(),
         };
@@ -423,8 +530,8 @@ impl<'g> Carver<'g> {
         if Identity::of(&now) != identity {
             return Err(changed());
         }
-        self.add(path, identity);
-        Ok(())
+        self.add(path.clone(), identity);
+        Ok(path)
     }
 
     fn add(&mut self, path: CanonicalPath, identity: Identity) {
@@ -581,7 +688,11 @@ mod tests {
     }
 
     fn parse(fixture: &Fixture) -> Result<WritableTree, JailPathError> {
-        WritableTree::parse(canonical(&fixture.tree), &[&canonical(&fixture.tmp)])
+        WritableTree::parse(
+            canonical(&fixture.tree),
+            &[&canonical(&fixture.tmp)],
+            &Home::unknown(),
+        )
     }
 
     fn carved(tree: &WritableTree) -> Vec<PathBuf> {
@@ -898,12 +1009,14 @@ mod tests {
         let fixture = fixture("recheck");
         let grants = [canonical(&fixture.tmp)];
         let grants: Vec<&CanonicalPath> = grants.iter().collect();
-        let tree = WritableTree::parse(canonical(&fixture.tree), &grants).expect("empty tree");
-        assert!(tree.recheck(&grants).is_ok());
+        let home = Home::unknown();
+        let tree =
+            WritableTree::parse(canonical(&fixture.tree), &grants, &home).expect("empty tree");
+        assert!(tree.recheck(&grants, &home).is_ok());
         make_dir(&fixture.tree.join(".git"));
         assert!(
             matches!(
-                tree.recheck(&grants),
+                tree.recheck(&grants, &home),
                 Err(JailPathError::VcsEntryChanged { path }) if path == fixture.tree.join(".git")
             ),
             "metadata created after the parse is a change"

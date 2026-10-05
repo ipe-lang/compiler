@@ -195,7 +195,8 @@ fn run_jailed_inner(
     // `ipe_env` matches the launcher's crate-private passthrough for every name
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
-    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload);
+    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload)
+        .expect("the argv builds");
     let (prog, rest) = argv.args().split_first().expect("non-empty argv");
     let mut cmd = Command::new(prog);
     cmd.args(rest);
