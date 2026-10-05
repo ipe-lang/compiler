@@ -473,6 +473,7 @@ fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<serde_json::Value, Cl
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if let Some(refusal) = remote_ingest::curl_refusal(output.status, budget.stdout_bytes(), budget)
     {
@@ -480,7 +481,7 @@ fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<serde_json::Value, Cl
     }
     if !output.status.success() {
         return Err(login_error(&crate::text::msg::login_request_failed(
-            &crate::style::TerminalSafe::sanitize(String::from_utf8_lossy(&output.stderr).trim()),
+            &output.stderr.to_terminal(),
         )));
     }
     serde_json::from_slice(&output.stdout)

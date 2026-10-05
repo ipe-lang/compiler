@@ -2209,6 +2209,7 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if let Some(refusal) =
         remote_ingest::curl_refusal(output.status, remote_ingest::INSTALLER_MAX_BYTES, budget)
@@ -2217,9 +2218,7 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
     }
     if !output.status.success() {
         return Err(CliError::Usage(
-            text::msg::upgrade_installer_download_failed(&crate::style::TerminalSafe::sanitize(
-                String::from_utf8_lossy(&output.stderr).trim(),
-            )),
+            text::msg::upgrade_installer_download_failed(&output.stderr.to_terminal()),
         ));
     }
     Ok(script)
