@@ -164,8 +164,11 @@ file carries a content stamp (`blake3:` and the hex digest of the bytes its
 units were extracted from), and `update` compares it with the file on disk, so
 uncommitted edits, deletions and new untracked files are picked up exactly as a
 fresh `index` would see them. A path that `update` no longer lists, or can no
-longer read (gone, refused, over the read ceiling), leaves the index. Both run
-in one transaction: a failed run leaves the previous index and queue in place.
+longer read (gone, refused, over the read ceiling), leaves the index. Calls are
+resolved over the whole index after every `index` and `update`, so the
+callgraph is the same whatever order files were read in and whichever files
+`update` re-extracted. Both run in one transaction: a failed run leaves the
+previous index and queue in place.
 
 **What the walk indexes:** every regular file git tracks, plus the untracked
 files `.gitignore` does not exclude, read from NUL-separated git listings

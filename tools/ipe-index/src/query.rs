@@ -1426,6 +1426,7 @@ mod tests {
             "sha",
         )
         .unwrap();
+        s.resolve_calls().unwrap();
         s
     }
 
