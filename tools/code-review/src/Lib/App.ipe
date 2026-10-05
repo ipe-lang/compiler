@@ -1,4 +1,4 @@
-module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
+module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, decisionOffQueue, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -6,6 +6,7 @@ import Ipe.Result exposing (Result(..))
 import Ipe.Task as Task
 import Ipe.Tea.Web.Cmd as Cmd
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Epoch exposing (Epoch)
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..))
@@ -51,13 +52,13 @@ type Msg
     | RefuseDraft String
     | RefuseCancel
     | RefuseSubmit Uid
-    | DecisionSaved Uid (Result Error ( Index.Attested, Index.Written ))
+    | DecisionSaved Uid Epoch (Result Error ( Index.Attested, Index.Written ))
     | Navigated Page
     | ShowQueue
     | ShowHistory
     | HistoryPageLoaded Queue.LoadTicket (Result Error Queue.HistoryPage)
     | HistoryNext LibDb.HistoryCursor
-    | SelectedViewLoaded Uid (Result Error (Maybe Index.UnitView))
+    | SelectedViewLoaded Uid Epoch (Result Error (Maybe Index.UnitView))
     | KeyDown String
     | SelectUnit Int
 
@@ -144,7 +145,7 @@ enterPage settings page model =
             loadQueue settings entered.queueCursor entered
 
         HistoryPage ->
-            withQueue settings (loadHistory settings HistoryStart { entered | selectedView = Queue.clearView entered.selectedView })
+            withQueue settings (loadHistory settings HistoryStart { entered | selectedView = Queue.clearView settings.epoch entered.selectedView })
 
         UnitPage raw ->
             case Queue.unitPageEntry raw of
@@ -152,7 +153,7 @@ enterPage settings page model =
                     withQueue settings (loadUnit settings uid entered)
 
                 Err _ ->
-                    ( { entered | selectedView = Queue.clearView entered.selectedView }, Cmd.none )
+                    ( { entered | selectedView = Queue.clearView settings.epoch entered.selectedView }, Cmd.none )
 
 
 -- The queue page from `cursor`, under the queue's next load ticket; the shown
@@ -209,7 +210,7 @@ loadHistory settings cursor model =
 -- while a read runs start no second read.
 loadUnit : Settings.AppSettings -> Uid -> Model -> ( Model, Cmd Msg )
 loadUnit settings uid model =
-    viewStep settings (Queue.reloadView uid model.selectedView) model
+    viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
 
 
 update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
@@ -244,10 +245,10 @@ update settings msg model =
         RefuseSubmit uid ->
             submitRefuse settings model uid
 
-        DecisionSaved uid result ->
+        DecisionSaved uid epoch result ->
             let
                 settled =
-                    { model | decision = Queue.decisionSettled uid model.decision }
+                    { model | decision = Queue.decisionSettled epoch uid model.decision }
             in
             case result of
                 Ok ( attested, written ) ->
@@ -279,8 +280,8 @@ update settings msg model =
         HistoryNext cursor ->
             loadHistory settings cursor model
 
-        SelectedViewLoaded uid result ->
-            viewStep settings (Queue.viewArrived uid result model.selectedView) model
+        SelectedViewLoaded uid epoch result ->
+            viewStep settings (Queue.viewArrived epoch uid result model.selectedView) model
 
         KeyDown key ->
             if model.page == QueuePage then
@@ -305,13 +306,13 @@ viewAfterLoad : Settings.AppSettings -> Model -> ( Model, Cmd Msg )
 viewAfterLoad settings model =
     case ( model.page, selectedUid model ) of
         ( QueuePage, Just uid ) ->
-            viewStep settings (Queue.reloadView uid model.selectedView) model
+            viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
 
         ( QueuePage, Nothing ) ->
-            ( { model | selectedView = Queue.clearView model.selectedView }, Cmd.none )
+            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
 
         ( HistoryPage, _ ) ->
-            ( { model | selectedView = Queue.clearView model.selectedView }, Cmd.none )
+            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
 
         ( UnitPage _, _ ) ->
             ( model, Cmd.none )
@@ -326,24 +327,25 @@ selectAt settings i model =
     in
     case selectedUid moved of
         Just uid ->
-            viewStep settings (Queue.selectView uid moved.selectedView) moved
+            viewStep settings (Queue.selectView settings.epoch uid moved.selectedView) moved
 
         Nothing ->
             ( moved, Cmd.none )
 
 
 -- A source-slot transition, with the one read it starts, if any: the only
--- place a source read is started.
+-- place a source read is started, its result stamped with this process's
+-- epoch.
 viewStep : Settings.AppSettings -> ( Queue.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
 viewStep settings ( state, next ) model =
-    ( { model | selectedView = state }, loadViewCmd settings.index next )
+    ( { model | selectedView = state }, loadViewCmd settings next )
 
 
-loadViewCmd : Settings.IndexSettings -> Maybe Uid -> Cmd Msg
+loadViewCmd : Settings.AppSettings -> Maybe Uid -> Cmd Msg
 loadViewCmd settings next =
     case next of
         Just uid ->
-            Cmd.perform (Queue.loadUnitView settings uid) (SelectedViewLoaded uid)
+            Cmd.perform (Queue.loadUnitView settings.index uid) (SelectedViewLoaded uid settings.epoch)
 
         Nothing ->
             Cmd.none
@@ -398,7 +400,7 @@ submitRefuse settings model uid =
             ( { model | refuseError = Just e }, Cmd.none )
 
         Ok reason ->
-            case Queue.startDecision uid model.decision of
+            case Queue.startDecision settings.epoch uid model.decision of
                 Just _ ->
                     saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } uid (Refused reason)
 
@@ -413,18 +415,23 @@ clampIndex i len =
 
 -- Every decision, from a button or a key, takes the session's one decision
 -- slot and goes through `Queue.decide` on the selected unit's shown source,
--- which it re-proves before writing. A decision asked while one is saving
--- starts nothing and says why.
+-- which it re-proves before writing. A decision asked off the queue page is
+-- refused before it takes the slot; one asked while another is saving starts
+-- nothing. Each says why.
 saveDecision : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model uid decision =
-    case Queue.startDecision uid model.decision of
-        Just saving ->
-            ( { model | decision = saving }
-            , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid)
-            )
+    if model.page /= QueuePage then
+        ( { model | decisionError = Just decisionOffQueue }, Cmd.none )
 
-        Nothing ->
-            ( { model | decisionError = Just decisionBusy }, Cmd.none )
+    else
+        case Queue.startDecision settings.epoch uid model.decision of
+            Just saving ->
+                ( { model | decision = saving }
+                , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
+                )
+
+            Nothing ->
+                ( { model | decisionError = Just decisionBusy }, Cmd.none )
 
 
 decisionBusy : Error
@@ -432,23 +439,24 @@ decisionBusy =
     Error.conflict "a decision is still being saved; try again once it settles"
 
 
+decisionOffQueue : Error
+decisionOffQueue =
+    Error.conflict "decisions are made on the queue page"
+
+
 decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decisionTask settings model uid decision =
-    if model.page /= QueuePage then
-        Task.fail (Error.conflict "decisions are made on the queue page")
+    case List.find (\q -> q.unit.uid == uid) (queueList model) of
+        Just _ ->
+            case Queue.decidableSource uid model.selectedView of
+                Just shown ->
+                    decideOn settings shown decision
 
-    else
-        case List.find (\q -> q.unit.uid == uid) (queueList model) of
-            Just _ ->
-                case Queue.decidableSource uid model.selectedView of
-                    Just shown ->
-                        decideOn settings shown decision
+                Nothing ->
+                    Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
 
-                    Nothing ->
-                        Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
-
-            Nothing ->
-                Task.fail (Error.conflict "unit is no longer in the queue")
+        Nothing ->
+            Task.fail (Error.conflict "unit is no longer in the queue")
 
 
 decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )

@@ -10,6 +10,7 @@ import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb
+import Lib.Epoch as Epoch
 import Lib.Index as Index
 import Lib.Queue as Queue
 import Lib.SafeText as SafeText
@@ -67,8 +68,8 @@ requireEnv key fix =
 -- the working directory. Then the index's `reviewed` copy is rebuilt from
 -- the review database once and stamped with the review log's head, so the
 -- first load already reads a current copy. Any failure stops startup with a message
--- naming the variable and one fix. Returns the settings, the one value the
--- app serves from.
+-- naming the variable and one fix. Last, this process's epoch is minted.
+-- Returns the settings, the one value the app serves from.
 requireSettings : String -> String -> String -> Task Error Settings.AppSettings
 requireSettings rawDb rawRoot rawReview =
     Task.onError
@@ -84,7 +85,8 @@ requireSettings rawDb rawRoot rawReview =
             LibDb.probe review
             db <- LibDb.openAt review
             Queue.resyncReviewed index db
-            Task.succeed { index = index, review = review }
+            epoch <- Epoch.mint
+            Task.succeed { index = index, review = review, epoch = epoch }
         )
 
 
