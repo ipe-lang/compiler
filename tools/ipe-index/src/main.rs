@@ -1148,13 +1148,13 @@ mod tests {
                 .unwrap()
         };
         let target = Some("ipe:src/b.rs".to_string());
-        assert_eq!(resolved(&db), [target.clone()]);
+        assert_eq!(resolved(&db), std::slice::from_ref(&target));
         std::fs::remove_file(fx.0.join("src/b.rs")).unwrap();
         update_then_compare(&fx, &specs, &db);
         assert_eq!(resolved(&db), [None]);
         fx.write("src/b.rs", "pub fn b() {}\n");
         update_then_compare(&fx, &specs, &db);
-        assert_eq!(resolved(&db), [target]);
+        assert_eq!(resolved(&db), std::slice::from_ref(&target));
     }
 
     // An indexed file that is now over the read ceiling, or no longer UTF-8,
