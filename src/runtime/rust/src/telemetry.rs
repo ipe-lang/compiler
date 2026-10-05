@@ -463,6 +463,7 @@ pub(crate) const fn test_dev_surface() -> DevSurface {
 /// A dev-only relaxation never negates this: it takes a [`DevIntent`] or
 /// [`DevSurface`]. The source inventory `tests/posture_read_inventory.rs`
 /// admits every caller by name.
+#[cfg(any(feature = "server", all(test, not(feature = "dev-posture"))))]
 #[must_use]
 pub(crate) fn posture_is_production() -> bool {
     Posture::from_env() == Posture::Production
