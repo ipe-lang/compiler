@@ -5,8 +5,9 @@
 //!
 //! `ipe dev` checks no capabilities: the native dev binary runs unjailed with
 //! the developer's own permissions. The WASI dev run grants the guest the same
-//! authority through [`WasiCtx::dev_ambient`], the one constructor of the run
-//! context — the working directory preopened read-write as `.`, stdio and the
+//! authority through [`WasiCtx::dev_ambient`] or [`WasiCtx::dev_ambient_bounded`],
+//! the two constructors of the run context, which differ only in the resource
+//! bounds — the working directory preopened read-write as `.`, stdio and the
 //! environment inherited, the network allowed. No capability profile reaches
 //! this module, and no release path runs a module through it.
 //!
@@ -38,9 +39,10 @@ const MODULE_ARGV0: &str = "ipe-app";
 
 /// The context a WASI module runs under.
 ///
-/// Constructible only through [`Self::dev_ambient`]: there is no empty or
-/// profile-derived form a caller could pass to reach the ambient grant by
-/// another name.
+/// Constructible only through [`Self::dev_ambient`] and
+/// [`Self::dev_ambient_bounded`]: both grant the one ambient authority and
+/// differ only in the resource bounds. There is no empty or profile-derived
+/// form a caller could pass to reach the ambient grant by another name.
 #[derive(Debug, Clone, Copy)]
 pub struct WasiCtx {
     limits: RunResourceLimits,
@@ -52,9 +54,15 @@ impl WasiCtx {
     /// native dev binary has — under the default resource bounds.
     #[must_use]
     pub fn dev_ambient() -> Self {
-        Self {
-            limits: RunResourceLimits::default(),
-        }
+        Self::dev_ambient_bounded(RunResourceLimits::default())
+    }
+
+    /// The `ipe dev` authority under the given resource bounds. The bounds
+    /// only set the store limiter and the epoch deadline; the authority
+    /// granted is identical to [`Self::dev_ambient`].
+    #[must_use]
+    pub const fn dev_ambient_bounded(limits: RunResourceLimits) -> Self {
+        Self { limits }
     }
 
     /// The resource bounds the store limiter and the epoch deadline enforce.

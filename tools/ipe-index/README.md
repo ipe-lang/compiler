@@ -152,18 +152,24 @@ ipe-index pipeline   # module counts per compiler stage (parse/canon/type/build/
 
 ```bash
 ipe-index index      # full rebuild: re-extracts every tracked file
-ipe-index update     # incremental: git-diff last_sha..HEAD, re-extract only
-                     #   changed files. Falls back to a full index when the DB
-                     #   is absent, of an older schema, or has no sha for a repo.
+ipe-index update     # incremental: walk the same files `index` walks,
+                     #   re-extract only those whose content stamp changed.
+                     #   Falls back to a full index when the DB is absent, of
+                     #   another schema or root set, or holds a path with no stamp.
 ```
 
 A full rebuild re-extracts the whole repo, so it takes tens of seconds on this
-repo; `update` re-extracts only what changed since the last run. Both run in
-one transaction: a failed run leaves the previous index and queue in place.
+repo; `update` re-extracts only what changed since the last run. Each indexed
+file carries a content stamp (`blake3:` and the hex digest of the bytes its
+units were extracted from), and `update` compares it with the file on disk, so
+uncommitted edits, deletions and new untracked files are picked up exactly as a
+fresh `index` would see them. A path that `update` no longer lists, or can no
+longer read (gone, refused, over the read ceiling), leaves the index. Both run
+in one transaction: a failed run leaves the previous index and queue in place.
 
 **What the walk indexes:** every regular file git tracks, plus the untracked
 files `.gitignore` does not exclude, read from NUL-separated git listings
-(`git ls-files -z -s`, `git diff --raw -z`), so a newline in a name never
+(`git ls-files -z -s`, `git ls-files -z --others`), so a newline in a name never
 splits it. The walk refuses, and names on stderr as `ipe-index: not indexing
 …`, any entry git records as a symbolic link (mode 120000) or a submodule
 (160000), an untracked nested repository, any name that is not UTF-8, and any

@@ -1,4 +1,4 @@
-module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, describe, parseRoot, parseTag, resolve, rootMap, rootPath, tagName, toError)
+module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, describe, maxRoots, parseRoot, parseTag, resolve, rootMap, rootPath, tagName, toError)
 
 import Ipe.Error as Error
 import Ipe.File as File
@@ -28,18 +28,48 @@ type Tag
     = Tag String
 
 
+-- The most repository roots one map binds: the value of ipe-index's
+-- `MAX_REPOS`, pinned to `tools/ipe-index/tests/max_repos.json` by a test.
+maxRoots : Int
+maxRoots =
+    64
+
+
+-- A root as the map holds it: its tag, its directory, and that directory's
+-- path components.
+type alias Entry =
+    { tag : Tag
+    , root : Root
+    , segments : List String
+    }
+
+
+-- One bound root and the path components of every declared root strictly
+-- below it, which own the paths under them instead.
+type alias Binding =
+    { tag : Tag
+    , root : Root
+    , deeper : List (List String)
+    }
+
+
 -- Which root each repository tag's paths join under. Opaque — `rootMap` is the
--- only way to build one, so a map is never empty and binds each tag once. A
--- tag reaches a `Root` only through this map: there is no default root.
+-- only way to build one, so a map is never empty, never larger than
+-- `maxRoots`, binds each tag and each directory once, and records for every
+-- root the deeper roots that own the paths under them. A tag reaches a `Root`
+-- only through this map: there is no default root.
 type RootMap
-    = RootMap (List ( Tag, Root ))
+    = RootMap (List Binding)
 
 
 -- Why a stored `tag:relative` index path, or a root map, was refused. Each
 -- stored-path variant carries the stored path as it came off the index; the
 -- path refusals also carry the `Ipe.Path` error that decided them, so the
 -- rules live in `Ipe.Path` alone. `UnknownTag` is a well-formed tag the map
--- does not bind; `NoRoots` and `DuplicateTag` refuse a map's construction.
+-- does not bind; `ClaimedByDeeperRoot` is a path that lies at or under a
+-- declared root deeper than its own tag's, which owns it. `NoRoots`,
+-- `DuplicateTag`, `DuplicateRoot` (two tags on one directory, named in
+-- binding order) and `TooManyRoots` refuse a map's construction.
 type PathError
     = MissingTag String
     | UnknownTag String
@@ -47,6 +77,9 @@ type PathError
     | NotUnderRoot String Error
     | NoRoots
     | DuplicateTag String
+    | DuplicateRoot String String
+    | ClaimedByDeeperRoot String
+    | TooManyRoots
 
 
 -- A tag as written before the `:` of a stored path. Refused (as `MissingTag`
@@ -68,13 +101,19 @@ tagName tag =
             name
 
 
--- A root map from its bindings. Refused: no binding (`NoRoots`), or a tag
--- bound twice (`DuplicateTag`), which would make the lookup order decide the
--- root.
+-- A root map from its bindings. Refused: no binding (`NoRoots`), more than
+-- `maxRoots` (`TooManyRoots`), a tag bound twice (`DuplicateTag`), which
+-- would make the lookup order decide the root, or two tags on one cleaned
+-- directory (`DuplicateRoot`, compared case- and separator-folded as
+-- `segmentsOf` keys it), which would give one file two owners. A root
+-- below another is allowed: the deeper root owns the paths under it.
 rootMap : List ( Tag, Root ) -> Result PathError RootMap
 rootMap bindings =
     if List.isEmpty bindings then
         Err NoRoots
+
+    else if List.length bindings > maxRoots then
+        Err TooManyRoots
 
     else
         case firstDuplicate (List.map (\( tag, _ ) -> tagName tag) bindings) of
@@ -82,7 +121,90 @@ rootMap bindings =
                 Err (DuplicateTag name)
 
             Nothing ->
-                Ok (RootMap bindings)
+                let
+                    entries =
+                        List.map entryOf bindings
+                in
+                case firstSharedRoot entries of
+                    Just ( first, second ) ->
+                        Err (DuplicateRoot (tagName first.tag) (tagName second.tag))
+
+                    Nothing ->
+                        Ok (RootMap (List.map (bindingOf entries) entries))
+
+
+entryOf : ( Tag, Root ) -> Entry
+entryOf ( tag, root ) =
+    { tag = tag, root = root, segments = segmentsOf (Path.toString (rootPath root)) }
+
+
+-- The entry with the segments of every entry strictly below it.
+bindingOf : List Entry -> Entry -> Binding
+bindingOf entries entry =
+    { tag = entry.tag
+    , root = entry.root
+    , deeper = List.filterMap
+        (\other ->
+            if strictlyBelow entry.segments other.segments then
+                Just other.segments
+
+            else
+                Nothing
+        )
+        entries
+    }
+
+
+-- The ownership key of a cleaned absolute path: its components, split on
+-- both `/` and `\` and lowercased. Ownership is judged over whole
+-- components, never over a string prefix: `/r/inner2` is not below
+-- `/r/inner`. One key serves the claim check and the duplicate-root check, so
+-- neither can be passed by a spelling the other folds: a path reached
+-- through `INNER` or `inner\x` on a case-insensitive or `\`-separated
+-- filesystem is claimed as under `inner`. Folding can only add claims and
+-- duplicates, never remove one: two roots that differ only in case are
+-- refused even where the filesystem tells them apart.
+segmentsOf : String -> List String
+segmentsOf path =
+    String.split "/" path
+        |> List.concatMap (String.split "\\")
+        |> List.filter (\segment -> segment /= "")
+        |> List.map String.toLower
+
+
+-- `prefix` is the leading components of `whole`, or all of it.
+startsWith : List String -> List String -> Bool
+startsWith prefix whole =
+    List.take (List.length prefix) whole == prefix
+
+
+-- `inner` lies strictly below `outer`.
+strictlyBelow : List String -> List String -> Bool
+strictlyBelow outer inner =
+    List.length inner > List.length outer && startsWith outer inner
+
+
+-- The first entry whose ownership key an earlier entry already holds, with
+-- that earlier entry.
+firstSharedRoot : List Entry -> Maybe ( Entry, Entry )
+firstSharedRoot entries =
+    List.foldl
+        (\entry ( seen, found ) ->
+            case found of
+                Just _ ->
+                    ( seen, found )
+
+                Nothing ->
+                    case List.find (\earlier -> earlier.segments == entry.segments) seen of
+                        Just earlier ->
+                            ( seen, Just ( earlier, entry ) )
+
+                        Nothing ->
+                            ( entry :: seen, Nothing )
+        )
+        ( [], Nothing )
+        entries
+        |> Tuple.second
 
 
 firstDuplicate : List String -> Maybe String
@@ -105,12 +227,11 @@ firstDuplicate names =
         |> Tuple.second
 
 
-rootFor : RootMap -> Tag -> Maybe Root
-rootFor map tag =
+bindingFor : RootMap -> Tag -> Maybe Binding
+bindingFor map tag =
     case map of
         RootMap bindings ->
-            List.find (\( bound, _ ) -> tagName bound == tagName tag) bindings
-                |> Maybe.map Tuple.second
+            List.find (\bound -> tagName bound.tag == tagName tag) bindings
 
 
 rootPath : Root -> Path
@@ -203,8 +324,10 @@ rootRefusal raw problem =
 -- relative path, sealed by `Path.fromString` and joined by `Path.under`, which
 -- alone decide every path refusal: a NUL byte or a `..` climbing out of the
 -- path is `InvalidRelative`; an empty, `.`, or absolute path, or a join not
--- strictly below the root, is `NotUnderRoot`. The check is lexical: a symlink
--- under the root is followed by the read that uses the result.
+-- strictly below the root, is `NotUnderRoot`. A joined path at or under a
+-- deeper declared root is `ClaimedByDeeperRoot`: the deeper root owns it, so
+-- no path reads through two roots. The check is lexical: a symlink under the
+-- root is followed by the read that uses the result.
 resolve : RootMap -> String -> Result PathError Path
 resolve roots stored =
     case String.split ":" stored of
@@ -214,12 +337,13 @@ resolve roots stored =
                     Err (MissingTag stored)
 
                 Ok tag ->
-                    case rootFor roots tag of
+                    case bindingFor roots tag of
                         Nothing ->
                             Err (UnknownTag stored)
 
-                        Just root ->
-                            joinUnder root stored (String.join ":" (first :: more))
+                        Just binding ->
+                            joinUnder binding.root stored (String.join ":" (first :: more))
+                                |> Result.andThen (refuseIfClaimed binding stored)
 
         _ ->
             Err (MissingTag stored)
@@ -234,6 +358,20 @@ joinUnder root stored rel =
         Ok relPath ->
             Path.under (rootPath root) relPath
                 |> Result.mapError (\e -> NotUnderRoot stored e)
+
+
+-- `path`, unless a root deeper than `binding`'s owns it.
+refuseIfClaimed : Binding -> String -> Path -> Result PathError Path
+refuseIfClaimed binding stored path =
+    let
+        segments =
+            segmentsOf (Path.toString path)
+    in
+    if List.any (\deeper -> startsWith deeper segments) binding.deeper then
+        Err (ClaimedByDeeperRoot stored)
+
+    else
+        Ok path
 
 
 -- A refusal as diagnostic text. The stored path and every nested error message
@@ -270,6 +408,29 @@ describe err =
 
         DuplicateTag tag ->
             SafeText.concat [ SafeText.literal "repo tag ", SafeText.quoted tag, SafeText.literal " is bound to more than one root" ]
+
+        DuplicateRoot first second ->
+            SafeText.concat
+                [ SafeText.literal "repo tags "
+                , SafeText.quoted first
+                , SafeText.literal " and "
+                , SafeText.quoted second
+                , SafeText.literal " are bound to one directory; bind each directory to one tag"
+                ]
+
+        ClaimedByDeeperRoot stored ->
+            SafeText.concat
+                [ SafeText.literal "index path "
+                , SafeText.quoted stored
+                , SafeText.literal " lies under a deeper configured repo root, which owns it"
+                ]
+
+        TooManyRoots ->
+            SafeText.concat
+                [ SafeText.literal "more than "
+                , SafeText.render (String.fromInt maxRoots)
+                , SafeText.literal " repository roots are configured"
+                ]
 
 
 toError : PathError -> Error

@@ -1248,6 +1248,12 @@ pub fn install_panic_classifier() {
     // shape that never installs the hook simply runs depth-only there.
     #[cfg(not(target_arch = "wasm32"))]
     record_stack_floor(RUNTIME_THREAD_STACK_SIZE);
+    // A malformed `IPE_LOG_LEVEL` refuses the program before its first line.
+    #[cfg(feature = "log")]
+    if let Err(refusal) = super::log::startup_check() {
+        eprint_task_error(&refusal.to_string());
+        crate::system::system_exit(1);
+    }
     std::panic::set_hook(Box::new(|info| {
         // Log (classified, with errId) — diagnostic fires regardless of whether
         // the panic is subsequently caught by catch_unwind / tokio::task::spawn.

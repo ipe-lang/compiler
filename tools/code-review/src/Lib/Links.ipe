@@ -3,25 +3,35 @@ module Lib.Links exposing (Candidates, Hidden(..), Link(..), LinkSet, Reach(..),
 import Ipe.Char as Char
 import Ipe.Dict as Dict
 import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.Uid as Uid exposing (Uid)
 
 
 -- A link a unit page shows. An internal link jumps to the /unit/<uid> page of
 -- its target, labelled with the target's qualified name rendered once into
 -- `SafeText`; an external link keeps its raw URL for the `href` check, and
--- `label` renders it.
+-- `label` renders it. `Unlinked` is a target whose stored uid is not a unit
+-- id: its name shows as plain text and no address is built from it.
 type Link
-    = Internal SafeText String
+    = Internal SafeText Uid
     | External String
+    | Unlinked SafeText
 
 
--- An internal link to unit `uid`, labelled with its stored qualified name.
+-- A link to unit `uid`, labelled with its stored qualified name. The stored
+-- uid is parsed here, the one point index link rows enter.
 internal : String -> String -> Link
 internal qualified uid =
-    Internal (SafeText.renderForeign qualified) uid
+    case Uid.parse uid of
+        Ok target ->
+            Internal (SafeText.renderForeign qualified) target
+
+        Err _ ->
+            Unlinked (SafeText.renderForeign qualified)
 
 
 -- How many links a page holds back. `Exactly n` counts links the page read
@@ -612,12 +622,18 @@ label link =
         External url ->
             SafeText.concat [ SafeText.literal "↗ ", SafeText.renderForeign url ]
 
+        Unlinked name ->
+            name
+
 
 linkKey : Link -> String
 linkKey link =
     case link of
         Internal _ uid ->
-            "i:" ++ uid
+            "i:" ++ Uid.toString uid
 
         External url ->
             "e:" ++ url
+
+        Unlinked name ->
+            "t:" ++ SafeText.toString name

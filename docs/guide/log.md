@@ -102,7 +102,7 @@ Two env vars control runtime log output. Use `ipe doc <VAR>` for the full entry.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `IPE_LOG_LEVEL` | unset (info) | Minimum severity emitted: `debug`, `info`, `warn`, or `error`. |
+| `IPE_LOG_LEVEL` | unset (info) | Minimum severity emitted: `debug`, `info`, `warn`, or `error`; any other value refuses startup. |
 | `IPE_LOG_FORMAT` | unset (human) | Set to `json` for structured log lines suited to aggregation pipelines. |
 
 See the [**Observability** subsystem](../reference/env.md#observability) in the

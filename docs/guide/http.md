@@ -96,7 +96,7 @@ full entry for any of them.
 |----------|---------|--------|
 | `IPE_HTTP_MAX_BODY_BYTES` | 33554432 (32 MiB) | Cap on outbound response bodies. |
 | `IPE_HTTP_DENY_PRIVATE` | auto (on in production) | Block SSRF-vector private/loopback targets. |
-| `IPE_HTTP_BIND` | auto | Override the server bind address. |
+| `IPE_HTTP_BIND` | auto | Override the server bind address: an IP address only; anything else refuses startup. |
 
 All vars are in the **HTTP client** subsystem of the
 [environment variable reference](../reference/env.md#http-client).

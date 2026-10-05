@@ -162,6 +162,9 @@ impl EnvCeiling {
                     match v.parse::<u64>() {
                         Ok(n) => match self.check(n) {
                             Ok(n) => return Ok(n),
+                            Err(CeilingDefect::TooLarge) => {
+                                return Err(self.refusal_over_bound(shown_env_value(v.as_bytes())));
+                            }
                             Err(defect) => defect,
                         },
                         Err(_) => CeilingDefect::TooLarge,
@@ -206,6 +209,58 @@ impl EnvCeiling {
         self.parse_as(self.lookup())
     }
 
+    /// Checks an in-code setting's value against this ceiling's bound.
+    ///
+    /// The value is a program literal, not an operator string, so it is never
+    /// `NotDecimal`; it must be positive whatever the [`ZeroCeiling`], since an
+    /// in-code `0` would be a sentinel for the default.
+    ///
+    /// # Errors
+    ///
+    /// A refusal naming `setting` when `value` is not positive or exceeds
+    /// [`Self::max_value`].
+    pub fn check_setting(
+        self,
+        setting: &'static str,
+        value: i64,
+    ) -> Result<u64, EnvCeilingRefusal> {
+        let checked = u64::try_from(value)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or(CeilingDefect::Zero)
+            .and_then(|n| self.check(n));
+        checked.map_err(|defect| EnvCeilingRefusal {
+            name: self.name,
+            unit: self.unit,
+            shown: value.to_string(),
+            defect,
+            source: CeilingSource::InCode {
+                setting,
+                max: self.max,
+            },
+        })
+    }
+
+    /// The default, checked against this ceiling's zero rule and bound.
+    ///
+    /// A ceiling whose bound another setting lowers (e.g. a window that must
+    /// stay below a lifetime) can leave its own default out of range.
+    ///
+    /// # Errors
+    ///
+    /// A refusal naming the variable, to be set within the bound, when the
+    /// default lies outside it.
+    pub fn check_default(self) -> Result<u64, EnvCeilingRefusal> {
+        self.check(self.default)
+            .map_err(|defect| EnvCeilingRefusal {
+                name: self.name,
+                unit: self.unit,
+                shown: self.default.to_string(),
+                defect,
+                source: CeilingSource::Default { max: self.max },
+            })
+    }
+
     /// A parsed value under this ceiling's zero rule and bound.
     const fn check(self, n: u64) -> Result<u64, CeilingDefect> {
         if n == 0 && matches!(self.zero, ZeroCeiling::Refused) {
@@ -223,6 +278,18 @@ impl EnvCeiling {
             unit: self.unit,
             shown,
             defect,
+            source: CeilingSource::Env,
+        }
+    }
+
+    /// A refusal of a parsed value above [`Self::max_value`].
+    const fn refusal_over_bound(self, shown: String) -> EnvCeilingRefusal {
+        EnvCeilingRefusal {
+            name: self.name,
+            unit: self.unit,
+            shown,
+            defect: CeilingDefect::TooLarge,
+            source: CeilingSource::EnvOverBound { max: self.max },
         }
     }
 }
@@ -289,9 +356,14 @@ impl EnvDuration {
                 shown_env_value(os.as_encoded_bytes()),
                 CeilingDefect::NotDecimal,
             ),
-            Ok(v) => match duration_secs(&v).and_then(|n| self.ceiling.check(n)) {
-                Ok(n) => return Ok(n),
-                Err(defect) => (shown_env_value(v.as_bytes()), defect),
+            Ok(v) => match duration_secs(&v).map(|n| self.ceiling.check(n)) {
+                Ok(Ok(n)) => return Ok(n),
+                Ok(Err(CeilingDefect::TooLarge)) => {
+                    return Err(self
+                        .ceiling
+                        .refusal_over_bound(shown_env_value(v.as_bytes())));
+                }
+                Ok(Err(defect)) | Err(defect) => (shown_env_value(v.as_bytes()), defect),
             },
         };
         Err(self.ceiling.refusal(shown, defect))
@@ -313,6 +385,15 @@ impl EnvDuration {
     /// Returns the [`Self::parse`] refusal for a present, malformed value.
     pub fn read(self) -> Result<u64, EnvCeilingRefusal> {
         self.parse(self.lookup())
+    }
+
+    /// Checks an in-code setting's second count against this duration's bound.
+    ///
+    /// # Errors
+    ///
+    /// As [`EnvCeiling::check_setting`].
+    pub fn check_setting(self, setting: &'static str, secs: i64) -> Result<u64, EnvCeilingRefusal> {
+        self.ceiling.check_setting(setting, secs)
     }
 }
 
@@ -396,13 +477,49 @@ pub struct EnvCeilingRefusal {
     unit: &'static str,
     shown: String,
     defect: CeilingDefect,
+    source: CeilingSource,
+}
+
+/// Where a refused ceiling value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CeilingSource {
+    /// The ceiling's environment variable.
+    Env,
+    /// The ceiling's environment variable, parsed but above its bound.
+    EnvOverBound {
+        /// The largest accepted value.
+        max: u64,
+    },
+    /// The unset variable's default, checked by [`EnvCeiling::check_default`].
+    Default {
+        /// The largest accepted value.
+        max: u64,
+    },
+    /// An in-code setting, checked by [`EnvCeiling::check_setting`].
+    InCode {
+        /// The setting's Ipê name, e.g. `Web.authMaxLifetime`.
+        setting: &'static str,
+        /// The largest accepted value.
+        max: u64,
+    },
 }
 
 impl EnvCeilingRefusal {
-    /// The refused variable's name.
+    /// The ceiling's environment variable, also for an in-code refusal.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// The refused in-code setting's name, or `None` for an environment value.
+    #[must_use]
+    pub const fn setting(&self) -> Option<&'static str> {
+        match self.source {
+            CeilingSource::Env
+            | CeilingSource::EnvOverBound { .. }
+            | CeilingSource::Default { .. } => None,
+            CeilingSource::InCode { setting, .. } => Some(setting),
+        }
     }
 
     /// Why the value was refused.
@@ -417,11 +534,34 @@ impl std::fmt::Display for EnvCeilingRefusal {
         let Self {
             name, unit, shown, ..
         } = self;
-        match self.defect {
-            CeilingDefect::NotDecimal => write!(f, "{name} must be a {unit} (got \"{shown}\")"),
-            CeilingDefect::Zero => write!(f, "{name} must be a positive {unit} (got \"{shown}\")"),
-            CeilingDefect::TooLarge => {
+        match (self.source, self.defect) {
+            (CeilingSource::Env, CeilingDefect::NotDecimal) => {
+                write!(f, "{name} must be a {unit} (got \"{shown}\")")
+            }
+            (CeilingSource::Env, CeilingDefect::Zero) => {
+                write!(f, "{name} must be a positive {unit} (got \"{shown}\")")
+            }
+            (CeilingSource::Env, CeilingDefect::TooLarge) => {
                 write!(f, "{name} is too large for this platform (got \"{shown}\")")
+            }
+            (CeilingSource::EnvOverBound { max }, _) => {
+                write!(f, "{name} must be at most {max} (got \"{shown}\")")
+            }
+            (CeilingSource::Default { max }, _) => write!(
+                f,
+                "{name} is unset and its default {shown} is out of range; set {name} to at most {max}"
+            ),
+            (
+                CeilingSource::InCode { setting, .. },
+                CeilingDefect::NotDecimal | CeilingDefect::Zero,
+            ) => {
+                write!(f, "the `{setting}` setting must be positive (got {shown})")
+            }
+            (CeilingSource::InCode { setting, max }, CeilingDefect::TooLarge) => {
+                write!(
+                    f,
+                    "the `{setting}` setting must be at most {max} (got {shown})"
+                )
             }
         }
     }
@@ -437,6 +577,56 @@ impl From<EnvCeilingRefusal> for String {
 
 impl From<EnvCeilingRefusal> for IpeError {
     fn from(refusal: EnvCeilingRefusal) -> Self {
+        Self::invalid_input(refusal.to_string())
+    }
+}
+
+/// A present environment value outside its variable's grammar, naming the variable.
+///
+/// The echoed value is truncated and escaped as an [`EnvCeilingRefusal`]'s is,
+/// and it reaches an `IpeError` channel as `InvalidInput`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvValueRefusal {
+    name: &'static str,
+    expected: &'static str,
+    shown: String,
+}
+
+impl EnvValueRefusal {
+    /// A refusal of `raw`, read from `name`, which must be `expected`.
+    ///
+    /// `expected` completes the refusal "`name` must be …", e.g. `"an IP address"`.
+    #[must_use]
+    pub fn new(name: &'static str, expected: &'static str, raw: &[u8]) -> Self {
+        Self {
+            name,
+            expected,
+            shown: shown_env_value(raw),
+        }
+    }
+
+    /// The refused variable's name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl std::fmt::Display for EnvValueRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            expected,
+            shown,
+        } = self;
+        write!(f, "{name} must be {expected} (got \"{shown}\")")
+    }
+}
+
+impl std::error::Error for EnvValueRefusal {}
+
+impl From<EnvValueRefusal> for IpeError {
+    fn from(refusal: EnvValueRefusal) -> Self {
         Self::invalid_input(refusal.to_string())
     }
 }
@@ -2996,10 +3186,128 @@ fn assert_decimal_contract(
 #[cfg(not(target_arch = "wasm32"))]
 mod env_ceiling_tests {
     use super::{
-        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, PROCESS_OUTPUT_CEILING,
-        ZeroCeiling, assert_env_ceiling_contract, assert_env_duration_contract, locked_remove_var,
-        locked_set_var, process_output_ceiling,
+        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, EnvValueRefusal,
+        PROCESS_OUTPUT_CEILING, ZeroCeiling, assert_env_ceiling_contract,
+        assert_env_duration_contract, locked_remove_var, locked_set_var, process_output_ceiling,
     };
+
+    #[test]
+    fn an_in_code_setting_is_positive_and_within_the_bound() {
+        for zero in [ZeroCeiling::Refused, ZeroCeiling::Accepted] {
+            let ceiling = EnvCeiling::new("IPE_TEST_CEILING", 7, zero, "count").at_most(100);
+            for (value, defect) in [
+                (0, CeilingDefect::Zero),
+                (-1, CeilingDefect::Zero),
+                (i64::MIN, CeilingDefect::Zero),
+                (101, CeilingDefect::TooLarge),
+                (i64::MAX, CeilingDefect::TooLarge),
+            ] {
+                let refused = ceiling.check_setting("Test.limit", value);
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|r| r.defect() == defect && r.setting() == Some("Test.limit")),
+                    "{value} must be refused as {defect:?} naming the setting, got {refused:?}"
+                );
+            }
+            assert_eq!(ceiling.check_setting("Test.limit", 100), Ok(100));
+            assert_eq!(ceiling.check_setting("Test.limit", 1), Ok(1));
+        }
+        let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration").at_most(5400);
+        assert_eq!(duration.check_setting("Test.ttl", 5400), Ok(5400));
+        assert_eq!(
+            duration
+                .parse(Ok("2h".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err("IPE_TEST_DURATION must be at most 5400 (got \"2h\")".to_owned()),
+            "a duration above the bound names the bound in seconds"
+        );
+        assert!(
+            duration
+                .check_setting("Test.ttl", 5401)
+                .is_err_and(|r| r.defect() == CeilingDefect::TooLarge)
+        );
+    }
+
+    #[test]
+    fn an_in_code_refusal_names_the_setting_not_the_variable() {
+        let ceiling =
+            EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count").at_most(100);
+        let too_large = ceiling
+            .check_setting("Test.limit", 101)
+            .map_err(|r| r.to_string());
+        assert_eq!(
+            too_large,
+            Err("the `Test.limit` setting must be at most 100 (got 101)".to_owned())
+        );
+        let zero = ceiling
+            .check_setting("Test.limit", 0)
+            .map_err(|r| r.to_string());
+        assert_eq!(
+            zero,
+            Err("the `Test.limit` setting must be positive (got 0)".to_owned())
+        );
+        let lowered = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
+        assert_eq!(lowered.check_default(), Ok(7));
+        assert_eq!(
+            lowered.at_most(6).check_default().map_err(|r| r.to_string()),
+            Err(
+                "IPE_TEST_CEILING is unset and its default 7 is out of range; set IPE_TEST_CEILING to at most 6"
+                    .to_owned()
+            )
+        );
+        let env = ceiling.parse(Ok("101".to_owned()));
+        assert!(
+            env.is_err_and(
+                |r| r.setting().is_none() && r.to_string().starts_with("IPE_TEST_CEILING")
+            ),
+            "an environment refusal names the variable"
+        );
+        assert_eq!(
+            ceiling
+                .parse(Ok("101".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err("IPE_TEST_CEILING must be at most 100 (got \"101\")".to_owned()),
+            "a value above the bound names the bound"
+        );
+        assert_eq!(
+            ceiling
+                .parse(Ok("99999999999999999999".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err(
+                "IPE_TEST_CEILING is too large for this platform (got \"99999999999999999999\")"
+                    .to_owned()
+            ),
+            "a value no `u64` holds is too large for the platform"
+        );
+    }
+
+    #[test]
+    fn an_env_value_refusal_escapes_and_truncates_its_echo() {
+        let refusal = EnvValueRefusal::new(
+            "EXAMPLE_VALUE",
+            "an IP address",
+            format!("\u{1b}[31m\n{}", "x".repeat(ENV_VALUE_SHOWN_CHARS * 2)).as_bytes(),
+        );
+        let shown = refusal.to_string();
+        assert_eq!(refusal.name(), "EXAMPLE_VALUE");
+        assert!(!shown.contains('\u{1b}'), "ESC is escaped: {shown}");
+        assert!(!shown.contains('\n'), "a newline is escaped: {shown}");
+        assert!(
+            shown.starts_with("EXAMPLE_VALUE must be an IP address (got \"\\u{1b}[31m\\n"),
+            "{shown}"
+        );
+        assert_eq!(
+            shown.matches('x').count(),
+            ENV_VALUE_SHOWN_CHARS - 6,
+            "the echo stops after its first source characters: {shown}"
+        );
+        let invalid = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", b"\xFF1");
+        assert_eq!(
+            invalid.to_string(),
+            "EXAMPLE_VALUE must be an IP address (got \"\\xFF1\")"
+        );
+    }
 
     #[test]
     fn a_duration_honours_the_contract_at_every_bound() {

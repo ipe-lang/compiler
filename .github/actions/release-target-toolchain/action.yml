@@ -1,0 +1,27 @@
+name: Release-target toolchain
+description: >-
+  The one copy of what a release target's cargo command runs under: the
+  pinned toolchain with the target installed, the dependency cache, and the
+  musl tools on a musl target. release.yml's `build` and ci.yml's
+  `release-targets-run` each run it straight after their checkout and right
+  before their cargo command; ci/verify-manifest.py check 23 pins all three
+  steps and this action's body.
+
+inputs:
+  target:
+    description: The target triple the matrix leg builds.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-toolchain-pinned
+      with:
+        targets: ${{ inputs.target }}
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Install musl toolchain (linux)
+      if: contains(inputs.target, 'musl')
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
