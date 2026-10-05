@@ -1,0 +1,475 @@
+module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, decisionOffQueue, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.List as List
+import Ipe.Result exposing (Result(..))
+import Ipe.Task as Task
+import Ipe.Tea.Web.Cmd as Cmd
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Epoch exposing (Epoch)
+import Lib.Index as Index
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..))
+import Lib.Settings as Settings
+import Lib.Uid exposing (Uid)
+
+
+type Page
+    = QueuePage
+    | HistoryPage
+    | UnitPage String
+
+
+-- `queueCursor` is where the shown queue page starts; a reload after a
+-- decision re-reads that page only. The Model is plain data persisted to the
+-- session store; the startup settings are not part of it and reach every
+-- handler as its first argument. `selectedView` is the session's one source
+-- read slot, read by the queue card and the unit page alike, and `decision`
+-- its one decision slot, so a second read or decision in flight has no
+-- representation.
+type alias Model =
+    { page : Page
+    , queueState : Queue.QueueState
+    , queueCursor : Index.Cursor
+    , refusingUid : Maybe Uid
+    , refuseDraft : String
+    , refuseError : Maybe Error
+    , decisionError : Maybe Error
+    , queueLoad : Queue.LoadTicket
+    , history : Queue.HistoryState
+    , historyLoad : Queue.LoadTicket
+    , selected : Int
+    , selectedView : Queue.SelectedView
+    , decision : Queue.DecisionSlot
+    }
+
+
+type Msg
+    = PendingLoaded Queue.LoadTicket (Result Error Queue.QueuePage)
+    | NextPage Index.Cursor
+    | ApproveUnit Uid
+    | RefuseStart Uid
+    | RefuseDraft String
+    | RefuseCancel
+    | RefuseSubmit Uid
+    | DecisionSaved Uid Epoch (Result Error ( Index.Attested, Index.Written ))
+    | Navigated Page
+    | ShowQueue
+    | ShowHistory
+    | HistoryPageLoaded Queue.LoadTicket (Result Error Queue.HistoryPage)
+    | HistoryNext LibDb.HistoryCursor
+    | SelectedViewLoaded Uid Epoch (Result Error (Maybe Index.UnitView))
+    | KeyDown String
+    | SelectUnit Int
+
+
+-- The session's first model. It loads nothing: the route entry that follows
+-- `init` on every new session (`onNavigate`) loads the page's data, so the
+-- route table is the one place a URL maps to a page.
+initialModel : Model
+initialModel =
+    { page = QueuePage
+    , queueState = Loading
+    , queueCursor = Index.Start
+    , refusingUid = Nothing
+    , refuseDraft = ""
+    , refuseError = Nothing
+    , decisionError = Nothing
+    , queueLoad = Queue.firstTicket
+    , history = HistoryLoading
+    , historyLoad = Queue.firstTicket
+    , selected = 0
+    , selectedView = NoneSelected
+    , decision = DecisionIdle
+    }
+
+
+-- The shown page's units, for selection and decisions; a queue that is not
+-- loaded has none to act on. What the view renders comes from
+-- `Queue.queueStatusText`, so this list never stands for "empty".
+queueList : Model -> List Queue.QueuedUnit
+queueList model =
+    case model.queueState of
+        Loaded page ->
+            page.units
+
+        Loading ->
+            []
+
+        Failed _ ->
+            []
+
+
+-- The queue card at the selected index, if the shown page has one.
+selectedUnit : Model -> Maybe Queue.QueuedUnit
+selectedUnit model =
+    List.head (List.drop model.selected (queueList model))
+
+
+selectedUid : Model -> Maybe Uid
+selectedUid model =
+    case selectedUnit model of
+        Just q ->
+            Just q.unit.uid
+
+        Nothing ->
+            Nothing
+
+
+-- The unit page's state, from its address and the session's one source slot:
+-- an address that names no unit is refused, and any other reads the slot.
+unitPageState : String -> Model -> Queue.UnitPageState
+unitPageState raw model =
+    case Queue.unitPageEntry raw of
+        Ok uid ->
+            Queue.unitPageOf uid model.selectedView
+
+        Err refused ->
+            refused
+
+
+-- A page entered, with the Cmd that loads its data: the one entry path, run
+-- on every URL entry (first request, reload, link, back and forward,
+-- reconnect) through `onNavigate`, and by the header buttons. The queue page
+-- reloads the queue; any other page loads the queue too while it is not
+-- loaded, since the header shows its progress on every page. History shows
+-- no source, so it clears the source slot; a read in flight stays recorded.
+enterPage : Settings.AppSettings -> Page -> Model -> ( Model, Cmd Msg )
+enterPage settings page model =
+    let
+        entered =
+            { model | page = page }
+    in
+    case page of
+        QueuePage ->
+            loadQueue settings entered.queueCursor entered
+
+        HistoryPage ->
+            withQueue settings (loadHistory settings HistoryStart { entered | selectedView = Queue.clearView settings.epoch entered.selectedView })
+
+        UnitPage raw ->
+            case Queue.unitPageEntry raw of
+                Ok uid ->
+                    withQueue settings (loadUnit settings uid entered)
+
+                Err _ ->
+                    ( { entered | selectedView = Queue.clearView settings.epoch entered.selectedView }, Cmd.none )
+
+
+-- The queue page from `cursor`, under the queue's next load ticket; the shown
+-- page stays until the result settles it.
+loadQueue : Settings.AppSettings -> Index.Cursor -> Model -> ( Model, Cmd Msg )
+loadQueue settings cursor model =
+    let
+        load =
+            Queue.nextTicket model.queueLoad
+    in
+    ( { model | queueCursor = cursor, queueLoad = load }
+    , Cmd.perform (Queue.loadPage settings cursor) (PendingLoaded load)
+    )
+
+
+-- An entry, plus a queue load while the queue is not loaded.
+withQueue : Settings.AppSettings -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+withQueue settings ( model, cmd ) =
+    case model.queueState of
+        Loaded _ ->
+            ( model, cmd )
+
+        Loading ->
+            alsoQueue settings cmd model
+
+        Failed _ ->
+            alsoQueue settings cmd model
+
+
+alsoQueue : Settings.AppSettings -> Cmd Msg -> Model -> ( Model, Cmd Msg )
+alsoQueue settings cmd model =
+    let
+        ( queued, queueCmd ) =
+            loadQueue settings model.queueCursor model
+    in
+    ( queued, Cmd.batch [ cmd, queueCmd ] )
+
+
+-- One History page loaded from `cursor`, under the History slot's next load
+-- ticket.
+loadHistory : Settings.AppSettings -> LibDb.HistoryCursor -> Model -> ( Model, Cmd Msg )
+loadHistory settings cursor model =
+    let
+        load =
+            Queue.nextTicket model.historyLoad
+    in
+    ( { model | history = HistoryLoading, historyLoad = load }
+    , Cmd.perform (Queue.loadHistoryPage settings cursor) (HistoryPageLoaded load)
+    )
+
+
+-- The unit page of `uid`, read afresh through the session's one source slot:
+-- during a read in flight it is only recorded as wanted, so entries made
+-- while a read runs start no second read.
+loadUnit : Settings.AppSettings -> Uid -> Model -> ( Model, Cmd Msg )
+loadUnit settings uid model =
+    viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
+
+
+update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )
+update settings msg model =
+    case msg of
+        PendingLoaded load result ->
+            if Queue.isCurrentLoad load model.queueLoad then
+                let
+                    loaded =
+                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing }
+                in
+                viewAfterLoad settings { loaded | selected = clampIndex model.selected (List.length (queueList loaded)) }
+
+            else
+                ( model, Cmd.none )
+
+        NextPage cursor ->
+            loadQueue settings cursor { model | queueState = Loading, selected = 0 }
+
+        ApproveUnit uid ->
+            saveDecision settings model uid Approved
+
+        RefuseStart uid ->
+            ( { model | refusingUid = Just uid, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+
+        RefuseDraft text ->
+            ( { model | refuseDraft = text, refuseError = Nothing }, Cmd.none )
+
+        RefuseCancel ->
+            ( { model | refusingUid = Nothing, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+
+        RefuseSubmit uid ->
+            submitRefuse settings model uid
+
+        DecisionSaved uid epoch result ->
+            let
+                settled =
+                    { model | decision = Queue.decisionSettled epoch uid model.decision }
+            in
+            case result of
+                Ok ( attested, written ) ->
+                    let
+                        load =
+                            Queue.nextTicket settled.queueLoad
+                    in
+                    ( { settled | decisionError = Nothing, queueLoad = load }, drainAndReload settings settled attested written load )
+
+                Err e ->
+                    ( { settled | decisionError = Just e }, Cmd.none )
+
+        Navigated page ->
+            enterPage settings page model
+
+        ShowQueue ->
+            enterPage settings QueuePage model
+
+        ShowHistory ->
+            enterPage settings HistoryPage model
+
+        HistoryPageLoaded load result ->
+            if Queue.isCurrentLoad load model.historyLoad then
+                ( { model | history = Queue.historyStateFromResult result }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
+
+        HistoryNext cursor ->
+            loadHistory settings cursor model
+
+        SelectedViewLoaded uid epoch result ->
+            viewStep settings (Queue.viewArrived epoch uid result model.selectedView) model
+
+        KeyDown key ->
+            if model.page == QueuePage then
+                keyActionMsg settings (Keys.keyAction (model.refusingUid /= Nothing) (List.length (queueList model)) model.selected key) model
+
+            else
+                ( model, Cmd.none )
+
+        SelectUnit i ->
+            if model.page == QueuePage then
+                selectAt settings i model
+
+            else
+                ( model, Cmd.none )
+
+
+-- The selected card's view after a queue load: on the queue page the
+-- selected unit is read afresh, since the load may follow a decision or a
+-- reindex. History shows no source, so the slot is cleared. The unit page
+-- owns the slot for its own unit, so a queue load leaves it alone.
+viewAfterLoad : Settings.AppSettings -> Model -> ( Model, Cmd Msg )
+viewAfterLoad settings model =
+    case ( model.page, selectedUid model ) of
+        ( QueuePage, Just uid ) ->
+            viewStep settings (Queue.reloadView settings.epoch uid model.selectedView) model
+
+        ( QueuePage, Nothing ) ->
+            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
+
+        ( HistoryPage, _ ) ->
+            ( { model | selectedView = Queue.clearView settings.epoch model.selectedView }, Cmd.none )
+
+        ( UnitPage _, _ ) ->
+            ( model, Cmd.none )
+
+
+-- The queue card at `i` selected, reading its view when it is not shown.
+selectAt : Settings.AppSettings -> Int -> Model -> ( Model, Cmd Msg )
+selectAt settings i model =
+    let
+        moved =
+            { model | selected = clampIndex i (List.length (queueList model)) }
+    in
+    case selectedUid moved of
+        Just uid ->
+            viewStep settings (Queue.selectView settings.epoch uid moved.selectedView) moved
+
+        Nothing ->
+            ( moved, Cmd.none )
+
+
+-- A source-slot transition, with the one read it starts, if any: the only
+-- place a source read is started, its result stamped with this process's
+-- epoch.
+viewStep : Settings.AppSettings -> ( Queue.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
+viewStep settings ( state, next ) model =
+    ( { model | selectedView = state }, loadViewCmd settings next )
+
+
+loadViewCmd : Settings.AppSettings -> Maybe Uid -> Cmd Msg
+loadViewCmd settings next =
+    case next of
+        Just uid ->
+            Cmd.perform (Queue.loadUnitView settings.index uid) (SelectedViewLoaded uid settings.epoch)
+
+        Nothing ->
+            Cmd.none
+
+
+-- Every KeyAction dispatches the same Msg the matching button sends —
+-- the buttons remain the single source of truth; the keys are a mirror.
+keyActionMsg : Settings.AppSettings -> KeyAction -> Model -> ( Model, Cmd Msg )
+keyActionMsg settings action model =
+    case action of
+        ApproveSelected ->
+            case selectedUid model of
+                Just uid ->
+                    saveDecision settings model uid Approved
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        RefuseSelected ->
+            case selectedUid model of
+                Just uid ->
+                    ( { model | refusingUid = Just uid, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        Select i ->
+            selectAt settings i model
+
+        ConfirmRefuse ->
+            case model.refusingUid of
+                Just uid ->
+                    submitRefuse settings model uid
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        CancelRefuse ->
+            ( { model | refusingUid = Nothing, refuseDraft = "", refuseError = Nothing }, Cmd.none )
+
+        Ignore ->
+            ( model, Cmd.none )
+
+
+-- The draft is parsed into a bounded `Reason` here, the one point where the
+-- reviewer's text enters; a blank or over-long draft stays open with why,
+-- and so does a draft submitted while another decision is saving.
+submitRefuse : Settings.AppSettings -> Model -> Uid -> ( Model, Cmd Msg )
+submitRefuse settings model uid =
+    case LibDb.parseReason model.refuseDraft of
+        Err e ->
+            ( { model | refuseError = Just e }, Cmd.none )
+
+        Ok reason ->
+            case Queue.startDecision settings.epoch uid model.decision of
+                Just _ ->
+                    saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } uid (Refused reason)
+
+                Nothing ->
+                    ( { model | refuseError = Just decisionBusy }, Cmd.none )
+
+
+clampIndex : Int -> Int -> Int
+clampIndex i len =
+    max 0 (min i (len - 1))
+
+
+-- Every decision, from a button or a key, takes the session's one decision
+-- slot and goes through `Queue.decide` on the selected unit's shown source,
+-- which it re-proves before writing. A decision asked off the queue page is
+-- refused before it takes the slot; one asked while another is saving starts
+-- nothing. Each says why.
+saveDecision : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
+saveDecision settings model uid decision =
+    if model.page /= QueuePage then
+        ( { model | decisionError = Just decisionOffQueue }, Cmd.none )
+
+    else
+        case Queue.startDecision settings.epoch uid model.decision of
+            Just saving ->
+                ( { model | decision = saving }
+                , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
+                )
+
+            Nothing ->
+                ( { model | decisionError = Just decisionBusy }, Cmd.none )
+
+
+decisionBusy : Error
+decisionBusy =
+    Error.conflict "a decision is still being saved; try again once it settles"
+
+
+decisionOffQueue : Error
+decisionOffQueue =
+    Error.conflict "decisions are made on the queue page"
+
+
+decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decisionTask settings model uid decision =
+    case List.find (\q -> q.unit.uid == uid) (queueList model) of
+        Just _ ->
+            case Queue.decidableSource uid model.selectedView of
+                Just shown ->
+                    decideOn settings shown decision
+
+                Nothing ->
+                    Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
+
+        Nothing ->
+            Task.fail (Error.conflict "unit is no longer in the queue")
+
+
+decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decideOn settings shown decision =
+    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.index db shown decision)
+
+
+-- The drain loop: the decision is already saved (DecisionSaved Ok), so the
+-- pair enters the index's `reviewed` copy under the attested hash the
+-- decision was written with, and the copy's stamp follows the review log's
+-- head as the write moved it. A failure anywhere fails closed with the queue
+-- unchanged — the unit stays visible with its badge and the next load
+-- rebuilds the copy.
+drainAndReload : Settings.AppSettings -> Model -> Index.Attested -> Index.Written -> Queue.LoadTicket -> Cmd Msg
+drainAndReload settings model attested written load =
+    Cmd.perform (Queue.drainThenLoad settings attested written model.queueCursor) (PendingLoaded load)

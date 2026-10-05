@@ -1,0 +1,657 @@
+module ViewRenderTests exposing (checks)
+
+import Ipe.Db as Db
+import Ipe.Error as Error
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Ipe.Ui as Ui
+import Lib.App exposing (Model, Page(..), initialModel)
+import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
+import Lib.Format as Format
+import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..))
+import Lib.Links exposing (Hidden(..), Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.SafeText as SafeText
+import Lib.Uid as Uid
+import Lib.View as View
+import TestSupport exposing (checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText)
+
+
+-- Every check here renders the real `View.view` to HTML, the exact string the
+-- browser receives, and asserts on that string. A refusal the view enforces
+-- (a withheld source gives no decision buttons; hostile text is escaped; a
+-- reason past the bound is never printed; a non-http link is never an `href`)
+-- is therefore pinned at the sink, not at a helper the view might stop calling.
+-- Each refusal sits beside a positive control that renders the permitted form
+-- through the same path, so a needle that no longer matches the markup turns a
+-- check red instead of letting its negative half pass vacuously.
+--
+-- The tests render under `Ui.layout []`, the root the app serves.
+page : Model -> String
+page model =
+    Html.render (Ui.layout [] (View.view model))
+
+
+has : String -> String -> Bool
+has needle haystack =
+    String.contains needle haystack
+
+
+-- A button's label as the markup spells it: the text directly between tags.
+button : String -> String -> Bool
+button label html =
+    has (">" ++ label ++ "<") html
+
+
+-- ── fixtures ────────────────────────────────────────────────────────────
+-- A model on the queue page, nothing loaded.
+baseModel : Model
+baseModel =
+    initialModel
+
+
+queued : Index.UnitView -> Queue.QueuedUnit
+queued loaded =
+    { unit = loaded.unit, change = New, changed = Nothing }
+
+
+queuePage : List Queue.QueuedUnit -> Int -> Queue.Progress -> Queue.QueuePage
+queuePage units total progress =
+    { units = units
+    , total = total
+    , dbName = SafeText.literal "index.db"
+    , dbBytes = 2048
+    , next = Nothing
+    , progress = progress
+    }
+
+
+-- The queue page with one selected unit card showing `loaded`.
+cardModel : Index.UnitView -> Model
+cardModel loaded =
+    { baseModel
+        | queueState = Loaded (queuePage [ queued loaded ] 1 { reviewed = 0, total = 1 })
+        , selectedView = ViewShown loaded
+    }
+
+
+-- The queue page whose one selected card carries a previous review of the
+-- unit, as a unit decided on an older hash resurfaces.
+changedModel : Index.UnitView -> LibDb.ReviewRow -> Model
+changedModel loaded old =
+    { baseModel
+        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = old.bodyHash }, changed = Just old } ] 1 { reviewed = 0, total = 1 })
+        , selectedView = ViewShown loaded
+    }
+
+
+-- The queue card with its refusal panel open.
+refusingModel : Index.UnitView -> Model
+refusingModel loaded =
+    let
+        card =
+            cardModel loaded
+    in
+    { card | refusingUid = Just loaded.unit.uid }
+
+
+-- The unit page of `loaded`'s own address, with its read settled.
+unitPageModel : Index.UnitView -> Model
+unitPageModel loaded =
+    { baseModel | page = UnitPage (Uid.toString loaded.unit.uid), selectedView = ViewShown loaded }
+
+
+-- A unit page at `address`, whatever it names.
+addressModel : String -> Model
+addressModel address =
+    { baseModel | page = UnitPage address }
+
+
+historyModel : List Queue.HistoryRow -> Model
+historyModel rows =
+    { baseModel
+        | page = HistoryPage
+        , history = HistoryLoaded { rows = rows, at = HistoryStart, next = Nothing }
+    }
+
+
+historyRowOf : LibDb.ReviewRow -> Queue.HistoryRow
+historyRowOf row =
+    { uid = row.uid
+    , bodyHash = row.bodyHash
+    , decision = row.decision
+    , reviewedAt = row.reviewedAt
+    , name = Nothing
+    }
+
+
+-- Text that is hostile in HTML (a tag) and in display (a bidi override).
+hostileText : String
+hostileText =
+    "<script>alert(1)</script>" ++ codeText 8238
+
+
+-- `hostileText` as it must reach the browser: the tag escaped by the HTML
+-- sink and the override spelled out by the display scrub, inside the marked
+-- element only a tool-written escape draws in.
+hostileEscaped : String
+hostileEscaped =
+    "&lt;script&gt;alert(1)&lt;/script&gt;" ++ escapeMarkup (renderedForeign (codeText 8238))
+
+
+-- A tool-written escape as the markup spells it.
+escapeMarkup : String -> String
+escapeMarkup spelled =
+    "<span data-review-escape=\"true\" style=\"" ++ View.escapeCss ++ "\">" ++ spelled ++ "</span>"
+
+
+-- The opening of an untrusted-text element: it draws in byte order.
+byteOrderOpen : String
+byteOrderOpen =
+    "<span style=\"" ++ View.displayOrderCss ++ "\">"
+
+
+-- True when `html` draws `hostileText`, right after `prefix`, at the start of
+-- an element that draws in byte order.
+hostileInByteOrder : String -> String -> Bool
+hostileInByteOrder prefix html =
+    has (byteOrderOpen ++ prefix ++ hostileEscaped) html
+
+
+-- True when `html` carries `hostileText` escaped and neither raw form.
+escapesHostile : String -> Bool
+escapesHostile html =
+    has hostileEscaped html
+        && not (has "<script>" html)
+        && not (has (codeText 8238) html)
+
+
+-- The text of the one source line the fixture unit shows that is neither a
+-- keyword nor punctuation, so a shown source is recognisable in the markup.
+sourceMarker : String
+sourceMarker =
+    "everything"
+
+
+requireUnit : Maybe Index.UnitView -> Task.Task Error Index.UnitView
+requireUnit found =
+    case found of
+        Just loaded ->
+            Task.succeed loaded
+
+        Nothing ->
+            Task.fail (Error.conflict "a fixture unit is missing from the seeded index")
+
+
+isShown : Index.UnitView -> Bool
+isShown loaded =
+    case loaded.view of
+        Shown _ ->
+            True
+
+        Stale _ ->
+            False
+
+        Unreadable _ ->
+            False
+
+
+-- The two fixture units loaded from a seeded index of their own, handed to
+-- `body`; both must be shown, or the checks that follow would test nothing.
+withSeededIndex : String -> (Index.UnitView -> Index.UnitView -> Task.Task Error (List ( String, Bool ))) -> Task.Task Error (List ( String, Bool ))
+withSeededIndex name body =
+    do
+        at <- freshScratch name
+        seedIndex at.indexDb at.repo
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
+        results <- body a b
+        cleanupIndex at.indexDb at.repo
+        Task.succeed ([ ( "the fixture units load as verified sources", isShown a && isShown b ) ] ++ results)
+
+
+-- ── decision buttons exist only for a verified source ───────────
+type alias Withheld =
+    { view : SourceView
+    , reason : String
+    }
+
+
+-- The fragment of text that says why a stale source is withheld. The match is
+-- exhaustive, so a new `StaleReason` does not compile until it is pinned here.
+staleCase : StaleReason -> Withheld
+staleCase reason =
+    case reason of
+        Drifted ->
+            { view = Stale reason, reason = "Source changed since it was indexed" }
+
+        RangeOutOfFile { lineCount } ->
+            { view = Stale reason, reason = "The file now has " ++ String.fromInt lineCount ++ " lines" }
+
+        UnverifiableHash ->
+            { view = Stale reason, reason = "predates source attestation" }
+
+
+-- Every way a source is withheld.
+withheldCases : List Withheld
+withheldCases =
+    [ staleCase Drifted
+    , staleCase (RangeOutOfFile { lineCount = 2 })
+    , staleCase UnverifiableHash
+    , { view = Unreadable (Error.invalidInput "gone"), reason = "Source unreadable: " }
+    ]
+
+
+noDecisionButtons : String -> Bool
+noDecisionButtons html =
+    not (button "Approve" html) && not (button "Refuse" html) && not (button "Confirm" html)
+
+
+-- A withheld source, on the queue card and on the unit page, names its reason,
+-- offers no decision button and prints none of the source.
+withheldRefuses : Index.UnitView -> Withheld -> Bool
+withheldRefuses loaded entry =
+    let
+        withheld =
+            { loaded | view = entry.view }
+
+        onCard =
+            page (cardModel withheld)
+
+        onPage =
+            page (unitPageModel withheld)
+    in
+    has entry.reason onCard
+        && noDecisionButtons onCard
+        && not (has sourceMarker onCard)
+        && has entry.reason onPage
+        && not (has sourceMarker onPage)
+
+
+-- A withheld card whose refusal panel is open still offers no decision.
+withheldRefusePanelRefuses : Index.UnitView -> Withheld -> Bool
+withheldRefusePanelRefuses loaded entry =
+    let
+        withheld =
+            { loaded | view = entry.view }
+
+        html =
+            page (refusingModel withheld)
+    in
+    has entry.reason html && noDecisionButtons html
+
+
+-- ── queue states and counts ─────────────────────────────────────
+-- The queue page in each state that shows no card, with the text that state
+-- shows: loading, failed, an empty queue, and a page with no open unit while
+-- the queue holds some.
+type alias StateCase =
+    { text : String
+    , model : Model
+    }
+
+
+stateCases : List StateCase
+stateCases =
+    [ { text = "Loading queue…", model = { baseModel | queueState = Loading } }
+    , { text = "Queue failed to load: ", model = { baseModel | queueState = Failed (Error.invalidInput "boom") } }
+    , { text = "No units queued.", model = { baseModel | queueState = Loaded (queuePage [] 0 { reviewed = 0, total = 0 }) } }
+    , { text = "No units to review on this page.", model = { baseModel | queueState = Loaded (queuePage [] 3 { reviewed = 0, total = 3 }) } }
+    ]
+
+
+stateNeedles : List String
+stateNeedles =
+    List.map (\c -> c.text) stateCases
+
+
+-- True when the page for the case carries its own text and none of the
+-- other states' texts.
+showsOnly : StateCase -> Bool
+showsOnly entry =
+    let
+        html =
+            page entry.model
+    in
+    has entry.text html && List.all (\other -> other == entry.text || not (has other html)) stateNeedles
+
+
+progressLine : Queue.Progress -> String
+progressLine progress =
+    String.fromInt progress.reviewed ++ " of " ++ String.fromInt progress.total ++ " reviewed (" ++ Format.percent progress.reviewed progress.total ++ ")"
+
+
+showingLine : Queue.QueuePage -> String
+showingLine loadedPage =
+    "showing " ++ String.fromInt (List.length loadedPage.units) ++ " of " ++ String.fromInt loadedPage.total
+
+
+-- The progress line and the "showing k of N" header follow the model's own
+-- counts: two models with different counts render different lines, and each
+-- line is the one its model's counts spell.
+countsFollowModel : Index.UnitView -> Index.UnitView -> Bool
+countsFollowModel a b =
+    let
+        first =
+            queuePage [ queued a, queued b ] 9 { reviewed = 3, total = 7 }
+
+        second =
+            queuePage [ queued a ] 4 { reviewed = 5, total = 5 }
+
+        firstHtml =
+            page { baseModel | queueState = Loaded first, selectedView = ViewShown a }
+
+        secondHtml =
+            page { baseModel | queueState = Loaded second, selectedView = ViewShown a }
+    in
+    has (progressLine first.progress) firstHtml
+        && has (showingLine first) firstHtml
+        && has (progressLine second.progress) secondHtml
+        && has (showingLine second) secondHtml
+        && not (has (progressLine second.progress) firstHtml)
+        && not (has (showingLine second) firstHtml)
+        && not (has (progressLine first.progress) secondHtml)
+        && not (has (showingLine first) secondHtml)
+
+
+-- ── error text ──────────────────────────────────────────────────────
+-- A refusal error is shown in the open refusal panel, escaped.
+refuseErrorEscaped : Index.UnitView -> Bool
+refuseErrorEscaped loaded =
+    let
+        opened =
+            refusingModel loaded
+
+        hostile =
+            page { opened | refuseError = Just (Error.invalidInput hostileText) }
+
+        plain =
+            page { opened | refuseError = Just (Error.invalidInput "needs a reason") }
+    in
+    escapesHostile hostile
+        && hostileInByteOrder "" hostile
+        && button "Confirm" hostile
+        && has "needs a reason" plain
+        && button "Confirm" plain
+
+
+-- A failed decision save is shown in the queue banner, escaped.
+decisionErrorEscaped : Index.UnitView -> Bool
+decisionErrorEscaped loaded =
+    let
+        card =
+            cardModel loaded
+
+        hostile =
+            page { card | decisionError = Just (Error.invalidInput hostileText) }
+
+        plain =
+            page { card | decisionError = Just (Error.invalidInput "disk full") }
+    in
+    has (byteOrderOpen ++ "Decision save failed: ") hostile
+        && escapesHostile hostile
+        && has "Decision save failed: " plain
+        && has "disk full" plain
+
+
+-- ── the address the page reports ────────────────────────────────────
+-- The path an address reports is an attribute value, escaped at the sink; the
+-- three pages report their fixed paths.
+pathAttributeEscaped : Index.UnitView -> Bool
+pathAttributeEscaped loaded =
+    let
+        hostileAddress =
+            "\"><script>alert(1)</script>"
+
+        hostile =
+            page (addressModel hostileAddress)
+
+        plain =
+            page (addressModel "abc")
+    in
+    has "data-ipe-path=\"/unit/&#34;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\"" hostile
+        && not (has "<script>" hostile)
+        && not (has hostileAddress hostile)
+        && has "data-ipe-path=\"/unit/abc\"" plain
+        && has "data-ipe-path=\"/\"" (page baseModel)
+        && has "data-ipe-path=\"/history\"" (page (historyModel []))
+
+
+-- ── links ──────────────────────────────────────────────────────────
+withLinks : List Link -> Index.UnitView -> Index.UnitView
+withLinks links loaded =
+    { loaded | links = { links = links, hidden = NoneHidden } }
+
+
+-- A link whose target is not an http(s) or mailto/tel URL or a same-origin
+-- path renders as its plain label with no `href` anywhere in the page.
+unsafeLinkHasNoHref : Index.UnitView -> String -> Bool
+unsafeLinkHasNoHref loaded url =
+    let
+        linked =
+            withLinks [ External url ] loaded
+
+        onPage =
+            page (unitPageModel linked)
+
+        onCard =
+            page (cardModel linked)
+    in
+    has url onPage
+        && has url onCard
+        && not (has "href=" onPage)
+        && not (has "href=" onCard)
+
+
+unsafeTargets : List String
+unsafeTargets =
+    [ "javascript:alert(1)"
+    , "data:text/html,x"
+    , "file:///etc/passwd"
+    , "//evil.example/x"
+    ]
+
+
+-- The same link path renders an https target as an `href`.
+safeLinkHasHref : Index.UnitView -> Bool
+safeLinkHasHref loaded =
+    let
+        linked =
+            withLinks [ External "https://example.com/x" ] loaded
+    in
+    has "href=\"https://example.com/x\"" (page (unitPageModel linked))
+        && has "href=\"https://example.com/x\"" (page (cardModel linked))
+
+
+-- ── checks on the seeded fixture units ──────────────────────────────────
+seededChecks : Index.UnitView -> Index.UnitView -> List ( String, Bool )
+seededChecks a b =
+    let
+        shownCard =
+            page (cardModel a)
+
+        shownPage =
+            page (unitPageModel a)
+
+        unit =
+            a.unit
+
+        hostileName =
+            { a | unit = { unit | qualified = SafeText.renderForeign hostileText } }
+
+        hostilePath =
+            { a | unit = { unit | path = SafeText.renderForeign hostileText } }
+
+        opened =
+            page (refusingModel a)
+
+        hostileHistory =
+            historyModel [ { uid = a.unit.uid, bodyHash = "h", decision = StoredApproved, reviewedAt = Timestamp.fromUnixMillis 0, name = Just (SafeText.renderForeign hostileText) } ]
+    in
+    [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
+    , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
+    , ( "a withheld source offers no decision with the refusal panel open", List.all (withheldRefusePanelRefuses a) withheldCases )
+    , ( "the unit page shows a verified source and never a decision button", has sourceMarker shownPage && noDecisionButtons shownPage )
+    , ( "an open refusal panel shows Confirm and Cancel in place of Approve and Refuse", button "Confirm" opened && button "Cancel" opened && not (button "Approve" opened) && not (button "Refuse" opened) )
+    , ( "the escaped needle differs from the raw hostile text, and a benign render holds no script tag, no href and shows the unit name", hostileEscaped /= hostileText && renderedForeign (codeText 8238) /= codeText 8238 && not (has "<script" shownCard) && not (has "href=" shownCard) && has "Lib.answer" shownCard )
+    , ( "a hostile unit name is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostileName)) && escapesHostile (page (unitPageModel hostileName)) )
+    , ( "a hostile unit path is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostilePath)) && escapesHostile (page (unitPageModel hostilePath)) )
+    , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
+    , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
+    , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
+    , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
+    , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
+    , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
+    , ( "a refusal error is escaped in the open refusal panel", refuseErrorEscaped a )
+    , ( "a failed decision save is escaped in the queue banner", decisionErrorEscaped a )
+    , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
+    , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
+    , ( "an https link target renders as an href", safeLinkHasHref a )
+    ]
+
+
+showsNoStateText : String -> Bool
+showsNoStateText html =
+    List.all (\needle -> not (has needle html)) stateNeedles
+
+
+-- ── a hostile source token ──────────────────────────────────────────────
+-- The text a comment token opens with: the line's indent and the marker.
+commentLead : String
+commentLead =
+    "    // "
+
+
+-- The fixture unit's four lines with a comment holding `hostileText`, then the
+-- six ASCII characters of an escape spelling and the real U+200B it names.
+hostileView : String
+hostileView =
+    "pub fn answer() -> i32 {\n    // " ++ hostileText ++ asciiSpelling ++ codeText 8203 ++ "\n    42\n}"
+
+
+asciiSpelling : String
+asciiSpelling =
+    " \\u{200b}x"
+
+
+-- The fixture library with lines 3..6 replaced by `hostileView`, and the
+-- unit's stored attestation re-pointed at them, so the source is shown
+-- (it re-hashes) while its text is hostile.
+hostileSourceChecks : Task.Task Error (List ( String, Bool ))
+hostileSourceChecks =
+    do
+        at <- freshScratch "ipe-view-render-hostile-source"
+        seedIndex at.indexDb at.repo
+        writeFileText (at.repo ++ "/src/Lib.rs") ("// fixture library\n\n" ++ hostileView ++ "\n")
+        execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest hostileView), Uid.toSql (uid "u-a") ]
+        loaded <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            [ ( "the hostile fixture source is verified and shown", isShown loaded )
+            , ( "a hostile source token is escaped on the queue page", escapesHostile (page (cardModel loaded)) )
+            , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel loaded)) )
+            , ( "a hostile source token draws in byte order", hostileInByteOrder commentLead (page (cardModel loaded)) && hostileInByteOrder commentLead (page (unitPageModel loaded)) )
+            , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
+            , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
+            ]
+
+
+-- ── stored decisions ────────────────────────────────────────────
+-- A reason one character past the bound, written to the review table as an
+-- older or edited file may hold it.
+overlongReason : String
+overlongReason =
+    String.repeat (LibDb.reasonMaxChars + 1) "Q"
+
+
+insertReviewWith : Db -> String -> String -> String -> SqlValue -> Task.Task Error ()
+insertReviewWith db unitLabel hash decision reason =
+    Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid unitLabel), SqlString hash, SqlString decision, reason, SqlInt 0 ]
+        |> Task.map (\_ -> ())
+
+
+requireRow : Maybe LibDb.ReviewRow -> Task.Task Error LibDb.ReviewRow
+requireRow found =
+    case found of
+        Just row ->
+            Task.succeed row
+
+        Nothing ->
+            Task.fail (Error.conflict "a fixture review row is missing")
+
+
+storedChecks : Task.Task Error (List ( String, Bool ))
+storedChecks =
+    do
+        at <- freshScratch "ipe-view-render-stored"
+        seedIndex at.indexDb at.repo
+        loaded <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        db <- migratedReviewAt at.reviewDb
+        insertReviewWith db "u-a" "h-long" "refuse" (SqlString overlongReason)
+        insertReviewWith db "u-b" "h-ok" "refuse" (SqlString "needs a test")
+        insertReviewWith db "u-c" "h-yes" "approve" (SqlNull (SqlString ""))
+        long <- LibDb.findDecision db (uid "u-a") "h-long" |> Task.andThen requireRow
+        ok <- LibDb.findDecision db (uid "u-b") "h-ok" |> Task.andThen requireRow
+        yes <- LibDb.findDecision db (uid "u-c") "h-yes" |> Task.andThen requireRow
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        removeFileIfAny (at.reviewDb ++ "-wal")
+        removeFileIfAny (at.reviewDb ++ "-shm")
+        Task.succeed (storedPure loaded long ok yes)
+
+
+-- The checks over rows read back from a review table.
+storedPure : Index.UnitView -> LibDb.ReviewRow -> LibDb.ReviewRow -> LibDb.ReviewRow -> List ( String, Bool )
+storedPure loaded long ok yes =
+    let
+        lengthNote =
+            "reason not shown: " ++ String.fromInt (String.length overlongReason) ++ " characters"
+
+        hiddenInHistory =
+            page (historyModel [ historyRowOf long ])
+
+        hiddenOnCard =
+            page (changedModel loaded long)
+
+        okInHistory =
+            page (historyModel [ historyRowOf ok ])
+
+        okOnCard =
+            page (changedModel loaded ok)
+
+        approvedInHistory =
+            page (historyModel [ historyRowOf yes ])
+
+        refusedInHistory =
+            page (historyModel [ historyRowOf ok ])
+    in
+    [ ( "an over-long stored reason shows its length and none of its text, in the History and on a changed card", has lengthNote hiddenInHistory && has lengthNote hiddenOnCard && not (has (String.repeat 20 "Q") hiddenInHistory) && not (has (String.repeat 20 "Q") hiddenOnCard) )
+    , ( "a valid stored reason is shown in the History and on a changed card", has "needs a test" okInHistory && has "needs a test" okOnCard && not (has "reason not shown" okInHistory) )
+    , ( "a stored approval shows its badge and no refusal", has "✓ Approved" approvedInHistory && not (has "✗ Refused" approvedInHistory) )
+    , ( "a stored refusal shows its badge and no approval", has "✗ Refused" refusedInHistory && not (has "✓ Approved" refusedInHistory) )
+    , ( "a changed card names a previous approval", has "Previously Approved" (page (changedModel loaded yes)) )
+    , ( "a changed card names a previous refusal with its reason", has "Previously Refused (needs a test)" okOnCard )
+    ]
+
+
+-- ── harness ─────────────────────────────────────────────────────────────
+-- A group whose fixtures fail to build reports one failed check by name, with
+-- the error, instead of ending the run.
+group : String -> Task.Task Error (List ( String, Bool )) -> Task.Task Error (List ( String, Bool ))
+group name task =
+    task
+        |> Task.onError (\e -> checkReporting Io.println name (Task.fail e) |> Task.map (\failed -> [ failed ]))
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b)))
+        , group "hostile source fixture" hostileSourceChecks
+        , group "stored decision fixture" storedChecks
+        ]
+        |> Task.map List.concat

@@ -38,7 +38,9 @@ import QueueTests
 import RepoPathTests
 import SafeTextTests
 import SettingsTests
+import SingleFlightTests
 import TypedRowsTests
+import ViewRenderTests
 import ViewTests
 
 
@@ -67,6 +69,8 @@ gatherChecks =
         , RepoPathTests.checks |> Task.andThen (contributesChecks "RepoPathTests")
         , SettingsTests.checks |> Task.andThen (contributesChecks "SettingsTests")
         , TypedRowsTests.checks |> Task.andThen (contributesChecks "TypedRowsTests")
+        , ViewRenderTests.checks |> Task.andThen (contributesChecks "ViewRenderTests")
+        , SingleFlightTests.checks |> Task.andThen (contributesChecks "SingleFlightTests")
         ]
         |> Task.map List.concat
 
