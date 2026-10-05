@@ -1,8 +1,9 @@
 # code-review
 
 A small Ipê/TEA web app that reads an `ipe-index` `index.db` as its review
-backlog: it lists the units the index has queued for review, shows each unit's
-source slice and context, and drains a unit's `change_queue` row once decided.
+backlog: it lists the index's open units (every current unit whose
+`(uid, body_hash)` pair has no decision), shows each unit's source slice and
+context, and records each decision in the index's `reviewed` copy.
 `main : Task Error ()` serves the embedded TEA app over `Ipe.Server.Http`, so
 the program stands on its own — no wrapper script.
 
@@ -54,9 +55,10 @@ by variable name only, never by value, since a mistyped URL can carry a
 password. Each refusal states one fix.
 
 The startup probes: the index DB is opened read-only and every column a queue
-page reads is selected, so a missing file or a database that is not an
-`ipe-index` index stops startup; the review DB is opened (created when absent)
-and migrated; the root must be an existing directory. A probe failure names
+page reads from its `open_units` view is selected, with the `reviewed` copy and
+its `reviewed_stamp`, so a missing file or a database that is not an
+`ipe-index` index stops startup; the review DB is opened (created when absent),
+migrated, and its log head read; the root must be an existing directory. A probe failure names
 the variable and the resolved file, which is a plain absolute path once
 parsed.
 
@@ -97,20 +99,38 @@ length, never its text.
 History shows 100 reviews per page, newest first; each page reads only its own
 rows, through an index in that order.
 
-The progress counter in the header counts the units whose current body hash
-has a decision, out of the units decided or still queued. Each queue load
-reads it as one SQL aggregate over the index's `reviewed` table, the app's
-copy of its decided `(uid, body_hash)` pairs, so a load costs the same however
-large the index or the review history grows. Deciding a unit raises the first
-number and leaves the second unchanged, and a reload or a second tab shows the
-same numbers. Each load also compares the copy's row count with the review
-DB's; on a mismatch (a decision whose drain failed, a rebuilt index file, a
-deleted review row) it rebuilds the copy from the review DB before counting,
-and startup always rebuilds it once.
+The queue lists the index's `open_units` view: its current units minus the
+`(uid, body_hash)` pairs in its `reviewed` table, the app's copy of the review
+DB's decisions. A unit is listed because its current body has no decision, not
+because a change event names it, so an edited unit re-opens, a unit reverted
+to a decided body stays decided, and a unit with no `change_queue` row is
+still listed, badged UNRECORDED.
+
+The progress counter in the header is the index's units minus its open units,
+out of all its units. The page rows, the open count and the progress are read
+in one index transaction, so they always describe the same index state, and a
+load costs the same however large the index or the review history grows.
+Deciding a unit raises the first number and leaves the second unchanged, and
+a reload or a second tab shows the same numbers.
+
+The review DB's `review` table is append-only (deleting or updating a row is
+refused, and re-inserting a decided pair, `REPLACE` included, changes
+nothing), and every decision the app records moves its `review_head`, a hash
+chain over the decided pairs that starts from a random genesis. Startup
+refuses a review DB whose append-only triggers are missing. The `reviewed`
+copy is trusted only when its `reviewed_stamp` equals that head: draining a
+decision moves the stamp along with the head, and any other stamp (a decision
+whose drain failed, an index file replaced by another, a decision made from
+another process) rebuilds the copy from the review DB before the page is
+read. A row written into `review` by hand, outside the app, does not move
+the head: its unit stays listed until the next rebuild. A replaced
+review DB has a new genesis, so it re-opens every unit the old one decided.
+Startup always rebuilds the copy once.
 
 The index DB is opened read-only for listing and read-write (never created) only
-to drain a decided unit: in one transaction its pair enters `reviewed` and its
-consumed `change_queue` row is deleted. The app creates and owns the review DB.
+to drain a decided unit: in one transaction its pair enters `reviewed`, its
+consumed `change_queue` row is deleted, and the stamp moves. The app creates
+and owns the review DB.
 
 ## Checks
 
@@ -153,7 +173,7 @@ the app cannot verify, so every unit reads as unverifiable until the index is
 rebuilt: `tools/scripts/ipe-index update` rebuilds an index of an older schema
 in full, as `tools/scripts/ipe-index index` does.
 
-The queue view loads one page of at most 200 units (`pageSize` in `src/Lib/Index.ipe`).
+The queue view loads one page of at most 200 open units (`pageSize` in `src/Lib/Index.ipe`).
 
 If you run from inside a compiler checkout, `ipe` may auto-discover the
 checkout's vendored runtime snapshot instead of its own version-matched one,

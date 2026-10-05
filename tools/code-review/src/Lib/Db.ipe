@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
+module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, advanceHead, currentHead, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -226,16 +226,52 @@ reviewStore =
 
 
 -- The startup check of `IPE_REVIEW_DB`: the review database is opened
--- (created when absent) and migrated, so an unwritable location stops the
--- server before it listens, naming the variable and the file.
+-- (created when absent) and migrated, its append-only guards are found on
+-- the tables they guard, and its log head is read, so an unwritable
+-- location, a file whose guards are gone, or one whose head is missing stops
+-- the server before it listens, naming the variable and the file.
 probe : DbLocation -> Task.Task Error ()
 probe loc =
     (do
         db <- openAt loc
         migrate db
+        requireGuards db
+        currentHead db
         Task.succeed ()
     )
         |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
+
+
+-- The triggers that keep the review log append-only, each named with the
+-- table it guards. A migrated file can still lose one: a dropped trigger, or
+-- the log renamed away and recreated, which carries its triggers to the
+-- renamed table.
+appendOnlyGuards : List String
+appendOnlyGuards =
+    [ "review_head_no_delete on review_head"
+    , "review_no_delete on review"
+    , "review_no_replace on review"
+    , "review_no_update on review"
+    ]
+
+
+guardDecoder : Db.Decode.Decoder String
+guardDecoder =
+    Db.Decode.succeed (\entry -> entry)
+        |> Db.Decode.required "guard" (Db.Decode.string "guard")
+
+
+-- Every guard in `appendOnlyGuards` is present on its table; a file missing
+-- one is refused, since its review rows could be rewritten unseen.
+requireGuards : Db -> Task.Task Error ()
+requireGuards db =
+    do
+        present <- Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+        if List.all (\entry -> List.member entry present) appendOnlyGuards then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.unexpected "the review log's append-only triggers are not all in place")
 
 
 -- The review database at a parsed location, opened through the one review URL
@@ -255,63 +291,85 @@ migrate db =
 -- A decision is recorded only against an `Attested` pair, the proof that
 -- the reviewer was shown exactly those bytes; a refusal's reason is already a
 -- parsed `Reason`, so every decision that reaches the store is well formed.
-insertDecision : Db -> Attested -> Decision -> Task.Task Error Int
+-- One review transaction inserts the row and moves the log's head. The
+-- insert runs first, so the write lock is held before the head is read, and
+-- the primary key decides a duplicate at commit: a pair already decided
+-- inserts nothing and is `AlreadyDecided`, the first review winning. A new
+-- row links the head from `prev` to the next head over the pair, through a
+-- compare-and-set that fails, rolling the row back, if the head moved after
+-- it was read.
+insertDecision : Db -> Attested -> Decision -> Task.Task Error Index.Written
 insertDecision db attested decision =
-    insertIfAbsent db (Index.attestedUid attested) (Index.attestedHash attested) decision
-
-
--- A duplicate (uid, body_hash) pair is a no-op: the first review wins and
--- re-reviewing the same pair never overwrites it. The insert runs first and
--- the primary key arbitrates, so two concurrent first reviews cannot both
--- pass a check and one then fail: an insert that fails where the pair's row
--- exists is the duplicate (0 rows), and one that fails with no row for the
--- pair keeps its own error. Review rows are never deleted, so a row seen
--- after a failed insert is the one that won.
-insertIfAbsent : Db -> String -> String -> Decision -> Task.Task Error Int
-insertIfAbsent db uid bodyHash decision =
-    insertNew db uid bodyHash decision
-        |> Task.onError (\insertError -> duplicateOr db uid bodyHash insertError)
-
-
-duplicateOr : Db -> String -> String -> Error -> Task.Task Error Int
-duplicateOr db uid bodyHash insertError =
     do
-        existing <- findDecision db uid bodyHash
-        case existing of
-            Just _ ->
-                Task.succeed 0
+        now <- Time.unixMillis ()
+        let
+            uid =
+                Index.attestedUid attested
 
-            Nothing ->
-                Task.fail insertError
+            bodyHash =
+                Index.attestedHash attested
+
+            ( decisionText, reason ) =
+                case decision of
+                    Approved ->
+                        ( "approve", SqlNull (SqlString "") )
+
+                    Refused r ->
+                        ( "refuse", SqlString (reasonString r) )
+        in
+        Db.withTransaction db
+            (\tx ->
+                do
+                    inserted <- Db.exec tx "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (uid, body_hash) DO NOTHING" [ SqlString uid, SqlString bodyHash, SqlString decisionText, reason, SqlTime (Timestamp.toUnixMillis now) ]
+                    linkInserted tx uid bodyHash inserted
+            )
 
 
-insertNew : Db -> String -> String -> Decision -> Task.Task Error Int
-insertNew db uid bodyHash decision =
-    case reviewStore of
-        Err e ->
-            Task.fail e
+linkInserted : Db -> String -> String -> Int -> Task.Task Error Index.Written
+linkInserted tx uid bodyHash inserted =
+    if inserted == 0 then
+        Task.succeed Index.AlreadyDecided
 
-        Ok store ->
-            do
-                now <- Time.unixMillis ()
-                let
-                    ( decisionText, reason ) =
-                        case decision of
-                            Approved ->
-                                ( "approve", Nothing )
+    else if inserted == 1 then
+        do
+            prev <- currentHead tx
+            let
+                head =
+                    Index.chainLink prev uid bodyHash
+            in
+            advanceHead tx prev head
+                |> Task.map (\_ -> Index.Inserted { prev = prev, head = head })
 
-                            Refused r ->
-                                ( "refuse", Just (Valid r) )
+    else
+        Task.fail (Error.unexpected "a review insert wrote more than one row")
 
-                    row =
-                        { uid = uid
-                        , bodyHash = bodyHash
-                        , decision = decisionText
-                        , reason = reason
-                        , reviewedAt = now
-                        }
-                in
-                Store.insert db store row
+
+-- The review log's head: the one `review_head` row. A missing or extra row
+-- is a failed read, never a default head.
+currentHead : Db -> Task.Task Error Index.ChainHead
+currentHead db =
+    do
+        rows <- Db.queryDecode db "SELECT head FROM review_head WHERE one = 1" [] Index.chainHeadDecoder
+        case rows of
+            [ head ] ->
+                Task.succeed head
+
+            _ ->
+                Task.fail (Error.unexpected "review_head did not return exactly one row")
+
+
+-- The head moved from `prev` to `next` only if it still reads `prev`: a head
+-- another writer moved first fails the move, so two decisions can never
+-- both link from the same head.
+advanceHead : Db -> Index.ChainHead -> Index.ChainHead -> Task.Task Error ()
+advanceHead db prev next =
+    do
+        moved <- Db.exec db "UPDATE review_head SET head = ? WHERE one = 1 AND head = ?" [ SqlString (Index.chainHeadText next), SqlString (Index.chainHeadText prev) ]
+        if moved == 1 then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.conflict "the review log's head moved while a decision was recorded; decide again")
 
 
 -- The review row recorded for one (uid, body_hash) key, if any. The
@@ -346,28 +404,6 @@ findLatestForUid db uid =
                 |> Store.orderAsc "body_hash"
                 |> Store.limit 1
                 |> Store.toMaybe db
-
-
-countDecoder : Db.Decode.Decoder Int
-countDecoder =
-    Db.Decode.succeed (\n -> n)
-        |> Db.Decode.required "total" (Db.Decode.int "total")
-
-
--- How many decisions the review table holds, counted by SQLite without
--- decoding a row, so a row whose stored reason no longer parses still
--- counts. A count query that yields anything but one row is a failed read,
--- never a zero.
-countDecisions : Db -> Task.Task Error Int
-countDecisions db =
-    do
-        rows <- Db.queryDecode db "SELECT COUNT(*) AS total FROM review" [] countDecoder
-        case rows of
-            [ n ] ->
-                Task.succeed n
-
-            _ ->
-                Task.fail (Error.unexpected "COUNT(*) over review did not return exactly one row")
 
 
 -- The most decided pairs one page of a progress rebuild reads.
