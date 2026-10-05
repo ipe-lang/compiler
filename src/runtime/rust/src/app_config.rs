@@ -482,25 +482,19 @@ fn host_bind_from(
     }))
 }
 
-/// The installed `Log.level` tag, if a setting set one and no `IPE_LOG_LEVEL`
-/// env override applies. Returns `None` when the caller should keep resolving
-/// (env present, or no setting) — the log subsystem owns the env read and the
-/// numeric fallback, so this is only the middle precedence tier. `env >
-/// setting-in-code > fallback`.
+/// The installed `Log.level` tag, if a setting set one: the middle tier of
+/// `env > setting-in-code > fallback`. The log subsystem owns the env tier,
+/// from its one startup snapshot of `IPE_LOG_LEVEL`, so this reads no env.
 // The vendored emit compiles `log.rs`, its reader, without the `log` feature.
 #[cfg_attr(not(feature = "log"), allow(dead_code))]
 pub(crate) fn resolve_log_level_override() -> Option<i64> {
-    // Env wins: when `IPE_LOG_LEVEL` is set (even to empty), the setting is not
-    // consulted — the caller reads the env value directly.
-    let env_present = crate::system::read_env_var("IPE_LOG_LEVEL").is_ok();
-    log_level_from(env_present, INSTALLED.get().and_then(|c| c.log_level))
+    installed_log_level(INSTALLED.get())
 }
 
-/// Pure middle-tier resolution for the log level: the installed setting applies
-/// only when no env override is present. Split out so the precedence is unit
-/// tested without touching the process-wide `INSTALLED` / real env.
-const fn log_level_from(env_present: bool, setting: Option<i64>) -> Option<i64> {
-    if env_present { None } else { setting }
+/// The `Log.level` tag of an installed config.
+#[cfg_attr(not(feature = "log"), allow(dead_code))]
+fn installed_log_level(cfg: Option<&ResolvedConfig>) -> Option<i64> {
+    cfg.and_then(|c| c.log_level)
 }
 
 /// Whether CSRF protection is enforced, applying the one precedence with a
@@ -828,23 +822,21 @@ mod tests {
         ));
     }
 
-    // ── Log level: env > setting > fallback ──────────────────────────────
+    // ── Log level: the setting tier reads no env ─────────────────────────
 
+    /// The setting tier ignores an `IPE_LOG_LEVEL` written after the log
+    /// subsystem's startup snapshot, so env presence has one source.
     #[test]
-    fn log_level_setting_applies_when_no_env() {
-        assert_eq!(log_level_from(false, Some(2)), Some(2));
-    }
-
-    #[test]
-    fn log_level_env_overrides_setting() {
-        // Env present → the setting is dropped so the caller reads env.
-        assert_eq!(log_level_from(true, Some(2)), None);
-    }
-
-    #[test]
-    fn log_level_absent_setting_falls_through() {
-        // No env, no setting → the caller's built-in fallback applies.
-        assert_eq!(log_level_from(false, None), None);
+    fn the_log_level_setting_tier_reads_no_env() {
+        let cfg = ResolvedConfig {
+            log_level: Some(2),
+            ..ResolvedConfig::default()
+        };
+        crate::system::locked_set_var("IPE_LOG_LEVEL", "error");
+        let tag = installed_log_level(Some(&cfg));
+        crate::system::locked_remove_var("IPE_LOG_LEVEL");
+        assert_eq!(tag, Some(2));
+        assert_eq!(installed_log_level(None), None);
     }
 
     // ── Host bind: an IP address or a startup refusal ─────────────────────

@@ -819,8 +819,9 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "unset (info)",
         purpose: "Minimum log level: `debug`, `info`, `warn` (or `warning`), or \
                   `error`, ASCII case-insensitive. Any other value, an empty or \
-                  padded one included, refuses startup. Takes precedence over an \
-                  installed `Log.level` setting.",
+                  padded one included, refuses startup. Read once at process start, \
+                  so a later `System.setenv` or `System.loadEnv` does not change it. \
+                  Takes precedence over an installed `Log.level` setting.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },

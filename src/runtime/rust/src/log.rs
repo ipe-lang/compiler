@@ -99,20 +99,28 @@ pub(crate) fn startup_check() -> Result<(), crate::system::EnvValueRefusal> {
 /// malformed `IPE_LOG_LEVEL` is refused by [`startup_check`]; an entry that runs
 /// no such check logs at info.
 fn log_threshold() -> i32 {
-    if let Some(tag) = crate::app_config::resolve_log_level_override() {
-        return match tag {
+    threshold_under(
+        env_threshold(),
+        crate::app_config::resolve_log_level_override(),
+    )
+}
+
+/// The precedence over the one `IPE_LOG_LEVEL` snapshot and the installed
+/// `Log.level` tag. A present `IPE_LOG_LEVEL`, malformed included, shadows the
+/// setting; a variable set after startup (`System.setenv`, `System.loadEnv`) is
+/// not in the snapshot and changes neither tier.
+fn threshold_under(env: &EnvThreshold, setting: Option<i64>) -> i32 {
+    match env {
+        Ok(Some(threshold)) => threshold.severity(),
+        Ok(None) => setting.map_or(LOG_LEVEL_INFO, |tag| match tag {
             t if t <= i64::from(LOG_LEVEL_DEBUG) => LOG_LEVEL_DEBUG,
             1 => LOG_LEVEL_INFO,
             2 => LOG_LEVEL_WARN,
             _ => LOG_LEVEL_ERROR,
-        };
+        }),
+        // Refused by `startup_check`; an entry without it logs at info.
+        Err(_) => LOG_LEVEL_INFO,
     }
-    env_threshold()
-        .as_ref()
-        .ok()
-        .copied()
-        .flatten()
-        .map_or(LOG_LEVEL_INFO, LogThreshold::severity)
 }
 
 fn log_json() -> bool {
@@ -334,7 +342,10 @@ pub fn log_warn_with<E: Send + 'static, A: IpeInterpolate>(
 
 #[cfg(test)]
 mod threshold_tests {
-    use super::{LogThreshold, threshold_from};
+    use super::{
+        LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LogThreshold,
+        threshold_from, threshold_under,
+    };
 
     fn parse(raw: &str) -> super::EnvThreshold {
         threshold_from(Ok(raw.to_owned()))
@@ -369,5 +380,21 @@ mod threshold_tests {
                 "{raw:?} must be refused naming IPE_LOG_LEVEL, got {outcome:?}"
             );
         }
+    }
+
+    /// The setting applies only when the startup snapshot holds no
+    /// `IPE_LOG_LEVEL`; a present one, malformed included, shadows it.
+    #[test]
+    fn the_snapshot_alone_decides_whether_the_setting_applies() {
+        let unset = Ok(None);
+        assert_eq!(threshold_under(&unset, Some(0)), LOG_LEVEL_DEBUG);
+        assert_eq!(threshold_under(&unset, Some(-7)), LOG_LEVEL_DEBUG);
+        assert_eq!(threshold_under(&unset, Some(1)), LOG_LEVEL_INFO);
+        assert_eq!(threshold_under(&unset, Some(2)), LOG_LEVEL_WARN);
+        assert_eq!(threshold_under(&unset, Some(9)), LOG_LEVEL_ERROR);
+        assert_eq!(threshold_under(&unset, None), LOG_LEVEL_INFO);
+        let error = Ok(Some(LogThreshold::Error));
+        assert_eq!(threshold_under(&error, Some(0)), LOG_LEVEL_ERROR);
+        assert_eq!(threshold_under(&parse("verbose"), Some(0)), LOG_LEVEL_INFO);
     }
 }
