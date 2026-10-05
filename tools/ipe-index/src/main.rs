@@ -3,6 +3,8 @@ mod diff;
 #[cfg(test)]
 mod display_hazard_vectors;
 mod extract;
+#[cfg(test)]
+mod extractor_digest;
 mod model;
 mod pipeline;
 mod query;
@@ -365,6 +367,8 @@ fn head_sha_or_empty(root: &str) -> String {
 enum FullReason {
     /// The rows are of another schema version, so their hashes are of another format.
     SchemaVersion,
+    /// The index was written by another ipe-index build, whose units may differ.
+    Extractor,
     /// The index was built under another root set, so some path has another owner.
     RepoSet,
     /// Some indexed path carries no [`store::FileStamp`] to judge it by.
@@ -402,10 +406,13 @@ enum UpdatePlan<'a> {
 }
 
 /// The reason an index cannot be judged file by file before its stamps are
-/// read, or `None` when its format and root set are this run's.
+/// read, or `None` when its format, extractor and root set are this run's.
 fn full_reason(store: &store::Store, repos: &repo_set::RepoSet) -> Result<Option<FullReason>> {
     if !store.schema_is_current()? {
         return Ok(Some(FullReason::SchemaVersion));
+    }
+    if !store.extractor_is_current()? {
+        return Ok(Some(FullReason::Extractor));
     }
     if store.recorded_repos()? != repos.recorded() {
         return Ok(Some(FullReason::RepoSet));
@@ -556,6 +563,7 @@ impl FullReason {
     const fn why(self) -> &'static str {
         match self {
             Self::SchemaVersion => "the index is of another schema version",
+            Self::Extractor => "the index was written by another ipe-index build",
             Self::RepoSet => "the index was built under another root set",
             Self::NoStamps => "an indexed path has no content stamp",
         }
@@ -634,6 +642,31 @@ mod tests {
             full_reason(&s, &set).unwrap(),
             Some(FullReason::SchemaVersion)
         );
+    }
+
+    // Rows another extractor wrote are kept for every unchanged file by an
+    // incremental update, so a recorded extractor other than this build's
+    // rebuilds.
+    #[test]
+    fn update_after_an_extractor_change_takes_full_index() {
+        let s = store::Store::open(":memory:").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
+        s.set_meta("extractor", "blake3:another-build").unwrap();
+        assert_eq!(full_reason(&s, &set).unwrap(), Some(FullReason::Extractor));
+    }
+
+    // An index that records no extractor names no build that wrote it, so it
+    // rebuilds too.
+    #[test]
+    fn an_index_without_an_extractor_stamp_takes_full_index() {
+        let s = store::Store::open(":memory:").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
+        s.conn
+            .execute("DELETE FROM meta WHERE k='extractor'", [])
+            .unwrap();
+        assert_eq!(full_reason(&s, &set).unwrap(), Some(FullReason::Extractor));
     }
 
     fn refusal(spec: &str) -> String {

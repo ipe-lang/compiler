@@ -155,7 +155,8 @@ ipe-index index      # full rebuild: re-extracts every tracked file
 ipe-index update     # incremental: walk the same files `index` walks,
                      #   re-extract only those whose content stamp changed.
                      #   Falls back to a full index when the DB is absent, of
-                     #   another schema or root set, or holds a path with no stamp.
+                     #   another schema or root set, holds a path with no stamp,
+                     #   or was written by another ipe-index build.
 ```
 
 A full rebuild re-extracts the whole repo, so it takes tens of seconds on this

@@ -148,6 +148,14 @@ const OPEN_UNITS_VIEW: &str = "CREATE VIEW open_units AS
 /// `index` rebuilds it.
 const SCHEMA_VERSION: &str = "10";
 
+/// The `blake3:` digest of this build's extractor sources, taken by `build.rs`.
+///
+/// An index records the one that wrote its rows under the meta key
+/// `extractor`, stamped exactly where `schema_version` is, and `update`
+/// rebuilds an index another build wrote. `src/extractor_digest.rs` names
+/// what it covers.
+const EXTRACTOR: &str = env!("IPE_INDEX_EXTRACTOR");
+
 /// Stable unit id: blake3 of `path|kind|qualified`. Content-stable across
 /// re-indexes; a rename of the symbol or path changes the id by design.
 pub fn unit_uid(path: &str, kind: Kind, qualified: &str) -> String {
@@ -570,7 +578,8 @@ impl Store {
         )?;
         self.conn.execute_batch(TABLE_SCHEMA)?;
         ensure_open_units_view(&self.conn)?;
-        self.set_meta("schema_version", SCHEMA_VERSION)
+        self.set_meta("schema_version", SCHEMA_VERSION)?;
+        self.set_meta("extractor", EXTRACTOR)
     }
 }
 
@@ -597,18 +606,22 @@ fn ensure_open_units_view(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Stamps `SCHEMA_VERSION` on a DB that holds no units and no version yet.
-/// A DB already holding rows keeps whatever version it records (or none):
-/// restamping would claim its stored hashes are in the current format.
+/// Stamps `SCHEMA_VERSION` and `EXTRACTOR` on a DB that holds no units.
+///
+/// Each key is written only where it is absent. A DB already holding rows
+/// keeps whatever it records (or nothing): restamping would claim its rows
+/// are in the current format and were written by this build.
 fn ensure_schema_version(conn: &Connection) -> Result<()> {
-    if read_schema_version(conn)?.is_none() {
-        let units: i64 = conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))?;
-        if units == 0 {
-            conn.execute(
-                "INSERT INTO meta VALUES ('schema_version', ?)",
-                [SCHEMA_VERSION],
-            )?;
-        }
+    let units: i64 = conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))?;
+    if units == 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)",
+            [SCHEMA_VERSION],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta VALUES ('extractor', ?)",
+            [EXTRACTOR],
+        )?;
     }
     Ok(())
 }
@@ -627,6 +640,14 @@ impl Store {
     /// of another version: their stored hashes would never be re-made.
     pub fn schema_is_current(&self) -> Result<bool> {
         Ok(read_schema_version(&self.conn)?.as_deref() == Some(SCHEMA_VERSION))
+    }
+
+    /// True when this build wrote the DB's rows.
+    ///
+    /// An incremental `update` keeps every unchanged file's rows, so it must
+    /// not run over rows another extractor produced.
+    pub fn extractor_is_current(&self) -> Result<bool> {
+        Ok(self.get_meta("extractor")?.as_deref() == Some(EXTRACTOR))
     }
 }
 
@@ -856,6 +877,24 @@ mod tests {
         ensure_schema_version(&s.conn).unwrap();
         assert_eq!(s.get_meta("schema_version").unwrap(), None);
         assert!(!s.schema_is_current().unwrap());
+    }
+
+    // A DB holding rows and no extractor stamp is never stamped on open: no
+    // record says which build wrote its rows.
+    #[test]
+    fn open_stamps_no_extractor_on_a_populated_db() {
+        let s = Store::open(":memory:").unwrap();
+        assert!(s.extractor_is_current().unwrap());
+        s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
+            .unwrap();
+        s.conn
+            .execute("DELETE FROM meta WHERE k='extractor'", [])
+            .unwrap();
+        ensure_schema_version(&s.conn).unwrap();
+        assert_eq!(s.get_meta("extractor").unwrap(), None);
+        assert!(!s.extractor_is_current().unwrap());
+        s.reset_index().unwrap();
+        assert_eq!(s.get_meta("extractor").unwrap().as_deref(), Some(EXTRACTOR));
     }
 
     #[test]
