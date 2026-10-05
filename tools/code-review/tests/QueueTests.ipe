@@ -819,6 +819,15 @@ unitPageStatesDistinct =
             )
 
 
+-- The byte-ceiling status text rounds a partial KiB up: one byte past the
+-- ceiling reads as the next whole KiB. Red if the size is floored.
+byteCeilingTextRoundsUp : Bool
+byteCeilingTextRoundsUp =
+    maybeContains
+        "257 KiB"
+        (Queue.sourceStatusText (TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })))
+
+
 isNotFound : Queue.UnitPageState -> Bool
 isNotFound state =
     case state of
@@ -1957,6 +1966,7 @@ checks =
             , check "a refill drains only pairs read from the review table" refillDrainsOnlyReviewPairs
             , check "re-queued change survives the drain" drainKeepsRequeuedChange
             , check "unit page states are distinct" unitPageStatesDistinct
+            , Task.succeed ( "a byte past the ceiling reads as the next whole KiB", byteCeilingTextRoundsUp )
             , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
             , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen
             , check "db size positive, missing index db fails the queue" dbSizeAndMissingDb

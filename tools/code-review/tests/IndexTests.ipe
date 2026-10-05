@@ -23,7 +23,7 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -327,17 +327,56 @@ oversizeRanksBeforeDrift =
         |> Task.map (\tag -> String.startsWith "too large bytes " tag)
 
 
--- The span pre-check cannot overflow on hostile stored integers: `1..MAX` is
--- too large with its exact line count, and `-MAX..MAX` is an invalid range
--- that skips the pre-check and is refused by the range check. Red if the
--- validity guard is dropped (the subtraction overflows) or the pre-check
--- judges an invalid range.
+-- The span pre-check is guarded on hostile stored integers. Ipê `Int`
+-- subtraction wraps, so the guard is proven by ranges the wrapped difference
+-- would misjudge: `1..MAX` is too large with its exact line count, `-MAX..MAX`
+-- is an invalid range refused by the range check, a start below 1 is not
+-- judged (unguarded it reads as an oversize span), and a start past the end
+-- is not judged (unguarded its difference wraps to a huge span). Red if the
+-- validity guard is dropped or the pre-check judges an invalid range.
 spanPreCheckNoOverflow : Task.Task Error Bool
 spanPreCheckNoOverflow =
     do
         huge <- oversizeTag False fixtureLibRs 1 9223372036854775807 (Index.attest viewA)
         invalid <- oversizeTag False fixtureLibRs (0 - 9223372036854775807) 9223372036854775807 (Index.attest viewA)
-        Task.succeed (huge == "too large lines 9223372036854775807" && invalid == "range 10")
+        Task.succeed
+            (huge
+                == "too large lines 9223372036854775807"
+                && invalid
+                == "range 10"
+                && notJudged 0 Index.viewLineCeiling
+                && notJudged 2 (0 - 9223372036854775807)
+            )
+
+
+-- Whether the span pre-check leaves `start..end` for the range check.
+notJudged : Int -> Int -> Bool
+notJudged start end =
+    case Index.spanOversize start end of
+        Nothing ->
+            True
+
+        Just _ ->
+            False
+
+
+-- `classifyView` itself refuses a span past the line ceiling, not only the
+-- pre-check before the read does. Red if its own span check is dropped.
+classifyRefusesPastLineCeiling : Bool
+classifyRefusesPastLineCeiling =
+    let
+        past =
+            Index.viewLineCeiling + 1
+
+        text =
+            xLines past
+    in
+    case Index.classifyView (uid "u-a") (Index.attest text) 1 past text of
+        TooLarge (SpanLines o) ->
+            o.lines == past
+
+        _ ->
+            False
 
 
 -- Both ceilings are positive, and the byte ceiling is within the read
@@ -823,6 +862,7 @@ checks =
         , check "each view ceiling binds where the other does not" byteCeilingVsLineCeiling
         , check "an oversized view is too large, never drifted" oversizeRanksBeforeDrift
         , check "the span pre-check cannot overflow on hostile line numbers" spanPreCheckNoOverflow
+        , Task.succeed ( "classifying a span past the line ceiling withholds it", classifyRefusesPastLineCeiling )
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
         ]
