@@ -10,8 +10,10 @@
 //! includes, and refuses when a value names such a path or cannot be proven
 //! not to.
 //!
-//! The scan fails closed. Every value is split into words, under every setting
-//! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
+//! The scan fails closed. Every setting is judged as the one key table in
+//! [`vcs_keys`](crate::vcs_keys) says its tool consumes the value, and every
+//! value is split into words but where the table decides it never names code.
+//! A path-shaped word is
 //! resolved against the configuration file's directory and the working tree,
 //! `~` through the injected [`Home`]; an option's argument is judged as a word
 //! of its own and the option word whole besides; a program name passes, as the
@@ -44,6 +46,7 @@ use ipe_fs_open::{
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
+use crate::vcs_keys::{self, Compose, Consume, Include, Load};
 use crate::vcs_metadata::VcsKind;
 
 /// The longest path-shaped word or link target, in bytes, the resolver takes.
@@ -239,200 +242,6 @@ impl ConfigRoots<'_> {
             Self::Darcs { .. } => VcsKind::Darcs,
         }
     }
-}
-
-/// Which subsections a [`NonCode`] pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubsectionMatch {
-    /// Only a key with no subsection.
-    Absent,
-    /// Only a key under some subsection.
-    Present,
-    /// A key with or without a subsection.
-    Either,
-}
-
-/// Which keys a [`NonCode`] pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyMatch {
-    /// Every key.
-    Any,
-    /// The one key, compared in the tool's own case.
-    Named(&'static str),
-    /// Every key whose part after its last `:` is this sub-option (Mercurial's `name:option`).
-    Suboption(&'static str),
-}
-
-/// A setting whose value never names code a tool runs, so it is not scanned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonCode {
-    /// The tool the setting belongs to.
-    pub kind: VcsKind,
-    /// The section; for Jujutsu, the top-level table.
-    pub section: &'static str,
-    /// The subsections matched.
-    pub subsection: SubsectionMatch,
-    /// The keys matched.
-    pub key: KeyMatch,
-}
-
-impl NonCode {
-    /// A pattern over `kind`'s `section`.
-    const fn new(
-        kind: VcsKind,
-        section: &'static str,
-        subsection: SubsectionMatch,
-        key: KeyMatch,
-    ) -> Self {
-        Self {
-            kind,
-            section,
-            subsection,
-            key,
-        }
-    }
-
-    /// Whether this pattern matches the setting.
-    fn matches(&self, kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
-        let (section, subsection, key) = setting;
-        let subsection_ok = match self.subsection {
-            SubsectionMatch::Absent => subsection.is_none(),
-            SubsectionMatch::Present => subsection.is_some(),
-            SubsectionMatch::Either => true,
-        };
-        let key_ok = match self.key {
-            KeyMatch::Any => true,
-            KeyMatch::Named(name) => name == key,
-            KeyMatch::Suboption(name) => key.rsplit_once(':').is_some_and(|(_, sub)| sub == name),
-        };
-        self.kind == kind && self.section == section && subsection_ok && key_ok
-    }
-}
-
-/// Every setting exempt from the scan, the one list of them.
-///
-/// Git keys are lowercase, as Git compares them. Git's refspecs
-/// (`remote.*.fetch`, `remote.*.push`) are listed because every clone writes
-/// one shaped like a path, and a refspec names refs, never a file. A remote or
-/// submodule URL is never exempt: it is admitted only when it is a network URL
-/// or names a defined remote, and judged as a path otherwise.
-pub const NON_CODE: &[NonCode] = &[
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("worktree"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("excludesfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("attributesfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "commit",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("template"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "blame",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("ignorerevsfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "branch",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(VcsKind::Git, "user", SubsectionMatch::Either, KeyMatch::Any),
-    NonCode::new(
-        VcsKind::Git,
-        "remote",
-        SubsectionMatch::Present,
-        KeyMatch::Named("fetch"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "remote",
-        SubsectionMatch::Present,
-        KeyMatch::Named("push"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "url",
-        SubsectionMatch::Present,
-        KeyMatch::Named("insteadof"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "url",
-        SubsectionMatch::Present,
-        KeyMatch::Named("pushinsteadof"),
-    ),
-    NonCode::new(
-        VcsKind::Mercurial,
-        "paths",
-        SubsectionMatch::Absent,
-        KeyMatch::Suboption("pushrev"),
-    ),
-    NonCode::new(
-        VcsKind::Mercurial,
-        "ui",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("username"),
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "revset-aliases",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "templates",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "template-aliases",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "colors",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "user",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "--when",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-];
-
-/// Whether [`NON_CODE`] exempts the setting.
-fn exempt(kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
-    NON_CODE
-        .iter()
-        .any(|pattern| pattern.matches(kind, setting))
 }
 
 /// The setting a refused value came from.
@@ -2297,7 +2106,7 @@ impl Scan<'_> {
                     self.note_remote(ctx, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
-                Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
+                Syntax::Hg => hg_route(&entry.setting, &entry.value),
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words(Runner::None)),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
@@ -2608,7 +2417,7 @@ impl Scan<'_> {
             match node {
                 TomlNode::Table(table) => {
                     for (key, value) in table {
-                        if top && exempt(VcsKind::Jujutsu, (key.as_str(), None, "")) {
+                        if top && vcs_keys::jj_exempt(key.as_str()) {
                             continue;
                         }
                         let index = labels.len();
@@ -3422,52 +3231,48 @@ fn git_route(setting: &Setting, value: &str) -> Route {
     else {
         return Route::Judge(Role::Words(Runner::None));
     };
-    let key = key.to_ascii_lowercase();
-    let subsection = subsection.as_deref();
-    let shape = (&**section, subsection.is_some(), key.as_str());
-    if shape == ("include", false, "path") {
-        return Route::Judge(Role::Include(Reading::Always));
+    let consume = vcs_keys::git(section, subsection.as_deref(), key).unwrap_or(Consume::Inert);
+    route_of(consume, value)
+}
+
+/// What becomes of `value`, which its tool consumes as `consume`.
+fn route_of(consume: Consume, value: &str) -> Route {
+    let words = |runner: Runner| Route::Judge(Role::Words(runner));
+    let forced = |path: &str| Route::Judge(Role::Forced(path.to_owned()));
+    match consume {
+        Consume::Exempt => Route::Judge(Role::Exempt),
+        Consume::Inert => words(Runner::None),
+        Consume::Bang => words(Runner::Bang),
+        Consume::Exec => words(Runner::Exec),
+        Consume::Composed(Compose::Alias) => words(Runner::GitAlias),
+        Consume::Composed(Compose::CredentialHelper) => words(Runner::GitHelper),
+        Consume::Composed(Compose::RemoteHelper) => words(Runner::GitRemote),
+        Consume::Load(Load::Include(Include::Always)) => {
+            Route::Judge(Role::Include(Reading::Always))
+        }
+        Consume::Load(Load::Include(Include::Conditional)) => {
+            Route::Judge(Role::Include(Reading::Conditional))
+        }
+        Consume::Load(Load::HooksPath) => Route::Judge(Role::HooksPath),
+        Consume::Load(Load::Forced) => forced(value),
+        Consume::Load(Load::ForcedUnlessBool) => {
+            if is_git_bool(value) {
+                words(Runner::None)
+            } else {
+                forced(value)
+            }
+        }
+        // A leading `!` disables the extension; the path after it is still judged.
+        Consume::Load(Load::ForcedUnbanged) => forced(value.strip_prefix('!').unwrap_or(value)),
+        Consume::Url { scp } => Route::Judge(Role::Url { scp }),
+        Consume::UrlList => Route::Judge(Role::UrlList),
+        Consume::RemoteName => Route::RemoteName,
+        // Mercurial calls `python:<file>:<fn>` as a Python callable it imports from the file.
+        Consume::PythonHook => value
+            .strip_prefix("python:")
+            .and_then(|rest| rest.rsplit_once(':'))
+            .map_or_else(|| words(Runner::Python), |(path, _)| forced(path)),
     }
-    if shape == ("includeif", true, "path") {
-        return Route::Judge(Role::Include(Reading::Conditional));
-    }
-    if shape == ("core", false, "hookspath") {
-        return Route::Judge(Role::HooksPath);
-    }
-    let forced = shape == ("init", false, "templatedir")
-        || (shape == ("core", false, "fsmonitor") && !is_git_bool(value));
-    if forced {
-        return Route::Judge(Role::Forced(value.to_owned()));
-    }
-    if matches!(
-        shape,
-        ("remote", true, "url" | "pushurl") | ("submodule", true, "url")
-    ) {
-        return Route::Judge(Role::Url { scp: true });
-    }
-    if matches!(
-        shape,
-        ("branch", true, "remote" | "pushremote") | ("remote", false, "pushdefault")
-    ) {
-        return Route::RemoteName;
-    }
-    if exempt(VcsKind::Git, (&**section, subsection, key.as_str())) {
-        return Route::Judge(Role::Exempt);
-    }
-    let runner = match shape {
-        // The subsection form (`[alias "x"] command`) is judged the same way:
-        // an alias Git does not read runs nothing, one it reads runs so.
-        ("alias", _, _) => Runner::GitAlias,
-        ("credential", _, "helper") => Runner::GitHelper,
-        ("submodule", true, "update") => Runner::Bang,
-        ("gpg", _, "program" | "defaultkeycommand")
-        | ("core", false, "askpass" | "gitproxy")
-        | ("difftool" | "mergetool" | "browser" | "man", true, "path")
-        | ("sendemail", _, "smtpserver") => Runner::Exec,
-        ("remote", true, "vcs") => Runner::GitRemote,
-        _ => Runner::None,
-    };
-    Route::Judge(Role::Words(runner))
 }
 
 /// Whether `setting` of a file in `syntax` gives a Git remote a URL: `remote.<name>.url` or `pushurl`, or a line of a `remotes/` or `branches/` file.
@@ -3519,44 +3324,15 @@ fn holds_nul(entry: &Entry) -> bool {
     name_holds || entry.value.contains('\0')
 }
 
-/// How Mercurial treats a value of `setting`.
-fn hg_role(setting: &Setting, value: &str) -> Role {
-    let (section, key) = match setting {
-        Setting::Key { section, key, .. } => (section, key),
-        Setting::Include => return Role::Include(Reading::Always),
-        Setting::Line(_) => return Role::Words(Runner::None),
-    };
-    if &**section == "extensions" {
-        // A leading `!` disables the extension; the path after it is still judged.
-        return Role::Forced(value.strip_prefix('!').unwrap_or(value).to_owned());
+/// What Mercurial does with a value of `setting`.
+fn hg_route(setting: &Setting, value: &str) -> Route {
+    match setting {
+        Setting::Key { section, key, .. } => {
+            route_of(vcs_keys::hg(section, key).unwrap_or(Consume::Inert), value)
+        }
+        Setting::Include => Route::Judge(Role::Include(Reading::Always)),
+        Setting::Line(_) => Route::Judge(Role::Words(Runner::None)),
     }
-    if &**section == "hooks"
-        && let Some((path, _)) = value
-            .strip_prefix("python:")
-            .and_then(|rest| rest.rsplit_once(':'))
-    {
-        return Role::Forced(path.to_owned());
-    }
-    if &**section == "paths" && (!key.contains(':') || key.ends_with(":pushurl")) {
-        return Role::UrlList;
-    }
-    // A `[schemes]` template or a `[subpaths]` replacement is the URL the
-    // tool reads in place of one it was given, `.hgsub` sources included; a
-    // template is also a URL the scheme chain rewrites again.
-    if &**section == "schemes" || &**section == "subpaths" {
-        return Role::Url { scp: false };
-    }
-    if exempt(VcsKind::Mercurial, (&**section, None, key.as_str())) {
-        return Role::Exempt;
-    }
-    // Mercurial runs an `[alias]` after one `!` through the shell, and calls
-    // a `[hooks]` value after `python:` as a Python callable it imports.
-    let runner = match &**section {
-        "alias" => Runner::Bang,
-        "hooks" => Runner::Python,
-        _ => Runner::None,
-    };
-    Role::Words(runner)
 }
 
 /// A character stream with Git's line handling: `\r\n` reads as `\n`, the end reads as `\n`.
@@ -5841,6 +5617,22 @@ mod tests {
         git_config(&f, "[branch.main \"x\"]\n\tremote = evil\n");
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn dotted_header_reaches_its_row() {
+        // `[remote.o "x"]` names `remote.o.x.vcs`: the remote helper row, which
+        // composes `git-remote-~/x`, a path relative to the working tree; read
+        // as a shell word, `~/x` would name the home outside every grant.
+        let f = fixture("dottedrow");
+        git_config(&f, "[remote.o \"x\"]\n\tvcs = ~/x\n");
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        git_config(&f, "[remote.o \"x\"]\n\tvcs = hg\n");
+        assert_eq!(scan_git(&f), Ok(()));
     }
 
     #[test]
