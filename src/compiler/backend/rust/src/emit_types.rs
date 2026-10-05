@@ -1530,8 +1530,7 @@ mod show_pin_agreement {
     /// One sample type per shown leaf the backend renders without a program.
     fn leaf_samples() -> Vec<IrType> {
         let unit = || Box::new(IrType::Unit);
-        let ui = |ctor| IrType::Ui { ctor, msg: unit() };
-        vec![
+        let mut samples = vec![
             IrType::Int,
             IrType::SessionHandle,
             IrType::Float,
@@ -1554,32 +1553,6 @@ mod show_pin_agreement {
             IrType::HttpRequest,
             IrType::WebSocketServer,
             IrType::WebSocketServerCfg,
-            ui(UiCtor::Html),
-            ui(UiCtor::Element),
-            ui(UiCtor::Cells),
-            ui(UiCtor::UiAttribute),
-            ui(UiCtor::TuiAttribute),
-            ui(UiCtor::CliLines),
-            ui(UiCtor::CliAttribute),
-            ui(UiCtor::HtmlAttribute),
-            ui(UiCtor::HtmlEvent),
-            ui(UiCtor::Label),
-            ui(UiCtor::Placeholder),
-            ui(UiCtor::RadioOption),
-            IrType::UiPlain(UiPlain::Length),
-            IrType::UiPlain(UiPlain::Color),
-            IrType::UiPlain(UiPlain::HAlign),
-            IrType::UiPlain(UiPlain::VAlign),
-            IrType::UiPlain(UiPlain::Location),
-            IrType::UiPlain(UiPlain::PseudoClass),
-            IrType::UiPlain(UiPlain::Description),
-            IrType::UiPlain(UiPlain::LayoutContext),
-            IrType::UiPlain(UiPlain::ColorError),
-            IrType::UiPlain(UiPlain::TermProfile),
-            IrType::UiPlain(UiPlain::AnsiColor),
-            IrType::UiPlain(UiPlain::WcagLevel),
-            IrType::UiPlain(UiPlain::TextSize),
-            IrType::UiPlain(UiPlain::Deficiency),
             IrType::WebReq,
             IrType::WebRoute(unit()),
             IrType::CustomElement {
@@ -1632,6 +1605,44 @@ mod show_pin_agreement {
             IrType::TuiApp,
             IrType::CliApp,
             IrType::WorkerApp,
+        ];
+        samples.extend(ui_leaf_samples());
+        samples
+    }
+
+    /// The shown `Ui` and `UiPlain` leaves.
+    fn ui_leaf_samples() -> Vec<IrType> {
+        let ui = |ctor| IrType::Ui {
+            ctor,
+            msg: Box::new(IrType::Unit),
+        };
+        vec![
+            ui(UiCtor::Html),
+            ui(UiCtor::Element),
+            ui(UiCtor::Cells),
+            ui(UiCtor::UiAttribute),
+            ui(UiCtor::TuiAttribute),
+            ui(UiCtor::CliLines),
+            ui(UiCtor::CliAttribute),
+            ui(UiCtor::HtmlAttribute),
+            ui(UiCtor::HtmlEvent),
+            ui(UiCtor::Label),
+            ui(UiCtor::Placeholder),
+            ui(UiCtor::RadioOption),
+            IrType::UiPlain(UiPlain::Length),
+            IrType::UiPlain(UiPlain::Color),
+            IrType::UiPlain(UiPlain::HAlign),
+            IrType::UiPlain(UiPlain::VAlign),
+            IrType::UiPlain(UiPlain::Location),
+            IrType::UiPlain(UiPlain::PseudoClass),
+            IrType::UiPlain(UiPlain::Description),
+            IrType::UiPlain(UiPlain::LayoutContext),
+            IrType::UiPlain(UiPlain::ColorError),
+            IrType::UiPlain(UiPlain::TermProfile),
+            IrType::UiPlain(UiPlain::AnsiColor),
+            IrType::UiPlain(UiPlain::WcagLevel),
+            IrType::UiPlain(UiPlain::TextSize),
+            IrType::UiPlain(UiPlain::Deficiency),
         ]
     }
 
