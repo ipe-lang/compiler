@@ -563,12 +563,19 @@ impl DebugScan<'_> {
         }
     }
 
+    /// Check a byte-string literal; one char per byte keeps every ASCII needle
+    /// matchable whatever the bytes are, with nothing replaced.
+    fn bytes(&mut self, bytes: &[u8]) {
+        let text: String = bytes.iter().copied().map(char::from).collect();
+        self.text(&text);
+    }
+
     /// Check one unparsed literal token by its decoded value.
     fn literal(&mut self, token: Literal) {
         let source = token.to_string();
         match Lit::new(token) {
             Lit::Str(lit) => self.text(&lit.value()),
-            Lit::ByteStr(lit) => self.text(&String::from_utf8_lossy(&lit.value())),
+            Lit::ByteStr(lit) => self.bytes(&lit.value()),
             Lit::CStr(lit) => self.text(&lit.value().to_string_lossy()),
             // `Lit` is `#[non_exhaustive]`; a number, `char`, byte or bool
             // literal holds no format text, and its source is still read.
@@ -703,7 +710,7 @@ impl<'ast> Visit<'ast> for DebugScan<'_> {
     }
 
     fn visit_lit_byte_str(&mut self, node: &'ast LitByteStr) {
-        self.text(&String::from_utf8_lossy(&node.value()));
+        self.bytes(&node.value());
     }
 
     fn visit_lit_cstr(&mut self, node: &'ast LitCStr) {
