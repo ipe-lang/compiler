@@ -115,14 +115,7 @@ fn wildcard_only_case_over_transitive_union_is_t0018() {
         ("B", B_SRC, &["C"]),
         ("A", a_src, &["B"]),
     ];
-    let solved = solve_direct(&modules);
-    assert!(
-        solved.is_some(),
-        "the three-module fixture must canonicalise"
-    );
-    let Some(solved) = solved else {
-        return;
-    };
+    let solved = solve_direct(&modules).expect("the three-module fixture must canonicalise");
     assert!(
         is_t0018(solved.get(2)),
         "a `_`-only case over `C.T` reached through `B` must be refused: {:?}",
@@ -143,14 +136,7 @@ fn explicit_arms_over_transitive_union_are_accepted() {
         ("B", B_SRC, &["C"]),
         ("A", a_src, &["B", "C"]),
     ];
-    let solved = solve_direct(&modules);
-    assert!(
-        solved.is_some(),
-        "the three-module fixture must canonicalise"
-    );
-    let Some(solved) = solved else {
-        return;
-    };
+    let solved = solve_direct(&modules).expect("the three-module fixture must canonicalise");
     assert!(
         matches!(solved.get(2).map(|s| &s.result), Some(Ok(()))),
         "explicit `X` / `Y` arms over `C.T` must be accepted: {:?}",
@@ -178,14 +164,7 @@ fn diamond_closure_terminates_and_holds_each_union_once() {
         ("E", e_src, &["B", "D"]),
         ("A", a_src, &["E"]),
     ];
-    let solved = solve_direct(&modules);
-    assert!(
-        solved.is_some(),
-        "the five-module fixture must canonicalise"
-    );
-    let Some(solved) = solved else {
-        return;
-    };
+    let solved = solve_direct(&modules).expect("the five-module fixture must canonicalise");
     let e = solved.get(3);
     assert!(e.is_some_and(|s| s.closed), "`E` must close its interface");
     assert_eq!(
