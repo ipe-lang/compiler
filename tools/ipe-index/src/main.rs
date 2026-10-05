@@ -980,7 +980,7 @@ mod tests {
 
     /// The review-visible rows of the index at `db`: every open unit (queue
     /// columns aside, which differ between a first index and an update by
-    /// design) and every file with its stamp.
+    /// design), every file with its stamp, and every edge with its resolution.
     #[cfg(unix)]
     fn index_dump(db: &str) -> Vec<String> {
         let s = store::Store::open(db).unwrap();
@@ -992,6 +992,8 @@ mod tests {
              || COALESCE(body_hash, '') || '|' || COALESCE(lang, '') \
              FROM open_units ORDER BY uid",
             "SELECT 'file|' || path || '|' || COALESCE(sha, '') FROM files ORDER BY path",
+            "SELECT 'edge|' || src || '|' || dst || '|' || kind || '|' \
+             || COALESCE(resolved, '') FROM edges ORDER BY 1",
         ] {
             let mut st = s.conn.prepare(sql).unwrap();
             let got: Vec<String> = st
@@ -1041,7 +1043,7 @@ mod tests {
         const A: &str = "fn a() -> u8 {\n    1\n}\n";
         const A_EDIT: &str = "fn a() -> u8 {\n    2\n}\n\nfn a2() {}\n";
         type Change = fn(&walk::fixture::Fixture);
-        let rows: [(&str, Change, bool, bool); 5] = [
+        let rows: [(&str, Change, bool, bool); 7] = [
             (
                 "untracked file added",
                 |fx| fx.write("new.rs", "fn n() {}\n"),
@@ -1065,6 +1067,21 @@ mod tests {
                 |fx| fx.write("a.rs", A_EDIT),
                 true,
                 false,
+            ),
+            (
+                "untracked file newly ignored",
+                |fx| fx.write(".gitignore", "u.rs\n"),
+                true,
+                true,
+            ),
+            (
+                "tracked file replaced by a symlink on disk",
+                |fx| {
+                    std::fs::remove_file(fx.0.join("b.rs")).unwrap();
+                    std::os::unix::fs::symlink("a.rs", fx.0.join("b.rs")).unwrap();
+                },
+                true,
+                true,
             ),
             (
                 "edit then revert",
@@ -1103,6 +1120,41 @@ mod tests {
                 .all(|sha| sha == "kept");
             assert_eq!(kept, a_kept, "{row}: `ipe:a.rs` re-extracted");
         }
+    }
+
+    // An import resolution belongs to the current file set, not to the run
+    // that extracted the importing file: deleting the target of an unchanged
+    // file's import leaves that import unresolved, as a fresh `index` stores
+    // it, and restoring the target resolves it again.
+    #[cfg(unix)]
+    #[test]
+    fn update_reresolves_imports_of_unchanged_files() {
+        let fx = walk::fixture::Fixture::new("update-reresolve");
+        fx.write("src/a.rs", "use crate::b;\n\nfn a() {}\n");
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        let resolved = |db: &str| -> Vec<Option<String>> {
+            let s = store::Store::open(db).unwrap();
+            let mut st = s
+                .conn
+                .prepare("SELECT resolved FROM edges WHERE src='ipe:src/a.rs' AND kind='import'")
+                .unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let target = Some("ipe:src/b.rs".to_string());
+        assert_eq!(resolved(&db), [target.clone()]);
+        std::fs::remove_file(fx.0.join("src/b.rs")).unwrap();
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(resolved(&db), [None]);
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(resolved(&db), [target]);
     }
 
     // An indexed file that is now over the read ceiling, or no longer UTF-8,

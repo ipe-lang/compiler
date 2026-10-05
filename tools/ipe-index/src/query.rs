@@ -491,14 +491,20 @@ pub fn cmd_wakeup(db: &str) -> Result<()> {
     cmd_roles(db)
 }
 
-/// Resolution pass: for every import edge, try to resolve `dst` to a canonical
-/// file path within the repo. Updates `edges.resolved` in a single transaction.
-/// Bounded: loads tracked file paths into a HashSet (bounded by file count);
-/// buffers unresolved import edges into a Vec (bounded by import-edge count)
-/// to work around the borrow-checker's prohibition on simultaneous read and
-/// write `Connection` statements — the buffer is freed after all UPDATEs commit.
+/// Resolution pass: for every import edge, resolve `dst` to a canonical file
+/// path within the repo, or to none. Writes `edges.resolved` in a single
+/// transaction.
+///
+/// Every import edge is resolved again against the current `files`, not only
+/// the unresolved ones: an incremental `update` that deletes or adds a file
+/// can change what an unchanged file's import names, and the stored
+/// resolution must be the one a fresh `index` computes. Only edges whose
+/// resolution changed are written.
+/// Bounded: loads tracked file paths into a `HashSet` (bounded by file count);
+/// buffers the changed resolutions into a `Vec` (bounded by import-edge count)
+/// because rusqlite does not permit a prepared SELECT and an `execute()` on
+/// the same `Connection` at once.
 pub fn resolve_edges(s: &Store, repo: &str) -> Result<()> {
-    // Load all known file paths into a set for fast membership test.
     let mut known: HashSet<String> = HashSet::new();
     {
         let mut st = s.conn.prepare("SELECT path FROM files")?;
@@ -506,54 +512,47 @@ pub fn resolve_edges(s: &Store, repo: &str) -> Result<()> {
             known.insert(row?);
         }
     }
-    // Collect rows to update (buffered to avoid borrow-checker issue with conn:
-    // rusqlite does not permit a prepared SELECT and an execute() on the same
-    // Connection simultaneously; the buffer is bounded by import-edge count).
-    let to_update: Vec<(i64, String, String, String)> = {
-        let mut st = s.conn.prepare(
-            "SELECT rowid, src, dst, kind FROM edges WHERE kind='import' AND resolved IS NULL",
-        )?;
-
-        st.query_map([], |r| {
+    let to_update: Vec<(i64, Option<String>)> = {
+        let mut st = s
+            .conn
+            .prepare("SELECT rowid, src, dst, resolved FROM edges WHERE kind='import'")?;
+        let rows = st.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(3)?,
             ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    // Use unchecked_transaction only if not already inside a transaction.
-    // When called from cmd_index (inside BEGIN/COMMIT), we can write directly.
-    // SAFETY of `unchecked_transaction`: the SELECT result above is fully
-    // materialised into `to_update` BEFORE any write below, so no prepared
-    // statement is live on `conn` during the UPDATEs. Do NOT reorder to stream
-    // rows from a live statement into the writes — that would alias `conn`.
-    let is_autocommit = s.conn.is_autocommit();
-    if is_autocommit {
-        // Not in a transaction — wrap in one for efficiency.
-        let tx = s.conn.unchecked_transaction()?;
-        for (rowid, src, dst, _kind) in to_update {
-            if let Some(resolved) = resolve_import(&src, &dst, repo, &known) {
-                tx.execute(
-                    "UPDATE edges SET resolved=? WHERE rowid=?",
-                    rusqlite::params![resolved, rowid],
-                )?;
+        })?;
+        let mut changed = Vec::new();
+        for row in rows {
+            let (rowid, src, dst, stored) = row?;
+            let resolved = resolve_import(&src, &dst, repo, &known);
+            if resolved != stored {
+                changed.push((rowid, resolved));
             }
         }
+        changed
+    };
+    let write = |conn: &rusqlite::Connection| -> Result<()> {
+        for (rowid, resolved) in &to_update {
+            conn.execute(
+                "UPDATE edges SET resolved=? WHERE rowid=?",
+                rusqlite::params![resolved, rowid],
+            )?;
+        }
+        Ok(())
+    };
+    // Inside the caller's transaction (`index`/`update`) write directly;
+    // otherwise wrap the writes in one. The SELECT above is fully
+    // materialised into `to_update` before any write, so no prepared
+    // statement is live on `conn` during the UPDATEs.
+    if s.conn.is_autocommit() {
+        let tx = s.conn.unchecked_transaction()?;
+        write(&tx)?;
         tx.commit()?;
     } else {
-        // Already inside a transaction (e.g., cmd_index's BEGIN). Write directly.
-        for (rowid, src, dst, _kind) in to_update {
-            if let Some(resolved) = resolve_import(&src, &dst, repo, &known) {
-                s.conn.execute(
-                    "UPDATE edges SET resolved=? WHERE rowid=?",
-                    rusqlite::params![resolved, rowid],
-                )?;
-            }
-        }
+        write(&s.conn)?;
     }
     Ok(())
 }
@@ -664,9 +663,16 @@ fn resolve_rust_import(src: &str, dst: &str, known: &HashSet<String>) -> Option<
         return None;
     }
 
-    // Find the crate root (directory containing Cargo.toml, inferred as parent of `src/`).
-    let src_path = std::path::Path::new(src);
-    let crate_root = find_crate_root(src_path)?;
+    // Find the crate root (directory containing Cargo.toml, inferred as parent
+    // of `src/`) on the path below its repo tag, so a crate at the top of a
+    // tagged root (`ipe:src/a.rs`) is found as `src`, then tag it back.
+    let (tag, untagged) = crate::model::split_tag(src);
+    let crate_root = find_crate_root(std::path::Path::new(untagged))?;
+    let crate_root = if tag.is_empty() {
+        crate_root
+    } else {
+        format!("{tag}:{crate_root}")
+    };
 
     // Build candidate path segments by stripping `crate::` and splitting on `::`.
     let rel = if let Some(stripped) = dst.strip_prefix("crate::") {
@@ -1350,6 +1356,33 @@ fn is_ident_char(b: u8) -> bool {
 mod tests {
     use super::*;
     use crate::model::Lang;
+
+    // A `crate::` import resolves under the file's own crate root, found below
+    // the repo tag: a crate at the top of a tagged root is `<tag>:src`, and a
+    // nested crate keeps its directory.
+    #[test]
+    fn rust_import_resolves_under_a_tagged_crate_root() {
+        let known: HashSet<String> = ["ipe:src/b.rs", "ipe:tools/x/src/c.rs", "src/d.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            resolve_rust_import("ipe:src/a.rs", "crate::b", &known).as_deref(),
+            Some("ipe:src/b.rs")
+        );
+        assert_eq!(
+            resolve_rust_import("ipe:tools/x/src/a.rs", "crate::c", &known).as_deref(),
+            Some("ipe:tools/x/src/c.rs")
+        );
+        assert_eq!(
+            resolve_rust_import("src/a.rs", "crate::d", &known).as_deref(),
+            Some("src/d.rs")
+        );
+        assert_eq!(
+            resolve_rust_import("ipe:src/a.rs", "crate::d", &known),
+            None
+        );
+    }
 
     #[test]
     fn splice_path_preserves_tag_and_subtree() {
