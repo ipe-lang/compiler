@@ -943,7 +943,7 @@ fn within_cap(bytes: &[u8], cap: u64) -> bool {
     u64::try_from(bytes.len()).is_ok_and(|len| len <= cap)
 }
 
-/// Read `base/<parts...>` when each part is one plain name and no level is a symlink.
+/// Read `base/<parts...>` when each part is one spelled name and no level is a symlink.
 ///
 /// Every level below `base` is opened relative to the held level above it,
 /// never following a link, and the file is proven regular and read from that
@@ -975,7 +975,11 @@ fn read_in_marked(
     read_below(&dir, parts, cap)
 }
 
-/// Read `<parts...>` below the held `dir`, each part one plain name, no level a link, at most `cap` bytes.
+/// Read `<parts...>` below the held `dir`, at most `cap` bytes, no level a link.
+///
+/// Each part must pass [`ipe_fs_open::is_one_spelled_name`], the rule
+/// [`write_entry`] and [`CacheRoot::write`] apply, so a read never names an
+/// entry the cache could not have written.
 fn read_below(dir: &HeldDir, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
     let names = parts
         .iter()
@@ -3298,6 +3302,44 @@ mod tests {
             fs::read(root.join("e1").join("k.json")).ok().as_deref(),
             Some(b"x".as_slice()),
             "one plain epoch and file name are written"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A read part that is not one spelled name misses, even where an entry of that name exists.
+    #[test]
+    fn a_read_part_that_is_not_one_spelled_name_misses() {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe_cache_spelled_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("cache");
+        fs::create_dir_all(root.join("e1")).unwrap();
+        fs::write(root.join("e1").join("k.json"), b"in").unwrap();
+        fs::write(base.join("k.json"), b"out").unwrap();
+        let refused: [&[&str]; 5] = [
+            &["..", "k.json"],
+            &["e1/k.json"],
+            &[".", "e1", "k.json"],
+            &["", "k.json"],
+            &["e1", "k\0.json"],
+        ];
+        for parts in refused {
+            assert_eq!(read_without_links(&root, parts, 64), None, "{parts:?}");
+        }
+        #[cfg(windows)]
+        {
+            let real = fs::canonicalize(&root).unwrap();
+            fs::create_dir(real.join("e1.")).unwrap();
+            fs::write(real.join("e1.").join("k.json"), b"dot").unwrap();
+            fs::write(real.join("e1").join("k.json "), b"space").unwrap();
+            for parts in [["e1.", "k.json"], ["e1", "k.json "]] {
+                assert_eq!(read_without_links(&root, &parts, 64), None, "{parts:?}");
+            }
+        }
+        assert_eq!(
+            read_without_links(&root, &["e1", "k.json"], 64).as_deref(),
+            Some(b"in".as_slice()),
+            "one spelled epoch and file name are read"
         );
         let _ = fs::remove_dir_all(&base);
     }
