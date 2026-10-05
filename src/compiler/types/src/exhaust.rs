@@ -177,6 +177,10 @@ impl ExhaustBudget {
 /// (a spurious or missed IPE-T0010) once both are linked.
 type TyId = (Vec<Symbol>, Symbol);
 
+/// A union's identity paired with its constructors and their payload arities,
+/// in declaration order.
+type UnionSig<'a> = (&'a TyId, &'a [(Symbol, usize)]);
+
 /// Constructor-signature tables, built once per module from its `type` decls.
 struct Sigs {
     /// Home module → (constructor name → its owning union's identity). Nesting on
@@ -284,7 +288,7 @@ impl Sigs {
     /// The union an ADT head's constructor belongs to, with its constructors.
     ///
     /// A miss is [`ctor_not_in_signature`].
-    fn union_of(&self, home: &[Symbol], ctor: Symbol) -> DResult<(&TyId, &[(Symbol, usize)])> {
+    fn union_of(&self, home: &[Symbol], ctor: Symbol) -> DResult<UnionSig<'_>> {
         let union = self
             .ctor_to_union
             .get(home)
@@ -978,10 +982,7 @@ fn check_case(
 /// when its head is a declared type (a home no builtin answers to) absent from
 /// [`Sigs`]: every union a module can reach is in its signature tables, so a
 /// miss is a broken closure, never a type without constructors.
-fn scrutinee_union<'a>(
-    scrut: &canon::Expr,
-    ctx: &'a Ctx<'_>,
-) -> DResult<Option<(&'a TyId, &'a [(Symbol, usize)])>> {
+fn scrutinee_union<'a>(scrut: &canon::Expr, ctx: &'a Ctx<'_>) -> DResult<Option<UnionSig<'a>>> {
     let ty = ctx
         .regions
         .get(&(ctx.home.to_vec(), scrut.span))
