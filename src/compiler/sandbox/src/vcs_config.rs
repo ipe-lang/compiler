@@ -1088,7 +1088,8 @@ enum Role {
 enum Runner {
     /// The value is the command line.
     None,
-    /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`.
+    /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`, a
+    /// Git `submodule.<name>.update`.
     Bang,
     /// A Git `alias.*`: one leading `!` makes the rest a shell command;
     /// otherwise Git splits the value into words itself, expanding none, reads
@@ -1105,7 +1106,7 @@ enum Runner {
     /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
     Python,
     /// The value is run without a shell (Git's `gpg.program`, `core.askPass`,
-    /// `core.gitProxy`), or split into words Git expands none of
+    /// `core.gitProxy`, a tool's `<tool>.path`, `sendemail.smtpServer`), or split into words Git expands none of
     /// (`gpg.ssh.defaultKeyCommand`): a `~`, a quote, or a space is part of
     /// the program path, and a word's leading `~` is a relative path's.
     Exec,
@@ -3458,9 +3459,11 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         // an alias Git does not read runs nothing, one it reads runs so.
         ("alias", _, _) => Runner::GitAlias,
         ("credential", _, "helper") => Runner::GitHelper,
-        ("gpg", _, "program" | "defaultkeycommand") | ("core", false, "askpass" | "gitproxy") => {
-            Runner::Exec
-        }
+        ("submodule", true, "update") => Runner::Bang,
+        ("gpg", _, "program" | "defaultkeycommand")
+        | ("core", false, "askpass" | "gitproxy")
+        | ("difftool" | "mergetool" | "browser" | "man", true, "path")
+        | ("sendemail", _, "smtpserver") => Runner::Exec,
         ("remote", true, "vcs") => Runner::GitRemote,
         _ => Runner::None,
     };
@@ -5698,6 +5701,57 @@ mod tests {
             format!("[core]\n\taskPass = {out}/askpass\n"),
             "[remote \"o\"]\n\tvcs = hg\n".to_owned(),
             "[core]\n\tsshCommand = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn git_tool_path_runs_without_a_shell_refused() {
+        let f = fixture("gittoolpath");
+        let out = f.out.display();
+        for key in [
+            "[difftool \"t\"]\n\tpath",
+            "[mergetool \"t\"]\n\tpath",
+            "[browser \"t\"]\n\tpath",
+            "[man \"t\"]\n\tpath",
+            "[sendemail]\n\tsmtpServer",
+        ] {
+            for value in ["~/evil".to_owned(), format!("\"x {out}/y\"")] {
+                let text = format!("{key} = {value}\n");
+                git_config(&f, &text);
+                let result = scan_git(&f);
+                assert!(
+                    in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                    "{text:?}: {result:?}"
+                );
+            }
+            for value in [format!("{out}/tool"), "tool".to_owned()] {
+                let text = format!("{key} = {value}\n");
+                git_config(&f, &text);
+                assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_submodule_update_bang_strips_then_shell() {
+        let f = fixture("gitsubupdate");
+        let tree = f.tree.display();
+        let out = f.out.display();
+        let text = format!("[submodule \"s\"]\n\tupdate = !{tree}/evil\n");
+        git_config(&f, &text);
+        let result = scan_git(&f);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil").as_path()),
+            "{text:?}: {result:?}"
+        );
+        for text in [
+            format!("[submodule \"s\"]\n\tupdate = !{out}/x\n"),
+            "[submodule \"s\"]\n\tupdate = !~/x\n".to_owned(),
+            "[submodule \"s\"]\n\tupdate = rebase\n".to_owned(),
         ] {
             git_config(&f, &text);
             assert_eq!(scan_git(&f), Ok(()), "{text:?}");
