@@ -2264,7 +2264,7 @@ mod listen_scope_tests {
 /// Runs one ignored test of this test binary as a child process holding a
 /// given `IPE_WEB_FRAME_ANCESTORS`, so the process-wide parse is made under
 /// that value and no other test of the parent can have made it first.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
 pub(crate) mod frame_ancestors_child {
     /// Printed by a child test once it has observed the startup refusal.
     pub(crate) const REFUSED: &str = "frame-ancestors startup refusal observed";
