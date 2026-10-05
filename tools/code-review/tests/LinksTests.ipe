@@ -30,7 +30,8 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, loadUnitNow, indexConn)
+import Lib.Uid as Uid
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, loadUnitNow, indexConn, uid)
 
 
 -- ── bounded, indexed links ──────────────────────────────────────────────
@@ -73,8 +74,8 @@ type alias FixtureUnit =
 
 -- A unit the fixture never loads: its hash attests nothing.
 other : String -> String -> String -> String -> FixtureUnit
-other uid path name qualified =
-    { uid = uid, path = path, kind = "fn", name = name, qualified = qualified, lines = 1, hash = "unloaded" }
+other label path name qualified =
+    { uid = label, path = path, kind = "fn", name = name, qualified = qualified, lines = 1, hash = "unloaded" }
 
 
 -- In insertion (rowid) order: each duplicate pair puts the unit that must
@@ -99,7 +100,7 @@ insertFixtureUnit : String -> FixtureUnit -> Task.Task Error ()
 insertFixtureUnit indexDb u =
     execIndex indexDb
         "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-        [ SqlString u.uid
+        [ Uid.toSql (uid u.uid)
         , SqlString u.path
         , SqlString u.kind
         , SqlString u.name
@@ -119,7 +120,7 @@ fixtureRows indexDb =
     Task.sequence
         (List.map (insertFixtureUnit indexDb) fixtureUnits
             ++ [ execIndex indexDb "INSERT INTO files (path, lang) VALUES (?, ?), (?, ?)" [ SqlString "ipe:src/links.rs", SqlString "rs", SqlString "ipe:src/Feature.ipe", SqlString "ipe" ]
-            , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ SqlString "u-src", SqlString "u-edge", SqlString "u-src", SqlString "u-src" ]
+            , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ Uid.toSql (uid "u-src"), Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-src"), Uid.toSql (uid "u-src") ]
             ]
         )
         |> Task.map (\_ -> ())
@@ -131,6 +132,12 @@ type alias LinksFixture =
     , ipe : List String
     , plan : List String
     }
+
+
+-- The `linkKey` of an internal link to fixture unit `label`.
+internalKey : String -> String
+internalKey label =
+    "i:" ++ Uid.toString (uid label)
 
 
 keysOf : Maybe Index.UnitView -> List String
@@ -146,7 +153,7 @@ keysOf found =
 -- The query plan of the candidate lookup `u-src` makes.
 candidatePlan : Task.Task Error (List String)
 candidatePlan =
-    case Index.candidateQuery "ipe:src/links.rs" "u-src" [ "helper", "app::links::helper", "dup::twin" ] of
+    case Index.candidateQuery "ipe:src/links.rs" (uid "u-src") [ "helper", "app::links::helper", "dup::twin" ] of
         ( sql, params ) ->
             indexConn
                 |> Task.andThen
@@ -166,8 +173,8 @@ linksFixture =
         writeFileText (at.repo ++ "/src/links.rs") (String.join "\n" rustLines ++ "\n")
         writeFileText (at.repo ++ "/src/Feature.ipe") (String.join "\n" ipeLines ++ "\n")
         fixtureRows at.indexDb
-        rust <- loadUnitNow "u-src"
-        ipe <- loadUnitNow "u-ipe"
+        rust <- loadUnitNow (uid "u-src")
+        ipe <- loadUnitNow (uid "u-ipe")
         plan <- candidatePlan
         cleanupIndex at.indexDb at.repo
         removeFileIfAny (at.repo ++ "/src/links.rs")
@@ -177,24 +184,24 @@ linksFixture =
 
 fixtureChecks : LinksFixture -> List ( String, Bool )
 fixtureChecks got =
-    [ ( "a callgraph edge links the callee", List.member "i:u-edge" got.rust )
-    , ( "an exact qualified reference links", List.member "i:u-exact" got.rust )
-    , ( "a bare reference links to its own module's unit", List.member "i:u-helper" got.rust )
-    , ( "a bare reference never links to another module's unit of the same name", not (List.member "i:u-shared" got.rust) )
+    [ ( "a callgraph edge links the callee", List.member (internalKey "u-edge") got.rust )
+    , ( "an exact qualified reference links", List.member (internalKey "u-exact") got.rust )
+    , ( "a bare reference links to its own module's unit", List.member (internalKey "u-helper") got.rust )
+    , ( "a bare reference never links to another module's unit of the same name", not (List.member (internalKey "u-shared") got.rust) )
     , ( "a duplicate qualified name links the same-path unit, then the lowest uid"
-    , List.member "i:u-twin-z" got.rust
-        && not (List.member "i:u-twin-a" got.rust)
-        && List.member "i:u-pair-a" got.rust
-        && not (List.member "i:u-pair-b" got.rust)
+    , List.member (internalKey "u-twin-z") got.rust
+        && not (List.member (internalKey "u-twin-a") got.rust)
+        && List.member (internalKey "u-pair-a") got.rust
+        && not (List.member (internalKey "u-pair-b") got.rust)
     )
-    , ( "a unit never links to itself", not (List.member "i:u-src" got.rust) )
+    , ( "a unit never links to itself", not (List.member (internalKey "u-src") got.rust) )
     , ( "links are edges first, then references in first-occurrence order, nothing hidden"
     , got.rust
-        == [ "i:u-edge", "i:u-helper", "i:u-exact", "i:u-twin-z", "i:u-pair-a" ]
+        == [ internalKey "u-edge", internalKey "u-helper", internalKey "u-exact", internalKey "u-twin-z", internalKey "u-pair-a" ]
         && got.rustHidden
         == Just NoneHidden
     )
-    , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ "i:u-foo" ] )
+    , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ internalKey "u-foo" ] )
     , ( "the candidate query uses i_units_qual", List.any (String.contains "i_units_qual") got.plan )
     ]
 
@@ -218,7 +225,7 @@ candidateCeiling =
             manyNames Links.linkCandidateCeiling
 
         bound =
-            case Index.candidateQuery "p" "u" over.names of
+            case Index.candidateQuery "p" (uid "u") over.names of
                 ( _, params ) ->
                     List.length params
     in
@@ -239,7 +246,7 @@ candidateCeiling =
 
 internalLinks : Int -> List Link
 internalLinks n =
-    List.map (\i -> Links.internal ("q" ++ String.fromInt i) ("u" ++ String.fromInt i)) (List.range 1 n)
+    List.map (\i -> Links.internal ("q" ++ String.fromInt i) (Uid.toString (uid ("u" ++ String.fromInt i)))) (List.range 1 n)
 
 
 linkCeilingCut : Bool
@@ -283,17 +290,17 @@ firstOccurrence =
             Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
 
         resolved =
-            Links.resolveCandidates wanted.lookups [ ( "c", "u-c" ), ( "a", "u-a" ), ( "b", "u-b" ) ]
+            Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
 
         assembled =
-            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" "u-a" ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
+            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
     in
     wanted.names
         == [ "b", "a", "c" ]
         && List.map Links.linkKey resolved
-        == [ "i:u-b", "i:u-a", "i:u-c" ]
+        == [ internalKey "u-b", internalKey "u-a", internalKey "u-c" ]
         && List.map Links.linkKey assembled.links
-        == [ "i:u-a", "i:u-b", "i:u-c", "e:https://x.io" ]
+        == [ internalKey "u-a", internalKey "u-b", internalKey "u-c", "e:https://x.io" ]
 
 
 candidateRule : Bool
@@ -329,12 +336,12 @@ referencesFollowTokens =
 
 candidateSqlBound : Bool
 candidateSqlBound =
-    case Index.candidateQuery "ipe:p" "u-self" [ "evil'); DROP TABLE units; --", "b" ] of
+    case Index.candidateQuery "ipe:p" (uid "u-self") [ "evil'); DROP TABLE units; --", "b" ] of
         ( sql, params ) ->
             not (String.contains "evil" sql)
                 && String.contains "IN (?, ?)" sql
                 && params
-                == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", SqlString "u-self" ]
+                == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", Uid.toSql (uid "u-self") ]
                 && Index.placeholders 3
                 == "?, ?, ?"
                 && Index.placeholders 0

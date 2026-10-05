@@ -19,17 +19,19 @@ import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
-import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), StoredDecision(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf)
+import Lib.Uid as Uid exposing (Uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -82,7 +84,7 @@ openDoesNotMigrateIn base =
     in
     do
         db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
-        readFailed <- LibDb.findDecision db "u-a" "h"
+        readFailed <- LibDb.findDecision db (uid "u-a") "h"
             |> Task.map (\_ -> False)
             |> Task.onError (\_ -> Task.succeed True)
         created <- tableExists db "review"
@@ -102,15 +104,15 @@ duplicateDecisionAlreadyDecided =
     onFreshReview "ipe-review-duplicate"
         (\db ->
             do
-                attested <- attestedFor "ipe-review-duplicate-index" "u-a"
+                attested <- attestedFor "ipe-review-duplicate-index" (uid "u-a")
                 genesis <- reviewHeadOf db
                 first <- LibDb.insertDecision db attested Approved
                 afterFirst <- reviewHeadOf db
                 changed <- refuse "changed"
                 second <- LibDb.insertDecision db attested changed
                 afterSecond <- reviewHeadOf db
-                n <- countReviewRows db "u-a" (Index.attest viewA)
-                found <- LibDb.findDecision db "u-a" (Index.attest viewA)
+                n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+                found <- LibDb.findDecision db (uid "u-a") (Index.attest viewA)
                 Task.succeed
                     (linksFrom genesis afterFirst first
                         && isAlreadyDecided second
@@ -162,12 +164,12 @@ reviewLogAppendOnly db =
                 |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
 
         rewrite sql =
-            Db.exec db sql [ SqlString "u-a", SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0 ]
+            Db.exec db sql [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0 ]
                 |> Task.map (\_ -> True)
                 |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
     in
     do
-        attested <- attestedFor "ipe-review-append-only-index" "u-a"
+        attested <- attestedFor "ipe-review-append-only-index" (uid "u-a")
         LibDb.insertDecision db attested Approved
         head <- reviewHeadOf db
         refusals <- Task.sequence
@@ -185,8 +187,8 @@ reviewLogAppendOnly db =
                 , "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
                 ]
             )
-        n <- countReviewRows db "u-a" (Index.attest viewA)
-        kept <- LibDb.findDecision db "u-a" (Index.attest viewA)
+        n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+        kept <- LibDb.findDecision db (uid "u-a") (Index.attest viewA)
         headAfter <- reviewHeadOf db
         Task.succeed
             (List.all (\ok -> ok) (refusals ++ rewrites)
@@ -217,8 +219,8 @@ concurrentHeadCasRefuses : Db -> Task.Task Error Bool
 concurrentHeadCasRefuses db =
     do
         current <- LibDb.currentHead db
-        refusedAsConflict <- staleCasRefused db (Index.chainLink current "stale-uid" "stale-hash")
-        n <- countReviewRows db "cas-uid" "cas-hash"
+        refusedAsConflict <- staleCasRefused db (Index.chainLink current (uid "stale-uid") "stale-hash")
+        n <- countReviewRows db (uid "cas-uid") "cas-hash"
         headAfter <- reviewHeadOf db
         Task.succeed (refusedAsConflict && n == 0 && headAfter == Index.chainHeadText current)
 
@@ -230,8 +232,8 @@ staleCasRefused db stale =
     Db.withTransaction db
         (\tx ->
             do
-                Db.exec tx "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "cas-uid", SqlString "cas-hash", SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
-                LibDb.advanceHead tx stale (Index.chainLink stale "cas-uid" "cas-hash")
+                Db.exec tx "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "cas-uid"), SqlString "cas-hash", SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
+                LibDb.advanceHead tx stale (Index.chainLink stale (uid "cas-uid") "cas-hash")
         )
         |> Task.map (\_ -> False)
         |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "")))
@@ -306,11 +308,11 @@ isApproved m =
             False
 
         Just row ->
-            case row.reason of
-                Nothing ->
-                    row.decision == "approve"
+            case row.decision of
+                StoredApproved ->
+                    True
 
-                Just _ ->
+                StoredRefused _ ->
                     False
 
 
@@ -342,8 +344,8 @@ reasonBounded db =
                     Error.kind e == Error.kind (Error.invalidInput "")
     in
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "long-uid", SqlString "hL", SqlString "refuse", SqlString (atBound ++ "x"), SqlInt 0 ]
-        storedRefused <- LibDb.findDecision db "long-uid" "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "long-uid"), SqlString "hL", SqlString "refuse", SqlString (atBound ++ "x"), SqlInt 0 ]
+        storedRefused <- LibDb.findDecision db (uid "long-uid") "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
         Task.succeed
             (rejected ""
                 && rejected "   "
@@ -373,12 +375,12 @@ storedReasonShown expected found =
             False
 
         Just row ->
-            case row.reason of
-                Nothing ->
+            case row.decision of
+                StoredApproved ->
                     False
 
-                Just r ->
-                    row.decision == "refuse" && SafeText.toString (LibDb.storedReasonText r) == expected
+                StoredRefused r ->
+                    SafeText.toString (LibDb.storedReasonText r) == expected
 
 
 decisionRoundtrip : Task.Task Error Bool
@@ -388,8 +390,8 @@ decisionRoundtrip =
             do
                 insertBoth "ipe-review-roundtrip-index" db
                 Task.map2 checkPair
-                    (LibDb.findDecision db "u-a" (Index.attest viewA))
-                    (LibDb.findDecision db "u-b" (Index.attest viewB))
+                    (LibDb.findDecision db (uid "u-a") (Index.attest viewA))
+                    (LibDb.findDecision db (uid "u-b") (Index.attest viewB))
         )
 
 
@@ -406,9 +408,9 @@ storedOverlongReasonDecodes db =
             "reason not shown: 5000 characters, over the 500-character limit"
     in
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "huge-uid", SqlString "hH", SqlString "refuse", SqlString (String.repeat 5000 "y"), SqlInt 0 ]
-        byPair <- LibDb.findDecision db "huge-uid" "hH"
-        byUid <- LibDb.findLatestForUid db "huge-uid"
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "huge-uid"), SqlString "hH", SqlString "refuse", SqlString (String.repeat 5000 "y"), SqlInt 0 ]
+        byPair <- LibDb.findDecision db (uid "huge-uid") "hH"
+        byUid <- LibDb.findLatestForUid db (uid "huge-uid")
         Task.succeed (storedReasonShown expected byPair && storedReasonShown expected byUid)
 
 
@@ -417,8 +419,8 @@ storedOverlongReasonDecodes db =
 storedBlankReasonDecodes : Db -> Task.Task Error Bool
 storedBlankReasonDecodes db =
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "blank-uid", SqlString "hB", SqlString "refuse", SqlString "\n\t", SqlInt 0 ]
-        found <- LibDb.findDecision db "blank-uid" "hB"
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "blank-uid"), SqlString "hB", SqlString "refuse", SqlString "\n\t", SqlInt 0 ]
+        found <- LibDb.findDecision db (uid "blank-uid") "hB"
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
 
 
@@ -432,11 +434,17 @@ historyWalkMatchesOrder db =
         seeded =
             [ ( "walk-b", "h1", 7 ), ( "walk-a", "h2", 7 ), ( "walk-a", "h1", 7 ), ( "walk-c", "h1", 3 ), ( "walk-c", "h2", 3 ), ( "walk-d", "h1", 9 ), ( "walk-e", "h1", 1 ) ]
 
-        seed ( uid, bodyHash, at ) =
-            Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString uid, SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
+        seed ( label, bodyHash, at ) =
+            Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid label), SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
+
+        walkKey ( label, bodyHash ) =
+            ( Uid.toString (uid label), bodyHash )
+
+        walkUids =
+            List.map (\( label, _, _ ) -> Uid.toString (uid label)) seeded
 
         keyDecoder =
-            Db.Decode.succeed (\uid bodyHash -> ( uid, bodyHash ))
+            Db.Decode.succeed (\unit bodyHash -> ( unit, bodyHash ))
                 |> Db.Decode.required "uid" (Db.Decode.string "uid")
                 |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
     in
@@ -449,8 +457,8 @@ historyWalkMatchesOrder db =
                 == expected
                 && walked.pages
                 > 3
-                && List.filter (\( uid, _ ) -> String.startsWith "walk-" uid) walked.seen
-                == [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h1" ), ( "walk-c", "h2" ), ( "walk-e", "h1" ) ]
+                && List.filter (\( unit, _ ) -> List.member unit walkUids) walked.seen
+                == List.map walkKey [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h1" ), ( "walk-c", "h2" ), ( "walk-e", "h1" ) ]
             )
 
 
@@ -466,11 +474,12 @@ type alias HistoryWalk =
 historyWalkStep : Db -> HistoryWalk -> Task.Task Error (Task.Step HistoryWalk HistoryWalk)
 historyWalkStep db state =
     do
-        page <- LibDb.historyPage db 2 state.cursor
+        size <- pageOf 2
+        page <- LibDb.historyPage db size state.cursor
         let
             next =
                 { cursor = state.cursor
-                , seen = state.seen ++ List.map (\row -> ( row.uid, row.bodyHash )) page.rows
+                , seen = state.seen ++ List.map (\row -> ( Uid.toString row.uid, row.bodyHash )) page.rows
                 , pages = state.pages + 1
                 }
         in
@@ -492,21 +501,46 @@ isLastHistoryPage next =
             False
 
 
--- A History page of no rows, or fewer, is refused as invalid input before
--- any read.
+-- A page size is parsed before any read: none of no rows, fewer, or past
+-- the ceiling has a `PageSize`, so no page read can be asked for one. Both
+-- bounds parse, and a one-row page returns at most one row.
 historyPageSizeRefused : Db -> Task.Task Error Bool
 historyPageSizeRefused db =
     let
-        refused size =
-            LibDb.historyPage db size HistoryStart
-                |> Task.map (\_ -> False)
-                |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.invalidInput "")))
+        refused rows =
+            case PageSize.parse rows of
+                Ok _ ->
+                    False
+
+                Err e ->
+                    Error.kind e == Error.kind (Error.invalidInput "")
+
+        accepted rows =
+            case PageSize.parse rows of
+                Ok size ->
+                    PageSize.toInt size == rows
+
+                Err _ ->
+                    False
     in
     do
-        zero <- refused 0
-        negative <- refused (-1)
-        one <- LibDb.historyPage db 1 HistoryStart |> Task.map (\page -> List.length page.rows <= 1)
-        Task.succeed (zero && negative && one)
+        one <- pageOf 1
+        onePage <- LibDb.historyPage db one HistoryStart
+        Task.succeed
+            (refused 0
+                && refused (-1)
+                && refused (PageSize.maxRows + 1)
+                && accepted 1
+                && accepted PageSize.maxRows
+                && List.length onePage.rows
+                <= 1
+            )
+
+
+-- A page of `rows` rows; a size the parser refuses fails the task.
+pageOf : Int -> Task.Task Error PageSize
+pageOf rows =
+    Task.fromResult (PageSize.parse rows)
 
 
 -- Each History state has its own text: a load in flight or a failed load
@@ -519,10 +553,10 @@ historyStateTextsDistinct =
             Error.unexpected "boom"
 
         row =
-            { uid = "u-h", bodyHash = "h", decision = "approve", reason = Nothing, reviewedAt = Timestamp.fromUnixMillis 0, name = Nothing }
+            { uid = uid "u-h", bodyHash = "h", decision = StoredApproved, reviewedAt = Timestamp.fromUnixMillis 0, name = Nothing }
 
         later =
-            HistoryAfter (Timestamp.fromUnixMillis 0) "u-h" "h"
+            HistoryAfter (Timestamp.fromUnixMillis 0) (uid "u-h") "h"
     in
     List.all identity
         [ Queue.historyStatusText HistoryLoading == Just "Loading history…"
@@ -547,7 +581,7 @@ historyPagesUseIndex db =
     in
     do
         first <- LibDb.historyPlan db HistoryStart
-        later <- LibDb.historyPlan db (HistoryAfter (Timestamp.fromUnixMillis 5) "u" "h")
+        later <- LibDb.historyPlan db (HistoryAfter (Timestamp.fromUnixMillis 5) (uid "u") "h")
         Task.succeed (indexed first && indexed later && List.any (String.startsWith "SEARCH") later)
 
 
@@ -594,15 +628,15 @@ failedWritesKeepTheirErrorIn base =
         dir <- Task.fromResult (Path.fromString base)
         File.mkdirAll dir
         removeReviewFiles dbPath
-        seen <- attestedFor "ipe-review-failed-writes-index" "u-a"
-        fresh <- attestedFor "ipe-review-failed-writes-index" "u-b"
+        seen <- attestedFor "ipe-review-failed-writes-index" (uid "u-a")
+        fresh <- attestedFor "ipe-review-failed-writes-index" (uid "u-b")
         rw <- migratedReviewAt dbPath
         LibDb.insertDecision rw seen Approved
         head <- reviewHeadOf rw
         ro <- openReadOnlyAt dbPath
         duplicate <- failedReadOnly (LibDb.insertDecision ro seen Approved)
         freshReview <- failedReadOnly (LibDb.insertDecision ro fresh Approved)
-        kept <- LibDb.findDecision rw "u-b" (Index.attest viewB)
+        kept <- LibDb.findDecision rw (uid "u-b") (Index.attest viewB)
         headAfter <- reviewHeadOf rw
         removeReviewFiles dbPath
         Task.succeed (duplicate && freshReview && not (hasDecision kept) && headAfter == head)
@@ -649,7 +683,7 @@ historyRoundtripIn base =
             )
         |> Task.andThen
             (\db ->
-                LibDb.historyPage db LibDb.historyPageSize HistoryStart
+                LibDb.historyPage db PageSize.history HistoryStart
                     |> Task.map
                         (\page ->
                             let
@@ -659,9 +693,8 @@ historyRoundtripIn base =
                             isLastHistoryPage page.next
                                 && List.length rows
                                 == 2
-                                && List.member ( "u-a", "approve" ) (List.map (\r -> ( r.uid, r.decision )) rows)
-                                && List.member ( "u-b", "refuse" ) (List.map (\r -> ( r.uid, r.decision )) rows)
-                                && List.member (Just "too big") (List.map (\r -> Maybe.map (\s -> SafeText.toString (LibDb.storedReasonText s)) r.reason) rows)
+                                && List.member ( uid "u-a", Nothing ) (List.map historyKey rows)
+                                && List.member ( uid "u-b", Just "too big" ) (List.map historyKey rows)
                         )
             )
         |> Task.andThen
@@ -673,13 +706,24 @@ historyRoundtripIn base =
             )
 
 
+-- A History row's uid and, for a refusal, its shown reason.
+historyKey : LibDb.ReviewRow -> ( Uid, Maybe String )
+historyKey row =
+    case row.decision of
+        StoredApproved ->
+            ( row.uid, Nothing )
+
+        StoredRefused reason ->
+            ( row.uid, Just (SafeText.toString (LibDb.storedReasonText reason)) )
+
+
 -- Fixture unit u-a approved and u-b refused "too big", each against the
 -- `Attested` pair its seeded source re-verifies to.
 insertBoth : String -> Db -> Task.Task Error Index.Written
 insertBoth scratch db =
     do
-        a <- attestedFor scratch "u-a"
-        b <- attestedFor scratch "u-b"
+        a <- attestedFor scratch (uid "u-a")
+        b <- attestedFor scratch (uid "u-b")
         LibDb.insertDecision db a Approved
         tooBig <- refuse "too big"
         LibDb.insertDecision db b tooBig
