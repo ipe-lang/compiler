@@ -1811,6 +1811,14 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         if let Some(msg) = endpoint_conflict(&routes) {
             return IpeResult::Err(msg.into());
         }
+        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
+        // (env) > the app's `Host.bind` setting > the posture fallback
+        // (loopback unless production). A present `IPE_HTTP_BIND` that is not
+        // an IP address refuses the listener.
+        let host = match crate::app_config::resolve_host_bind() {
+            Ok(host) => host,
+            Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
+        };
         let ceilings = match listen_ceilings() {
             Ok(ceilings) => ceilings,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
@@ -1934,15 +1942,13 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             port,
         );
         let port = resolved.port;
-        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
-        // (env) > the app's `Host.bind` setting > the build-profile fallback
-        // (loopback in debug, all interfaces in release). The conservative
-        // loopback default keeps a dev console off the LAN by construction.
-        let host = crate::app_config::resolve_host_bind();
+        let Ok(port) = u16::try_from(port) else {
+            return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
+        };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
-        crate::telemetry::record_bind(&host);
-        let addr = format!("{}:{}", host, port);
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+        crate::telemetry::record_bind(host);
+        let addr = std::net::SocketAddr::new(host, port);
+        let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return IpeResult::Err(resolved.addr_in_use_message().into());
@@ -3464,6 +3470,26 @@ mod tests {
         println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
     }
 
+    /// A present `IPE_HTTP_BIND` that is not an IP address refuses the listener
+    /// before it binds.
+    #[tokio::test]
+    async fn listen_refuses_a_bind_that_is_not_an_ip_address() {
+        for raw in ["localhost", "127.0.0.1:8080", "[::1]", " 127.0.0.1"] {
+            crate::system::locked_set_var("IPE_HTTP_BIND", raw);
+            // A listener that got past the refusal would bind and serve forever;
+            // the timeout turns that regression into a failure instead of a hang.
+            let listened: Result<IpeResult<String, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(0, Vec::new()),
+            )
+            .await;
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+            let refused = matches!(&listened, Ok(IpeResult::Err(msg))
+                if msg.starts_with("Server.listen: IPE_HTTP_BIND must be an IP address"));
+            assert!(refused, "IPE_HTTP_BIND={raw:?} must refuse the listener");
+        }
+    }
+
     #[test]
     fn server_header_is_case_insensitive_go_parity() {
         let mut headers = HashMap::new();
@@ -4060,7 +4086,7 @@ mod tests {
     async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -4083,7 +4109,7 @@ mod tests {
     #[tokio::test]
     async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let html = "<html><body><h1>hi</h1></body></html>";
         let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
         crate::system::locked_remove_var("ENV");
@@ -4203,7 +4229,7 @@ mod tests {
         // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -4231,7 +4257,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),

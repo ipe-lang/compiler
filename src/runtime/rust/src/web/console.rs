@@ -1135,7 +1135,7 @@ mod tests {
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_INGEST_TOKEN");
         if !cfg!(feature = "dev-posture") {
-            crate::telemetry::record_bind("127.0.0.1");
+            crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         }
         assert_eq!(
             status_of(ingest_token_blocked(&origin_headers(None))),
