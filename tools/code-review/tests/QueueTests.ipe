@@ -222,6 +222,23 @@ tooLargeNotDecidable =
             )
 
 
+-- Loads the first page, runs `grow`, then decides the shown unit `u-a`; the
+-- decision's outcome is the value, a refusal its `Err`.
+decideUnitA : Db -> Task.Task Error () -> Task.Task Error (Result Error Bool)
+decideUnitA db grow =
+    do
+        r <- loadFirstPage
+        grow
+        case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == uid "u-a") r.units) of
+            Just shown ->
+                decideShownNow db shown Approved
+                    |> Task.map (\_ -> Ok True)
+                    |> Task.onError (\e -> Task.succeed (Err e))
+
+            Nothing ->
+                Task.fail (Error.conflict "fixture unit u-a is not shown")
+
+
 -- The shown unit's line grows, inside the same span, past the byte ceiling
 -- before its decision: `Queue.decide` re-reads it at decision time and
 -- refuses it as past the ceiling, writing no row. The control, the unchanged
@@ -232,19 +249,6 @@ decideRefusedWhenGrownPastCeiling =
     let
         grown =
             String.replace "// the answer to everything" ("// " ++ String.repeat (ByteSize.toBytes Index.viewByteCeiling) "x") fixtureLibRs
-
-        decideUnitA db grow =
-            do
-                r <- loadFirstPage
-                grow
-                case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == uid "u-a") r.units) of
-                    Just shown ->
-                        decideShownNow db shown Approved
-                            |> Task.map (\_ -> Ok True)
-                            |> Task.onError (\e -> Task.succeed (Err e))
-
-                    Nothing ->
-                        Task.fail (Error.conflict "fixture unit u-a is not shown")
     in
     do
         at <- freshScratch "ipe-index-decide-grown"
