@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, pageSize, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Crypto as Crypto
@@ -15,9 +15,11 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Highlight as Highlight
 import Lib.Links as Links
+import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (RootMap)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (IndexSettings)
+import Lib.Uid as Uid exposing (Uid)
 
 
 -- One ipe-index unit's metadata, never its source: a queue page lists these
@@ -28,7 +30,7 @@ import Lib.Settings as Settings exposing (IndexSettings)
 -- unit's file, parsed for highlighting. `attested` is the stored body hash,
 -- parsed once.
 type alias Unit =
-    { uid : String
+    { uid : Uid
     , path : SafeText
     , name : SafeText
     , qualified : SafeText
@@ -72,10 +74,10 @@ unitFiles =
 -- one file read and verified against its tag's root in `roots`, and its
 -- links resolved from the view when it is shown. Nothing when no such unit
 -- exists. The unit page and the selected queue card both load through it.
-loadView : Db.Db -> RootMap -> String -> Task.Task Error (Maybe UnitView)
+loadView : Db.Db -> RootMap -> Uid -> Task.Task Error (Maybe UnitView)
 loadView conn roots uid =
     do
-        rows <- Db.queryDecode conn unitByUidSql [ SqlString uid ] rowDecoder
+        rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql uid ] rowDecoder
         case List.head rows of
             Just row ->
                 do
@@ -126,9 +128,9 @@ linksOf conn row view =
 
 -- The callgraph edges ipe-index resolved out of `uid`, one past the link
 -- ceiling, so a full read shows that more edges may exist.
-edgeLinks : Db.Db -> String -> Task.Task Error (List ( String, String ))
+edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( String, String ))
 edgeLinks conn uid =
-    Db.queryDecode conn edgeSql [ SqlString uid, SqlString uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
+    Db.queryDecode conn edgeSql [ Uid.toSql uid, Uid.toSql uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
 
 
 edgeSql : String
@@ -169,10 +171,10 @@ candidateRows conn row names =
 -- per name, the unit in `path` first, then the lowest uid — ipe-index's own
 -- `uid_for_qualified` tie-break. Every name is bound; only placeholders enter
 -- the SQL text.
-candidateQuery : String -> String -> List String -> ( String, List SqlValue )
+candidateQuery : String -> Uid -> List String -> ( String, List SqlValue )
 candidateQuery path uid names =
     ( "SELECT qualified, uid FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
-    , List.concat [ [ SqlString path ], List.map SqlString names, [ SqlString uid ] ]
+    , List.concat [ [ SqlString path ], List.map SqlString names, [ Uid.toSql uid ] ]
     )
 
 
@@ -190,7 +192,7 @@ qualifiedDecoder =
 
 
 type alias RowUnit =
-    { uid : String
+    { uid : Uid
     , path : String
     , name : String
     , qualified : String
@@ -208,7 +210,7 @@ type alias RowUnit =
 -- The queue row is decoded in two halves of at most ten columns each
 -- (`Db.Decode.succeed` lifts at most 10 parameters — IPE-L0121), then merged.
 type alias RowA =
-    { uid : String
+    { uid : Uid
     , path : String
     , name : String
     , qualified : String
@@ -227,7 +229,7 @@ type alias RowB =
     }
 
 
-makeRowA : String -> String -> String -> String -> RowA
+makeRowA : Uid -> String -> String -> String -> RowA
 makeRowA uid path name qualified =
     { uid = uid
     , path = path
@@ -276,7 +278,7 @@ rowDecoder =
 partADecoder : Db.Decode.Decoder RowA
 partADecoder =
     Db.Decode.succeed makeRowA
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
         |> Db.Decode.required "path" (Db.Decode.string "path")
         |> Db.Decode.required "name" (Db.Decode.string "name")
         |> Db.Decode.required "qualified" (Db.Decode.string "qualified")
@@ -328,22 +330,13 @@ readConnection settings =
     Db.open "sqlite" (Settings.indexReadUrl settings.db)
 
 
--- The most open units one page load reads. An index can hold tens of
--- thousands of open units, and each loaded unit costs a review-db lookup,
--- so a load is bounded by this constant rather than by the index's size. A
--- page load reads no source file.
-pageSize : Int
-pageSize =
-    200
-
-
 -- Where a page starts in the `(enqueued_at, uid)` order of `open_units`: the
 -- head, or strictly after the last row of the previous page. `uid` breaks
 -- ties on `enqueued_at` (a unit with no queue row orders at 0), so the order
 -- is total and no row is skipped or repeated across pages.
 type Cursor
     = Start
-    | After { enqueuedAt : Int, uid : String }
+    | After { enqueuedAt : Int, uid : Uid }
 
 
 -- An open unit with the `enqueued_at` it is ordered by, so the caller can
@@ -421,15 +414,15 @@ openOrder =
 
 -- The page query and its bound parameters for `cursor`. Every value is a
 -- bound parameter; the page bound is always the last one.
-pendingPageQuery : Cursor -> ( String, List SqlValue )
-pendingPageQuery cursor =
+pendingPageQuery : PageSize -> Cursor -> ( String, List SqlValue )
+pendingPageQuery size cursor =
     case cursor of
         Start ->
-            ( openColumns ++ openOrder, [ SqlInt pageSize ] )
+            ( openColumns ++ openOrder, [ SqlInt (PageSize.toInt size) ] )
 
         After at ->
             ( openColumns ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
-            , [ SqlInt at.enqueuedAt, SqlString at.uid, SqlInt pageSize ]
+            , [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
             )
 
 
@@ -450,15 +443,15 @@ openColumnsDecoder =
         changeDecoder
 
 
--- One page of open units at `cursor` read on `conn`, at most `pageSize`
--- rows of metadata. No source file is read: a unit's file is read only by
+-- One page of open units at `cursor` read on `conn`, at most `size` rows
+-- of metadata. No source file is read: a unit's file is read only by
 -- `loadView`, so a unit whose file is missing still lists, and only a failed
 -- query fails the page.
-loadPendingPage : Db.Db -> Cursor -> Task.Task Error (List PendingRow)
-loadPendingPage conn cursor =
+loadPendingPage : Db.Db -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
+loadPendingPage conn size cursor =
     let
         ( sql, params ) =
-            pendingPageQuery cursor
+            pendingPageQuery size cursor
     in
     Db.queryDecode conn sql params pendingRowDecoder
         |> Task.map (List.map (\( row, change, at ) -> { unit = withRow row, change = change, enqueuedAt = at }))
@@ -536,7 +529,7 @@ readSnapshot conn cursor =
         (\tx ->
             do
                 stamp <- readStamp tx
-                rows <- loadPendingPage tx cursor
+                rows <- loadPendingPage tx PageSize.queue cursor
                 open <- countPending tx
                 units <- countUnits tx
                 bytes <- dbBytes tx
@@ -594,9 +587,9 @@ chainHeadText head =
 -- SHA-256 of the three parts, each written as its decimal length, `:`, then
 -- the part, so no choice of uid or hash can make two different triples hash
 -- the same input.
-chainLink : ChainHead -> String -> String -> ChainHead
+chainLink : ChainHead -> Uid -> String -> ChainHead
 chainLink prev uid hash =
-    ChainHead (Crypto.sha256 (lengthPrefixed [ chainHeadText prev, uid, hash ]))
+    ChainHead (Crypto.sha256 (lengthPrefixed [ chainHeadText prev, Uid.toString uid, hash ]))
 
 
 lengthPrefixed : List String -> String
@@ -654,19 +647,19 @@ moveStamp conn written =
 -- built only by `decidedPairDecoder`, which `Lib.Db.decidedPairsAfter` runs
 -- over the review table, so a refill drains only pairs read back from it.
 type DecidedPair
-    = DecidedPair { uid : String, hash : String }
+    = DecidedPair { uid : Uid, hash : String }
 
 
 -- The one constructor of a `DecidedPair`: a row's `uid` and `body_hash`.
 decidedPairDecoder : Db.Decode.Decoder DecidedPair
 decidedPairDecoder =
     Db.Decode.succeed (\uid hash -> DecidedPair { uid = uid, hash = hash })
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
 
 
 -- A decided pair's key, read-only: the (uid, body_hash) it was decoded from.
-decidedPairKey : DecidedPair -> ( String, String )
+decidedPairKey : DecidedPair -> ( Uid, String )
 decidedPairKey pair =
     case pair of
         DecidedPair p ->
@@ -691,14 +684,14 @@ drainDecided conn pair =
 -- change. Whether a unit is open never reads this row: `open_units` compares
 -- the current pair with `reviewed`. Returns the count of queue rows
 -- deleted. Atomic only inside a transaction the caller opens.
-drainPair : Db.Db -> String -> String -> Task.Task Error Int
+drainPair : Db.Db -> Uid -> String -> Task.Task Error Int
 drainPair conn uid hash =
     do
-        Db.exec conn "INSERT OR IGNORE INTO reviewed (uid, body_hash) VALUES (?, ?)" [ SqlString uid, SqlString hash ]
+        Db.exec conn "INSERT OR IGNORE INTO reviewed (uid, body_hash) VALUES (?, ?)" [ Uid.toSql uid, SqlString hash ]
         Db.deleteWhere conn
             "change_queue"
             (Sql.and
-                (Sql.eq (Sql.column "uid") (Sql.param (SqlString uid)))
+                (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql uid)))
                 (Sql.eq (Sql.column "new_hash") (Sql.param (SqlString hash)))
             )
 
@@ -742,7 +735,7 @@ unitsStore =
 -- the unit still exists (a decided unit whose source was deleted leaves a
 -- review row but no name). The `uid` value is bound as a parameter by
 -- `Store.findBy`, never interpolated into SQL text.
-nameFor : Db.Db -> String -> Task.Task Error (Maybe SafeText)
+nameFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
 nameFor conn uid =
     case unitsStore of
         Err e ->
@@ -750,7 +743,7 @@ nameFor conn uid =
 
         Ok store ->
             do
-                rows <- Store.findBy conn store "uid" (SqlString uid)
+                rows <- Store.findBy conn store "uid" (Uid.toSql uid)
                 case List.head rows of
                     Just row ->
                         Task.succeed (Maybe.map SafeText.renderForeign (Result.toMaybe (Store.readText "qualified" row)))
@@ -798,7 +791,7 @@ readFailure stored e =
         e
 
 
-verifyView : String -> String -> Result StaleReason String -> SourceView
+verifyView : Uid -> String -> Result StaleReason String -> SourceView
 verifyView uid stored sliced =
     case sliced of
         Err reason ->
@@ -899,7 +892,7 @@ hashDigits attested =
 -- Source text proved equal to its attestation. Opaque: built only by
 -- `viewOf`, so holding one means the bytes were re-hashed.
 type ShownSource
-    = ShownSource { uid : String, text : String, hash : String }
+    = ShownSource { uid : Uid, text : String, hash : String }
 
 
 shownText : ShownSource -> String
@@ -920,10 +913,10 @@ shownHash shown =
 -- were shown, re-proved against the current index row and file. Opaque:
 -- built only by `reverify`.
 type Attested
-    = Attested { uid : String, hash : String }
+    = Attested { uid : Uid, hash : String }
 
 
-attestedUid : Attested -> String
+attestedUid : Attested -> Uid
 attestedUid attested =
     case attested of
         Attested a ->
@@ -950,7 +943,7 @@ reverify settings shown =
         ShownSource s ->
             do
                 conn <- readConnection settings
-                rows <- Db.queryDecode conn unitByUidSql [ SqlString s.uid ] rowDecoder
+                rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
                 case List.head rows of
                     Just row ->
                         viewOf settings.roots row
@@ -960,7 +953,7 @@ reverify settings shown =
                         Task.fail (Error.conflict "unit no longer indexed")
 
 
-confirmShown : String -> String -> SourceView -> Task.Task Error Attested
+confirmShown : Uid -> String -> SourceView -> Task.Task Error Attested
 confirmShown uid hash fresh =
     case fresh of
         Shown now ->

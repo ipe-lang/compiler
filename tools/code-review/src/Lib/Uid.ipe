@@ -1,0 +1,73 @@
+module Lib.Uid exposing (Uid, decoder, parse, toSql, toString)
+
+-- A unit's ipe-index id: exactly 64 lowercase hex digits, the blake3 hex
+-- form `unit_uid` writes. Opaque: built only by `parse` and `decoder`, so a
+-- route segment, a link target or a stored row that is not such an id has
+-- no representation. `toSql` and `toString` are the exits, used at an SQL,
+-- link or display sink.
+
+import Ipe.Char as Char
+import Ipe.Db
+import Ipe.Db.Decode
+import Ipe.Error as Error
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+
+
+type Uid
+    = Uid String
+
+
+uidLength : Int
+uidLength =
+    64
+
+
+-- The one grammar of a unit id. The refusal never echoes the text it read.
+parse : String -> Result Error Uid
+parse raw =
+    if String.length raw == uidLength && String.all isLowerHex raw then
+        Ok (Uid raw)
+
+    else
+        Err (Error.invalidInput "a unit id is exactly 64 lowercase hex digits")
+
+
+-- `0`-`9` or `a`-`f`, ASCII only.
+isLowerHex : Char -> Bool
+isLowerHex c =
+    let
+        code =
+            Char.toCode c
+    in
+    (code >= 48 && code <= 57) || (code >= 97 && code <= 102)
+
+
+-- Column `column` read as a unit id; a value that is not one fails the read
+-- naming the column, never the value.
+decoder : String -> Db.Decode.Decoder Uid
+decoder column =
+    Db.Decode.string column
+        |> Db.Decode.andThen (\raw -> fromColumn column raw)
+
+
+fromColumn : String -> String -> Db.Decode.Decoder Uid
+fromColumn column raw =
+    case parse raw of
+        Ok uid ->
+            Db.Decode.succeed uid
+
+        Err _ ->
+            Db.Decode.fail ("column " ++ column ++ " holds a value that is not a unit id")
+
+
+toSql : Uid -> SqlValue
+toSql uid =
+    SqlString (toString uid)
+
+
+toString : Uid -> String
+toString uid =
+    case uid of
+        Uid text ->
+            text

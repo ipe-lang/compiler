@@ -1,0 +1,304 @@
+module TypedRowsTests exposing (checks)
+
+import Ipe.Db as Db
+import Ipe.Error as Error
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.PageSize as PageSize exposing (PageSize)
+import Lib.Queue as Queue exposing (UnitPageState(..))
+import Lib.SafeText as SafeText
+import Lib.Uid as Uid exposing (Uid)
+import TestSupport exposing (check, codeText, freshDir, uid)
+
+
+-- ── unit ids ────────────────────────────────────────────────────────────
+--
+-- A unit id is exactly 64 lowercase ASCII hex digits: one short, one long,
+-- uppercase, one non-hex digit, empty, a path, an encoded path, and a
+-- 64-character string holding a bidi override are each refused; 64 lowercase
+-- hex digits parse and read back unchanged. Red if the grammar loosens.
+uidParseRefuses : Bool
+uidParseRefuses =
+    let
+        hex =
+            String.repeat 64 "a"
+    in
+    List.all uidRefused
+        [ String.repeat 63 "a"
+        , String.repeat 65 "a"
+        , String.repeat 64 "A"
+        , String.repeat 63 "a" ++ "g"
+        , ""
+        , "../x"
+        , "%2e%2e"
+        , String.repeat 63 "a" ++ codeText 8238
+        , codeText 8238 ++ String.repeat 63 "a"
+        ]
+        && Result.map Uid.toString (Uid.parse hex)
+        == Ok hex
+        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+-- True when `raw` is refused as invalid input.
+uidRefused : String -> Bool
+uidRefused raw =
+    case Uid.parse raw of
+        Ok _ ->
+            False
+
+        Err e ->
+            Error.kind e == Error.kind (Error.invalidInput "")
+
+
+-- A `/unit/<uid>` route whose uid does not parse is its own unit-page state,
+-- with no uid to load: `unitPageEntry` yields `UnitIdRefused`, never a uid,
+-- while a unit id enters as that uid. Red if a refused segment reaches a
+-- load.
+routeUidRefusedNotQueried : Bool
+routeUidRefusedNotQueried =
+    entryRefused "zz"
+        && entryRefused ("../" ++ String.repeat 61 "a")
+        && entryRefused (String.repeat 64 "F")
+        && entryAccepted (uid "u-a")
+        && Queue.unitPageStatusText UnitIdRefused
+        == Just "This address does not name a unit."
+
+
+entryRefused : String -> Bool
+entryRefused raw =
+    case Queue.unitPageEntry raw of
+        Err UnitIdRefused ->
+            True
+
+        Err _ ->
+            False
+
+        Ok _ ->
+            False
+
+
+entryAccepted : Uid -> Bool
+entryAccepted unit =
+    case Queue.unitPageEntry (Uid.toString unit) of
+        Ok entered ->
+            entered == unit
+
+        Err _ ->
+            False
+
+
+-- A stored link target that is not a unit id builds no internal link: its
+-- name shows as plain text, keyed apart from every internal link, whether it
+-- came from a callgraph edge or a resolved reference. Red if `Internal` is
+-- built from an unparsed uid.
+badLinkUidRendersText : Bool
+badLinkUidRendersText =
+    let
+        edge =
+            Links.internal "app::x" "zz"
+
+        resolved =
+            Links.resolveCandidates [ [ "x" ] ] [ ( "x", "../evil" ) ]
+    in
+    isUnlinked edge
+        && SafeText.toString (Links.label edge)
+        == "app::x"
+        && Links.linkKey edge
+        == "t:app::x"
+        && List.all isUnlinked resolved
+        && List.length resolved
+        == 1
+        && not (isUnlinked (Links.internal "app::y" (Uid.toString (uid "u-y"))))
+
+
+isUnlinked : Link -> Bool
+isUnlinked link =
+    case link of
+        Unlinked _ ->
+            True
+
+        Internal _ _ ->
+            False
+
+        External _ ->
+            False
+
+
+-- ── page sizes and the rebuild bound ────────────────────────────────────
+--
+-- A page holds one row at least and `maxRows` at most: 0, -1 and
+-- `maxRows + 1` are refused, both bounds parse, and every constant page size
+-- lies within them. Red if either bound moves.
+pageSizeRefuses : Bool
+pageSizeRefuses =
+    pageRefused 0
+        && pageRefused (-1)
+        && pageRefused (PageSize.maxRows + 1)
+        && pageAccepted 1
+        && pageAccepted PageSize.maxRows
+        && List.all (\size -> pageAccepted (PageSize.toInt size)) [ PageSize.queue, PageSize.history, PageSize.pairs ]
+
+
+pageRefused : Int -> Bool
+pageRefused rows =
+    case PageSize.parse rows of
+        Ok _ ->
+            False
+
+        Err e ->
+            Error.kind e == Error.kind (Error.invalidInput "")
+
+
+pageAccepted : Int -> Bool
+pageAccepted rows =
+    case PageSize.parse rows of
+        Ok size ->
+            PageSize.toInt size == rows
+
+        Err _ ->
+            False
+
+
+-- `pageCeiling` pages of `size` pairs as a bound, or the refusal.
+boundOf : PageSize -> Int -> Result Error Queue.ResyncBound
+boundOf size pageCeiling =
+    Queue.makeResyncBound size pageCeiling
+
+
+boundRefused : PageSize -> Int -> Bool
+boundRefused size pageCeiling =
+    case boundOf size pageCeiling of
+        Ok _ ->
+            False
+
+        Err e ->
+            Error.kind e == Error.kind (Error.invalidInput "")
+
+
+boundAccepted : PageSize -> Int -> Bool
+boundAccepted size pageCeiling =
+    case boundOf size pageCeiling of
+        Ok _ ->
+            True
+
+        Err _ ->
+            False
+
+
+-- A ceiling whose decision count, or whose loop limit `pageCeiling + 1`,
+-- passes the largest `Int` has no bound; the last ceiling under it, and the
+-- production bound, parse. Red if the check multiplies before it compares,
+-- or is off by one.
+resyncBoundRefusesOverflow : Bool
+resyncBoundRefusesOverflow =
+    boundRefused PageSize.queue 9223372036854775807 && overflowEdges
+
+
+overflowEdges : Bool
+overflowEdges =
+    case PageSize.parse 1 of
+        Ok one ->
+            boundRefused one 9223372036854775807
+                && boundAccepted one 9223372036854775806
+                && boundRefused PageSize.pairs (9223372036854775806 // 200 + 1)
+                && boundAccepted PageSize.pairs (9223372036854775806 // 200)
+                && boundAccepted PageSize.pairs Queue.resyncPageCeiling
+
+        Err _ ->
+            False
+
+
+-- A ceiling below one page has no bound. Red if zero or a negative ceiling
+-- parses.
+resyncBoundRefusesZeroCeiling : Bool
+resyncBoundRefusesZeroCeiling =
+    boundRefused PageSize.pairs 0
+        && boundRefused PageSize.pairs (-1)
+        && boundAccepted PageSize.pairs 1
+
+
+-- ── stored review rows ──────────────────────────────────────────────────
+--
+-- A review table built without the decision check, as an older or edited
+-- file may be, holding `rows`. The table has no guards, so
+-- only the reads run against it.
+uncheckedReview : String -> List (List SqlValue) -> Task.Task Error Db
+uncheckedReview name rows =
+    do
+        base <- freshDir name
+        db <- Db.open "sqlite" ("sqlite://" ++ base ++ "/review.db?mode=rwc")
+        Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
+        Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
+        Task.succeed db
+
+
+-- True when `task` fails with an error that names `unit`.
+failsNaming : Uid -> Task.Task Error a -> Task.Task Error Bool
+failsNaming unit task =
+    task
+        |> Task.map (\_ -> False)
+        |> Task.onError (\e -> Task.succeed (String.contains (Uid.toString unit) (Error.toString e)))
+
+
+-- True when `task` fails.
+fails : Task.Task Error a -> Task.Task Error Bool
+fails task =
+    task
+        |> Task.map (\_ -> False)
+        |> Task.onError (\_ -> Task.succeed True)
+
+
+-- A stored decision that is neither `approve` nor `refuse` fails every read
+-- of its row with a typed error naming the row's uid, never reading as an
+-- approval; a stored uid that is not a unit id fails the History page.
+-- Red if an unknown decision reads as any decision.
+unknownStoredDecisionRefused : Task.Task Error Bool
+unknownStoredDecisionRefused =
+    do
+        db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
+        byPair <- failsNaming (uid "u-m") (LibDb.findDecision db (uid "u-m") "h")
+        byUid <- failsNaming (uid "u-m") (LibDb.findLatestForUid db (uid "u-m"))
+        page <- failsNaming (uid "u-m") (LibDb.historyPage db PageSize.history HistoryStart)
+        bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
+        badUid <- fails (LibDb.historyPage bad PageSize.history HistoryStart)
+        Task.succeed (byPair && byUid && page && badUid)
+
+
+-- A stored refusal with a NULL reason reads as a refusal whose reason is
+-- blank, never as an approval. Red if a NULL reason drops the refusal.
+refuseWithNullReasonIsBlank : Task.Task Error Bool
+refuseWithNullReasonIsBlank =
+    do
+        db <- uncheckedReview "ipe-review-null-reason" [ [ Uid.toSql (uid "u-n"), SqlString "h", SqlString "refuse", SqlNull (SqlString ""), SqlInt 1 ] ]
+        found <- LibDb.findDecision db (uid "u-n") "h"
+        Task.succeed (Maybe.map (\row -> blankRefusal row.decision) found == Just True)
+
+
+blankRefusal : StoredDecision -> Bool
+blankRefusal decision =
+    case decision of
+        StoredRefused reason ->
+            SafeText.toString (LibDb.storedReasonText reason) == "reason not shown: it is blank"
+
+        StoredApproved ->
+            False
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ Task.succeed ( "a unit id is exactly 64 lowercase hex digits", uidParseRefuses )
+        , Task.succeed ( "a route uid that is not a unit id is refused before any load", routeUidRefusedNotQueried )
+        , Task.succeed ( "a link target that is not a unit id renders as text", badLinkUidRendersText )
+        , Task.succeed ( "a page size below one row or past the ceiling has no representation", pageSizeRefuses )
+        , Task.succeed ( "a rebuild bound that passes the largest integer has no representation", resyncBoundRefusesOverflow )
+        , Task.succeed ( "a rebuild bound below one page has no representation", resyncBoundRefusesZeroCeiling )
+        , check "a stored decision this reviewer does not know fails its reads, naming the uid" unknownStoredDecisionRefused
+        , check "a stored refusal with no reason reads as a blank refusal" refuseWithNullReasonIsBlank
+        ]

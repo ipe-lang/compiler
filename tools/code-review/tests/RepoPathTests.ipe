@@ -30,7 +30,8 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import Lib.Uid as Uid
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -55,7 +56,7 @@ traversalPathsRejectedIn base =
             (\r ->
                 let
                     tag =
-                        unitViewTag "u-esc" r.units
+                        unitViewTag (uid "u-esc") r.units
                 in
                 String.startsWith "unreadable: " tag
                     && String.contains "escapes its root via `..`" tag
@@ -76,7 +77,7 @@ seedTraversalDb base =
                         (\_ ->
                             Db.exec conn
                                 "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-                                [ SqlString "u-esc"
+                                [ Uid.toSql (uid "u-esc")
                                 , SqlString "ipe:a/../../escape"
                                 , SqlString "fn"
                                 , SqlString "x"
@@ -93,7 +94,7 @@ seedTraversalDb base =
                         (\_ ->
                             Db.exec conn
                                 "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
-                                [ SqlString "u-esc", SqlString "new", SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString "s", SqlInt 1 ]
+                                [ Uid.toSql (uid "u-esc"), SqlString "new", SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString "s", SqlInt 1 ]
                         )
             )
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_DB" (base ++ "/index.db"))
