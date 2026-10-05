@@ -961,6 +961,7 @@ mod tests {
             ("run_jail/mod.rs", include_str!("run_jail/mod.rs")),
             ("run_jail/linux.rs", include_str!("run_jail/linux.rs")),
             ("run_jail/macos.rs", include_str!("run_jail/macos.rs")),
+            ("run_jail/windows.rs", include_str!("run_jail/windows.rs")),
             ("build_jail.rs", include_str!("build_jail.rs")),
             ("covers.rs", include_str!("covers.rs")),
             ("mounts.rs", include_str!("mounts.rs")),

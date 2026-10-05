@@ -52,7 +52,7 @@ pub const MAX_PIN_MOUNTS: NonZeroU32 = ceiling(1024);
 /// The most bytes of entry names one walk holds while it is pending.
 pub const MAX_HELD_NAME_BYTES: NonZeroU32 = ceiling(16 << 20);
 
-// Every legal carve can be pinned: the pin pass is never the first ceiling hit.
+// One pin per legal carve fits; deeper carves can still exceed it, and refuse.
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the pin ceiling drops below the carve ceiling [ledger #boundary]
 const _: () = assert!(MAX_PIN_MOUNTS.get() >= MAX_CARVE_ENTRIES.get());
 
@@ -91,6 +91,14 @@ impl WalkLimits {
             pins: ceiling(pins),
             ..Self::DEFAULT
         }
+    }
+
+    /// Test-only: these ceilings with at most `bytes` of entry names held.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_held_name_bytes(mut self, bytes: u32) -> Self {
+        self.held_name_bytes = ceiling(bytes);
+        self
     }
 
     /// The most ancestor directories a carve's mount plan pins.
@@ -366,40 +374,24 @@ impl WritableTree {
         home: &Home,
         limits: WalkLimits,
     ) -> Result<Self, JailPathError> {
-        let (carve, roots) = Carver::carve(&tree, other_grants, limits)?;
+        Self::parse_probed(tree, other_grants, home, limits, device_of)
+    }
+
+    /// [`Self::parse_under`] with `device` naming the filesystem each held
+    /// directory of the walk lies on.
+    fn parse_probed(
+        tree: CanonicalPath,
+        other_grants: &[&CanonicalPath],
+        home: &Home,
+        limits: WalkLimits,
+        device: DeviceOf,
+    ) -> Result<Self, JailPathError> {
+        let (carve, roots) = Carver::carve(&tree, other_grants, limits, device)?;
         scan_roots(&tree, other_grants, &carve, &roots, home, limits)?;
         Ok(Self {
             tree,
             carve,
             limits,
-        })
-    }
-
-    /// Confirm the tree still holds exactly the carve it was parsed with, and
-    /// its configuration still names no code inside a writable grant.
-    ///
-    /// # Errors
-    /// [`JailPathError::VcsEntryChanged`] when an entry appeared, vanished, or
-    /// was replaced since the parse; any error of [`Self::parse`] the tree now
-    /// raises.
-    pub fn recheck(
-        &self,
-        other_grants: &[&CanonicalPath],
-        home: &Home,
-    ) -> Result<(), JailPathError> {
-        let (now, roots) = Carver::carve(&self.tree, other_grants, self.limits)?;
-        if now == self.carve {
-            return scan_roots(&self.tree, other_grants, &now, &roots, home, self.limits);
-        }
-        let changed = self
-            .carve
-            .0
-            .iter()
-            .find(|was| !now.0.contains(was))
-            .or_else(|| now.0.iter().find(|is| !self.carve.0.contains(is)))
-            .map_or(&self.tree, CarvePath::path);
-        Err(JailPathError::VcsEntryChanged {
-            path: changed.as_path().to_path_buf(),
         })
     }
 
@@ -590,6 +582,7 @@ struct Carver<'g> {
     tree: &'g CanonicalPath,
     grants: Vec<&'g CanonicalPath>,
     limits: WalkLimits,
+    device: DeviceOf,
     carve: VcsCarve,
     roots: Vec<VcsRoot>,
 }
@@ -599,6 +592,7 @@ impl<'g> Carver<'g> {
         tree: &'g CanonicalPath,
         other_grants: &[&'g CanonicalPath],
         limits: WalkLimits,
+        device: DeviceOf,
     ) -> Result<(VcsCarve, Vec<VcsRoot>), JailPathError> {
         let mut carver = Self {
             tree,
@@ -606,6 +600,7 @@ impl<'g> Carver<'g> {
                 .chain(other_grants.iter().copied())
                 .collect(),
             limits,
+            device,
             carve: VcsCarve::default(),
             roots: Vec::new(),
         };
@@ -625,7 +620,7 @@ impl<'g> Carver<'g> {
         let root_path = tree.as_path();
         let root =
             HeldDir::open_root(root_path).map_err(|refusal| walk_unreadable(root_path, refusal))?;
-        let device = device_of(&root, root_path)?;
+        let device = (self.device)(&root, root_path)?;
         let mut budget = Budget::new(self.limits);
         let pending = budget.list(&root, root_path)?;
         let mut stack = vec![Frame {
@@ -671,7 +666,7 @@ impl<'g> Carver<'g> {
             let Some(child) = open_child(&top.dir, &name, &path)? else {
                 continue;
             };
-            if device_of(&child, &path)? != device {
+            if (self.device)(&child, &path)? != device {
                 return Err(JailPathError::VcsWalkCrossDevice { path });
             }
             let pending = match budget.list(&child, &path) {
@@ -890,6 +885,9 @@ fn open_child(
         ) => Err(walk_unreadable(path, refusal)),
     }
 }
+
+/// The filesystem a held directory lies on, compared across one walk.
+type DeviceOf = fn(&HeldDir, &Path) -> Result<Option<u64>, JailPathError>;
 
 /// The device the held directory at `path` lives on (unix).
 #[cfg(unix)]
@@ -1387,25 +1385,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_metadata_dir_replaced_after_the_parse_refuses_on_recheck() {
-        let fixture = fixture("recheck");
-        let grants = [canonical(&fixture.tmp)];
-        let grants: Vec<&CanonicalPath> = grants.iter().collect();
-        let home = Home::unknown();
-        let tree =
-            WritableTree::parse(canonical(&fixture.tree), &grants, &home).expect("empty tree");
-        assert!(tree.recheck(&grants, &home).is_ok());
-        make_dir(&fixture.tree.join(".git"));
-        assert!(
-            matches!(
-                tree.recheck(&grants, &home),
-                Err(JailPathError::VcsEntryChanged { path }) if path == fixture.tree.join(".git")
-            ),
-            "metadata created after the parse is a change"
-        );
-    }
-
     fn parse_under(fixture: &Fixture, limits: WalkLimits) -> Result<WritableTree, JailPathError> {
         WritableTree::parse_under(
             canonical(&fixture.tree),
@@ -1413,36 +1392,6 @@ mod tests {
             &Home::unknown(),
             limits,
         )
-    }
-
-    #[test]
-    fn the_build_jail_recheck_rescans_config() {
-        let fixture = fixture("recheck-config");
-        let git = fixture.tree.join(".git");
-        make_dir(&git);
-        write(
-            &git.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n",
-        );
-        let grants = [canonical(&fixture.tmp)];
-        let grants: Vec<&CanonicalPath> = grants.iter().collect();
-        let home = Home::unknown();
-        let tree =
-            WritableTree::parse(canonical(&fixture.tree), &grants, &home).expect("clean config");
-        assert!(tree.recheck(&grants, &home).is_ok());
-        write(&git.join("config"), "[core]\n\thooksPath = .husky\n");
-        let rechecked = tree.recheck(&grants, &home);
-        assert!(
-            matches!(
-                &rechecked,
-                Err(JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
-                    kind: VcsKind::Git,
-                    named: crate::Named::InGrant(path),
-                    ..
-                })) if *path == fixture.tree.join(".husky")
-            ),
-            "a config edited after the parse refuses on recheck: {rechecked:?}"
-        );
     }
 
     #[test]
@@ -1515,6 +1464,82 @@ mod tests {
                 }) if limit.get() == 2 && *at == fixture.tree.join("c").join(".git")
             ),
             "the third carve refuses: {walked:?}"
+        );
+    }
+
+    #[test]
+    fn walk_refuses_held_name_bytes_ceiling() {
+        let fixture = fixture("walk-held-bytes");
+        write(&fixture.tree.join("aaaa"), "");
+        write(&fixture.tree.join("bbbb"), "");
+        let limits = WalkLimits::DEFAULT.with_held_name_bytes(8);
+        assert!(
+            parse_under(&fixture, limits).is_ok(),
+            "eight bytes of names at a ceiling of eight are held"
+        );
+        write(&fixture.tree.join("cccc"), "");
+        let walked = parse_under(&fixture, limits);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsWalkCeiling {
+                    ceiling: WalkCeiling::HeldNameBytes(limit),
+                    at,
+                }) if limit.get() == 8 && *at == fixture.tree
+            ),
+            "twelve bytes of names refuse: {walked:?}"
+        );
+    }
+
+    #[test]
+    fn walk_refuses_an_absent_root() {
+        let fixture = fixture("walk-absent");
+        let tree = canonical(&fixture.tree);
+        std::fs::remove_dir(&fixture.tree).expect("remove the tree");
+        let walked = WritableTree::parse(tree, &[&canonical(&fixture.tmp)], &Home::unknown());
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsWalkUnreadable {
+                    path,
+                    refusal: OpenRefusal::Absent,
+                }) if *path == fixture.tree
+            ),
+            "a tree that vanished proves no carve: {walked:?}"
+        );
+    }
+
+    /// A stand-in filesystem probe: a directory named `other-fs` lies on a
+    /// device of its own.
+    #[allow(clippy::unnecessary_wraps)] // the probe it stands in for is fallible
+    fn other_fs_device(_dir: &HeldDir, path: &Path) -> Result<Option<u64>, JailPathError> {
+        let other = path.file_name() == Some(std::ffi::OsStr::new("other-fs"));
+        Ok(Some(u64::from(other)))
+    }
+
+    #[test]
+    fn walk_refuses_a_cross_device_dir() {
+        let fixture = fixture("walk-cross-device");
+        let other = fixture.tree.join("sub").join("other-fs");
+        make_dir(&other.join(".git"));
+        let probed = |device: DeviceOf| {
+            WritableTree::parse_probed(
+                canonical(&fixture.tree),
+                &[&canonical(&fixture.tmp)],
+                &Home::unknown(),
+                WalkLimits::DEFAULT,
+                device,
+            )
+        };
+        let same = probed(device_of).expect("one filesystem parses");
+        assert_eq!(carved(&same), vec![other.join(".git")]);
+        let walked = probed(other_fs_device);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsWalkCrossDevice { path }) if *path == other
+            ),
+            "a directory on another filesystem could hide metadata: {walked:?}"
         );
     }
 

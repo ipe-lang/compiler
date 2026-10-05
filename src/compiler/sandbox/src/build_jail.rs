@@ -540,12 +540,7 @@ pub fn build_in_jail(
     // established (a missing primitive, a non-ACL scratch volume gated by the
     // pre-spawn `FILE_PERSISTENT_ACLS` probe, a failed `CreateProcessW`) is a
     // `RunJailDefect` → `Unavailable`; the untrusted build never runs unconfined.
-    match crate::run_jail::build_windows_jailed(
-        profile,
-        mounts.scoped_tmp().as_path(),
-        mounts.working_tree().as_path(),
-        payload,
-    ) {
+    match crate::run_jail::build_windows_jailed(profile, mounts, payload) {
         Ok(code) => JailOutcome::decode(Some(win_exit_to_i32(code))),
         Err(defect) => JailOutcome::Unavailable { defect },
     }

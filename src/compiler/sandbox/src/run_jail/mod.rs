@@ -2333,6 +2333,33 @@ mod tests {
     }
 
     #[test]
+    fn a_config_edited_after_the_mount_recheck_refuses_at_argv_time() {
+        let fixture = tree_fixture("run-jail-recheck-then-argv");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let first = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(first.is_ok(), "a clean config builds: {first:?}");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        assert_eq!(
+            fixture.mounts.recheck(),
+            Ok(()),
+            "the mount recheck proves paths, never the tree's configuration"
+        );
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the argv builder parses the tree after the mounts were rechecked: {refused:?}"
+        );
+    }
+
+    #[test]
     fn vcs_config_refusal_display_is_escaped() {
         let path = std::path::PathBuf::from("/tree/a\nb");
         let refusal = crate::ConfigRefusal::ConfigInGrant {
