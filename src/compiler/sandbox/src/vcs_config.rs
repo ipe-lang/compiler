@@ -3405,7 +3405,7 @@ fn hg_route(setting: &Setting, value: &str) -> Route {
                 route_of(consume, value)
             }),
         Setting::Include => Route::Judge(Role::Include(Reading::Always)),
-        Setting::Line(_) => Route::Judge(Role::Words(Runner::None)),
+        Setting::Line(_) => Route::Judge(Role::Unknown),
     }
 }
 
@@ -4539,6 +4539,7 @@ mod tests {
             "[merge-tools]\nkdiff3.regkey = SoftwareKDiff3\n".to_owned(),
             "[hooks]\ncommit:frob = x\n".to_owned(),
             "[pager]\nattend- = x\n".to_owned(),
+            "[merge-tools]\nkdiff3.regappend = \\..\\..\\evil.exe\n".to_owned(),
         ] {
             let result = scan_hg(&f, &text);
             assert_eq!(

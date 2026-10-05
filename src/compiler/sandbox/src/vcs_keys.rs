@@ -1654,7 +1654,6 @@ const HG: &[Row] = &[
     ("merge-tools.<name>.mergemarkertemplate", INERT), // mercurial/filemerge.py:43 _toolstr
     ("merge-tools.<name>.premerge", INERT), // mercurial/filemerge.py:421 _toolstr
     ("merge-tools.<name>.priority", INERT), // mercurial/filemerge.py:249 _toolstr
-    ("merge-tools.<name>.regappend", INERT), // mercurial/filemerge.py:159 _toolstr
     ("merge-tools.<name>.symlink", INERT), // mercurial/filemerge.py:186 _toolstr
     ("merge.checkignored", INERT),       // mercurial/merge.py:1705 config
     ("merge.checkunknown", INERT),       // mercurial/merge.py:1706 config
@@ -2069,6 +2068,10 @@ const HG_UNDOCUMENTED: &[(&str, &str)] = &[
 /// The settings the Mercurial snapshot lists that no row decides, each with why.
 #[cfg(test)]
 const HG_UNDECIDED: &[(&str, &str)] = &[
+    (
+        "merge-tools.<name>.regappend",
+        "appended to a registry path Mercurial then runs",
+    ),
     ("absorb.amend-flag", "no reader in Mercurial 7.2.4 is cited"),
     (
         "acl.allow.*",
