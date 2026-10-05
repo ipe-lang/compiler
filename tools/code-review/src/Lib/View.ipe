@@ -1,4 +1,4 @@
-module Lib.View exposing (view)
+module Lib.View exposing (displayOrderCss, escapeCss, view)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
@@ -18,7 +18,7 @@ import Lib.Highlight as Highlight exposing (Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
-import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
 
 
@@ -154,7 +154,7 @@ decisionErrorBanner : Model -> Ui.Element Msg
 decisionErrorBanner model =
     case model.decisionError of
         Just err ->
-            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (Ui.text ("Decision save failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString err))))
+            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.concat [ SafeText.literal "Decision save failed: ", SafeText.renderForeign (Error.toString err) ]))
 
         Nothing ->
             Ui.none
@@ -630,10 +630,37 @@ previousLabel row =
 
 -- The one sink for text that came from the index, the review database or
 -- the environment: it takes only `SafeText`, so such text cannot be shown
--- raw.
+-- raw. It draws in byte order (`displayOrderCss`) and marks every escape the
+-- tool wrote (`escapeCss`), so no text the tool received can pass for one.
 safeText : SafeText -> Ui.Element msg
 safeText text =
-    Ui.text (SafeText.toString text)
+    Ui.html (Html.span [ Attr.style displayOrderCss ] (List.map segmentHtml (SafeText.segments text)))
+
+
+segmentHtml : Segment -> Html.Html msg
+segmentHtml seg =
+    case seg of
+        Verbatim s ->
+            Html.text s
+
+        Escaped c ->
+            Html.span [ Attr.attribute "data-review-escape" "true", Attr.style escapeCss ] [ Html.text (SafeText.escapeSpelling c) ]
+
+
+-- The CSS every untrusted-text element carries: its characters are drawn in
+-- byte (logical) order, so strong right-to-left letters cannot reorder the
+-- neutral characters around them, and two right-to-left name segments around
+-- `::` cannot swap.
+displayOrderCss : String
+displayOrderCss =
+    "unicode-bidi:bidi-override;direction:ltr"
+
+
+-- The CSS of an escape the tool wrote: a boxed, tinted run that no source
+-- character draws like.
+escapeCss : String
+escapeCss =
+    "background-color:#4a3410;border:1px solid #c98a2b;border-radius:2px;color:#ffd27a"
 
 
 chip : SafeText -> Ui.Element Msg
@@ -798,12 +825,10 @@ numberedLine lang ( n, line ) =
 tokenEl : Highlight.Token -> Ui.Element Msg
 tokenEl tok =
     Ui.el
-        ([ Font.family Font.monospace
+        [ Font.family Font.monospace
         , Font.size 12
         , Font.color (tokenColor tok)
         ]
-            ++ List.map (\( k, v ) -> Ui.style k v) Highlight.sourceTokenStyle
-        )
         (safeText (Highlight.tokenText tok))
 
 

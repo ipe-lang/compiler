@@ -143,10 +143,30 @@ hostileText =
 
 
 -- `hostileText` as it must reach the browser: the tag escaped by the HTML
--- sink and the override spelled out by the display scrub.
+-- sink and the override spelled out by the display scrub, inside the marked
+-- element only a tool-written escape draws in.
 hostileEscaped : String
 hostileEscaped =
-    "&lt;script&gt;alert(1)&lt;/script&gt;" ++ renderedForeign (codeText 8238)
+    "&lt;script&gt;alert(1)&lt;/script&gt;" ++ escapeMarkup (renderedForeign (codeText 8238))
+
+
+-- A tool-written escape as the markup spells it.
+escapeMarkup : String -> String
+escapeMarkup spelled =
+    "<span data-review-escape=\"true\" style=\"" ++ View.escapeCss ++ "\">" ++ spelled ++ "</span>"
+
+
+-- The opening of an untrusted-text element: it draws in byte order.
+byteOrderOpen : String
+byteOrderOpen =
+    "<span style=\"" ++ View.displayOrderCss ++ "\">"
+
+
+-- True when `html` draws `hostileText`, right after `prefix`, at the start of
+-- an element that draws in byte order.
+hostileInByteOrder : String -> String -> Bool
+hostileInByteOrder prefix html =
+    has (byteOrderOpen ++ prefix ++ hostileEscaped) html
 
 
 -- True when `html` carries `hostileText` escaped and neither raw form.
@@ -360,6 +380,7 @@ refuseErrorEscaped loaded =
             page { opened | refuseError = Just (Error.invalidInput "needs a reason") }
     in
     escapesHostile hostile
+        && hostileInByteOrder "" hostile
         && button "Confirm" hostile
         && has "needs a reason" plain
         && button "Confirm" plain
@@ -378,7 +399,7 @@ decisionErrorEscaped loaded =
         plain =
             page { card | decisionError = Just (Error.invalidInput "disk full") }
     in
-    has "Decision save failed: " hostile
+    has (byteOrderOpen ++ "Decision save failed: ") hostile
         && escapesHostile hostile
         && has "Decision save failed: " plain
         && has "disk full" plain
@@ -487,6 +508,8 @@ seededChecks a b =
     , ( "a hostile unit name is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostileName)) && escapesHostile (page (unitPageModel "x" hostileName)) )
     , ( "a hostile unit path is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostilePath)) && escapesHostile (page (unitPageModel "x" hostilePath)) )
     , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
+    , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel "x" hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
+    , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
@@ -504,10 +527,16 @@ showsNoStateText html =
 
 
 -- ── a hostile source token ──────────────────────────────────────────────
--- The fixture unit's four lines with a comment holding `hostileText`.
+-- The fixture unit's four lines with a comment holding `hostileText`, then the
+-- six ASCII characters of an escape spelling and the real U+200B it names.
 hostileView : String
 hostileView =
-    "pub fn answer() -> i32 {\n    // " ++ hostileText ++ "\n    42\n}"
+    "pub fn answer() -> i32 {\n    // " ++ hostileText ++ asciiSpelling ++ codeText 8203 ++ "\n    42\n}"
+
+
+asciiSpelling : String
+asciiSpelling =
+    " \\u{200b}x"
 
 
 -- The fixture library with lines 3..6 replaced by `hostileView`, and the
@@ -526,6 +555,8 @@ hostileSourceChecks =
             [ ( "the hostile fixture source is verified and shown", isShown loaded )
             , ( "a hostile source token is escaped on the queue page", escapesHostile (page (cardModel loaded)) )
             , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel "x" loaded)) )
+            , ( "a hostile source token draws in byte order", hostileInByteOrder "// " (page (cardModel loaded)) && hostileInByteOrder "// " (page (unitPageModel "x" loaded)) )
+            , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             ]
 
