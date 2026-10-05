@@ -15,11 +15,12 @@ ipe_canon = { path = "../canon" }
 ipe_kernels = { path = "../kernels" }
 # `EnumCount` for `StdlibKernel::COUNT`, sizing the per-kernel scheme memo.
 strum = { version = "0.26" }
+# Leaf-side crate (deps: intern, diagnostics, kernels) → no cycle. The show
+# gate and the transparent-FFI-union classifier read the lowerer's own tables.
+ipe_ir = { path = "../ir" }
 
 [dev-dependencies]
 ipe_parse = { path = "../parse" }
-# `SHOWN_LEAVES`: the show gate is pinned against the compiler's show table.
-ipe_ir = { path = "../ir" }
 
 [lints]
 workspace = true
