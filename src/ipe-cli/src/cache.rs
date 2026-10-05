@@ -2802,6 +2802,15 @@ mod tests {
     }
 
     /// A FIFO is refused by its shape rather than opened (which would block).
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo must create the FIFO");
+    }
+
     #[test]
     #[cfg(unix)]
     fn hash_tree_refuses_a_fifo() {
@@ -2812,11 +2821,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create base");
-        let made = std::process::Command::new("mkfifo")
-            .arg(base.join("pipe.ipe"))
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo must create the FIFO");
+        make_fifo(&base.join("pipe.ipe"));
 
         let result = hash_tree(&base);
         let _ = std::fs::remove_dir_all(&base);
@@ -2976,11 +2981,7 @@ mod tests {
         let base = two_file_tree("swap-file-fifo");
         let (held, files) = walked(&base);
         std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
-        let made = std::process::Command::new("mkfifo")
-            .arg(base.join("Main.ipe"))
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo must create the FIFO");
+        make_fifo(&base.join("Main.ipe"));
 
         let (send, receive) = std::sync::mpsc::channel();
         let hashed_base = base.clone();
