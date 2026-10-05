@@ -127,7 +127,7 @@ refusalName err =
         DuplicateTag _ ->
             "duplicate-tag"
 
-        DuplicateRoot ->
+        DuplicateRoot _ _ ->
             "duplicate-root"
 
         ClaimedByDeeperRoot _ ->
@@ -509,8 +509,8 @@ withForeign stored e err =
         DuplicateTag _ ->
             DuplicateTag stored
 
-        DuplicateRoot ->
-            DuplicateRoot
+        DuplicateRoot _ _ ->
+            DuplicateRoot stored stored
 
         ClaimedByDeeperRoot _ ->
             ClaimedByDeeperRoot stored
@@ -531,7 +531,7 @@ allPathErrors =
     , NotUnderRoot "" e
     , NoRoots
     , DuplicateTag ""
-    , DuplicateRoot
+    , DuplicateRoot "" ""
     , ClaimedByDeeperRoot ""
     , TooManyRoots
     ]
@@ -637,8 +637,21 @@ sameRootTwoTagsRefused =
             (mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "b", slash ) ])
                 && mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "b", dotted ) ])
                 && mapRefusedAs "duplicate-root" (mapResult [ ( "a", plain ), ( "c", other ), ( "b", slash ) ])
+                && mapRefusalIs (DuplicateRoot "a" "b") (mapResult [ ( "a", plain ), ( "c", other ), ( "b", slash ) ])
+                && mapRefusalIs (DuplicateRoot "b" "a") (mapResult [ ( "b", dotted ), ( "c", other ), ( "a", plain ) ])
                 && not (mapRefused (mapResult [ ( "a", plain ), ( "b", other ) ]))
             )
+
+
+-- The map was refused with exactly `expected`.
+mapRefusalIs : PathError -> Result PathError RootMap -> Bool
+mapRefusalIs expected result =
+    case result of
+        Ok _ ->
+            False
+
+        Err err ->
+            describeText err == describeText expected
 
 
 mapRefused : Result PathError RootMap -> Bool

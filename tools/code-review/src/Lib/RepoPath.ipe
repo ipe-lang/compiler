@@ -68,8 +68,8 @@ type RootMap
 -- rules live in `Ipe.Path` alone. `UnknownTag` is a well-formed tag the map
 -- does not bind; `ClaimedByDeeperRoot` is a path that lies at or under a
 -- declared root deeper than its own tag's, which owns it. `NoRoots`,
--- `DuplicateTag`, `DuplicateRoot` (two tags on one directory) and
--- `TooManyRoots` refuse a map's construction.
+-- `DuplicateTag`, `DuplicateRoot` (two tags on one directory, named in
+-- binding order) and `TooManyRoots` refuse a map's construction.
 type PathError
     = MissingTag String
     | UnknownTag String
@@ -77,7 +77,7 @@ type PathError
     | NotUnderRoot String Error
     | NoRoots
     | DuplicateTag String
-    | DuplicateRoot
+    | DuplicateRoot String String
     | ClaimedByDeeperRoot String
     | TooManyRoots
 
@@ -125,9 +125,9 @@ rootMap bindings =
                     entries =
                         List.map entryOf bindings
                 in
-                case firstDuplicate (List.map (\entry -> String.join "/" entry.segments) entries) of
-                    Just _ ->
-                        Err DuplicateRoot
+                case firstSharedRoot entries of
+                    Just ( first, second ) ->
+                        Err (DuplicateRoot (tagName first.tag) (tagName second.tag))
 
                     Nothing ->
                         Ok (RootMap (List.map (bindingOf entries) entries))
@@ -182,6 +182,29 @@ startsWith prefix whole =
 strictlyBelow : List String -> List String -> Bool
 strictlyBelow outer inner =
     List.length inner > List.length outer && startsWith outer inner
+
+
+-- The first entry whose ownership key an earlier entry already holds, with
+-- that earlier entry.
+firstSharedRoot : List Entry -> Maybe ( Entry, Entry )
+firstSharedRoot entries =
+    List.foldl
+        (\entry ( seen, found ) ->
+            case found of
+                Just _ ->
+                    ( seen, found )
+
+                Nothing ->
+                    case List.find (\earlier -> earlier.segments == entry.segments) seen of
+                        Just earlier ->
+                            ( seen, Just ( earlier, entry ) )
+
+                        Nothing ->
+                            ( entry :: seen, Nothing )
+        )
+        ( [], Nothing )
+        entries
+        |> Tuple.second
 
 
 firstDuplicate : List String -> Maybe String
@@ -386,8 +409,14 @@ describe err =
         DuplicateTag tag ->
             SafeText.concat [ SafeText.literal "repo tag ", SafeText.quoted tag, SafeText.literal " is bound to more than one root" ]
 
-        DuplicateRoot ->
-            SafeText.literal "two repo tags are bound to one directory"
+        DuplicateRoot first second ->
+            SafeText.concat
+                [ SafeText.literal "repo tags "
+                , SafeText.quoted first
+                , SafeText.literal " and "
+                , SafeText.quoted second
+                , SafeText.literal " are bound to one directory; bind each directory to one tag"
+                ]
 
         ClaimedByDeeperRoot stored ->
             SafeText.concat
