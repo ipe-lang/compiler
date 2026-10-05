@@ -1,0 +1,89 @@
+module Lib.App exposing (Model, Msg(..), Page(..), queueList, selectedUid, selectedUnit)
+
+import Ipe.Error exposing (Error)
+import Ipe.List as List
+import Ipe.Result exposing (Result)
+import Lib.Db as LibDb
+import Lib.Index as Index
+import Lib.Queue as Queue exposing (QueueState(..))
+import Lib.Uid exposing (Uid)
+
+
+type Page
+    = QueuePage
+    | HistoryPage
+    | UnitPage String
+
+
+-- `queueCursor` is where the shown queue page starts; a reload after a
+-- decision re-reads that page only. The Model is plain data persisted to the
+-- session store; the startup settings are not part of it and reach every
+-- handler as its first argument.
+type alias Model =
+    { page : Page
+    , queueState : Queue.QueueState
+    , queueCursor : Index.Cursor
+    , refusingUid : Maybe Uid
+    , refuseDraft : String
+    , refuseError : Maybe Error
+    , decisionError : Maybe Error
+    , queueLoad : Queue.LoadTicket
+    , history : Queue.HistoryState
+    , historyLoad : Queue.LoadTicket
+    , unitPage : Queue.UnitPageState
+    , unitLoad : Queue.LoadTicket
+    , selected : Int
+    , selectedView : Queue.SelectedView
+    }
+
+
+type Msg
+    = PendingLoaded Queue.LoadTicket (Result Error Queue.QueuePage)
+    | NextPage Index.Cursor
+    | ApproveUnit Uid
+    | RefuseStart Uid
+    | RefuseDraft String
+    | RefuseCancel
+    | RefuseSubmit Uid
+    | DecisionSaved Uid (Result Error ( Index.Attested, Index.Written ))
+    | Navigated Page
+    | ShowQueue
+    | ShowHistory
+    | HistoryPageLoaded Queue.LoadTicket (Result Error Queue.HistoryPage)
+    | HistoryNext LibDb.HistoryCursor
+    | UnitViewLoaded Queue.LoadTicket (Result Error (Maybe Index.UnitView))
+    | SelectedViewLoaded Uid (Result Error (Maybe Index.UnitView))
+    | KeyDown String
+    | SelectUnit Int
+
+
+-- The shown page's units, for selection and decisions; a queue that is not
+-- loaded has none to act on. What the view renders comes from
+-- `Queue.queueStatusText`, so this list never stands for "empty".
+queueList : Model -> List Queue.QueuedUnit
+queueList model =
+    case model.queueState of
+        Loaded page ->
+            page.units
+
+        Loading ->
+            []
+
+        Failed _ ->
+            []
+
+
+-- The queue card at the selected index, if the shown page has one.
+selectedUnit : Model -> Maybe Queue.QueuedUnit
+selectedUnit model =
+    List.head (List.drop model.selected (queueList model))
+
+
+selectedUid : Model -> Maybe Uid
+selectedUid model =
+    case selectedUnit model of
+        Just q ->
+            Just q.unit.uid
+
+        Nothing ->
+            Nothing
