@@ -29,7 +29,8 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom)
+import Lib.Uid as Uid exposing (Uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, uid)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -70,7 +71,20 @@ viewTagsAfter name mutate =
         mutate at
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
-        Task.succeed (List.map (\u -> u.uid ++ "=" ++ viewTag u.view) r.units)
+        Task.succeed (List.map (\u -> fixtureLabel u.uid ++ "=" ++ viewTag u.view) r.units)
+
+
+-- The fixture label of a seeded unit id, or the id itself for any other.
+fixtureLabel : Uid -> String
+fixtureLabel unit =
+    if unit == uid "u-a" then
+        "u-a"
+
+    else if unit == uid "u-b" then
+        "u-b"
+
+    else
+        Uid.toString unit
 
 
 -- True for an `Unreadable` view tag whose rendered error contains `needle`.
@@ -98,7 +112,7 @@ rangePastFileIsStale =
         (\at ->
             execIndex at.indexDb
                 "UPDATE units SET line_start = ?, line_end = ?, body_hash = ? WHERE uid = ?"
-                [ SqlInt 9, SqlInt 11, SqlString (Index.attest "    7\n}"), SqlString "u-a" ]
+                [ SqlInt 9, SqlInt 11, SqlString (Index.attest "    7\n}"), Uid.toSql (uid "u-a") ]
         )
         |> Task.map (\tags -> List.member "u-a=range 10" tags)
 
@@ -116,7 +130,7 @@ legacyHashUnverifiable =
             (\stored ->
                 viewTagsAfter
                     "ipe-index-attest-legacy"
-                    (\at -> execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString stored, SqlString "u-a" ])
+                    (\at -> execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString stored, Uid.toSql (uid "u-a") ])
                     |> Task.map (\tags -> List.member "u-a=unverifiable" tags)
             )
         |> Task.sequence
@@ -161,7 +175,7 @@ oversizedSourceRefusedIn base =
         writeFileText (repo ++ "/src/Lib.rs") (String.repeat (16 * 1024 * 1024 + 1) "x")
         r <- loadFirstPage
         cleanupIndex indexDb repo
-        Task.succeed (unreadableNaming "16777216-byte limit" (unitViewTag "u-a" r.units))
+        Task.succeed (unreadableNaming "16777216-byte limit" (unitViewTag (uid "u-a") r.units))
 
 
 -- The unit page's data path: a uid that exists loads with its source and
@@ -192,7 +206,7 @@ unitPageLoadIn base =
         |> Task.andThen (\_ -> setIndexEnv indexDb repo)
         |> Task.andThen
             (\_ ->
-                loadUnitNow "u-a"
+                loadUnitNow (uid "u-a")
                     |> Task.andThen
                         (\mb ->
                             case mb of
@@ -217,7 +231,7 @@ unitPageLoadIn base =
                     Task.succeed False
 
                 else
-                    loadUnitNow "u-zz"
+                    loadUnitNow (uid "u-zz")
                         |> Task.map
                             (\mb ->
                                 case mb of
@@ -325,11 +339,11 @@ pageReadsNoSource =
         conn <- indexConn
         rows <- pendingRows conn
         settings <- envSettings
-        found <- Index.loadView conn settings.roots "u-b"
+        found <- Index.loadView conn settings.roots (uid "u-b")
         cleanupIndex at.indexDb at.repo
         Task.succeed
             (List.map (\r -> r.unit.uid) rows
-                == [ "u-a", "u-b" ]
+                == [ uid "u-a", uid "u-b" ]
                 && String.startsWith "unreadable: " (loadedViewTag found)
             )
 
@@ -357,7 +371,7 @@ langFromFilesTable =
         conn <- indexConn
         rows <- pendingRows conn
         cleanupIndex at.indexDb at.repo
-        Task.succeed (List.map (\r -> r.unit.uid ++ "=" ++ langName r.unit.lang) rows == [ "u-a=Rust", "u-b=Unknown" ])
+        Task.succeed (List.map (\r -> fixtureLabel r.unit.uid ++ "=" ++ langName r.unit.lang) rows == [ "u-a=Rust", "u-b=Unknown" ])
 
 
 -- An index with no `files` table stops startup naming `IPE_INDEX_DB`. Red if
@@ -409,16 +423,16 @@ unrecordedUnitListed =
         at <- freshScratch "ipe-index-unrecorded"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        execIndex at.indexDb "DELETE FROM change_queue WHERE uid = ?" [ SqlString "u-a" ]
+        execIndex at.indexDb "DELETE FROM change_queue WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed
             (r.total
                 == 2
                 && List.map (\e -> e.uid) r.units
-                == [ "u-a", "u-b" ]
-                && List.all (\e -> e.uid /= "u-a" || isUnrecorded e.change) r.units
-                && List.all (\e -> e.uid /= "u-b" || modifiedFrom e.change == Just "oldB") r.units
+                == [ uid "u-a", uid "u-b" ]
+                && List.all (\e -> e.uid /= uid "u-a" || isUnrecorded e.change) r.units
+                && List.all (\e -> e.uid /= uid "u-b" || modifiedFrom e.change == Just "oldB") r.units
             )
 
 
@@ -427,7 +441,7 @@ unrecordedUnitListed =
 -- in a missing `old_hash`.
 changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
 changeDecodeRefusesModifiedWithoutOld =
-    pageReadFailsAfter "ipe-index-modified-no-old" "UPDATE change_queue SET old_hash = NULL WHERE uid = 'u-b'"
+    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
 
 
 -- An index whose view reports a change kind this reviewer does not know, or
@@ -537,7 +551,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "pageSize", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownText", "storedHash", "viewText" ]
+    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownText", "storedHash", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.

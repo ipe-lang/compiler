@@ -30,7 +30,8 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import Lib.Uid as Uid
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- Every member of the runtime's `is_log_hazard` set as it stood before the
@@ -256,12 +257,12 @@ indexTextRendered =
             , SqlString ("fn" ++ codeText 27)
             , SqlString ("internal" ++ codeText 8294)
             , SqlString ("purpose" ++ codeText 8207 ++ "A")
-            , SqlString "u-a"
+            , Uid.toSql (uid "u-a")
             ]
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (case List.find (\e -> e.uid == "u-a") r.units of
+            (case List.find (\e -> e.uid == uid "u-a") r.units of
                 Just entry ->
                     indexUnitRendered entry.unit
 
@@ -300,7 +301,7 @@ sourceTokensRendered =
             String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
 
         label =
-            [ Links.internal ("Lib." ++ rlo ++ "x") "u-x" ]
+            [ Links.internal ("Lib." ++ rlo ++ "x") (Uid.toString (uid "u-x")) ]
                 |> List.map (\l -> SafeText.toString (Links.label l))
     in
     List.all

@@ -1,0 +1,58 @@
+module Lib.PageSize exposing (PageSize, history, maxRows, pairs, parse, queue, toInt)
+
+-- How many rows one page read may return: at least one, at most `maxRows`.
+-- Opaque: built only by `parse` and the constants below, so a page size of
+-- zero, a negative one or one past the ceiling has no representation, and no
+-- reader re-checks it. `toInt` is the exit, used at the SQL `LIMIT` sink and
+-- for the short-page test.
+
+import Ipe.Error as Error
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+
+
+type PageSize
+    = PageSize Int
+
+
+-- The most rows any one page read returns.
+maxRows : Int
+maxRows =
+    1000
+
+
+parse : Int -> Result Error PageSize
+parse rows =
+    if rows < 1 then
+        Err (Error.invalidInput ("a page holds at least one row; the page size is " ++ String.fromInt rows))
+
+    else if rows > maxRows then
+        Err (Error.invalidInput ("a page holds at most " ++ String.fromInt maxRows ++ " rows; the page size is " ++ String.fromInt rows))
+
+    else
+        Ok (PageSize rows)
+
+
+-- One queue page of open units.
+queue : PageSize
+queue =
+    PageSize 200
+
+
+-- One History page of review rows.
+history : PageSize
+history =
+    PageSize 100
+
+
+-- One page of decided pairs a progress rebuild reads.
+pairs : PageSize
+pairs =
+    PageSize 200
+
+
+toInt : PageSize -> Int
+toInt size =
+    case size of
+        PageSize rows ->
+            rows
