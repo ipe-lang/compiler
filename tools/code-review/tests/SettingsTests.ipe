@@ -510,6 +510,162 @@ settingsExports source =
             False
 
 
+-- The startup settings never ride in session state. The session `Model` is
+-- persisted, and every type it can hold is declared in a module of `src`,
+-- so no `type` declaration in `src` may name a settings-carrying type except
+-- the declarations that define the settings themselves (`admittedCarriers`).
+-- The scan reads each declaration whole, from its `type` line to the next
+-- line at column 0, and judges every word by its unqualified name, so a
+-- qualified or wrapped spelling (`Settings.AppSettings`,
+-- `Maybe RepoPath.RootMap`) is caught alike. `tests/Main.ipe` is this
+-- suite's entry, so `src/Main.ipe` cannot be compiled here to round-trip its
+-- `Model`; its source is scanned instead, and the scan must find `Model`
+-- there. Red while the `Model` holds a `settings` field.
+settingsNeverInSessionState : Task.Task Error Bool
+settingsNeverInSessionState =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        Task.succeed
+            (layoutAdmits topNames libNames
+                && stateAdmitted sources
+                && not (stateAdmitted (withModelField sources))
+                && not (stateAdmitted (appendTo "Main.ipe" "type alias Held =\n    { settings : Settings.AppSettings\n    }" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Index.ipe" "type alias Held =\n    { roots : Maybe RepoPath.RootMap }" sources))
+                && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.DbLocation)" sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Main.ipe") sources))
+            )
+
+
+-- `sources` with a `settings` field added to the `Model` declaration of
+-- `Main`, the shape a session carrying the startup settings takes.
+withModelField : List ( String, String ) -> List ( String, String )
+withModelField sources =
+    List.map
+        (\( rel, text ) ->
+            if rel == "Main.ipe" then
+                ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
+
+            else
+                ( rel, text )
+        )
+        sources
+
+
+-- The types that carry a configured location, by unqualified name.
+settingsCarriers : List String
+settingsCarriers =
+    [ "AppSettings", "IndexSettings", "DbLocation", "RootMap", "Root", "Binding", "Entry" ]
+
+
+-- The declarations admitted to name a settings carrier: the ones that
+-- define the settings, each in its own module.
+admittedCarriers : List ( String, List String )
+admittedCarriers =
+    [ ( "Lib/Settings.ipe", [ "IndexSettings", "AppSettings" ] )
+    , ( "Lib/RepoPath.ipe", [ "Root", "Entry", "Binding", "RootMap" ] )
+    ]
+
+
+-- `Main` declares a `Model`, and no declaration outside `admittedCarriers`
+-- names a settings carrier.
+stateAdmitted : List ( String, String ) -> Bool
+stateAdmitted sources =
+    List.any (\( rel, text ) -> rel == "Main.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+        && List.all
+            (\( rel, text ) ->
+                List.all
+                    (\( name, words ) -> declarationAdmitted rel name || not (List.any namesCarrier words))
+                    (typeDeclarations text)
+            )
+            sources
+
+
+declarationAdmitted : String -> String -> Bool
+declarationAdmitted rel name =
+    List.any (\( file, names ) -> file == rel && List.member name names) admittedCarriers
+
+
+-- A word naming a settings carrier, qualified or not.
+namesCarrier : String -> Bool
+namesCarrier word =
+    case List.head (List.reverse (String.split "." word)) of
+        Just last ->
+            List.member last settingsCarriers
+
+        Nothing ->
+            False
+
+
+-- A `type` declaration: its name and every word of it.
+type alias Declaration =
+    ( String, List String )
+
+
+-- The declarations closed so far, newest first, and the one being read.
+type alias DeclarationScan =
+    ( List Declaration, Maybe Declaration )
+
+
+-- Every `type` declaration of `text`, from its `type` line up to the next
+-- line starting at column 0.
+typeDeclarations : String -> List Declaration
+typeDeclarations text =
+    let
+        ( closed, current ) =
+            List.foldl declarationStep ( [], Nothing ) (String.lines text)
+    in
+    List.reverse (closeDeclaration current closed)
+
+
+declarationStep : String -> DeclarationScan -> DeclarationScan
+declarationStep line ( closed, current ) =
+    if String.startsWith "type " line then
+        ( closeDeclaration current closed, Just ( declarationName line, typeWords line ) )
+
+    else if line /= "" && not (String.startsWith " " line) then
+        ( closeDeclaration current closed, Nothing )
+
+    else
+        case current of
+            Just ( name, words ) ->
+                ( closed, Just ( name, words ++ typeWords line ) )
+
+            Nothing ->
+                ( closed, Nothing )
+
+
+closeDeclaration : Maybe Declaration -> List Declaration -> List Declaration
+closeDeclaration current closed =
+    case current of
+        Just declaration ->
+            declaration :: closed
+
+        Nothing ->
+            closed
+
+
+declarationName : String -> String
+declarationName line =
+    String.words line
+        |> List.filter (\word -> word /= "type" && word /= "alias")
+        |> List.head
+        |> Maybe.withDefault ""
+
+
+-- The words of one declaration line, with type punctuation read as space.
+typeWords : String -> List String
+typeWords line =
+    String.words (List.foldl (\mark text -> String.replace mark " " text) line [ "->", "{", "}", "(", ")", "[", "]", ",", ":", "|", "=" ])
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -521,4 +677,5 @@ checks =
         , check "startup probes name the variable and the file" probesNameTheirVariable
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
+        , check "no session state type carries the startup settings" settingsNeverInSessionState
         ]
