@@ -34,7 +34,9 @@ pub use vcs_config::{
     scan as scan_vcs_config,
 };
 pub use vcs_metadata::{
-    CarvePath, JailArm, POINTER_CAP, PointerFault, VcsCarve, VcsKind, WritableTree,
+    CarvePath, JailArm, MAX_CARVE_ENTRIES, MAX_DEPTH, MAX_HELD_NAME_BYTES, MAX_PIN_MOUNTS,
+    MAX_WALK_ENTRIES, POINTER_CAP, PointerFault, VcsCarve, VcsKind, WalkCeiling, WalkLimits,
+    WritableTree,
 };
 
 pub mod build_jail;

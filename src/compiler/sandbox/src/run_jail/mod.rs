@@ -2244,6 +2244,49 @@ mod tests {
         );
     }
 
+    /// Whether `argv` binds `tree` read-write over itself.
+    fn binds_tree(argv: &[String], tree: &CanonicalPath) -> bool {
+        let tree = tree.as_path().to_string_lossy();
+        argv.windows(3).any(
+            |w| matches!(w, [flag, from, to] if flag == "--bind" && *from == tree && *to == tree),
+        )
+    }
+
+    #[test]
+    fn one_mount_set_serves_both_scopes() {
+        let fixture = tree_fixture("run-jail-both-scopes");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let isolated =
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).expect("isolated argv");
+        assert!(
+            !binds_tree(&isolated, &fixture.tree),
+            "an isolated profile binds no tree: {isolated:?}"
+        );
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite)
+            .expect("granted argv");
+        assert!(
+            binds_tree(&granted, &fixture.tree),
+            "a granted profile binds the tree: {granted:?}"
+        );
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the same mounts scan the granted tree: {refused:?}"
+        );
+        assert!(
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).is_ok(),
+            "the same mounts still serve an isolated profile"
+        );
+    }
+
     #[test]
     fn the_jail_rescans_config_at_every_build() {
         let fixture = tree_fixture("run-jail-rescan");

@@ -22,8 +22,11 @@ use std::path::{Path, PathBuf};
 
 use crate::home::{HomeDir, HomeRefusal, RelativeToolHome, ToolHome};
 use crate::run_jail::FilesystemScope;
+use ipe_diagnostics::terminal::is_display_hazard;
+use ipe_fs_open::OpenRefusal;
+
 use crate::vcs_config::ConfigRefusal;
-use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WritableTree};
+use crate::vcs_metadata::{JailArm, PointerFault, VcsKind, WalkCeiling, WritableTree};
 
 /// Directories masked in every jail, whoever the invoker is.
 const STATIC_MASKS: [&str; 3] = ["/home", "/root", "/tmp"];
@@ -93,7 +96,60 @@ pub enum JailPathError {
     /// carved metadata names, or may name, code inside a writable grant, or
     /// cannot be read.
     VcsConfig(ConfigRefusal),
+    /// A writable working tree holds more entries, nests deeper, or holds more
+    /// metadata than one walk proves, so metadata past the ceiling could go
+    /// uncarved.
+    VcsWalkCeiling {
+        /// The ceiling reached, with its limit.
+        ceiling: WalkCeiling,
+        /// The directory or entry the walk was at.
+        at: PathBuf,
+    },
+    /// A directory inside a writable working tree cannot be opened or listed,
+    /// so metadata inside it could go uncarved.
+    VcsWalkUnreadable {
+        /// The directory.
+        path: PathBuf,
+        /// Why it cannot be opened or listed.
+        refusal: OpenRefusal,
+    },
+    /// A directory inside a writable working tree is on another filesystem
+    /// than the tree's root, which the walk does not enter blind.
+    VcsWalkCrossDevice {
+        /// The directory.
+        path: PathBuf,
+    },
 }
+
+/// A path shown injectively: `\` doubled, and every control, invisible, or
+/// text-reordering character and every byte that is not UTF-8 written as an
+/// escape, so no file name can forge or hide a line of the message.
+struct ShownPath<'a>(&'a Path);
+
+impl fmt::Display for ShownPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write as _;
+        for chunk in self.0.as_os_str().as_encoded_bytes().utf8_chunks() {
+            for c in chunk.valid().chars() {
+                if c == '\\' {
+                    f.write_str("\\\\")?;
+                } else if is_display_hazard(c) {
+                    write!(f, "\\u{{{:x}}}", u32::from(c))?;
+                } else {
+                    f.write_char(c)?;
+                }
+            }
+            for byte in chunk.invalid() {
+                write!(f, "\\x{byte:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a walk refusal tells the developer to do.
+const WALK_REMEDY: &str = "run `ipe clean`, run from a directory that holds fewer files, or \
+                           run without the filesystem grant";
 
 impl fmt::Display for JailPathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -101,7 +157,7 @@ impl fmt::Display for JailPathError {
             Self::Unresolved { path, kind } => write!(
                 f,
                 "the jail path {} does not resolve ({kind}); refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::UserHomeUnresolved(refusal) => write!(
                 f,
@@ -113,42 +169,63 @@ impl fmt::Display for JailPathError {
             Self::Moved { path } => write!(
                 f,
                 "the jail path {} changed after it was resolved; refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::ExposesCargoHome { bind, cargo_home } => write!(
                 f,
                 "the bind {} would expose the cargo home {} (credentials.toml): no jail \
                  path may sit at or above it; refusing to build the jail",
-                bind.display(),
-                cargo_home.display()
+                ShownPath(bind),
+                ShownPath(cargo_home)
             ),
             Self::VcsEntryUnexpectedKind { kind, path } => write!(
                 f,
                 "the {kind} entry {} in the writable working tree is not a form {kind} \
                  writes (a symlink, fifo, socket, or device), so it cannot be kept \
                  read-only; refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::VcsPointerUnreadable { kind, path, reason } => write!(
                 f,
                 "the {kind} pointer file {} in the writable working tree {reason}; \
                  refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::VcsEntryChanged { path } => write!(
                 f,
                 "the version-control entry {} changed after the jail checked it; \
                  refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::VcsMetadataUncarvable { arm, path } => write!(
                 f,
                 "the {arm} jail cannot keep the version-control metadata {} read-only \
                  under a writable working tree: run without the filesystem grant, or \
                  from a tree without version-control metadata; refusing to build the jail",
-                path.display()
+                ShownPath(path)
             ),
             Self::VcsConfig(refusal) => write!(f, "{refusal}"),
+            Self::VcsWalkCeiling { ceiling, at } => write!(
+                f,
+                "the writable working tree under {} {ceiling}, so the jail cannot prove \
+                 every version-control directory inside it is kept read-only; refusing to \
+                 build the jail: {WALK_REMEDY}",
+                ShownPath(at)
+            ),
+            Self::VcsWalkUnreadable { path, refusal } => write!(
+                f,
+                "the directory {} in the writable working tree cannot be read ({refusal}), \
+                 so version-control metadata inside it could go unprotected; refusing to \
+                 build the jail: make it readable, or run without the filesystem grant",
+                ShownPath(path)
+            ),
+            Self::VcsWalkCrossDevice { path } => write!(
+                f,
+                "the directory {} in the writable working tree is on another filesystem, \
+                 which the jail does not search for version-control metadata; refusing to \
+                 build the jail: unmount it, or run without the filesystem grant",
+                ShownPath(path)
+            ),
         }
     }
 }
