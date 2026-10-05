@@ -6,6 +6,7 @@ import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
+import Lib.Epoch exposing (Epoch)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.SafeText as SafeText exposing (SafeText)
 
@@ -28,11 +29,13 @@ type alias IndexSettings =
 
 
 -- Every location the app serves from: the index and the review database,
--- each parsed once at startup. A request reads this value and never the
+-- each parsed once at startup, and the epoch of the process serving them,
+-- minted once at startup. A request reads this value and never the
 -- environment.
 type alias AppSettings =
     { index : IndexSettings
     , review : DbLocation
+    , epoch : Epoch
     }
 
 

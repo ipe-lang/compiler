@@ -9,6 +9,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Index as Index exposing (Change(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.SafeText as SafeText
@@ -150,10 +151,10 @@ unitEntriesDuringReadCoalesce settings a b =
             after settings [ Navigated (unitAt ub), Navigated (unitAt uc) ] first
 
         ( _, startedDuring ) =
-            Queue.reloadView ub first.selectedView
+            Queue.reloadView settings.epoch ub first.selectedView
 
         returned =
-            after settings [ SelectedViewLoaded ua (Ok (Just a)) ] entered
+            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] entered
     in
     inFlight first
         == Just ( ua, Nothing )
@@ -184,7 +185,7 @@ oneReadSlotAcrossPages settings a b =
             b.unit.uid
 
         cardReading =
-            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True })
+            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch })
 
         onUnitPage =
             after settings [ Navigated (unitAt ub) ] cardReading
@@ -232,25 +233,25 @@ unitPageSettlesOnItsOwnRead settings a b =
             uid "u-c"
 
         waiting =
-            after settings [ Navigated (unitAt ub) ] (queueModel [ a ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True }))
+            after settings [ Navigated (unitAt ub) ] (queueModel [ a ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch }))
 
         otherReturned =
-            after settings [ SelectedViewLoaded ua (Ok (Just a)) ] waiting
+            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] waiting
 
         queueLoaded =
             after settings [ PendingLoaded otherReturned.queueLoad (Ok (queuePageOf [ a ])) ] otherReturned
 
         ownReturned =
-            after settings [ SelectedViewLoaded ub (Ok (Just b)) ] queueLoaded
+            after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] queueLoaded
 
         lateOther =
-            after settings [ SelectedViewLoaded ua (Ok (Just a)) ] ownReturned
+            after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] ownReturned
 
         shownElsewhere =
             { ownReturned | page = unitAt ua }
 
         missing =
-            after settings [ Navigated (unitAt uc), SelectedViewLoaded uc (Ok Nothing) ] ownReturned
+            after settings [ Navigated (unitAt uc), SelectedViewLoaded uc settings.epoch (Ok Nothing) ] ownReturned
 
         refused =
             after settings [ Navigated (UnitPage "not-a-unit-id") ] ownReturned
@@ -275,9 +276,8 @@ unitPageSettlesOnItsOwnRead settings a b =
 
 -- One decision is in flight per session: a decision asked, by button, key or
 -- refusal, while one is saving starts nothing and says why, and keeps the
--- refusal draft; once the decision settles the next one starts. A decision
--- asked off the queue page holds no slot it could keep. Red if a second
--- decision, with its source re-read, starts beside the first.
+-- refusal draft; once the decision settles the next one starts. Red if a
+-- second decision, with its source re-read, starts beside the first.
 decisionsSingleFlight : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 decisionsSingleFlight settings a b =
     let
@@ -297,25 +297,25 @@ decisionsSingleFlight settings a b =
             after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] saving
 
         settled =
-            after settings [ DecisionSaved ua (Err (Error.conflict "boom")) ] pressedAgain
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
 
         next =
             after settings [ ApproveUnit ua ] settled
 
         lateOther =
-            after settings [ DecisionSaved b.unit.uid (Err (Error.conflict "boom")) ] next
+            after settings [ DecisionSaved b.unit.uid settings.epoch (Err (Error.conflict "boom")) ] next
     in
-    Queue.startDecision ua (DecisionSaving ua)
+    Queue.startDecision settings.epoch ua (DecisionSaving ua settings.epoch)
         == Nothing
         && saving.decision
-        == DecisionSaving ua
+        == DecisionSaving ua settings.epoch
         && saving.decisionError
         == Nothing
         && pressedAgain.decision
-        == DecisionSaving ua
+        == DecisionSaving ua settings.epoch
         && busyMessage pressedAgain.decisionError
         && refusing.decision
-        == DecisionSaving ua
+        == DecisionSaving ua settings.epoch
         && busyMessage refusing.refuseError
         && refusing.refusingUid
         == Just ua
@@ -324,9 +324,157 @@ decisionsSingleFlight settings a b =
         && settled.decision
         == DecisionIdle
         && next.decision
-        == DecisionSaving ua
+        == DecisionSaving ua settings.epoch
         && lateOther.decision
-        == DecisionSaving ua
+        == DecisionSaving ua settings.epoch
+
+
+-- A slot left taken by another process, whose completion died with it, is
+-- idle: slot ownership is tied to process lifetime. A decision saving under
+-- a foreign epoch blocks no decision, by button or refusal, and a decision
+-- result from a foreign epoch settles no slot this process owns, while a
+-- decision saving under this epoch still refuses a second. Red if a
+-- persisted `DecisionSaving` blocks the session after a restart, or if any
+-- process's result frees this process's slot.
+foreignDecisionIsIdle : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> Bool
+foreignDecisionIsIdle settings otherEpoch a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        stale =
+            { shown | decision = DecisionSaving ub otherEpoch }
+
+        approved =
+            after settings [ ApproveUnit ua ] stale
+
+        refused =
+            after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] stale
+
+        foreignResult =
+            after settings [ DecisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
+
+        ownResult =
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] foreignResult
+    in
+    Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch)
+        == Just (DecisionSaving ua settings.epoch)
+        && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch)
+        == Nothing
+        && approved.decision
+        == DecisionSaving ua settings.epoch
+        && approved.decisionError
+        == Nothing
+        && refused.decision
+        == DecisionSaving ua settings.epoch
+        && refused.refuseError
+        == Nothing
+        && foreignResult.decision
+        == DecisionSaving ua settings.epoch
+        && ownResult.decision
+        == DecisionIdle
+
+
+-- A source read left in flight by another process is `NoneSelected`: a
+-- unit-page entry, a queue card selected, a queue load and a History entry
+-- each act as on an idle slot, and a read result from a foreign epoch
+-- settles no read this process owns, while a read in flight under this
+-- epoch still holds the slot. Red if a persisted `ViewLoading` blocks the
+-- session after a restart, or if another process's result settles it.
+foreignReadIsIdle : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> Bool
+foreignReadIsIdle settings otherEpoch a b =
+    let
+        ua =
+            a.unit.uid
+
+        ub =
+            b.unit.uid
+
+        stale =
+            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = otherEpoch })
+
+        ownSelected =
+            after settings [ SelectUnit 1 ] (queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch }))
+
+        unitEntered =
+            after settings [ Navigated (unitAt ub) ] stale
+
+        selected =
+            after settings [ SelectUnit 1 ] stale
+
+        reloading =
+            after settings [ Navigated QueuePage ] stale
+
+        queueLoaded =
+            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+
+        historyEntered =
+            after settings [ Navigated HistoryPage ] stale
+
+        foreignResult =
+            after settings [ SelectedViewLoaded ub otherEpoch (Ok (Just b)) ] selected
+
+        ownResult =
+            after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] foreignResult
+    in
+    inFlight unitEntered
+        == Just ( ub, Nothing )
+        && inFlight selected
+        == Just ( ub, Nothing )
+        && inFlight queueLoaded
+        == Just ( ua, Nothing )
+        && inFlight historyEntered
+        == Nothing
+        && inFlight ownSelected
+        == Just ( ua, Just ub )
+        && inFlight foreignResult
+        == Just ( ub, Nothing )
+        && inFlight ownResult
+        == Nothing
+        && Queue.selectedViewStatusText ub ownResult.selectedView
+        == Nothing
+
+
+-- A decision asked off the queue page is refused before it takes the slot,
+-- so it holds nothing a later decision would wait on. Red if a decision
+-- asked on the unit page or History takes the decision slot.
+decisionOffQueueHoldsNoSlot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+decisionOffQueueHoldsNoSlot settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        onUnitPage =
+            after settings [ ApproveUnit ua ] { shown | page = unitAt ua }
+
+        onHistory =
+            after settings [ ApproveUnit ua ] { shown | page = HistoryPage }
+
+        onQueue =
+            after settings [ ApproveUnit ua ] shown
+
+        offQueue =
+            Just (Error.message App.decisionOffQueue)
+    in
+    onUnitPage.decision
+        == DecisionIdle
+        && Maybe.map Error.message onUnitPage.decisionError
+        == offQueue
+        && onHistory.decision
+        == DecisionIdle
+        && Maybe.map Error.message onHistory.decisionError
+        == offQueue
+        && onQueue.decision
+        == DecisionSaving ua settings.epoch
 
 
 -- ── rendered ────────────────────────────────────────────────────────────
@@ -369,11 +517,13 @@ busyRendered settings a b =
 
 
 -- ── harness ─────────────────────────────────────────────────────────────
--- The two seeded fixture units and the settings a server would parse for
--- that index, handed to `body`.
+-- The settings a server would parse for the seeded index, an epoch minted
+-- apart from theirs, standing for another process's, and the two seeded
+-- fixture units, handed to `body`.
 withSeeded :
     String
     -> (Settings.AppSettings
+        -> Epoch
         -> Index.UnitView
         -> Index.UnitView
         -> List ( String, Bool ))
@@ -383,10 +533,11 @@ withSeeded name body =
         at <- freshScratch name
         seedIndex at.indexDb at.repo
         settings <- envAppSettings
+        otherEpoch <- Epoch.mint
         a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
         cleanupIndex at.indexDb at.repo
-        Task.succeed (body settings a b)
+        Task.succeed (body settings otherEpoch a b)
 
 
 requireUnit : Maybe Index.UnitView -> Task.Task Error Index.UnitView
@@ -402,11 +553,14 @@ requireUnit found =
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     withSeeded "ipe-single-flight"
-        (\settings a b ->
+        (\settings otherEpoch a b ->
             [ ( "unit-page entries during a source read start no second read", unitEntriesDuringReadCoalesce settings a b )
             , ( "the queue card and the unit page share one source read slot", oneReadSlotAcrossPages settings a b )
             , ( "the unit page settles only on its own unit's read", unitPageSettlesOnItsOwnRead settings a b )
             , ( "a decision asked while one is saving starts no second decision", decisionsSingleFlight settings a b )
+            , ( "a decision saving under another process's epoch blocks no decision", foreignDecisionIsIdle settings otherEpoch a b )
+            , ( "a source read in flight under another process's epoch blocks no read", foreignReadIsIdle settings otherEpoch a b )
+            , ( "a decision asked off the queue page takes no decision slot", decisionOffQueueHoldsNoSlot settings a b )
             , ( "a refused decision and a unit page awaiting its read render as such", busyRendered settings a b )
             ]
         )

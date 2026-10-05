@@ -9,6 +9,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp exposing (Timestamp)
 import Lib.Db as LibDb exposing (HistoryCursor(..))
+import Lib.Epoch exposing (Epoch)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -359,70 +360,98 @@ decide settings db shown decision =
 -- `fresh` is False once the queue page reloaded or cleared during the read,
 -- so its result predates the page and never settles the view: the in-flight
 -- unit selected again is read afresh, and with nothing wanted the result is
--- dropped.
+-- dropped. `owner` is the epoch whose process runs the read: slot ownership
+-- is tied to process lifetime, so a read owned by another epoch is
+-- `NoneSelected` to every transition.
 type SelectedView
     = NoneSelected
-    | ViewLoading { uid : Uid, wanted : Maybe Uid, fresh : Bool }
+    | ViewLoading { uid : Uid, wanted : Maybe Uid, fresh : Bool, owner : Epoch }
     | ViewShown Index.UnitView
     | ViewMissing Uid
     | ViewFailed Uid Error
 
 
--- `uid` selected, with the uid to read next, if any. During a read only the
--- wanted unit is recorded; the shown unit selected again reads nothing.
-selectView : Uid -> SelectedView -> ( SelectedView, Maybe Uid )
-selectView uid state =
+-- The slot as process `epoch` sees it: a read owned by another epoch has no
+-- completion left to settle it, so it is `NoneSelected`.
+ownedView : Epoch -> SelectedView -> SelectedView
+ownedView epoch state =
     case state of
         ViewLoading loading ->
-            ( ViewLoading { uid = loading.uid, wanted = wantedAfter loading.uid loading.fresh uid, fresh = loading.fresh }, Nothing )
+            if loading.owner == epoch then
+                state
+
+            else
+                NoneSelected
+
+        ViewShown _ ->
+            state
+
+        NoneSelected ->
+            state
+
+        ViewMissing _ ->
+            state
+
+        ViewFailed _ _ ->
+            state
+
+
+-- `uid` selected in process `epoch`, with the uid to read next, if any.
+-- During a read only the wanted unit is recorded; the shown unit selected
+-- again reads nothing.
+selectView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
+selectView epoch uid state =
+    case ownedView epoch state of
+        ViewLoading loading ->
+            ( ViewLoading { uid = loading.uid, wanted = wantedAfter loading.uid loading.fresh uid, fresh = loading.fresh, owner = loading.owner }, Nothing )
 
         ViewShown shown ->
             if shown.unit.uid == uid then
-                ( state, Nothing )
+                ( ViewShown shown, Nothing )
 
             else
-                startView uid
+                startView epoch uid
 
         NoneSelected ->
-            startView uid
+            startView epoch uid
 
         ViewMissing _ ->
-            startView uid
+            startView epoch uid
 
         ViewFailed _ _ ->
-            startView uid
+            startView epoch uid
 
 
 -- `uid` selected after the queue page reloaded, so its view is read afresh
 -- even when it is the one shown; during a read it is read once that read
 -- returns.
-reloadView : Uid -> SelectedView -> ( SelectedView, Maybe Uid )
-reloadView uid state =
-    case state of
+reloadView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
+reloadView epoch uid state =
+    case ownedView epoch state of
         ViewLoading loading ->
-            ( ViewLoading { uid = loading.uid, wanted = Just uid, fresh = False }, Nothing )
+            ( ViewLoading { uid = loading.uid, wanted = Just uid, fresh = False, owner = loading.owner }, Nothing )
 
         ViewShown _ ->
-            startView uid
+            startView epoch uid
 
         NoneSelected ->
-            startView uid
+            startView epoch uid
 
         ViewMissing _ ->
-            startView uid
+            startView epoch uid
 
         ViewFailed _ _ ->
-            startView uid
+            startView epoch uid
 
 
 -- No unit to select. A read in flight stays recorded, with nothing wanted
 -- after it, so no second read can start beside it, and its result is
 -- dropped when it returns.
-clearView : SelectedView -> SelectedView
-clearView state =
-    case state of
+clearView : Epoch -> SelectedView -> SelectedView
+clearView epoch state =
+    case ownedView epoch state of
         ViewLoading loading ->
-            ViewLoading { uid = loading.uid, wanted = Nothing, fresh = False }
+            ViewLoading { uid = loading.uid, wanted = Nothing, fresh = False, owner = loading.owner }
 
         ViewShown _ ->
             NoneSelected
@@ -437,20 +466,21 @@ clearView state =
             NoneSelected
 
 
--- The read of `uid` returned with `result`: when another unit was selected
--- meanwhile its read starts, otherwise the result settles the view. A
--- response for any uid but the in-flight one changes nothing.
-viewArrived : Uid -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
-viewArrived uid result state =
+-- The read of `uid` run by process `epoch` returned with `result`: when
+-- another unit was selected meanwhile its read starts, otherwise the result
+-- settles the view. A response for any uid but the in-flight one, or from
+-- any process but the read's owner, changes nothing.
+viewArrived : Epoch -> Uid -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
+viewArrived epoch uid result state =
     case state of
         ViewLoading loading ->
-            if loading.uid /= uid then
+            if loading.uid /= uid || loading.owner /= epoch then
                 ( state, Nothing )
 
             else
                 case loading.wanted of
                     Just next ->
-                        startView next
+                        startView epoch next
 
                     Nothing ->
                         if loading.fresh then
@@ -472,9 +502,9 @@ viewArrived uid result state =
             ( state, Nothing )
 
 
-startView : Uid -> ( SelectedView, Maybe Uid )
-startView uid =
-    ( ViewLoading { uid = uid, wanted = Nothing, fresh = True }, Just uid )
+startView : Epoch -> Uid -> ( SelectedView, Maybe Uid )
+startView epoch uid =
+    ( ViewLoading { uid = uid, wanted = Nothing, fresh = True, owner = epoch }, Just uid )
 
 
 -- The unit wanted after the in-flight read of `inFlight` when `uid` is
@@ -633,29 +663,37 @@ unitPageOf uid state =
 
 -- The session's one decision slot. A decision re-reads its source to re-prove
 -- it, so at most one is in flight: a decision asked while one is saving
--- starts nothing.
+-- starts nothing. A saving decision records the epoch whose process runs it:
+-- slot ownership is tied to process lifetime, so one owned by another epoch
+-- is idle.
 type DecisionSlot
     = DecisionIdle
-    | DecisionSaving Uid
+    | DecisionSaving Uid Epoch
 
 
--- The slot holding a decision on `uid`; Nothing while another is saving.
-startDecision : Uid -> DecisionSlot -> Maybe DecisionSlot
-startDecision uid slot =
+-- The slot holding a decision on `uid` run by process `epoch`; Nothing
+-- while another decision of that process is saving.
+startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
+startDecision epoch uid slot =
     case slot of
         DecisionIdle ->
-            Just (DecisionSaving uid)
+            Just (DecisionSaving uid epoch)
 
-        DecisionSaving _ ->
-            Nothing
+        DecisionSaving _ owner ->
+            if owner == epoch then
+                Nothing
+
+            else
+                Just (DecisionSaving uid epoch)
 
 
--- The decision on `uid` settled; a result for any other uid leaves the slot.
-decisionSettled : Uid -> DecisionSlot -> DecisionSlot
-decisionSettled uid slot =
+-- The decision on `uid` run by process `epoch` settled; a result for any
+-- other uid or from any other process leaves the slot.
+decisionSettled : Epoch -> Uid -> DecisionSlot -> DecisionSlot
+decisionSettled epoch uid slot =
     case slot of
-        DecisionSaving saving ->
-            if saving == uid then
+        DecisionSaving saving owner ->
+            if saving == uid && owner == epoch then
                 DecisionIdle
 
             else
