@@ -34,9 +34,10 @@ enum Cmd {
         #[arg(long, default_value = ".ipe-index/index.db")]
         db: String,
     },
-    /// Incrementally refresh the index: per-repo `last_sha..HEAD` git diff,
-    /// re-extract only changed files. Falls back to a full `index` when the DB
-    /// is absent or a repo has no recorded sha.
+    /// Incrementally refresh the index: walk the same files `index` walks and
+    /// re-extract each one whose content stamp changed. Falls back to a full
+    /// `index` when the DB is absent, of another schema or root set, or holds
+    /// a path with no stamp.
     Update {
         #[arg(long, default_values_t = default_repos())]
         repo: Vec<String>,
@@ -219,6 +220,9 @@ fn parse_repos(specs: &[String]) -> Result<repo_set::RepoSet> {
 
 /// Store one file's rows (file, symbols, units, stage and coverage edges)
 /// under its tagged path. The caller has already dropped any old rows.
+///
+/// The file's [`store::FileStamp`] is taken over `src`, the very text the
+/// units are extracted from, so a stamp never names other bytes than its rows.
 fn ingest_file(
     store: &store::Store,
     tagged: &str,
@@ -230,7 +234,14 @@ fn ingest_file(
     // known). Recompute the role on the tagged path so the tag-aware
     // classifier fires.
     let role = model::role_of(tagged);
-    store.put_file(tagged, lang.as_str(), role.as_str(), src.len() as i64, "")?;
+    let stamp = store::FileStamp::of_bytes(src.as_bytes());
+    store.put_file(
+        tagged,
+        lang.as_str(),
+        role.as_str(),
+        src.len() as i64,
+        &stamp,
+    )?;
     extract::extract_file(store, tagged, lang, src, sha)?;
     pipeline::record_stage(store, tagged)?;
     // Coverage is an Ipê-import relation, so it only applies to `.ipe`
@@ -325,7 +336,7 @@ fn index_set(repos: &repo_set::RepoSet, db: &str) -> Result<()> {
                 // never collide (each has Cargo.toml, README.md, scripts/*, tools/*).
                 ingest_file(store, &repo.tag().tagged(&f.path), f.lang, &src, &sha)?;
             }
-            // Per-repo HEAD sha so an incremental `update` can diff each.
+            // Per-repo HEAD sha the index was last built at.
             if !sha.is_empty() {
                 store.set_meta(&repo.tag().last_sha_key(), &sha)?;
             }
@@ -348,80 +359,205 @@ fn head_sha_or_empty(root: &str) -> String {
     })
 }
 
-/// Incremental refresh: for each repo, diff `last_sha:<tag>..HEAD`, re-extract
-/// only the changed files. Falls back to a full `index` when the DB is absent,
-/// its rows are of another schema version or root set, or a repo has no
-/// recorded sha.
+/// Why `update` rebuilds the whole index instead of judging file by file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullReason {
+    /// The rows are of another schema version, so their hashes are of another format.
+    SchemaVersion,
+    /// The index was built under another root set, so some path has another owner.
+    RepoSet,
+    /// Some indexed path carries no [`store::FileStamp`] to judge it by.
+    NoStamps,
+}
+
+/// One declared root as an incremental `update` walks it.
+struct RepoWalk<'a> {
+    root: &'a repo_set::DeclaredRoot,
+    claimed: Vec<&'a repo_set::DeclaredRoot>,
+    /// The root's HEAD sha (`""` without one): the attribution of its rows and events.
+    sha: String,
+}
+
+/// One path an incremental `update` must judge.
+enum FileWork<'a> {
+    /// A file the walk lists: read, and re-extracted when its stamp is not `stored`.
+    Listed {
+        repo: &'a RepoWalk<'a>,
+        file: walk::Tracked,
+        stored: Option<store::FileStamp>,
+    },
+    /// An indexed path no walk lists (deleted, ignored, no longer a regular
+    /// file): its rows leave the index.
+    Gone {
+        tagged: String,
+        repo: Option<&'a RepoWalk<'a>>,
+    },
+}
+
+/// What an `update` does: judge each path, or rebuild the whole index.
+enum UpdatePlan<'a> {
+    Incremental(Vec<FileWork<'a>>),
+    Full(FullReason),
+}
+
+/// The reason an index cannot be judged file by file before its stamps are
+/// read, or `None` when its format and root set are this run's.
+fn full_reason(store: &store::Store, repos: &repo_set::RepoSet) -> Result<Option<FullReason>> {
+    if !store.schema_is_current()? {
+        return Ok(Some(FullReason::SchemaVersion));
+    }
+    if store.recorded_repos()? != repos.recorded() {
+        return Ok(Some(FullReason::RepoSet));
+    }
+    Ok(None)
+}
+
+/// Plans an incremental `update` over the files [`walk::tracked`] lists, the
+/// listing `index` reads, so the paths `update` judges are the paths a fresh
+/// `index` of the same working tree would store.
+fn plan_update<'a>(
+    store: &store::Store,
+    repos: &repo_set::RepoSet,
+    walks: &'a [RepoWalk<'a>],
+) -> Result<UpdatePlan<'a>> {
+    if let Some(reason) = full_reason(store, repos)? {
+        return Ok(UpdatePlan::Full(reason));
+    }
+    let Some(mut stamps) = store.stamps()? else {
+        return Ok(UpdatePlan::Full(FullReason::NoStamps));
+    };
+    let mut work = Vec::new();
+    for repo in walks {
+        for file in walk::tracked(repo.root, &repo.claimed)? {
+            let stored = stamps.remove(&repo.root.tag().tagged(&file.path));
+            work.push(FileWork::Listed { repo, file, stored });
+        }
+    }
+    let mut gone: Vec<String> = stamps.into_keys().collect();
+    gone.sort();
+    work.extend(gone.into_iter().map(|tagged| {
+        let tag = model::split_tag(&tagged).0;
+        let repo = walks.iter().find(|w| w.root.tag().as_str() == tag);
+        FileWork::Gone { tagged, repo }
+    }));
+    Ok(UpdatePlan::Incremental(work))
+}
+
+/// Applies one path's work; returns whether its rows changed.
+///
+/// A listed file is read under the same ceiling as `index`. Equal stamps skip
+/// it. A file that cannot be read (absent by now, over the ceiling, not UTF-8,
+/// refused on disk) takes the delete branch, never the skip: its old units
+/// must not stay open, or hidden, under bytes the tree no longer holds.
+fn apply_work(store: &store::Store, work: &FileWork<'_>, now: i64) -> Result<bool> {
+    let (tagged, sha, fresh) = match work {
+        FileWork::Gone { tagged, repo } => {
+            (tagged.clone(), repo.map_or("", |r| r.sha.as_str()), None)
+        }
+        FileWork::Listed { repo, file, stored } => {
+            let src = read_capped(repo.root, &file.path, &repo.claimed);
+            let unchanged = match (&src, stored) {
+                (Some(src), Some(stored)) => store::FileStamp::of_bytes(src.as_bytes()) == *stored,
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            };
+            if unchanged {
+                return Ok(false);
+            }
+            (
+                repo.root.tag().tagged(&file.path),
+                repo.sha.as_str(),
+                src.map(|src| (file.lang, src)),
+            )
+        }
+    };
+    let shas = HashMap::from([(model::split_tag(&tagged).0.to_string(), sha.to_string())]);
+    let before = store.snapshot_path(&tagged)?;
+    store.drop_file(&tagged)?;
+    if let Some((lang, src)) = &fresh {
+        ingest_file(store, &tagged, *lang, src, sha)?;
+    }
+    let after = store.snapshot_path(&tagged)?;
+    reconcile_queue(store, &before, &after, &shas, now)?;
+    Ok(true)
+}
+
+/// Incremental refresh: judge every file `index` would read by its stamp and
+/// re-extract only the changed ones. Falls back to a full `index` when the DB
+/// is absent or [`plan_update`] finds it cannot be judged file by file.
 fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
     let repos = parse_repos(repo_specs)?;
     if !std::path::Path::new(db).exists() {
         return index_set(&repos, db);
     }
+    let walks: Vec<RepoWalk<'_>> = repos
+        .iter()
+        .map(|root| RepoWalk {
+            root,
+            claimed: repos.claimed_in(root),
+            sha: head_sha_or_empty(root.root_str()),
+        })
+        .collect();
     let store = store::Store::open(db)?;
-    if needs_full_index(&store, &repos)? {
-        drop(store);
-        return index_set(&repos, db);
-    }
     store.begin()?;
-    let mut changed_count = 0usize;
-    for repo in repos.iter() {
-        let since = store
-            .get_meta(&repo.tag().last_sha_key())?
-            .unwrap_or_default();
-        let sha = head_sha_or_empty(repo.root_str());
-        let shas = HashMap::from([(repo.tag().as_str().to_string(), sha.clone())]);
-        let claimed = repos.claimed_in(repo);
-        let (ups, dels) = walk::changed(repo, &since, &claimed)?;
-        // One timestamp per repo so the run's events order stably
-        // (enqueued_at is a tiebreaker in `pending`'s ORDER BY).
+    let applied = (|| -> Result<Result<usize, FullReason>> {
+        let work = match plan_update(&store, &repos, &walks)? {
+            UpdatePlan::Full(reason) => return Ok(Err(reason)),
+            UpdatePlan::Incremental(work) => work,
+        };
+        // One timestamp per run so its events order stably (`enqueued_at` is
+        // a tiebreaker in `pending`'s ORDER BY).
         let now = diff::now_millis();
-        for d in &dels {
-            let tagged = repo.tag().tagged(d);
-            let before = store.snapshot_path(&tagged)?;
-            store.drop_file(&tagged)?;
-            reconcile_queue(&store, &before, &diff::Snapshot::new(), &shas, now)?;
-        }
-        for f in &ups {
-            let tagged = repo.tag().tagged(&f.path);
-            let before = store.snapshot_path(&tagged)?;
-            // An oversized/unreadable file keeps no units, so its old units
-            // reconcile as deleted.
-            let src = read_capped(repo, &f.path, &claimed);
-            store.drop_file(&tagged)?;
-            if let Some(src) = src {
-                ingest_file(&store, &tagged, f.lang, &src, &sha)?;
+        let mut changed = 0usize;
+        for item in &work {
+            if apply_work(&store, item, now)? {
+                changed += 1;
             }
-            let after = store.snapshot_path(&tagged)?;
-            reconcile_queue(&store, &before, &after, &shas, now)?;
         }
-        if !sha.is_empty() {
-            store.set_meta(&repo.tag().last_sha_key(), &sha)?;
+        for repo in &walks {
+            if !repo.sha.is_empty() {
+                store.set_meta(&repo.root.tag().last_sha_key(), &repo.sha)?;
+            }
         }
-        changed_count += ups.len() + dels.len();
+        query::resolve_edges(&store, ".")?;
+        Ok(Ok(changed))
+    })();
+    let outcome = match applied {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if let Err(rb) = store.rollback() {
+                eprintln!("ipe-index: rollback after a failed update: {rb}");
+            }
+            return Err(e);
+        }
+    };
+    match outcome {
+        Ok(changed) => {
+            store.commit()?;
+            eprintln!(
+                "ipe-index: updated {changed} changed path(s) across {} repo(s)",
+                repos.iter().len()
+            );
+            Ok(())
+        }
+        Err(reason) => {
+            store.rollback()?;
+            drop(store);
+            eprintln!("ipe-index: {}; rebuilding the whole index", reason.why());
+            index_set(&repos, db)
+        }
     }
-    query::resolve_edges(&store, ".")?;
-    store.commit()?;
-    eprintln!(
-        "ipe-index: updated {changed_count} changed path(s) across {} repo(s)",
-        repos.iter().len()
-    );
-    Ok(())
 }
 
-/// An incremental `update` can only diff a DB whose rows are in the current
-/// format, that was built under this exact root set, and that records a sha
-/// for every repo; anything else is rebuilt. A changed root set moves the
-/// owner of some paths, and only a rebuild drops the old owner's rows.
-fn needs_full_index(store: &store::Store, repos: &repo_set::RepoSet) -> Result<bool> {
-    if !store.schema_is_current()? || store.recorded_repos()? != repos.recorded() {
-        return Ok(true);
-    }
-    for repo in repos.iter() {
-        if store.get_meta(&repo.tag().last_sha_key())?.is_none() {
-            return Ok(true);
+impl FullReason {
+    /// Why the run rebuilds, as a clause for its stderr line.
+    const fn why(self) -> &'static str {
+        match self {
+            Self::SchemaVersion => "the index is of another schema version",
+            Self::RepoSet => "the index was built under another root set",
+            Self::NoStamps => "an indexed path has no content stamp",
         }
     }
-    Ok(false)
 }
 
 fn main() -> Result<()> {
@@ -468,18 +604,20 @@ mod tests {
     }
 
     #[test]
-    fn current_db_with_shas_updates_incrementally() {
+    fn a_current_db_of_this_root_set_is_judged_file_by_file() {
         let s = store::Store::open(":memory:").unwrap();
         let set = repos();
         s.record_repos(&set.recorded()).unwrap();
-        s.set_meta("last_sha:ipe", "abc").unwrap();
-        assert!(!needs_full_index(&s, &set).unwrap());
+        assert_eq!(full_reason(&s, &set).unwrap(), None);
     }
 
     #[test]
-    fn missing_repo_sha_rebuilds() {
+    fn a_db_with_no_recorded_root_set_rebuilds() {
         let s = store::Store::open(":memory:").unwrap();
-        assert!(needs_full_index(&s, &repos()).unwrap());
+        assert_eq!(
+            full_reason(&s, &repos()).unwrap(),
+            Some(FullReason::RepoSet)
+        );
     }
 
     // Rows of an older schema carry hashes in the old format; an incremental
@@ -487,9 +625,13 @@ mod tests {
     #[test]
     fn older_schema_rebuilds() {
         let s = store::Store::open(":memory:").unwrap();
-        s.set_meta("last_sha:ipe", "abc").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
         s.set_meta("schema_version", "2").unwrap();
-        assert!(needs_full_index(&s, &repos()).unwrap());
+        assert_eq!(
+            full_reason(&s, &set).unwrap(),
+            Some(FullReason::SchemaVersion)
+        );
     }
 
     fn refusal(spec: &str) -> String {
@@ -808,7 +950,10 @@ mod tests {
         assert_eq!(stored_files(&db), ["out:inner/x.rs", "out:top.rs"]);
         {
             let s = store::Store::open(&db).unwrap();
-            assert!(needs_full_index(&s, &parse_repos(&both).unwrap()).unwrap());
+            assert_eq!(
+                full_reason(&s, &parse_repos(&both).unwrap()).unwrap(),
+                Some(FullReason::RepoSet)
+            );
         }
         cmd_update(&both, &db).unwrap();
         assert_eq!(stored_files(&db), ["in:x.rs", "out:top.rs"]);
@@ -831,5 +976,306 @@ mod tests {
         );
         assert_eq!(s.count("units").unwrap(), units);
         assert_eq!(queue(&s), rows);
+    }
+
+    /// The review-visible rows of the index at `db`: every open unit (queue
+    /// columns aside, which differ between a first index and an update by
+    /// design), every file with its stamp, and every edge with its resolution.
+    #[cfg(unix)]
+    fn index_dump(db: &str) -> Vec<String> {
+        let s = store::Store::open(db).unwrap();
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT 'unit|' || uid || '|' || path || '|' || COALESCE(kind, '') || '|' \
+             || COALESCE(name, '') || '|' || COALESCE(qualified, '') || '|' \
+             || COALESCE(line_start, '') || '|' || COALESCE(line_end, '') || '|' \
+             || COALESCE(body_hash, '') || '|' || COALESCE(lang, '') \
+             FROM open_units ORDER BY uid",
+            "SELECT 'file|' || path || '|' || COALESCE(sha, '') FROM files ORDER BY path",
+            "SELECT 'edge|' || src || '|' || dst || '|' || kind || '|' \
+             || COALESCE(resolved, '') FROM edges ORDER BY 1",
+        ] {
+            let mut st = s.conn.prepare(sql).unwrap();
+            let got: Vec<String> = st
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            rows.extend(got);
+        }
+        rows
+    }
+
+    /// Runs `update` on `db`, then a fresh `index` of the same working tree
+    /// into a second DB, and asserts both hold the same rows. Returns the dump.
+    #[cfg(unix)]
+    fn update_then_compare(fx: &walk::fixture::Fixture, specs: &[String], db: &str) -> Vec<String> {
+        cmd_update(specs, db).unwrap();
+        let fresh = fx.path(".git/fresh-index.db");
+        let _ = std::fs::remove_file(&fresh);
+        cmd_index(specs, &fresh).unwrap();
+        let updated = index_dump(db);
+        assert_eq!(updated, index_dump(&fresh));
+        updated
+    }
+
+    /// `(updated_sha)` of every unit of `path` in the index at `db`.
+    #[cfg(unix)]
+    fn updated_shas(db: &str, path: &str) -> Vec<String> {
+        let s = store::Store::open(db).unwrap();
+        let mut st = s
+            .conn
+            .prepare("SELECT updated_sha FROM units WHERE path=? ORDER BY uid")
+            .unwrap();
+        st.query_map([path], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    // `update` judges the files `index` lists, by content: whatever the working
+    // tree did since the last run (committed or not, tracked or not), the open
+    // units after `update` are the open units of a fresh `index`. A file whose
+    // bytes are back to the stamped ones is not re-extracted.
+    #[cfg(unix)]
+    #[test]
+    fn update_membership_equals_index() {
+        const A: &str = "fn a() -> u8 {\n    1\n}\n";
+        const A_EDIT: &str = "fn a() -> u8 {\n    2\n}\n\nfn a2() {}\n";
+        type Change = fn(&walk::fixture::Fixture);
+        let rows: [(&str, Change, bool, bool); 7] = [
+            (
+                "untracked file added",
+                |fx| fx.write("new.rs", "fn n() {}\n"),
+                true,
+                true,
+            ),
+            (
+                "untracked file removed",
+                |fx| std::fs::remove_file(fx.0.join("u.rs")).unwrap(),
+                true,
+                true,
+            ),
+            (
+                "tracked file deleted without commit",
+                |fx| std::fs::remove_file(fx.0.join("b.rs")).unwrap(),
+                true,
+                true,
+            ),
+            (
+                "tracked file edited without commit",
+                |fx| fx.write("a.rs", A_EDIT),
+                true,
+                false,
+            ),
+            (
+                "untracked file newly ignored",
+                |fx| fx.write(".gitignore", "u.rs\n"),
+                true,
+                true,
+            ),
+            (
+                "tracked file replaced by a symlink on disk",
+                |fx| {
+                    std::fs::remove_file(fx.0.join("b.rs")).unwrap();
+                    std::os::unix::fs::symlink("a.rs", fx.0.join("b.rs")).unwrap();
+                },
+                true,
+                true,
+            ),
+            (
+                "edit then revert",
+                |fx| {
+                    fx.write("a.rs", A_EDIT);
+                    fx.write("a.rs", A);
+                },
+                false,
+                true,
+            ),
+        ];
+        for (i, (row, change, moves, a_kept)) in rows.into_iter().enumerate() {
+            let fx = walk::fixture::Fixture::new(&format!("update-membership-{i}"));
+            fx.write("a.rs", A);
+            fx.write("b.rs", "fn b() {}\n");
+            fx.commit("one");
+            fx.write("u.rs", "fn u() {}\n");
+            let specs = [format!("ipe:{}", fx.root())];
+            let db = fx.path(".git/ipe-index.db");
+            cmd_index(&specs, &db).unwrap();
+            let before = index_dump(&db);
+            {
+                let s = store::Store::open(&db).unwrap();
+                s.conn
+                    .execute(
+                        "UPDATE units SET updated_sha='kept' WHERE path='ipe:a.rs'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            change(&fx);
+            let after = update_then_compare(&fx, &specs, &db);
+            assert_eq!(after != before, moves, "{row}: rows moved");
+            let kept = updated_shas(&db, "ipe:a.rs")
+                .iter()
+                .all(|sha| sha == "kept");
+            assert_eq!(kept, a_kept, "{row}: `ipe:a.rs` re-extracted");
+        }
+    }
+
+    // An import resolution belongs to the current file set, not to the run
+    // that extracted the importing file: deleting the target of an unchanged
+    // file's import leaves that import unresolved, as a fresh `index` stores
+    // it, and restoring the target resolves it again.
+    #[cfg(unix)]
+    #[test]
+    fn update_reresolves_imports_of_unchanged_files() {
+        let fx = walk::fixture::Fixture::new("update-reresolve");
+        fx.write("src/a.rs", "use crate::b;\n\nfn a() {}\n");
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        let resolved = |db: &str| -> Vec<Option<String>> {
+            let s = store::Store::open(db).unwrap();
+            let mut st = s
+                .conn
+                .prepare("SELECT resolved FROM edges WHERE src='ipe:src/a.rs' AND kind='import'")
+                .unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let target = Some("ipe:src/b.rs".to_string());
+        assert_eq!(resolved(&db), std::slice::from_ref(&target));
+        std::fs::remove_file(fx.0.join("src/b.rs")).unwrap();
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(resolved(&db), [None]);
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(resolved(&db), std::slice::from_ref(&target));
+    }
+
+    // An indexed file that is now over the read ceiling, or no longer UTF-8,
+    // takes the delete branch: its old units leave the index, as a fresh
+    // `index` would never have stored them.
+    #[cfg(unix)]
+    #[test]
+    fn update_drops_unreadable_and_oversized() {
+        let fx = walk::fixture::Fixture::new("update-unreadable");
+        fx.write("a.rs", "fn a() {}\n");
+        fx.write("big.rs", "fn big() {}\n");
+        fx.write("bin.rs", "fn bin() {}\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(stored_files(&db), ["ipe:a.rs", "ipe:big.rs", "ipe:bin.rs"]);
+        let over = usize::try_from(walk::MAX_FILE_BYTES).unwrap() + 1;
+        fx.write("big.rs", &format!("fn big() {{}}\n{}", "/".repeat(over)));
+        std::fs::write(fx.0.join("bin.rs"), b"fn bin() {}\n\xff\n").unwrap();
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(stored_files(&db), ["ipe:a.rs"]);
+        let s = store::Store::open(&db).unwrap();
+        let left: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM units WHERE path IN ('ipe:big.rs', 'ipe:bin.rs')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    // A v8 index stores `""` where a stamp belongs: `update` cannot judge its
+    // files, so it rebuilds, and the store reads version 9 only once the full
+    // run has stamped every file. The same rows under the current version
+    // still rebuild, for want of stamps.
+    #[cfg(unix)]
+    #[test]
+    fn update_on_v8_store_takes_full_index() {
+        let fx = walk::fixture::Fixture::new("update-v8");
+        fx.write("a.rs", "fn a() {}\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        let repos = parse_repos(&specs).unwrap();
+        let walks: Vec<RepoWalk<'_>> = repos
+            .iter()
+            .map(|root| RepoWalk {
+                root,
+                claimed: repos.claimed_in(root),
+                sha: String::new(),
+            })
+            .collect();
+        let plan_of = |s: &store::Store| match plan_update(s, &repos, &walks).unwrap() {
+            UpdatePlan::Full(reason) => Some(reason),
+            UpdatePlan::Incremental(_) => None,
+        };
+        {
+            let s = store::Store::open(&db).unwrap();
+            assert_eq!(plan_of(&s), None);
+            s.conn
+                .execute_batch(
+                    "PRAGMA ignore_check_constraints = ON; \
+                     UPDATE files SET sha = ''; \
+                     PRAGMA ignore_check_constraints = OFF;",
+                )
+                .unwrap();
+            assert_eq!(plan_of(&s), Some(FullReason::NoStamps));
+            s.set_meta("schema_version", "8").unwrap();
+            assert_eq!(plan_of(&s), Some(FullReason::SchemaVersion));
+        }
+        fx.write("a.rs", "fn a() {}\n\nfn b() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        let s = store::Store::open(&db).unwrap();
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("9"));
+        assert!(s.stamps().unwrap().is_some_and(|st| st.len() == 1));
+        assert_eq!(plan_of(&s), None);
+    }
+
+    // A root below the top of its work tree walks relative to itself: a file
+    // outside it never enters, and a file inside it is named from the root.
+    #[cfg(unix)]
+    #[test]
+    fn update_in_subdir_root_is_root_relative() {
+        let fx = walk::fixture::Fixture::new("subdir-update");
+        fx.write("sub/x.rs", "fn a() {}\n");
+        fx.write("top.rs", "fn t() {}\n");
+        fx.commit("one");
+        let specs = [format!("sub:{}", fx.path("sub"))];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        fx.write("sub/x.rs", "fn b() {}\n");
+        fx.write("top.rs", "fn u() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(stored_files(&db), ["sub:x.rs"]);
+    }
+
+    // A file under a declared inner root is judged by that root alone: the
+    // outer root's update neither stores nor deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn update_skips_claimed_paths() {
+        let fx = walk::fixture::Fixture::new("claimed-update");
+        fx.write("top.rs", "fn t() {}\n");
+        fx.write("inner/x.rs", "fn x() {}\n");
+        fx.write("inner/y.rs", "fn y() {}\n");
+        fx.commit("one");
+        let specs = [
+            format!("out:{}", fx.root()),
+            format!("in:{}", fx.path("inner")),
+        ];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(stored_files(&db), ["in:x.rs", "in:y.rs", "out:top.rs"]);
+        fx.write("top.rs", "fn u() {}\n");
+        fx.write("inner/x.rs", "fn z() {}\n");
+        std::fs::remove_file(fx.0.join("inner/y.rs")).unwrap();
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(stored_files(&db), ["in:x.rs", "out:top.rs"]);
     }
 }

@@ -1,5 +1,5 @@
 
-CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT);
+CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT CHECK (length(sha) = 71 AND substr(sha, 1, 7) = 'blake3:' AND NOT substr(sha, 8) GLOB '*[^0-9a-f]*'));
 CREATE TABLE IF NOT EXISTS symbols (file TEXT, name TEXT, kind TEXT, line INTEGER, col INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS edges   (src TEXT, dst TEXT, kind TEXT, resolved TEXT);
 CREATE TABLE IF NOT EXISTS meta    (k TEXT PRIMARY KEY, v TEXT);

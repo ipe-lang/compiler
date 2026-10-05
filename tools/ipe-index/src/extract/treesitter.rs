@@ -766,10 +766,22 @@ mod tests {
         // The resolution helper maps a dotted `.ipe` module name to its file path.
         use crate::query::resolve_edges;
         let s = Store::open(":memory:").unwrap();
-        s.put_file("Ipe/Core/List.ipe", "ipe", "stdlib-ipe", 0, "")
-            .unwrap();
-        s.put_file("Ipe/Core/Maybe.ipe", "ipe", "stdlib-ipe", 0, "")
-            .unwrap();
+        s.put_file(
+            "Ipe/Core/List.ipe",
+            "ipe",
+            "stdlib-ipe",
+            0,
+            &crate::store::FileStamp::of_bytes(b""),
+        )
+        .unwrap();
+        s.put_file(
+            "Ipe/Core/Maybe.ipe",
+            "ipe",
+            "stdlib-ipe",
+            0,
+            &crate::store::FileStamp::of_bytes(b""),
+        )
+        .unwrap();
         s.put_edge("Ipe/Core/List.ipe", "Ipe.Core.Maybe", "import")
             .unwrap();
         resolve_edges(&s, ".").unwrap();

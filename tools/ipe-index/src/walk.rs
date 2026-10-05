@@ -72,8 +72,6 @@ pub enum Listing {
     Staged,
     /// `git ls-files -z --others --exclude-standard` (untracked, not ignored).
     Untracked,
-    /// `git diff --raw -z --no-renames` (changes between two commits).
-    Diff,
 }
 
 impl fmt::Display for Listing {
@@ -81,7 +79,6 @@ impl fmt::Display for Listing {
         f.write_str(match self {
             Self::Staged => "git ls-files -z -s",
             Self::Untracked => "git ls-files -z --others",
-            Self::Diff => "git diff --raw -z",
         })
     }
 }
@@ -93,8 +90,6 @@ pub enum WalkError {
     MalformedRecord { listing: Listing, record: usize },
     /// The listing does not end with the NUL that terminates its last record.
     Unterminated { listing: Listing },
-    /// A change header at `record` has no path record after it.
-    MissingPath { listing: Listing, record: usize },
 }
 
 impl fmt::Display for WalkError {
@@ -105,9 +100,6 @@ impl fmt::Display for WalkError {
             }
             Self::Unterminated { listing } => {
                 write!(f, "`{listing}` output does not end with a NUL")
-            }
-            Self::MissingPath { listing, record } => {
-                write!(f, "`{listing}` record {record} has no path after it")
             }
         }
     }
@@ -241,7 +233,7 @@ enum Mode {
     Symlink,
     /// 160000.
     Gitlink,
-    /// Any other six-digit octal mode (`000000` for an absent side of a change).
+    /// Any other six-digit octal mode.
     Unknown(String),
 }
 
@@ -627,171 +619,6 @@ pub fn tracked(root: &DeclaredRoot, claimed: &[&DeclaredRoot]) -> Result<Vec<Tra
     let (files, refused) = listing(root, claimed)?;
     report(&refused);
     Ok(files)
-}
-
-/// One change record of `git diff --raw -z --no-renames`, before the disk check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
-    /// The path holds a regular file at the new commit.
-    Upsert(String),
-    /// The path holds no indexable file at the new commit.
-    ///
-    /// Deleted, or now a link or a submodule; its stale units leave the index.
-    Delete(String),
-    /// The entry is refused; a refused name is never stored, so it has nothing to delete.
-    Refused(Refusal),
-}
-
-/// Parses `git diff --raw -z --no-renames`.
-///
-/// Each change is a `:<old> <new> <osha> <nsha> <status>` record followed by
-/// one `<name>` record; renames and copies never appear (`--no-renames`).
-pub fn parse_diff(out: &[u8]) -> Result<Vec<Change>, WalkError> {
-    let listing = Listing::Diff;
-    let mut recs = records(out, listing)?.into_iter().enumerate();
-    let mut changes = Vec::new();
-    while let Some((record, header)) = recs.next() {
-        let malformed = WalkError::MalformedRecord { listing, record };
-        let Some(header) = header.strip_prefix(b":") else {
-            return Err(malformed);
-        };
-        let mut fields = header.split(|&b| b == b' ');
-        let (Some(_old), Some(new), Some(_osha), Some(_nsha), Some(status), None) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            return Err(malformed);
-        };
-        let Some(new) = Mode::parse(new) else {
-            return Err(malformed);
-        };
-        let deleted = match status {
-            b"D" => true,
-            b"A" | b"M" | b"T" => false,
-            _ => return Err(malformed),
-        };
-        let Some((_, name)) = recs.next() else {
-            return Err(WalkError::MissingPath { listing, record });
-        };
-        if name.is_empty() {
-            return Err(malformed);
-        }
-        let path = match path_of(name) {
-            Err(refusal) => {
-                changes.push(Change::Refused(refusal));
-                continue;
-            }
-            Ok(path) if !is_indexable(&path) => continue,
-            Ok(path) => path,
-        };
-        if deleted {
-            changes.push(Change::Delete(path));
-            continue;
-        }
-        match new.refusal(&path) {
-            None => changes.push(Change::Upsert(path)),
-            Some(refusal) => {
-                changes.push(Change::Refused(refusal));
-                changes.push(Change::Delete(path));
-            }
-        }
-    }
-    Ok(changes)
-}
-
-/// Changed/added + deleted paths between `since` sha and HEAD (for incremental update).
-///
-/// A path that is no longer a regular file (a link or submodule at HEAD, or
-/// not a regular file on disk) is a delete, so its stale units leave the index.
-/// The diff is `--relative`: only paths under `root` are listed, relative to
-/// it, even when `root` is a subdirectory of its work tree. A path under a
-/// `claimed` root is neither upserted nor deleted here: that root owns it.
-pub fn changed(
-    root: &DeclaredRoot,
-    since: &str,
-    claimed: &[&DeclaredRoot],
-) -> Result<(Vec<Tracked>, Vec<String>)> {
-    // `since` is interpolated into a positional commit-range token
-    // (`{since}..HEAD`). Reject anything that git could parse as an option
-    // (leading '-', e.g. `--output=…`) or that carries path/shell-hostile
-    // bytes, so a crafted ref can't smuggle options or write arbitrary files.
-    if since.is_empty()
-        || since.starts_with('-')
-        || !since
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
-    {
-        bail!("refusing unsafe git since-ref: {}", shown(since));
-    }
-    // `--no-renames` decomposes renames into a `D oldpath` + `A newpath` pair,
-    // so every change record carries exactly one path.
-    let range = format!("{since}..HEAD");
-    // `--` ends the revisions, so a range git cannot resolve is an error,
-    // never a pathspec naming a file called `<since>..HEAD`.
-    verify_root(root)?;
-    let out = git_stdout(
-        root.root_str(),
-        &[
-            "diff",
-            "--raw",
-            "-z",
-            "--no-renames",
-            "--relative",
-            &range,
-            "--",
-        ],
-    )?;
-    let (upserts, deletes, refused) = classify(root.root(), parse_diff(&out)?, claimed);
-    report(&refused);
-    refuse_moved_roots(&refused)?;
-    Ok((upserts, deletes))
-}
-
-/// Sorts the changes of one diff of `dir` into upserts, deletes and refusals.
-///
-/// A change at or under a `claimed` root is dropped, refusal included: that
-/// root's own diff owns it.
-fn classify(
-    dir: &Path,
-    changes: Vec<Change>,
-    claimed: &[&DeclaredRoot],
-) -> (Vec<Tracked>, Vec<String>, Vec<Refusal>) {
-    let mut upserts = Vec::new();
-    let mut deletes = Vec::new();
-    let mut refused = Vec::new();
-    for change in changes {
-        match change {
-            Change::Delete(path) => match on_disk(dir, &path, claimed) {
-                OnDisk::Claimed(_) => {}
-                OnDisk::Refused(found @ DiskRefusal::RootMoved { .. }) => {
-                    refused.push(Refusal::NotRegularOnDisk { path, found });
-                }
-                OnDisk::Regular(_) | OnDisk::Absent | OnDisk::Refused(_) => deletes.push(path),
-            },
-            Change::Refused(refusal) if refused_elsewhere(dir, &refusal, claimed) => {}
-            Change::Refused(refusal) => refused.push(refusal),
-            Change::Upsert(path) => match on_disk(dir, &path, claimed) {
-                OnDisk::Regular(_) => upserts.push(Tracked::at(path)),
-                OnDisk::Absent => deletes.push(path),
-                OnDisk::Claimed(_) => {}
-                OnDisk::Refused(found @ DiskRefusal::RootMoved { .. }) => {
-                    refused.push(Refusal::NotRegularOnDisk { path, found });
-                }
-                OnDisk::Refused(found) => {
-                    refused.push(Refusal::NotRegularOnDisk {
-                        path: path.clone(),
-                        found,
-                    });
-                    deletes.push(path);
-                }
-            },
-        }
-    }
-    (upserts, deletes, refused)
 }
 
 /// Why [`read_indexed`] returned no text for a path.
@@ -1276,60 +1103,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_maps_link_and_submodule_changes_to_deletes() {
-        let out = b":100644 100644 aaa bbb M\0a.rs\0\
-                    :100644 120000 aaa bbb T\0leak.rs\0\
-                    :000000 160000 000 bbb A\0sub\0\
-                    :100644 000000 aaa 000 D\0gone.rs\0\
-                    :000000 100644 000 bbb A\0two\nlines.rs\0\
-                    :000000 100644 000 bbb A\0\xfe.rs\0";
-        assert_eq!(
-            parse_diff(out).unwrap(),
-            [
-                Change::Upsert("a.rs".to_string()),
-                Change::Refused(Refusal::SymlinkEntry {
-                    path: "leak.rs".to_string()
-                }),
-                Change::Delete("leak.rs".to_string()),
-                Change::Refused(Refusal::GitlinkEntry {
-                    path: "sub".to_string()
-                }),
-                Change::Delete("sub".to_string()),
-                Change::Delete("gone.rs".to_string()),
-                Change::Upsert("two\nlines.rs".to_string()),
-                Change::Refused(Refusal::NonUtf8Name { offset: 0 }),
-            ]
-        );
-    }
-
-    #[test]
-    fn diff_framing_errors_refuse_the_whole_listing() {
-        assert_eq!(
-            parse_diff(b":100644 100644 a b M\0"),
-            Err(WalkError::MissingPath {
-                listing: Listing::Diff,
-                record: 0
-            })
-        );
-        for rec in [
-            &b"100644 100644 a b M\0a.rs\0"[..],
-            b":100644 100644 a b R100\0a.rs\0",
-            b":100644 100644 a b\0a.rs\0",
-            b":100644 1006 a b M\0a.rs\0",
-        ] {
-            assert_eq!(
-                parse_diff(rec),
-                Err(WalkError::MalformedRecord {
-                    listing: Listing::Diff,
-                    record: 0
-                }),
-                "{}",
-                rec.escape_ascii()
-            );
-        }
-    }
-
-    #[test]
     fn refusals_render_without_raw_control_bytes() {
         let r = Refusal::SymlinkEntry {
             path: "a\n\u{1b}[2J\u{202e}\\.rs".to_string(),
@@ -1424,17 +1197,6 @@ mod tests {
         );
     }
 
-    // A range git cannot resolve is an error, never a pathspec for a file of that name.
-    #[cfg(unix)]
-    #[test]
-    fn an_unresolvable_since_ref_is_an_error_not_a_pathspec() {
-        let fx = Fixture::new("since-pathspec");
-        std::fs::write(fx.0.join("abc..HEAD"), "x").unwrap();
-        fx.git(&["add", "abc..HEAD"]);
-        let set = set(&[("ipe", fx.root())]);
-        assert!(changed(root_of(&set, "ipe"), "abc", &[]).is_err());
-    }
-
     #[cfg(unix)]
     fn sorted(files: Vec<Tracked>) -> Vec<String> {
         let mut v: Vec<String> = files.into_iter().map(|t| t.path).collect();
@@ -1488,47 +1250,6 @@ mod tests {
             read_owned(out.root(), "inner/x.rs", &set.claimed_in(out)),
             Err(ReadRefusal::Claimed(inner.tag().clone()))
         );
-    }
-
-    // A root below the top of its work tree diffs relative to itself: a change
-    // outside it never appears, and a change inside it is named from the root.
-    #[cfg(unix)]
-    #[test]
-    fn update_in_subdir_root_is_root_relative() {
-        let fx = Fixture::new("subdir-update");
-        fx.write("sub/x.rs", "fn a() {}");
-        fx.write("top.rs", "fn t() {}");
-        fx.commit("one");
-        let first = head_sha(fx.root()).unwrap();
-        fx.write("sub/x.rs", "fn b() {}");
-        fx.write("top.rs", "fn u() {}");
-        fx.commit("two");
-        let set = set(&[("sub", &fx.path("sub"))]);
-        let (ups, dels) = changed(root_of(&set, "sub"), &first, &[]).unwrap();
-        assert_eq!(sorted(ups), ["x.rs"]);
-        assert_eq!(dels, Vec::<String>::new());
-    }
-
-    // A change under a declared inner root is neither upserted nor deleted by
-    // the outer root's update.
-    #[cfg(unix)]
-    #[test]
-    fn update_skips_claimed_paths() {
-        let fx = Fixture::new("claimed-update");
-        fx.write("top.rs", "fn t() {}");
-        fx.write("inner/x.rs", "fn x() {}");
-        fx.write("inner/y.rs", "fn y() {}");
-        fx.commit("one");
-        let first = head_sha(fx.root()).unwrap();
-        fx.write("top.rs", "fn u() {}");
-        fx.write("inner/x.rs", "fn z() {}");
-        std::fs::remove_file(fx.0.join("inner/y.rs")).unwrap();
-        fx.commit("two");
-        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
-        let out = root_of(&set, "out");
-        let (ups, dels) = changed(out, &first, &set.claimed_in(out)).unwrap();
-        assert_eq!(sorted(ups), ["top.rs"]);
-        assert_eq!(dels, Vec::<String>::new());
     }
 
     // An inner root swapped for another directory of the same name after the
@@ -1593,33 +1314,5 @@ mod tests {
                 path: "link.rs".to_string()
             }]
         );
-    }
-
-    // A diff refusal under a declared inner root is dropped by the outer
-    // update; one outside every inner root is still reported and deleted.
-    #[cfg(unix)]
-    #[test]
-    fn diff_refusals_under_a_claimed_root_are_its_own() {
-        let fx = Fixture::new("claimed-diff-refusals");
-        fx.write("top.rs", "fn t() {}");
-        fx.write("inner/x.rs", "fn x() {}");
-        let set = set(&[("out", fx.root()), ("in", &fx.path("inner"))]);
-        let out = root_of(&set, "out");
-        let link = |path: &str| Refusal::SymlinkEntry {
-            path: path.to_string(),
-        };
-        let (ups, dels, refused) = classify(
-            out.root(),
-            vec![
-                Change::Refused(link("inner/l.rs")),
-                Change::Delete("inner/l.rs".to_string()),
-                Change::Refused(link("l.rs")),
-                Change::Delete("l.rs".to_string()),
-            ],
-            &set.claimed_in(out),
-        );
-        assert_eq!(sorted(ups), Vec::<String>::new());
-        assert_eq!(dels, ["l.rs"]);
-        assert_eq!(refused, [link("l.rs")]);
     }
 }
