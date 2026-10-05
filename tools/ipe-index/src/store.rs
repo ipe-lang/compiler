@@ -389,6 +389,7 @@ impl Store {
             .execute("INSERT OR REPLACE INTO meta VALUES (?,?)", [k, v])?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn get_meta(&self, k: &str) -> Result<Option<String>> {
         Ok(self
             .conn
