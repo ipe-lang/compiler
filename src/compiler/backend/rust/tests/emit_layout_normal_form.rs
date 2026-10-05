@@ -107,7 +107,11 @@ fn layout_violations(text: &str) -> Vec<Violation> {
 
 /// The repository's `tests/golden` directory.
 fn golden_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../tests/golden")
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../tests/golden"
+    ))
+    .to_path_buf()
 }
 
 /// Every emitted golden Rust file.
