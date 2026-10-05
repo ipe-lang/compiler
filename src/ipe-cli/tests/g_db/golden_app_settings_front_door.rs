@@ -464,7 +464,7 @@ const FIXTURE_PREFIX: &str = "app_settings_";
 
 /// Why a build outcome is not the pinned refusal.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RejectionFault {
+pub enum RejectionFault {
     /// The build was accepted.
     Accepted,
     /// The build failed without a pipeline diagnostic — a missing or unreadable
@@ -486,7 +486,7 @@ pub(crate) enum RejectionFault {
 /// `expected`, and — when `fragment` is set — a type mismatch whose expected or
 /// found type renders `fragment`. Any other outcome is a fault, so a fixture
 /// that fails to load can never pass as "rejected".
-pub(crate) fn judge_rejection(
+pub fn judge_rejection(
     result: &Result<(), CliError>,
     expected: Code,
     fragment: Option<&'static str>,
@@ -529,7 +529,7 @@ pub(crate) fn judge_rejection(
 
 /// The emitted `src/main.rs` under `out`, if any. A rejected build must stop
 /// before codegen, so every rejected test asserts this is `None`.
-pub(crate) fn emitted_rust(out: &Path) -> Option<PathBuf> {
+pub fn emitted_rust(out: &Path) -> Option<PathBuf> {
     Some(out.join("src").join("main.rs")).filter(|p| p.exists())
 }
 
@@ -557,7 +557,7 @@ fn reconcile(
         return Err(InventoryFault::NoneEnumerated);
     }
     if let Some(both) = accepted.iter().find(|a| rejected.contains(*a)) {
-        return Err(InventoryFault::DoublyClassified(*both));
+        return Err(InventoryFault::DoublyClassified(both));
     }
     if let Some(stray) = on_disk
         .iter()
@@ -570,7 +570,7 @@ fn reconcile(
         .chain(rejected)
         .find(|c| !on_disk.iter().any(|d| d == *c))
     {
-        return Err(InventoryFault::Stale(*stale));
+        return Err(InventoryFault::Stale(stale));
     }
     Ok(on_disk.len())
 }
