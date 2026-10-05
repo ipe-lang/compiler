@@ -1271,18 +1271,27 @@ struct Table<const N: usize> {
     ok: bool,
 }
 
-const GIT_TABLE: Table<{ GIT.len() }> = parse_table(GIT, Shape::Git);
-const HG_TABLE: Table<{ HG.len() }> = parse_table(HG, Shape::Hg);
+/// Whether every Git row parses, in order, and the Git rows decide every setting once.
+const fn git_rows_sound() -> bool {
+    let table = parse_table::<{ GIT.len() }>(GIT, Shape::Git);
+    table.ok && rows_disjoint(&table.rows, Shape::Git)
+}
+
+/// Whether every Mercurial row parses, in order, and the Mercurial rows decide every setting once.
+const fn hg_rows_sound() -> bool {
+    let table = parse_table::<{ HG.len() }>(HG, Shape::Hg);
+    table.ok && rows_disjoint(&table.rows, Shape::Hg)
+}
 
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a Git row's spelling is malformed or out of order, or two Git rows decide one setting differently at equal specificity [ledger #boundary]
-const _: () = assert!(GIT_TABLE.ok && rows_disjoint(&GIT_TABLE.rows, Shape::Git));
+const _: () = assert!(git_rows_sound());
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a Mercurial row's spelling is malformed or out of order, or two Mercurial rows decide one setting differently at equal specificity [ledger #boundary]
-const _: () = assert!(HG_TABLE.ok && rows_disjoint(&HG_TABLE.rows, Shape::Hg));
+const _: () = assert!(hg_rows_sound());
 
 /// The parsed Git rows.
-static GIT_ROWS: [Parsed; GIT.len()] = GIT_TABLE.rows;
+static GIT_ROWS: [Parsed; GIT.len()] = parse_table::<{ GIT.len() }>(GIT, Shape::Git).rows;
 /// The parsed Mercurial rows.
-static HG_ROWS: [Parsed; HG.len()] = HG_TABLE.rows;
+static HG_ROWS: [Parsed; HG.len()] = parse_table::<{ HG.len() }>(HG, Shape::Hg).rows;
 
 /// How Git consumes `section.subsection.key`, or `None` when no row decides it.
 ///
