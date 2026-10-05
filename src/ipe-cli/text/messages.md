@@ -1869,19 +1869,19 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe dev build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+the emitted `fn main` anchor is absent, so the embedded capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+
+## run-main-anchor-ambiguous
+
+the emitted source holds more than one `fn main` anchor, so the embedded capability floor has no single place to be retained from — refusing to write an ambiguous artifact
+
+## run-floor-block-malformed
+
+the emitted source carries a capability floor block other than the one ipe writes — refusing to embed a floor beside one it cannot account for
 
 ## run-profile-unparsable
 
 {code}: {detail} — refusing to run (a profile that does not parse is not honored)
-
-## run-floor-unreadable
-
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
-
-## run-floor-not-release
-
-{code}: the app was built by `ipe dev build`, not `ipe release build` — `ipe release run` runs only a release build: rebuild it with `ipe release build`
 
 ## build-entry-not-main
 
@@ -1979,9 +1979,9 @@ ipe dev run {flag}: {name} has no recordable session — recording and replay ca
 
 ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
-## session-jailed
+## session-ffi-unproven
 
-ipe dev run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed, since its replay is not proven deterministic — run it without {flag}
 
 ## session-flags-exclusive
 

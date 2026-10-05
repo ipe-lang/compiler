@@ -37,6 +37,7 @@ pub enum MainMsg {
     Increment,
     Decrement,
 }
+
 impl IpeStringify for MainMsg {
     fn ipe_show(&self) -> String {
         match self {
@@ -47,9 +48,11 @@ impl IpeStringify for MainMsg {
 }
 
 pub use ipe_runtime::error::IpeError;
+
 pub fn str_err(s: &str) -> IpeError {
     IpeError::unexpected(s.to_string())
 }
+
 // Recursion guard shim — every user function body opens with
 // `let _ipe_recursion_guard = crate::recursion_guard();`, which resolves here.
 pub fn recursion_guard() -> ipe_runtime::core::RecursionGuard {
@@ -62,136 +65,173 @@ pub type Decoder<T> = ipe_runtime::json::Decoder<IpeError, T>;
 pub fn ok_res<A>(a: A) -> IpeResult<IpeError, A> {
     ipe_runtime::core::ok_res(a)
 }
+
 pub fn task_succeed<A: Send + 'static>(a: A) -> IpeTask<A> {
     ipe_runtime::task::task_succeed(a)
 }
+
 // ── Log kernels ────────────────────────────────────────────────────────────
 pub fn log_info(msg: String) -> IpeTask<()> {
     ipe_runtime::log::log_info(msg)
 }
+
 pub fn log_debug(msg: String) -> IpeTask<()> {
     ipe_runtime::log::log_debug(msg)
 }
+
 pub fn log_warn(msg: String) -> IpeTask<()> {
     ipe_runtime::log::log_warn(msg)
 }
+
 pub fn log_error(msg: String) -> IpeTask<()> {
     ipe_runtime::log::log_error(msg)
 }
+
 pub fn log_info_with<A: IpeInterpolate>(msg: String, attrs: Vec<A>) -> IpeTask<()> {
     ipe_runtime::log::log_info_with(msg, attrs)
 }
+
 pub fn log_error_with<A: IpeInterpolate>(msg: String, attrs: Vec<A>) -> IpeTask<()> {
     ipe_runtime::log::log_error_with(msg, attrs)
 }
+
 pub fn log_debug_with<A: IpeInterpolate>(msg: String, attrs: Vec<A>) -> IpeTask<()> {
     ipe_runtime::log::log_debug_with(msg, attrs)
 }
+
 pub fn log_warn_with<A: IpeInterpolate>(msg: String, attrs: Vec<A>) -> IpeTask<()> {
     ipe_runtime::log::log_warn_with(msg, attrs)
 }
+
 // ── System (env) kernels ───────────────────────────────────────────────────
 pub fn system_args(_: ()) -> IpeTask<Vec<String>> {
     ipe_runtime::system::system_args(())
 }
+
 pub fn system_setenv(key: String, val: String) -> IpeTask<()> {
     ipe_runtime::system::system_setenv(key, val)
 }
+
 pub fn system_unsetenv(key: String) -> IpeTask<()> {
     ipe_runtime::system::system_unsetenv(key)
 }
+
 // ── Time kernels ───────────────────────────────────────────────────────────
 pub fn time_now(_: ()) -> IpeTask<i64> {
     ipe_runtime::time::time_now(())
 }
+
 pub fn time_sleep(ms: i64) -> IpeTask<()> {
     ipe_runtime::time::time_sleep(ms)
 }
+
 pub fn time_unix_millis(_: ()) -> IpeTask<i64> {
     ipe_runtime::time::time_unix_millis(())
 }
+
 // ── Random kernels ─────────────────────────────────────────────────────────
 pub fn random_int(lo: i64, hi: i64) -> IpeTask<i64> {
     ipe_runtime::random::random_int(lo, hi)
 }
+
 pub fn random_float(lo: f64, hi: f64) -> IpeTask<f64> {
     ipe_runtime::random::random_float(lo, hi)
 }
+
 pub fn random_choice(items: Vec<String>) -> IpeTask<String> {
     ipe_runtime::random::random_choice(items)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_read_file(path: ipe_runtime::path::Path) -> IpeTask<String> {
     ipe_runtime::file::file_read_file(path)
 }
+
 pub fn file_write_file(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_write_file(path, content)
 }
+
 pub fn file_delete(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_delete(path)
 }
+
 // ── Task combinators ───────────────────────────────────────────────────────
 pub fn task_fail<A: Send + 'static>(e: IpeError) -> IpeTask<A> {
     ipe_runtime::task::task_fail(e)
 }
+
 pub fn task_map<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> B + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_map(f, t)
 }
+
 pub fn task_and_then<A: Send + 'static, B: Send + 'static>(
     t: IpeTask<A>,
     f: Box<dyn FnOnce(A) -> IpeTask<B> + Send + 'static>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then(t, f)
 }
+
 pub fn task_map_error<A: Send + 'static>(
     f: Box<dyn Fn(IpeError) -> IpeError + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_map_error(f, t)
 }
+
 pub fn task_on_error<A: Send + 'static>(
     f: Box<dyn FnOnce(IpeError) -> IpeTask<A> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_on_error(f, t)
 }
+
 pub fn task_from_result<A: Send + 'static>(r: IpeResult<IpeError, A>) -> IpeTask<A> {
     ipe_runtime::task::task_from_result(r)
 }
+
 pub fn task_and_then_result<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> IpeResult<IpeError, B> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then_result(f, t)
 }
+
 pub fn task_sequence<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_sequence(tasks)
 }
+
 pub fn task_parallel<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_parallel(tasks)
 }
+
 pub fn task_run<A: Send + 'static>(t: IpeTask<A>) -> IpeResult<IpeError, A> {
     ipe_runtime::task::task_run(t)
 }
+
 // ── Io kernels ─────────────────────────────────────────────────────────────
 pub fn io_read_line(_: ()) -> IpeTask<String> {
     ipe_runtime::io::io_read_line(())
 }
+
 pub fn io_write_stdout(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stdout(s)
 }
+
 pub fn io_write_stderr(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stderr(s)
 }
+
 pub fn io_println(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_println(msg)
 }
+
 pub fn io_eprintln(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_eprintln(msg)
 }
+
 // ── Io secret kernels ──────────────────────────────────────────────────────
 // `Io.readSecret` returns the opaque `Secret`, so its wrapper hard-references
 // `ipe_runtime::secret::Secret`. That module is `secret`-gated in the dependency
@@ -202,78 +242,102 @@ pub fn io_eprintln(msg: String) -> IpeTask<()> {
 pub fn io_read_secret(prompt: String) -> IpeTask<ipe_runtime::secret::Secret> {
     ipe_runtime::io::io_read_secret(prompt)
 }
+
 // ── System kernels ─────────────────────────────────────────────────────────
 pub fn system_getenv(key: String) -> IpeTask<String> {
     ipe_runtime::system::system_getenv(key)
 }
+
 pub fn system_getenv_or(key: String, default: String) -> String {
     ipe_runtime::system::system_getenv_or(key, default)
 }
+
 pub fn system_get_arg(n: i64) -> IpeTask<IpeMaybe<String>> {
     ipe_runtime::system::system_get_arg(n)
 }
+
 pub fn system_getenv_int(key: String) -> IpeTask<i64> {
     ipe_runtime::system::system_getenv_int(key)
 }
+
 pub fn system_getenv_bool(key: String) -> IpeTask<bool> {
     ipe_runtime::system::system_getenv_bool(key)
 }
+
 pub fn system_cwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_cwd(())
 }
+
 pub fn system_getcwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_getcwd(())
 }
+
 pub fn system_load_env(_: ()) -> IpeTask<()> {
     ipe_runtime::system::system_load_env(())
 }
+
 pub fn system_exit(code: i64) -> ! {
     ipe_runtime::system::system_exit(code)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_exists(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_exists(path)
 }
+
 pub fn file_remove(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_remove(path)
 }
+
 pub fn file_mkdir_all(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_mkdir_all(path)
 }
+
 pub fn file_read_file_limit(path: ipe_runtime::path::Path, limit: i64) -> IpeTask<String> {
     ipe_runtime::file::file_read_file_limit(path, limit)
 }
+
 pub fn file_read_file_bytes(path: ipe_runtime::path::Path) -> IpeTask<Vec<i64>> {
     ipe_runtime::file::file_read_file_bytes(path)
 }
+
 pub fn file_append(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_append(path, content)
 }
+
 pub fn file_read_dir(path: ipe_runtime::path::Path) -> IpeTask<Vec<String>> {
     ipe_runtime::file::file_read_dir(path)
 }
+
 pub fn file_is_dir(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_is_dir(path)
 }
+
 pub fn file_temp_file(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_file(prefix)
 }
+
 pub fn file_temp_dir(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_dir(prefix)
 }
+
 pub fn file_copy(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_copy(src, dst)
 }
+
 pub fn file_rename(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_rename(src, dst)
 }
+
 // ── Crypto (entropy) kernels ───────────────────────────────────────────────
 pub fn crypto_random_bytes(n: i64) -> IpeTask<String> {
     ipe_runtime::crypto_core::crypto_random_bytes(n)
 }
+
 pub fn crypto_random_token(n: i64) -> IpeTask<String> {
     ipe_runtime::crypto_core::crypto_random_token(n)
 }
+
 // ── Http kernels ───────────────────────────────────────────────────────────
 pub fn http_parse_query(raw: String) -> IpeResult<IpeError, HashMap<String, String>> {
     ipe_runtime::http_client::http_parse_query(raw)
@@ -285,6 +349,7 @@ pub fn main_update(msg: MainMsg, count: i64) -> i64 {
         MainMsg::Decrement => (count - 1),
     }
 }
+
 pub fn ipe_main() -> IpeTask<()> {
     io_println(string_from_int(crate::main_update(MainMsg::Increment, 0)))
 }
@@ -293,10 +358,6 @@ pub fn ipe_main() -> IpeTask<()> {
 pub fn list_map_consume<T0, T1>(f: impl Fn(T0) -> T1, list: Vec<T0>) -> Vec<T1> {
     list.into_iter().map(f).collect()
 }
-
-// ===========================================
-// FFI PLACEHOLDER TYPES (types referenced but not defined)
-// ===========================================
 
 // ===========================================
 // ENTRY POINT

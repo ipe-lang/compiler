@@ -15,7 +15,6 @@ exit: 0
     [--runtime <dir>]                                   vendor the Ipê runtime from <dir>
     [--emit-ir]                                         also emit the intermediate representation
     [--fix]                                             apply machine-applicable fixes before building
-    [--accept-risks]                                    accept every disclosed .Unsafe escape-hatch import and proceed without prompting
     [--static]                                          produce a statically linked binary
     [--target <wasm|wasi|triple>]                       compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
     [--allocator <auto|system|dlmalloc|talc|mimalloc>]  select the global allocator (default: auto); `system` is the target libc's malloc, which on musl is several times slower than the default on allocation-heavy work

@@ -711,6 +711,17 @@ const SHUTDOWN_WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// unrelated edit.
 const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// The target every watch rebuild emits for.
+const REBUILD_TARGET: ipe_ir::Target = ipe_ir::Target::Native;
+
+/// The intent every watch rebuild emits with: a development loop, so `Debug.*`
+/// is allowed.
+const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WATCH.intent();
+
+/// The floor every watch rebuild's crate carries: the development marker.
+const REBUILD_FLOOR: crate::run_sandbox::EmitFloor =
+    crate::run_sandbox::EmitFloor::of(REBUILD_INTENT, REBUILD_TARGET);
+
 /// Schedule one follow-up [`OrchestratorEvent::FsBatch`] after
 /// [`RESOLVE_RETRY_DELAY`] — the recovery path for a `resolve_project_sources`
 /// failure. Without this, a transient failure has no other route back into
@@ -1326,11 +1337,10 @@ fn run_inner(
                         &db_main,
                         resolved.db_driver,
                         ffi_prep.emit,
-                        ipe_ir::Target::Native,
+                        REBUILD_TARGET,
                         resolved.wasm_public_env.clone(),
                         false,
-                        // `ipe dev watch` is a development loop — Debug.* is allowed.
-                        crate::verb::Verb::DEV_WATCH.intent(),
+                        REBUILD_INTENT,
                         // Dependency-model emit: the project links the runtime as a
                         // path dependency (what `ipe dev build` uses by default), so
                         // no runtime source is vendored into `src/ipe_runtime/`.
@@ -1624,8 +1634,23 @@ fn run_inner(
                             &opts.runtime_dir,
                             None,
                             false,
+                            REBUILD_FLOOR,
                         ) {
                             Ok(dir) => dir,
+                            Err(e) => {
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(&format!(
+                                        "[ipe dev watch] failed to write emitted project: {e}"
+                                    )),
+                                    WatchRole::Failure,
+                                );
+                                continue;
+                            }
+                        };
+                        // The watch cargo step compiles only a crate written
+                        // with the development marker.
+                        let marked = match crate_dir.dev_marked() {
+                            Ok(marked) => marked,
                             Err(e) => {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
@@ -1683,7 +1708,7 @@ fn run_inner(
                         }
                         match spawn_cargo_build(
                             &opts.cargo_path,
-                            crate_dir.path(),
+                            marked,
                             opts.target_dir.as_deref(),
                             generation,
                             evt_tx.clone(),
@@ -1691,7 +1716,7 @@ fn run_inner(
                         ) {
                             Ok(child) => {
                                 cargo_child = Some(child);
-                                building = Some(crate_dir);
+                                building = Some(crate_dir.into_dir());
                             }
                             Err(e) => emit_watch_line(
                                 &crate::style::TerminalSafe::sanitize(&format!(
@@ -3217,16 +3242,16 @@ fn env_flag_on(name: &str) -> bool {
 /// An I/O error if the `cargo` process itself cannot be spawned.
 fn spawn_cargo_build(
     cargo_path: &Path,
-    out_dir: &Path,
+    krate: crate::DevMarkedCrate<'_>,
     target_dir: Option<&Path>,
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
-    let accel = choose_build_accel(out_dir, target_dir, env_flag_on(NO_INCREMENTAL_ENV));
+    let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
     let build = crate::cargo_step::WatchBuild {
         cargo: cargo_path,
-        crate_dir: out_dir,
+        krate,
         target_dir,
         accel: &accel,
         verbosity: crate::cargo_step::Verbosity::of_quiet(quiet),
@@ -4223,9 +4248,15 @@ mod tests {
     ) -> Option<super::CargoOutcome> {
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, rx) = mpsc::channel();
-        let child =
-            super::spawn_cargo_build(cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true)
-                .expect("spawn fake cargo");
+        let child = super::spawn_cargo_build(
+            cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        )
+        .expect("spawn fake cargo");
         before_exit(child.as_ref());
         let event = rx.recv_timeout(Duration::from_secs(30));
         let _ = std::fs::remove_dir_all(out_dir);
@@ -4272,8 +4303,14 @@ mod tests {
         let cargo = fake_cargo("waiter_refused", "exec sleep 30");
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, _rx) = mpsc::channel();
-        let spawned =
-            super::spawn_cargo_build(&cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true);
+        let spawned = super::spawn_cargo_build(
+            &cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        );
         let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
         let _ = std::fs::remove_dir_all(out_dir);
         assert!(
@@ -4380,5 +4417,45 @@ mod tests {
             "an untouched crate is handed back to run, got {proven:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A watch rebuild links its crate through `cargo` directly, so the crate
+    /// carries the development marker from the moment it is written: a release
+    /// reader refuses the binary as a development build.
+    #[test]
+    fn watch_rebuild_embeds_the_development_marker() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::REBUILD_FLOOR,
+            crate::run_sandbox::EmitFloor::DevelopmentMarker
+        );
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-watch-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+        let claimed = crate::output_dir::OwnedDir::claim(&base.join("crate"))?;
+        let written = super::write_emitted_project(
+            &emitted_with_main("fn main() {\n    run();\n}\n"),
+            &super::EmitTarget::Claimed(claimed),
+            &base.join("no-runtime"),
+            None,
+            false,
+            super::REBUILD_FLOOR,
+        )?;
+        assert!(
+            written.dev_marked().is_ok(),
+            "a watch rebuild's crate is dev-marked for its cargo step"
+        );
+        let main_rs = std::fs::read_to_string(written.path().join("src").join("main.rs"))?;
+        assert!(
+            main_rs.contains(&crate::run_sandbox::dev_floor_marker_source()),
+            "the development marker is embedded, got {main_rs}"
+        );
+        assert!(
+            main_rs.contains("fn main() {\n    // Retain the embedded capability floor"),
+            "fn main retains the marker, got {main_rs}"
+        );
+        assert_eq!(main_rs.matches("static IPE_CAPABILITY_FLOOR").count(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 }

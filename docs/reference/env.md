@@ -187,7 +187,6 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
-| `IPE_ALLOW_UNSANDBOXED` | unset (false) | When `bwrap` confinement is unavailable, set to `1` to allow `ipe dev run` to proceed unconfined instead of refusing. Widens the trust boundary. Never set in CI or production. | `SecurityTunable` |
 | `IPE_HOME` | unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe) | Root directory for materialised runtime source, config, and cached binaries. Overrides the XDG / home-directory fallback. Must be an absolute path. | `Tunable` |
 | `IPE_RUNTIME_DIR` | unset (embedded / in-repo) | Explicit path to the runtime crate source directory. Overrides the embedded fallback. Used in tests and in-repo development. | `Tunable` |
 | `IPE_RUNTIME_VENDORED` | unset (false) | Set to `1` to declare that the runtime is vendored (already present on disk) and skip materialization. Used during packaging. | `Tunable` |
@@ -206,7 +205,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_WEB_BANNER` | unset (on in dev) | Set to `off`, `0`, or `false` to disable the reconnection-status banner in the browser client. | `Tunable` |
 | `IPE_WEB_BASE_PATH` | unset (root-mounted) | Sub-app mount prefix, e.g. `/billing`. All session-cookie, CSRF-cookie, and asset paths are scoped to this prefix. Set automatically when mounting a sub-app. | `Tunable` |
 | `IPE_WEB_CSRF_ORIGIN_CHECK` | unset (off) | Set to `on` to enforce strict `Origin`-header cross-origin checking on top of the double-submit CSRF token. | `SecurityTunable` |
-| `IPE_WEB_FRAME_ANCESTORS` | unset (no embedding allowed) | Space-separated `Content-Security-Policy: frame-ancestors` allow-list, e.g. `https://app.example.com`. Enables embedding this app in a third-party iframe; also sets `SameSite=None; Secure` on session cookies. | `SecurityTunable` |
+| `IPE_WEB_FRAME_ANCESTORS` | unset (no embedding allowed) | Space-separated `Content-Security-Policy: frame-ancestors` allow-list, e.g. `https://app.example.com`. Enables embedding this app in a third-party iframe; also sets `SameSite=None; Secure` on session cookies. A value holding a control or non-ASCII byte, a `;` or `,`, or only whitespace refuses to start the server. | `SecurityTunable` |
 | `IPE_WEB_HEARTBEAT_TTL_MS` | 35000 | SSE heartbeat interval (ms) the browser uses to detect a stale connection. | `Tunable` |
 | `IPE_WEB_HELLO_TIMEOUT_MS` | 8000 | Timeout (ms) for the initial SSE hello handshake. The browser closes and retries if this deadline passes. | `Tunable` |
 | `IPE_WEB_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise for large file uploads; lower to tighten the DoS floor. | `Tunable` |

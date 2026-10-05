@@ -1,0 +1,11 @@
+module Lib exposing (Wrap(..), nav)
+
+import Ipe.Html as Html exposing (Html)
+
+
+type Wrap msg
+    = Wrap (Html msg)
+
+
+nav =
+    Html.div [] [ Html.text "nav" ]

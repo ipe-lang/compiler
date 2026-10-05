@@ -1,9 +1,9 @@
 //! The typed identity of every build-producing CLI verb.
 //!
 //! A verb lives under exactly one umbrella group (`dev` or `release`), and the
-//! umbrella alone fixes its build posture: [`Umbrella::Dev`] builds with
-//! [`BuildIntent::Development`] and [`BundleProfile::Dev`], [`Umbrella::Release`]
-//! with [`BuildIntent::Release`] and [`BundleProfile::Release`]. A verb's
+//! umbrella alone fixes its build intent: [`Umbrella::Dev`] builds with
+//! [`BuildIntent::Development`], [`Umbrella::Release`] with
+//! [`BuildIntent::Release`]. A verb's
 //! [`fmt::Display`] (`dev build`) is the one spelling of its name for help
 //! pages, usage refusals, machine-output command fields, verb labels, and the
 //! argv of a self-reinvocation.
@@ -12,7 +12,6 @@ use core::fmt;
 
 use ipe_backend_rust::BuildIntent;
 
-use crate::driver::BundleProfile;
 use crate::text;
 
 /// The umbrella group a build-producing verb lives under.
@@ -43,15 +42,6 @@ impl Umbrella {
         match self {
             Self::Dev => BuildIntent::Development,
             Self::Release => BuildIntent::Release,
-        }
-    }
-
-    /// The bundle profile every verb of this umbrella packages with.
-    #[must_use]
-    pub(crate) const fn bundle_profile(self) -> BundleProfile {
-        match self {
-            Self::Dev => BundleProfile::Dev,
-            Self::Release => BundleProfile::Release,
         }
     }
 
@@ -130,12 +120,6 @@ impl Verb {
     #[must_use]
     pub const fn intent(self) -> BuildIntent {
         self.umbrella().intent()
-    }
-
-    /// The bundle profile this verb packages with, fixed by its umbrella.
-    #[must_use]
-    pub(crate) const fn bundle_profile(self) -> BundleProfile {
-        self.umbrella().bundle_profile()
     }
 
     /// The verb word typed after the group word.
@@ -297,13 +281,11 @@ mod tests {
     #[test]
     fn the_umbrella_alone_fixes_the_posture() {
         for verb in Verb::ALL {
-            let (intent, profile) = match verb.umbrella() {
-                Umbrella::Dev => (BuildIntent::Development, BundleProfile::Dev),
-                Umbrella::Release => (BuildIntent::Release, BundleProfile::Release),
+            let intent = match verb.umbrella() {
+                Umbrella::Dev => BuildIntent::Development,
+                Umbrella::Release => BuildIntent::Release,
             };
             assert_eq!(verb.intent(), intent, "{verb}");
-            assert_eq!(verb.bundle_profile(), profile, "{verb}");
-            assert_eq!(verb.bundle_profile().build_intent(), intent, "{verb}");
         }
     }
 

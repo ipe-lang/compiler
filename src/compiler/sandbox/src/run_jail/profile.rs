@@ -62,7 +62,12 @@ pub enum FilesystemScope {
     /// writable tempdir. The maximally-isolated filesystem view.
     Isolated,
     /// `filesystem` granted: the working tree is bound read-write (still coarse
-    /// — any path under it — per the first-cut map).
+    /// — any path under it — per the first-cut map), except its version-control
+    /// metadata ([`crate::VcsKind::ALL`]), which stays read-only: the host runs
+    /// code that metadata names. An arm that cannot keep it read-only refuses
+    /// a tree holding it. Metadata the program creates after the jail starts is
+    /// not carved on every arm, so a tree is trusted only as far as the next
+    /// tool the developer runs over it.
     WorkingTreeReadWrite,
 }
 
@@ -293,7 +298,8 @@ impl SandboxProfile {
 /// and development-only behaviour that a deployment must not ship.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorIntent {
-    /// Embedded by `ipe dev build` (or by a floor line that names no intent).
+    /// Embedded by a development build (`ipe dev`), or by a floor line that
+    /// names no intent.
     Development,
     /// Embedded by `ipe release build`.
     Release,
@@ -324,7 +330,8 @@ pub struct CapFloor {
 pub enum FloorRefusal {
     /// The app carries no readable capability floor.
     Unreadable,
-    /// The floor was embedded by a development build, not `ipe release build`.
+    /// The floor was embedded by a development build (`ipe dev`), not
+    /// `ipe release build`.
     NotRelease,
     /// The profile grants more than the floor the app was built with.
     ProfileWider,
@@ -337,13 +344,15 @@ impl std::fmt::Display for FloorRefusal {
             Self::Unreadable => write!(
                 f,
                 "{}: the binary embeds no readable capability floor — refusing to run an \
-                 artifact whose confinement cannot be verified",
+                 artifact whose confinement cannot be verified: rebuild it with \
+                 `ipe release build`",
                 code.as_str()
             ),
             Self::NotRelease => write!(
                 f,
-                "{}: the app was built by `ipe dev build`, not `ipe release build` — a \
-                 release runs only a release build: rebuild it with `ipe release build`",
+                "{}: the app is a development build (`ipe dev`), not an \
+                 `ipe release build` artifact — a release runs only a release build: \
+                 rebuild it with `ipe release build`",
                 code.as_str()
             ),
             Self::ProfileWider => {

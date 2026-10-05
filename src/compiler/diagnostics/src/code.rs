@@ -725,7 +725,7 @@ code! {
     // -----------------------------------------------------------------------
 
     /// a program imports an `Ipe.<M>.Unsafe` escape hatch and the risk was not
-    /// acknowledged (non-interactive build without `--accept-risks` / manifest
+    /// acknowledged (non-interactive release build without manifest
     /// pre-acceptance, or an interactive "no")
     IPE_S0001 = "IPE-S0001", "unsafe escape hatch imported without acknowledgment", "IPE-S0001";
 

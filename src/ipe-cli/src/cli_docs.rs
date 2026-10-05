@@ -98,11 +98,14 @@ fn render_sections(
     }
 }
 
-/// A group node inside a section: its name, summary, and a link to each member
-/// verb (whose full body lives in the command-groups appendix).
+/// A group node inside a section: its name, summary, note, and a link to each
+/// member verb (whose full body lives in the command-groups appendix).
 fn render_group(out: &mut String, group: &GroupSpec) {
     let _ = writeln!(out, "### `ipe {}`\n", group.name);
     let _ = writeln!(out, "{}\n", group.summary);
+    if let Some(note) = group.note {
+        let _ = writeln!(out, "{note}\n");
+    }
     out.push_str(crate::text::verbs_label());
     out.push_str("\n\n");
     for &verb in &group.members {

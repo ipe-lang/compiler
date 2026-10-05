@@ -24,16 +24,11 @@ pub fn web_req(
                 .or_insert_with(|| val.to_string());
         }
     }
+    // Decoded through the one request-cookie parser, first value wins, so
+    // `req.cookies` agrees with `Server.getCookie` and the session reader.
     let mut cookies: IpeDict<String> = IpeDict::new();
-    if let Some(c) = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        for pair in c.split(';') {
-            if let Some((k, v)) = pair.trim().split_once('=') {
-                cookies.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
+    for (name, value) in crate::server::request_cookie_jar(headers) {
+        cookies.entry(name).or_insert(value);
     }
     WebReq {
         path: uri.path().to_string(),
@@ -70,5 +65,27 @@ mod tests {
         assert_eq!(req.cookies.get("ipe_sid").map(String::as_str), Some("abc"));
         assert_eq!(req.cookies.get("theme").map(String::as_str), Some("dark"));
         assert_eq!(req.headers.get("X-Custom").map(String::as_str), Some("v"));
+    }
+
+    /// `req.cookies` keeps the session cookie beside a pair with a non-ASCII byte.
+    #[test]
+    fn web_req_keeps_the_cookies_beside_a_non_ascii_pair() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"x=\xC3\xA9; ipe_sid=abc").unwrap(),
+        );
+        let uri: axum::http::Uri = "/".parse().unwrap();
+        let req = web_req(
+            &axum::http::Method::GET,
+            &uri,
+            &h,
+            crate::dict::dict_empty(),
+        );
+        assert_eq!(req.cookies.get("ipe_sid").map(String::as_str), Some("abc"));
+        assert!(
+            !req.cookies.contains_key("x"),
+            "the non-ASCII pair is skipped"
+        );
     }
 }

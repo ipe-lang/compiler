@@ -7,19 +7,20 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{CanonicalPath, HomeMasks, JailPathError};
+use crate::{CanonicalPath, HomeMasks, JailPathError, WritableTree};
 
 /// Every host path a build or run jail exposes, none at or above the cargo home.
 ///
 /// The one always-writable scratch, the working tree (writable only when the
-/// profile grants the filesystem axis), and the read-only binds, with the home
-/// masks resolved alongside them. Only [`Self::of_invoker`] builds one, after
+/// profile grants the filesystem axis, and then never its version-control
+/// metadata), and the read-only binds, with the home masks resolved alongside
+/// them. Only [`Self::of_invoker`] builds one, after
 /// checking every path, whatever its source, against the invoker's cargo home;
 /// [`Self::recheck`] repeats that check when the jail is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JailMounts {
     scoped_tmp: CanonicalPath,
-    working_tree: CanonicalPath,
+    working_tree: WritableTree,
     read_only: Vec<CanonicalPath>,
     homes: HomeMasks,
     cargo_home: PathBuf,
@@ -37,6 +38,7 @@ impl JailMounts {
     /// - [`JailPathError::ToolHomeRelative`] when `CARGO_HOME` is relative.
     /// - [`JailPathError::ExposesCargoHome`] when a path equals or contains the
     ///   cargo home.
+    /// - Any error of [`WritableTree::parse`] the working tree raises.
     pub fn of_invoker(
         scoped_tmp: CanonicalPath,
         working_tree: CanonicalPath,
@@ -59,11 +61,11 @@ impl JailMounts {
     }
 
     /// `scoped_tmp`, `working_tree`, and `read_only` checked against
-    /// `cargo_home`.
+    /// `cargo_home`, the working tree parsed for its version-control carve.
     ///
     /// # Errors
     /// [`JailPathError::ExposesCargoHome`] when a path equals or contains
-    /// `cargo_home`.
+    /// `cargo_home`; any error of [`WritableTree::parse`].
     fn checked(
         scoped_tmp: CanonicalPath,
         working_tree: CanonicalPath,
@@ -71,6 +73,7 @@ impl JailMounts {
         homes: HomeMasks,
         cargo_home: PathBuf,
     ) -> Result<Self, JailPathError> {
+        let working_tree = WritableTree::parse(working_tree, &[&scoped_tmp])?;
         let mounts = Self {
             scoped_tmp,
             working_tree,
@@ -105,16 +108,18 @@ impl JailMounts {
     }
 
     /// Confirm every path still resolves to itself and still exposes no cargo
-    /// home.
+    /// home, and the working tree still holds exactly its carve.
     ///
     /// # Errors
     /// [`JailPathError::Moved`] when a path changed since it was resolved;
-    /// [`JailPathError::ExposesCargoHome`] when one now covers the cargo home.
+    /// [`JailPathError::ExposesCargoHome`] when one now covers the cargo home;
+    /// any error of [`WritableTree::recheck`].
     pub fn recheck(&self) -> Result<(), JailPathError> {
         for path in self.all() {
             path.recheck()?;
         }
-        self.refuse_exposing()
+        self.refuse_exposing()?;
+        self.working_tree.recheck(&[&self.scoped_tmp])
     }
 
     /// Refuse when a fixed path a platform profile grants on top of these
@@ -150,7 +155,7 @@ impl JailMounts {
     }
 
     fn all(&self) -> impl Iterator<Item = &CanonicalPath> {
-        [&self.scoped_tmp, &self.working_tree]
+        [&self.scoped_tmp, self.working_tree.tree()]
             .into_iter()
             .chain(&self.read_only)
     }
@@ -164,6 +169,13 @@ impl JailMounts {
     /// The working tree, writable only when the filesystem axis is granted.
     #[must_use]
     pub const fn working_tree(&self) -> &CanonicalPath {
+        self.working_tree.tree()
+    }
+
+    /// The working tree with the version-control carve a writable grant of it
+    /// must render.
+    #[must_use]
+    pub const fn writable_tree(&self) -> &WritableTree {
         &self.working_tree
     }
 
@@ -415,5 +427,34 @@ mod tests {
             Path::new("/opt/home/.cargo/bin"),
             Path::new("/opt/home/.cargo")
         ));
+    }
+
+    #[test]
+    fn a_git_dir_swapped_after_check_refuses_on_recheck() {
+        let base_dir = TestDir::new("covers-vcs-recheck").expect("test dir");
+        let base = base_dir.path();
+        let tree = base.join("tree");
+        let tmp = base.join("tmp");
+        make_dir(&tree.join(".git"));
+        make_dir(&tmp);
+        let resolve = |path: &Path| CanonicalPath::resolve(path).expect("canonical");
+        let mounts = JailMounts::checked_against(
+            resolve(&tmp),
+            resolve(&tree),
+            Vec::new(),
+            HomeMasks::unmasked(),
+            &base.join("cargo"),
+        )
+        .expect("the tree parses");
+        assert!(mounts.recheck().is_ok(), "nothing changed yet");
+        std::fs::rename(tree.join(".git"), base.join("old.git")).expect("rename");
+        make_dir(&tree.join(".git"));
+        assert!(
+            matches!(
+                mounts.recheck(),
+                Err(JailPathError::VcsEntryChanged { path }) if path == tree.join(".git")
+            ),
+            "a replaced metadata dir is a change"
+        );
     }
 }

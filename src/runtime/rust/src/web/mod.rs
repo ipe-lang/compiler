@@ -1480,25 +1480,27 @@ fn normalise_base_path(raw: &str) -> String {
 /// (`__Host-` requires Secure, which a browser drops over `http://`). A sub-app
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
 #[cfg(feature = "server")]
-fn cookie_name_for(base: &str) -> String {
+fn cookie_name_for(base: &str) -> crate::server::CookieName {
     cookie_name_with(base, csrf::cookies_secure())
 }
 
 /// [`cookie_name_for`] under an explicit `Secure` decision.
 #[cfg(feature = "server")]
-fn cookie_name_with(base: &str, secure: bool) -> String {
+fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
+    use crate::server::{CookieName, RuntimeCookie};
     if base.is_empty() {
-        if secure {
-            "__Host-ipe_sid".to_string()
+        let root = if secure {
+            RuntimeCookie::HostSession
         } else {
-            "ipe_sid".to_string()
-        }
+            RuntimeCookie::Session
+        };
+        CookieName::runtime(root, "")
     } else {
         let suffix: String = base
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        format!("ipe_sid{suffix}")
+        CookieName::runtime(RuntimeCookie::Session, &suffix)
     }
 }
 
@@ -1529,7 +1531,7 @@ pub(super) fn web_base_path() -> String {
 /// The active session cookie name (read AND write must agree, so both
 /// `page_response` and `sid_from_cookie` route through this).
 #[cfg(feature = "server")]
-fn session_cookie_name() -> String {
+fn session_cookie_name() -> crate::server::CookieName {
     cookie_name_for(&web_base_path())
 }
 
@@ -1537,6 +1539,34 @@ fn session_cookie_name() -> String {
 #[cfg(feature = "server")]
 fn cookie_path() -> String {
     cookie_path_for(&web_base_path())
+}
+
+/// The session cookie line: `Path` is the app's base, `HttpOnly`, `Max-Age` is
+/// the store `ttl`. `Secure` when cookies are secure or this request arrived over
+/// TLS at a trusted proxy; `SameSite=None` (always `Secure`) when the app may be
+/// framed cross-origin, else `Lax`.
+#[cfg(feature = "server")]
+fn session_set_cookie(
+    sid: &str,
+    headers: &axum::http::HeaderMap,
+    ttl: std::time::Duration,
+) -> crate::server::SetCookie {
+    use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
+    SetCookie::new(
+        &session_cookie_name(),
+        &CookieValue::encode(sid),
+        CookieAttributes {
+            path: CookiePath::encode(&cookie_path()),
+            http_only: true,
+            same_site: if csrf::frame_ancestors().is_some() {
+                SameSite::None
+            } else {
+                SameSite::Lax
+            },
+            secure: csrf::cookies_secure() || request_is_https(headers),
+            max_age_secs: Some(ttl.as_secs()),
+        },
+    )
 }
 
 /// Whether to trust `X-Forwarded-Proto` for TLS-termination detection. Mirrors
@@ -1616,35 +1646,12 @@ fn page_response(
     // request-scoped.
     //
     // SameSite=Lax stays so top-level navigations keep the session.
-    let secure = if csrf::cookies_secure() || request_is_https(headers) {
-        "; Secure"
-    } else {
-        ""
-    };
-    // SameSite: a deploy opted into cross-origin embedding via
-    // IPE_WEB_FRAME_ANCESTORS needs `SameSite=None; Secure` so the
-    // session cookie survives inside a third-party iframe; otherwise `Lax`
-    // (top-level navigations keep the session). `cookies_secure()` is already true
-    // in frame-ancestors mode, so `None` always pairs with `Secure`.
-    let same_site = if csrf::frame_ancestors().is_some() {
-        "None"
-    } else {
-        "Lax"
-    };
-    // Max-Age: persist the cookie for the store TTL so a
-    // tab-close doesn't drop a still-live server session. Without it the cookie is
-    // session-scoped and the user loses state on tab close.
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
-    let max_age = ttl.as_secs();
-    let session_cookie = format!(
-        "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
-        session_cookie_name(),
-        cookie_path()
-    );
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1653,21 +1660,7 @@ fn page_response(
         html,
     )
         .into_response();
-    let h = resp.headers_mut();
-    // Two Set-Cookie headers — `append`, not `insert`, so both land.
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    // Security response headers — page GET only.
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
-    }
-    resp
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -1682,27 +1675,12 @@ fn page_response_with_overlay(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let html = render_page_full_with_overlay(sid, &web_base_path(), body, csrf_token, overlay);
-    let secure = if csrf::cookies_secure() || request_is_https(headers) {
-        "; Secure"
-    } else {
-        ""
-    };
-    let same_site = if csrf::frame_ancestors().is_some() {
-        "None"
-    } else {
-        "Lax"
-    };
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
-    let max_age = ttl.as_secs();
-    let session_cookie = format!(
-        "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
-        session_cookie_name(),
-        cookie_path()
-    );
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1711,19 +1689,133 @@ fn page_response_with_overlay(
         html,
     )
         .into_response();
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+}
+
+/// `resp` with one `Set-Cookie` header per line of `cookies`, then the page
+/// security headers.
+///
+/// A cookie line or a security header with no header representation answers
+/// `500`: a page never ships without the session or CSRF cookie it was built
+/// with, nor without its framing policy.
+#[cfg(feature = "server")]
+fn with_page_headers(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+) -> axum::response::Response {
+    with_page_headers_checked(resp, cookies, csrf::security_headers())
+}
+
+/// [`with_page_headers`] over the outcome of reading the security headers: a
+/// refused framing policy answers `500` with no cookie and no header set.
+#[cfg(feature = "server")]
+fn with_page_headers_checked(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(security) = security else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    with_page_headers_from(resp, cookies, security)
+}
+
+/// [`with_page_headers`] over an explicit security-header set.
+#[cfg(feature = "server")]
+fn with_page_headers_from(
+    mut resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Vec<(&'static str, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let h = resp.headers_mut();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
+    // One header per cookie — `append`, not `insert`, so every line lands.
+    for cookie in cookies {
+        let Some(v) = cookie.header_value() else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
         h.append(axum::http::header::SET_COOKIE, v);
     }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
+    for (name, val) in security {
+        let Ok(v) = axum::http::HeaderValue::from_str(&val) else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        h.insert(axum::http::HeaderName::from_static(name), v);
     }
     resp
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+mod page_headers_tests {
+    use super::{with_page_headers_checked, with_page_headers_from};
+    use crate::server::SetCookie;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    fn ok() -> axum::response::Response {
+        StatusCode::OK.into_response()
+    }
+
+    fn framing() -> Vec<(&'static str, String)> {
+        vec![("x-frame-options", "SAMEORIGIN".to_owned())]
+    }
+
+    /// Every cookie line lands as its own header, next to the security headers.
+    #[test]
+    fn page_headers_append_every_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lines: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(lines, ["ipe_sid=a; Path=/", "__ipe_csrf=b; Path=/"]);
+        assert!(resp.headers().get("x-frame-options").is_some());
+    }
+
+    /// A cookie line with no header representation answers 500: the page is
+    /// never sent without its session cookie.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a\r\nX-Injected: 1");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// A security header with no header representation answers 500: the page
+    /// is never sent without its framing policy.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_security_header() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csp = vec![(
+            "content-security-policy",
+            "frame-ancestors https://a.example\r\nX-Injected: 1".to_owned(),
+        )];
+        let resp = with_page_headers_from(ok(), &[&session], csp);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("content-security-policy").is_none());
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: the page ships neither
+    /// its cookies nor a header set missing the framing policy.
+    #[test]
+    fn page_headers_refuse_a_refused_framing_policy() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let resp = with_page_headers_checked(
+            ok(),
+            &[&session],
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-frame-options").is_none());
+        let framed = with_page_headers_checked(ok(), &[&session], Ok(framing()));
+        assert_eq!(framed.status(), StatusCode::OK);
+    }
 }
 
 /// Maximum request body bytes for `/_ipe/event`: `IPE_WEB_MAX_BODY_BYTES`,
@@ -2593,6 +2685,8 @@ pub(crate) enum StartupRefusal {
     },
     /// An environment ceiling the app applies is present but malformed.
     Ceiling(crate::system::EnvCeilingRefusal),
+    /// `IPE_WEB_FRAME_ANCESTORS` has no `frame-ancestors` representation.
+    FrameAncestors(crate::telemetry::FrameAncestorsRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -2605,6 +2699,7 @@ impl std::fmt::Display for StartupRefusal {
                 write!(f, "web base path `{base}` is malformed: {refusal}")
             }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
+            Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -4949,6 +5044,9 @@ where
     if let Err(refusal) = client_tuning_js() {
         return Err(StartupRefusal::Ceiling(refusal.clone()));
     }
+    // The framing policy every page carries is parsed here, so a value with no
+    // header representation refuses the router; the page path re-checks it.
+    crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               uri: axum::http::Uri,
@@ -5343,17 +5441,7 @@ where
 /// never the parent's `ipe_sid`.
 #[cfg(feature = "server")]
 fn sid_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    let name = session_cookie_name();
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for c in raw.split(';') {
-        let c = c.trim();
-        if let Some((k, v)) = c.split_once('=')
-            && k.trim() == name
-        {
-            return Some(v.trim().to_string());
-        }
-    }
-    None
+    crate::server::request_cookie(headers, &session_cookie_name())
 }
 
 // The Ipe.Html `Ffi.callPure "htmlXxx"` kernel wrappers (html_render_,
@@ -5967,16 +6055,19 @@ mod base_path_tests {
     #[test]
     fn cookie_name_is_ipe_sid_at_root_distinct_under_base() {
         // Plain-http dev: the root cookie keeps its plain name.
-        assert_eq!(cookie_name_with("", false), "ipe_sid");
-        assert_eq!(cookie_name_with("", true), "__Host-ipe_sid");
+        assert_eq!(cookie_name_with("", false).text(), "ipe_sid");
+        assert_eq!(cookie_name_with("", true).text(), "__Host-ipe_sid");
         // Distinct from the parent's `ipe_sid` so the proxied child can't clobber it.
         for secure in [false, true] {
             assert_eq!(
-                cookie_name_with("/_ipe/console", secure),
+                cookie_name_with("/_ipe/console", secure).text(),
                 "ipe_sid__ipe_console"
             );
         }
-        assert_eq!(cookie_name_for("/_ipe/console"), "ipe_sid__ipe_console");
+        assert_eq!(
+            cookie_name_for("/_ipe/console").text(),
+            "ipe_sid__ipe_console"
+        );
     }
 
     // A release binary under `ENV=dev` still names its root session cookie
@@ -5986,7 +6077,7 @@ mod base_path_tests {
     fn session_cookie_host_prefixed_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
         assert!(super::csrf::cookies_secure());
-        assert_eq!(cookie_name_for(""), "__Host-ipe_sid");
+        assert_eq!(cookie_name_for("").text(), "__Host-ipe_sid");
         crate::system::locked_remove_var("ENV");
     }
 
@@ -5995,6 +6086,34 @@ mod base_path_tests {
         assert_eq!(cookie_path_for(""), "/");
         // Scoped → the cookie is never sent to the parent's own routes.
         assert_eq!(cookie_path_for("/_ipe/console"), "/_ipe/console");
+    }
+
+    /// The typed session line keeps the exact bytes of the hand-formatted one,
+    /// so an existing browser session cookie is replaced, never duplicated.
+    #[test]
+    fn session_set_cookie_keeps_the_session_line_bytes() {
+        let headers = axum::http::HeaderMap::new();
+        let ttl = std::time::Duration::from_secs(1800);
+        let secure = if super::csrf::cookies_secure() {
+            "; Secure"
+        } else {
+            ""
+        };
+        let same_site = if super::csrf::frame_ancestors().is_some() {
+            "None"
+        } else {
+            "Lax"
+        };
+        let expected = format!(
+            "{}=0f3a-sid; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={}",
+            super::session_cookie_name(),
+            super::cookie_path(),
+            ttl.as_secs()
+        );
+        assert_eq!(
+            super::session_set_cookie("0f3a-sid", &headers, ttl).as_str(),
+            expected
+        );
     }
 
     #[test]
@@ -7966,7 +8085,7 @@ mod hot_init_session_scoping_tests {
             for part in s.split(';') {
                 let part = part.trim();
                 if let Some((k, v)) = part.split_once('=')
-                    && k.trim() == cookie_name_for("")
+                    && k.trim() == cookie_name_for("").as_str()
                 {
                     return v.trim().to_string();
                 }
@@ -9210,6 +9329,53 @@ mod emitted_router_behavior_tests {
         }
     }
 
+    /// The router refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation at startup. The value is read once per
+    /// process, so the check runs in a child holding it.
+    #[test]
+    fn an_unrepresentable_frame_ancestors_refuses_the_router() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "router_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `an_unrepresentable_frame_ancestors_refuses_the_router`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by an_unrepresentable_frame_ancestors_refuses_the_router"]
+    async fn router_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        let refused = build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err();
+        assert!(
+            matches!(
+                refused,
+                Some(StartupRefusal::FrameAncestors(
+                    crate::telemetry::FrameAncestorsRefusal::DirectiveSeparator
+                ))
+            ),
+            "a `;` must refuse the router, got {refused:?}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
+    }
+
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────
 
     /// Ports `live_get_root_contains_initial_count`: GET `/` renders the initial
@@ -9562,6 +9728,10 @@ mod emitted_router_behavior_tests {
                     .to_string(),
             )),
             parse_route_base("/%zz").expect_err("the base is malformed"),
+            StartupRefusal::FrameAncestors(
+                crate::telemetry::FrameAncestors::parse("https://a.example\r\n")
+                    .expect_err("a CR/LF source list is refused"),
+            ),
         ];
         for cause in causes {
             let detail = cause.to_string();

@@ -530,6 +530,21 @@ mod tests {
         assert_eq!(verify_release_floor(&profile, &release), Ok(()));
     }
 
+    /// The release wrapper refuses an app that embeds no floor marker.
+    #[test]
+    fn verify_release_floor_refuses_a_floorless_binary() {
+        let profile = net_profile();
+        let floorless: &[u8] = b"\x7fELF\x02\x01\x01\0fn main() {}\0";
+        assert_eq!(
+            verify_release_floor(&profile, floorless),
+            Err(FloorRefusal::Unreadable)
+        );
+        assert_eq!(
+            verify_release_floor(&profile, b""),
+            Err(FloorRefusal::Unreadable)
+        );
+    }
+
     /// A read holds at most the cap: a file at the cap is read whole, one
     /// byte over refuses, and a directory is not a regular file.
     #[test]

@@ -4,15 +4,14 @@
 //! `Ipe.<M>.Unsafe` submodule flips [`Capability::Unsafe`], visible in
 //! `ipe capabilities`). Disclosure serves the auditor of a dependency; this gate
 //! serves the author exposing *their own* program. When user code reaches for a
-//! disclosed hatch, `ipe dev build`/`ipe dev run` surface the risk (which module, what
-//! risk) and require consent before proceeding.
+//! disclosed hatch, `ipe release` surfaces the risk (which module, what risk)
+//! and requires consent before proceeding.
 //!
 //! The stance is non-patronizing: the safe path (no `.Unsafe` import) is silent —
 //! no warning, no prompt, no flag. The acknowledgment fires *only* on a real,
 //! disclosed exposure.
 //!
-//! Consent has three forms, in precedence order:
-//! - the one-off `--accept-risks` flag,
+//! Consent has two forms, in precedence order:
 //! - the durable `[capabilities] accept = ["unsafe"]` manifest token,
 //! - an interactive `y` at a real terminal prompt.
 //!
@@ -123,23 +122,23 @@ fn risk_of(module: &str) -> &'static str {
 
 /// The remedy line every refusal / prompt shares.
 const fn remedy_line() -> &'static str {
-    "  = re-run with --accept-risks to take responsibility and proceed, or add \n\
-     \x20   `accept = [\"unsafe\"]` under [capabilities] in package.ipe for durable consent."
+    "  = add `accept = [\"unsafe\"]` under [capabilities] in package.ipe to take \n\
+     \x20   responsibility and proceed."
 }
 
-/// Whether consent is already recorded, without any prompt: the one-off flag or
-/// the durable manifest token.
+/// Whether consent is already recorded, without any prompt: the durable
+/// manifest token.
 #[must_use]
-pub fn pre_accepted(accept_risks_flag: bool, manifest_accept: &BTreeSet<Capability>) -> bool {
-    accept_risks_flag || manifest_accept.contains(&Capability::Unsafe)
+pub fn pre_accepted(manifest_accept: &BTreeSet<Capability>) -> bool {
+    manifest_accept.contains(&Capability::Unsafe)
 }
 
 /// The acknowledgment gate: given the program's inferred capabilities and the
 /// consent inputs, decide whether the build may proceed.
 ///
 /// - No `unsafe` in the inferred set → the safe path: returns `Ok(())` silently,
-///   whatever the flags. There is no ceremony on ordinary code.
-/// - `unsafe` present, pre-accepted (flag or manifest) → proceeds silently.
+///   whatever the manifest says. There is no ceremony on ordinary code.
+/// - `unsafe` present, pre-accepted by the manifest → proceeds silently.
 /// - `unsafe` present, an interactive terminal, not pre-accepted → prints the
 ///   risk and prompts; a `y` proceeds, anything else is a typed refusal.
 /// - `unsafe` present, non-interactive, not pre-accepted → **fails closed** with
@@ -154,7 +153,6 @@ pub fn pre_accepted(accept_risks_flag: bool, manifest_accept: &BTreeSet<Capabili
 /// absent (a non-interactive build, or an interactive "no").
 pub fn gate<R: std::io::BufRead, W: Write>(
     inferred: &BTreeSet<Capability>,
-    accept_risks_flag: bool,
     manifest_accept: &BTreeSet<Capability>,
     via: &[String],
     interactive: bool,
@@ -165,9 +163,8 @@ pub fn gate<R: std::io::BufRead, W: Write>(
         // The safe path: no disclosed exposure, nothing to acknowledge.
         return Ok(());
     }
-    if pre_accepted(accept_risks_flag, manifest_accept) {
-        // Recorded consent (flag or manifest) — proceed silently. Consent is the
-        // one-off flag or the durable manifest token; either suffices.
+    if pre_accepted(manifest_accept) {
+        // Recorded consent in the manifest — proceed silently.
         return Ok(());
     }
 
@@ -256,10 +253,9 @@ mod tests {
     fn safe_program_is_never_gated() {
         let mut out = Vec::new();
         let mut stdin = Cursor::new(Vec::new());
-        // No `unsafe` capability → Ok regardless of interactivity or flags.
+        // No `unsafe` capability → Ok regardless of interactivity.
         gate(
             &caps(&[Capability::Network]),
-            false,
             &BTreeSet::new(),
             &[],
             false,
@@ -271,29 +267,11 @@ mod tests {
     }
 
     #[test]
-    fn flag_pre_accepts_silently() {
-        let mut out = Vec::new();
-        let mut stdin = Cursor::new(Vec::new());
-        gate(
-            &caps(&[Capability::Unsafe]),
-            true,
-            &BTreeSet::new(),
-            &["Ipe.Html.Unsafe".to_owned()],
-            false,
-            &mut stdin,
-            &mut out,
-        )
-        .expect("--accept-risks proceeds");
-        assert!(out.is_empty());
-    }
-
-    #[test]
     fn manifest_token_pre_accepts_silently() {
         let mut out = Vec::new();
         let mut stdin = Cursor::new(Vec::new());
         gate(
             &caps(&[Capability::Unsafe]),
-            false,
             &caps(&[Capability::Unsafe]),
             &["Ipe.Db.Unsafe".to_owned()],
             false,
@@ -312,7 +290,6 @@ mod tests {
         let mut stdin = Cursor::new(Vec::new());
         let err = gate(
             &caps(&[Capability::Unsafe]),
-            false,
             &BTreeSet::new(),
             &["Ipe.Html.Unsafe".to_owned()],
             false,
@@ -327,7 +304,11 @@ mod tests {
             msg.contains("cross-site scripting"),
             "names the risk: {msg}"
         );
-        assert!(msg.contains("--accept-risks"), "names the remedy: {msg}");
+        assert!(
+            msg.contains("accept = [\"unsafe\"]"),
+            "names the manifest remedy: {msg}"
+        );
+        assert!(!msg.contains("--accept-risks"), "names no flag: {msg}");
         assert!(
             msg.contains("will not prompt"),
             "states it will not block: {msg}"
@@ -340,7 +321,6 @@ mod tests {
         let mut stdin = Cursor::new(b"y\n".to_vec());
         gate(
             &caps(&[Capability::Unsafe]),
-            false,
             &BTreeSet::new(),
             &["Ipe.Html.Unsafe".to_owned()],
             true,
@@ -358,7 +338,6 @@ mod tests {
         let mut stdin = Cursor::new(b"n\n".to_vec());
         let err = gate(
             &caps(&[Capability::Unsafe]),
-            false,
             &BTreeSet::new(),
             &["Ipe.Html.Unsafe".to_owned()],
             true,
@@ -377,7 +356,6 @@ mod tests {
         let mut stdin = Cursor::new(Vec::new());
         let err = gate(
             &caps(&[Capability::Unsafe]),
-            false,
             &BTreeSet::new(),
             &["Ipe.Html.Unsafe".to_owned()],
             true,

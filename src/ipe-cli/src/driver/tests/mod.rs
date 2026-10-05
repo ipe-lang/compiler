@@ -4249,45 +4249,24 @@ fn session_is_admitted_for_a_native_cli_or_worker_app() {
     }
 }
 
-// A native-bearing program runs jailed, where the log is unreachable: refused
-// whether the crossing is inferred or only declared, and a pure program passes.
+// A program that can link Rust FFI is refused a session — its replay is not
+// proven deterministic — and told to run without the flag, while a program
+// with no FFI records and replays.
 #[test]
-fn session_is_refused_for_a_native_bearing_program() {
-    use crate::run_sandbox::ResolvedCapabilities;
-    use ipe_ir::Capability;
-    use std::collections::BTreeSet;
-    let native: BTreeSet<Capability> = std::iter::once(Capability::NativeFfi).collect();
-    let raw: BTreeSet<Capability> = std::iter::once(Capability::FfiRaw).collect();
-    let bearing = [
-        ResolvedCapabilities {
-            inferred: native.clone(),
-            declared: BTreeSet::new(),
-        },
-        ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: native,
-        },
-        ResolvedCapabilities {
-            inferred: raw,
-            declared: BTreeSet::new(),
-        },
-    ];
+fn session_record_refuses_ffi_program() {
+    use crate::ffi::FfiPresence;
     for flag in ["--record", "--replay"] {
-        for resolved in &bearing {
-            let result = gate_session_capabilities(flag, resolved);
-            assert!(
-                matches!(&result, Err(CliError::Usage(msg)) if msg.contains("native-bearing")),
-                "{flag} on a native-bearing program must be refused, got: {result:?}"
-            );
-        }
-        let pure = ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: BTreeSet::new(),
-        };
-        let result = gate_session_capabilities(flag, &pure);
+        let result = gate_session_ffi(flag, FfiPresence::Present);
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains("Rust FFI")
+                    && msg.contains(&format!("run it without {flag}"))),
+            "{flag} on an FFI program must be refused with its remedy, got: {result:?}"
+        );
+        let result = gate_session_ffi(flag, FfiPresence::Absent);
         assert!(
             result.is_ok(),
-            "{flag} on a pure program must pass: {result:?}"
+            "{flag} on a program with no FFI must pass: {result:?}"
         );
     }
 }
@@ -4575,7 +4554,14 @@ fn emitting_into_a_user_directory_is_refused_untouched() {
     fs::create_dir_all(&elsewhere).expect("project dir");
     let result = EmitTarget::at(&dir, &ProjectPaths::of_file(&elsewhere.join("Main.ipe")))
         .and_then(|target| {
-            write_emitted_project(&emitted, &target, &dir.join("no-runtime"), None, false)
+            write_emitted_project(
+                &emitted,
+                &target,
+                &dir.join("no-runtime"),
+                None,
+                false,
+                crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+            )
         });
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -4765,6 +4751,7 @@ fn a_replaced_claimed_target_is_refused_untouched() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(
@@ -4807,6 +4794,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -4824,6 +4812,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -5383,7 +5372,7 @@ fn group_required_sanitizes_attempted() {
 const DEBUG_LOG_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Debug as Debug\n\nshout : String -> String\nshout s =\n    Debug.log \"shout\" s\n\nmain : Task Error ()\nmain =\n    Io.println (shout \"hi\")\n";
 
 /// Compile [`DEBUG_LOG_MAIN`] under `verb`'s posture, uncached.
-fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::output_dir::OwnedDir, CliError> {
+fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::EmittedCrate, CliError> {
     let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp = ipe_test_temp::temp_root()
         .join(format!("ipec-verb-posture-{label}-{}", std::process::id()));
@@ -5485,11 +5474,11 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app under `profile`.
-fn bundle_debug_desktop(profile: BundleProfile, label: &str) -> Result<(), CliError> {
+/// Bundle the Debug-using desktop app finished in `finish`.
+fn bundle_debug_desktop(finish: NativeFinish<'_>, label: &str) -> Result<(), CliError> {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
     let project = tmp.to_string_lossy().into_owned();
-    let result = bundle_delivery(BundleHost::Desktop, profile, Some(&project));
+    let result = bundle_delivery(BundleHost::Desktop, finish, Some(&project));
     let _ = fs::remove_dir_all(&tmp);
     result
 }
@@ -5500,8 +5489,15 @@ fn bundle_debug_desktop(profile: BundleProfile, label: &str) -> Result<(), CliEr
 /// any cargo build.
 #[test]
 fn release_desktop_bundle_gates_debug() {
+    let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
+        inferred: std::collections::BTreeSet::new(),
+        declared: std::collections::BTreeSet::new(),
+    });
     let result = bundle_debug_desktop(
-        Verb::RELEASE_BUILD.bundle_profile(),
+        NativeFinish::Release {
+            consented: &consented,
+            driver: ipe_backend_rust::DbDriver::Sqlite,
+        },
         "release-desktop-debug",
     );
     assert!(
@@ -5521,7 +5517,7 @@ fn dev_desktop_bundle_admits_debug() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result = bundle_debug_desktop(Verb::DEV_BUILD.bundle_profile(), "dev-desktop-debug");
+    let result = bundle_debug_desktop(NativeFinish::Dev, "dev-desktop-debug");
     assert!(
         !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
         "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"
