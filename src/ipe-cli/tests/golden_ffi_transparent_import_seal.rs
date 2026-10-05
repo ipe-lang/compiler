@@ -115,6 +115,11 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20       Err _ -> Io.println \"err shift\"\n";
 
 fn write_project(dir: &Path) -> bool {
+    write_project_with(dir, MAIN_IPE)
+}
+
+/// Write a project whose `src/Main.ipe` is `main`, with the `tm` FFI cache seeded.
+fn write_project_with(dir: &Path, main: &str) -> bool {
     let src = dir.join("src");
     let _ = fs::remove_dir_all(dir);
     if fs::create_dir_all(&src).is_err() {
@@ -123,7 +128,7 @@ fn write_project(dir: &Path) -> bool {
     if !seed_transparent_ffi_cache(dir) {
         return false;
     }
-    fs::write(src.join("Main.ipe"), MAIN_IPE).is_ok()
+    fs::write(src.join("Main.ipe"), main).is_ok()
 }
 
 /// Read one emitted file, failing the test with a directory listing when the
@@ -152,6 +157,55 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Write the real foreign crate `tm` under `tmp`, repoint the emitted crate at
+/// `out` to it (the fixture crate cannot live on crates.io, so this changes
+/// WHERE `tm` comes from, never what the emitted code says), and `cargo run` it.
+fn cargo_run_against_local_tm(tmp: &Path, out: &Path) -> std::process::Output {
+    // The real foreign crate the emitted wrappers bind.
+    let tm_dir = tmp.join("tm");
+    fs::create_dir_all(tm_dir.join("src")).expect("mkdir tm");
+    fs::write(
+        tm_dir.join("Cargo.toml"),
+        "[package]\nname = \"tm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("tm Cargo.toml");
+    fs::write(
+        tm_dir.join("src/lib.rs"),
+        r#"pub struct Point { pub x: i64, pub y: f64 }
+pub enum Shade { On, Level(i64), Mix { amount: i64, label: String } }
+pub fn shift(p: Point) -> Point { Point { x: p.x + 1, y: p.y } }
+pub fn classify(p: Point) -> Shade {
+    if p.x > 1 { Shade::Mix { amount: p.x, label: String::from("mix") } } else { Shade::On }
+}
+pub fn brightness(s: Shade) -> i64 {
+    match s { Shade::On => 0, Shade::Level(n) => n, Shade::Mix { amount, .. } => amount }
+}
+"#,
+    )
+    .expect("tm lib.rs");
+
+    // Repoint the registry pin at the local fixture crate.
+    let manifest_path = out.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("emitted Cargo.toml");
+    assert!(
+        manifest.contains("tm = \"=0.1.0\""),
+        "emitted manifest must pin the foreign crate; got:\n{manifest}"
+    );
+    let patched = manifest.replace(
+        "tm = \"=0.1.0\"",
+        &format!("tm = {{ path = {:?} }}", tm_dir.display().to_string()),
+    );
+    fs::write(&manifest_path, patched).expect("patched Cargo.toml");
+
+    let cargo = ipe_env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    std::process::Command::new(cargo)
+        .arg("run")
+        .arg("--quiet")
+        .current_dir(out)
+        .output()
+        .expect("cargo run spawns")
 }
 
 /// Default gate: `ipe dev build` exits 0 and the emitted crate carries the whole
@@ -237,49 +291,7 @@ fn transparent_import_emitted_crate_builds_and_runs() {
         panic!("transparent-import fixture must build, got: {err}")
     }
 
-    // The real foreign crate the emitted wrappers bind.
-    let tm_dir = tmp.join("tm");
-    fs::create_dir_all(tm_dir.join("src")).expect("mkdir tm");
-    fs::write(
-        tm_dir.join("Cargo.toml"),
-        "[package]\nname = \"tm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .expect("tm Cargo.toml");
-    fs::write(
-        tm_dir.join("src/lib.rs"),
-        r#"pub struct Point { pub x: i64, pub y: f64 }
-pub enum Shade { On, Level(i64), Mix { amount: i64, label: String } }
-pub fn shift(p: Point) -> Point { Point { x: p.x + 1, y: p.y } }
-pub fn classify(p: Point) -> Shade {
-    if p.x > 1 { Shade::Mix { amount: p.x, label: String::from("mix") } } else { Shade::On }
-}
-pub fn brightness(s: Shade) -> i64 {
-    match s { Shade::On => 0, Shade::Level(n) => n, Shade::Mix { amount, .. } => amount }
-}
-"#,
-    )
-    .expect("tm lib.rs");
-
-    // Repoint the registry pin at the local fixture crate.
-    let manifest_path = out.join("Cargo.toml");
-    let manifest = fs::read_to_string(&manifest_path).expect("emitted Cargo.toml");
-    assert!(
-        manifest.contains("tm = \"=0.1.0\""),
-        "emitted manifest must pin the foreign crate; got:\n{manifest}"
-    );
-    let patched = manifest.replace(
-        "tm = \"=0.1.0\"",
-        &format!("tm = {{ path = {:?} }}", tm_dir.display().to_string()),
-    );
-    fs::write(&manifest_path, patched).expect("patched Cargo.toml");
-
-    let cargo = ipe_env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let run = std::process::Command::new(cargo)
-        .arg("run")
-        .arg("--quiet")
-        .current_dir(&out)
-        .output()
-        .expect("cargo run spawns");
+    let run = cargo_run_against_local_tm(&tmp, &out);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
@@ -294,5 +306,62 @@ pub fn brightness(s: Shade) -> i64 {
         "the struct and enum must round-trip through foreign code.\nstdout: {stdout}"
     );
 
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The repo root, for the `tests/golden` fixtures.
+fn repo_root() -> PathBuf {
+    let joined = e2e_support::manifest_dir!().join("..").join("..");
+    fs::canonicalize(&joined).unwrap_or(joined)
+}
+
+/// A transparent `Rust.*` union has a registered enum and an emitted
+/// `IpeStringify` impl, so showing it (directly and as a user union's payload)
+/// is accepted, and under `IPE_E2E=1` the emitted crate builds and runs,
+/// rendering the constructors. The opaque-handle refusal is
+/// `g_misc::golden_show_policy::showing_a_rust_handle_is_refused_before_cargo`.
+#[test]
+fn showing_a_transparent_union_builds_and_renders_it() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let source = repo_root()
+        .join("tests")
+        .join("golden")
+        .join("show_transparent_foreign")
+        .join("Main.ipe");
+    let main =
+        fs::read_to_string(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_show_transparent_foreign");
+    assert!(
+        write_project_with(&tmp, &main),
+        "must write the fixture project + FFI cache"
+    );
+    let entry = tmp.join("src").join("Main.ipe");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("show_transparent_foreign_out");
+    let _ = fs::remove_dir_all(&out);
+    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+        panic!("showing a transparent union must be accepted, got: {err}")
+    }
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        let _ = fs::remove_dir_all(&tmp);
+        return;
+    }
+    let run = cargo_run_against_local_tm(&tmp, &out);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "the emitted crate showing a transparent union must build and run exit 0.\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "shade: Level 3"),
+        "the transparent union renders its constructor:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("holder: Holder Mix 2 ") && l.contains("mix")),
+        "a user union renders its transparent-union payload:\n{stdout}"
+    );
     let _ = fs::remove_dir_all(&tmp);
 }

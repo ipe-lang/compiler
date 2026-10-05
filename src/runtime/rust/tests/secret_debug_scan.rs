@@ -21,26 +21,36 @@
 //! pins where that text is written. Outside test code, an `impl IpeStringify`
 //! written by hand sits only in [`SHOW_IMPL_FILES`]; every other runtime type
 //! renders through a `show_row!` row, which lists its leaf and policy in the
-//! show table. The compiler backend never spells the removed `Debug` fallback
-//! ([`REFUSED_BACKEND_SPELLINGS`]), so an emitted field renders through its
-//! show row or as a fixed marker.
+//! show table.
+//!
+//! The compiler backend's sources (`src`, `rust/src`, `rust/templates`) get a
+//! positive check: outside test code, every string literal, macro token and
+//! path that renders through `Debug` (a `{…:?}` spec, `fmt::Debug`) sits in a
+//! function [`DEBUG_SITES`] lists with its exact count and the reason it is
+//! never emitted or is sound to emit. A new site, or one more in a listed
+//! function, fails the scan; so does a listed entry that matches nothing. The
+//! removed `Debug` fallback ([`FALLBACK_TEXT`]) is refused at every site, so an
+//! emitted field renders through its show row or as a fixed marker.
 //!
 //! A node is skipped only when its `cfg` is proven test-only, so an
 //! unrecognised shape keeps it scanned.
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::BTreeMap;
+
+use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Fields, GenericArgument, ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStruct,
-    PathArguments, Type,
+    Attribute, Fields, GenericArgument, ImplItem, Item, ItemEnum, ItemFn, ItemImpl, ItemMod,
+    ItemStruct, LitByteStr, LitCStr, LitStr, Macro, Path, PathArguments, TraitItem, Type, UsePath,
+    UseTree,
 };
 
-// The `cfg` classification shared with the dial and print-macro scans; this
-// scan needs only `cfg_test_only`.
-#[allow(dead_code)] // the shared module's other classifiers serve the other scans
+// The `cfg` classification shared with the dial and print-macro scans.
+#[allow(dead_code)] // the shared module's expression classifier serves the other scans
 #[path = "support/cfg_scan.rs"]
 mod cfg_scan;
-use cfg_scan::cfg_test_only;
+use cfg_scan::{cfg_test_only, impl_item_attrs, item_attrs, trait_item_attrs};
 
 #[path = "support/source_tree.rs"]
 mod source_tree;
@@ -108,8 +118,641 @@ const ALLOWED: [Allowed; 1] = [Allowed {
 /// own module, which holds the container and primitive rows.
 const SHOW_IMPL_FILES: &[&str] = &["stringify.rs"];
 
-/// Spellings of the `Debug` fallback the backend must never emit.
-const REFUSED_BACKEND_SPELLINGS: &[&str] = &["stringify::Wrap", ")).dispatch()"];
+/// Text that marks a `Debug` rendering: a `{…:?}` format spec or the
+/// `fmt::Debug` trait's name.
+const DEBUG_TEXT: &[&str] = &["?}", "fmt::Debug"];
+
+/// The removed `Debug` fallback's spellings: refused at every site the scan
+/// reads, never admitted by a [`DEBUG_SITES`] entry.
+const FALLBACK_TEXT: &[&str] = &["stringify::Wrap", ")).dispatch()"];
+
+/// The function name a site outside every function is listed under.
+const NO_FUNC: &str = "-";
+
+/// A backend function whose string literals, macro tokens or paths render a
+/// value through `Debug`, `count` times.
+struct DebugSite {
+    file: &'static str,
+    func: &'static str,
+    count: usize,
+    /// Why the `Debug` text never reaches emitted Rust, or why it is sound there.
+    #[allow(dead_code)] // documentation carried with the entry
+    why: &'static str,
+}
+
+const DIAGNOSTIC: &str = "a compiler diagnostic's text, never emitted";
+const EXPR_HEAD: &str = "the head of the divergence report's expression dump, never emitted";
+const SCHEMA_HASH: &str =
+    "a model-schema hash input from a closed fieldless enum's name, never emitted";
+const SKELETON_KEY: &str = "a skeleton key from a leaf type's variant name, never emitted";
+const ENV_NAME_LITERAL: &str = "quotes a public env name into emitted Rust; a `str`'s `Debug` \
+     escapes are Rust string-literal escapes";
+const SERDE_REFUSAL: &str = "a serde error carrying a path-refusal diagnostic, never emitted";
+
+/// Every backend function that renders through `Debug`, with its exact count, so
+/// a new site anywhere (a new function, or one more in a listed function) fails
+/// [`the_backend_renders_through_debug_only_at_listed_sites`].
+const DEBUG_SITES: &[DebugSite] = &[
+    DebugSite {
+        file: "rust/src/emit_doc.rs",
+        func: "build_binop_chain",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_doc.rs",
+        func: "build_call_binop",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_doc.rs",
+        func: "build_db_param_call",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_doc.rs",
+        func: "expr_head",
+        count: 1,
+        why: EXPR_HEAD,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/expr.rs",
+        func: "emit_expr_at",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/ffi.rs",
+        func: "callee_name",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/ffi.rs",
+        func: "ffi_path",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/func.rs",
+        func: "emit_func_value",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/kernel_calls.rs",
+        func: "emit_db_call",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/kernel_calls.rs",
+        func: "emit_server_call",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/kernel_calls.rs",
+        func: "emit_tea_call",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/kernel_calls.rs",
+        func: "emit_ui_plan",
+        count: 7,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/kernel_calls.rs",
+        func: "require_input_sub_shape",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_expr/patterns.rs",
+        func: "render_pat",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/emit_model_schema.rs",
+        func: "hash_ty",
+        count: 2,
+        why: SCHEMA_HASH,
+    },
+    DebugSite {
+        file: "rust/src/lib.rs",
+        func: "match_template",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/lib.rs",
+        func: "resolve_ident",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/lib.rs",
+        func: "skeleton_ty",
+        count: 1,
+        why: SKELETON_KEY,
+    },
+    DebugSite {
+        file: "rust/src/preamble.rs",
+        func: "anchor_missing",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "anchor_missing",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "assemble_split_manifest",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "async_runtime_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "check_hydration_state_fields",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "chrono_tz_cargo_toml",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "compression_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "config_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "crypto_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "crypto_core_heavy_cargo_toml",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "csv_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "db_cargo_toml",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "dev_posture_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "drop_prelude_section",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "email_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "emit_program",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "emit_spine",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "ffi_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "http_client_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "insert_app_serde_dependency",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "insert_app_serde_json_dependency",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "jwt_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "locale_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "native_runtime_bindings",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "refuse_lexer_hazards",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "render_env_public_rs",
+        count: 1,
+        why: ENV_NAME_LITERAL,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "secret_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "server_cargo_toml",
+        count: 4,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "ssrf_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "substitute_dep_manifest_anchors",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "tea_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "tui_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "unclassified_wrapper",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "url_cargo_toml",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "web_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "websocket_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "webview_cargo_toml",
+        count: 3,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/static_build.rs",
+        func: "staticize_manifest",
+        count: 2,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "src/lib.rs",
+        func: "deserialize",
+        count: 1,
+        why: SERDE_REFUSAL,
+    },
+    DebugSite {
+        file: "src/lib.rs",
+        func: "validate",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+];
+
+/// What the [`DebugScan`] found in the backend sources.
+#[derive(Default)]
+struct DebugFindings {
+    /// `Debug` renderings per `(file, function)`.
+    sites: BTreeMap<(String, String), usize>,
+    /// Every `file:function: spelling` of the removed fallback.
+    fallback: Vec<String>,
+}
+
+/// Records every `Debug` rendering of one backend file outside test code.
+///
+/// Emitted Rust is built only from the backend's string literals, so the scan
+/// reads every literal (macro tokens included) and every path; attributes,
+/// doc comments and comments never reach emitted text and are skipped.
+struct DebugScan<'a> {
+    file: &'a str,
+    funcs: Vec<String>,
+    found: &'a mut DebugFindings,
+}
+
+impl DebugScan<'_> {
+    fn func(&self) -> String {
+        self.funcs.last().map_or(NO_FUNC, String::as_str).to_owned()
+    }
+
+    fn debug_site(&mut self) {
+        let key = (self.file.to_owned(), self.func());
+        let count = self.found.sites.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    fn fallback(&mut self, spelling: &str) {
+        let site = format!("{}:{}: {spelling}", self.file, self.func());
+        self.found.fallback.push(site);
+    }
+
+    /// Check one literal's source text.
+    fn text(&mut self, text: &str) {
+        if DEBUG_TEXT.iter().any(|needle| text.contains(needle)) {
+            self.debug_site();
+        }
+        for spelling in FALLBACK_TEXT {
+            if text.contains(spelling) {
+                self.fallback(spelling);
+            }
+        }
+    }
+
+    /// Check one `first::second` path step.
+    fn path_step(&mut self, first: &str, second: &str) {
+        match (first, second) {
+            ("fmt", "Debug") => self.debug_site(),
+            ("stringify", "Wrap") => self.fallback("stringify::Wrap"),
+            _ => {}
+        }
+    }
+
+    /// Check a macro's unparsed tokens: their literals and `a::b` steps.
+    fn tokens(&mut self, stream: TokenStream) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let mut rest = trees.as_slice();
+        while let Some((head, tail)) = rest.split_first() {
+            match head {
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Literal(lit) => self.text(&lit.to_string()),
+                TokenTree::Ident(first) => {
+                    if let [
+                        TokenTree::Punct(a),
+                        TokenTree::Punct(b),
+                        TokenTree::Ident(second),
+                        ..,
+                    ] = tail
+                        && a.as_char() == ':'
+                        && b.as_char() == ':'
+                    {
+                        self.path_step(&first.to_string(), &second.to_string());
+                    }
+                }
+                TokenTree::Punct(_) => {}
+            }
+            rest = tail;
+        }
+    }
+
+    /// Walk a function's item with its name as the current site.
+    fn within(&mut self, name: String, walk: impl FnOnce(&mut Self)) {
+        self.funcs.push(name);
+        walk(self);
+        self.funcs.pop();
+    }
+}
+
+/// The last names a `use` tree imports directly below its `fmt::` or
+/// `stringify::` prefix.
+fn use_leaves(tree: &UseTree) -> Vec<String> {
+    match tree {
+        UseTree::Name(name) => vec![name.ident.to_string()],
+        UseTree::Rename(rename) => vec![rename.ident.to_string()],
+        UseTree::Group(group) => group.items.iter().flat_map(use_leaves).collect(),
+        UseTree::Path(_) | UseTree::Glob(_) => Vec::new(),
+    }
+}
+
+impl<'ast> Visit<'ast> for DebugScan<'_> {
+    fn visit_attribute(&mut self, _: &'ast Attribute) {}
+
+    fn visit_item(&mut self, node: &'ast Item) {
+        if cfg_test_only(item_attrs(node)) {
+            return;
+        }
+        if let Item::Fn(f) = node {
+            if !is_test_fn(&f.attrs) {
+                self.within(f.sig.ident.to_string(), |scan| {
+                    visit::visit_item(scan, node)
+                });
+            }
+            return;
+        }
+        visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast ImplItem) {
+        if cfg_test_only(impl_item_attrs(node)) {
+            return;
+        }
+        if let ImplItem::Fn(f) = node {
+            if !is_test_fn(&f.attrs) {
+                self.within(f.sig.ident.to_string(), |scan| {
+                    visit::visit_impl_item(scan, node);
+                });
+            }
+            return;
+        }
+        visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast TraitItem) {
+        if cfg_test_only(trait_item_attrs(node)) {
+            return;
+        }
+        if let TraitItem::Fn(f) = node {
+            if !is_test_fn(&f.attrs) {
+                self.within(f.sig.ident.to_string(), |scan| {
+                    visit::visit_trait_item(scan, node);
+                });
+            }
+            return;
+        }
+        visit::visit_trait_item(self, node);
+    }
+
+    fn visit_lit_str(&mut self, node: &'ast LitStr) {
+        self.text(&node.token().to_string());
+    }
+
+    fn visit_lit_byte_str(&mut self, node: &'ast LitByteStr) {
+        self.text(&node.token().to_string());
+    }
+
+    fn visit_lit_cstr(&mut self, node: &'ast LitCStr) {
+        self.text(&node.token().to_string());
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        visit::visit_macro(self, node);
+        self.tokens(node.tokens.clone());
+    }
+
+    fn visit_path(&mut self, node: &'ast Path) {
+        let names: Vec<String> = node.segments.iter().map(|s| s.ident.to_string()).collect();
+        for step in names.windows(2) {
+            if let [first, second] = step {
+                self.path_step(first, second);
+            }
+        }
+        visit::visit_path(self, node);
+    }
+
+    fn visit_use_path(&mut self, node: &'ast UsePath) {
+        let first = node.ident.to_string();
+        for second in use_leaves(&node.tree) {
+            self.path_step(&first, &second);
+        }
+        visit::visit_use_path(self, node);
+    }
+}
+
+/// Every `Debug` rendering and fallback spelling of `sources`.
+#[allow(clippy::expect_used)] // an unparsable source must fail the scan, never be skipped
+fn debug_findings(sources: &[(String, String)]) -> DebugFindings {
+    let mut found = DebugFindings::default();
+    for (name, src) in sources {
+        let tree = syn::parse_file(src).expect("a backend source parses");
+        let mut scan = DebugScan {
+            file: name,
+            funcs: Vec::new(),
+            found: &mut found,
+        };
+        scan.visit_file(&tree);
+    }
+    found
+}
+
+/// Every disagreement between the found `sites` and the `listed` ones: a site
+/// no entry lists, a count that differs, or an entry the scan never matched.
+fn unlisted_debug_sites(
+    sites: &BTreeMap<(String, String), usize>,
+    listed: &[DebugSite],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ((file, func), count) in sites {
+        let entry = listed
+            .iter()
+            .find(|e| e.file == file.as_str() && e.func == func.as_str());
+        match entry {
+            Some(e) if e.count == *count => {}
+            Some(e) => out.push(format!(
+                "{file}:{func}: {count} `Debug` sites, listed {}",
+                e.count
+            )),
+            None => out.push(format!("{file}:{func}: {count} unlisted `Debug` sites")),
+        }
+    }
+    for e in listed {
+        let key = (e.file.to_owned(), e.func.to_owned());
+        if !sites.contains_key(&key) {
+            out.push(format!(
+                "{}:{}: stale entry, no `Debug` site",
+                e.file, e.func
+            ));
+        }
+    }
+    out
+}
+
+/// The backend sources the emit scan reads, as `dir/relative-path`.
+fn backend_sources() -> Vec<(String, String)> {
+    let backend = e2e_support::manifest_dir!().join("../../compiler/backend");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for dir in ["src", "rust/src", "rust/templates"] {
+        let root = backend.join(dir);
+        assert!(root.is_dir(), "the backend tree has no {}", root.display());
+        sources.extend(
+            rust_sources(&root)
+                .into_iter()
+                .map(|(name, src)| (format!("{dir}/{name}"), src)),
+        );
+    }
+    sources
+}
 
 /// The words of an identifier, split at `_` and at lower-to-upper case changes.
 fn words(ident: &str) -> Vec<String> {
@@ -393,19 +1036,6 @@ fn stray_show_impls(sources: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
-/// Every `file: spelling` of `sources` that spells a refused backend form.
-fn refused_spellings(sources: &[(String, String)]) -> Vec<String> {
-    sources
-        .iter()
-        .flat_map(|(name, src)| {
-            REFUSED_BACKEND_SPELLINGS
-                .iter()
-                .filter(|spelling| src.contains(**spelling))
-                .map(move |spelling| format!("{name}: {spelling}"))
-        })
-        .collect()
-}
-
 /// Outside test code, a runtime type's `IpeStringify` is a `show_row!` row
 /// unless it sits in [`SHOW_IMPL_FILES`], and each listed file still holds one.
 #[test]
@@ -425,27 +1055,132 @@ fn every_runtime_show_impl_is_a_listed_row() {
     }
 }
 
-/// The backend's source and templates never spell the `Debug` fallback.
+/// Outside test code, the backend renders through `Debug` only at the
+/// [`DEBUG_SITES`] entries, each matched with its exact count, and never spells
+/// the removed fallback.
 #[test]
-fn the_backend_never_spells_the_debug_fallback() {
-    let backend = e2e_support::manifest_dir!().join("../../compiler/backend");
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for dir in ["src", "rust/src", "rust/templates"] {
-        let root = backend.join(dir);
-        assert!(root.is_dir(), "the backend tree has no {}", root.display());
-        sources.extend(
-            rust_sources(&root)
-                .into_iter()
-                .map(|(name, src)| (format!("{dir}/{name}"), src)),
-        );
-    }
+fn the_backend_renders_through_debug_only_at_listed_sites() {
+    let sources = backend_sources();
     assert!(
         sources
             .iter()
             .any(|(name, _)| name == "rust/src/emit_types.rs"),
         "the backend walk did not read rust/src/emit_types.rs"
     );
-    assert_eq!(refused_spellings(&sources), Vec::<String>::new());
+    let mut keys: Vec<(&str, &str)> = DEBUG_SITES.iter().map(|e| (e.file, e.func)).collect();
+    keys.sort_unstable();
+    let listed = keys.len();
+    keys.dedup();
+    assert_eq!(keys.len(), listed, "a `DEBUG_SITES` entry is listed twice");
+    let found = debug_findings(&sources);
+    assert_eq!(found.fallback, Vec::<String>::new());
+    assert_eq!(
+        unlisted_debug_sites(&found.sites, DEBUG_SITES),
+        Vec::<String>::new()
+    );
+}
+
+/// The scan counts a new `Debug` site and refuses the fallback spellings,
+/// while test code, attributes and doc comments stay out of its count.
+#[test]
+fn a_new_backend_debug_site_is_refused() {
+    let src = r#"
+        //! `{x:?}` in a module doc is never emitted.
+        /// `fmt::Debug` in a doc comment is never emitted.
+        fn listed(v: &str) -> String { format!("{v:?}") }
+        fn offending(v: &str) -> String { let mut s = String::new(); s.push_str(&format!("({v:#?})")); s }
+        fn bound<T: std::fmt::Debug>(_: T) {}
+        fn fallback(b: &str) -> String { format!("(&ipe_runtime::stringify::Wrap({b})).dispatch()") }
+        impl Emit { fn method(&self) -> String { concat!("x", "{:?}").to_owned() } }
+        #[allow(clippy::useless_format, reason = "{x:?}")]
+        fn attributed() -> String { String::new() }
+        #[cfg(test)] mod tests { fn probe(v: &str) -> String { format!("{v:?}") } }
+        #[test] fn case() { let _ = format!("{:?}", 1); }
+        #[cfg(all(test, feature = "web"))] fn gated(v: &str) -> String { format!("{v:?}") }
+        const TOP: &str = "{:?}";
+    "#;
+    let sources = [("emit.rs".to_owned(), src.to_owned())];
+    let found = debug_findings(&sources);
+    let sites: Vec<(&str, &str, usize)> = found
+        .sites
+        .iter()
+        .map(|((file, func), count)| (file.as_str(), func.as_str(), *count))
+        .collect();
+    assert_eq!(
+        sites,
+        [
+            ("emit.rs", "-", 1),
+            ("emit.rs", "bound", 1),
+            ("emit.rs", "listed", 1),
+            ("emit.rs", "method", 1),
+            ("emit.rs", "offending", 1),
+        ]
+    );
+    assert_eq!(
+        found.fallback,
+        [
+            "emit.rs:fallback: stringify::Wrap",
+            "emit.rs:fallback: )).dispatch()"
+        ]
+    );
+    let listed = [
+        DebugSite {
+            file: "emit.rs",
+            func: "listed",
+            count: 1,
+            why: DIAGNOSTIC,
+        },
+        DebugSite {
+            file: "emit.rs",
+            func: "offending",
+            count: 2,
+            why: DIAGNOSTIC,
+        },
+        DebugSite {
+            file: "emit.rs",
+            func: "gone",
+            count: 1,
+            why: DIAGNOSTIC,
+        },
+    ];
+    assert_eq!(
+        unlisted_debug_sites(&found.sites, &listed),
+        [
+            "emit.rs:-: 1 unlisted `Debug` sites",
+            "emit.rs:bound: 1 unlisted `Debug` sites",
+            "emit.rs:method: 1 unlisted `Debug` sites",
+            "emit.rs:offending: 1 `Debug` sites, listed 2",
+            "emit.rs:gone: stale entry, no `Debug` site",
+        ]
+    );
+}
+
+/// One more `Debug` rendering in a listed function breaks its exact count.
+#[test]
+fn one_more_debug_site_in_a_listed_function_is_refused() {
+    let one = [(
+        "emit.rs".to_owned(),
+        "fn report(k: &str) -> String { format!(\"kernel {k:?}\") }".to_owned(),
+    )];
+    let two = [(
+        "emit.rs".to_owned(),
+        "fn report(k: &str) -> String { format!(\"kernel {k:?}\") + &format!(\"{k:?}\") }"
+            .to_owned(),
+    )];
+    let listed = [DebugSite {
+        file: "emit.rs",
+        func: "report",
+        count: 1,
+        why: DIAGNOSTIC,
+    }];
+    assert_eq!(
+        unlisted_debug_sites(&debug_findings(&one).sites, &listed),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unlisted_debug_sites(&debug_findings(&two).sites, &listed),
+        ["emit.rs:report: 2 `Debug` sites, listed 1"]
+    );
 }
 
 #[test]
@@ -463,24 +1198,6 @@ fn a_hand_written_show_impl_outside_the_listed_files_is_refused() {
     assert_eq!(
         stray_show_impls(&sources),
         ["widget.rs:Widget", "widget.rs:Holder"]
-    );
-}
-
-#[test]
-fn a_backend_spelling_of_the_debug_fallback_is_refused() {
-    let sources = [
-        (
-            "emit.rs".to_owned(),
-            "format!(\"(&ipe_runtime::stringify::Wrap({b})).dispatch()\")".to_owned(),
-        ),
-        (
-            "ctor.rs".to_owned(),
-            "// `Msg::Wrap(a)` and `IpeStringify::ipe_show(p0)`".to_owned(),
-        ),
-    ];
-    assert_eq!(
-        refused_spellings(&sources),
-        ["emit.rs: stringify::Wrap", "emit.rs: )).dispatch()"]
     );
 }
 

@@ -2289,37 +2289,30 @@ fn canon_type_embeds_lambda(t: &canon::Type) -> bool {
     }
 }
 
-/// Is `home` a driver-generated FFI interface module (`Rust.*`)?
-///
-/// The `Rust.*` namespace is origin-reserved at canonicalisation, so the home
-/// prefix IS the provenance.
-fn home_is_ffi_interface(interner: &Interner, home: &[Symbol]) -> bool {
-    home.first()
-        .and_then(|s| interner.resolve(*s))
-        .is_some_and(|s| s == "Rust")
-}
-
-/// Does canonical type `t` name a `Rust.*` handle anywhere?
-fn canon_type_embeds_ffi(interner: &Interner, t: &canon::Type) -> bool {
+/// Does canonical type `t` name an opaque FFI handle anywhere
+/// ([`EnumEmbeds::is_opaque_handle`])?
+fn canon_type_embeds_opaque_handle(
+    interner: &Interner,
+    embeds: &EnumEmbeds,
+    t: &canon::Type,
+) -> bool {
+    let walk = |t: &canon::Type| canon_type_embeds_opaque_handle(interner, embeds, t);
     match t {
-        canon::Type::Lambda(a, b) => {
-            canon_type_embeds_ffi(interner, a) || canon_type_embeds_ffi(interner, b)
-        }
+        canon::Type::Lambda(a, b) => walk(a) || walk(b),
         canon::Type::Var(_) | canon::Type::Unit => false,
-        canon::Type::Tuple(elems) => elems.iter().any(|e| canon_type_embeds_ffi(interner, e)),
-        canon::Type::Con { home, args, .. } => {
-            home_is_ffi_interface(interner, home)
-                || args.iter().any(|a| canon_type_embeds_ffi(interner, a))
+        canon::Type::Tuple(elems) => elems.iter().any(walk),
+        canon::Type::Con { home, name, args } => {
+            embeds.is_opaque_handle(interner, home, *name) || args.iter().any(walk)
         }
-        canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => fields
-            .iter()
-            .any(|(_, f)| canon_type_embeds_ffi(interner, f)),
+        canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
+            fields.iter().any(|(_, f)| walk(f))
+        }
     }
 }
 
 /// The user enums whose DEFINITION holds what a `Ty::Con`'s type arguments
 /// cannot show: a function (`type Handler a = OnClick (Int -> a) | Plain a`) or
-/// an opaque `Rust.*` handle in a constructor payload.
+/// an opaque FFI handle in a constructor payload.
 ///
 /// Such an enum is not `Equatable` (a function) or showable (a function or a
 /// handle) however it is applied: its payload is invisible in a `Ty::Con`'s
@@ -2332,8 +2325,11 @@ fn canon_type_embeds_ffi(interner: &Interner, t: &canon::Type) -> bool {
 pub(crate) struct EnumEmbeds {
     /// Enums with a function in a payload.
     fun: BTreeSet<(Vec<Symbol>, Symbol)>,
-    /// Enums with a function or a `Rust.*` handle in a payload.
+    /// Enums with a function or an opaque FFI handle in a payload.
     show_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
+    /// The transparent FFI unions ([`ipe_ir::FfiUnion::Transparent`]): each
+    /// lowers to an app enum with an emitted `IpeStringify` impl.
+    transparent_ffi: BTreeSet<(Vec<Symbol>, Symbol)>,
 }
 
 impl EnumEmbeds {
@@ -2343,18 +2339,42 @@ impl EnumEmbeds {
         module_unions: &[canon::Union],
         dep_unions: &[&canon::Union],
     ) -> Self {
-        let mut facts = Self::default();
-        for u in module_unions.iter().chain(dep_unions.iter().copied()) {
+        let unions = || module_unions.iter().chain(dep_unions.iter().copied());
+        let mut facts = Self {
+            transparent_ffi: unions()
+                .filter(|u| {
+                    ipe_ir::home_is_ffi_interface(interner, &u.home)
+                        && ipe_ir::FfiUnion::classify(
+                            u.name,
+                            u.ctors.iter().map(|c| (c.name, c.arity)),
+                        ) == ipe_ir::FfiUnion::Transparent
+                })
+                .map(|u| (u.home.clone(), u.name))
+                .collect(),
+            ..Self::default()
+        };
+        for u in unions() {
             let payloads = || u.ctors.iter().flat_map(|c| c.args.iter());
             let fun = payloads().any(canon_type_embeds_lambda);
             if fun {
                 facts.fun.insert((u.home.clone(), u.name));
             }
-            if fun || payloads().any(|t| canon_type_embeds_ffi(interner, t)) {
+            if fun || payloads().any(|t| canon_type_embeds_opaque_handle(interner, &facts, t)) {
                 facts.show_refused.insert((u.home.clone(), u.name));
             }
         }
         facts
+    }
+
+    /// Is `(home, name)` an opaque FFI handle: a type under an FFI interface
+    /// home that is not a known transparent union?
+    ///
+    /// Decided by the union's definition ([`ipe_ir::FfiUnion`]), the same fact
+    /// the lowerer emits an `EnumDef` by, never by the home prefix alone. A
+    /// `Rust.*` type whose definition is not in scope is a handle (fail closed).
+    fn is_opaque_handle(&self, interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
+        ipe_ir::home_is_ffi_interface(interner, home)
+            && !self.transparent_ffi.contains(&(home.to_vec(), name))
     }
 
     /// Does enum `(home, name)`'s definition embed a function?
@@ -2376,9 +2396,10 @@ pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
 /// show row that is not `Refused`.
 ///
 /// Refuses a bare type variable (fail-closed, like every sibling obligation), a
-/// function, a tuple wider than [`MAX_SHOWN_TUPLE_ARITY`], a `Rust.*` handle,
-/// and an enum whose definition embeds a function or a handle
-/// ([`EnumEmbeds`]). Every type argument is walked.
+/// function, a tuple wider than [`MAX_SHOWN_TUPLE_ARITY`], an opaque FFI
+/// handle ([`EnumEmbeds::is_opaque_handle`]), and an enum whose definition
+/// embeds a function or a handle ([`EnumEmbeds`]). A transparent FFI union is
+/// shown like any user union. Every type argument is walked.
 fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
         Ty::Var(_) | Ty::Fun(_, _) => false,
@@ -2393,7 +2414,7 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
             .values()
             .all(|f| ty_is_showable(interner, f, enum_embeds)),
         Ty::Con { module, name, args } => {
-            !home_is_ffi_interface(interner, module)
+            !enum_embeds.is_opaque_handle(interner, module, *name)
                 && !enum_embeds.refuses_show(module, *name)
                 && args
                     .iter()
@@ -7665,6 +7686,109 @@ mod tests {
         assert!(!ty_is_equatable(&holds_fn, &embeds));
         assert!(ty_is_showable(&i, &holds_int, &embeds));
         assert!(ty_is_equatable(&holds_int, &embeds));
+    }
+
+    /// A union `name` under `home` with constructors `ctors`, each `(name, payloads)`.
+    fn union_with(
+        i: &mut Interner,
+        home: &[&str],
+        name: &str,
+        ctors: Vec<(&str, Vec<canon::Type>)>,
+    ) -> canon::Union {
+        canon::Union {
+            home: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern union name"),
+            name_span: Span::DUMMY,
+            vars: Vec::new(),
+            ctors: ctors
+                .into_iter()
+                .enumerate()
+                .map(|(index, (ctor, args))| canon::Ctor {
+                    name: i.intern(ctor).expect("intern ctor name"),
+                    index,
+                    arity: args.len(),
+                    args,
+                    span: Span::DUMMY,
+                })
+                .collect(),
+        }
+    }
+
+    /// Opacity is a fact of the definition, not of the `Rust.*` home: a
+    /// transparent FFI union (it lowers to an app enum with an emitted
+    /// `IpeStringify` impl) is showable, directly and as a user union's
+    /// payload. The opaque `type Encoder = Encoder` placeholder, a `Rust.*`
+    /// type with no definition in scope, and a transparent union or a user
+    /// union holding the placeholder stay refused.
+    #[test]
+    fn a_transparent_ffi_union_is_showable_and_an_opaque_handle_is_not() {
+        let mut i = Interner::new();
+        let canon_con = |i: &mut Interner, home: &[&str], name: &str| canon::Type::Con {
+            home: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern type name"),
+            args: Vec::new(),
+        };
+        let tm = ["Rust", "Tm"];
+        let int = canon_con(&mut i, &[], "Int");
+        let string = canon_con(&mut i, &[], "String");
+        let shade = canon_con(&mut i, &tm, "Shade");
+        let encoder = canon_con(&mut i, &tm, "Encoder");
+        let unions = vec![
+            union_with(
+                &mut i,
+                &tm,
+                "Shade",
+                vec![
+                    ("On", vec![]),
+                    ("Level", vec![int.clone()]),
+                    ("Mix", vec![int, string]),
+                ],
+            ),
+            union_with(&mut i, &tm, "Encoder", vec![("Encoder", vec![])]),
+            union_with(
+                &mut i,
+                &tm,
+                "Wrapped",
+                vec![("Wrapped", vec![encoder.clone()])],
+            ),
+            union_with(&mut i, &["Main"], "Holder", vec![("Holder", vec![shade])]),
+            union_with(&mut i, &["Main"], "Keeps", vec![("Keeps", vec![encoder])]),
+        ];
+        let show = TyBounds::show();
+        for (module_unions, dep_unions) in [
+            (unions.as_slice(), Vec::new()),
+            (&[][..], unions.iter().collect::<Vec<_>>()),
+        ] {
+            let embeds = EnumEmbeds::of(&i, module_unions, &dep_unions);
+            for (home, name, shown) in [
+                (&tm[..], "Shade", true),
+                (&["Main"][..], "Holder", true),
+                (&tm[..], "Encoder", false),
+                (&tm[..], "Undeclared", false),
+                (&tm[..], "Wrapped", false),
+                (&["Main"][..], "Keeps", false),
+            ] {
+                let ty = con_ty(&mut i, home, name);
+                assert_eq!(
+                    ty_is_showable(&i, &ty, &embeds),
+                    shown,
+                    "showability of {home:?}.{name}"
+                );
+                for site in BOTH_SITES {
+                    assert_eq!(
+                        super_bounds_satisfied(&i, show, &ty, site, &embeds),
+                        shown,
+                        "Stringify of {home:?}.{name} at {site:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// `true` iff inference refused the program with the interpolation

@@ -1428,3 +1428,236 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     }
     Ok(items.render())
 }
+
+#[cfg(test)]
+mod show_pin_agreement {
+    use super::{GenericScope, render_type};
+    use crate::RustBackend;
+    use ipe_intern::Interner;
+    use ipe_ir::{
+        IrType, ModPath, Program, RuntimeBridgedEnum, SHOWN_LEAVES, ShowLeaf, ShowPolicy,
+        ShowShape, UiCtor, UiPlain,
+    };
+
+    /// The runtime's show-row pins: each leaf with the Rust type that renders it.
+    const SHOW_ROWS: &str = include_str!("../../../../runtime/rust/tests/show_rows.rs");
+
+    /// Every `"Leaf" => Policy: Type;` line of `text`.
+    fn parse_pins(text: &str) -> Vec<(&str, &str)> {
+        text.lines()
+            .filter_map(|line| {
+                let (leaf, rest) = line.trim().strip_prefix('"')?.split_once('"')?;
+                let (_, ty) = rest.trim().strip_prefix("=>")?.split_once(':')?;
+                Some((leaf, ty.trim().strip_suffix(';')?.trim()))
+            })
+            .collect()
+    }
+
+    /// A Rust type's own name: its last path segment, type arguments dropped.
+    fn type_name(spelled: &str) -> &str {
+        let head = spelled.split_once('<').map_or(spelled, |(head, _)| head);
+        head.rsplit_once("::").map_or(head, |(_, name)| name).trim()
+    }
+
+    fn leaf_of(ty: &IrType) -> Option<ShowLeaf> {
+        match ty.show_shape() {
+            ShowShape::Leaf(leaf) => Some(leaf),
+            ShowShape::Carrier(_)
+            | ShowShape::Param
+            | ShowShape::Named { .. }
+            | ShowShape::TooWide => None,
+        }
+    }
+
+    /// One sample type per shown leaf the backend renders without a program.
+    fn leaf_samples() -> Vec<IrType> {
+        let unit = || Box::new(IrType::Unit);
+        let ui = |ctor| IrType::Ui { ctor, msg: unit() };
+        vec![
+            IrType::Int,
+            IrType::SessionHandle,
+            IrType::Float,
+            IrType::Bool,
+            IrType::Str,
+            IrType::Char,
+            IrType::Unit,
+            IrType::Task(unit()),
+            IrType::Bytes,
+            IrType::Json,
+            IrType::Decoder(unit()),
+            IrType::Db,
+            IrType::Cmd(unit()),
+            IrType::Sub(unit()),
+            IrType::ServerRequest,
+            IrType::ServerResponse,
+            IrType::ServerRoute,
+            IrType::ServerCookie,
+            IrType::StreamWriter,
+            IrType::HttpRequest,
+            IrType::WebSocketServer,
+            IrType::WebSocketServerCfg,
+            ui(UiCtor::Html),
+            ui(UiCtor::Element),
+            ui(UiCtor::Cells),
+            ui(UiCtor::UiAttribute),
+            ui(UiCtor::TuiAttribute),
+            ui(UiCtor::CliLines),
+            ui(UiCtor::CliAttribute),
+            ui(UiCtor::HtmlAttribute),
+            ui(UiCtor::HtmlEvent),
+            ui(UiCtor::Label),
+            ui(UiCtor::Placeholder),
+            ui(UiCtor::RadioOption),
+            IrType::UiPlain(UiPlain::Length),
+            IrType::UiPlain(UiPlain::Color),
+            IrType::UiPlain(UiPlain::HAlign),
+            IrType::UiPlain(UiPlain::VAlign),
+            IrType::UiPlain(UiPlain::Location),
+            IrType::UiPlain(UiPlain::PseudoClass),
+            IrType::UiPlain(UiPlain::Description),
+            IrType::UiPlain(UiPlain::LayoutContext),
+            IrType::UiPlain(UiPlain::ColorError),
+            IrType::UiPlain(UiPlain::TermProfile),
+            IrType::UiPlain(UiPlain::AnsiColor),
+            IrType::UiPlain(UiPlain::WcagLevel),
+            IrType::UiPlain(UiPlain::TextSize),
+            IrType::UiPlain(UiPlain::Deficiency),
+            IrType::WebReq,
+            IrType::WebRoute(unit()),
+            IrType::CustomElement {
+                down: unit(),
+                up: unit(),
+            },
+            IrType::Order,
+            IrType::BackoffStrategy,
+            IrType::HttpMethod,
+            IrType::Decimal,
+            IrType::Principal,
+            IrType::AuthConfig,
+            IrType::TokenSource,
+            IrType::ErrorKind,
+            IrType::Error,
+            IrType::ErrorDetails,
+            IrType::ErrorInfo,
+            IrType::PanicInfo,
+            IrType::TypeInfo,
+            IrType::SqlFragment,
+            IrType::Secret,
+            IrType::Path,
+            IrType::Regex,
+            IrType::ProcessRunWithCfg,
+            IrType::ProcessRunInPtyCfg,
+            IrType::CacheCfg,
+            IrType::CacheStats,
+            IrType::WebSocketClientCfg,
+            IrType::CsvDoc,
+            IrType::EmailMessage,
+            IrType::EmailAttachment,
+            IrType::EmailSesConfig,
+            IrType::EmailSmtpConfig,
+            IrType::EmailProvider,
+            IrType::CryptoKey,
+            IrType::CryptoMac,
+            IrType::EmailAddress,
+            IrType::Url,
+            IrType::UrlRelative,
+            IrType::Dsn,
+            IrType::Connection,
+            IrType::Setting,
+            IrType::Locale,
+            IrType::WebApp,
+            IrType::TuiApp,
+            IrType::CliApp,
+            IrType::WorkerApp,
+        ]
+    }
+
+    /// The runtime-bridged enums `render_type` names without a registered
+    /// definition, as `(leaf, type)` samples.
+    fn bridged_samples(interner: &mut Interner) -> Vec<(ShowLeaf, IrType)> {
+        [
+            RuntimeBridgedEnum::CacheHandle,
+            RuntimeBridgedEnum::ChunkEvent,
+            RuntimeBridgedEnum::StreamId,
+            RuntimeBridgedEnum::RedirectPolicy,
+        ]
+        .into_iter()
+        .map(|bridged| {
+            let home = bridged
+                .home()
+                .iter()
+                .map(|seg| interner.intern(seg).expect("intern a home segment"))
+                .collect();
+            let name = interner.intern(bridged.name()).expect("intern a name");
+            let ty = IrType::Enum {
+                home: ModPath(home),
+                name,
+                args: Vec::new(),
+            };
+            (bridged.show_leaf(), ty)
+        })
+        .collect()
+    }
+
+    /// The Rust type `render_type` spells for each shown leaf is a type the
+    /// runtime's `show_rows.rs` pins to that leaf, and every shown leaf has a
+    /// sample here, so a renamed render or a moved pin breaks this test.
+    #[test]
+    fn every_rendered_leaf_type_is_its_pinned_row_type() {
+        let mut interner = Interner::new();
+        let bridged = bridged_samples(&mut interner);
+        let program = Program {
+            modules: vec![],
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+        };
+        let backend = RustBackend::new(&interner);
+        let ctx = backend.emit_ctx_for_tests(&program).expect("build EmitCtx");
+        let pins = parse_pins(SHOW_ROWS);
+        let samples: Vec<(ShowLeaf, IrType)> = leaf_samples()
+            .into_iter()
+            .map(|ty| {
+                let leaf = leaf_of(&ty).expect("a leaf sample classifies as a leaf");
+                (leaf, ty)
+            })
+            .chain(bridged)
+            .collect();
+        for (leaf, ty) in &samples {
+            let rendered = render_type(&ctx, ty, GenericScope::new(&[])).expect("render");
+            let pinned: Vec<&str> = pins
+                .iter()
+                .filter(|(name, _)| *name == leaf.name())
+                .map(|(_, pin)| type_name(pin))
+                .collect();
+            assert!(
+                pinned.contains(&type_name(&rendered)),
+                "leaf {} renders as `{rendered}`, but show_rows.rs pins it to {pinned:?}",
+                leaf.name()
+            );
+        }
+        for (name, policy) in SHOWN_LEAVES {
+            if policy.tag() == ShowPolicy::Refused.tag() {
+                continue;
+            }
+            assert!(
+                samples.iter().any(|(leaf, _)| leaf.name() == name),
+                "shown leaf {name} has no render sample"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pin_parser_reads_a_row_and_skips_the_rest() {
+        let text = "pins! {\n    \"Int\" => Value: i64;\n    #[cfg(feature = \"x\")]\n    \"Task\" => Internals: a::IpeTask<b::E, ()>;\n}\n";
+        assert_eq!(
+            parse_pins(text),
+            vec![("Int", "i64"), ("Task", "a::IpeTask<b::E, ()>")]
+        );
+        assert_eq!(type_name("a::IpeTask<b::E, ()>"), "IpeTask");
+        assert_eq!(type_name("()"), "()");
+        assert_ne!(
+            type_name("ipe_runtime::url::Url"),
+            type_name("x::UrlRelative")
+        );
+    }
+}

@@ -10,6 +10,8 @@
 //! unions lowered without an `EnumDef` and the set the backend knows the facts
 //! of cannot drift.
 
+use ipe_intern::{Interner, Symbol};
+
 use crate::ir::{CarrierLeaf, IrType, carrier_leaf};
 use crate::show_policy::{ShowLeaf, show_leaf};
 
@@ -155,6 +157,49 @@ impl RuntimeBridgedEnum {
     }
 }
 
+/// Is `home` a driver-generated FFI interface module (`Rust.*`)?
+///
+/// The `Rust.*` namespace is origin-reserved at canonicalisation, so the home
+/// prefix is the provenance of an FFI declaration. It is NOT the provenance of
+/// opacity: an FFI interface declares both opaque handles and transparent
+/// unions ([`FfiUnion`]).
+#[must_use]
+pub fn home_is_ffi_interface(interner: &Interner, home: &[Symbol]) -> bool {
+    home.first()
+        .and_then(|s| interner.resolve(*s))
+        .is_some_and(|s| s == "Rust")
+}
+
+/// What a union declared under an FFI interface home lowers to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FfiUnion {
+    /// The opaque-handle placeholder `type N = N`: no `EnumDef` is lowered,
+    /// its values are the foreign crate's own type, and it has no show row.
+    OpaqueHandle,
+    /// A real closed-union declaration: it lowers to an app enum with an
+    /// emitted `IpeStringify` impl, like any user union.
+    Transparent,
+}
+
+impl FfiUnion {
+    /// Classify the union `name` declared under an FFI interface home, given
+    /// each constructor's `(name, arity)`.
+    ///
+    /// The placeholder is exactly one nullary constructor spelling the type
+    /// name; the FFI driver never declares a transparent union of that shape,
+    /// so the two are distinct by construction. The lowerer (which `EnumDef`s
+    /// to emit) and the type checker (which types have a rendering) both read
+    /// this one classification, so they cannot disagree on a union.
+    #[must_use]
+    pub fn classify(name: Symbol, ctors: impl IntoIterator<Item = (Symbol, usize)>) -> Self {
+        let mut ctors = ctors.into_iter();
+        match (ctors.next(), ctors.next()) {
+            (Some((ctor, 0)), None) if ctor == name => Self::OpaqueHandle,
+            _ => Self::Transparent,
+        }
+    }
+}
+
 /// Is a non-carrier, non-enum leaf in an enum payload or record field `Clone`?
 ///
 /// The one leaf rule the frontend's clone classifier and the backend's
@@ -225,6 +270,41 @@ mod tests {
         assert!(!payload_leaf_is_clone(&IrType::Task(Box::new(
             IrType::Unit
         ))));
+    }
+
+    #[test]
+    fn only_the_nullary_self_named_union_is_an_opaque_handle() {
+        let mut i = Interner::new();
+        let mut sym = |s: &str| i.intern(s).expect("intern");
+        let (shade, on, level, encoder) = (sym("Shade"), sym("On"), sym("Level"), sym("Encoder"));
+        assert_eq!(
+            FfiUnion::classify(encoder, [(encoder, 0)]),
+            FfiUnion::OpaqueHandle
+        );
+        for ctors in [
+            vec![(shade, 1)],
+            vec![(on, 0)],
+            vec![(shade, 0), (level, 1)],
+            vec![(on, 0), (level, 1)],
+            vec![],
+        ] {
+            assert_eq!(
+                FfiUnion::classify(shade, ctors.clone()),
+                FfiUnion::Transparent,
+                "{ctors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_rust_home_is_an_ffi_interface() {
+        let mut i = Interner::new();
+        let rust = i.intern("Rust").expect("intern");
+        let tm = i.intern("Tm").expect("intern");
+        let main = i.intern("Main").expect("intern");
+        assert!(home_is_ffi_interface(&i, &[rust, tm]));
+        assert!(!home_is_ffi_interface(&i, &[main, rust]));
+        assert!(!home_is_ffi_interface(&i, &[]));
     }
 
     #[test]

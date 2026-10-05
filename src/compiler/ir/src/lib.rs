@@ -23,7 +23,9 @@ pub mod record_shapes;
 pub mod seq_clone;
 mod show_policy;
 
-pub use enum_facts::{EnumTraits, RuntimeBridgedEnum, payload_leaf_is_clone};
+pub use enum_facts::{
+    EnumTraits, FfiUnion, RuntimeBridgedEnum, home_is_ffi_interface, payload_leaf_is_clone,
+};
 pub use held::{
     EnumPayloadTable, MAX_HELD_WALK_DEPTH, Reach, enum_payload_holds, enum_payload_table,
     ir_type_holds, ir_type_reaches,
