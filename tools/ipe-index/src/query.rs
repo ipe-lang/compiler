@@ -1377,8 +1377,14 @@ mod tests {
     // A small indexed store to exercise the review commands.
     fn seeded() -> Store {
         let s = Store::open(":memory:").unwrap();
-        s.put_file("ipe:src/lib.rs", "rs", "compiler-rs", 0, "")
-            .unwrap();
+        s.put_file(
+            "ipe:src/lib.rs",
+            "rs",
+            "compiler-rs",
+            0,
+            &crate::store::FileStamp::of_bytes(b""),
+        )
+        .unwrap();
         crate::extract::extract_file(
             &s,
             "ipe:src/lib.rs",

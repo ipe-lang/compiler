@@ -3,6 +3,7 @@ use crate::model::{Kind, Unit};
 use crate::repo_set::{MAX_REPOS, RecordedRoot};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 
 pub struct Store {
     pub conn: Connection,
@@ -24,7 +25,7 @@ pub struct Store {
 /// emits the allowed values). [`OPEN_UNITS_VIEW`] follows the tables in the
 /// schema fixture `tests/schema.sql`.
 const TABLE_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT);
+CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT CHECK (length(sha) = 71 AND substr(sha, 1, 7) = 'blake3:' AND NOT substr(sha, 8) GLOB '*[^0-9a-f]*'));
 CREATE TABLE IF NOT EXISTS symbols (file TEXT, name TEXT, kind TEXT, line INTEGER, col INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS edges   (src TEXT, dst TEXT, kind TEXT, resolved TEXT);
 CREATE TABLE IF NOT EXISTS meta    (k TEXT PRIMARY KEY, v TEXT);
@@ -114,7 +115,10 @@ const OPEN_UNITS_VIEW: &str = "CREATE VIEW open_units AS
   WHERE NOT EXISTS (SELECT 1 FROM reviewed r
                     WHERE r.uid = u.uid AND r.body_hash = u.body_hash)";
 
-/// Current schema version: v8 is v7 plus the `open_units` view and the
+/// Current schema version: v9 is v8 with a [`FileStamp`] in every `files.sha`,
+/// the digest an incremental `update` judges each listed file by; v8 rows
+/// store `""` there, so a v8 index is rebuilt before `update` trusts a stamp.
+/// v8 is v7 plus the `open_units` view and the
 /// `reviewed_stamp` table; a v7 index has neither, so it is rebuilt before the
 /// review app reads it. v7 is v6 plus the `repos` root set the rows were
 /// indexed under; a v6 index records none, so its owner of each path is
@@ -129,7 +133,7 @@ const OPEN_UNITS_VIEW: &str = "CREATE VIEW open_units AS
 /// stamps it only on a DB with no units yet, so a stamp always describes the
 /// rows beside it; a DB holding rows of another version keeps its stamp until
 /// `index` rebuilds it.
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = "9";
 
 /// Stable unit id: blake3 of `path|kind|qualified`. Content-stable across
 /// re-indexes; a rename of the symbol or path changes the id by design.
@@ -142,6 +146,59 @@ pub fn unit_uid(path: &str, kind: Kind, qualified: &str) -> String {
     h.update(qualified.as_bytes());
     h.finalize().to_hex().to_string()
 }
+
+/// A file's content digest as `files.sha` stores it: `blake3:` and 64 lowercase hex.
+///
+/// Only [`FileStamp::of_bytes`] (over the bytes an index run read) and
+/// [`FileStamp::parse`] (over stored text) make one, so a stamp in hand always
+/// names some file content in the one stored spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStamp(String);
+
+/// Why stored text is not a [`FileStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampRefusal {
+    /// The text is empty (the stamp a v8 index stores).
+    Empty,
+    /// The text does not start with the `blake3:` scheme.
+    UnknownScheme,
+    /// The digest is not exactly 64 lowercase hex digits.
+    BadDigest,
+}
+
+impl FileStamp {
+    const SCHEME: &str = "blake3:";
+    const DIGEST_LEN: usize = 64;
+
+    /// The stamp of `bytes`, the content an index run read for one file.
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        Self(format!("{}{}", Self::SCHEME, blake3::hash(bytes).to_hex()))
+    }
+
+    /// Parses stored text, refusing anything [`FileStamp::of_bytes`] never writes.
+    pub fn parse(text: &str) -> Result<Self, StampRefusal> {
+        if text.is_empty() {
+            return Err(StampRefusal::Empty);
+        }
+        let Some(digest) = text.strip_prefix(Self::SCHEME) else {
+            return Err(StampRefusal::UnknownScheme);
+        };
+        let lower_hex = digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if digest.len() != Self::DIGEST_LEN || !lower_hex {
+            return Err(StampRefusal::BadDigest);
+        }
+        Ok(Self(text.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The stamp of every indexed path, by tagged path.
+pub type Stamps = HashMap<String, FileStamp>;
 
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
@@ -167,12 +224,48 @@ impl Store {
         self.conn.execute_batch("COMMIT;")?;
         Ok(())
     }
-    pub fn put_file(&self, path: &str, lang: &str, role: &str, size: i64, sha: &str) -> Result<()> {
+    pub fn put_file(
+        &self,
+        path: &str,
+        lang: &str,
+        role: &str,
+        size: i64,
+        stamp: &FileStamp,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)",
-            rusqlite::params![path, lang, role, size, sha],
+            rusqlite::params![path, lang, role, size, stamp.as_str()],
         )?;
         Ok(())
+    }
+    /// The stamp of every indexed path, or `None` when some indexed path has
+    /// none an incremental `update` can trust.
+    ///
+    /// A `files` row whose `sha` is not a [`FileStamp`] (the `""` of a v8
+    /// index, NULL, any other text), or a unit whose path has no `files` row,
+    /// leaves that path unjudgeable, so the whole index is rebuilt.
+    pub fn stamps(&self) -> Result<Option<Stamps>> {
+        let orphans: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM units WHERE path NOT IN (SELECT path FROM files)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphans > 0 {
+            return Ok(None);
+        }
+        let mut st = self.conn.prepare("SELECT path, sha FROM files")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut stamps = Stamps::new();
+        for row in rows {
+            let (path, sha) = row?;
+            let Some(stamp) = sha.as_deref().and_then(|t| FileStamp::parse(t).ok()) else {
+                return Ok(None);
+            };
+            stamps.insert(path, stamp);
+        }
+        Ok(Some(stamps))
     }
     pub fn put_symbol(
         &self,
@@ -519,7 +612,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let s = Store::open(":memory:").unwrap();
-        s.put_file("a.rs", "rs", "runtime-rs", 10, "deadbeef")
+        s.put_file("a.rs", "rs", "runtime-rs", 10, &FileStamp::of_bytes(b"a"))
             .unwrap();
         s.put_symbol("a.rs", "list_head", "fn", 5, 0).unwrap();
         s.put_edge("a.rs", "b.rs", "import").unwrap();
@@ -631,17 +724,99 @@ mod tests {
     // refuses to run incrementally over it, and the full rebuild stamps it
     // current.
     #[test]
-    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_8() {
-        assert_eq!(SCHEMA_VERSION, "8");
+    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_9() {
+        assert_eq!(SCHEMA_VERSION, "9");
         let s = Store::open(":memory:").unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
-        s.set_meta("schema_version", "7").unwrap();
+        s.set_meta("schema_version", "8").unwrap();
         ensure_schema_version(&s.conn).unwrap();
         assert!(!s.schema_is_current().unwrap());
         s.reset_index().unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("8"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("9"));
         assert!(s.schema_is_current().unwrap());
+    }
+
+    // Stored text is a stamp only in the one spelling `of_bytes` writes.
+    #[test]
+    fn file_stamp_parse_refuses() {
+        let good = FileStamp::of_bytes(b"fn a() {}\n");
+        assert_eq!(FileStamp::parse(good.as_str()), Ok(good.clone()));
+        let digest = good.as_str().strip_prefix("blake3:").unwrap_or_default();
+        assert_eq!(digest.len(), 64);
+        let short = format!("blake3:{}", digest.get(1..).unwrap_or_default());
+        let long = format!("blake3:{digest}0");
+        let upper = format!("blake3:{}", "A".repeat(64));
+        let nonhex = format!("blake3:{}", "g".repeat(64));
+        let sha256 = format!("sha256:{digest}");
+        for (text, want) in [
+            ("", StampRefusal::Empty),
+            (short.as_str(), StampRefusal::BadDigest),
+            (long.as_str(), StampRefusal::BadDigest),
+            (upper.as_str(), StampRefusal::BadDigest),
+            (nonhex.as_str(), StampRefusal::BadDigest),
+            (sha256.as_str(), StampRefusal::UnknownScheme),
+            (digest, StampRefusal::UnknownScheme),
+        ] {
+            assert_eq!(FileStamp::parse(text), Err(want), "{text:?}");
+        }
+    }
+
+    // The `files.sha` CHECK refuses what `FileStamp::parse` refuses, so a
+    // writer that bypasses `put_file` cannot store an unjudgeable stamp.
+    #[test]
+    fn files_sha_check_refuses_a_non_stamp() {
+        let s = Store::open(":memory:").unwrap();
+        let digest = "a".repeat(64);
+        for sha in [
+            String::new(),
+            format!("blake3:{}", "a".repeat(63)),
+            format!("blake3:{}", "A".repeat(64)),
+            format!("sha256:{digest}"),
+        ] {
+            let err = s.conn.execute(
+                "INSERT INTO files VALUES ('p', 'rs', 'r', 0, ?)",
+                [sha.as_str()],
+            );
+            assert!(
+                err.as_ref().is_err_and(|e| e.to_string().contains("CHECK")),
+                "{sha:?}: {err:?}"
+            );
+        }
+        s.conn
+            .execute(
+                "INSERT INTO files VALUES ('p', 'rs', 'r', 0, ?)",
+                [format!("blake3:{digest}")],
+            )
+            .unwrap();
+    }
+
+    // Every indexed path must carry a stamp for `update` to judge file by file:
+    // a `""` stamp or a unit with no `files` row leaves the stamps unusable.
+    #[test]
+    fn stamps_are_none_when_a_path_has_no_stamp() {
+        let s = Store::open(":memory:").unwrap();
+        assert_eq!(s.stamps().unwrap(), Some(Stamps::new()));
+        let stamp = FileStamp::of_bytes(b"x");
+        s.put_file("src/a.rs", "rs", "r", 1, &stamp).unwrap();
+        s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
+            .unwrap();
+        assert_eq!(
+            s.stamps().unwrap(),
+            Some(Stamps::from([("src/a.rs".to_string(), stamp.clone())]))
+        );
+        s.put_unit(&sample_unit("src/b.rs", "bar", "crate::bar"))
+            .unwrap();
+        assert_eq!(s.stamps().unwrap(), None, "a unit with no files row");
+        s.drop_file("src/b.rs").unwrap();
+        s.conn
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON; \
+                 INSERT INTO files VALUES ('src/c.rs', 'rs', 'r', 0, ''); \
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+            .unwrap();
+        assert_eq!(s.stamps().unwrap(), None, "a v8 `\"\"` stamp");
     }
 
     // A DB with units but no recorded version is not stamped current either.
@@ -687,7 +862,14 @@ mod tests {
     #[test]
     fn drop_file_removes_owned_rows() {
         let s = Store::open(":memory:").unwrap();
-        s.put_file("src/a.rs", "rs", "compiler-rs", 10, "").unwrap();
+        s.put_file(
+            "src/a.rs",
+            "rs",
+            "compiler-rs",
+            10,
+            &FileStamp::of_bytes(b""),
+        )
+        .unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
         let uid = unit_uid("src/a.rs", Kind::Fn, "crate::foo");
@@ -912,7 +1094,14 @@ mod tests {
     #[test]
     fn open_units_is_one_row_per_unit_with_its_language() {
         let s = Store::open(":memory:").unwrap();
-        s.put_file("src/a.rs", "rs", "runtime-rs", 10, "").unwrap();
+        s.put_file(
+            "src/a.rs",
+            "rs",
+            "runtime-rs",
+            10,
+            &FileStamp::of_bytes(b""),
+        )
+        .unwrap();
         let with_file = unit_with_hash(&s, "foo", "sha256:aa");
         queue(&s, &with_file, "new", None, Some("sha256:aa"), 5);
         s.put_unit(&sample_unit("src/b.rs", "bar", "crate::bar"))
