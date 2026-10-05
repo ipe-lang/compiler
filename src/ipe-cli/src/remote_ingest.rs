@@ -239,7 +239,7 @@ impl WallBudget {
 /// Ceiling on every wall-time ceiling of a local child, in seconds.
 ///
 /// No local child may run longer than one hour. The jailed FFI inspector
-/// allows 900 seconds and a self-run of `ipe run` contains a full cargo build,
+/// allows 900 seconds and a self-run of `ipe dev run` contains a full cargo build,
 /// so a local wall may exceed [`MAX_WALL_SECS`]; this is the type's ceiling,
 /// not a default.
 pub const MAX_LOCAL_WALL_SECS: u64 = 3600;
@@ -557,7 +557,7 @@ pub const WASM_TOOL_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<600>(),
 });
 
-/// The ceilings of a self-run of this CLI (`ipe run <snippet>`), which contains a full cargo build.
+/// The ceilings of a self-run of this CLI (`ipe dev run <snippet>`), which contains a full cargo build.
 ///
 /// Its stdout (the snippet's output) is held to 1 MiB and its run to
 /// [`MAX_LOCAL_WALL_SECS`].
@@ -1268,7 +1268,7 @@ pub enum LocalSource {
     FfiInspect,
     /// A wasm bundle tool (`wasm-bindgen`, `wasm-opt`).
     WasmTool,
-    /// This CLI run again on a snippet (`ipe run`).
+    /// This CLI run again on a snippet (`ipe dev run`).
     SelfRun,
 }
 
@@ -1286,7 +1286,7 @@ impl std::fmt::Display for LocalSource {
             Self::LinkProbe => "linker probe",
             Self::FfiInspect => "FFI inspector",
             Self::WasmTool => "wasm bundle tool",
-            Self::SelfRun => "`ipe run` of an example",
+            Self::SelfRun => "`ipe dev run` of an example",
         })
     }
 }
