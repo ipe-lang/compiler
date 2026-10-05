@@ -9,7 +9,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
-import Lib.App exposing (Model, Page(..))
+import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..))
@@ -51,21 +51,7 @@ button label html =
 -- A model on the queue page, nothing loaded.
 baseModel : Model
 baseModel =
-    { page = QueuePage
-    , queueState = Loading
-    , queueCursor = Index.Start
-    , refusingUid = Nothing
-    , refuseDraft = ""
-    , refuseError = Nothing
-    , decisionError = Nothing
-    , queueLoad = Queue.firstTicket
-    , history = HistoryLoading
-    , historyLoad = Queue.firstTicket
-    , unitPage = UnitLoading
-    , unitLoad = Queue.firstTicket
-    , selected = 0
-    , selectedView = NoneSelected
-    }
+    initialModel
 
 
 queued : Index.UnitView -> Queue.QueuedUnit
@@ -113,9 +99,16 @@ refusingModel loaded =
     { card | refusingUid = Just loaded.unit.uid }
 
 
-unitPageModel : String -> Index.UnitView -> Model
-unitPageModel address loaded =
-    { baseModel | page = UnitPage address, unitPage = UnitLoaded loaded }
+-- The unit page of `loaded`'s own address, with its read settled.
+unitPageModel : Index.UnitView -> Model
+unitPageModel loaded =
+    { baseModel | page = UnitPage (Uid.toString loaded.unit.uid), selectedView = ViewShown loaded }
+
+
+-- A unit page at `address`, whatever it names.
+addressModel : String -> Model
+addressModel address =
+    { baseModel | page = UnitPage address }
 
 
 historyModel : List Queue.HistoryRow -> Model
@@ -250,7 +243,7 @@ withheldRefuses loaded entry =
             page (cardModel withheld)
 
         onPage =
-            page (unitPageModel "x" withheld)
+            page (unitPageModel withheld)
     in
     has entry.reason onCard
         && noDecisionButtons onCard
@@ -394,10 +387,10 @@ pathAttributeEscaped loaded =
             "\"><script>alert(1)</script>"
 
         hostile =
-            page (unitPageModel hostileAddress loaded)
+            page (addressModel hostileAddress)
 
         plain =
-            page (unitPageModel "abc" loaded)
+            page (addressModel "abc")
     in
     has "data-ipe-path=\"/unit/&#34;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\"" hostile
         && not (has "<script>" hostile)
@@ -422,7 +415,7 @@ unsafeLinkHasNoHref loaded url =
             withLinks [ External url ] loaded
 
         onPage =
-            page (unitPageModel "x" linked)
+            page (unitPageModel linked)
 
         onCard =
             page (cardModel linked)
@@ -449,7 +442,7 @@ safeLinkHasHref loaded =
         linked =
             withLinks [ External "https://example.com/x" ] loaded
     in
-    has "href=\"https://example.com/x\"" (page (unitPageModel "x" linked))
+    has "href=\"https://example.com/x\"" (page (unitPageModel linked))
         && has "href=\"https://example.com/x\"" (page (cardModel linked))
 
 
@@ -461,7 +454,7 @@ seededChecks a b =
             page (cardModel a)
 
         shownPage =
-            page (unitPageModel "x" a)
+            page (unitPageModel a)
 
         unit =
             a.unit
@@ -484,8 +477,8 @@ seededChecks a b =
     , ( "the unit page shows a verified source and never a decision button", has sourceMarker shownPage && noDecisionButtons shownPage )
     , ( "an open refusal panel shows Confirm and Cancel in place of Approve and Refuse", button "Confirm" opened && button "Cancel" opened && not (button "Approve" opened) && not (button "Refuse" opened) )
     , ( "the escaped needle differs from the raw hostile text, and a benign render holds no script tag, no href and shows the unit name", hostileEscaped /= hostileText && renderedForeign (codeText 8238) /= codeText 8238 && not (has "<script" shownCard) && not (has "href=" shownCard) && has "Lib.answer" shownCard )
-    , ( "a hostile unit name is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostileName)) && escapesHostile (page (unitPageModel "x" hostileName)) )
-    , ( "a hostile unit path is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostilePath)) && escapesHostile (page (unitPageModel "x" hostilePath)) )
+    , ( "a hostile unit name is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostileName)) && escapesHostile (page (unitPageModel hostileName)) )
+    , ( "a hostile unit path is escaped on the queue page and the unit page", escapesHostile (page (cardModel hostilePath)) && escapesHostile (page (unitPageModel hostilePath)) )
     , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
@@ -525,7 +518,7 @@ hostileSourceChecks =
         Task.succeed
             [ ( "the hostile fixture source is verified and shown", isShown loaded )
             , ( "a hostile source token is escaped on the queue page", escapesHostile (page (cardModel loaded)) )
-            , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel "x" loaded)) )
+            , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel loaded)) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             ]
 

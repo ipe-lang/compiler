@@ -1,4 +1,4 @@
-module Lib.Queue exposing (HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), clearView, decidableSource, decide, drainThenLoad, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, stateFromResult, unitPageEntry, unitPageFromResult, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), clearView, decidableSource, decide, decisionSettled, drainThenLoad, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.Db as Db
 import Ipe.Error as Error
@@ -350,7 +350,8 @@ decide settings db shown decision =
         Task.succeed ( attested, written )
 
 
--- The selected queue card's source: nothing selected, one read in flight
+-- The session's one source slot, shared by the selected queue card and the
+-- unit page: nothing selected, one read in flight
 -- (with the unit wanted once it returns, when the selection moved during the
 -- read), the loaded view, no unit with the read's uid, or a failed read. At
 -- most one read is in flight: a selection made during a read only records
@@ -595,17 +596,73 @@ unitPageEntry raw =
             Err UnitIdRefused
 
 
-unitPageFromResult : Result Error (Maybe Index.UnitView) -> UnitPageState
-unitPageFromResult result =
-    case result of
-        Ok (Just loaded) ->
-            UnitLoaded loaded
+-- The unit page of `uid`, read from the session's one source slot, the same
+-- `SelectedView` the queue card reads through, so the two pages never hold
+-- two reads in flight. Only a view settled for `uid` itself shows; a read in
+-- flight, or a view settled for another unit, is still loading.
+unitPageOf : Uid -> SelectedView -> UnitPageState
+unitPageOf uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                UnitLoaded shown
 
-        Ok Nothing ->
-            UnitNotFound
+            else
+                UnitLoading
 
-        Err e ->
-            UnitFailed e
+        ViewMissing missing ->
+            if missing == uid then
+                UnitNotFound
+
+            else
+                UnitLoading
+
+        ViewFailed failed e ->
+            if failed == uid then
+                UnitFailed e
+
+            else
+                UnitLoading
+
+        ViewLoading _ ->
+            UnitLoading
+
+        NoneSelected ->
+            UnitLoading
+
+
+-- The session's one decision slot. A decision re-reads its source to re-prove
+-- it, so at most one is in flight: a decision asked while one is saving
+-- starts nothing.
+type DecisionSlot
+    = DecisionIdle
+    | DecisionSaving Uid
+
+
+-- The slot holding a decision on `uid`; Nothing while another is saving.
+startDecision : Uid -> DecisionSlot -> Maybe DecisionSlot
+startDecision uid slot =
+    case slot of
+        DecisionIdle ->
+            Just (DecisionSaving uid)
+
+        DecisionSaving _ ->
+            Nothing
+
+
+-- The decision on `uid` settled; a result for any other uid leaves the slot.
+decisionSettled : Uid -> DecisionSlot -> DecisionSlot
+decisionSettled uid slot =
+    case slot of
+        DecisionSaving saving ->
+            if saving == uid then
+                DecisionIdle
+
+            else
+                slot
+
+        DecisionIdle ->
+            DecisionIdle
 
 
 -- The one-line text for a unit page that has no unit to show; Nothing once
