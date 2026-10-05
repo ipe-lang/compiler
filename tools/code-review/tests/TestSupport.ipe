@@ -28,10 +28,21 @@ module TestSupport exposing
     , seedIndexDb
     , insertUnitRows
     , setIndexEnv
+    , envSettings
+    , envReview
+    , envAppSettings
     , loadFirstPage
     , indexConn
     , loadUnitNow
     , decideNow
+    , loadPageNow
+    , loadHistoryPageNow
+    , drainThenLoadNow
+    , loadUnitViewNow
+    , drainUnitNow
+    , decideShownNow
+    , resyncReviewedNow
+    , resyncReviewedWithinNow
     , checkUnits
     , listSecond
     , isUnitA
@@ -444,6 +455,77 @@ insertUnitRows conn =
             )
 
 
+-- The settings a server resolves once at startup, here parsed from the
+-- current `IPE_INDEX_*` environment the way `main` reads and parses it. A test
+-- that calls a request-time function resolves them once and passes them in;
+-- the `*Now` helpers below resolve them from the environment at each call.
+envSettings : Task.Task Error Settings.IndexSettings
+envSettings =
+    do
+        rawDb <- System.getenv "IPE_INDEX_DB"
+        rawRoot <- System.getenv "IPE_INDEX_ROOT"
+        Settings.parseIndexSettings rawDb rawRoot
+
+
+-- The review store location a server resolves once at startup, here parsed
+-- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
+envReview : Task.Task Error Settings.DbLocation
+envReview =
+    Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
+
+
+-- Every setting a server resolves once at startup, from the current
+-- environment.
+envAppSettings : Task.Task Error Settings.AppSettings
+envAppSettings =
+    do
+        index <- envSettings
+        review <- envReview
+        Task.succeed { index = index, review = review }
+
+
+-- Each request-time function below, run on settings resolved from the current
+-- environment.
+loadPageNow : Index.Cursor -> Task.Task Error Queue.QueuePage
+loadPageNow cursor =
+    envAppSettings |> Task.andThen (\settings -> Queue.loadPage settings cursor)
+
+
+loadHistoryPageNow : LibDb.HistoryCursor -> Task.Task Error Queue.HistoryPage
+loadHistoryPageNow cursor =
+    envAppSettings |> Task.andThen (\settings -> Queue.loadHistoryPage settings cursor)
+
+
+drainThenLoadNow : Index.Attested -> Index.Cursor -> Task.Task Error Queue.QueuePage
+drainThenLoadNow attested cursor =
+    envAppSettings |> Task.andThen (\settings -> Queue.drainThenLoad settings attested cursor)
+
+
+loadUnitViewNow : String -> Task.Task Error (Maybe Index.UnitView)
+loadUnitViewNow uid =
+    envSettings |> Task.andThen (\settings -> Queue.loadUnitView settings uid)
+
+
+decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decideShownNow db shown decision =
+    envSettings |> Task.andThen (\settings -> Queue.decide settings db shown decision)
+
+
+drainUnitNow : Index.Attested -> Task.Task Error Int
+drainUnitNow attested =
+    envSettings |> Task.andThen (\settings -> Index.drainUnit settings attested)
+
+
+resyncReviewedNow : Db -> Task.Task Error Int
+resyncReviewedNow db =
+    envSettings |> Task.andThen (\settings -> Queue.resyncReviewed settings db)
+
+
+resyncReviewedWithinNow : Queue.ResyncBound -> Db -> Task.Task Error Int
+resyncReviewedWithinNow bound db =
+    envSettings |> Task.andThen (\settings -> Queue.resyncReviewedWithin settings bound db)
+
+
 setIndexEnv : String -> String -> Task.Task Error ()
 setIndexEnv indexDb repo =
     System.setenv "IPE_INDEX_DB" indexDb
@@ -466,7 +548,7 @@ type alias PageEntry =
 loadFirstPage : Task.Task Error { units : List PageEntry, total : Int }
 loadFirstPage =
     do
-        settings <- Settings.indexSettings
+        settings <- envSettings
         conn <- Index.readConnection settings
         rows <- Index.loadPendingPage conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) rows)
@@ -497,14 +579,14 @@ pageEntry conn roots row =
 -- The index read connection from the current `IPE_INDEX_*` environment.
 indexConn : Task.Task Error Db
 indexConn =
-    Settings.indexSettings |> Task.andThen Index.readConnection
+    envSettings |> Task.andThen Index.readConnection
 
 
 -- The view of unit `uid` loaded from the index the current environment names.
 loadUnitNow : String -> Task.Task Error (Maybe Index.UnitView)
 loadUnitNow uid =
     do
-        settings <- Settings.indexSettings
+        settings <- envSettings
         conn <- Index.readConnection settings
         Index.loadView conn settings.roots uid
 
@@ -519,7 +601,7 @@ decideNow db uid decision =
             (\found ->
                 case Maybe.andThen (\loaded -> shownOf loaded.view) found of
                     Just shown ->
-                        Queue.decide db shown decision
+                        decideShownNow db shown decision
 
                     Nothing ->
                         Task.fail (Error.conflict ("unit " ++ uid ++ " is not shown"))
@@ -734,7 +816,7 @@ reverifyShown uid found =
         Just loaded ->
             case loaded.view of
                 Shown shown ->
-                    Index.reverify shown
+                    envSettings |> Task.andThen (\settings -> Index.reverify settings shown)
 
                 Stale _ ->
                     Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is stale"))
