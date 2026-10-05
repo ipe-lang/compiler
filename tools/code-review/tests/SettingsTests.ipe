@@ -606,7 +606,8 @@ settingsNeverInSessionState =
                 && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
                 && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
                 && not (statePinned (replaceIn "Main.ipe" "        , view = View.view\n" "        , view = View.view settings\n" sources))
-                && not (statePinned (replaceIn "Main.ipe" "        , update = update settings\n" "        , update = \\msg state -> update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , update = App.update settings\n" "        , update = \\msg state -> App.update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Lib/App.ipe" "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" "update : Msg -> ( Model, Settings.AppSettings ) -> ( Model, Cmd Msg )" sources))
                 && not (statePinned (appendTo "Lib/Queue.ipe" "other = Web.embed" sources))
                 && not (statePinned (replaceIn "Main.ipe" "reviewApp settings =\n    Web.embed\n" "reviewApp settings =\n    let\n        update = \\s msg state -> state\n    in\n    Web.embed\n" sources))
             )
@@ -635,7 +636,7 @@ statePinned sources =
 stateAnnotations : List ( String, String )
 stateAnnotations =
     [ ( "Main.ipe", "init : Web.WebReq -> ( Model, Cmd Msg )" )
-    , ( "Main.ipe", "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" )
+    , ( "Lib/App.ipe", "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" )
     , ( "Lib/View.ipe", "view : Model -> Ui.Element Msg" )
     , ( "Main.ipe", "subscriptions : Model -> Sub Msg" )
     ]
@@ -643,7 +644,7 @@ stateAnnotations =
 
 stateWiring : String
 stateWiring =
-    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = update settings\n        , view = View.view\n        , subscriptions = subscriptions\n"
+    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = App.update settings\n        , view = View.view\n        , subscriptions = subscriptions\n"
 
 
 -- `sources` with `old` replaced by `new` in the code of module `rel`.
