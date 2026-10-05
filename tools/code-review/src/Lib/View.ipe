@@ -11,7 +11,7 @@ import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
-import Lib.App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
+import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
 import Lib.Db as LibDb exposing (StoredDecision(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Token(..))
@@ -137,8 +137,8 @@ pageBody model =
         HistoryPage ->
             historyBody model
 
-        UnitPage _ ->
-            unitPageBody model
+        UnitPage raw ->
+            unitPageBody (App.unitPageState raw model)
 
 
 queueBody : Model -> Ui.Element Msg
@@ -347,25 +347,25 @@ nameOf row =
 
 -- The unit page shows the source of one unit with its resolved links —
 -- no decision buttons, no change state; the unit is read-only here.
-unitPageBody : Model -> Ui.Element Msg
-unitPageBody model =
-    case model.unitPage of
+unitPageBody : Queue.UnitPageState -> Ui.Element Msg
+unitPageBody state =
+    case state of
         UnitLoaded loaded ->
             Ui.column
                 [ Ui.width Ui.fill, Ui.spacing 16, Ui.scrollbars ]
                 [ unitPageCard loaded ]
 
         UnitLoading ->
-            unitPageStatus model.unitPage
+            unitPageStatus state
 
         UnitNotFound ->
-            unitPageStatus model.unitPage
+            unitPageStatus state
 
         UnitFailed _ ->
-            unitPageStatus model.unitPage
+            unitPageStatus state
 
         UnitIdRefused ->
-            unitPageStatus model.unitPage
+            unitPageStatus state
 
 
 unitPageStatus : Queue.UnitPageState -> Ui.Element Msg

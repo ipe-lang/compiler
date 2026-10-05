@@ -713,8 +713,12 @@ unitPageStatesDistinct =
         seedIndex at.indexDb at.repo
         loaded <- loadUnitViewNow (uid "no-such")
         cleanupIndex at.indexDb at.repo
+        let
+            ( settled, _ ) =
+                Queue.viewArrived (uid "no-such") (Ok loaded) (ViewLoading { uid = uid "no-such", wanted = Nothing, fresh = True })
+        in
         Task.succeed
-            (isNotFound (Queue.unitPageFromResult (Ok loaded))
+            (isNotFound (Queue.unitPageOf (uid "no-such") settled)
                 && List.length pageTexts
                 == 4
                 && List.length sourceTexts
