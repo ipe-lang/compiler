@@ -1091,8 +1091,9 @@ enum Runner {
     /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`.
     Bang,
     /// A Git `alias.*`: one leading `!` makes the rest a shell command;
-    /// otherwise Git reads its own options off the front, and the first word
-    /// left names a Git command, which Git runs as the program `git-<word>`
+    /// otherwise Git splits the value into words itself, expanding none, reads
+    /// its own options off the front, and the first word left names a Git
+    /// command, which Git runs as the program `git-<word>`
     /// (`execv_dashed_external`), relative to its working directory once the
     /// word holds a `/`.
     GitAlias,
@@ -1104,8 +1105,9 @@ enum Runner {
     /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
     Python,
     /// The value is run without a shell (Git's `gpg.program`, `core.askPass`,
-    /// `core.gitProxy`), or split at spaces only (`gpg.ssh.defaultKeyCommand`):
-    /// a `~`, a quote, or a space is part of the program path.
+    /// `core.gitProxy`), or split into words Git expands none of
+    /// (`gpg.ssh.defaultKeyCommand`): a `~`, a quote, or a space is part of
+    /// the program path, and a word's leading `~` is a relative path's.
     Exec,
     /// A Git `remote.<name>.vcs`: run without a shell as the program `git-remote-<value>`.
     GitRemote,
@@ -1113,24 +1115,25 @@ enum Runner {
 
 /// The command line a tool runs for a value, as [`Runner::consume`] composes it.
 enum Line<'v> {
-    /// Text the tool splits into shell words.
-    Shell {
+    /// Text a shell splits into words and expands.
+    Shell(Cow<'v, str>),
+    /// Text the tool splits into words itself, quotes grouping, expanding no
+    /// `~`, and runs without a shell.
+    Split {
         /// The text split into words.
         text: Cow<'v, str>,
         /// The program prefix the tool adds to the first word not shaped like an option.
-        command_prefix: Option<&'static str>,
+        command_prefix: &'static str,
     },
-    /// Text the tool runs as one program, neither split nor expanded.
+    /// Text the tool runs as one program, neither split nor expanded, or
+    /// split into words it expands none of.
     Exec(Cow<'v, str>),
 }
 
 impl<'v> Line<'v> {
-    /// A command line run as written.
+    /// A command line a shell runs as written.
     const fn of(text: Cow<'v, str>) -> Self {
-        Self::Shell {
-            text,
-            command_prefix: None,
-        }
+        Self::Shell(text)
     }
 }
 
@@ -1152,9 +1155,9 @@ impl Runner {
             // Git splits an alias into words and reads its own options
             // (`-p`, `-c <name>`) off the front before the word naming a
             // command, so the prefix lands on a word, not on the value's text.
-            Self::GitAlias => strip("!").unwrap_or(Line::Shell {
+            Self::GitAlias => strip("!").unwrap_or(Line::Split {
                 text: Cow::Borrowed(value),
-                command_prefix: Some("git-"),
+                command_prefix: "git-",
             }),
             Self::Exec => Line::Exec(Cow::Borrowed(value)),
             Self::GitRemote => Line::Exec(Cow::Owned(format!("git-remote-{value}"))),
@@ -2720,22 +2723,29 @@ impl Scan<'_> {
         };
         let mut words = Words::default();
         match runner.consume(value) {
-            Line::Shell {
+            Line::Shell(text) => words
+                .push_split(&text, Position::Program, tilde)
+                .map_err(unproven)?,
+            // No word's leading `~` is expanded: each is judged both ways.
+            Line::Split {
                 text,
                 command_prefix,
             } => {
                 words
-                    .push_split(&text, Position::Program, tilde)
+                    .push_split(&text, Position::Program, Tilde::Verbatim)
                     .map_err(unproven)?;
-                if let Some(prefix) = command_prefix {
-                    words.prefix_command(prefix);
-                }
+                words.prefix_command(command_prefix);
             }
-            // The whole text is the program, a leading `~` the first
-            // character of a relative path; it is judged both ways.
-            Line::Exec(text) => words
-                .push_forms(text.into_owned(), Position::Program)
-                .map_err(unproven)?,
+            // The whole text is the program, and its words those of a tool
+            // splitting it without a shell; a leading `~` is judged both ways.
+            Line::Exec(text) => {
+                words
+                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .map_err(unproven)?;
+                words
+                    .push_forms(text.into_owned(), Position::Program)
+                    .map_err(unproven)?;
+            }
         }
         self.judge_queue(ctx, &mut words)
     }
@@ -5629,6 +5639,7 @@ mod tests {
             format!("[alias]\n\tx = --paginate {out}/x\n"),
             format!("[alias \"x\"]\n\tcommand = {out}/x\n"),
             "[alias]\n\tx = ~/x\n".to_owned(),
+            "[alias]\n\tx = y ~/x\n".to_owned(),
             "[credential]\n\thelper = ~/x\n".to_owned(),
             "[credential \"https://example.com\"]\n\thelper = ~/x\n".to_owned(),
         ] {
@@ -5666,6 +5677,7 @@ mod tests {
             format!("[gpg]\n\tprogram = \"a {out}/x\"\n"),
             "[gpg \"ssh\"]\n\tprogram = ~/x\n".to_owned(),
             "[gpg \"ssh\"]\n\tdefaultKeyCommand = ~/x\n".to_owned(),
+            format!("[gpg \"ssh\"]\n\tdefaultKeyCommand = {out}/sh ~/x\n"),
             "[core]\n\taskPass = ~/x\n".to_owned(),
             format!("[core]\n\taskPass = \"a {out}/x\"\n"),
             "[core]\n\tgitProxy = ~/x\n".to_owned(),
