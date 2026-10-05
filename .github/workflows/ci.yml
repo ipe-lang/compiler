@@ -454,7 +454,8 @@ jobs:
   # queue, not on the release tag. `ring` needs a native C toolchain, so each leg
   # runs natively. Both workflows run the checkout, the one shared
   # .github/actions/release-target-toolchain step and the cargo command, in that
-  # order and nothing else; ci/verify-manifest.py check 23 pins all three.
+  # order and nothing else before the cargo command; ci/verify-manifest.py
+  # check 23 pins all three.
   # `cargo check` does not link.
   release-targets-run:
     needs: [changes, quick-check]

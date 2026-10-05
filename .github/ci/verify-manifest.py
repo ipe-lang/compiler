@@ -432,7 +432,11 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       proven absent.  LIMIT: steps after the cargo step (packaging, release
       VM lines after the cargo line) are unverified beyond the scans above
       and can replace or rebuild the shipped artifact (`curl -o dist/ipe`, a
-      script, a compiler named at run time).
+      script, a compiler named at run time).  LIMIT: a job in release.yml
+      outside the pinned set, or the publish job, can upload or replace an
+      artifact under a shipped name.  LIMIT: a release run takes the local
+      actions from the tag's checked-out tree, so a tag off main carries
+      composite text that CI never verified.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
