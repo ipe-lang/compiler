@@ -846,14 +846,19 @@ impl CurlRunError {
     /// The [`CliError`] for this failure; a failure with no typed error of its own is `other`.
     fn into_cli(self, other: impl FnOnce() -> CliError) -> CliError {
         match self {
-            Self::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
+            Self::Exceeded(refusal) | Self::CouldNotRun(RunError::Exceeded(refusal)) => {
+                CliError::RemoteIngestExceeded(refusal)
+            }
             Self::CouldNotRun(RunError::PipeDrainTimeout(stream)) => {
                 CliError::ChildPipeHeld(stream)
             }
             Self::CouldNotRun(RunError::PipeRead(stream, kind)) => {
                 CliError::ChildPipeUnread(stream, kind)
             }
-            Self::Scratch(_) | Self::CouldNotRun(_) | Self::Status(_) | Self::Body => other(),
+            Self::Scratch(_)
+            | Self::CouldNotRun(RunError::Spawn(_) | RunError::Wait(_) | RunError::Measure(..))
+            | Self::Status(_)
+            | Self::Body => other(),
         }
     }
 }
@@ -2402,6 +2407,24 @@ mod tests {
                 "status text {stdout_text:?} should refuse as Status({expected:?}), got {result:?}"
             );
         }
+    }
+
+    /// A curl whose output pipe could not be read is that typed error, never
+    /// the caller's catch-all refusal.
+    #[test]
+    fn an_unread_curl_pipe_is_its_own_error() {
+        let unread = CurlRunError::CouldNotRun(RunError::PipeRead(
+            remote_ingest::Stream::Stdout,
+            std::io::ErrorKind::Other,
+        ))
+        .into_cli(|| CliError::Interrupted);
+        assert!(
+            matches!(
+                unread,
+                CliError::ChildPipeUnread(remote_ingest::Stream::Stdout, std::io::ErrorKind::Other)
+            ),
+            "{unread:?}"
+        );
     }
 
     /// A response body past the cap is a typed ingest refusal, never a

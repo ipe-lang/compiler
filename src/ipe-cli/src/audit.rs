@@ -1456,6 +1456,7 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
 ///   process group is killed.
 /// - [`CliError::ChildPipeHeld`] when a process `cargo-deny` started holds a
 ///   pipe open.
+/// - [`CliError::ChildPipeUnread`] when reading one of its output pipes fails.
 fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     let manifest = prepared.emitted_dir.join("Cargo.toml");
     if !manifest.is_file() {

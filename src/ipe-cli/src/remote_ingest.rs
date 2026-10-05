@@ -4103,6 +4103,29 @@ mod tests {
         assert_eq!(past, CaptureOutcome::Overflowed(vec![b'x'; 16]));
     }
 
+    /// A failed read on a live output pipe is kept as a failure, never taken for the pipe's end.
+    ///
+    /// A read on a directory descriptor fails (`EISDIR`); the watcher then
+    /// names the pipe and how it failed, so the bytes read so far cannot pass
+    /// as the child's whole output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_pipe_read_is_a_failure_not_an_end() {
+        let dir = std::fs::File::open("/").expect("open the root directory");
+        let mut io = super::ChildIo {
+            stdout: super::pipes::Reader::new(Some(dir), bytes(CAP)).expect("stdout reader"),
+            stderr: super::pipes::Reader::new(None::<std::fs::File>, bytes(CAP))
+                .expect("stderr reader"),
+            stdin: None,
+        };
+        let _ = io.pump();
+        assert!(io.open_stream().is_none(), "a failed pipe is closed");
+        assert_eq!(
+            io.read_failure(),
+            Some((Stream::Stdout, std::io::ErrorKind::IsADirectory))
+        );
+    }
+
     /// Stderr one byte past its ceiling is kept to the ceiling and marked truncated.
     #[cfg(unix)]
     #[test]
