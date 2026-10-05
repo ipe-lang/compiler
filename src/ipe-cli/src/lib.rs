@@ -138,16 +138,18 @@ const fn shown_eq(
     compiler: &[(&str, ipe_ir::ShowPolicy)],
     runtime: &[(&str, ipe_runtime_rust::stringify::ShowPolicy)],
 ) -> bool {
-    let (mut a, mut b) = (compiler, runtime);
+    let (mut left, mut right) = (compiler, runtime);
     loop {
-        match (a, b) {
+        match (left, right) {
             ([], []) => return true,
-            ([(x, p), a_rest @ ..], [(y, q), b_rest @ ..]) => {
-                if !text::bytes_eq(x.as_bytes(), y.as_bytes()) || p.tag() != q.tag() {
+            ([(lname, lpolicy), left_rest @ ..], [(rname, rpolicy), right_rest @ ..]) => {
+                if !text::bytes_eq(lname.as_bytes(), rname.as_bytes())
+                    || lpolicy.tag() != rpolicy.tag()
+                {
                     return false;
                 }
-                a = a_rest;
-                b = b_rest;
+                left = left_rest;
+                right = right_rest;
             }
             _ => return false,
         }
