@@ -1632,7 +1632,11 @@ mod tests {
         let fixture = fixture("walk-nested-config");
         let gitdir = fixture.root.join("outside").join("gd");
         make_dir(&gitdir);
-        write(&gitdir.join("config"), "[core]\n\tfsmonitor = ../tree/x\n");
+        let named = fixture.tree.join("x");
+        write(
+            &gitdir.join("config"),
+            &format!("[core]\n\tfsmonitor = {}\n", named.display()),
+        );
         let sub = fixture.tree.join("sub");
         make_dir(&sub);
         write(
@@ -1647,9 +1651,37 @@ mod tests {
                     kind: VcsKind::Git,
                     named: crate::Named::InGrant(path),
                     ..
-                })) if *path == fixture.tree.join("x")
+                })) if *path == named
             ),
             "a nested repository's configuration is judged: {walked:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_gitfile_config_naming_dot_dot_is_unprovable() {
+        let fixture = fixture("walk-nested-config-dotdot");
+        let gitdir = fixture.root.join("outside").join("gd");
+        make_dir(&gitdir);
+        write(&gitdir.join("config"), "[core]\n\tfsmonitor = ../tree/x\n");
+        let sub = fixture.tree.join("sub");
+        make_dir(&sub);
+        write(
+            &sub.join(".git"),
+            &format!("gitdir: {}\n", gitdir.display()),
+        );
+        let walked = parse(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsConfig(
+                    crate::ConfigRefusal::NamesWritableCode {
+                        kind: VcsKind::Git,
+                        named: crate::Named::Unprovable(crate::Unprovable::DotDot),
+                        ..
+                    }
+                ))
+            ),
+            "a parent step in a nested configuration value is refused: {walked:?}"
         );
     }
 

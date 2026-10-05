@@ -1488,16 +1488,41 @@ mod tests {
 
     #[test]
     fn filesystem_granted_binds_the_working_tree_read_write() {
+        let base_dir = crate::test_dir::TestDir::new("run-jail-rw").expect("test dir");
+        let tree = base_dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("fixture dir");
+        let tree = CanonicalPath::resolve(&tree).expect("fixture path");
         let p = SandboxProfile {
             filesystem: FilesystemScope::WorkingTreeReadWrite,
             ..SandboxProfile::maximally_isolated()
         };
-        let joined = rendered(&p, None).join(" ");
+        let mounts = mounts_of(
+            CanonicalPath::assumed("/work/tmp-1"),
+            tree.clone(),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let no_env = |_: &str| None;
+        let joined = run_jail_argv(
+            &tools(),
+            &p,
+            &mounts,
+            None,
+            &no_env,
+            &[OsString::from("app")],
+        )
+        .expect("the argv builds")
+        .args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let at = tree.as_path().display();
         assert!(
-            joined.contains("--bind /work/tree /work/tree"),
+            joined.contains(&format!("--bind {at} {at}")),
             "working tree not bound rw: {joined}"
         );
-        assert!(joined.contains("--chdir /work/tree"), "{joined}");
+        assert!(joined.contains(&format!("--chdir {at}")), "{joined}");
     }
 
     #[test]

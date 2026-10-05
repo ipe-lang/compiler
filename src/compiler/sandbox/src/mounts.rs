@@ -516,12 +516,14 @@ impl<'a> PinnedCarve<'a> {
     }
 
     /// The directories pinned, shallowest first.
+    #[cfg(any(target_os = "freebsd", test))]
     #[must_use]
     pub fn pins(&self) -> &[CanonicalPath] {
         &self.pins
     }
 
     /// The carve bound read-only.
+    #[cfg(any(target_os = "freebsd", test))]
     #[must_use]
     pub const fn carve(&self) -> &'a CanonicalPath {
         self.carve
@@ -632,15 +634,12 @@ fn with_carves<'a>(
 ) -> Result<Vec<MountStep<'a>>, JailPathError> {
     let carves: Vec<(&'a CanonicalPath, &'a WalkLimits)> = binds
         .iter()
-        .filter_map(|bind| match bind {
-            Bind::WorkingTree(tree) => {
-                let tree: &'a WritableTree = *tree;
-                Some(
-                    tree.carve()
-                        .paths()
-                        .map(move |carve| (carve, tree.limits())),
-                )
-            }
+        .filter_map(|bind| match *bind {
+            Bind::WorkingTree(tree) => Some(
+                tree.carve()
+                    .paths()
+                    .map(move |carve| (carve, tree.limits())),
+            ),
             Bind::ReadOnly(_) | Bind::ReadWrite(_) => None,
         })
         .flatten()
@@ -1567,6 +1566,7 @@ mod tests {
 
     #[test]
     fn every_carve_renders_with_its_pins() {
+        type Layout<'a> = (&'a str, HomeMasks, &'a str, Vec<&'a str>, Vec<Bind<'a>>);
         let scratch = CanonicalPath::assumed("/srv/scratch");
         let nested_scratch = CanonicalPath::assumed("/srv/u/proj/build/scratch");
         let in_carve = CanonicalPath::assumed("/srv/tree/a/.git/scratch");
@@ -1578,7 +1578,7 @@ mod tests {
             "/srv/tree/a/b/c/d/_darcs",
             "/srv/tree/x/y/z/.git",
         ];
-        let layouts: [(&str, HomeMasks, &str, Vec<&str>, Vec<Bind<'_>>); 4] = [
+        let layouts: [Layout<'_>; 4] = [
             (
                 "carves at depths one to five",
                 HomeMasks::unmasked(),
@@ -1645,6 +1645,10 @@ mod tests {
             }
             assert_eq!(bind_after_covered_mask(&argv), None, "{layout}: {argv:?}");
         }
+    }
+
+    #[test]
+    fn a_writable_bind_inside_a_carve_is_covered_again() {
         let tree = CanonicalPath::assumed("/srv/tree");
         let carve = CanonicalPath::assumed("/srv/tree/a/b/.git");
         let bare = [

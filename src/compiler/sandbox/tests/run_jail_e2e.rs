@@ -302,7 +302,7 @@ fn nested_carve_ancestor_rename_refused() {
             OsString::from("/proc/self/mountinfo"),
         ]
     };
-    let pinned: Vec<(std::path::PathBuf, Option<i32>)> = [store.clone(), repo.clone()]
+    let pinned: Vec<(std::path::PathBuf, Option<i32>)> = [store.clone(), repo]
         .into_iter()
         .map(|dir| {
             let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &mounted(&dir));

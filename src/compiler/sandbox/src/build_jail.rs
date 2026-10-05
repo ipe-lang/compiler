@@ -3946,7 +3946,8 @@ mod tests {
         use crate::mounts::{jail_binds, mount_plan, plan_bind_after_covered_mask};
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
-        let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
+        let binding = granted(&fixture.mounts);
+        let binds = jail_binds(&fixture.mounts, &binding);
         let plan = mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds");
         assert_eq!(plan_bind_after_covered_mask(&plan), None, "{plan:?}");
         let rendered = freebsd_mount_ops(root, &plan);
@@ -4040,7 +4041,8 @@ mod tests {
         )
         .expect("a tree with a git dir parses");
         let root = Path::new("/jailroot");
-        let granted_binds = jail_binds(&mounts, &granted(&mounts));
+        let binding = granted(&mounts);
+        let granted_binds = jail_binds(&mounts, &binding);
         let rendered = freebsd_mount_ops(
             root,
             &mount_plan(mounts.homes(), &granted_binds).expect("the plan builds"),
@@ -4071,7 +4073,8 @@ mod tests {
         use crate::mounts::{jail_binds, mount_plan};
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
-        let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
+        let binding = granted(&fixture.mounts);
+        let binds = jail_binds(&fixture.mounts, &binding);
         let rendered = freebsd_mount_ops(
             root,
             &mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds"),
@@ -4116,7 +4119,8 @@ mod tests {
         use crate::mounts::{jail_binds, mount_plan};
         let fixture = mount_fixture();
         let root = Path::new("/jailroot");
-        let binds = jail_binds(&fixture.mounts, &granted(&fixture.mounts));
+        let binding = granted(&fixture.mounts);
+        let binds = jail_binds(&fixture.mounts, &binding);
         let rendered = freebsd_mount_ops(
             root,
             &mount_plan(fixture.mounts.homes(), &binds).expect("the plan builds"),
