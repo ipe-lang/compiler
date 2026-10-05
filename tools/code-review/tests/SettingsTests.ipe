@@ -293,12 +293,13 @@ dbRefusalsStateOneFix =
 -- module's count must equal its row in `admittedSites`: a new call, a
 -- wrapper around an admitted one, a second import of `Ipe.System`, or a read
 -- in a new module is red whatever it is spelled as or whatever variable it
--- names. `Ipe.System`'s environment readers all contain `getenv` and its
--- working-directory readers all contain `cwd`, so an alias or an
--- `exposing` import cannot dodge the count; the only admitted import is the
--- exact `import Ipe.System as System`. In `Main`: the environment is read on
--- exactly two code lines — `requireEnv`'s read and the `requireSettings`
--- call in `main` — and `requireEnv` is called twice. `Settings` exports both
+-- names. Every use of `Ipe.System` is counted as `System.`, its `getenv*`
+-- and `*cwd` readers again by name, and the only admitted import is the
+-- exact `import Ipe.System as System`, so an alias or an `exposing` import
+-- cannot dodge the count. In `Main`: the environment is read on exactly two
+-- code lines — `requireEnv`'s read and the `requireSettings` call in
+-- `main` — and `requireEnv` is named only by its declaration and its two
+-- literal-key calls, so no wrapper can pass it a key. `Settings` exports both
 -- parsers and neither the bare `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
@@ -366,11 +367,15 @@ occurrences needle text =
 -- Each needle and, for every module admitted to name it, the exact number of
 -- times its code does. A module absent from a needle's row names it zero
 -- times. `System.` counts every qualified use of the module: `Main`'s
--- `getenv`, `getenvOr` and two `exit`s, `RepoPath`'s `cwd`.
+-- `getenv`, `getenvOr` and two `exit`s, `RepoPath`'s `cwd`. `Ipe.Env` reads
+-- the live environment on the native target and `Ipe.Process` can run a
+-- child that prints it, so neither is admitted anywhere.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
     [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ) ] )
     , ( "Ipe.Ffi", [] )
+    , ( "Ipe.Env", [] )
+    , ( "Ipe.Process", [] )
     , ( "System.", [ ( "Main.ipe", 4 ), ( "Lib/RepoPath.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
@@ -442,11 +447,26 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/Queue.ipe" "reload = Settings.parseIndexSettings"
                 && evaded sources "Migrations.ipe" "import Ipe.System as System\nraw = System.getenvOr \"X\" \"\""
                 && evaded sources "Lib/Index.ipe" "fresh = File.isDir"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
                 && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
                 && not (layoutAdmits ("Pages" :: topNames) libNames)
                 && not (layoutAdmits topNames ("Extra" :: libNames))
                 && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
+                && mainAdmits (mainCode sources)
+                && not (mainAdmits (mainCode sources ++ "\nreread name = requireEnv name \"\""))
             )
+
+
+-- The code of `Main`, empty when the inventory has no `Main`.
+mainCode : List ( String, String ) -> String
+mainCode sources =
+    case List.find (\( rel, _ ) -> rel == "Main.ipe") sources of
+        Just ( _, text ) ->
+            text
+
+        Nothing ->
+            ""
 
 
 -- The scan refuses `sources` once `extra` is appended to module `rel`.
@@ -483,6 +503,8 @@ mainAdmits text =
         == 2
         && occurrences "requireEnv \"" text
         == 2
+        && occurrences "requireEnv" text
+        == 4
         && occurrences "requireSettings" text
         == 3
         && occurrences "parseIndexSettings" text
@@ -514,8 +536,8 @@ settingsExports source =
 -- persisted, and every type it can hold is declared in a module of `src`,
 -- so no `type` declaration in `src` may name a settings-carrying type except
 -- the declarations that define the settings themselves (`admittedCarriers`).
--- The scan reads each declaration whole, from its `type` line to the next
--- line at column 0, and judges every word by its unqualified name, so a
+-- The scan reads each declaration whole (`typeDeclarations`) and judges
+-- every word by its unqualified name, so a
 -- qualified or wrapped spelling (`Settings.AppSettings`,
 -- `Maybe RepoPath.RootMap`) is caught alike. `tests/Main.ipe` is this
 -- suite's entry, so `src/Main.ipe` cannot be compiled here to round-trip its
@@ -540,8 +562,67 @@ settingsNeverInSessionState =
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Index.ipe" "type alias Held =\n    { roots : Maybe RepoPath.RootMap }" sources))
                 && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.DbLocation)" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n\t= Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note -}\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Main.ipe") sources))
+                && statePinned sources
+                && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , update = update settings\n" "        , update = \\msg state -> update settings msg state\n" sources))
+                && not (statePinned (appendTo "Lib/Queue.ipe" "other = Web.embed" sources))
             )
+
+
+-- The app's session state is `Model`: the app functions carry it by these
+-- exact annotations and the one `embed` in `src` wires exactly these
+-- functions, so the state cannot be a tuple or record that pairs `Model`
+-- with the settings, which no `type` declaration would show.
+statePinned : List ( String, String ) -> Bool
+statePinned sources =
+    let
+        code =
+            mainCode sources
+
+        codeLines =
+            String.lines code
+    in
+    List.all (\line -> List.member line codeLines) stateAnnotations
+        && occurrences stateWiring code
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources)
+        == 1
+
+
+stateAnnotations : List String
+stateAnnotations =
+    [ "init : Web.WebReq -> ( Model, Cmd Msg )"
+    , "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )"
+    , "view : Model -> Ui.Element Msg"
+    , "subscriptions : Model -> Sub Msg"
+    ]
+
+
+stateWiring : String
+stateWiring =
+    "    Web.embed\n        { init = init\n        , update = update settings\n        , view = view\n        , subscriptions = subscriptions\n"
+
+
+-- `sources` with `old` replaced by `new` in the code of module `rel`.
+replaceIn : String -> String -> String -> List ( String, String ) -> List ( String, String )
+replaceIn rel old new sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, String.replace old new text )
+
+            else
+                ( name, text )
+        )
+        sources
 
 
 -- `sources` with a `settings` field added to the `Model` declaration of
@@ -569,7 +650,7 @@ settingsCarriers =
 -- define the settings, each in its own module.
 admittedCarriers : List ( String, List String )
 admittedCarriers =
-    [ ( "Lib/Settings.ipe", [ "IndexSettings", "AppSettings" ] )
+    [ ( "Lib/Settings.ipe", [ "DbLocation", "IndexSettings", "AppSettings" ] )
     , ( "Lib/RepoPath.ipe", [ "Root", "Entry", "Binding", "RootMap" ] )
     ]
 
@@ -609,37 +690,82 @@ type alias Declaration =
     ( String, List String )
 
 
--- The declarations closed so far, newest first, and the one being read.
+-- The declarations closed so far, newest first, the one being read, and
+-- how many `{-` block comments are open after the last line.
 type alias DeclarationScan =
-    ( List Declaration, Maybe Declaration )
+    { closed : List Declaration
+    , current : Maybe Declaration
+    , depth : Int
+    }
 
 
 -- Every `type` declaration of `text`, from its `type` line up to the next
--- line starting at column 0.
+-- line that starts a top-level item: a line at column 0 that is not inside
+-- or opening a block comment. A line indented by a space or a tab, a blank
+-- line, and any line of a block comment continue the declaration, so a
+-- comment or a tab between a declaration's head and its body cannot end the
+-- scan early. A miscounted comment can only add words to a declaration or
+-- start a spurious one, never drop a real one.
 typeDeclarations : String -> List Declaration
 typeDeclarations text =
     let
-        ( closed, current ) =
-            List.foldl declarationStep ( [], Nothing ) (String.lines text)
+        scan =
+            List.foldl declarationStep { closed = [], current = Nothing, depth = 0 } (String.lines text)
     in
-    List.reverse (closeDeclaration current closed)
+    List.reverse (closeDeclaration scan.current scan.closed)
 
 
 declarationStep : String -> DeclarationScan -> DeclarationScan
-declarationStep line ( closed, current ) =
-    if String.startsWith "type " line then
-        ( closeDeclaration current closed, Just ( declarationName line, typeWords line ) )
+declarationStep line scan =
+    let
+        depth =
+            commentDepthAfter scan.depth line
+    in
+    if startsDeclaration line then
+        { closed = closeDeclaration scan.current scan.closed, current = Just ( declarationName line, typeWords line ), depth = depth }
 
-    else if line /= "" && not (String.startsWith " " line) then
-        ( closeDeclaration current closed, Nothing )
+    else if endsDeclaration scan.depth line then
+        { closed = closeDeclaration scan.current scan.closed, current = Nothing, depth = depth }
 
     else
-        case current of
+        case scan.current of
             Just ( name, words ) ->
-                ( closed, Just ( name, words ++ typeWords line ) )
+                { closed = scan.closed, current = Just ( name, words ++ typeWords line ), depth = depth }
 
             Nothing ->
-                ( closed, Nothing )
+                { scan | depth = depth }
+
+
+-- A line at column 0 holding the word `type` anywhere, so a block comment
+-- before the keyword cannot hide the declaration.
+startsDeclaration : String -> Bool
+startsDeclaration line =
+    not (indented line) && List.member "type" (String.words line)
+
+
+-- A line at column 0 outside a block comment, not opening one.
+endsDeclaration : Int -> String -> Bool
+endsDeclaration depth line =
+    depth == 0 && line /= "" && not (indented line) && not (String.startsWith "{-" line)
+
+
+indented : String -> Bool
+indented line =
+    String.startsWith " " line || String.startsWith "\t" line
+
+
+-- The open block-comment count after `line`, never below zero.
+commentDepthAfter : Int -> String -> Int
+commentDepthAfter depth line =
+    let
+        next =
+            depth + occurrences "{-" line - occurrences "-}" line
+    in
+    if next < 0 then
+        0
+
+    else
+        next
 
 
 closeDeclaration : Maybe Declaration -> List Declaration -> List Declaration
@@ -652,12 +778,28 @@ closeDeclaration current closed =
             closed
 
 
+-- The word after `type`, or after `type alias`.
 declarationName : String -> String
 declarationName line =
-    String.words line
-        |> List.filter (\word -> word /= "type" && word /= "alias")
+    afterType (String.words line)
+        |> List.filter (\word -> word /= "alias")
         |> List.head
         |> Maybe.withDefault ""
+
+
+-- The words after the first `type`.
+afterType : List String -> List String
+afterType words =
+    case words of
+        word :: rest ->
+            if word == "type" then
+                rest
+
+            else
+                afterType rest
+
+        [] ->
+            []
 
 
 -- The words of one declaration line, with type punctuation read as space.
