@@ -17,8 +17,9 @@
 //! of its own and the option word whole besides; a program name passes, as the
 //! setting's tool composes it: less only the one runner prefix (`!`,
 //! `python:`) that tool consumes (anywhere else `!/x` is a relative path), and
-//! with the `git-` a Git alias or credential helper names a program by; any
-//! other word, a `--` or `-` ending a
+//! with the `git-` a Git alias, credential helper, or remote helper names a
+//! program by, and whole, `~` and spaces included, where the tool runs it
+//! without a shell; any other word, a `--` or `-` ending a
 //! program's options, a command substitution, an expansion, a glob or brace
 //! expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
@@ -1102,20 +1103,31 @@ enum Runner {
     GitHelper,
     /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
     Python,
+    /// The value is run without a shell (Git's `gpg.program`, `core.askPass`,
+    /// `core.gitProxy`), or split at spaces only (`gpg.ssh.defaultKeyCommand`):
+    /// a `~`, a quote, or a space is part of the program path.
+    Exec,
+    /// A Git `remote.<name>.vcs`: run without a shell as the program `git-remote-<value>`.
+    GitRemote,
 }
 
 /// The command line a tool runs for a value, as [`Runner::consume`] composes it.
-struct Line<'v> {
-    /// The text split into words.
-    text: Cow<'v, str>,
-    /// The program prefix the tool adds to the first word not shaped like an option.
-    command_prefix: Option<&'static str>,
+enum Line<'v> {
+    /// Text the tool splits into shell words.
+    Shell {
+        /// The text split into words.
+        text: Cow<'v, str>,
+        /// The program prefix the tool adds to the first word not shaped like an option.
+        command_prefix: Option<&'static str>,
+    },
+    /// Text the tool runs as one program, neither split nor expanded.
+    Exec(Cow<'v, str>),
 }
 
 impl<'v> Line<'v> {
     /// A command line run as written.
     const fn of(text: Cow<'v, str>) -> Self {
-        Self {
+        Self::Shell {
             text,
             command_prefix: None,
         }
@@ -1125,25 +1137,27 @@ impl<'v> Line<'v> {
 impl Runner {
     /// The command line the tool runs for `value`.
     fn consume(self, value: &str) -> Line<'_> {
-        let prefix = match self {
-            Self::None => return Line::of(Cow::Borrowed(value)),
-            Self::GitHelper if is_git_absolute(value) => return Line::of(Cow::Borrowed(value)),
-            Self::Bang | Self::GitAlias | Self::GitHelper => "!",
-            Self::Python => "python:",
+        let strip = |prefix: &str| {
+            value
+                .strip_prefix(prefix)
+                .map(|rest| Line::of(Cow::Borrowed(rest)))
         };
-        if let Some(rest) = value.strip_prefix(prefix) {
-            return Line::of(Cow::Borrowed(rest));
-        }
         match self {
-            Self::GitHelper => Line::of(Cow::Owned(format!("git-credential-{value}"))),
+            Self::None => Line::of(Cow::Borrowed(value)),
+            Self::Bang => strip("!").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
+            Self::Python => strip("python:").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
+            Self::GitHelper if is_git_absolute(value) => Line::of(Cow::Borrowed(value)),
+            Self::GitHelper => strip("!")
+                .unwrap_or_else(|| Line::of(Cow::Owned(format!("git-credential-{value}")))),
             // Git splits an alias into words and reads its own options
             // (`-p`, `-c <name>`) off the front before the word naming a
             // command, so the prefix lands on a word, not on the value's text.
-            Self::GitAlias => Line {
+            Self::GitAlias => strip("!").unwrap_or(Line::Shell {
                 text: Cow::Borrowed(value),
                 command_prefix: Some("git-"),
-            },
-            Self::None | Self::Bang | Self::Python => Line::of(Cow::Borrowed(value)),
+            }),
+            Self::Exec => Line::Exec(Cow::Borrowed(value)),
+            Self::GitRemote => Line::Exec(Cow::Owned(format!("git-remote-{value}"))),
         }
     }
 }
@@ -2704,13 +2718,24 @@ impl Scan<'_> {
             Syntax::Git | Syntax::Hg | Syntax::Darcs | Syntax::GitRemote => Tilde::Shell,
             Syntax::Toml => Tilde::Verbatim,
         };
-        let line = runner.consume(value);
         let mut words = Words::default();
-        words
-            .push_split(&line.text, Position::Program, tilde)
-            .map_err(unproven)?;
-        if let Some(prefix) = line.command_prefix {
-            words.prefix_command(prefix);
+        match runner.consume(value) {
+            Line::Shell {
+                text,
+                command_prefix,
+            } => {
+                words
+                    .push_split(&text, Position::Program, tilde)
+                    .map_err(unproven)?;
+                if let Some(prefix) = command_prefix {
+                    words.prefix_command(prefix);
+                }
+            }
+            // The whole text is the program, a leading `~` the first
+            // character of a relative path; it is judged both ways.
+            Line::Exec(text) => words
+                .push_forms(text.into_owned(), Position::Program)
+                .map_err(unproven)?,
         }
         self.judge_queue(ctx, &mut words)
     }
@@ -3423,6 +3448,10 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         // an alias Git does not read runs nothing, one it reads runs so.
         ("alias", _, _) => Runner::GitAlias,
         ("credential", _, "helper") => Runner::GitHelper,
+        ("gpg", _, "program" | "defaultkeycommand") | ("core", false, "askpass" | "gitproxy") => {
+            Runner::Exec
+        }
+        ("remote", true, "vcs") => Runner::GitRemote,
         _ => Runner::None,
     };
     Route::Judge(Role::Words(runner))
@@ -5548,7 +5577,7 @@ mod tests {
             format!("[alias]\n\tx = !!{out}/x\n"),
             format!("[alias]\n\tx = \"'!'{out}/x\"\n"),
             format!("[credential]\n\thelper = !!{out}/helper\n"),
-            format!("[core]\n\tpager = less;!{out}/x\n"),
+            format!("[core]\n\tpager = \"less;!{out}/x\"\n"),
             format!("[alias]\n\tx = !sh -c '!{out}/x'\n"),
             format!("[alias]\n\tx = !sh -c '!{out}/x {out}/y'\n"),
         ] {
@@ -5622,6 +5651,41 @@ mod tests {
             format!("[credential]\n\thelper = {out}/helper\n"),
             "[credential]\n\thelper = !~/x\n".to_owned(),
             "[core]\n\tpager = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn git_program_run_without_a_shell_judged_whole() {
+        let f = fixture("gitexec");
+        let out = f.out.display();
+        for text in [
+            "[gpg]\n\tprogram = ~/x\n".to_owned(),
+            format!("[gpg]\n\tprogram = \"a {out}/x\"\n"),
+            "[gpg \"ssh\"]\n\tprogram = ~/x\n".to_owned(),
+            "[gpg \"ssh\"]\n\tdefaultKeyCommand = ~/x\n".to_owned(),
+            "[core]\n\taskPass = ~/x\n".to_owned(),
+            format!("[core]\n\taskPass = \"a {out}/x\"\n"),
+            "[core]\n\tgitProxy = ~/x\n".to_owned(),
+            "[remote \"o\"]\n\tvcs = ~/x\n".to_owned(),
+            format!("[remote \"o\"]\n\tvcs = {out}/x\n"),
+            format!("[remote \"o\"]\n\tvcs = \"a {out}/x\"\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[gpg]\n\tprogram = gpg2\n".to_owned(),
+            format!("[gpg]\n\tprogram = {out}/gpg\n"),
+            format!("[core]\n\taskPass = {out}/askpass\n"),
+            "[remote \"o\"]\n\tvcs = hg\n".to_owned(),
+            "[core]\n\tsshCommand = ~/x\n".to_owned(),
         ] {
             git_config(&f, &text);
             assert_eq!(scan_git(&f), Ok(()), "{text:?}");
