@@ -29,7 +29,7 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -374,6 +374,113 @@ probeRefusesIndexWithoutFiles =
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 
 
+-- An index without the `open_units` view, or without the `reviewed_stamp`
+-- table, stops startup naming `IPE_INDEX_DB`. Red if the probe stops
+-- selecting either.
+probeRefusesIndexWithoutView : Task.Task Error Bool
+probeRefusesIndexWithoutView =
+    do
+        noView <- probeAfter "ipe-index-probe-view" "DROP VIEW open_units"
+        noStamp <- probeAfter "ipe-index-probe-stamp" "DROP TABLE reviewed_stamp"
+        Task.succeed (noView && noStamp)
+
+
+-- The probe of a seeded index after `sql` ran on it: True when it refuses,
+-- naming the variable and the file.
+probeAfter : String -> String -> Task.Task Error Bool
+probeAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb sql []
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
+
+
+-- A unit with no change_queue row for its current body is still open: it
+-- is listed and counted, its change `Unrecorded`. Membership is the current
+-- pair against the decided set, never the event log. Red while the page
+-- reads `change_queue` as its membership.
+unrecordedUnitListed : Task.Task Error Bool
+unrecordedUnitListed =
+    do
+        at <- freshScratch "ipe-index-unrecorded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "DELETE FROM change_queue WHERE uid = ?" [ SqlString "u-a" ]
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (r.total
+                == 2
+                && List.map (\e -> e.uid) r.units
+                == [ "u-a", "u-b" ]
+                && List.all (\e -> e.uid /= "u-a" || isUnrecorded e.change) r.units
+                && List.all (\e -> e.uid /= "u-b" || modifiedFrom e.change == Just "oldB") r.units
+            )
+
+
+-- A `modified` row that does not say which hash it replaced fails the page
+-- read rather than show a change with no old side. Red if the decoder fills
+-- in a missing `old_hash`.
+changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
+changeDecodeRefusesModifiedWithoutOld =
+    pageReadFailsAfter "ipe-index-modified-no-old" "UPDATE change_queue SET old_hash = NULL WHERE uid = 'u-b'"
+
+
+-- An index whose view reports a change kind this reviewer does not know, or
+-- an old hash with no change, fails the page read rather than show the unit
+-- as some other change. The view is replaced, as a foreign or tampered index
+-- could, since the shipped view lists only `new` and `modified`. Red if the
+-- decoder has a catch-all arm.
+changeDecodeRefusesUnknown : Task.Task Error Bool
+changeDecodeRefusesUnknown =
+    do
+        unknown <- pageReadFailsAfter "ipe-index-change-unknown" (foreignView "'renamed'" "NULL")
+        orphanOld <- pageReadFailsAfter "ipe-index-change-orphan-old" (foreignView "NULL" "'h-old'")
+        Task.succeed (unknown && orphanOld)
+
+
+-- A replacement `open_units` view listing every unit with a fixed change and
+-- old hash.
+foreignView : String -> String -> String
+foreignView change oldHash =
+    String.concat
+        [ "DROP VIEW open_units; CREATE VIEW open_units AS SELECT u.uid, u.path, u.kind, u.name, u.qualified, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang, "
+        , change
+        , " AS change, "
+        , oldHash
+        , " AS old_hash, 0 AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path"
+        ]
+
+
+-- True when the first page read fails on a seeded index after `sql` ran.
+pageReadFailsAfter : String -> String -> Task.Task Error Bool
+pageReadFailsAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        failed <- Index.loadPendingPage conn Index.Start
+            |> Task.map (\_ -> False)
+            |> Task.onError (\_ -> Task.succeed True)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed failed
+
+
+-- Each `;`-separated statement of `sql` run in order on the index.
+execIndexScript : String -> String -> Task.Task Error ()
+execIndexScript indexDb sql =
+    String.split "; " sql
+        |> List.map (\stmt -> execIndex indexDb stmt [])
+        |> Task.sequence
+        |> Task.map (\_ -> ())
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -388,4 +495,8 @@ checks =
         , check "a queue page reads no source file; only a unit's view load does" pageReadsNoSource
         , check "a unit's language comes from its file's indexed language" langFromFilesTable
         , check "an index without a files table fails the probe" probeRefusesIndexWithoutFiles
+        , check "an index without the open_units view or the stamp fails the probe" probeRefusesIndexWithoutView
+        , check "a unit with no change row is still listed" unrecordedUnitListed
+        , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
+        , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
         ]

@@ -22,7 +22,7 @@ import Ipe.Ui.Input as Input
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
@@ -173,7 +173,7 @@ type Msg
     | RefuseDraft String
     | RefuseCancel
     | RefuseSubmit String
-    | DecisionSaved String (Result Error ( Index.Attested, Int ))
+    | DecisionSaved String (Result Error ( Index.Attested, Index.Written ))
     | Navigated Page
     | ShowQueue
     | ShowHistory
@@ -219,12 +219,12 @@ update settings msg model =
 
         DecisionSaved uid result ->
             case result of
-                Ok ( attested, _ ) ->
+                Ok ( attested, written ) ->
                     let
                         load =
                             Queue.nextTicket model.queueLoad
                     in
-                    ( { model | decisionError = Nothing, queueLoad = load }, drainAndReload settings model attested load )
+                    ( { model | decisionError = Nothing, queueLoad = load }, drainAndReload settings model attested written load )
 
                 Err e ->
                     ( { model | decisionError = Just e }, Cmd.none )
@@ -404,7 +404,7 @@ saveDecision settings model uid decision =
     Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid)
 
 
-decisionTask : Settings.AppSettings -> Model -> String -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decisionTask : Settings.AppSettings -> Model -> String -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decisionTask settings model uid decision =
     case List.find (\q -> q.unit.uid == uid) (queueList model) of
         Just _ ->
@@ -419,19 +419,20 @@ decisionTask settings model uid decision =
             Task.fail (Error.conflict "unit is no longer in the queue")
 
 
-decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideOn settings shown decision =
     LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.index db shown decision)
 
 
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the
--- consumed queue entry leaves the index queue under the attested hash the
--- decision was written with. A failure anywhere fails closed with the queue
--- unchanged — the unit stays visible with its badge and the next click
--- retries.
-drainAndReload : Settings.AppSettings -> Model -> Index.Attested -> Queue.LoadTicket -> Cmd Msg
-drainAndReload settings model attested load =
-    Cmd.perform (Queue.drainThenLoad settings attested model.queueCursor) (PendingLoaded load)
+-- pair enters the index's `reviewed` copy under the attested hash the
+-- decision was written with, and the copy's stamp follows the review log's
+-- head as the write moved it. A failure anywhere fails closed with the queue
+-- unchanged — the unit stays visible with its badge and the next load
+-- rebuilds the copy.
+drainAndReload : Settings.AppSettings -> Model -> Index.Attested -> Index.Written -> Queue.LoadTicket -> Cmd Msg
+drainAndReload settings model attested written load =
+    Cmd.perform (Queue.drainThenLoad settings attested written model.queueCursor) (PendingLoaded load)
 
 
 header : Model -> Ui.Element Msg
@@ -670,7 +671,7 @@ railItem model i q =
             [ Ui.el
                 [ Font.size 12, Font.bold, Font.color (Ui.rgb 220 220 230) ]
                 (safeText q.unit.qualified)
-            , changeBadge q.queued.change
+            , changeBadge q.change
             ]
         }
 
@@ -934,7 +935,7 @@ unitCard model selected q =
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
             [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
-            , changeBadge q.queued.change
+            , changeBadge q.change
             , changedChip q
             , chip unit.facing
             , chip unit.kind
@@ -995,18 +996,21 @@ maybePurpose unit =
             SafeText.literal ""
 
 
-changeBadge : String -> Ui.Element Msg
+changeBadge : Index.Change -> Ui.Element Msg
 changeBadge change =
     case change of
-        "new" ->
+        New ->
             chipColored (SafeText.literal "NEW") (Ui.rgb 35 120 55)
 
-        _ ->
+        Modified _ ->
             chipColored (SafeText.literal "MODIFIED") (Ui.rgb 145 95 20)
+
+        Unrecorded ->
+            chipColored (SafeText.literal "UNRECORDED") (Ui.rgb 90 90 110)
 
 
 -- A unit that was already reviewed on an older hash gets an amber
--- "changed" chip at the queue head; unchanged re-queues are hidden entirely.
+-- "changed" chip at the queue head.
 changedChip : Queue.QueuedUnit -> Ui.Element Msg
 changedChip q =
     case q.changed of
@@ -1290,8 +1294,8 @@ requireEnv key fix =
 -- database created and migrated, and the root, which the parse already
 -- requires to be an existing directory. A relative value resolves against
 -- the working directory. Then the index's `reviewed` copy is rebuilt from
--- the review database once, so progress starts exact even after an edit the
--- per-load count check cannot see. Any failure stops startup with a message
+-- the review database once and stamped with the review log's head, so the
+-- first load already reads a current copy. Any failure stops startup with a message
 -- naming the variable and one fix. Returns the settings, the one value the
 -- app serves from.
 requireSettings : String -> String -> String -> Task Error Settings.AppSettings

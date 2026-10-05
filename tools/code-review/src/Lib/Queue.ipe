@@ -20,12 +20,13 @@ import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
 
 
--- A pending unit plus its resurfacing state. `changed` is Just the previous
--- review when this uid was already decided on an OLDER body hash: the author
--- edited the code after the review, so the unit must be reviewed again.
+-- An open unit plus its resurfacing state. `change` is what the index
+-- recorded about its current body. `changed` is Just the previous review
+-- when this uid was already decided on an OLDER body hash: the author edited
+-- the code after the review, so the unit must be reviewed again.
 type alias QueuedUnit =
     { unit : Index.Unit
-    , queued : Index.QueuedChange
+    , change : Index.Change
     , changed : Maybe LibDb.ReviewRow
     }
 
@@ -44,42 +45,16 @@ type alias QueuePage =
 
 
 -- Review progress over the index as it stands, never from a session:
--- `reviewed` counts the units whose current body hash has a decision, `total`
--- the units reviewed or still queued. Both are one aggregate over the index's
--- `reviewed` table, the copy of the review database's decided pairs that each
--- drain extends; every load first checks the copy's row count against the
--- review database and rebuilds the copy on a mismatch. Deciding a unit moves
--- it from queued to reviewed, so `total` holds while the queue drains, and a
--- reload or a second tab reads the same numbers.
+-- `total` counts the index's units and `reviewed` those not open, so a unit
+-- is reviewed exactly when its current (uid, body_hash) pair has a decision.
+-- Both come from the same read as the page's rows, after the `reviewed`
+-- copy is proved current against the review log's head. Deciding a unit
+-- moves it from open to reviewed, so `total` holds while the queue drains,
+-- and a reload or a second tab reads the same numbers.
 type alias Progress =
     { reviewed : Int
     , total : Int
     }
-
-
--- The progress of the index, read on the index connection `conn`, with the
--- `reviewed` copy checked fresh first: when its row count differs from the
--- decision count of the review database `db` (a decision whose drain failed,
--- a replaced index file, a deleted review row), the copy is rebuilt once and
--- the row read again. It never loops.
-currentProgress : IndexSettings -> Db.Db -> Db.Db -> Task.Task Error Progress
-currentProgress settings conn db =
-    do
-        first <- Index.loadProgress conn
-        decisions <- LibDb.countDecisions db
-        if first.mirrored == decisions then
-            Task.succeed (progressFrom first)
-
-        else
-            do
-                resyncReviewed settings db
-                second <- Index.loadProgress conn
-                Task.succeed (progressFrom second)
-
-
-progressFrom : Index.ProgressRow -> Progress
-progressFrom row =
-    { reviewed = row.reviewed, total = row.total }
 
 
 -- How far one rebuild of the `reviewed` copy may read: `pageCeiling` pages
@@ -105,8 +80,11 @@ resyncBound =
 
 
 -- The `reviewed` copy rebuilt from the review database: one index
--- transaction empties it and drains every decided pair, so a pair's
--- undrained queue row leaves too. Returns the count of pairs copied.
+-- transaction empties it, drains every decided pair, so a pair's undrained
+-- queue row leaves too, and stamps the copy with the review-log head read
+-- before the refill. A decision recorded during the refill moves the head
+-- past that stamp, so the next load rebuilds again rather than trust a copy
+-- that may lack it. Returns the count of pairs copied.
 resyncReviewed : IndexSettings -> Db.Db -> Task.Task Error Int
 resyncReviewed settings db =
     resyncReviewedWithin settings resyncBound db
@@ -114,15 +92,18 @@ resyncReviewed settings db =
 
 -- `resyncReviewed` reading at most `bound.pageCeiling` pages of
 -- `bound.pageSize` decided pairs. A review database holding more refuses
--- the rebuild and rolls it back, leaving the copy as it was. A bound below
--- one page of one pair is refused before the copy is touched.
+-- the rebuild and rolls it back, leaving the copy and its stamp as they
+-- were. A bound below one page of one pair is refused before the copy is
+-- touched.
 resyncReviewedWithin : IndexSettings -> ResyncBound -> Db.Db -> Task.Task Error Int
 resyncReviewedWithin settings bound db =
     if bound.pageSize < 1 || bound.pageCeiling < 1 then
         Task.fail (Error.invalidInput "a review progress rebuild needs a page size and a page ceiling of at least 1")
 
     else
-        Index.rebuildReviewed settings (\conn -> refillPages bound db conn)
+        do
+            head <- LibDb.currentHead db
+            Index.rebuildReviewed settings head (\conn -> refillPages bound db conn)
 
 
 -- The state one `refillPages` step carries: how many pages have been read,
@@ -331,12 +312,12 @@ historyRow conn row =
 -- since only a verified view holds a `ShownSource`, and only after
 -- `Index.reverify` re-proves it, so the hash written is the hash of the
 -- bytes the reviewer saw.
-decide : IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decide : IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decide settings db shown decision =
     do
         attested <- Index.reverify settings shown
-        n <- LibDb.insertDecision db attested decision
-        Task.succeed ( attested, n )
+        written <- LibDb.insertDecision db attested decision
+        Task.succeed ( attested, written )
 
 
 -- The selected queue card's source: nothing selected, one read in flight
@@ -624,8 +605,8 @@ sourceStatusText view =
 
 
 -- One unit's view by uid through `Index.loadView`, the one source read the
--- unit page and the selected queue card share (decided units have no
--- change_queue row, so it queries units directly), on one connection from
+-- unit page and the selected queue card share (a decided unit is not open,
+-- so it queries units directly), on one connection from
 -- `settings`. Nothing when no unit has this uid.
 loadUnitView : IndexSettings -> String -> Task.Task Error (Maybe Index.UnitView)
 loadUnitView settings uid =
@@ -666,7 +647,7 @@ queueStatusText state =
                 Nothing
 
 
--- The queue header: database name, size, and how many of the queued units
+-- The queue header: database name, size, and how many of the open units
 -- this page shows.
 pageHeaderText : QueuePage -> String
 pageHeaderText page =
@@ -681,49 +662,89 @@ pageHeaderText page =
         ]
 
 
--- One page of the queue at `cursor`, as the review app sees it:
+-- One page of the queue at `cursor`, as the review app sees it: the open
+-- units of the index (its current units whose (uid, body_hash) pair has no
+-- decision), with
 --
---   * a unit whose exact (uid, body_hash) pair was already decided is
---     hidden — the first review of a pair is final and the drain loop
---     already cleared it; a re-queued identical unit is a no-op;
 --   * a unit decided on an older hash resurfaced at the head, flagged with
 --     its previous review;
---   * never-seen units keep the index's enqueue order after resurfaced ones.
+--   * never-seen units keeping the index's enqueue order after resurfaced
+--     ones.
 --
--- Only one page of the queue is classified per load, so the resurfaced-first
--- order holds within the page.
+-- Only one page is classified per load, so the resurfaced-first order holds
+-- within the page.
 --
--- The page also carries the whole-queue count, the database size and the
--- review progress. Progress is read first, so a rebuild of the `reviewed`
--- copy that drains an undrained decided pair is already reflected in the
--- page's rows and count. The settings are the value resolved at startup and
--- every index read runs on the one read connection opened from them.
+-- The page rows, the open count, the progress and the database size come
+-- from one index read, trusted only when the `reviewed` copy's stamp equals
+-- the review log's head: any other stamp (a failed drain, a replaced index
+-- or review file, a decision another process recorded) rebuilds the copy
+-- and reads once more, and a stamp that still differs fails the load rather
+-- than show a stale queue. It never loops. The settings are the value
+-- resolved at startup and every index read runs on the one read connection
+-- opened from them.
 loadPage : AppSettings -> Index.Cursor -> Task.Task Error QueuePage
 loadPage settings cursor =
     do
         conn <- Index.readConnection settings.index
         db <- LibDb.openAt settings.review
-        progress <- currentProgress settings.index conn db
-        rows <- Index.loadPendingPage conn cursor
-        total <- Index.countPending conn
-        bytes <- Index.dbBytes conn
-        units <- classify db rows
+        snap <- freshSnapshot settings.index conn db cursor
+        units <- classify db snap.rows
         Task.succeed
             { units = units
-            , total = total
+            , total = snap.open
             , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
-            , dbBytes = bytes
-            , next = nextCursor rows
-            , progress = progress
+            , dbBytes = snap.bytes
+            , next = nextCursor snap.rows
+            , progress = { reviewed = snap.units - snap.open, total = snap.units }
             }
 
 
--- A decided unit drained from the index queue, then the queue page at
--- `cursor` reloaded. The drain writes the index alone: the review database
--- already holds the decision, so nothing is written to it here.
-drainThenLoad : AppSettings -> Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
-drainThenLoad settings attested cursor =
-    Index.drainUnit settings.index attested |> Task.andThen (\_ -> loadPage settings cursor)
+-- The index read at `cursor` under a current stamp: read as is, or once
+-- more after one rebuild of the copy; a stamp still behind after the
+-- rebuild is a failed load.
+freshSnapshot : IndexSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error Index.Snapshot
+freshSnapshot settings conn db cursor =
+    do
+        first <- currentSnapshot conn db cursor
+        case first of
+            Just fresh ->
+                Task.succeed fresh
+
+            Nothing ->
+                do
+                    resyncReviewed settings db
+                    second <- currentSnapshot conn db cursor
+                    case second of
+                        Just fresh ->
+                            Task.succeed fresh
+
+                        Nothing ->
+                            Task.fail (Error.conflict "the review progress copy is still behind the review database after a rebuild; reload")
+
+
+-- The index read at `cursor`, Just when the copy's stamp is the review log's
+-- current head. The head is read first: a decision recorded after it moves
+-- the head on, so a match proves the copy holds every decision up to a head
+-- the log really had.
+currentSnapshot : Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error (Maybe Index.Snapshot)
+currentSnapshot conn db cursor =
+    do
+        head <- LibDb.currentHead db
+        snap <- Index.readSnapshot conn cursor
+        if snap.stamp == Just (Index.chainHeadText head) then
+            Task.succeed (Just snap)
+
+        else
+            Task.succeed Nothing
+
+
+-- A decided unit drained from the index, then the queue page at `cursor`
+-- reloaded. The drain writes the index alone: the review database already
+-- holds the decision, and `written` says how it moved the log's head, so
+-- the drain moves the copy's stamp the same way.
+drainThenLoad : AppSettings -> Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error QueuePage
+drainThenLoad settings attested written cursor =
+    Index.drainUnit settings.index attested written |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.
@@ -747,41 +768,43 @@ classify db rows =
         |> Task.map prioritize
 
 
-classifyUnit : Db.Db -> Index.PendingRow -> Task.Task Error (Maybe QueuedUnit)
+-- An open unit with the latest review of its uid when that review is of an
+-- older body: a review of the current body (one recorded after the page was
+-- read) is not a previous review.
+classifyUnit : Db.Db -> Index.PendingRow -> Task.Task Error QueuedUnit
 classifyUnit db row =
     let
         unit =
             row.unit
+
+        current =
+            Index.storedHash unit.attested
     in
     do
-        decided <- LibDb.findDecision db unit.uid (Index.storedHash unit.attested)
-        case decided of
-            Just _ ->
-                Task.succeed Nothing
-
-            Nothing ->
-                do
-                    old <- LibDb.findLatestForUid db unit.uid
-                    Task.succeed (Just { unit = unit, queued = row.queued, changed = old })
+        latest <- LibDb.findLatestForUid db unit.uid
+        Task.succeed
+            { unit = unit
+            , change = row.change
+            , changed = Maybe.andThen (previousReview current) latest
+            }
 
 
-prioritize : List (Maybe QueuedUnit) -> List QueuedUnit
+previousReview : String -> LibDb.ReviewRow -> Maybe LibDb.ReviewRow
+previousReview current row =
+    if row.bodyHash == current then
+        Nothing
+
+    else
+        Just row
+
+
+prioritize : List QueuedUnit -> List QueuedUnit
 prioritize classified =
     let
         ( changed, fresh ) =
-            partition (List.concatMap collect classified)
+            partition classified
     in
     changed ++ fresh
-
-
-collect : Maybe QueuedUnit -> List QueuedUnit
-collect mb =
-    case mb of
-        Just q ->
-            [ q ]
-
-        Nothing ->
-            []
 
 
 -- Stable partition: resurfaced (changed) units first, fresh units after,
