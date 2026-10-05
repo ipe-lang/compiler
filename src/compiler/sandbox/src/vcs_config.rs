@@ -4091,6 +4091,13 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+        // The unscoped row judges `smtpServer` as an executed path, where `~` is not the home.
+        git_config(&f, "[sendemail \"work\"]\n\tsmtpServer = ~/evil\n");
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
         for text in [
             "[credential \"https://h\"]\n\tusername = x\n",
             "[sendemail \"work\"]\n\tsmtpServer = /usr/sbin/sendmail\n",
