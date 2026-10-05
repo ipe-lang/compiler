@@ -3,6 +3,8 @@ mod diff;
 #[cfg(test)]
 mod display_hazard_vectors;
 mod extract;
+#[cfg(test)]
+mod extractor_digest;
 mod model;
 mod pipeline;
 mod query;
@@ -292,7 +294,8 @@ fn rebuild(
         let shas = ingest(store)?;
         let after = store.snapshot_all()?;
         reconcile_queue(store, &before, &after, &shas, diff::now_millis())?;
-        // Resolution pass over the merged store (tagged paths). Best-effort across tags.
+        // Resolution passes over the merged store (tagged paths). Best-effort across tags.
+        store.resolve_calls()?;
         query::resolve_edges(store, ".")
     })();
     match built {
@@ -364,6 +367,8 @@ fn head_sha_or_empty(root: &str) -> String {
 enum FullReason {
     /// The rows are of another schema version, so their hashes are of another format.
     SchemaVersion,
+    /// The index was written by another ipe-index build, whose units may differ.
+    Extractor,
     /// The index was built under another root set, so some path has another owner.
     RepoSet,
     /// Some indexed path carries no [`store::FileStamp`] to judge it by.
@@ -401,10 +406,13 @@ enum UpdatePlan<'a> {
 }
 
 /// The reason an index cannot be judged file by file before its stamps are
-/// read, or `None` when its format and root set are this run's.
+/// read, or `None` when its format, extractor and root set are this run's.
 fn full_reason(store: &store::Store, repos: &repo_set::RepoSet) -> Result<Option<FullReason>> {
     if !store.schema_is_current()? {
         return Ok(Some(FullReason::SchemaVersion));
+    }
+    if !store.extractor_is_current()? {
+        return Ok(Some(FullReason::Extractor));
     }
     if store.recorded_repos()? != repos.recorded() {
         return Ok(Some(FullReason::RepoSet));
@@ -519,6 +527,7 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
                 store.set_meta(&repo.root.tag().last_sha_key(), &repo.sha)?;
             }
         }
+        store.resolve_calls()?;
         query::resolve_edges(&store, ".")?;
         Ok(Ok(changed))
     })();
@@ -554,6 +563,7 @@ impl FullReason {
     const fn why(self) -> &'static str {
         match self {
             Self::SchemaVersion => "the index is of another schema version",
+            Self::Extractor => "the index was written by another ipe-index build",
             Self::RepoSet => "the index was built under another root set",
             Self::NoStamps => "an indexed path has no content stamp",
         }
@@ -632,6 +642,31 @@ mod tests {
             full_reason(&s, &set).unwrap(),
             Some(FullReason::SchemaVersion)
         );
+    }
+
+    // Rows another extractor wrote are kept for every unchanged file by an
+    // incremental update, so a recorded extractor other than this build's
+    // rebuilds.
+    #[test]
+    fn update_after_an_extractor_change_takes_full_index() {
+        let s = store::Store::open(":memory:").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
+        s.set_meta("extractor", "blake3:another-build").unwrap();
+        assert_eq!(full_reason(&s, &set).unwrap(), Some(FullReason::Extractor));
+    }
+
+    // An index that records no extractor names no build that wrote it, so it
+    // rebuilds too.
+    #[test]
+    fn an_index_without_an_extractor_stamp_takes_full_index() {
+        let s = store::Store::open(":memory:").unwrap();
+        let set = repos();
+        s.record_repos(&set.recorded()).unwrap();
+        s.conn
+            .execute("DELETE FROM meta WHERE k='extractor'", [])
+            .unwrap();
+        assert_eq!(full_reason(&s, &set).unwrap(), Some(FullReason::Extractor));
     }
 
     fn refusal(spec: &str) -> String {
@@ -980,7 +1015,8 @@ mod tests {
 
     /// The review-visible rows of the index at `db`: every open unit (queue
     /// columns aside, which differ between a first index and an update by
-    /// design), every file with its stamp, and every edge with its resolution.
+    /// design), every file with its stamp, every edge with its resolution,
+    /// every call site, and every callgraph edge.
     #[cfg(unix)]
     fn index_dump(db: &str) -> Vec<String> {
         let s = store::Store::open(db).unwrap();
@@ -994,6 +1030,9 @@ mod tests {
             "SELECT 'file|' || path || '|' || COALESCE(sha, '') FROM files ORDER BY path",
             "SELECT 'edge|' || src || '|' || dst || '|' || kind || '|' \
              || COALESCE(resolved, '') FROM edges ORDER BY 1",
+            "SELECT 'site|' || caller_uid || '|' || path || '|' || exact || '|' \
+             || COALESCE(local, '') FROM call_sites ORDER BY 1",
+            "SELECT 'call|' || caller_uid || '|' || callee_uid FROM callgraph ORDER BY 1",
         ] {
             let mut st = s.conn.prepare(sql).unwrap();
             let got: Vec<String> = st
@@ -1190,7 +1229,7 @@ mod tests {
     }
 
     // A v8 index stores `""` where a stamp belongs: `update` cannot judge its
-    // files, so it rebuilds, and the store reads version 9 only once the full
+    // files, so it rebuilds, and the store reads version 10 only once the full
     // run has stamped every file. The same rows under the current version
     // still rebuild, for want of stamps.
     #[cfg(unix)]
@@ -1232,9 +1271,98 @@ mod tests {
         fx.write("a.rs", "fn a() {}\n\nfn b() {}\n");
         update_then_compare(&fx, &specs, &db);
         let s = store::Store::open(&db).unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("9"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("10"));
         assert!(s.stamps().unwrap().is_some_and(|st| st.len() == 1));
         assert_eq!(plan_of(&s), None);
+    }
+
+    /// Every `callgraph` edge of the index at `db` as `(caller, callee)`
+    /// qualified names, sorted, and the count of edges naming a uid no unit has.
+    #[cfg(unix)]
+    fn call_edges(db: &str) -> (Vec<(String, String)>, i64) {
+        let s = store::Store::open(db).unwrap();
+        let mut st = s
+            .conn
+            .prepare(
+                "SELECT cu.qualified, ce.qualified FROM callgraph cg \
+                 JOIN units cu ON cu.uid = cg.caller_uid \
+                 JOIN units ce ON ce.uid = cg.callee_uid ORDER BY 1, 2",
+            )
+            .unwrap();
+        let edges = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let dangling = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM callgraph \
+                 WHERE caller_uid NOT IN (SELECT uid FROM units) \
+                 OR callee_uid NOT IN (SELECT uid FROM units)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (edges, dangling)
+    }
+
+    /// The one call `z` makes into `b`, as [`call_edges`] lists it.
+    #[cfg(unix)]
+    fn z_calls_b() -> (Vec<(String, String)>, i64) {
+        (vec![("crate::z".to_string(), "crate::b".to_string())], 0)
+    }
+
+    // The caller sorts after its callee, so a fresh `index` holds the call.
+    // Re-extracting only the callee's file keeps the unchanged caller's call.
+    #[cfg(unix)]
+    #[test]
+    fn update_keeps_calls_into_a_reextracted_file() {
+        let fx = walk::fixture::Fixture::new("update-calls-reextract");
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        fx.write("src/z.rs", "pub fn z() { b(); }\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(call_edges(&db), z_calls_b());
+        fx.write("src/b.rs", "pub fn b() {}\n\npub fn c() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(call_edges(&db), z_calls_b());
+    }
+
+    // A callee file added under an unchanged caller gains the caller's call.
+    #[cfg(unix)]
+    #[test]
+    fn update_adds_calls_into_an_added_file() {
+        let fx = walk::fixture::Fixture::new("update-calls-add");
+        fx.write("src/z.rs", "pub fn z() { b(); }\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(call_edges(&db), (Vec::new(), 0));
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(call_edges(&db), z_calls_b());
+    }
+
+    // A deleted callee file takes the calls into it along, and leaves no
+    // edge naming a unit the index no longer holds.
+    #[cfg(unix)]
+    #[test]
+    fn update_drops_calls_into_a_deleted_file() {
+        let fx = walk::fixture::Fixture::new("update-calls-delete");
+        fx.write("src/b.rs", "pub fn b() {}\n");
+        fx.write("src/z.rs", "pub fn z() { b(); }\n");
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        assert_eq!(call_edges(&db), z_calls_b());
+        std::fs::remove_file(fx.0.join("src/b.rs")).unwrap();
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(call_edges(&db), (Vec::new(), 0));
     }
 
     // A root below the top of its work tree walks relative to itself: a file

@@ -3,7 +3,7 @@ use crate::model::{Facing, Kind, Lang, facing_of};
 use crate::static_re::StaticRegex;
 use crate::store::Store;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 /// `https?://` URL inside a doc comment → an external link row.
@@ -317,27 +317,72 @@ fn call_function_name<'s>(call: Node, src: &'s str) -> Option<&'s str> {
     src.get(f.byte_range())
 }
 
-/// The qualified names a call's callee text is looked up as, in order — the
-/// callee rule `tests/callee_vectors.json` pins and code-review's `Links`
-/// mirrors. A Rust turbofish (`foo::<T>`) is stripped. A Rust `crate::`
-/// prefix names the caller's own crate, so it is rewritten to `crate_root`. A
-/// path (`a::b`, `a.b`) is looked up exactly; a bare name exactly, then in the
-/// caller's module `base_qual`.
-fn callee_candidates(callee: &str, base_qual: &str, crate_root: Option<&str>) -> Vec<String> {
+/// The qualified names one call's callee text is looked up as, in order.
+///
+/// A path callee has one candidate and a bare callee two, so a callee with no
+/// candidate, or a third, has no representation. Only [`callee_candidates`]
+/// builds one, and never with an empty name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Callee {
+    exact: String,
+    local: Option<String>,
+}
+
+impl Callee {
+    /// The name looked up first: the callee text itself.
+    pub fn exact(&self) -> &str {
+        &self.exact
+    }
+
+    /// The name looked up when [`Callee::exact`] names no unit.
+    ///
+    /// Only a bare callee has one: the callee in the caller's module.
+    pub fn local(&self) -> Option<&str> {
+        self.local.as_deref()
+    }
+
+    /// Every candidate, in lookup order.
+    #[cfg(test)]
+    pub fn candidates(&self) -> Vec<String> {
+        std::iter::once(self.exact.clone())
+            .chain(self.local.clone())
+            .collect()
+    }
+}
+
+/// The callee a call's callee text is looked up as.
+///
+/// This is the callee rule `tests/callee_vectors.json` pins and code-review's
+/// `Links` mirrors. A Rust turbofish (`foo::<T>`) is stripped. A Rust
+/// `crate::` prefix names the caller's own crate, so it is rewritten to
+/// `crate_root`. A path (`a::b`, `a.b`) is looked up exactly; a bare name
+/// exactly, then in the caller's module `base_qual`. `None` when no name is
+/// left once the turbofish is stripped: such a callee names no unit.
+pub fn callee_candidates(
+    callee: &str,
+    base_qual: &str,
+    crate_root: Option<&str>,
+) -> Option<Callee> {
     let callee = match callee.find("::<") {
         Some(i) => callee.get(..i).unwrap_or(callee),
         None => callee,
     };
+    if callee.is_empty() {
+        return None;
+    }
     let callee = match (crate_root, callee.strip_prefix("crate::")) {
         (Some(root), Some(rest)) => format!("{root}::{rest}"),
         _ => callee.to_string(),
     };
-    if callee.contains("::") || callee.contains('.') {
-        vec![callee]
+    let local = if callee.contains("::") || callee.contains('.') {
+        None
     } else {
-        let local = format!("{base_qual}::{callee}");
-        vec![callee, local]
-    }
+        Some(format!("{base_qual}::{callee}"))
+    };
+    Some(Callee {
+        exact: callee,
+        local,
+    })
 }
 
 /// The uid of the smallest emitted unit whose item span contains `node` — the
@@ -375,8 +420,8 @@ pub fn extract(
     let base_qual = module_path(path, lang);
 
     // Two passes. Pass 1 emits units (and their doc links) and buffers the call
-    // nodes; pass 2 resolves calls against the file's COMPLETE unit set, so a
-    // call to a fn defined later in the file still finds its callee.
+    // nodes; pass 2 stores each call against the file's COMPLETE unit set, so
+    // a call inside a fn defined later in the file still finds its caller.
     let mut unit_spans: Vec<(usize, usize, String)> = Vec::new();
     let mut calls: Vec<Node> = Vec::new();
 
@@ -466,34 +511,33 @@ pub fn extract(
         }
     }
 
-    // Pass 2 — callgraph edges. Each callee resolves to the first of its
-    // `callee_candidates` some unit's qualified name matches exactly
-    // (`uid_for_qualified`; units use `::` separators for every language).
-    // A Rust `crate::` rewrite keeps a same-named symbol in another crate out
-    // of the match. The caller is the innermost emitted unit whose item span
-    // contains the call.
+    // Pass 2 — call sites. Each call with an enclosing unit (the innermost
+    // emitted unit whose item span contains it) is stored unresolved, as its
+    // caller and its `callee_candidates`, once per file. `Store::resolve_calls`
+    // alone turns call sites into `callgraph` edges, over the whole index, so
+    // an edge never depends on which file was extracted first. A Rust
+    // `crate::` rewrite keeps a same-named symbol in another crate out of the
+    // match.
     let crate_root = if lang == Lang::Rust {
         let (_tag, rel) = crate::model::split_tag(path);
         Some(super::rust_crate_root(rel))
     } else {
         None
     };
+    let mut sites: BTreeSet<(String, Callee)> = BTreeSet::new();
     for node in calls {
-        let Some(callee) = call_function_name(node, src) else {
+        let Some(caller_uid) = enclosing_unit_uid(node, &unit_spans) else {
             continue;
         };
-        let mut callee_uid = None;
-        for candidate in callee_candidates(callee, &base_qual, crate_root.as_deref()) {
-            callee_uid = store.uid_for_qualified(&candidate, path)?;
-            if callee_uid.is_some() {
-                break;
-            }
-        }
-        if let Some(callee_uid) = callee_uid
-            && let Some(caller_uid) = enclosing_unit_uid(node, &unit_spans)
-        {
-            store.put_call(&caller_uid, &callee_uid)?;
-        }
+        let Some(callee) = call_function_name(node, src)
+            .and_then(|callee| callee_candidates(callee, &base_qual, crate_root.as_deref()))
+        else {
+            continue;
+        };
+        sites.insert((caller_uid, callee));
+    }
+    for (caller_uid, callee) in &sites {
+        store.put_call_site(caller_uid, path, callee)?;
     }
     Ok(()) // `tree` dropped here, before the next file — the bounded-memory invariant
 }
@@ -510,9 +554,11 @@ mod tests {
     use crate::store::Store;
     use std::collections::HashMap;
 
+    /// Extracts one file, then resolves the calls of the whole store, as a run does.
     fn do_extract(s: &Store, path: &str, lang: Lang, src: &str) {
         let mut ord: HashMap<(String, String), i64> = HashMap::new();
         extract(s, path, lang, src, "sha", &mut ord).unwrap();
+        s.resolve_calls().unwrap();
     }
 
     const CALLEE_VECTORS: &str = include_str!("../../tests/callee_vectors.json");
@@ -521,6 +567,14 @@ mod tests {
     // the unit's stored qualified name is the one this extractor builds from
     // its path (so code-review's module, read back from that name, is this
     // `base_qual`), and the callee's candidates are `callee_candidates`'s.
+    // A callee that is only a turbofish names no unit; storing it would trip
+    // the `call_sites` CHECK and abort the whole index.
+    #[test]
+    fn a_turbofish_only_callee_names_no_unit() {
+        assert!(callee_candidates("::<u8>", "crate", Some("crate")).is_none());
+        assert!(callee_candidates("", "crate", Some("crate")).is_none());
+    }
+
     #[test]
     fn callee_vectors_follow_the_callee_rule() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(CALLEE_VECTORS).unwrap();
@@ -544,8 +598,8 @@ mod tests {
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect();
             assert_eq!(
-                callee_candidates(field("callee"), &base, Some(&root)),
-                want,
+                callee_candidates(field("callee"), &base, Some(&root)).map(|c| c.candidates()),
+                Some(want),
                 "{row}"
             );
         }
@@ -661,7 +715,7 @@ mod tests {
     #[test]
     fn rust_calls_resolve_to_units() {
         // `caller` calls `helper`; the callee unit is defined after the call
-        // (forward reference) — pass-2 resolution still finds it.
+        // (forward reference) — resolution over the whole store still finds it.
         let s = Store::open(":memory:").unwrap();
         let src = "pub fn caller() { helper(); }\npub fn helper() {}\n";
         do_extract(&s, "src/lib.rs", Lang::Rust, src);

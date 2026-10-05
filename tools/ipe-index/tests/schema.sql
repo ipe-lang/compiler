@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS callgraph (
 );
 CREATE INDEX IF NOT EXISTS i_cg_caller ON callgraph(caller_uid);
 CREATE INDEX IF NOT EXISTS i_cg_callee ON callgraph(callee_uid);
+CREATE TABLE IF NOT EXISTS call_sites (
+  caller_uid TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  exact      TEXT NOT NULL CHECK (exact <> ''),
+  local      TEXT CHECK (local IS NULL OR local <> '')
+);
+CREATE INDEX IF NOT EXISTS i_cs_path ON call_sites(path);
 CREATE TABLE IF NOT EXISTS change_queue (
   uid          TEXT PRIMARY KEY,
   change       TEXT NOT NULL CHECK (change IN ('new','modified','deleted')),
