@@ -255,6 +255,21 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_real_dev_build",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_dev_binary_with_forged_release_literal",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_dev_run_binary_with_forged_release_literal",
+        JAIL_ABSENT,
+    ),
+    (
         "src/ipe-cli/tests/webview_e2e.rs",
         "webview_counter_tier_b",
         "the native-window tier needs xvfb and the system webview",

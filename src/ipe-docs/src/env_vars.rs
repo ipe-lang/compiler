@@ -879,15 +879,6 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
-        name: "IPE_ALLOW_UNSANDBOXED",
-        default: "unset (false)",
-        purpose: "When `bwrap` confinement is unavailable, set to `1` to allow \
-                  `ipe dev run` to proceed unconfined instead of refusing. Widens the \
-                  trust boundary. Never set in CI or production.",
-        subsystem: Subsystem::Runtime,
-        class: Class::SecurityTunable,
-    },
-    EnvVar {
         name: "IPE_HOME",
         default: "unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe)",
         purpose: "Root directory for materialised runtime source, config, and cached \

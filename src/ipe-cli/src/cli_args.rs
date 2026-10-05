@@ -606,11 +606,7 @@ pub enum BuildMode {
 }
 
 /// Fully-parsed `ipe dev build` arguments.
-// Four independent one-of-two CLI switches (`fix`, `accept_risks`, `debugger`,
-// `quiet`) each maps naturally to a bool; a two-variant enum or state machine
-// would obscure their independence rather than clarify it.
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct BuildArgs {
     /// The positional entry (`None` → project-aware default).
     pub entry: Option<String>,
@@ -621,11 +617,6 @@ pub struct BuildArgs {
     pub runtime: Option<String>,
     /// `--fix` — apply machine-applicable fixes before building.
     pub fix: bool,
-    /// `--accept-risks` — take responsibility for every disclosed `.Unsafe`
-    /// escape-hatch import and proceed without the acknowledgment prompt. The
-    /// one-off, non-interactive form of consent (the durable form is
-    /// `[capabilities] accept = ["unsafe"]` in `package.ipe`).
-    pub accept_risks: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the emitted runtime loop. Absent from `ipe release` so the debugger can
     /// never ship in a production artifact. Orthogonal to the `Debug.*`
@@ -661,7 +652,6 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
     let mut runtime: Option<String> = None;
     let mut emit_ir = false;
     let mut fix = false;
-    let mut accept_risks = false;
     let mut debugger = false;
     let mut quiet = false;
     let mut static_flags = StaticFlags::default();
@@ -688,7 +678,6 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
             )?,
             "--emit-ir" => emit_ir = true,
             "--fix" => fix = true,
-            "--accept-risks" => accept_risks = true,
             "--debugger" => debugger = true,
             "-q" | "--quiet" => quiet = true,
             other => {
@@ -750,7 +739,6 @@ pub fn parse_build(rest: &[String]) -> Result<BuildArgs, CliError> {
         delivery,
         runtime,
         fix,
-        accept_risks,
         debugger,
         mode,
         format: format.unwrap_or_default(),
@@ -812,10 +800,6 @@ pub struct RunArgs {
     /// refused at parse; `Wasi` (`--target wasi`) routes `ipe dev run` to the
     /// embedded-wasmtime execution path; `None` is the ordinary native run.
     pub wasm: WasmKind,
-    /// `--accept-risks` — take responsibility for every disclosed `.Unsafe`
-    /// escape-hatch import and proceed without the acknowledgment prompt. Same
-    /// one-off consent as `ipe dev build --accept-risks`.
-    pub accept_risks: bool,
     /// `--debugger` — compile the development-only time-travelling debugger into
     /// the emitted runtime loop. Absent from `ipe release` so the debugger can
     /// never ship in a production artifact.
@@ -869,7 +853,6 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
 
     let mut out: Option<String> = None;
     let mut runtime: Option<String> = None;
-    let mut accept_risks = false;
     let mut debugger = false;
     let mut session = SessionMode::Live;
     let mut quiet = false;
@@ -895,7 +878,6 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
                 "--runtime",
                 LABEL,
             )?,
-            "--accept-risks" => accept_risks = true,
             "--debugger" => debugger = true,
             "--record" => set_session(&mut session, SessionMode::Record)?,
             "--replay" => {
@@ -948,7 +930,6 @@ pub fn parse_run(rest: &[String]) -> Result<RunArgs, CliError> {
         runtime,
         static_layer,
         wasm,
-        accept_risks,
         debugger,
         session,
         bin_args,
@@ -2408,6 +2389,28 @@ mod tests {
         );
         let a = parse_release_build(&s(&["--emit-permissions", "ios"])).expect("release build");
         assert_eq!(a.emit_permissions.as_deref(), Some("ios"));
+    }
+
+    /// The dev verbs take no consent, so they take no consent flag either.
+    #[test]
+    fn dev_accept_risks_flag_is_refused() {
+        let build = parse_build(&s(&["--accept-risks"]));
+        assert!(
+            matches!(&build, Err(CliError::Usage(m))
+                if m == "ipe dev build: unknown flag `--accept-risks`"),
+            "{build:?}"
+        );
+        let run = parse_run(&s(&["--accept-risks"]));
+        assert!(
+            matches!(&run, Err(CliError::Usage(m))
+                if m == "ipe dev run: unknown flag `--accept-risks`"),
+            "dev run must refuse the consent flag"
+        );
+        let watch = parse_watch(&s(&["--accept-risks"]));
+        assert!(
+            matches!(&watch, Err(CliError::Usage(_))),
+            "dev watch must refuse the consent flag"
+        );
     }
 
     #[test]

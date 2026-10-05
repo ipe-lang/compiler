@@ -326,7 +326,7 @@ pub fn build_with_options_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let source =
         crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
@@ -424,7 +424,7 @@ pub fn build_loose_file_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let collected = collect_entry_and_siblings(entry)?;
 
@@ -464,7 +464,7 @@ pub fn build_test_into(
     test_entry: &Path,
     out: OutTarget<'_>,
     runtime_dir: &Path,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let project = ProjectPaths::of_file(test_entry).with_sources(project_src_root);
     let target = out.prove(&project)?;
     let collected = collect_test_sources(project_src_root, tests_root, test_entry)?;
@@ -915,7 +915,7 @@ pub fn compile_modules(
     blame_path: &Path,
     db_driver: ipe_backend_rust::DbDriver,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let cache_site = cache::env_cache_dir(&target.path()?);
     compile_modules_observed(
         sources,
@@ -970,7 +970,7 @@ pub fn compile_modules_observed(
     db_driver: ipe_backend_rust::DbDriver,
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
-) -> (Result<OwnedDir, CliError>, CacheOutcome) {
+) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
     // Inject the transitive compiled-source stdlib closure. `injected` is the
     // driver's unforgeable record of which module paths are trusted stdlib
     // source — the ONLY inputs that earn `ModuleOrigin::EmbeddedStdlib` below.
@@ -1045,6 +1045,7 @@ pub fn compile_modules_observed(
                 runtime_dir,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
+                crate::run_sandbox::EmitFloor::of(options.intent, options.target),
             ),
             CacheOutcome::Hit,
         );
@@ -1113,12 +1114,13 @@ pub fn compile_modules_observed(
                     runtime_dir,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
+                    crate::run_sandbox::EmitFloor::of(options.intent, options.target),
                 );
                 // Warm the (cheaper-to-hit) EmittedProject tier for the
                 // next build too — advisory, best-effort, and rooted in the
                 // claim the write returned.
                 if let Ok(claimed) = &written
-                    && let Some(root) = site.root(claimed)
+                    && let Some(root) = site.root(claimed.dir())
                 {
                     cache::store(&root, epoch, &cache_key, &emitted);
                 }
@@ -1175,6 +1177,7 @@ pub fn compile_modules_observed(
         runtime_dir,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
+        crate::run_sandbox::EmitFloor::of(options.intent, options.target),
     );
 
     // A writable cache root comes only from the claim the write above
@@ -1182,7 +1185,7 @@ pub fn compile_modules_observed(
     // the target is proven ipe's.
     if let Ok(claimed) = &written
         && let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref())
-        && let Some(root) = site.root(claimed)
+        && let Some(root) = site.root(claimed.dir())
     {
         cache::store(&root, epoch, &cache_key, &emitted);
         // Also store the lowered `Program` at the IR tier.
@@ -2132,22 +2135,41 @@ pub fn inject_wasm_widget_bundle(
 /// from the project proven again; a claimed target is proven still the
 /// directory it claimed.
 ///
+/// A native development emit's `src/main.rs` carries the development marker
+/// as it is written ([`crate::run_sandbox::EmitFloor`]), so every binary a
+/// dev-intent path links names its posture, whichever cargo step builds it.
+///
 /// # Errors
 /// [`CliError::Io`] on any filesystem failure; [`CliError::StaticRefusal`]
 /// for a webview shape under a static plan; [`CliError::Pipeline`] on a
 /// backend-invariant breach (manifest anchor drift);
 /// [`CliError::OutputRefused`] when the target cannot be claimed or was
-/// replaced since it was claimed.
+/// replaced since it was claimed; [`CliError::Usage`] when a native
+/// development emit has no `src/main.rs` or no `fn main` anchor.
 pub fn write_emitted_project(
     emitted: &ipe_backend::EmittedProject,
     target: &EmitTarget,
     runtime_dir: &Path,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     tree_shake_vendored: bool,
-) -> Result<OwnedDir, CliError> {
+    floor: crate::run_sandbox::EmitFloor,
+) -> Result<EmittedCrate, CliError> {
     use ipe_backend_rust::static_build;
 
     let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored)?;
+    match floor {
+        crate::run_sandbox::EmitFloor::DevelopmentMarker => {
+            let main_rs = manifest
+                .get_mut(Path::new("src/main.rs"))
+                .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
+            *main_rs = crate::run_sandbox::embed_floor_text(
+                main_rs,
+                &crate::run_sandbox::dev_floor_marker_source(),
+            )?;
+        }
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+        | crate::run_sandbox::EmitFloor::NoNativeBinary => {}
+    }
     if let Some(plan) = static_plan {
         // The webview-under-static refusal reads the backend's typed
         // `uses_webview` signal (set from the resolved runtime/host), never a
@@ -2170,7 +2192,109 @@ pub fn write_emitted_project(
     if static_plan.is_none() {
         remove_stale_static_config(&crate_dir)?;
     }
-    Ok(crate_dir)
+    Ok(EmittedCrate {
+        dir: crate_dir,
+        floor,
+    })
+}
+
+/// An emitted crate together with the floor line [`write_emitted_project`]
+/// wrote into it.
+///
+/// Only [`write_emitted_project`] builds one, so the floor a cargo step reads
+/// here is the floor the crate's `src/main.rs` carries — never a claim a
+/// caller restates.
+#[derive(Debug)]
+pub struct EmittedCrate {
+    dir: OwnedDir,
+    floor: crate::run_sandbox::EmitFloor,
+}
+
+impl EmittedCrate {
+    /// The claimed directory the crate was written into.
+    #[must_use]
+    pub const fn dir(&self) -> &OwnedDir {
+        &self.dir
+    }
+
+    /// The crate directory's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// The floor line written into the crate.
+    #[must_use]
+    pub const fn floor(&self) -> crate::run_sandbox::EmitFloor {
+        self.floor
+    }
+
+    /// Give up the floor witness, keeping only the claimed directory.
+    #[must_use]
+    pub fn into_dir(self) -> OwnedDir {
+        self.dir
+    }
+
+    /// The crate as one carrying the development marker.
+    ///
+    /// # Errors
+    /// [`CliError::Pipeline`] (an internal bug) when the crate was written
+    /// with any other floor line.
+    pub fn dev_marked(&self) -> Result<DevMarkedCrate<'_>, CliError> {
+        match self.floor {
+            crate::run_sandbox::EmitFloor::DevelopmentMarker => Ok(DevMarkedCrate {
+                path: self.dir.path(),
+            }),
+            floor @ (crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+            | crate::run_sandbox::EmitFloor::NoNativeBinary) => Err(floor_mismatch_bug(
+                "ipe_cli::EmittedCrate::dev_marked",
+                format!("a development cargo step was handed a crate emitted with {floor:?}"),
+            )),
+        }
+    }
+
+    /// A witness over an already-written directory, for unit tests that
+    /// stage a crate by hand.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume_written(
+        dir: OwnedDir,
+        floor: crate::run_sandbox::EmitFloor,
+    ) -> Self {
+        Self { dir, floor }
+    }
+}
+
+/// A crate directory proven to carry the development marker: the only crate
+/// a development cargo step outside the floored build may compile.
+#[derive(Clone, Copy, Debug)]
+pub struct DevMarkedCrate<'a> {
+    path: &'a Path,
+}
+
+impl<'a> DevMarkedCrate<'a> {
+    /// The crate directory's path.
+    #[must_use]
+    pub const fn path(&self) -> &'a Path {
+        self.path
+    }
+
+    /// A witness over a hand-staged directory, for unit tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume(path: &'a Path) -> Self {
+        Self { path }
+    }
+}
+
+/// The internal-bug error for a cargo step handed a crate whose written floor
+/// is not the one the step's build needs.
+pub fn floor_mismatch_bug(where_: &'static str, detail: String) -> CliError {
+    CliError::Pipeline {
+        file: PathBuf::from("src/main.rs"),
+        src: String::new(),
+        diag: Box::new(Diagnostic::CompilerBug { where_, detail }),
+    }
 }
 
 /// Map a backend-invariant [`Diagnostic`] (a `CompilerBug` from manifest
@@ -2612,7 +2736,7 @@ pub fn build_project_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
     let discovered = project::discover_modules(&manifest.src_root)?;
 

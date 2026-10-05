@@ -14,7 +14,6 @@ path: a source file, a project directory, or a package.ipe (default: the current
 - @--runtime
 - `[--emit-ir]` — also emit the intermediate representation
 - `[--fix]` — apply machine-applicable fixes before building
-- @--accept-risks
 - @--static
 - @--target
 - @--allocator
