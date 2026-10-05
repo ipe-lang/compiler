@@ -452,8 +452,10 @@ jobs:
   # release leg's `cargo build` is a `cargo check` here, on the same runner, target
   # and pinned toolchain, so a target that cannot compile surfaces in the merge
   # queue, not on the release tag. `ring` needs a native C toolchain, so each leg
-  # runs natively. The matrix, argv and FreeBSD prelude are held equal to
-  # release.yml's by ci/verify-manifest.py check 23. `cargo check` does not link.
+  # runs natively. Both workflows run the checkout, the one shared
+  # .github/actions/release-target-toolchain step and the cargo command, in that
+  # order and nothing else; ci/verify-manifest.py check 23 pins all three.
+  # `cargo check` does not link.
   release-targets-run:
     needs: [changes, quick-check]
     # Tests phase: five native runners, so merge queue and dispatch only.
@@ -476,16 +478,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/release-target-toolchain
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install musl toolchain (linux)
-        if: contains(matrix.target, 'musl')
-        shell: bash
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+          target: ${{ matrix.target }}
       - name: Check ipe + ipe-ffi-inspector
         shell: bash
         env:
@@ -493,7 +488,7 @@ jobs:
         run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
 
   # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
-  # that leg's check, with release.yml's `uses`, prelude and cargo line.
+  # that leg's check: release.yml's VM step, its cargo line pinned by check 23.
   release-targets-freebsd:
     needs: [changes, quick-check]
     if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
@@ -506,8 +501,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
-          run: |
-            cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+          run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 
   # Required context for the release-target jobs: the phase verdict (see the header).
   release-targets:

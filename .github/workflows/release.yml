@@ -49,7 +49,9 @@ jobs:
           echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
 
   # Native/cross build per target. Linux is fully-static musl (copy-anywhere,
-  # no runtime deps); the others are the platform-native binary.
+  # no runtime deps); the others are the platform-native binary. The checkout,
+  # the shared .github/actions/release-target-toolchain step and the cargo
+  # command are ci.yml's release-targets-run's, pinned by check 23.
   build:
     needs: resolve-tag
     strategy:
@@ -82,23 +84,20 @@ jobs:
         with:
           # Build the tagged commit `resolve-tag` parsed.
           ref: ${{ needs.resolve-tag.outputs.tag }}
-      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/release-target-toolchain
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install musl toolchain (linux)
-        if: contains(matrix.target, 'musl')
-        shell: bash
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+          target: ${{ matrix.target }}
       - name: Build ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+      - name: Stage ipe + ipe-ffi-inspector
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
         run: |
-          cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
           mkdir -p dist
           BIN="target/$TARGET/release"
           cp "$BIN/ipe$EXT"               "dist/ipe$EXT"

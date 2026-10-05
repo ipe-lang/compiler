@@ -313,8 +313,8 @@ checks:
       Every target release.yml builds type-checks on its own runner under the
       pinned toolchain and the lockfile before merge, so a release target that
       cannot compile surfaces in the merge queue, not on the release tag;
-      check 23 holds the matrix, cargo line and FreeBSD prelude equal to
-      release.yml's.
+      check 23 holds the matrix equal to release.yml's and pins each job's
+      checkout, shared toolchain step and cargo line, nothing between them.
     aggregates: [release-targets-run, release-targets-freebsd]
 
   # ── Cancel-on-cheap-red watcher — informational (never a merge gate) ──────

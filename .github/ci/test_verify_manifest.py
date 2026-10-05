@@ -6406,14 +6406,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
-      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/release-target-toolchain
         with:
-          targets: ${{ matrix.target }}
-      - name: Install musl toolchain (linux)
-        if: contains(matrix.target, 'musl')
+          target: ${{ matrix.target }}
+      - name: Check ipe + ipe-ffi-inspector
         shell: bash
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
@@ -6454,19 +6451,20 @@ jobs:
       - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           ref: ${{ needs.resolve-tag.outputs.tag }}
-      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/release-target-toolchain
         with:
-          targets: ${{ matrix.target }}
-      - name: Install musl toolchain (linux)
-        if: contains(matrix.target, 'musl')
+          target: ${{ matrix.target }}
+      - name: Build ipe + ipe-ffi-inspector
         shell: bash
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+      - name: Stage
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
         run: |
-          cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
           mkdir -p dist
           cp "target/$TARGET/release/ipe$EXT" dist/
   build-freebsd:
@@ -6496,44 +6494,104 @@ jobs:
           expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"
           echo done
 """
-_RT_ACTION = """\
-name: pinned
-runs:
-  using: composite
-  steps:
-    - id: channel
-      shell: bash
-      run: echo "channel=1.0" >> "$GITHUB_OUTPUT"
-    - uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
-      with:
-        toolchain: ${{ steps.channel.outputs.channel }}
-        targets: ${{ inputs.targets }}
-"""
+# The two local actions the native jobs run, as the repository holds them:
+# check 23 pins their bodies, so the fixture is the real text.
+_RT_REPO = os.path.dirname(os.path.dirname(HERE))
+
+
+def _rt_action_text(name: str) -> str:
+    with open(os.path.join(_RT_REPO, ".github", "actions", name, "action.yml")) as f:
+        return f.read()
+
+
+_RT_ACTION = _rt_action_text("rust-toolchain-pinned")
+_RT_TOOLCHAIN = _rt_action_text("release-target-toolchain")
 
 
 class TestReleaseTargetParity(unittest.TestCase):
-    """Check 23: ci.yml checks exactly the targets release.yml builds."""
+    """Check 23: ci.yml checks exactly the targets release.yml builds, each
+    job an allowlist: its one checkout, the shared toolchain step, its one
+    pinned cargo line, nothing between them."""
 
-    def errors(self, ci: str = _RT_CI, release: str = _RT_RELEASE, action: str = _RT_ACTION) -> list[str]:
+    def errors(
+        self,
+        ci: str = _RT_CI,
+        release: str = _RT_RELEASE,
+        action: str | None = _RT_ACTION,
+        toolchain: str | None = _RT_TOOLCHAIN,
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as repo:
             root = os.path.join(repo, ".github")
             _write(os.path.join(root, "workflows", "ci.yml"), ci)
             _write(os.path.join(root, "workflows", "release.yml"), release)
-            _write(os.path.join(root, "actions", "rust-toolchain-pinned", "action.yml"), action)
+            if action is not None:
+                _write(os.path.join(root, "actions", "rust-toolchain-pinned", "action.yml"), action)
+            if toolchain is not None:
+                _write(os.path.join(root, "actions", "release-target-toolchain", "action.yml"), toolchain)
             errors: list[str] = []
             check_release_target_parity(errors, root=root)
             return errors
 
     def assertRefused(
-        self, needle: str, ci: str = _RT_CI, release: str = _RT_RELEASE, action: str = _RT_ACTION
+        self,
+        needle: str,
+        ci: str = _RT_CI,
+        release: str = _RT_RELEASE,
+        action: str | None = _RT_ACTION,
+        toolchain: str | None = _RT_TOOLCHAIN,
     ) -> None:
-        errors = self.errors(ci, release, action)
+        errors = self.errors(ci, release, action, toolchain)
         self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
 
     @staticmethod
     def swap(text: str, old: str, new: str) -> str:
         assert text.count(old) >= 1, old
         return text.replace(old, new)
+
+    _CI_CARGO = "      - name: Check ipe + ipe-ffi-inspector\n"
+    _REL_CARGO = "      - name: Build ipe + ipe-ffi-inspector\n"
+    _CI_VM_RUN = "          run: |\n            cargo check"
+    _REL_VM_RUN = "          run: |\n            cargo build"
+    _CI_CARGO_RUN = "        run: cargo check --release"
+    _REL_CARGO_RUN = "        run: cargo build --release"
+    _MUSL_RUN = "      run: sudo apt-get update && sudo apt-get install -y musl-tools\n"
+    _MUSL_IF = "contains(inputs.target, 'musl')"
+    _NATIVE_3 = ("ci.yml job 'release-targets-run' step 3", "release.yml job 'build' step 3")
+
+    def before_cargo(self, step: str) -> tuple[str, str]:
+        """`step` run between the shared toolchain step and the cargo step."""
+        return (
+            self.swap(_RT_CI, self._CI_CARGO, step + self._CI_CARGO),
+            self.swap(_RT_RELEASE, self._REL_CARGO, step + self._REL_CARGO),
+        )
+
+    def assertRefusedBeforeCargo(self, line: str) -> None:
+        """`line` is refused wherever it can run before a cargo command: as a
+        step between the shared step and the cargo step (on either side alone),
+        as a line of the cargo step, as a VM line before the cargo line, and as
+        a step of the shared action."""
+        def at(n: int) -> str:
+            return line.replace("\n", "\n" + " " * n)
+
+        step = f"      - shell: bash\n        run: |\n          {at(10)}\n"
+        ci, release = self.before_cargo(step)
+        for needle in self._NATIVE_3:
+            self.assertRefused(needle, ci, release)
+        self.assertRefused("ci.yml job 'release-targets-run' step 3", ci)
+        self.assertRefused("release.yml job 'build' step 3", release=release)
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", ci)
+        ci = self.swap(_RT_CI, self._CI_CARGO_RUN, f"        run: |\n          {at(10)}\n          cargo check --release")
+        release = self.swap(_RT_RELEASE, self._REL_CARGO_RUN, f"        run: |\n          {at(10)}\n          cargo build --release")
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
+        self.assertRefused("release.yml job 'build' step 3.run is", release=release)
+        ci = self.swap(_RT_CI, self._CI_VM_RUN, f"          run: |\n            {at(12)}\n            cargo check")
+        release = self.swap(_RT_RELEASE, self._REL_VM_RUN, f"          run: |\n            {at(12)}\n            cargo build")
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", ci)
+        self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", release=release)
+        toolchain = self.swap(
+            _RT_TOOLCHAIN, "    - name: Install musl toolchain (linux)\n", f"    - shell: bash\n      run: |\n        {at(8)}\n    - name: Install musl toolchain (linux)\n"
+        )
+        self.assertRefused("release-target-toolchain' has 4 steps where its pin has 3", toolchain=toolchain)
 
     def test_matching_workflows_pass(self) -> None:
         self.assertEqual(self.errors(), [])
@@ -6570,32 +6628,44 @@ class TestReleaseTargetParity(unittest.TestCase):
             (" --features ipe/wasi_run", " --features ipe/signing"),
             (" -p ipe -p ipe-ffi-inspector", " -p ipe"),
             ("--release --locked --features", "--release --locked --offline --features"),
+            ("cargo check --release", "cargo  check --release"),
+            ("cargo check --release", "cargo +nightly check --release"),
         ):
             with self.subTest(change=new):
-                self.assertRefused("native cargo command", self.swap(_RT_CI, old, new))
+                self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", self.swap(_RT_CI, old, new))
 
     def test_release_dropping_locked_is_refused(self) -> None:
         release = self.swap(_RT_RELEASE, "cargo build --release --locked --features", "cargo build --release --features")
-        self.assertRefused("native cargo command", release=release)
+        self.assertRefused("release.yml job 'build' step 3.run is", release=release)
+        self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", release=release)
 
     def test_release_builds_must_ship_the_feature(self) -> None:
         # Dropped from both workflows alike: still equal, still refused.
         ci = _RT_CI.replace(" --features ipe/wasi_run", "")
         release = _RT_RELEASE.replace(" --features ipe/wasi_run", "")
-        self.assertRefused("job 'build' builds without `--features ipe/wasi_run`", ci, release)
-        self.assertRefused("job 'build-freebsd' builds without `--features ipe/wasi_run`", ci, release)
-        # The `=` spelling is the same switch.
+        self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
+        self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", ci, release)
+        # The `=` spelling is another line than the pinned one.
         ci = _RT_CI.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
         release = _RT_RELEASE.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
-        self.assertEqual(self.errors(ci, release), [])
+        self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
 
     def test_ci_must_check_not_build(self) -> None:
-        self.assertRefused("must run `cargo check`", self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features"))
+        ci = self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features")
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", ci)
 
     def test_toolchain_or_musl_drift_refused(self) -> None:
-        self.assertRefused("native toolchain step", self.swap(_RT_CI, "targets: ${{ matrix.target }}", "targets: x86_64-unknown-linux-musl"))
-        self.assertRefused("musl install run", self.swap(_RT_CI, "install -y musl-tools", "install -y musl-dev"))
-        self.assertRefused("musl install condition", self.swap(_RT_CI, "contains(matrix.target, 'musl')", "true"))
+        self.assertRefused(
+            "ci.yml job 'release-targets-run' step 2.with.target is",
+            self.swap(_RT_CI, "          target: ${{ matrix.target }}\n", "          target: x86_64-unknown-linux-musl\n"),
+        )
+        toolchain = self.swap(_RT_TOOLCHAIN, "install -y musl-tools", "install -y musl-dev")
+        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        toolchain = self.swap(_RT_TOOLCHAIN, self._MUSL_IF, "true")
+        self.assertRefused("release-target-toolchain' step 3.if is", toolchain=toolchain)
+        toolchain = self.swap(_RT_TOOLCHAIN, "targets: ${{ inputs.target }}", "targets: x86_64-unknown-linux-musl")
+        self.assertRefused("release-target-toolchain' step 1.with.targets is", toolchain=toolchain)
 
     def test_expected_artifact_missing_refused(self) -> None:
         release = self.swap(_RT_RELEASE, 'expected="ipe-linux-x64 ipe-darwin-arm64 ipe-freebsd-x64"', 'expected="ipe-linux-x64 ipe-freebsd-x64"')
@@ -6610,263 +6680,278 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("has no job 'release-targets-freebsd'", head)
 
     def test_freebsd_prelude_drift_refused(self) -> None:
-        self.assertRefused("FreeBSD VM `prepare`", self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"))
-        self.assertRefused("FreeBSD VM `usesh`", self.swap(_RT_CI, "usesh: true", "usesh: false"))
+        self.assertRefused(
+            "ci.yml job 'release-targets-freebsd' step 2.with.prepare is",
+            self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"),
+        )
+        self.assertRefused(
+            "ci.yml job 'release-targets-freebsd' step 2.with.usesh is", self.swap(_RT_CI, "usesh: true", "usesh: false")
+        )
         self.assertRefused(
             "FreeBSD VM action",
             self.swap(_RT_CI, "freebsd-vm@0000000000000000000000000000000000000000", "freebsd-vm@1111111111111111111111111111111111111111"),
+        )
+        self.assertRefused(
+            "ci.yml job 'release-targets-freebsd' step 2.uses is",
+            self.swap(_RT_CI, "vmactions/freebsd-vm@", "VMActions/freebsd-vm@"),
         )
 
     def test_freebsd_cargo_drift_refused(self) -> None:
         for old, new in (("--release --locked --features", "--release --features"), (" -p ipe-ffi-inspector\n", "\n")):
             with self.subTest(change=new):
                 ci = _RT_CI.rsplit(old, 1)
-                self.assertRefused("FreeBSD cargo command", new.join(ci))
+                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", new.join(ci))
 
     def test_conditional_ci_cargo_step_refused(self) -> None:
         masks = ("if: github.event_name == 'workflow_dispatch'", "continue-on-error: true")
         for mask in masks:
             with self.subTest(job="native", mask=mask):
-                ci = self.swap(_RT_CI, "      - shell: bash\n", f"      - {mask}\n        shell: bash\n")
-                self.assertRefused("has an `if:` or `continue-on-error`", ci)
+                ci = self.swap(_RT_CI, "        shell: bash\n", f"        {mask}\n        shell: bash\n")
+                self.assertRefused("ci.yml job 'release-targets-run' step 3 has keys", ci)
             with self.subTest(job="freebsd", mask=mask):
                 ci = self.swap(
                     _RT_CI, "      - uses: vmactions/freebsd-vm@", f"      - {mask}\n        uses: vmactions/freebsd-vm@"
                 )
-                self.assertRefused("has an `if:` or `continue-on-error`", ci)
+                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2 has keys", ci)
         for job in ("release-targets-run", "release-targets-freebsd"):
             with self.subTest(job=job, mask="job continue-on-error"):
                 ci = self.swap(_RT_CI, f"  {job}:\n", f"  {job}:\n    continue-on-error: true\n")
-                self.assertRefused(f"job '{job}' has a `continue-on-error`", ci)
+                self.assertRefused(f"ci.yml job '{job}' has a job `continue-on-error`", ci)
 
     def test_runs_on_drift_refused(self) -> None:
         ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ubuntu-latest\n")
-        self.assertRefused("native job `runs-on`", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' runs on 'ubuntu-latest'; it must be exactly", ci)
         ci = self.swap(_RT_CI, "  release-targets-freebsd:\n    runs-on: ubuntu-latest\n", "  release-targets-freebsd:\n    runs-on: ubuntu-22.04\n")
-        self.assertRefused("FreeBSD job `runs-on`", ci)
+        self.assertRefused("ci.yml job 'release-targets-freebsd' runs on 'ubuntu-22.04'; it must be exactly", ci)
         ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    env:\n      RUSTFLAGS: -Copt-level=0\n")
-        self.assertRefused("native job `env`", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' has a job `env`", ci)
 
     def test_cargo_step_shell_or_target_drift_refused(self) -> None:
-        self.assertRefused("native cargo step `shell`", self.swap(_RT_CI, "      - shell: bash\n", "      - shell: pwsh\n"))
+        ci = self.swap(_RT_CI, "        shell: bash\n        env:", "        shell: pwsh\n        env:")
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.shell is 'pwsh'", ci)
         self.assertRefused(
-            "`TARGET` = 'x86_64-unknown-linux-musl' in ci.yml (cargo step)",
+            "ci.yml job 'release-targets-run' step 3.env.TARGET is 'x86_64-unknown-linux-musl'",
             self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n", "          TARGET: x86_64-unknown-linux-musl\n"),
         )
         self.assertRefused(
-            "native cargo step `working-directory`",
-            self.swap(_RT_CI, "      - shell: bash\n", "      - shell: bash\n        working-directory: src\n"),
+            "ci.yml job 'release-targets-run' step 3 has keys",
+            self.swap(_RT_CI, "        shell: bash\n", "        shell: bash\n        working-directory: src\n"),
         )
 
     def test_extra_ci_step_refused(self) -> None:
         fake = "      - run: echo /tmp/fake-cargo >> \"$GITHUB_PATH\"\n"
-        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", fake + "      - name: Install musl toolchain (linux)\n")
-        self.assertRefused("must run exactly release.yml's 4 steps", ci)
+        ci = self.swap(_RT_CI, "      - uses: ./.github/actions/release-target-toolchain\n", fake + "      - uses: ./.github/actions/release-target-toolchain\n")
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' step 2 has keys", ci)
+        ci = _RT_CI + "      - shell: bash\n        run: echo after\n"
+        self.assertRefused("ci.yml job 'release-targets-freebsd' has 3 steps", ci)
         vm = "      - run: echo '[build]' > .cargo/config.toml\n      - uses: vmactions/freebsd-vm@"
         ci = self.swap(_RT_CI, "      - uses: vmactions/freebsd-vm@", vm)
-        self.assertRefused("must run exactly release.yml's 2 steps", ci)
+        self.assertRefused("ci.yml job 'release-targets-freebsd' has 3 steps", ci)
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2 has keys", ci)
+        native = self.swap(_RT_CI, "      - name: Check ipe", "      - shell: bash\n        run: echo after\n      - name: Check ipe")
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", native)
 
     def test_ci_step_differing_from_release_refused(self) -> None:
-        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", "      - name: Install musl toolchain (linux)\n        continue-on-error: true\n")
-        self.assertRefused("native step 3", ci)
-        ci = self.swap(_RT_CI, "      - uses: ./.github/actions/rust-toolchain-pinned\n", "      - uses: ./.github/actions/rust-toolchain-pinned\n        if: false\n")
-        self.assertRefused("native step 2", ci)
+        shared = "      - uses: ./.github/actions/release-target-toolchain\n"
+        for extra in ("continue-on-error: true", "if: false", "env:\n          RUSTFLAGS: --cfg broken"):
+            with self.subTest(extra=extra):
+                ci = self.swap(_RT_CI, shared, shared + f"        {extra}\n")
+                self.assertRefused("ci.yml job 'release-targets-run' step 2 has keys", ci)
+        ci = self.swap(_RT_CI, "        with:\n          target: ${{ matrix.target }}\n", "        with:\n          target: ${{ matrix.target }}\n          extra: x\n")
+        self.assertRefused("ci.yml job 'release-targets-run' step 2.with has keys", ci)
 
     def test_checkout_of_another_commit_refused(self) -> None:
         checkout = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
         pinned = checkout + "        with:\n          ref: 0123abc\n"
-        self.assertRefused("native step 1", _RT_CI.replace(checkout, pinned, 1))
+        self.assertRefused("ci.yml job 'release-targets-run' step 1 has keys", _RT_CI.replace(checkout, pinned, 1))
+        moving = self.swap(_RT_CI, "actions/checkout@0000000000000000000000000000000000000000", "actions/checkout@v7")
+        self.assertRefused("ci.yml job 'release-targets-run' step 1.uses is 'actions/checkout@v7'", moving)
 
     def test_cargo_step_extra_line_refused(self) -> None:
-        native = self.swap(
-            _RT_CI,
-            "        run: cargo check --release",
-            "        run: |\n          cargo() { :; }\n          cargo check --release",
-        )
-        self.assertRefused("job 'release-targets-run' runs cargo 2 time(s)", native)
-        bsd = self.swap(
-            _RT_CI,
-            "          run: |\n            cargo check",
-            "          run: |\n            alias cargo=true\n            cargo check",
-        )
-        self.assertRefused("job 'release-targets-freebsd' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", bsd)
-        native = self.swap(_RT_CI, "        run: cargo check --release", "        run: |\n          export RUSTFLAGS=-Cx\n          cargo check --release")
-        self.assertRefused("native cargo step must run only", native)
-        bsd = self.swap(_RT_CI, "          run: |\n            cargo check", "          run: |\n            export RUSTFLAGS=-Cx\n            cargo check")
-        self.assertRefused("FreeBSD cargo step must run only", bsd)
+        for line in ("cargo() { :; }", "export RUSTFLAGS=-Cx", "alias cargo=true"):
+            with self.subTest(line=line):
+                native = self.swap(_RT_CI, self._CI_CARGO_RUN, f"        run: |\n          {line}\n          cargo check --release")
+                self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", native)
+                bsd = self.swap(_RT_CI, self._CI_VM_RUN, f"          run: |\n            {line}\n            cargo check")
+                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", bsd)
+        native = self.swap(_RT_CI, "-p ipe -p ipe-ffi-inspector\n  release", "-p ipe -p ipe-ffi-inspector; true\n  release")
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", native)
 
     def test_cargo_step_env_beyond_release_refused(self) -> None:
         ci = self.swap(_RT_CI, "          TARGET: ${{ matrix.target }}\n        run: cargo", "          TARGET: ${{ matrix.target }}\n          RUSTC_WRAPPER: /tmp/w\n        run: cargo")
-        self.assertRefused("`RUSTC_WRAPPER` = '/tmp/w' in ci.yml (cargo step) but None in release.yml (unset)", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.env has keys", ci)
 
     def test_vm_input_drift_refused(self) -> None:
-        ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n          run: |\n            cargo check", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n          run: |\n            cargo check")
-        self.assertRefused("FreeBSD step 2 `with`", ci)
+        ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n")
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with has keys", ci)
 
     def test_job_key_drift_refused(self) -> None:
         for key in ("services:\n      cache:\n        image: x", "permissions:\n      contents: write", "defaults:\n      run:\n        shell: sh"):
             with self.subTest(key=key):
                 ci = self.swap(_RT_CI, "  release-targets-run:\n", f"  release-targets-run:\n    {key}\n")
-                self.assertRefused(f"native job `{key.split(':')[0]}`", ci)
+                self.assertRefused(f"ci.yml job 'release-targets-run' has a job `{key.split(':')[0]}`", ci)
 
     def test_non_literal_matrix_refused(self) -> None:
         ci = self.swap(_RT_CI, "        include:\n", "        extra: [1]\n        include:\n")
-        self.assertRefused("must be a matrix of only an `include` list", ci)
+        self.assertRefused("a matrix of only an `include` list", ci)
 
-    # The cargo command's whole static context: every scope that can reach it
-    # is compared both ways, with only `ALLOWED_ENV_DIFFERENCES` apart.
+    # The cargo command's whole static context: the workflow, the job and the
+    # step around it are pinned, with only `ALLOWED_ENV_DIFFERENCES` apart.
 
     def test_release_line_before_cargo_line_refused(self) -> None:
         for before in ("cd sub", "export RUSTFLAGS='--cfg broken'"):
             with self.subTest(job="native", line=before):
                 release = self.swap(
-                    _RT_RELEASE, "        run: |\n          cargo build", f"        run: |\n          {before}\n          cargo build"
+                    _RT_RELEASE, self._REL_CARGO_RUN, f"        run: |\n          {before}\n          cargo build --release"
                 )
-                self.assertRefused(f"release.yml's native cargo step runs [{before!r}] before", release=release)
+                self.assertRefused("release.yml job 'build' step 3.run is", release=release)
             with self.subTest(job="freebsd", line=before):
-                release = self.swap(
-                    _RT_RELEASE, "          run: |\n            cargo build", f"          run: |\n            {before}\n            cargo build"
-                )
-                self.assertRefused(f"release.yml's FreeBSD cargo step runs [{before!r}] before", release=release)
+                release = self.swap(_RT_RELEASE, self._REL_VM_RUN, f"          run: |\n            {before}\n            cargo build")
+                self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", release=release)
 
     def test_release_only_cargo_step_env_refused(self) -> None:
-        for key in ("RUSTFLAGS: --cfg broken", "CARGO_BUILD_TARGET_DIR: /tmp/t", "RUSTC_BOOTSTRAP: '1'"):
+        anchor = "          TARGET: ${{ matrix.target }}\n        run: cargo"
+        for key in ("RUSTFLAGS: --cfg broken", "CARGO_BUILD_TARGET_DIR: /tmp/t", "RUSTC_BOOTSTRAP: '1'", "EXT: ${{ matrix.ext }}"):
             with self.subTest(key=key):
-                release = self.swap(_RT_RELEASE, "          EXT: ${{ matrix.ext }}\n", f"          EXT: ${{{{ matrix.ext }}}}\n          {key}\n")
-                self.assertRefused(f"has `{key.split(':')[0]}` = ", release=release)
-                self.assertRefused("None in ci.yml (unset)", release=release)
+                release = self.swap(_RT_RELEASE, anchor, f"          TARGET: ${{{{ matrix.target }}}}\n          {key}\n        run: cargo")
+                self.assertRefused("release.yml job 'build' step 3.env has keys", release=release)
         release = self.swap(
             _RT_RELEASE,
-            "        env:\n          TARGET: ${{ matrix.target }}\n          EXT: ${{ matrix.ext }}\n",
-            "        env: ${{ fromJSON(vars.BUILD_ENV) }}\n",
+            "        env:\n          TARGET: ${{ matrix.target }}\n        run: cargo",
+            "        env: ${{ fromJSON(vars.BUILD_ENV) }}\n        run: cargo",
         )
-        self.assertRefused("the cargo step `env` must be a literal mapping", release=release)
+        self.assertRefused("release.yml job 'build' step 3.env is '${{ fromJSON(vars.BUILD_ENV) }}', which is not a mapping", release=release)
 
     def test_workflow_env_and_defaults_compared(self) -> None:
         release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  RUSTFLAGS: --cfg broken\n")
-        self.assertRefused("`RUSTFLAGS` = None in ci.yml (unset) but '--cfg broken' in release.yml (workflow)", release=release)
+        self.assertRefused("release.yml workflow env has keys ['RUSTFLAGS'] (extra ['RUSTFLAGS']", release=release)
         ci = self.swap(_RT_CI, "  CARGO_INCREMENTAL: '0'\n", "  CARGO_INCREMENTAL: '0'\n  RUSTFLAGS: --cfg broken\n")
-        self.assertRefused("`RUSTFLAGS` = '--cfg broken' in ci.yml (workflow)", ci)
+        self.assertRefused("ci.yml workflow env has keys", ci)
         release = self.swap(
             _RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\ndefaults:\n  run:\n    working-directory: sub\n"
         )
-        self.assertRefused("ci.yml's workflow `defaults` is None", release=release)
+        self.assertRefused("release.yml has a workflow `defaults`", release=release)
         release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv: ${{ vars.E }}\n")
-        self.assertRefused("the workflow `env` must be a literal mapping", release=release)
+        self.assertRefused("release.yml workflow env is '${{ vars.E }}', which is not a mapping", release=release)
 
     def test_allowed_env_differences_are_closed(self) -> None:
-        allowed = {(a.side.value, a.level.value, a.key, a.value) for a in verify_manifest.ALLOWED_ENV_DIFFERENCES}
+        allowed = {(a.side.value, a.key, a.value) for a in verify_manifest.ALLOWED_ENV_DIFFERENCES}
         self.assertEqual(
             allowed,
             {
-                ("ci.yml", "workflow", "CARGO_TERM_COLOR", "always"),
-                ("ci.yml", "workflow", "CARGO_INCREMENTAL", "0"),
-                ("release.yml", "cargo step", "EXT", "${{ matrix.ext }}"),
+                ("ci.yml", "CARGO_TERM_COLOR", "always"),
+                ("ci.yml", "CARGO_INCREMENTAL", "0"),
             },
         )
         # An allowed key at another value, at another level, or on the other side.
-        self.assertRefused("`CARGO_INCREMENTAL` = '1' in ci.yml", self.swap(_RT_CI, "CARGO_INCREMENTAL: '0'", "CARGO_INCREMENTAL: '1'"))
+        self.assertRefused(
+            "ci.yml workflow env.CARGO_INCREMENTAL is '1', which must be exactly '0'",
+            self.swap(_RT_CI, "CARGO_INCREMENTAL: '0'", "CARGO_INCREMENTAL: '1'"),
+        )
         ci = self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", "")
         ci = self.swap(ci, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    env:\n      CARGO_TERM_COLOR: always\n")
-        self.assertRefused("`CARGO_TERM_COLOR` = 'always' in ci.yml (job)", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' has a job `env`", ci)
         release = self.swap(_RT_RELEASE, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  CARGO_INCREMENTAL: '0'\n")
-        self.assertRefused("names ci.yml's workflow `CARGO_INCREMENTAL` = '0', which no", release=release)
+        self.assertRefused("release.yml workflow env has keys ['CARGO_INCREMENTAL']", release=release)
         # A stale entry is refused.
-        self.assertRefused("names ci.yml's workflow `CARGO_TERM_COLOR` = 'always', which no", self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", ""))
-        # The name of an allowed difference is read nowhere it is visible.
-        both = ("        run: sudo apt-get update", "        run: test -z \"$CARGO_INCREMENTAL\" || sudo apt-get update")
-        self.assertRefused("names `CARGO_INCREMENTAL`", self.swap(_RT_CI, *both), self.swap(_RT_RELEASE, *both))
+        self.assertRefused("missing ['CARGO_TERM_COLOR']", self.swap(_RT_CI, "  CARGO_TERM_COLOR: always\n", ""))
+        # The name of an allowed difference is read nowhere before the cargo command.
+        toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", "run: test -z \"$CARGO_INCREMENTAL\" || sudo apt-get update")
+        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
         ci = self.swap(_RT_CI, '--target "$TARGET"', '--target "$TARGET$EXT"')
-        release = self.swap(_RT_RELEASE, '--target "$TARGET"', '--target "$TARGET$EXT"')
-        self.assertRefused("names `EXT`, which only release.yml's native cargo command sees", ci, release)
+        release = self.swap(_RT_RELEASE, '--target "$TARGET" -p', '--target "$TARGET$EXT" -p')
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci, release)
+        self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
 
     def test_matrix_value_read_by_mirrored_step_refused(self) -> None:
-        env_write = '      - run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV"\n      - name: Install musl toolchain (linux)\n'
-        ci = self.swap(_RT_CI, "      - name: Install musl toolchain (linux)\n", env_write)
-        release = self.swap(_RT_RELEASE, "      - name: Install musl toolchain (linux)\n", env_write)
+        env_write = '      - run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV"\n'
+        ci, release = self.before_cargo(env_write)
         release = self.swap(release, "            target: x86_64-unknown-linux-musl\n            ext: ''\n", "            target: x86_64-unknown-linux-musl\n            ext: ''\n            flags: --cfg broken\n")
-        self.assertRefused("matrix `flags` for target 'x86_64-unknown-linux-musl'", ci, release)
-        whole = ("        if: contains(matrix.target, 'musl')\n", "        if: contains(toJSON(matrix), 'musl')\n")
-        self.assertRefused("`matrix` read whole or by a computed name", self.swap(_RT_CI, *whole), self.swap(_RT_RELEASE, *whole))
-        computed = ("        if: contains(matrix.target, 'musl')\n", "        if: contains(matrix['target'], 'musl')\n")
-        self.assertRefused("`matrix` read whole or by a computed name", self.swap(_RT_CI, *computed), self.swap(_RT_RELEASE, *computed))
+        self.assertRefused("release.yml job 'build' step 3", ci, release)
+        self.assertRefused("release.yml job 'build': a matrix leg must hold exactly", ci, release)
+        for target in ("${{ toJSON(matrix) }}", "${{ matrix['target'] }}", "${{ matrix.flags }}"):
+            with self.subTest(target=target):
+                both = ("          target: ${{ matrix.target }}\n", f"          target: {target}\n")
+                self.assertRefused("ci.yml job 'release-targets-run' step 2.with.target is", self.swap(_RT_CI, *both))
+                self.assertRefused("release.yml job 'build' step 2.with.target is", release=self.swap(_RT_RELEASE, *both))
 
     def test_context_expression_in_mirrored_region_refused(self) -> None:
-        cond = "contains(matrix.target, 'musl')"
-        for new, needle in (
-            (f"{cond} && github.event_name == 'workflow_dispatch'", "the `github` context"),
-            (f"{cond} && always()", "`always()`"),
-            (f"{cond} && runner.os == 'Linux'", "the `runner` context"),
-            (f"{cond} && hashFiles('x') != ''", "`hashFiles()`"),
+        cond = self._MUSL_IF
+        for new in (
+            f"{cond} && github.event_name == 'workflow_dispatch'",
+            f"{cond} && always()",
+            f"{cond} && runner.os == 'Linux'",
+            f"{cond} && hashFiles('x') != ''",
         ):
             with self.subTest(expr=new):
-                self.assertRefused(needle, self.swap(_RT_CI, cond, new), self.swap(_RT_RELEASE, cond, new))
-        ref = ("targets: ${{ matrix.target }}", "targets: ${{ github.ref_name }}")
-        self.assertRefused("the `github` context", self.swap(_RT_CI, *ref), self.swap(_RT_RELEASE, *ref))
-        shell = ("        run: sudo apt-get update", "        run: test \"$GITHUB_EVENT_NAME\" = x || sudo apt-get update")
-        self.assertRefused("names the runner variable `GITHUB_EVENT_NAME`", self.swap(_RT_CI, *shell), self.swap(_RT_RELEASE, *shell))
+                self.assertRefused("release-target-toolchain' step 3.if is", toolchain=self.swap(_RT_TOOLCHAIN, cond, new))
+        ref = ("          target: ${{ matrix.target }}\n", "          target: ${{ github.ref_name }}\n")
+        self.assertRefused("release.yml job 'build' step 2.with.target is", release=self.swap(_RT_RELEASE, *ref))
+        shell = ("run: sudo apt-get update", "run: test \"$GITHUB_EVENT_NAME\" = x || sudo apt-get update")
+        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=self.swap(_RT_TOOLCHAIN, *shell))
+        save = ("save-if: ${{ github.ref == 'refs/heads/main' }}", "save-if: true")
+        self.assertRefused("release-target-toolchain' step 2.with.save-if is", toolchain=self.swap(_RT_TOOLCHAIN, *save))
 
     def test_local_action_context_read_refused(self) -> None:
         action = self.swap(_RT_ACTION, "targets: ${{ inputs.targets }}", "targets: ${{ github.event_name == 'release' && 'x' || inputs.targets }}")
-        self.assertRefused("rust-toolchain-pinned step 2.with.targets", action=action)
-        with tempfile.TemporaryDirectory() as repo:
-            root = os.path.join(repo, ".github")
-            _write(os.path.join(root, "workflows", "ci.yml"), _RT_CI)
-            _write(os.path.join(root, "workflows", "release.yml"), _RT_RELEASE)
-            errors: list[str] = []
-            check_release_target_parity(errors, root=root)
-        self.assertTrue(any("has no single action.yml" in e for e in errors), errors)
+        self.assertRefused("rust-toolchain-pinned' step 2.with.targets is", action=action)
+        for absent in ("action", "toolchain"):
+            with self.subTest(absent=absent):
+                errors = self.errors(**{absent: None})
+                self.assertTrue(any("has no single action.yml" in e for e in errors), errors)
 
-    # A value spliced into the region's text is scanned as that text is.
+    # A value spliced into the pinned region is refused by its pin or its
+    # grammar before any scan reads it.
 
     _MUSL_LEG = "            target: x86_64-unknown-linux-musl\n"
-    _APT = "        run: sudo apt-get update"
 
-    def both(self, old: str, new: str) -> tuple[str, str]:
-        return self.swap(_RT_CI, old, new), self.swap(_RT_RELEASE, old, new)
-
-    def with_leg_key(self, ci: str, release: str, line: str) -> tuple[str, str]:
+    def with_leg_key(self, line: str) -> tuple[str, str]:
         leg = self._MUSL_LEG + f"            {line}\n"
-        return self.swap(ci, self._MUSL_LEG, leg), self.swap(release, self._MUSL_LEG, leg)
+        return self.swap(_RT_CI, self._MUSL_LEG, leg), self.swap(_RT_RELEASE, self._MUSL_LEG, leg)
 
     def test_matrix_value_scanned_as_cargo_step_text(self) -> None:
-        env_write = '        run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV" && sudo apt-get update'
-        for line, needle in (
-            ("flags: ${{ github.event_name == 'release' && '--cfg broken' || '' }}", "the `github` context"),
-            ("flags: --cfg $GITHUB_REF_NAME", "names the runner variable `GITHUB_REF_NAME`"),
-            ("flags: $CARGO_INCREMENTAL", "names `CARGO_INCREMENTAL`"),
-            ("flags: '$EXT'", "names `EXT`"),
-            ("flags: [--cfg, broken]", "is a mapping or list"),
+        for value, needle in (
+            ("${{ github.event_name == 'release' && 'x' || 'y' }}", "outside the runner-label and target-triple grammar"),
+            ("x86_64-$GITHUB_REF_NAME", "outside the runner-label and target-triple grammar"),
+            ("'x86_64 linux'", "outside the runner-label and target-triple grammar"),
+            ("'x;git checkout main'", "outside the runner-label and target-triple grammar"),
+            ("[--cfg, broken]", "each a literal string"),
         ):
-            with self.subTest(line=line):
-                ci, release = self.with_leg_key(*self.both(self._APT, env_write), line)
+            with self.subTest(value=value):
+                leg = ("            target: x86_64-unknown-linux-musl\n", f"            target: {value}\n")
+                ci, release = self.swap(_RT_CI, *leg), self.swap(_RT_RELEASE, *leg)
+                self.assertRefused(f"ci.yml job 'release-targets-run': {'a matrix leg' if 'literal' in needle else 'matrix leg'}", ci, release)
                 self.assertRefused(needle, ci, release)
+        ci, release = self.with_leg_key("flags: --cfg broken")
+        self.assertRefused("a matrix leg must hold exactly ['os', 'target']", ci, release)
+        release = self.swap(_RT_RELEASE, "            ext: ''\n", "            ext: '$EXT'\n")
+        self.assertRefused("outside the runner-label and target-triple grammar", release=release)
 
     def test_name_spliced_across_an_expression_refused(self) -> None:
-        guard = '        run: test -z "{}" || sudo apt-get update'
-        for text, line in (
-            ("$${{ matrix.part }}_REF", "part: GITHUB"),
-            ("$GITHUB${{ matrix.part }}", "part: _REF"),
-            ("$${{ matrix.part }}${{ matrix.part }}", "part: GITHUB"),
-        ):
+        guard = 'run: test -z "{}" || sudo apt-get update'
+        for text in ("$${{ matrix.part }}_REF", "$GITHUB${{ matrix.part }}", "$${{ format('{0}_REF', 'GITHUB') }}"):
             with self.subTest(text=text):
-                ci, release = self.with_leg_key(*self.both(self._APT, guard.format(text)), line)
-                self.assertRefused("to a name character or another expression", ci, release)
-        for call in ("format('${0}_REF', 'GITHUB')", "fromJSON('\"$GITHUB\\u005fREF\"')", "join(fromJSON('[1]'), 'x')"):
-            with self.subTest(call=call):
-                self.assertRefused("builds text with", *self.both(self._APT, guard.format(f"${{{{ {call} }}}}")))
+                toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", guard.format(text))
+                self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        ci, release = self.with_leg_key("part: GITHUB")
+        self.assertRefused("a matrix leg must hold exactly", ci, release)
 
     def test_actions_runner_variable_refused(self) -> None:
-        guard = '        run: test -z "$ACTIONS_ID_TOKEN_REQUEST_URL" || sudo apt-get update'
-        self.assertRefused("names the runner variable `ACTIONS_ID_TOKEN_REQUEST_URL`", *self.both(self._APT, guard))
+        toolchain = self.swap(
+            _RT_TOOLCHAIN, "run: sudo apt-get update", 'run: test -z "$ACTIONS_ID_TOKEN_REQUEST_URL" || sudo apt-get update'
+        )
+        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
 
     def test_local_action_defaults_and_run_read_no_unscanned_value(self) -> None:
-        defaults = _RT_ACTION.replace(
-            "runs:\n", "inputs:\n  targets:\n    default: ${{ github.ref_name }}\nruns:\n"
-        )
-        self.assertRefused("input defaults.targets", action=defaults)
+        defaults = self.swap(_RT_ACTION, '    required: false\n    default: ""\n\nruns:', '    required: false\n    default: ${{ github.ref_name }}\n\nruns:')
+        self.assertRefused("rust-toolchain-pinned' inputs (descriptions aside).targets.default is", action=defaults)
         spliced = _RT_ACTION + "    - shell: bash\n      run: echo ${{ steps.channel.outputs.channel }}\n"
-        self.assertRefused("reads the `steps` context", action=spliced)
+        self.assertRefused("rust-toolchain-pinned' has 4 steps where its pin has 3", action=spliced)
+        default = self.swap(_RT_TOOLCHAIN, "    required: true\n", "    required: true\n    default: x86_64-unknown-linux-musl\n")
+        self.assertRefused("release-target-toolchain' inputs (descriptions aside).target has keys", toolchain=default)
+        top = _RT_TOOLCHAIN + "outputs:\n  x:\n    value: y\n"
+        self.assertRefused("release-target-toolchain' has a top-level `outputs`", toolchain=top)
 
     def test_freebsd_strategy_refused(self) -> None:
         strategy = "    strategy:\n      matrix:\n        include:\n          - flags: x\n"
@@ -6874,60 +6959,59 @@ class TestReleaseTargetParity(unittest.TestCase):
         release = _RT_RELEASE.replace("  build-freebsd:\n", "  build-freebsd:\n" + strategy, 1)
         self.assertNotEqual(ci, _RT_CI)
         self.assertNotEqual(release, _RT_RELEASE)
-        self.assertRefused("FreeBSD job has a `strategy`", ci, release)
+        self.assertRefused("ci.yml job 'release-targets-freebsd' has a job `strategy`", ci, release)
+        self.assertRefused("release.yml job 'build-freebsd' has a job `strategy`", ci, release)
 
     # GitHub reads each scalar as YAML 1.2 does and hands a step its own text
     # of it; the checker compares the loaded value, so the type is part of it.
 
-    _CARGO_ENV = "        env:\n          TARGET: ${{ matrix.target }}\n"
-
-    def with_cargo_env(self, ci_line: str, release_line: str) -> tuple[str, str]:
-        return (
-            self.swap(_RT_CI, self._CARGO_ENV, self._CARGO_ENV + f"          {ci_line}\n"),
-            self.swap(_RT_RELEASE, self._CARGO_ENV, self._CARGO_ENV + f"          {release_line}\n"),
-        )
-
     def test_env_values_equal_only_as_typed_text(self) -> None:
-        for ci_line, release_line, needle in (
-            ("RUSTFLAGS: 1", "RUSTFLAGS: true", "sets ['RUSTFLAGS'] to a non-string"),
-            ("RUSTFLAGS: '1'", "RUSTFLAGS: 'true'", "`RUSTFLAGS` = '1' in ci.yml"),
-            ("RUSTFLAGS: 0x2", "RUSTFLAGS: 2", "spell it as YAML 1.2 does"),
-            ("RUSTFLAGS: yes", "RUSTFLAGS: true", "spell it as YAML 1.2 does"),
-            ("RUSTFLAGS: 2", "RUSTFLAGS: 2", "sets ['RUSTFLAGS'] to a non-string"),
+        for line, needle in (
+            ("CARGO_INCREMENTAL: 0", "ci.yml workflow env.CARGO_INCREMENTAL is 0, which must be exactly '0'"),
+            ("CARGO_INCREMENTAL: 0x0", "spell it as YAML 1.2 does"),
+            ("CARGO_INCREMENTAL: no", "spell it as YAML 1.2 does"),
+            ("CARGO_INCREMENTAL: false", "ci.yml workflow env.CARGO_INCREMENTAL is False, which must be exactly '0'"),
         ):
-            with self.subTest(ci=ci_line, release=release_line):
-                self.assertRefused(needle, *self.with_cargo_env(ci_line, release_line))
-        self.assertEqual(self.errors(*self.with_cargo_env("RUSTFLAGS: '2'", "RUSTFLAGS: '2'")), [])
+            with self.subTest(line=line):
+                self.assertRefused(needle, self.swap(_RT_CI, "  CARGO_INCREMENTAL: '0'\n", f"  {line}\n"))
+        for line in ('CARGO_INCREMENTAL: "0"', "CARGO_INCREMENTAL: '0'"):
+            with self.subTest(line=line):
+                self.assertEqual(self.errors(self.swap(_RT_CI, "  CARGO_INCREMENTAL: '0'\n", f"  {line}\n")), [])
+        usesh = self.swap(_RT_CI, "usesh: true", "usesh: 'true'")
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.usesh is 'true', which must be exactly True", usesh)
 
     def test_matrix_values_equal_only_as_typed_text(self) -> None:
-        env_write = '        run: echo "RUSTFLAGS=${{ matrix.flags }}" >> "$GITHUB_ENV" && sudo apt-get update'
-        ci, release = self.both(self._APT, env_write)
-        for ci_line, release_line, needle in (
-            ("flags: 1", "flags: true", "is a non-string scalar"),
-            ("flags: '1'", "flags: 'true'", "matrix `flags` for target 'x86_64-unknown-linux-musl'"),
-            ("flags: 0x2", "flags: 2", "spell it as YAML 1.2 does"),
+        for value, needle in (
+            ("1", "each a literal string"),
+            ("true", "each a literal string"),
+            ("0x2", "spell it as YAML 1.2 does"),
         ):
-            with self.subTest(ci=ci_line, release=release_line):
-                c = self.swap(ci, self._MUSL_LEG, self._MUSL_LEG + f"            {ci_line}\n")
-                r = self.swap(release, self._MUSL_LEG, self._MUSL_LEG + f"            {release_line}\n")
-                self.assertRefused(needle, c, r)
+            with self.subTest(value=value):
+                leg = ("            target: x86_64-unknown-linux-musl\n", f"            target: {value}\n")
+                self.assertRefused(needle, self.swap(_RT_CI, *leg), self.swap(_RT_RELEASE, *leg))
 
     def test_line_continuation_joins_a_runner_name(self) -> None:
-        for text, needle in (
-            ('$GITHUB\\\n_REF_NAME', "`GITHUB_REF_NAME`"),
-            ('$GIT\\\nHUB_REF', "`GITHUB_REF`"),
-            ('$GITHUB`\n_REF_NAME', "`GITHUB_REF_NAME`"),
-        ):
+        # Before the cargo command no continuation can be written at all.
+        for text in ('$GITHUB\\\n_REF_NAME', '$GIT\\\nHUB_REF', '$GITHUB`\n_REF_NAME'):
             with self.subTest(text=text):
-                guard = '        run: |\n          echo "RUSTFLAGS=--cfg ' + text.replace("\n", "\n          ").replace("\r\n          ", "\r\n") + '" >> "$GITHUB_ENV"\n          sudo apt-get update'
-                self.assertRefused(needle, *self.both(self._APT, guard))
-        # A double-quoted scalar keeps a carriage return the shell also joins over.
-        crlf = '        run: "echo \\"RUSTFLAGS=--cfg $GITHUB\\\\\\r\\n_REF_NAME\\" >> \\"$GITHUB_ENV\\" && sudo apt-get update && sudo apt-get install -y musl-tools"'
-        self.assertRefused("`GITHUB_REF_NAME`", *self.both(self._APT + " && sudo apt-get install -y musl-tools", crlf))
+                toolchain = self.swap(
+                    _RT_TOOLCHAIN,
+                    "      run: sudo apt-get update",
+                    '      run: |\n        echo "RUSTFLAGS=--cfg ' + text.replace("\n", "\n        ") + '" >> "$GITHUB_ENV"\n        sudo apt-get update',
+                )
+                self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        # After it, the tail scan joins continuations before it names a program.
+        for split in ("CAR\\\n            GO build", "car\\\r\n            go build"):
+            with self.subTest(split=split):
+                release = self.swap(
+                    _RT_RELEASE, "            cp target/release/ipe dist/ipe\n", f"            cp target/release/ipe dist/ipe\n            {split}\n"
+                )
+                self.assertRefused("runs `cargo` after the cargo command", release=release)
 
     def test_runner_variable_refused(self) -> None:
-        guard = '        run: echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV" && sudo apt-get update'
-        self.assertRefused("names the runner variable `RUNNER_DEBUG`", *self.both(self._APT, guard))
+        toolchain = self.swap(_RT_TOOLCHAIN, "run: sudo apt-get update", 'run: echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV" && sudo apt-get update')
+        self.assertRefused("release-target-toolchain' step 3.run is", toolchain=toolchain)
+        self.assertRefusedBeforeCargo('echo "RUSTFLAGS=--cfg d$RUNNER_DEBUG" >> "$GITHUB_ENV"')
 
     _TAG_REF = "          ref: ${{ needs.resolve-tag.outputs.tag }}\n"
 
@@ -6935,17 +7019,19 @@ class TestReleaseTargetParity(unittest.TestCase):
         for ref in ("main", "${{ github.event.inputs.ref }}", "${{ needs.resolve-tag.outputs.tag }}x"):
             with self.subTest(ref=ref):
                 release = self.swap(_RT_RELEASE, self._TAG_REF, f"          ref: {ref}\n")
-                self.assertRefused("first step must check out `ref: ${{ needs.resolve-tag.outputs.tag }}`", release=release)
+                self.assertRefused("release.yml job 'build' step 1.with.ref is", release=release)
+                self.assertRefused("release.yml job 'build-freebsd' step 1.with.ref is", release=release)
+        release = self.swap(_RT_RELEASE, self._TAG_REF, self._TAG_REF + "          fetch-depth: 0\n")
+        self.assertRefused("release.yml job 'build' step 1.with has keys", release=release)
         release = self.swap(_RT_RELEASE, "    needs: resolve-tag\n", "")
-        self.assertRefused("job 'build' must need `resolve-tag`", release=release)
+        self.assertRefused("release.yml job 'build' must need `resolve-tag`", release=release)
         second = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: main\n"
-        anchor = "      - name: Install musl toolchain (linux)\n"
-        ci = self.swap(_RT_CI, anchor, "      - uses: actions/checkout@0000000000000000000000000000000000000000\n" + anchor)
-        release = self.swap(_RT_RELEASE, anchor, second + anchor)
+        ci, release = self.before_cargo(second)
         self.assertRefused("release.yml job 'build' step 3 runs `actions/checkout@", ci, release)
+        self.assertRefused("release.yml job 'build' step 3 has keys", ci, release)
 
     def test_quoted_and_unquoted_cargo_arguments_differ(self) -> None:
-        self.assertRefused("native cargo command", self.swap(_RT_CI, '--target "$TARGET"', "--target $TARGET"))
+        self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", self.swap(_RT_CI, '--target "$TARGET"', "--target $TARGET"))
 
     def test_second_cargo_invocation_refused(self) -> None:
         upload = "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
@@ -6958,123 +7044,166 @@ class TestReleaseTargetParity(unittest.TestCase):
             "echo -p | xargs cargo build",
             "sh -c 'cargo build --release -p ipe'",
             "c=cargo; $c build",
+            'c""argo build',
+            "/usr/bin/CARGO.exe build",
         ):
             with self.subTest(line=line):
                 release = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", f"            cp target/release/ipe dist/ipe\n            {line}\n")
-                self.assertRefused("job 'build-freebsd' runs cargo", release=release)
+                self.assertRefused("release.yml job 'build-freebsd' step 2 with.run (after the cargo line) runs `cargo`", release=release)
                 later = f"      - shell: bash\n        run: {line}\n"
                 release = self.swap(_RT_RELEASE, upload, later + upload)
-                self.assertRefused("job 'build-freebsd' runs cargo", release=release)
-        native = self.swap(_RT_RELEASE, '\n          mkdir -p dist\n          cp "', '\n          mkdir -p dist\n          cargo build --release -p ipe\n          cp "')
-        self.assertRefused("job 'build' must have exactly one cargo command, has 2", release=native)
-        # The shell joins `CAR\` + newline + `GO`; a case-insensitive file system runs it as cargo.
-        split = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", "            cp target/release/ipe dist/ipe\n            CAR\\\n            GO build\n")
-        self.assertRefused("job 'build-freebsd' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", release=split)
+                self.assertRefused("release.yml job 'build-freebsd' step 3 run: runs `cargo`", release=release)
+                native = self.swap(_RT_RELEASE, '          mkdir -p dist\n          cp "', f"          mkdir -p dist\n          {line}\n          cp \"")
+                self.assertRefused("release.yml job 'build' step 4 run: runs `cargo`", release=native)
+        # A cargo step only ci.yml runs is a step its pins do not hold.
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", _RT_CI.replace("  release-targets-freebsd:\n", "      - shell: bash\n        run: cargo build\n  release-targets-freebsd:\n", 1))
 
     _CHECKOUT = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
-    _MUSL = "      - name: Install musl toolchain (linux)\n"
     _UPLOAD = "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
 
     def test_first_step_is_the_only_checkout(self) -> None:
         # With no `ref`, on a dispatch, a second checkout builds the dispatching branch over the tag.
         for second in (self._CHECKOUT, self._CHECKOUT + "        with:\n          fetch-depth: 0\n"):
             with self.subTest(second=second):
-                ci = self.swap(_RT_CI, self._MUSL, second + self._MUSL)
-                release = self.swap(_RT_RELEASE, self._MUSL, second + self._MUSL)
+                ci, release = self.before_cargo(second)
                 self.assertRefused("release.yml job 'build' step 3 runs `actions/checkout@", ci, release)
                 self.assertRefused("ci.yml job 'release-targets-run' step 3 runs `actions/checkout@", ci, release)
         # After the cargo step too, and in the FreeBSD jobs.
         release = self.swap(_RT_RELEASE, self._UPLOAD, self._CHECKOUT + self._UPLOAD)
         self.assertRefused("release.yml job 'build-freebsd' step 3 runs `actions/checkout@", release=release)
+        release = self.swap(_RT_RELEASE, "      - name: Stage\n", self._CHECKOUT + "      - name: Stage\n")
+        self.assertRefused("release.yml job 'build' step 4 runs `actions/checkout@", release=release)
         ci = _RT_CI + self._CHECKOUT
         self.assertRefused("ci.yml job 'release-targets-freebsd' step 3 runs `actions/checkout@", ci)
-        # And in a local action a job step uses.
-        action = _RT_ACTION + "    - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+        # And in a local action a job step uses, at any depth.
+        checkout = "    - uses: actions/checkout@0000000000000000000000000000000000000000\n"
         self.assertRefused(
-            "release.yml job 'build' step 2 -> ./.github/actions/rust-toolchain-pinned step 3 runs `actions/checkout@",
-            action=action,
+            "release.yml job 'build' step 2 -> ./.github/actions/release-target-toolchain step 4 runs `actions/checkout@",
+            toolchain=_RT_TOOLCHAIN + checkout,
+        )
+        self.assertRefused(
+            "release.yml job 'build' step 2 -> ./.github/actions/release-target-toolchain step 1 -> "
+            "./.github/actions/rust-toolchain-pinned step 4 runs `actions/checkout@",
+            action=_RT_ACTION + checkout,
         )
         ci = self.swap(_RT_CI, "      - uses: actions/checkout@0000000000000000000000000000000000000000\n      - uses: ./", "      - uses: ./")
-        self.assertRefused("ci.yml job 'release-targets-run''s first step must be its checkout", ci)
+        self.assertRefused("ci.yml job 'release-targets-run' step 1 has keys", ci)
 
     def test_checkout_is_recognised_case_insensitively(self) -> None:
         # GitHub reads owner and repo case-insensitively.
         for spelling in ("Actions/Checkout", "ACTIONS/checkout", "actions/checkout/sub"):
             with self.subTest(spelling=spelling):
                 second = f"      - uses: {spelling}@0000000000000000000000000000000000000000\n        with:\n          ref: main\n"
-                ci = self.swap(_RT_CI, self._MUSL, second + self._MUSL)
-                release = self.swap(_RT_RELEASE, self._MUSL, second + self._MUSL)
+                release = self.swap(_RT_RELEASE, "      - name: Stage\n", second + "      - name: Stage\n")
+                self.assertRefused(f"release.yml job 'build' step 4 runs `{spelling}@", release=release)
+                ci, release = self.before_cargo(second)
                 self.assertRefused(f"release.yml job 'build' step 3 runs `{spelling}@", ci, release)
+                first = self.swap(_RT_CI, "actions/checkout@0000000000000000000000000000000000000000\n      - uses: ./", f"{spelling}@0000000000000000000000000000000000000000\n      - uses: ./")
+                self.assertRefused("ci.yml job 'release-targets-run' step 1.uses is", first)
+        # The shared step's path is matched exactly, case included.
+        for path in ("./.github/actions/Release-Target-Toolchain", "./.github/actions/release-target-toolchain/", ".github/actions/release-target-toolchain"):
+            with self.subTest(path=path):
+                ci = self.swap(_RT_CI, "      - uses: ./.github/actions/release-target-toolchain\n", f"      - uses: {path}\n")
+                self.assertRefused("ci.yml job 'release-targets-run' step 2.uses is", ci)
         upper = self.swap(_RT_RELEASE, self._UPLOAD, self._UPLOAD.replace("actions/upload-artifact", "Actions/Upload-Artifact"))
         upper = self.swap(upper, "name: ipe-freebsd-x64\n", "name: ipe-unexpected\n")
         self.assertRefused("publishes 'ipe-unexpected' but its completeness gate does not expect it", release=upper)
 
     def test_tree_mover_before_cargo_refused(self) -> None:
-        for line, name in (
-            ("git fetch origin main && git checkout FETCH_HEAD", "git"),
-            ("GIT_DIR=.git git checkout main", "git"),
-            ("command git checkout main", "git"),
-            ("sudo git reset --hard origin/main", "git"),
-            ('g""it checkout main', "git"),
-            ("sh -c 'g\"\"it checkout main'", "git"),
-            ("/usr/bin/GIT.exe checkout main", "git"),
-            ("gh pr checkout 1", "gh"),
+        for line in (
+            "git fetch origin main && git checkout FETCH_HEAD",
+            "GIT_DIR=.git git checkout main",
+            "command git checkout main",
+            "sudo git reset --hard origin/main",
+            'g""it checkout main',
+            "sh -c 'g\"\"it checkout main'",
+            "/usr/bin/GIT.exe checkout main",
+            "gh pr checkout 1",
+            "gi\\\nt checkout main",
         ):
             with self.subTest(line=line):
-                step = f"      - shell: bash\n        run: {line}\n"
-                ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
-                release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
-                self.assertRefused(f"release.yml native job step 3.run: {line!r} runs `{name}`", ci, release)
-        # A continuation split, a VM line before cargo, and a local action.
-        step = "      - shell: bash\n        run: |\n          gi\\\n          t checkout main\n"
-        ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
-        release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
-        self.assertRefused("runs `git`, which can move the checked-out tree", ci, release)
-        vm = "          run: |\n            git checkout main\n            cargo "
-        ci = self.swap(_RT_CI, "          run: |\n            cargo ", vm)
-        release = self.swap(_RT_RELEASE, "          run: |\n            cargo ", vm)
-        self.assertRefused("release.yml FreeBSD job cargo step line: 'git checkout main' runs `git`", ci, release)
-        action = self.swap(_RT_ACTION, 'run: echo "channel=1.0"', 'run: git checkout main; echo "channel=1.0"')
-        self.assertRefused("rust-toolchain-pinned step 1.run: 'git checkout main;", action=action)
-        # `.github` and `GH_TOKEN` name neither.
-        step = "      - shell: bash\n        env:\n          GH_TOKEN: x\n        run: ls .github\n"
-        ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
-        release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
-        self.assertEqual(self.errors(ci, release), [])
+                self.assertRefusedBeforeCargo(line)
+        action = self.swap(_RT_ACTION, "        set -euo pipefail\n", "        set -euo pipefail\n        git checkout main\n")
+        self.assertRefused("rust-toolchain-pinned' step 1.run is", action=action)
+        # A step naming neither `git` nor `gh` is refused too: before the cargo
+        # command only the pinned steps run.
+        self.assertRefusedBeforeCargo("ls .github")
+        ci, release = self.before_cargo("      - shell: bash\n        env:\n          GH_TOKEN: x\n        run: ls .github\n")
+        self.assertRefused("release.yml job 'build' step 3.env has keys", ci, release)
+        action = self.swap(_RT_ACTION, "      run: rustc --version\n", "      run: rustc --version\n\n    - shell: bash\n      run: rustc --version\n")
+        self.assertRefused("rust-toolchain-pinned' has 4 steps where its pin has 3", action=action)
 
     def test_program_named_at_run_time_before_cargo_refused(self) -> None:
         for line in ("\"$(printf '\\x67it')\" checkout main", "$TOOL checkout main", "env $TOOL checkout main", 'eval "$TOOL"'):
             with self.subTest(line=line):
-                step = f"      - shell: bash\n        run: |\n          {line}\n"
-                ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
-                release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
-                self.assertRefused("runs a program named at run time", ci, release)
+                self.assertRefusedBeforeCargo(line)
+
+    def test_glob_built_program_name_before_cargo_refused(self) -> None:
+        for line in (
+            "[g]it checkout main",
+            "/usr/bin/[g]it checkout main",
+            "/usr/*/gi? checkout main",
+            "[c]argo build --release -p ipe",
+            "RUSTFLAGS=--cfg=evil [c]argo build --release -p ipe",
+        ):
+            with self.subTest(line=line):
+                self.assertRefusedBeforeCargo(line)
+
+    def test_alias_or_hashed_program_before_cargo_refused(self) -> None:
+        for line in (
+            "shopt -s expand_aliases; alias x=/usr/bin/[g]it",
+            "hash -p /usr/bin/[g]it x; x checkout main",
+            "hash -p /tmp/shim/fake x; x build",
+            "x() { /usr/bin/[g]it \"$@\"; }; x checkout main",
+            "PATH=/tmp/shim:$PATH",
+        ):
+            with self.subTest(line=line):
+                self.assertRefusedBeforeCargo(line)
+
+    def test_tree_moved_without_naming_git_before_cargo_refused(self) -> None:
+        for line in (
+            "curl -sSL https://example.invalid/t.tgz | tar xz --strip-components=1",
+            "wget -qO- https://example.invalid/t.tgz | tar xz",
+            "rsync -a /tmp/tree/ ./",
+            "python3 -c \"import shutil; shutil.copytree('/tmp/tree', '.', dirs_exist_ok=True)\"",
+            "cp -r /tmp/tree/. .",
+        ):
+            with self.subTest(line=line):
+                self.assertRefusedBeforeCargo(line)
 
     def test_compiler_at_or_after_cargo_refused(self) -> None:
         later = "      - shell: bash\n        run: rustc -O src/main.rs -o dist/ipe\n"
         release = self.swap(_RT_RELEASE, "  build-freebsd:\n", later + "  build-freebsd:\n")
-        self.assertRefused("release.yml job 'build' step 5.run runs `rustc` at or after the cargo step", release=release)
+        self.assertRefused("release.yml job 'build' step 5 run: runs `rustc` after the cargo command", release=release)
         release = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", "            rustc -O src/main.rs -o dist/ipe\n")
-        self.assertRefused("job 'build-freebsd' step 2.with.run runs `rustc` at or after the cargo step", release=release)
-        # A cargo subcommand binary is a cargo invocation the shell count does not read.
+        self.assertRefused("release.yml job 'build-freebsd' step 2 with.run (after the cargo line) runs `rustc`", release=release)
+        # A cargo subcommand binary is a cargo invocation too.
         zig = "      - shell: bash\n        run: cargo-zigbuild zigbuild --release -p ipe\n"
         release = self.swap(_RT_RELEASE, "  build-freebsd:\n", zig + "  build-freebsd:\n")
-        self.assertRefused("job 'build' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", release=release)
-        # Before the cargo step rustc only reports its version.
-        action = _RT_ACTION + "    - shell: bash\n      run: rustc --version\n"
-        self.assertEqual(self.errors(action=action), [])
+        self.assertRefused("release.yml job 'build' step 5 run: runs `cargo` after the cargo command", release=release)
+        # Before the cargo step rustc only reports its version, in the one pinned step.
+        action = _RT_ACTION + "    - shell: bash\n      run: rustc -O src/main.rs\n"
+        self.assertRefused("rust-toolchain-pinned' has 4 steps where its pin has 3", action=action)
+        action = self.swap(_RT_ACTION, "      run: rustc --version\n", "      run: rustc -O src/main.rs\n")
+        self.assertRefused("rust-toolchain-pinned' step 3.run is", action=action)
 
     def test_run_steps_name_bash(self) -> None:
         for shell in ("cmd", "pwsh", "sh", "bash -c 'git checkout main; bash {0}'"):
             with self.subTest(shell=shell):
-                ci = self.swap(_RT_CI, "        shell: bash\n        run: sudo", f"        shell: {shell}\n        run: sudo")
-                release = self.swap(_RT_RELEASE, "        shell: bash\n        run: sudo", f"        shell: {shell}\n        run: sudo")
-                self.assertRefused(f"release.yml job 'build' step 3 runs under `shell: {shell!r}`", ci, release)
+                toolchain = self.swap(_RT_TOOLCHAIN, "      shell: bash\n      run: sudo", f"      shell: {shell}\n      run: sudo")
+                self.assertRefused(
+                    f"release.yml job 'build' step 2 -> ./.github/actions/release-target-toolchain step 3 runs under `shell: {shell!r}`",
+                    toolchain=toolchain,
+                )
+                release = self.swap(_RT_RELEASE, "        shell: bash\n        env:\n          TARGET: ${{ matrix.target }}\n          EXT:", f"        shell: {shell}\n        env:\n          TARGET: ${{{{ matrix.target }}}}\n          EXT:")
+                self.assertRefused(f"release.yml job 'build' step 4 runs under `shell: {shell!r}`", release=release)
         # The runner's default shell is PowerShell on Windows.
-        ci = self.swap(_RT_CI, "        shell: bash\n        run: sudo", "        run: sudo")
-        release = self.swap(_RT_RELEASE, "        shell: bash\n        run: sudo", "        run: sudo")
-        self.assertRefused("release.yml job 'build' step 3 runs under `shell: None`", ci, release)
-        action = self.swap(_RT_ACTION, "      shell: bash\n", "      shell: pwsh\n")
+        toolchain = self.swap(_RT_TOOLCHAIN, "      shell: bash\n      run: sudo", "      run: sudo")
+        self.assertRefused("release-target-toolchain step 3 runs under `shell: None`", toolchain=toolchain)
+        later = "      - run: echo after\n"
+        release = self.swap(_RT_RELEASE, "  build-freebsd:\n", later + "  build-freebsd:\n")
+        self.assertRefused("release.yml job 'build' step 5 runs under `shell: None`", release=release)
+        action = self.swap(_RT_ACTION, "      shell: bash\n      run: |\n", "      shell: pwsh\n      run: |\n")
         self.assertRefused("rust-toolchain-pinned step 1 runs under `shell: 'pwsh'`", action=action)
 
 
