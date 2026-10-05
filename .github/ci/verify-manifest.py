@@ -384,7 +384,11 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       else, each pair equal but for its `name` and the `with.ref` of
       release.yml's first step, which must be a checkout of exactly
       `${{ needs.resolve-tag.outputs.tag }}` in a job that needs
-      `resolve-tag`; any later checkout with a `ref` is refused.  Values are
+      `resolve-tag`.  In all four jobs the first step is the only checkout
+      (`uses:` read with owner and repo case-folded, as GitHub reads them): a
+      second one anywhere in the job or its local actions, `ref` or none, is
+      refused.  Every `run` step of the four jobs, local actions included,
+      names `shell: bash`, the shell the run-text scans read.  Values are
       compared typed (`1` is not `true`, nor `'1'`), and an `env` or read
       matrix value that is not a string is refused, since GitHub hands the
       step its own text of it; the shared loader refuses a plain scalar YAML
@@ -399,8 +403,12 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       job runs cargo exactly once, in the cargo step: every invocation the
       shell reader finds (behind an env prefix, `env`, `command`, `exec`,
       `time`, `sh -c`) in any step or local action is counted, a `cargo`
-      word it cannot read as one (`xargs cargo`, `c=cargo; $c`) is refused,
-      so release.yml's packaging steps cannot rebuild what it ships.  The environments are equal
+      word it cannot read as one (`xargs cargo`, `c=cargo; $c`,
+      `cargo-zigbuild`) is refused, and so is a `rustc` word at or after the
+      cargo step.  Before the cargo step a `git` or `gh` word (as written,
+      continuations joined, or as the shell reads it: `g""it`, an `sh -c`
+      body) is refused, as is a command whose program, or a command runner's
+      operand (`env`, `sudo`, `eval`, ..), is built at run time.  The environments are equal
       but for the closed, value-pinned `ALLOWED_ENV_DIFFERENCES`, each entry
       named with its why; an entry no longer used is refused, and so is any
       read of an allowed name where it is visible (the whole region for a
@@ -431,7 +439,12 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       dynamically (`${!x}`, `printenv`, `env`, `eval`), the internals of the
       third-party actions (checkout, rust-cache, the toolchain and VM
       actions), and a build script or proc-macro reading an allowed name are
-      not proven absent.
+      not proven absent.  LIMIT: steps after the cargo step (packaging) are
+      unverified and can replace or rebuild the shipped artifact (`curl -o
+      dist/ipe`, a script, a compiler named at run time); the counts above
+      refuse only the spellings they read.  LIMIT: a program run from a file
+      in the tree (a script, a build tool) before the cargo step is read by
+      no scan, nor is a tree move inside a third-party action.
   LIMIT (checks 15, 16, 20, 22, 23): a cargo line is read as run, not
   proven to reach its step's exit status — `cargo .. || true`, an `exit 0`
   before it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail`
@@ -520,6 +533,17 @@ MOLD_INSTALL_WORD_RE = re.compile(r"(?:^|[|;&(]\s*|(?<![A-Za-z0-9_-])sudo\s+)(?:
 # `/` (a subpath), so `owner/repo/sub@ref` names the same action as
 # `owner/repo@ref`.
 USES_REPO_RE = re.compile(r"([^/@]+/[^/@]+)(?=[/@])")
+
+
+def uses_action(uses: object, owner_repo: str) -> bool:
+    """Whether a `uses:` value runs the remote action `owner_repo`, at any ref
+    or subpath. GitHub reads owner and repo case-insensitively, so
+    `Actions/Checkout@v4` is `actions/checkout`: every recogniser of a remote
+    action goes through this one comparison."""
+    if not isinstance(uses, str):
+        return False
+    m = USES_REPO_RE.match(uses.casefold())
+    return m is not None and m[1] == owner_repo.casefold()
 # No job wraps or replaces rustc. SSOT: every env-var name that hands rustc a
 # wrapper.
 RUSTC_WRAPPER_VAR = "RUSTC_WRAPPER"
@@ -1023,10 +1047,6 @@ class Step:
     @property
     def uses(self) -> str | None:
         return self._str("uses")
-
-    @property
-    def uses_folded(self) -> str:
-        return (self.uses or "").casefold()
 
     @property
     def run(self) -> str | None:
@@ -1583,8 +1603,7 @@ def _downloads_archive(job: dict) -> bool:
         uses = st.get("uses")
         with_ = st.get("with")
         if (
-            isinstance(uses, str)
-            and uses.startswith("actions/download-artifact@")
+            uses_action(uses, "actions/download-artifact")
             and isinstance(with_, dict)
             and with_.get("name") == HEAVY_SHARD_ARTIFACT
         ):
@@ -2551,7 +2570,7 @@ WASM_RUNNERS: dict[str, tuple[str, str, str]] = {
     "wasm32-unknown-unknown": ("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER", "wasm-bindgen-test-runner", "wasm-bindgen"),
 }
 WASM_RUNNER_CRATES = frozenset({"wasm-bindgen-cli"})
-_TOOL_INSTALLER = "taiki-e/install-action@"
+_TOOL_INSTALLER = "taiki-e/install-action"
 # The one step `if:` a claim step may carry: the release-only trivial pass.
 _CLAIM_STEP_GUARDS = frozenset({"needs.changes.outputs.release_only != 'true'"})
 _TEST_RUNS = frozenset({"test", "nextest run", "bench"})
@@ -2670,7 +2689,7 @@ def _claim_config(repo: str, platform: str) -> str | None:
 def _tool_pins(step: dict) -> list[str]:
     """The `tool:` items of a `taiki-e/install-action` step, else none."""
     uses = step.get("uses")
-    if not isinstance(uses, str) or not uses.startswith(_TOOL_INSTALLER):
+    if not uses_action(uses, _TOOL_INSTALLER):
         return []
     with_ = step.get("with")
     tool = with_.get("tool") if isinstance(with_, dict) else None
@@ -2867,7 +2886,7 @@ def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
                 if inv.subcommand == "install" and any(c.split("@", 1)[0] in WASM_RUNNER_CRATES for c in inv.install_crates):
                     errors.append(
                         f"check 20: {loc_job} runs `{found.line}`; install the runner through the pinned "
-                        f"{_TOOL_INSTALLER.rstrip('@')} step instead; refused"
+                        f"{_TOOL_INSTALLER} step instead; refused"
                     )
                 if inv.subcommand not in _TEST_RUNS or inv.no_run or not (inv.target or "").startswith("wasm32"):
                     continue
@@ -3080,7 +3099,7 @@ def _artifact_steps(job: dict, action: str) -> set[str]:
         if not isinstance(st, dict):
             continue
         uses, with_ = st.get("uses"), st.get("with")
-        if isinstance(uses, str) and uses.startswith(f"actions/{action}-artifact@"):
+        if uses_action(uses, f"actions/{action}-artifact"):
             name = with_.get("name") if isinstance(with_, dict) else None
             out.add(name if isinstance(name, str) else "")
     return out
@@ -4185,10 +4204,7 @@ def _uses_repo(st: Step, owner_repo: str) -> bool:
     """Whether `st` runs the remote action `owner_repo` (case-folded), at any
     ref or subpath. A name ban is hygiene, not a trust boundary: a fork under
     another owner passes it, and check 7's SHA pin is what bounds that."""
-    if st.uses is None:
-        return False
-    m = USES_REPO_RE.match(st.uses_folded)
-    return m is not None and m[1] == owner_repo.casefold()
+    return uses_action(st.uses, owner_repo)
 
 
 def _refuse_rust_cache_save(st: Step, loc: str, errors: list[str]) -> None:
@@ -5758,8 +5774,9 @@ def _cargo_lines(text: object) -> list[str]:
 
 # The word `cargo` (or `cargo.exe`) anywhere in a step's strings, as a
 # second, spelling-level count beside `cargo_invocation.in_shell`'s: a path
-# component (`~/.cargo/bin`) or a variable name (`CARGO_HOME`) is not one.
-_CARGO_WORD_RE = re.compile(r"(?<![A-Za-z0-9_.-])cargo(?:\.exe)?(?![A-Za-z0-9_-])", re.IGNORECASE)
+# component (`~/.cargo/bin`) or a variable name (`CARGO_HOME`) is not one; a
+# cargo subcommand binary (`cargo-zigbuild`) is.
+_CARGO_WORD_RE = re.compile(r"(?<![A-Za-z0-9_.-])cargo(?:\.exe)?(?![A-Za-z0-9_])", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -5842,6 +5859,17 @@ def _cargo_step(
             "another invocation, before or after it, can rebuild what the job ships; refused"
         )
         return None
+    at = next(n for n, st in enumerate(_steps_of(job), start=1) if st is step)
+    for js in _job_steps(job, where, repo, errors):
+        if js.top < at:
+            continue
+        body = {k: v for k, v in js.step.items() if k != "name"}
+        for w, text, _b in _region_strings(body, js.where, False, errors):
+            for name in sorted(_named_commands(text, _COMPILERS)):
+                errors.append(
+                    f"check 23: {w} runs `{name}` at or after the cargo step: a compiler run outside cargo can "
+                    "rebuild what the job ships; refused"
+                )
     if "if" in step or "continue-on-error" in step:
         errors.append(
             f"check 23: {where}: the step running `{line}` has an `if:` or `continue-on-error`, so the job "
@@ -5942,7 +5970,7 @@ def _step_with_run(job: dict, needle: str) -> dict | None:
 # job: its place in the CI phase graph (check 11 governs `needs` and `if`), its
 # timeout, its display name, and the matrix and steps compared on their own.
 _PARITY_FREE_JOB_KEYS = frozenset({"name", "needs", "if", "timeout-minutes", "strategy", "steps"})
-_CHECKOUT_ACTION = "actions/checkout@"
+_CHECKOUT_ACTION = "actions/checkout"
 # The job that parses the release tag, and the one `ref` a release build
 # checks out: the tag it parsed. ci.yml checks the tree under test instead.
 RELEASE_TAG_JOB = "resolve-tag"
@@ -5950,7 +5978,7 @@ RELEASE_CHECKOUT_REF = "${{ needs.resolve-tag.outputs.tag }}"
 
 
 def _is_checkout(step: dict) -> bool:
-    return str(step.get("uses", "")).startswith(_CHECKOUT_ACTION)
+    return uses_action(step.get("uses"), _CHECKOUT_ACTION)
 
 
 def _tag_ref_set_aside(steps: list[dict], step: dict) -> bool:
@@ -5966,30 +5994,53 @@ def _tag_ref_set_aside(steps: list[dict], step: dict) -> bool:
     )
 
 
-def _check_release_checkout(job: dict, where: str, errors: list[str]) -> None:
-    """A release build checks out the parsed tag and nothing else: its first
-    step is a checkout whose `ref` is exactly `RELEASE_CHECKOUT_REF`, the
-    job needs `RELEASE_TAG_JOB` (else the expression reads empty and the
-    checkout falls back to the event's ref, a branch on a dispatch), and no
-    later checkout carries a `ref`. Any other `ref` — a branch, a `github.*`
-    value, a second checkout over the first — builds a tree other than the
-    tag's, which ci.yml never checked."""
+def _check_checkouts(job: dict, where: str, side: _Side, repo: str, errors: list[str]) -> None:
+    """A release-target job's first step is its one checkout: a second one,
+    anywhere in the job or in a local action it uses, replaces the tree the
+    job builds (with no `ref`, on a dispatch, it checks out the dispatching
+    branch over the tag). release.yml's checkout builds the parsed tag and
+    nothing else: its `ref` is exactly `RELEASE_CHECKOUT_REF`, and the job
+    needs `RELEASE_TAG_JOB` (else the expression reads empty and the checkout
+    falls back to the event's ref, a branch on a dispatch). Any other `ref` —
+    a branch, a `github.*` value — builds a tree other than the tag's, which
+    ci.yml never checked."""
     steps = _steps_of(job)
-    needs = job.get("needs")
-    if not (needs == RELEASE_TAG_JOB or (isinstance(needs, list) and RELEASE_TAG_JOB in needs)):
-        errors.append(f"check 23: {where} must need `{RELEASE_TAG_JOB}`, whose tag its checkout builds; refused")
-    if not steps or not _tag_ref_set_aside(steps, steps[0]):
-        first = steps[0] if steps else None
-        errors.append(
-            f"check 23: {where}'s first step must check out `ref: {RELEASE_CHECKOUT_REF}`, and is {first!r}: "
-            "any other ref builds a tree other than the release tag's; refused"
-        )
-    for n, step in enumerate(steps[1:], start=2):
-        with_ = step.get("with")
-        if _is_checkout(step) and isinstance(with_, dict) and "ref" in with_:
+    if side is _Side.RELEASE:
+        needs = job.get("needs")
+        if not (needs == RELEASE_TAG_JOB or (isinstance(needs, list) and RELEASE_TAG_JOB in needs)):
+            errors.append(f"check 23: {where} must need `{RELEASE_TAG_JOB}`, whose tag its checkout builds; refused")
+        if not steps or not _tag_ref_set_aside(steps, steps[0]):
+            first = steps[0] if steps else None
             errors.append(
-                f"check 23: {where} step {n} checks out `ref: {with_['ref']!r}` after the tag's checkout: it can "
-                "replace the tree the job builds; refused"
+                f"check 23: {where}'s first step must check out `ref: {RELEASE_CHECKOUT_REF}`, and is {first!r}: "
+                "any other ref builds a tree other than the release tag's; refused"
+            )
+    elif not steps or not _is_checkout(steps[0]):
+        first = steps[0] if steps else None
+        errors.append(f"check 23: {where}'s first step must be its checkout, and is {first!r}; refused")
+    for js in _job_steps(job, where, repo, errors):
+        if (js.top != 1 or js.in_action) and _is_checkout(js.step):
+            errors.append(
+                f"check 23: {js.where} runs `{js.step.get('uses')}`, a second checkout: it can replace the tree "
+                "the job builds, and the first step is the job's only checkout; refused"
+            )
+
+
+# The one shell a release-target job's `run` steps name. Every scan of a
+# `run` text (the cargo count, the tree-mover and runner-variable scans, the
+# line-continuation joins) reads POSIX shell; a step left to the runner's
+# default runs PowerShell on Windows, and `cmd` continues a line with `^`.
+_RELEASE_TARGET_SHELL = "bash"
+
+
+def _check_shells(job: dict, where: str, repo: str, errors: list[str]) -> None:
+    """Every `run` step of `job`, its local actions' included, names `shell:
+    bash`, the shell the run-text scans read."""
+    for js in _job_steps(job, where, repo, errors):
+        if "run" in js.step and js.step.get("shell") != _RELEASE_TARGET_SHELL:
+            errors.append(
+                f"check 23: {js.where} runs under `shell: {js.step.get('shell')!r}`, which the run-text scans "
+                f"do not read as written; it must name `shell: {_RELEASE_TARGET_SHELL}`; refused"
             )
 
 
@@ -6156,6 +6207,79 @@ def _scanned_texts(text: str) -> tuple[str, ...]:
     not (inside single quotes) only adds a text to scan, never drops one."""
     joined = _LINE_CONTINUATION_RE.sub("", text)
     return (text,) if joined == text else (text, joined)
+
+
+# Commands that move the checked-out tree (`git checkout`, `git fetch` +
+# `git reset`, `gh pr checkout`, ..). Before the cargo step one would build a
+# tree other than the one checked out, on both sides alike, so the word is
+# refused whatever subcommand follows it.
+_TREE_MOVERS = frozenset({"git", "gh"})
+# A compiler run outside cargo: at or after the cargo step it can rebuild the
+# artifact the job ships.
+_COMPILERS = frozenset({"rustc"})
+# Commands that run their operands as a command: a built word among their
+# operands can name any program.
+_COMMAND_RUNNERS = frozenset(
+    {"env", "command", "exec", "builtin", "nice", "nohup", "timeout", "stdbuf", "sudo", "doas", "time", "xargs",
+     "find", "eval", "sh", "bash", "dash", "zsh", "ksh", "source", "."}
+)
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_RESERVED = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "[[", "]]"})
+_SHELL_WORD_TEXT_RE = re.compile(r"[ \t;&|()\n`]")
+_EXPRESSION_RE = re.compile(r"\$\{\{.*?\}\}", re.S)
+
+
+def _word_re(names: frozenset[str]) -> re.Pattern[str]:
+    """`names` as words of a text (`.exe` allowed after one), never part of
+    a path component, a hyphenated or an underscored name: `.github` and
+    `GH_TOKEN` name neither `git` nor `gh`."""
+    alt = "|".join(re.escape(n) for n in sorted(names))
+    return re.compile(rf"(?<![A-Za-z0-9_.-])(?:{alt})(?:\.exe)?(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _named_commands(text: str, names: frozenset[str], depth: int = 0) -> set[str]:
+    """Which of `names` `text` can run, read two ways: as words of the text
+    (as written and continuations joined) and as the shell reads it (quotes
+    removed, so `g""it` is `git`), every word of every command, the text of a
+    quoted word that holds shell syntax (an `sh -c` body, an `echo .. | sh`
+    feed) and of a here-document read again as shell, to
+    `cargo_invocation.NESTING_LIMIT` levels. Past that limit every name is
+    reported, so the caller refuses."""
+    if depth > cargo_invocation.NESTING_LIMIT:
+        return set(names)
+    found = {m.group(0).casefold().removesuffix(".exe") for t in _scanned_texts(text) for m in _word_re(names).finditer(t)}
+    joined = _EXPRESSION_RE.sub("$GITHUB_EXPRESSION", _scanned_texts(text)[-1])
+    for body in (joined, *shell_lex.heredoc_bodies(joined)):
+        for cmd in shell_lex.split_commands(body):
+            for word in cmd.words:
+                base = posixpath.basename(word).casefold().removesuffix(".exe")
+                if base in names:
+                    found.add(base)
+                if _SHELL_WORD_TEXT_RE.search(word) and word != body:
+                    found |= _named_commands(word, names, depth + 1)
+    return {n for n in names if n.casefold() in found}
+
+
+def _built_command(text: str) -> str | None:
+    """A command of shell `text` whose program this check cannot name: a
+    command word, or any operand of a command that runs its operands
+    (`env`, `sudo`, `xargs`, `sh`, `eval`, ..), built at run time from a
+    variable, an expression or a substitution. None when every command names
+    its program literally."""
+    joined = _EXPRESSION_RE.sub("$GITHUB_EXPRESSION", _scanned_texts(text)[-1])
+    for body in (joined, *shell_lex.heredoc_bodies(joined)):
+        for cmd in shell_lex.split_commands(body):
+            words = list(cmd.words)
+            while words and (words[0] in _SHELL_RESERVED or _SHELL_ASSIGNMENT_RE.match(words[0])):
+                words.pop(0)
+            if not words:
+                continue
+            line = " ".join(cmd.words)
+            if "$" in words[0] or "`" in words[0]:
+                return line
+            if posixpath.basename(words[0]) in _COMMAND_RUNNERS and any("$" in w or "`" in w for w in words[1:]):
+                return line
+    return None
 # The contexts a string of the region may read: a workflow's own strings the
 # matrix leg (compared key by key), a local action's its inputs (the compared
 # `with:`) and its own steps' outputs — the latter never inside a `run:`, where
@@ -6259,28 +6383,77 @@ def _region_strings(node: object, where: str, step_level: bool, errors: list[str
     return out
 
 
+def _local_composite(uses: str, repo: str, where: str, depth: int, errors: list[str]) -> tuple[dict, list[dict]] | None:
+    """The document and step mappings of the local composite action `uses`
+    names, or None (refused) when it nests past `LOCAL_ACTION_DEPTH_LIMIT`
+    levels or cannot be read as a composite of step mappings."""
+    rel = posixpath.normpath(uses.split("@", 1)[0][2:])
+    found = [os.path.join(repo, rel, n) for n in ("action.yml", "action.yaml") if os.path.isfile(os.path.join(repo, rel, n))]
+    if depth >= LOCAL_ACTION_DEPTH_LIMIT or len(found) != 1:
+        why = "nests local actions too deep" if found else "has no single action.yml/action.yaml"
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} {why}, so what it reads cannot be compared; refused")
+        return None
+    try:
+        with open(found[0]) as f:
+            doc = strict_yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} is unreadable ({e}); refused")
+        return None
+    runs = doc.get("runs") if isinstance(doc, dict) else None
+    steps = runs.get("steps") if isinstance(runs, dict) and runs.get("using") == "composite" else None
+    if not isinstance(steps, list) or not all(isinstance(st, dict) for st in steps):
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} is not a composite of step mappings; refused")
+        return None
+    return doc, steps
+
+
+def _refuse_once(errors: list[str], message: str) -> None:
+    """Several scans read the same local action; its refusal is listed once."""
+    if message not in errors:
+        errors.append(message)
+
+
+@dataclass(frozen=True)
+class _JobStep:
+    """A step a job runs: one of its own (`top` is its 1-based number) or one
+    of a local composite action that step uses, at any depth (`top` is the
+    number of the job step that uses it)."""
+
+    top: int
+    where: str
+    step: dict
+    in_action: bool
+
+
+def _job_steps(job: dict, where: str, repo: str, errors: list[str]) -> list[_JobStep]:
+    """Every step `job` runs, its local actions' steps included."""
+    out: list[_JobStep] = []
+
+    def walk(uses: object, top: int, swhere: str, depth: int) -> None:
+        if not (isinstance(uses, str) and uses.startswith("./")):
+            return
+        got = _local_composite(uses, repo, swhere, depth, errors)
+        for n, st in enumerate(got[1] if got else [], start=1):
+            inner = f"{swhere} -> {uses} step {n}"
+            out.append(_JobStep(top, inner, st, True))
+            walk(st.get("uses"), top, inner, depth + 1)
+
+    for n, st in enumerate(_steps_of(job), start=1):
+        swhere = f"{where} step {n}"
+        out.append(_JobStep(n, swhere, st, False))
+        walk(st.get("uses"), n, swhere, 0)
+    return out
+
+
 def _local_action_strings(uses: str, repo: str, where: str, depth: int, errors: list[str]) -> list[_RegionText]:
     """The step strings of the local composite action `uses` names and of
     every local action it uses in turn (to `LOCAL_ACTION_DEPTH_LIMIT`
     levels): an action runs in the workflow's evaluation context too. An
     action that cannot be read as a composite is refused."""
-    rel = posixpath.normpath(uses.split("@", 1)[0][2:])
-    found = [os.path.join(repo, rel, n) for n in ("action.yml", "action.yaml") if os.path.isfile(os.path.join(repo, rel, n))]
-    if depth >= LOCAL_ACTION_DEPTH_LIMIT or len(found) != 1:
-        why = "nests local actions too deep" if found else "has no single action.yml/action.yaml"
-        errors.append(f"check 23: {where}: local action {uses!r} {why}, so what it reads cannot be compared; refused")
+    got = _local_composite(uses, repo, where, depth, errors)
+    if got is None:
         return []
-    try:
-        with open(found[0]) as f:
-            doc = strict_yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as e:
-        errors.append(f"check 23: {where}: local action {uses!r} is unreadable ({e}); refused")
-        return []
-    runs = doc.get("runs") if isinstance(doc, dict) else None
-    steps = runs.get("steps") if isinstance(runs, dict) and runs.get("using") == "composite" else None
-    if not isinstance(steps, list) or not all(isinstance(st, dict) for st in steps):
-        errors.append(f"check 23: {where}: local action {uses!r} is not a composite of step mappings; refused")
-        return []
+    doc, steps = got
     out: list[_RegionText] = []
     inputs = doc.get("inputs")
     defaults = (
@@ -6355,7 +6528,7 @@ def _cargo_region(
             with_ = dict(body["with"])
             if side is _Side.RELEASE and _tag_ref_set_aside(steps, st):
                 with_.pop("ref", None)
-            if uses.casefold().startswith(RUST_CACHE_REPO.casefold() + "@") and with_.get("save-if") == RUST_CACHE_SAVE_IF:
+            if uses_action(uses, RUST_CACHE_REPO) and with_.get("save-if") == RUST_CACHE_SAVE_IF:
                 del with_["save-if"]
             if is_cargo and vm_run:
                 with_.pop("run", None)
@@ -6415,6 +6588,11 @@ def _refuse_spliced_names(item: _RegionText, parsed: gha_expr.Template, errors: 
             )
 
 
+# The region strings a shell runs: a step's `run`, the cargo step's lines, a
+# FreeBSD VM's `prepare`.
+_SHELL_TEXT_SUFFIXES = (".run", " line", ".with.prepare")
+
+
 def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
     """Refuse every string of `region` that can evaluate differently in the
     two workflows; the matrix keys it reads (case-folded)."""
@@ -6455,6 +6633,18 @@ def _region_reads(region: list[_RegionText], errors: list[str]) -> set[str]:
                 errors.append(
                     f"check 23: {item.where}: {item.text!r} names the runner variable `{m.group(0)}`, which can "
                     f"differ between ci.yml and {RELEASE_WORKFLOW} in a step that reaches the cargo command; refused"
+                )
+        for name in sorted(_named_commands(item.text, _TREE_MOVERS)):
+            errors.append(
+                f"check 23: {item.where}: {item.text!r} runs `{name}`, which can move the checked-out tree "
+                "before the cargo command builds it; refused"
+            )
+        if item.where.endswith(_SHELL_TEXT_SUFFIXES):
+            built = _built_command(item.text)
+            if built is not None:
+                errors.append(
+                    f"check 23: {item.where}: `{built}` runs a program named at run time, which no scan of "
+                    "this step can read; refused"
                 )
     return reads
 
@@ -6614,8 +6804,14 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
             errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
 
     _job_unmasked(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", errors)
-    _check_release_checkout(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", errors)
-    _check_release_checkout(rel[RELEASE_FREEBSD_JOB], f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", errors)
+    for side, job, name in (
+        (_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB),
+        (_Side.CI, ci[CI_RELEASE_FREEBSD_JOB], CI_RELEASE_FREEBSD_JOB),
+        (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB),
+        (_Side.RELEASE, rel[RELEASE_FREEBSD_JOB], RELEASE_FREEBSD_JOB),
+    ):
+        _check_checkouts(job, f"{side.value} job {name!r}", side, repo, errors)
+        _check_shells(job, f"{side.value} job {name!r}", repo, errors)
     _job_unmasked(ci[CI_RELEASE_FREEBSD_JOB], f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", errors)
     # The same `os` per target means the same runner only when both jobs run on
     # `matrix.os`; the job's environment must agree too.
@@ -6645,8 +6841,8 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
         _compare(label, ci_musl.get(key) if ci_musl else None, rel_musl.get(key) if rel_musl else None, errors)
 
     ci_bsd, rel_bsd = ci[CI_RELEASE_FREEBSD_JOB], rel[RELEASE_FREEBSD_JOB]
-    ci_vm = [s for s in _steps_of(ci_bsd) if str(s.get("uses", "")).startswith("vmactions/freebsd-vm@")]
-    rel_vm = [s for s in _steps_of(rel_bsd) if str(s.get("uses", "")).startswith("vmactions/freebsd-vm@")]
+    ci_vm = [s for s in _steps_of(ci_bsd) if uses_action(s.get("uses"), "vmactions/freebsd-vm")]
+    rel_vm = [s for s in _steps_of(rel_bsd) if uses_action(s.get("uses"), "vmactions/freebsd-vm")]
     ci_step = _only(ci_vm, f"ci.yml job {CI_RELEASE_FREEBSD_JOB!r}", "FreeBSD VM step", errors)
     rel_step = _only(rel_vm, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", "FreeBSD VM step", errors)
     if isinstance(ci_step, dict) and isinstance(rel_step, dict):
@@ -6687,7 +6883,7 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
     published = {leg.get("artifact") for leg in rel_legs.values()}
     for step in _steps_of(rel_bsd):
         with_ = step.get("with")
-        if str(step.get("uses", "")).startswith("actions/upload-artifact@") and isinstance(with_, dict):
+        if uses_action(step.get("uses"), "actions/upload-artifact") and isinstance(with_, dict):
             published.add(with_.get("name"))
     expected_sets = [
         set(m.group(1).split())

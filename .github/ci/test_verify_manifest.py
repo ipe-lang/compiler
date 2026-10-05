@@ -6411,6 +6411,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain (linux)
         if: contains(matrix.target, 'musl')
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - shell: bash
         env:
@@ -6458,6 +6459,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain (linux)
         if: contains(matrix.target, 'musl')
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - shell: bash
         env:
@@ -6940,7 +6942,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         anchor = "      - name: Install musl toolchain (linux)\n"
         ci = self.swap(_RT_CI, anchor, "      - uses: actions/checkout@0000000000000000000000000000000000000000\n" + anchor)
         release = self.swap(_RT_RELEASE, anchor, second + anchor)
-        self.assertRefused("job 'build' step 3 checks out `ref: 'main'` after the tag's checkout", ci, release)
+        self.assertRefused("release.yml job 'build' step 3 runs `actions/checkout@", ci, release)
 
     def test_quoted_and_unquoted_cargo_arguments_differ(self) -> None:
         self.assertRefused("native cargo command", self.swap(_RT_CI, '--target "$TARGET"', "--target $TARGET"))
@@ -6968,6 +6970,112 @@ class TestReleaseTargetParity(unittest.TestCase):
         # The shell joins `CAR\` + newline + `GO`; a case-insensitive file system runs it as cargo.
         split = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", "            cp target/release/ipe dist/ipe\n            CAR\\\n            GO build\n")
         self.assertRefused("job 'build-freebsd' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", release=split)
+
+    _CHECKOUT = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+    _MUSL = "      - name: Install musl toolchain (linux)\n"
+    _UPLOAD = "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+
+    def test_first_step_is_the_only_checkout(self) -> None:
+        # With no `ref`, on a dispatch, a second checkout builds the dispatching branch over the tag.
+        for second in (self._CHECKOUT, self._CHECKOUT + "        with:\n          fetch-depth: 0\n"):
+            with self.subTest(second=second):
+                ci = self.swap(_RT_CI, self._MUSL, second + self._MUSL)
+                release = self.swap(_RT_RELEASE, self._MUSL, second + self._MUSL)
+                self.assertRefused("release.yml job 'build' step 3 runs `actions/checkout@", ci, release)
+                self.assertRefused("ci.yml job 'release-targets-run' step 3 runs `actions/checkout@", ci, release)
+        # After the cargo step too, and in the FreeBSD jobs.
+        release = self.swap(_RT_RELEASE, self._UPLOAD, self._CHECKOUT + self._UPLOAD)
+        self.assertRefused("release.yml job 'build-freebsd' step 3 runs `actions/checkout@", release=release)
+        ci = _RT_CI + self._CHECKOUT
+        self.assertRefused("ci.yml job 'release-targets-freebsd' step 3 runs `actions/checkout@", ci)
+        # And in a local action a job step uses.
+        action = _RT_ACTION + "    - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+        self.assertRefused(
+            "release.yml job 'build' step 2 -> ./.github/actions/rust-toolchain-pinned step 3 runs `actions/checkout@",
+            action=action,
+        )
+        ci = self.swap(_RT_CI, "      - uses: actions/checkout@0000000000000000000000000000000000000000\n      - uses: ./", "      - uses: ./")
+        self.assertRefused("ci.yml job 'release-targets-run''s first step must be its checkout", ci)
+
+    def test_checkout_is_recognised_case_insensitively(self) -> None:
+        # GitHub reads owner and repo case-insensitively.
+        for spelling in ("Actions/Checkout", "ACTIONS/checkout", "actions/checkout/sub"):
+            with self.subTest(spelling=spelling):
+                second = f"      - uses: {spelling}@0000000000000000000000000000000000000000\n        with:\n          ref: main\n"
+                ci = self.swap(_RT_CI, self._MUSL, second + self._MUSL)
+                release = self.swap(_RT_RELEASE, self._MUSL, second + self._MUSL)
+                self.assertRefused(f"release.yml job 'build' step 3 runs `{spelling}@", ci, release)
+        upper = self.swap(_RT_RELEASE, self._UPLOAD, self._UPLOAD.replace("actions/upload-artifact", "Actions/Upload-Artifact"))
+        upper = self.swap(upper, "name: ipe-freebsd-x64\n", "name: ipe-unexpected\n")
+        self.assertRefused("publishes 'ipe-unexpected' but its completeness gate does not expect it", release=upper)
+
+    def test_tree_mover_before_cargo_refused(self) -> None:
+        for line, name in (
+            ("git fetch origin main && git checkout FETCH_HEAD", "git"),
+            ("GIT_DIR=.git git checkout main", "git"),
+            ("command git checkout main", "git"),
+            ("sudo git reset --hard origin/main", "git"),
+            ('g""it checkout main', "git"),
+            ("sh -c 'g\"\"it checkout main'", "git"),
+            ("/usr/bin/GIT.exe checkout main", "git"),
+            ("gh pr checkout 1", "gh"),
+        ):
+            with self.subTest(line=line):
+                step = f"      - shell: bash\n        run: {line}\n"
+                ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
+                release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
+                self.assertRefused(f"release.yml native job step 3.run: {line!r} runs `{name}`", ci, release)
+        # A continuation split, a VM line before cargo, and a local action.
+        step = "      - shell: bash\n        run: |\n          gi\\\n          t checkout main\n"
+        ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
+        release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
+        self.assertRefused("runs `git`, which can move the checked-out tree", ci, release)
+        vm = "          run: |\n            git checkout main\n            cargo "
+        ci = self.swap(_RT_CI, "          run: |\n            cargo ", vm)
+        release = self.swap(_RT_RELEASE, "          run: |\n            cargo ", vm)
+        self.assertRefused("release.yml FreeBSD job cargo step line: 'git checkout main' runs `git`", ci, release)
+        action = self.swap(_RT_ACTION, 'run: echo "channel=1.0"', 'run: git checkout main; echo "channel=1.0"')
+        self.assertRefused("rust-toolchain-pinned step 1.run: 'git checkout main;", action=action)
+        # `.github` and `GH_TOKEN` name neither.
+        step = "      - shell: bash\n        env:\n          GH_TOKEN: x\n        run: ls .github\n"
+        ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
+        release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
+        self.assertEqual(self.errors(ci, release), [])
+
+    def test_program_named_at_run_time_before_cargo_refused(self) -> None:
+        for line in ("\"$(printf '\\x67it')\" checkout main", "$TOOL checkout main", "env $TOOL checkout main", 'eval "$TOOL"'):
+            with self.subTest(line=line):
+                step = f"      - shell: bash\n        run: |\n          {line}\n"
+                ci = self.swap(_RT_CI, self._MUSL, step + self._MUSL)
+                release = self.swap(_RT_RELEASE, self._MUSL, step + self._MUSL)
+                self.assertRefused("runs a program named at run time", ci, release)
+
+    def test_compiler_at_or_after_cargo_refused(self) -> None:
+        later = "      - shell: bash\n        run: rustc -O src/main.rs -o dist/ipe\n"
+        release = self.swap(_RT_RELEASE, "  build-freebsd:\n", later + "  build-freebsd:\n")
+        self.assertRefused("release.yml job 'build' step 5.run runs `rustc` at or after the cargo step", release=release)
+        release = self.swap(_RT_RELEASE, "            cp target/release/ipe dist/ipe\n", "            rustc -O src/main.rs -o dist/ipe\n")
+        self.assertRefused("job 'build-freebsd' step 2.with.run runs `rustc` at or after the cargo step", release=release)
+        # A cargo subcommand binary is a cargo invocation the shell count does not read.
+        zig = "      - shell: bash\n        run: cargo-zigbuild zigbuild --release -p ipe\n"
+        release = self.swap(_RT_RELEASE, "  build-freebsd:\n", zig + "  build-freebsd:\n")
+        self.assertRefused("job 'build' runs cargo 1 time(s) as the shell reads it but names `cargo` 2", release=release)
+        # Before the cargo step rustc only reports its version.
+        action = _RT_ACTION + "    - shell: bash\n      run: rustc --version\n"
+        self.assertEqual(self.errors(action=action), [])
+
+    def test_run_steps_name_bash(self) -> None:
+        for shell in ("cmd", "pwsh", "sh", "bash -c 'git checkout main; bash {0}'"):
+            with self.subTest(shell=shell):
+                ci = self.swap(_RT_CI, "        shell: bash\n        run: sudo", f"        shell: {shell}\n        run: sudo")
+                release = self.swap(_RT_RELEASE, "        shell: bash\n        run: sudo", f"        shell: {shell}\n        run: sudo")
+                self.assertRefused(f"release.yml job 'build' step 3 runs under `shell: {shell!r}`", ci, release)
+        # The runner's default shell is PowerShell on Windows.
+        ci = self.swap(_RT_CI, "        shell: bash\n        run: sudo", "        run: sudo")
+        release = self.swap(_RT_RELEASE, "        shell: bash\n        run: sudo", "        run: sudo")
+        self.assertRefused("release.yml job 'build' step 3 runs under `shell: None`", ci, release)
+        action = self.swap(_RT_ACTION, "      shell: bash\n", "      shell: pwsh\n")
+        self.assertRefused("rust-toolchain-pinned step 1 runs under `shell: 'pwsh'`", action=action)
 
 
 class TestModuleConstantsDefinedOnce(unittest.TestCase):
