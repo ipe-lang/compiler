@@ -375,7 +375,16 @@ classifyRefusesPastLineCeiling =
         TooLarge (SpanLines o) ->
             o.lines == past
 
-        _ ->
+        TooLarge (ViewBytes _) ->
+            False
+
+        Shown _ ->
+            False
+
+        Stale _ ->
+            False
+
+        Unreadable _ ->
             False
 
 
