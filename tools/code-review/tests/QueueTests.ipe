@@ -190,7 +190,7 @@ onlySelectedShownDecidable =
                 Just loaded ->
                     not (isNothing (Queue.decidableSource (uid "u-a") (ViewShown loaded)))
                         && isNothing (Queue.decidableSource (uid "u-b") (ViewShown loaded))
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewLoading { uid = "u-a", wanted = Nothing, fresh = True }))
+                        && isNothing (Queue.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True }))
                         && isNothing (Queue.decidableSource (uid "u-a") NoneSelected)
 
                 Nothing ->

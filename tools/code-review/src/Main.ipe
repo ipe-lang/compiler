@@ -306,7 +306,7 @@ selectAt settings i model =
 
 
 -- A selected-view transition, with the one read it starts, if any.
-viewStep : Settings.AppSettings -> ( Queue.SelectedView, Maybe String ) -> Model -> ( Model, Cmd Msg )
+viewStep : Settings.AppSettings -> ( Queue.SelectedView, Maybe Uid ) -> Model -> ( Model, Cmd Msg )
 viewStep settings ( state, next ) model =
     ( { model | selectedView = state }, loadViewCmd settings.index next )
 
