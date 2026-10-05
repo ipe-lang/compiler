@@ -14,7 +14,9 @@
 //! [`vcs_keys`](crate::vcs_keys) says its tool consumes the value, and every
 //! value is split into words but where the table decides it never names code.
 //! A Git setting no row decides is judged under every reading at once, which
-//! admits only a boolean or a number. A path-shaped word is resolved against
+//! admits only a boolean or a number. A Mercurial setting whose key names a
+//! program Mercurial runs ([`vcs_keys::hg_key_tool`]) has that name judged as
+//! a tool name first, whatever its value. A path-shaped word is resolved against
 //! the configuration file's directory and the working tree, `~` through the
 //! injected [`Home`]; an option's argument is judged as a word of its own and
 //! the option word whole besides; a program name passes, as the
@@ -332,6 +334,10 @@ pub enum Unprovable {
     /// The scan does not know how the tool consumes the setting, and the value is neither a boolean nor a number.
     UnknownSetting,
     /// A tool name holds a separator, `..`, `~`, or `:`, so the name the tool resolves inside its own directory may reach out of it.
+    ///
+    /// A name a Mercurial setting's key gives is also refused when it is
+    /// empty, expands a variable (`$`, `%`), or, on Windows, names an entry of
+    /// the working tree, where Windows finds a program not on `PATH`.
     ToolPath,
 }
 
@@ -894,6 +900,11 @@ enum Role {
     },
     /// A tool name: one the tool resolves inside its own directory, judged as a program name.
     ToolName,
+    /// A program name Mercurial takes from a setting's key and resolves through
+    /// `findexe` relative to the repository root, after expanding `~` and
+    /// variables: judged as [`Role::ToolName`], and refused besides when empty,
+    /// when it may expand, or when Windows may find it in the working tree.
+    KeyTool,
     /// A setting no row decides: admitted only when no reading makes it a path.
     ///
     /// Read through a shell, the value's words name files; run without one, the
@@ -2131,7 +2142,14 @@ impl Scan<'_> {
                     self.note_remote(ctx, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
-                Syntax::Hg => hg_route(&entry.setting, &entry.value),
+                Syntax::Hg => {
+                    if let Setting::Key { section, key, .. } = &entry.setting
+                        && let Some(name) = vcs_keys::hg_key_tool(section, key)
+                    {
+                        self.judge(ctx, &Role::KeyTool, name).map_err(&refuse)?;
+                    }
+                    hg_route(&entry.setting, &entry.value)
+                }
                 Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words(Runner::None)),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
@@ -2164,6 +2182,7 @@ impl Scan<'_> {
                     | Role::Include(_)
                     | Role::HooksPath
                     | Role::ToolName
+                    | Role::KeyTool
                     | Role::Unknown,
                 ) => {}
             }
@@ -2488,7 +2507,8 @@ impl Scan<'_> {
 
     /// Judge one value by its role.
     fn judge(&mut self, ctx: &FileCtx, role: &Role, value: &str) -> Result<(), Stop> {
-        if *role != Role::Exempt {
+        // A key's tool name is refused as a path before the checks would name a narrower reason.
+        if !matches!(role, Role::Exempt | Role::KeyTool) {
             value_checks(value).map_err(unproven)?;
         }
         match role {
@@ -2541,8 +2561,20 @@ impl Scan<'_> {
                 }
                 self.judge_words(ctx, value, Runner::None)
             }
+            Role::KeyTool => {
+                let bare = !value.is_empty()
+                    && !value.contains("..")
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
+                    });
+                if !bare || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
+                    return Err(unproven(Unprovable::ToolPath));
+                }
+                value_checks(value).map_err(unproven)?;
+                self.judge_words(ctx, value, Runner::None)
+            }
             Role::Unknown => {
-                if is_git_scalar(value) {
+                if is_scalar(ctx.syntax, value) {
                     Ok(())
                 } else {
                     Err(unproven(Unprovable::UnknownSetting))
@@ -2559,6 +2591,29 @@ impl Scan<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether the working tree holds an entry Windows may run for the bare program `name`: `name` itself or `name.<extension>`, ignoring case.
+    ///
+    /// Windows drops a name's trailing dots and spaces, and a name or entry
+    /// that is not ASCII is taken to match.
+    fn worktree_runs(&self, name: &str) -> Result<bool, ConfigRefusal> {
+        let stem = name.trim_end_matches(['.', ' ']);
+        if stem.is_empty() || !stem.is_ascii() {
+            return Ok(true);
+        }
+        let worktree = self.grants.worktree.as_path();
+        let dir = HeldDir::open_root(worktree)
+            .map_err(|refusal| self.unreadable(worktree, fault_of(refusal)))?;
+        let entries = dir
+            .entries_hinted(self.limits.listing)
+            .map_err(|refusal| self.unreadable(worktree, fault_of(refusal)))?;
+        Ok(entries.iter().any(|(entry, _)| {
+            entry
+                .as_os_str()
+                .to_str()
+                .is_none_or(|text| runs_as(text, stem))
+        }))
     }
 
     /// Judge every word of the command line `value`, once `runner` consumed its prefix.
@@ -3270,6 +3325,27 @@ fn is_git_scalar(value: &str) -> bool {
     is_git_bool(value) || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Whether `value` is one no reading of an unknown `syntax` setting makes a path.
+fn is_scalar(syntax: Syntax, value: &str) -> bool {
+    match syntax {
+        Syntax::Git => is_git_scalar(value),
+        Syntax::Hg => is_hg_scalar(value),
+        // Every setting of these files has a decided route, so none is unknown.
+        Syntax::GitRemote | Syntax::Toml | Syntax::Darcs => false,
+    }
+}
+
+/// Whether `value` is empty, a Mercurial boolean, or a decimal integer.
+fn is_hg_scalar(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    [
+        "", "1", "yes", "true", "on", "always", "0", "no", "false", "off", "never",
+    ]
+    .iter()
+    .any(|word| value.eq_ignore_ascii_case(word))
+        || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What Git does with a value of `setting`.
 fn git_route(setting: &Setting, value: &str) -> Route {
     let Setting::Key {
@@ -3376,14 +3452,26 @@ fn holds_nul(entry: &Entry) -> bool {
     name_holds || entry.value.contains('\0')
 }
 
+/// Whether Windows may run the directory entry `entry` for the ASCII program `stem`: `stem` or `stem.<extension>`, ignoring case.
+fn runs_as(entry: &str, stem: &str) -> bool {
+    if !entry.is_ascii() {
+        return true;
+    }
+    let Some((head, rest)) = entry.split_at_checked(stem.len()) else {
+        return false;
+    };
+    head.eq_ignore_ascii_case(stem) && (rest.is_empty() || rest.starts_with('.'))
+}
+
 /// What Mercurial does with a value of `setting`.
 fn hg_route(setting: &Setting, value: &str) -> Route {
     match setting {
-        Setting::Key { section, key, .. } => {
-            route_of(vcs_keys::hg(section, key).unwrap_or(Consume::Inert), value)
-        }
+        Setting::Key { section, key, .. } => vcs_keys::hg(section, key)
+            .map_or(Route::Judge(Role::Unknown), |consume| {
+                route_of(consume, value)
+            }),
         Setting::Include => Route::Judge(Role::Include(Reading::Always)),
-        Setting::Line(_) => Route::Judge(Role::Words(Runner::None)),
+        Setting::Line(_) => Route::Judge(Role::Unknown),
     }
 }
 
@@ -4491,6 +4579,160 @@ mod tests {
         write(&dot_hg.join("hgrc"), "[ui]\nnot an item\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(fault(&result), Some(ConfigFault::Malformed { line: 2 }));
+    }
+
+    fn scan_hg(f: &Fixture, text: &str) -> Result<(), ConfigRefusal> {
+        let dot_hg = f.tree.join(".hg");
+        write(&dot_hg.join("hgrc"), text);
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        scan_with(f, &roots, ConfigLimits::DEFAULT)
+    }
+
+    #[test]
+    fn unknown_hg_key_refused() {
+        let f = fixture("hgunknown");
+        let tree = f.tree.display();
+        for text in [
+            "[frob]\nx = /usr/bin/true\n".to_owned(),
+            "[ui]\nfrobnicate = ~/x\n".to_owned(),
+            "[frob]\nn = 1x\n".to_owned(),
+            format!("[defaults]\npull = --ssh {tree}/evil\n"),
+            "[ui]\ndebugger = evil\n".to_owned(),
+            "[acl.allow]\nfoo = alice\n".to_owned(),
+            "[merge-tools]\nkdiff3.regkey = SoftwareKDiff3\n".to_owned(),
+            "[hooks]\ncommit:frob = x\n".to_owned(),
+            "[pager]\nattend- = x\n".to_owned(),
+            "[merge-tools]\nkdiff3.regappend = \\..\\..\\evil.exe\n".to_owned(),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::UnknownSetting),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Controls: a value no reading makes a path, and documented settings with a row.
+        for text in [
+            "[frob]\nn = 1\n",
+            "[frob]\nn = -3\n",
+            "[frob]\non = Never\n",
+            "[frob]\ne =\n",
+            "[phases]\npublish = False\n",
+            "[ui]\nmergemarkers = basic\n",
+            "[extensions]\nrebase =\nrebase:required = True\n",
+            "[paths]\ndefault = https://example.com/r\ndefault:bookmarks.mode = mirror\n",
+            "[hooks]\npriority.commit = 5\ncommit:run-with-plain = auto\n",
+            "[alias]\nst = status\nst:doc = status\n",
+        ] {
+            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_key_named_tool_refused() {
+        let f = fixture("hgkeytool");
+        for text in [
+            "[merge-tools]\nbin/evil.priority = 1\n",
+            "[merge-tools]\nbin/evil = 1\n",
+            "[partial-merge-tools]\nbin/evil.order = 1\n",
+            "[extdiff]\ncmd.bin/evil =\n",
+            "[extdiff]\nbin/evil =\n",
+            "[merge-tools]\n~/evil.gui = True\n",
+            "[merge-tools]\n$HOME.priority = 1\n",
+            "[merge-tools]\n..\\evil.priority = 1\n",
+            "[extdiff]\ncmd.a:b =\n",
+            "[partial-merge-tools]\nx/y.disable = False\n",
+            "[merge-tools]\n%USERPROFILE%.priority = 1\n",
+            "[merge-tools]\n.priority = 1\n",
+            "[partial-merge-tools]\nx\" & evil & \".order = 1\n",
+            "[extdiff]\ncmd.a b =\n",
+            "[merge-tools]\nx;y.priority = 1\n",
+        ] {
+            let result = scan_hg(&f, text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::ToolPath),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[merge-tools]\nkdiff3.priority = 1\n",
+            "[extdiff]\ncmd.vd =\n",
+        ] {
+            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_key_tool_value_still_judged() {
+        let f = fixture("hgkeyvalue");
+        let text = format!("[merge-tools]\nkdiff3.args = {}/evil\n", f.tree.display());
+        let result = scan_hg(&f, &text);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil").as_path()),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn hg_key_tool_entry_matching() {
+        assert!(runs_as("evil", "evil"));
+        assert!(runs_as("EVIL.exe", "evil"));
+        assert!(runs_as("evil.cmd", "Evil"));
+        assert!(runs_as("évil", "vd"));
+        assert!(!runs_as("evildoer", "evil"));
+        assert!(!runs_as("evi", "evil"));
+        assert!(!runs_as(".hg", "evil"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hg_key_tool_in_worktree_refused_on_windows() {
+        let f = fixture("hgkeywin");
+        write(&f.tree.join("evil.exe"), "");
+        let result = scan_hg(&f, "[merge-tools]\nevil.priority = 1\n");
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::ToolPath),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn hg_tool_paths_judged() {
+        let f = fixture("hgtools");
+        let tree = f.tree.display();
+        for text in [
+            format!("[merge-tools]\nx.executable = {tree}/evil\n"),
+            "[merge-tools]\nx.executable = evil\n".to_owned(),
+            "[ui]\nmerge = evil\n".to_owned(),
+            format!("[merge-tools]\nx.args = {tree}/evil\n"),
+            format!("[extdiff]\nopts.vd = {tree}/evil\n"),
+            format!("[extdiff]\nvd = {tree}/evil\n"),
+            format!("[fix]\nblack:command = {tree}/evil\n"),
+            format!("[email]\nmethod = {tree}/evil\n"),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Mercurial expands `~` in a tool's executable; a program run without a shell does not.
+        assert_eq!(
+            scan_hg(&f, "[merge-tools]\nx.executable = ~/evil\n"),
+            Ok(())
+        );
+        let result = scan_hg(&f, "[profiling]\npy-spy.exe = ~/evil\n");
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
     }
 
     #[test]
