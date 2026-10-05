@@ -162,6 +162,9 @@ impl EnvCeiling {
                     match v.parse::<u64>() {
                         Ok(n) => match self.check(n) {
                             Ok(n) => return Ok(n),
+                            Err(CeilingDefect::TooLarge) => {
+                                return Err(self.refusal_over_bound(shown_env_value(v.as_bytes())));
+                            }
                             Err(defect) => defect,
                         },
                         Err(_) => CeilingDefect::TooLarge,
@@ -278,6 +281,17 @@ impl EnvCeiling {
             source: CeilingSource::Env,
         }
     }
+
+    /// A refusal of a parsed value above [`Self::max_value`].
+    const fn refusal_over_bound(self, shown: String) -> EnvCeilingRefusal {
+        EnvCeilingRefusal {
+            name: self.name,
+            unit: self.unit,
+            shown,
+            defect: CeilingDefect::TooLarge,
+            source: CeilingSource::EnvOverBound { max: self.max },
+        }
+    }
 }
 
 /// One operator-tunable duration read from the environment, in whole seconds.
@@ -342,9 +356,14 @@ impl EnvDuration {
                 shown_env_value(os.as_encoded_bytes()),
                 CeilingDefect::NotDecimal,
             ),
-            Ok(v) => match duration_secs(&v).and_then(|n| self.ceiling.check(n)) {
-                Ok(n) => return Ok(n),
-                Err(defect) => (shown_env_value(v.as_bytes()), defect),
+            Ok(v) => match duration_secs(&v).map(|n| self.ceiling.check(n)) {
+                Ok(Ok(n)) => return Ok(n),
+                Ok(Err(CeilingDefect::TooLarge)) => {
+                    return Err(self
+                        .ceiling
+                        .refusal_over_bound(shown_env_value(v.as_bytes())));
+                }
+                Ok(Err(defect)) | Err(defect) => (shown_env_value(v.as_bytes()), defect),
             },
         };
         Err(self.ceiling.refusal(shown, defect))
@@ -466,6 +485,11 @@ pub struct EnvCeilingRefusal {
 enum CeilingSource {
     /// The ceiling's environment variable.
     Env,
+    /// The ceiling's environment variable, parsed but above its bound.
+    EnvOverBound {
+        /// The largest accepted value.
+        max: u64,
+    },
     /// The unset variable's default, checked by [`EnvCeiling::check_default`].
     Default {
         /// The largest accepted value.
@@ -491,7 +515,9 @@ impl EnvCeilingRefusal {
     #[must_use]
     pub const fn setting(&self) -> Option<&'static str> {
         match self.source {
-            CeilingSource::Env | CeilingSource::Default { .. } => None,
+            CeilingSource::Env
+            | CeilingSource::EnvOverBound { .. }
+            | CeilingSource::Default { .. } => None,
             CeilingSource::InCode { setting, .. } => Some(setting),
         }
     }
@@ -517,6 +543,9 @@ impl std::fmt::Display for EnvCeilingRefusal {
             }
             (CeilingSource::Env, CeilingDefect::TooLarge) => {
                 write!(f, "{name} is too large for this platform (got \"{shown}\")")
+            }
+            (CeilingSource::EnvOverBound { max }, _) => {
+                write!(f, "{name} must be at most {max} (got \"{shown}\")")
             }
             (CeilingSource::Default { max }, _) => write!(
                 f,
@@ -3186,6 +3215,13 @@ mod env_ceiling_tests {
         }
         let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration").at_most(5400);
         assert_eq!(duration.check_setting("Test.ttl", 5400), Ok(5400));
+        assert_eq!(
+            duration
+                .parse(Ok("2h".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err("IPE_TEST_DURATION must be at most 5400 (got \"2h\")".to_owned()),
+            "a duration above the bound names the bound in seconds"
+        );
         assert!(
             duration
                 .check_setting("Test.ttl", 5401)
@@ -3226,6 +3262,23 @@ mod env_ceiling_tests {
                 |r| r.setting().is_none() && r.to_string().starts_with("IPE_TEST_CEILING")
             ),
             "an environment refusal names the variable"
+        );
+        assert_eq!(
+            ceiling
+                .parse(Ok("101".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err("IPE_TEST_CEILING must be at most 100 (got \"101\")".to_owned()),
+            "a value above the bound names the bound"
+        );
+        assert_eq!(
+            ceiling
+                .parse(Ok("99999999999999999999".to_owned()))
+                .map_err(|r| r.to_string()),
+            Err(
+                "IPE_TEST_CEILING is too large for this platform (got \"99999999999999999999\")"
+                    .to_owned()
+            ),
+            "a value no `u64` holds is too large for the platform"
         );
     }
 

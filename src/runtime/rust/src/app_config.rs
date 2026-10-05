@@ -1148,6 +1148,13 @@ mod tests {
                         && r.defect() == CeilingDefect::TooLarge),
                 "an env window of {window} under a 1800 s lifetime must be refused, got {outcome:?}"
             );
+            assert_eq!(
+                outcome.map_err(|r| r.to_string()),
+                Err(format!(
+                    "IPE_AUTH_SLIDE_WINDOW must be at most 1799 (got \"{window}\")"
+                )),
+                "the refusal names the bound the lifetime sets"
+            );
         }
         for window in [1800, 3600] {
             let outcome = slide_window_from(1800, unset(), Some(window));
