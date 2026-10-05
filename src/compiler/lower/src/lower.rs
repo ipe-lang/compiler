@@ -25871,7 +25871,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StoreUpper
                 | KernelFn::StoreLower
                 // ── Server: cookie token source — arity 1 ────────────────
-                // `Server.cookieToken : String -> TokenSource`
+                // `Server.cookieToken : String -> Result Error TokenSource`
                 | KernelFn::ServerCookieToken
                 // ── Ipe.Ffi.Js port — outbound. `Js.send : a -> Cmd msg`. Arity 1;
                 //    the port intercept rejects it before emission, this is the
@@ -26163,7 +26163,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ServerQueryParam
                 | KernelFn::ServerHeader
                 | KernelFn::ServerGetCookie
-                // `Server.cookie : String -> String -> Cookie`
+                // `Server.cookie : String -> String -> Result Error Cookie`
                 | KernelFn::ServerCookieNew
                 // `Server.withCookie : Cookie -> Response -> Response`
                 | KernelFn::ServerWithCookie
@@ -26250,7 +26250,7 @@ impl<'a> Lowerer<'a> {
                 // `required : String -> Decoder a -> Decoder (a -> b) -> Decoder b`
                 | KernelFn::DbDecRequired
                 // ── Server arity-3 ───────────────────────────────────────
-                // `Server.withHeader : String -> String -> Response -> Response`
+                // `Server.withHeader : String -> String -> Response -> Result Error Response`
                 | KernelFn::ServerWithHeader
                 // `Server.getAuthed/postAuthed/putAuthed/deleteAuthed :
                 //     String -> AuthConfig

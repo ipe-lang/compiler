@@ -454,9 +454,9 @@ the view through the `Ui.html : Html msg -> Element msg` node.
 **`init` is per-session, not per-page-reload.** First request from browser
 w/ no `ipe_sid` cookie fires `init`. Browser reload while session alive
 RESTORES Model from session store — `init` does NOT run. Force fresh `init`
-(demo reset/e2e bootstrap): `Cmd.perform
-(Cookie.expire "ipe_sid")` then reload. If goal = "my other tab missed an
-update", use `Cmd.publish` instead.
+(demo reset/e2e bootstrap): run under `ipe dev watch --reset-state`, or
+clear the session cookie in the browser, then reload. If goal = "my other tab
+missed an update", use `Cmd.publish` instead.
 
 ### init's `req` shape
 
