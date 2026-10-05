@@ -16351,7 +16351,7 @@ impl<'a> Lowerer<'a> {
                 // `ipe_backend_rust::emit_types`) drops the enum's
                 // `#[derive(Clone, Debug, PartialEq)]` whenever a field embeds a
                 // function, and the hand-written `IpeStringify` impl renders such
-                // a field as the `<fn>` placeholder.
+                // a field as the `<function>` placeholder.
                 let ir = normalize_enum_payload_fun_carrier(ir);
                 fields.push(ir);
             }

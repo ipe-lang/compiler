@@ -7,6 +7,8 @@
 //! is an exhaustive match over every variant: a new variant fails to compile
 //! until it names its leaf or its children.
 
+use std::cell::Cell;
+
 use ipe_intern::{Interner, Symbol};
 
 use crate::enum_facts::RuntimeBridgedEnum;
@@ -376,6 +378,57 @@ pub fn named_enum_shape(
     NamedShow::Leaf(bridged.map_or(show_leaf::FOREIGN, RuntimeBridgedEnum::show_leaf))
 }
 
+/// The marker of a function-typed component.
+pub const FUNCTION_MARKER: &str = "<function>";
+
+/// The marker of a tuple too wide to render.
+pub const WIDE_TUPLE_MARKER: &str = "<tuple>";
+
+/// The marker of a component past the walk's depth ceiling.
+pub const DEEP_VALUE_MARKER: &str = "<value>";
+
+/// The marker of one component `t` with no rendering, or `None` when `t`
+/// itself is shown (its children are the walk's concern).
+///
+/// A function renders as [`FUNCTION_MARKER`], a tuple too wide as
+/// [`WIDE_TUPLE_MARKER`], and an opaque handle as `<Home.Name>`.
+fn refused_component_marker(
+    t: &IrType,
+    payloads: &EnumPayloadTable,
+    interner: &Interner,
+) -> Option<String> {
+    match t.show_shape() {
+        ShowShape::Leaf(leaf) => {
+            (leaf.policy() == ShowPolicy::Refused).then(|| FUNCTION_MARKER.to_owned())
+        }
+        ShowShape::TooWide => Some(WIDE_TUPLE_MARKER.to_owned()),
+        ShowShape::Named { home, name, .. } => {
+            match named_enum_shape(interner, payloads, home, name) {
+                NamedShow::Leaf(leaf) if leaf.policy() == ShowPolicy::Refused => {
+                    Some(handle_marker(interner, home, name))
+                }
+                NamedShow::Leaf(_) | NamedShow::Registered => None,
+            }
+        }
+        ShowShape::Carrier(_) | ShowShape::Param => None,
+    }
+}
+
+/// `<Home.Name>` for the opaque handle `(home, name)`; a symbol the interner
+/// cannot resolve degrades to the bare `<handle>`.
+fn handle_marker(interner: &Interner, home: &ModPath, name: Symbol) -> String {
+    let segs: Option<Vec<&str>> = home
+        .0
+        .iter()
+        .chain(std::iter::once(&name))
+        .map(|s| interner.resolve(*s))
+        .collect();
+    segs.map_or_else(
+        || "<handle>".to_owned(),
+        |segs| format!("<{}>", segs.join(".")),
+    )
+}
+
 /// Does a value of type `ty` hold a component with no rendering?
 ///
 /// The [`ir_type_holds`] walk with a flat leaf test: a `Refused` leaf, a tuple
@@ -387,16 +440,36 @@ pub fn ir_type_holds_refused(
     payloads: &EnumPayloadTable,
     interner: &Interner,
 ) -> bool {
-    ir_type_holds(ty, payloads, &|t: &IrType| match t.show_shape() {
-        ShowShape::Leaf(leaf) => leaf.policy() == ShowPolicy::Refused,
-        ShowShape::TooWide => true,
-        ShowShape::Named { home, name, .. } => {
-            match named_enum_shape(interner, payloads, home, name) {
-                NamedShow::Registered => false,
-                NamedShow::Leaf(leaf) => leaf.policy() == ShowPolicy::Refused,
-            }
+    ir_type_holds(ty, payloads, &|t: &IrType| {
+        refused_component_marker(t, payloads, interner).is_some()
+    })
+}
+
+/// The text a value of type `ty` renders as when it holds a component with no
+/// rendering, or `None` when every component is shown.
+///
+/// The marker names a refused component the walk reached: [`FUNCTION_MARKER`],
+/// [`WIDE_TUPLE_MARKER`], or `<Home.Name>` for an opaque handle. Past the
+/// walk's depth ceiling, where no component was named, [`DEEP_VALUE_MARKER`].
+#[must_use]
+pub fn refused_marker(
+    ty: &IrType,
+    payloads: &EnumPayloadTable,
+    interner: &Interner,
+) -> Option<String> {
+    let found: Cell<Option<String>> = Cell::new(None);
+    let holds = ir_type_holds(ty, payloads, &|t: &IrType| {
+        let marker = refused_component_marker(t, payloads, interner);
+        let refused = marker.is_some();
+        if refused {
+            found.set(marker);
         }
-        ShowShape::Carrier(_) | ShowShape::Param => false,
+        refused
+    });
+    holds.then(|| {
+        found
+            .into_inner()
+            .unwrap_or_else(|| DEEP_VALUE_MARKER.to_owned())
     })
 }
 
@@ -451,6 +524,34 @@ mod tests {
         ));
         let wide = IrType::Tuple(vec![IrType::Int; MAX_SHOWN_TUPLE_ARITY + 1]);
         assert!(ir_type_holds_refused(&wide, &payloads, &interner));
+    }
+
+    #[test]
+    fn a_refused_component_names_its_marker() {
+        let mut interner = Interner::new();
+        let payloads = BTreeMap::new();
+        let fun = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+        let foreign = IrType::Enum {
+            home: ModPath(vec![
+                interner.intern("Rust").expect("intern"),
+                interner.intern("Demo").expect("intern"),
+            ]),
+            name: interner.intern("Widget").expect("intern"),
+            args: vec![],
+        };
+        let wide = IrType::Tuple(vec![IrType::Int; MAX_SHOWN_TUPLE_ARITY + 1]);
+        for (ty, marker) in [
+            (IrType::List(Box::new(fun)), FUNCTION_MARKER),
+            (IrType::Maybe(Box::new(foreign)), "<Rust.Demo.Widget>"),
+            (wide, WIDE_TUPLE_MARKER),
+        ] {
+            assert_eq!(
+                refused_marker(&ty, &payloads, &interner).as_deref(),
+                Some(marker),
+                "{ty:?}"
+            );
+        }
+        assert_eq!(refused_marker(&IrType::Bytes, &payloads, &interner), None);
     }
 
     #[test]

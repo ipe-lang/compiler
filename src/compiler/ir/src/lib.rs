@@ -39,8 +39,9 @@ pub use ir::{
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};
 pub use show_policy::{
-    MAX_SHOWN_TUPLE_ARITY, NamedShow, SHOWN_LEAVES, ShowLeaf, ShowPolicy, ShowShape,
-    ir_type_holds_refused, named_enum_shape, show_leaf,
+    DEEP_VALUE_MARKER, FUNCTION_MARKER, MAX_SHOWN_TUPLE_ARITY, NamedShow, SHOWN_LEAVES, ShowLeaf,
+    ShowPolicy, ShowShape, WIDE_TUPLE_MARKER, ir_type_holds_refused, named_enum_shape,
+    refused_marker, show_leaf,
 };
 
 /// The compilation target (kernel-availability axis) — re-exported so

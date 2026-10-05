@@ -7,7 +7,7 @@
 
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
-use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, ir_type_is_derivable};
+use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, refused_marker};
 
 use std::collections::BTreeSet;
 
@@ -742,8 +742,7 @@ fn render_fn_once_chain(
 ///
 /// A payload-carrying and/or generic enum gains tuple-variant payloads, a
 /// `<T1, …>` clause on the enum and its impl, and `IpeStringify` arms that bind
-/// each payload field and render it through the total autoref dispatch — mirroring
-/// `ipeStringifyEnumImpl`:
+/// each payload field and render it through its own `IpeStringify` impl:
 /// ```text
 /// #[derive(Clone, Debug, PartialEq)]
 /// pub enum MainMaybe<T1> {
@@ -751,10 +750,10 @@ fn render_fn_once_chain(
 ///     Nothing,
 /// }
 ///
-/// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainMaybe<T1> {
+/// impl<T1: IpeStringify> IpeStringify for MainMaybe<T1> {
 ///     fn ipe_show(&self) -> String {
 ///         match self {
-///             MainMaybe::Just(p0) => format!("Just {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch()),
+///             MainMaybe::Just(p0) => format!("Just {}", IpeStringify::ipe_show(p0)),
 ///             MainMaybe::Nothing => "Nothing".to_string(),
 ///         }
 ///     }
@@ -813,7 +812,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     // is unaffected — no `'static` bound, byte-identical to before.
     let params_need_static = enum_stores_shared_fun(ctx, def);
 
-    // Generic clauses: `<T1, T2>` on the enum, `<T1: IpeStringify + Debug, …>` on
+    // Generic clauses: `<T1, T2>` on the enum, `<T1: IpeStringify, …>` on
     // the impl, `<T1, T2>` on the impl's `for` type. All empty when the enum is
     // non-generic, so that path emits no generic clause.
     let params: Vec<String> = (1..=def.type_params.len())
@@ -828,7 +827,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     } else {
         let bounds: Vec<String> = params
             .iter()
-            .map(|p| format!("{p}: IpeStringify + std::fmt::Debug{bound_static}"))
+            .map(|p| format!("{p}: IpeStringify{bound_static}"))
             .collect();
         let decl_params: Vec<String> = params.iter().map(|p| format!("{p}{decl_static}")).collect();
         (
@@ -905,10 +904,10 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
 ///
 /// A nullary variant renders a bare ident and a `Name::V => "V".to_string()`
 /// arm; a payload variant renders `V(field types…)` (boxing a direct self-edge)
-/// and a `format!`-based arm binding `p0..pN`. A derivable field is stringified
-/// through the runtime autoref `Wrap(..).dispatch()`; a non-derivable payload (a
-/// function / opaque wrapper) is bound `_` and rendered as the `<fn>` placeholder
-/// (its `.dispatch()` would not resolve).
+/// and a `format!`-based arm binding `p0..pN`. A field whose every component
+/// has a show row renders through its `IpeStringify` impl; a field holding a
+/// component with no rendering (a function, an opaque `Rust.*` handle) is bound
+/// `_` and renders as that component's fixed marker ([`refused_marker`]).
 fn emit_enum_variant_lines_and_arms(
     ctx: &EmitCtx,
     def: &EnumDef,
@@ -944,24 +943,21 @@ fn emit_enum_variant_lines_and_arms(
                     rendered
                 };
                 field_types.push(rendered);
-                if ir_type_is_derivable(field_ty, &|home, name| ctx.enum_is_derivable(home, name)) {
-                    let binder = format!("p{i}");
-                    // `binder` is a `match self` binder → already a `&FieldType`,
-                    // so `Wrap(binder)` carries the reference the dispatch
-                    // expects. Sound because a derivable field type impls
-                    // `IpeStringify` or `Debug` (the autoref fallback).
-                    show_args.push(format!(
-                        "(&ipe_runtime::stringify::Wrap({binder})).dispatch()"
-                    ));
-                    binders.push(binder);
-                } else {
-                    // seal: a non-derivable payload (a function / opaque
-                    // wrapper) impls neither `IpeStringify` nor `Debug`, so the
-                    // autoref `.dispatch()` would not resolve (E0599). Bind it
-                    // with `_` and render a `<fn>` placeholder — these carry no
-                    // user-visible data, matching the reference backend.
-                    binders.push("_".to_owned());
-                    show_args.push("\"<fn>\"".to_owned());
+                // seal: a field holding a component with no show row has no
+                // `IpeStringify` impl, so it binds `_` and renders as its fixed
+                // marker; every other field has one (the `ipe-cli` show-table
+                // assertion pins each leaf to a runtime row). `binder` is a
+                // `match self` binder, already a `&FieldType`.
+                match refused_marker(field_ty, &ctx.enum_variants, ctx.interner) {
+                    None => {
+                        let binder = format!("p{i}");
+                        show_args.push(format!("IpeStringify::ipe_show({binder})"));
+                        binders.push(binder);
+                    }
+                    Some(marker) => {
+                        binders.push("_".to_owned());
+                        show_args.push(rust_str_lit(&marker));
+                    }
                 }
             }
             variant_lines.push(format!("    {vn}({}),", field_types.join(", ")));
@@ -1088,7 +1084,7 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 ///
 /// impl IpeStringify for RecXY {
 ///     fn ipe_show(&self) -> String {
-///         format!("{{{} {}}}", (&ipe_runtime::stringify::Wrap(&self.x)).dispatch(), (&ipe_runtime::stringify::Wrap(&self.y)).dispatch())
+///         format!("{{{} {}}}", IpeStringify::ipe_show(&self.x), IpeStringify::ipe_show(&self.y))
 ///     }
 /// }
 /// ```
@@ -1096,8 +1092,8 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 /// The `ipe_show` body mirrors the reference's `%v` rendering of a struct
 /// (`{f0 f1 ...}`, fields space-separated in declared order, no field names) so
 /// stringifying a record reads identically across the two backends. Each field
-/// renders through the runtime's total autoref `Wrap(..).dispatch()` shim, which
-/// never fails to resolve a method regardless of the field type.
+/// renders through its `IpeStringify` impl, or as a fixed marker when it holds
+/// a component with no rendering ([`refused_marker`]).
 ///
 /// A GENERIC record shape (a field typed by a type variable) gains a
 /// generic clause on both the struct and its impl. Shape (for `{ value : a }`):
@@ -1107,17 +1103,12 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 ///     value: T1,
 /// }
 ///
-/// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecValue<T1> {
+/// impl<T1: IpeStringify> IpeStringify for RecValue<T1> {
 ///     ...
 /// }
 /// ```
-/// The impl bounds each parameter `IpeStringify + std::fmt::Debug` so the inline
-/// autoref `Wrap(..).dispatch()` resolves at the generic frame (the
-/// `IpeStringify` arm is selected with zero autoref, the `Debug` arm is the
-/// always-available fallback). `std::fmt::Debug` is spelled in full — the
-/// emitted crate's `pub use ipe_runtime::*` shadows the `core` crate with the
-/// runtime's `core` module, so `core::fmt` would not resolve. A monomorphic
-/// record emits an empty clause.
+/// The impl bounds each parameter `IpeStringify`, so a field typed by it
+/// renders at the generic frame. A monomorphic record emits an empty clause.
 pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> {
     let name = &rec.name;
     // The struct's own generic scope: each parameter symbol → `T1`, `T2`, … by
@@ -1129,15 +1120,11 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
         let ident = mangle_reserved(field_name.clone());
         let rust_ty = render_type(ctx, field_ty, scope)?;
         field_lines.push(format!("    {ident}: {rust_ty},"));
-        if ir_type_is_derivable(field_ty, &|home, name| ctx.enum_is_derivable(home, name)) {
-            show_args.push(format!(
-                "(&ipe_runtime::stringify::Wrap(&self.{ident})).dispatch()"
-            ));
-        } else {
-            // seal: a non-derivable field (a function / opaque wrapper)
-            // impls neither `IpeStringify` nor `Debug`, so `.dispatch()` would
-            // not resolve. Render a `<fn>` placeholder for that `{}` slot.
-            show_args.push("\"<fn>\"".to_owned());
+        // seal: a field holding a component with no show row has no
+        // `IpeStringify` impl, so it renders as its fixed marker.
+        match refused_marker(field_ty, &ctx.enum_variants, ctx.interner) {
+            None => show_args.push(format!("IpeStringify::ipe_show(&self.{ident})")),
+            Some(marker) => show_args.push(rust_str_lit(&marker)),
         }
     }
     let fields_block = field_lines.join("\n");
@@ -1157,7 +1144,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     let decl_static = if params_need_static { ": 'static" } else { "" };
     let bound_static = if params_need_static { " + 'static" } else { "" };
 
-    // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify + Debug, …>`
+    // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify, …>`
     // on the impl, `<T1, T2>` on the impl's `for` type. All empty when the record
     // is monomorphic.
     let params: Vec<String> = (1..=rec.type_params.len())
@@ -1168,7 +1155,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     } else {
         let bounds: Vec<String> = params
             .iter()
-            .map(|p| format!("{p}: IpeStringify + std::fmt::Debug{bound_static}"))
+            .map(|p| format!("{p}: IpeStringify{bound_static}"))
             .collect();
         let decl_params: Vec<String> = params.iter().map(|p| format!("{p}{decl_static}")).collect();
         (
