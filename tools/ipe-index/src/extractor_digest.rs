@@ -102,8 +102,9 @@ fn refusal(path: &Path, why: &str) -> io::Error {
 mod tests {
     use super::*;
 
-    // The digest the binary carries is the one its own sources give, so an
-    // input `build.rs` misses, or a change it does not rerun on, turns this red.
+    // The digest the binary carries is the one its own sources give. On an
+    // incremental build it turns red when `build.rs` misses an input or does
+    // not rerun after a `src` edit; a clean build always agrees with itself.
     #[test]
     fn extractor_digest_names_this_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

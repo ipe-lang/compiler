@@ -376,7 +376,8 @@ impl Store {
                    AND u.path = cs.path ORDER BY u.uid LIMIT 1), \
                  (SELECT u.uid FROM units u WHERE u.qualified = cs.local \
                    ORDER BY u.uid LIMIT 1)) AS callee \
-               FROM call_sites cs) \
+               FROM call_sites cs \
+               WHERE cs.caller_uid IN (SELECT uid FROM units)) \
              WHERE callee IS NOT NULL",
             [],
         )?;
@@ -616,8 +617,12 @@ fn ensure_open_units_view(conn: &Connection) -> Result<()> {
 /// keeps whatever it records (or nothing): restamping would claim its rows
 /// are in the current format and were written by this build.
 fn ensure_schema_version(conn: &Connection) -> Result<()> {
-    let units: i64 = conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))?;
-    if units == 0 {
+    let rows: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM units) + (SELECT COUNT(*) FROM files)",
+        [],
+        |r| r.get(0),
+    )?;
+    if rows == 0 {
         conn.execute(
             "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)",
             [SCHEMA_VERSION],
@@ -901,6 +906,21 @@ mod tests {
         assert_eq!(s.get_meta("extractor").unwrap().as_deref(), Some(EXTRACTOR));
     }
 
+    // A file with no unit (an unparsed language) is still a row: a DB holding
+    // only such files is not empty, so it is never stamped on open.
+    #[test]
+    fn open_stamps_no_extractor_on_a_db_holding_only_files() {
+        let s = Store::open(":memory:").unwrap();
+        s.put_file("notes.txt", "other", "other", 1, &FileStamp::of_bytes(b"x"))
+            .unwrap();
+        s.conn
+            .execute("DELETE FROM meta WHERE k='extractor'", [])
+            .unwrap();
+        ensure_schema_version(&s.conn).unwrap();
+        assert_eq!(s.get_meta("extractor").unwrap(), None);
+        assert!(!s.extractor_is_current().unwrap());
+    }
+
     #[test]
     fn units_kind_check_rejects_invalid() {
         let s = Store::open(":memory:").unwrap();
@@ -951,7 +971,11 @@ mod tests {
         assert_eq!(s.count("units").unwrap(), 1);
         assert_eq!(s.count("links").unwrap(), 1);
         assert_eq!(s.count("call_sites").unwrap(), 2);
-        assert_eq!(s.count("callgraph").unwrap(), 2);
+        assert_eq!(
+            s.count("callgraph").unwrap(),
+            1,
+            "a call site whose caller is no unit owns no edge"
+        );
         s.drop_file("src/a.rs").unwrap();
         assert_eq!(s.count("files").unwrap(), 0);
         assert_eq!(s.count("units").unwrap(), 0);

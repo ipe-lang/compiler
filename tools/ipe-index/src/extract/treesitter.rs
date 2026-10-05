@@ -567,6 +567,14 @@ mod tests {
     // the unit's stored qualified name is the one this extractor builds from
     // its path (so code-review's module, read back from that name, is this
     // `base_qual`), and the callee's candidates are `callee_candidates`'s.
+    // A callee that is only a turbofish names no unit; storing it would trip
+    // the `call_sites` CHECK and abort the whole index.
+    #[test]
+    fn a_turbofish_only_callee_names_no_unit() {
+        assert!(callee_candidates("::<u8>", "crate", Some("crate")).is_none());
+        assert!(callee_candidates("", "crate", Some("crate")).is_none());
+    }
+
     #[test]
     fn callee_vectors_follow_the_callee_rule() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(CALLEE_VECTORS).unwrap();
