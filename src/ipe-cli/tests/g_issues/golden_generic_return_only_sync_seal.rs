@@ -72,7 +72,7 @@ fn generic_return_only_sync_bounds_emitted() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     // `Main`'s functions land in `src/main.rs` for a single-home program and in
@@ -102,7 +102,7 @@ fn generic_return_only_sync_seal_builds() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     crate::support::assert_seal_builds(GOLDEN, &out);

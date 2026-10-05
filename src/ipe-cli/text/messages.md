@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe build --target wasm` to produce a browser bundle
+ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build --target wasm` to produce a browser bundle
 
 ## run-wasi-native-flags
 
@@ -78,11 +78,11 @@ ipe run builds and executes a native binary; --target wasm has no native artifac
 
 ## eject-out-required
 
-ipe eject: --out <dir> is required (the directory to write the standalone project to)
+ipe release eject: --out <dir> is required (the directory to write the standalone project to)
 
 ## release-no-wasi
 
-ipe release produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe build --target wasi`
+ipe release build produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe dev build --target wasi`
 
 ## release-embed-bundle-exclusive
 
@@ -218,7 +218,7 @@ refusing to use the project manifest `{path}` found above the entry file: it is 
 
 ## manifest-unverifiable
 
-refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe build path/to/project`), whose `package.ipe` is then used as named
+refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe dev build path/to/project`), whose `package.ipe` is then used as named
 
 ## no-entry
 
@@ -596,6 +596,18 @@ unknown `ipe {group}` verb `{attempted}`
 
 = help: maybe `ipe {group} {sugg}`?
 
+## cli-group-required
+
+`ipe {attempted}` is not a command on its own — it lives under a group
+
+## cli-subcommand-required
+
+`ipe {group}` needs a subcommand
+
+## cli-group-required-form
+
+= help: `ipe {form}`
+
 ## cli-verify-failed
 
 verify: the {stage} stage failed
@@ -712,12 +724,12 @@ advisory file {path} is malformed — refusing to treat the dep as safe:
 
 ## cli-wasi-run-feature-disabled
 
-ipe run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
-  = help: build the module with `ipe build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
+ipe dev run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
+  = help: build the module with `ipe dev build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
 
 ## cli-wasi-run-failed
 
-ipe run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
+ipe dev run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
 
 ## cli-wasi-run-exited
 
@@ -781,7 +793,7 @@ WASI wall-clock deadline
 
 ## watch-thread-refused
 
-[ipe watch] warning: {detail}; the dependency-resolve retry is skipped
+[ipe dev watch] warning: {detail}; the dependency-resolve retry is skipped
 
 # Publish refusals
 
@@ -1857,15 +1869,19 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+the emitted `fn main` anchor is absent, so the embedded capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+
+## run-main-anchor-ambiguous
+
+the emitted source holds more than one `fn main` anchor, so the embedded capability floor has no single place to be retained from — refusing to write an ambiguous artifact
+
+## run-floor-block-malformed
+
+the emitted source carries a capability floor block other than the one ipe writes — refusing to embed a floor beside one it cannot account for
 
 ## run-profile-unparsable
 
 {code}: {detail} — refusing to run (a profile that does not parse is not honored)
-
-## run-floor-unreadable
-
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
 
 ## build-entry-not-main
 
@@ -1873,11 +1889,11 @@ program entry module `{module}` is not yet buildable — a declared `programs` e
 
 ## pack-retired
 
-ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe build web desktop` / `ipe build web ios` / `ipe build web android` for a fast dev bundle, or `ipe release web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe build --emit-permissions <ios|macos|android>`.
+ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe dev build web desktop` / `ipe dev build web ios` / `ipe dev build web android` for a fast dev bundle, or `ipe release build web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe release build --emit-permissions <ios|macos|android>`.
 
 ## build-binary-missing
 
-ipe build: expected binary at {path} — cargo build succeeded but the binary is missing
+ipe dev build: expected binary at {path} — cargo build succeeded but the binary is missing
 
 ## release-binary-missing
 
@@ -1887,9 +1903,65 @@ ipe release: expected binary at {path} — cargo build succeeded but binary is m
 
 ipe release: expected app binary at {path} — cargo build succeeded but binary is missing
 
-## release-workspace-root-unknown
+## emitted-crate-name-unreadable
 
-ipe release: cannot locate workspace root (no Cargo.toml with [workspace] found in any parent directory)
+the emitted crate manifest {path} names no plain `[package] name`, so its built binary cannot be located — rebuild the program to re-emit the crate
+
+## cli-wrapper-source-refused
+
+ipe release: the jail wrapper source at {root} is not verified: {reason}. A native-bearing release builds its wrapper only from the compiler source tree this `ipe` was built from; build `ipe` from its source checkout to release a native-bearing app
+
+## wrapper-source-no-build-root
+
+the build-time crate path has no workspace root above it
+
+## wrapper-source-unsupported
+
+this host cannot prove directory ownership
+
+## wrapper-source-unproven
+
+{path} is absent or not owner-trusted
+
+## wrapper-source-unreadable
+
+{path} could not be read as UTF-8 within the manifest size cap
+
+## wrapper-source-unparsable
+
+{path} is not valid TOML
+
+## wrapper-source-not-workspace
+
+its Cargo.toml has no [workspace] table
+
+## wrapper-source-member-undeclared
+
+the workspace members do not include {member}
+
+## wrapper-source-package-mismatch
+
+the wrapper member's package is not {package}
+
+## cli-no-run-form
+
+`ipe release run` runs a native program; the {target} target has no run form
+
+## cli-no-run-form-hint
+
+= help: build it with `ipe release build {form}`
+
+## release-run-artifact-flags
+
+ipe release run: {dir} is a built artifact directory; it runs as built and takes no build arguments
+
+## release-run-bundle-incomplete
+
+ipe release run: the bundle at {dir} has no {missing}; a bundle runs only with its wrapper, app and profile together
+
+## release-run-wrapper-unverifiable
+
+ipe release run: {dir} holds a wrapper with no app and profile beside it, so there is nothing to verify; ipe release run runs a bundle directory or a project
 
 ## wasm-bindgen-failed
 
@@ -1901,43 +1973,31 @@ the wasm32-wasip1 build reported no `.wasm` artifact for {dir} — cargo's JSON 
 
 ## session-no-recordable
 
-ipe run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
+ipe dev run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
 
 ## session-native-only
 
-ipe run {flag}: works on a native run only — drop `--target wasi`
+ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
-## session-jailed
+## session-ffi-unproven
 
-ipe run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed, since its replay is not proven deterministic — run it without {flag}
 
 ## session-flags-exclusive
 
-ipe run: {first} and {second} cannot be combined — record a session, then replay it
+ipe dev run: {first} and {second} cannot be combined — record a session, then replay it
 
 ## replay-no-default-log
 
-ipe run --replay: no session log at {typed} or trace at {trace} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {typed} or trace at {trace} — record one with `ipe dev run --record`
 
 ## replay-log-missing
 
-ipe run --replay: no session log at {path} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {path} — record one with `ipe dev run --record`
 
 ## program-exited
 
 {program} exited with code {code}
-
-## exec-no-artifact-dir
-
-ipe exec: no artifact directory at {dir}
-
-## exec-no-binary
-
-ipe exec: no built binary at {path} — run `ipe build` first
-
-## exec-profile-missing
-
-ipe exec: {path} embeds a capability floor but carries no ipe.profile — the artifact is incomplete or tampered; refusing to run native code without its jail profile
 
 ## cargo-metadata-failed
 
@@ -2035,6 +2095,14 @@ released → {path} (single self-jailing binary; run `--capabilities` to audit)
 ## release-bundled
 
 released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app can be run directly, bypassing the sandbox — prefer embed mode for production)
+
+## mobile-android-note
+
+note: an unsigned Android Gradle project is written here. `./gradlew assembleDebug` (with the Android SDK) builds an APK signed with the SDK's debug key, for local install only; a store build needs your own keystore — add a `signingConfig` for it to `app/build.gradle`, then run `./gradlew assembleRelease`.
+
+## mobile-ios-note
+
+note: the iOS shell project layout is written here, but a signed, runnable .ipa must be produced on a macOS runner with Xcode + a signing identity (out of scope).
 
 # Consent refusals
 

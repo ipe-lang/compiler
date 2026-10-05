@@ -33,7 +33,7 @@ two-process dance collapses into a single Ipê source file.
 
 ```bash
 cd examples/29-webview-threejs-spike
-ipe run src/Main.ipe
+ipe dev run src/Main.ipe
 ```
 
 A native window opens, the Three.js scene paints, the FPS counter

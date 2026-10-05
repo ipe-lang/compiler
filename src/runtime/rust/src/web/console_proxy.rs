@@ -62,7 +62,7 @@ pub fn console_bin_path() -> Option<std::path::PathBuf> {
         return if pb.is_file() { Some(pb) } else { None };
     }
     // Key on the IPE compiler version (same source as `/_ipe/buildinfo`), NOT
-    // the generated crate's CARGO_PKG_VERSION (always "0.1.0"). The ipe build
+    // the generated crate's CARGO_PKG_VERSION (always "0.1.0"). The ipe dev build
     // sets IPE_VERSION when compiling this app, so a console binary placed for
     // one ipe version is never exec'd by an app built with another.
     let ver = option_env!("IPE_VERSION").unwrap_or("dev");

@@ -3001,7 +3001,7 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::DevOnlyKernelInProduction { kernel } => vec![HelpLine::Note(
             format!(
                 "`{kernel}` is a development-only debugging tool. Remove it before \
-                 releasing, or switch to `ipe build` / `ipe run` for development. \
+                 releasing, or switch to `ipe dev build` / `ipe dev run` for development. \
                  To log in production, use `Io.eprintln` or `Log.info`."
             )
             .into_boxed_str(),
@@ -3390,26 +3390,19 @@ fn sandbox_help(msg: &SandboxError) -> Vec<HelpLine> {
              to enable the isolation jail for compiling untrusted crates"
                 .into(),
         )],
-        SandboxError::RunJail { .. } => vec![
-            HelpLine::Note(
-                "this program reaches native Rust code whose effects cannot be proven \
-                 safe; install bubblewrap (bwrap on Linux) or sandbox-exec (macOS) to \
-                 confine it"
-                    .into(),
-            ),
-            HelpLine::Note(
-                "set IPE_ALLOW_UNSANDBOXED=1 to run unconfined at your own risk \
-                 (never in CI)"
-                    .into(),
-            ),
-        ],
+        SandboxError::RunJail { .. } => vec![HelpLine::Note(
+            "this program reaches native Rust code whose effects cannot be proven \
+             safe; install bubblewrap (bwrap on Linux) or sandbox-exec (macOS) to \
+             confine it"
+                .into(),
+        )],
     }
 }
 
 fn consent_help(msg: &ConsentError) -> Vec<HelpLine> {
     let remedy = HelpLine::Note(
-        "re-run with --accept-risks to take responsibility and proceed, or add \
-         `accept = [\"unsafe\"]` under [capabilities] in package.ipe for durable consent"
+        "add `accept = [\"unsafe\"]` under [capabilities] in package.ipe to take \
+         responsibility and proceed"
             .into(),
     );
     match msg {
@@ -3417,7 +3410,7 @@ fn consent_help(msg: &ConsentError) -> Vec<HelpLine> {
             remedy,
             HelpLine::Note(
                 "this is a non-interactive build; it will not prompt — \
-                 pre-accept with --accept-risks or the manifest token"
+                 pre-accept with the manifest token"
                     .into(),
             ),
         ],

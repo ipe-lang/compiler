@@ -5,7 +5,7 @@
 //! save), format-on-save chains a second write shortly after the first, and
 //! a multi-file operation (branch switch, `git stash pop`) can emit dozens
 //! of events within milliseconds. Firing one rebuild per raw event would
-//! defeat the whole point of building `ipe watch` on an incremental engine —
+//! defeat the whole point of building `ipe dev watch` on an incremental engine —
 //! salsa's minimal recompute only pays off if the driver demands it once per
 //! logical change, not once per raw inotify/FSEvents wakeup.
 //!

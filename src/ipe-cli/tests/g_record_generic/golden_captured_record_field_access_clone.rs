@@ -1,6 +1,6 @@
 //! A captured-record-into-`Fn`-closure move gap (SEAL).
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`
 //! with E0507 — "cannot move out of `row`, a captured variable in an `Fn`
 //! closure" — when a record is captured into a lambda whose FIRST use of it is a
 //! field access and which then also uses the whole record.
@@ -64,7 +64,7 @@ fn captured_record_field_access_is_cloned_not_moved() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for captured_record_field_access_clone: {:?}",
+        "ipe dev build must succeed for captured_record_field_access_clone: {:?}",
         built.err()
     );
 
@@ -84,7 +84,7 @@ fn captured_record_field_access_is_cloned_not_moved() {
 /// cargo-0 ∧ run-0: the emitted project actually compiles with `rustc` (no
 /// E0507), runs, and prints the expected line. Gated on `IPE_E2E=1` — a real
 /// `cargo build`, the only check that would have caught the original SEAL
-/// violation (E0507, `ipe build` clean).
+/// violation (E0507, `ipe dev build` clean).
 #[test]
 fn captured_record_cargo_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -102,7 +102,7 @@ fn captured_record_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for captured_record_field_access_clone: {:?}",
+        "ipe dev build must succeed for captured_record_field_access_clone: {:?}",
         built.err()
     );
 

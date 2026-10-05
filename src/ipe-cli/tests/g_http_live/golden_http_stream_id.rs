@@ -72,7 +72,7 @@ fn http_stream_open_full_emit_succeeds() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for HttpStream.open's HttpRequest arg (no \
+        "ipe dev build must succeed for HttpStream.open's HttpRequest arg (no \
          field-read consumer, no signature spelling out the fieldset); \
          got: {:?}",
         built.err()

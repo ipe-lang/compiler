@@ -134,7 +134,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build(&entry, &out_dir, &runtime)
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
@@ -156,7 +156,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
 /// ```
 ///
 /// What this test proves and what it does NOT: it typechecks the program
-/// (`ipe build` accepts the record-alias `onKey`, no IPE-T0001) and asserts the
+/// (`ipe dev build` accepts the record-alias `onKey`, no IPE-T0001) and asserts the
 /// emitter produces the exact record-bridge wrapper — a `|kind, value|` closure
 /// that constructs `RecKindValue { kind, value }` from BOTH parameters in ONE
 /// expression, so both key fields provably flow from the runtime's
@@ -192,7 +192,7 @@ fn tui_onkey_record_typechecks() {
         let built = ipe::build(&entry, &out_dir, &runtime);
         assert!(
             built.is_ok(),
-            "{label}: ipe build failed (T0001 regression?): {:?}",
+            "{label}: ipe dev build failed (T0001 regression?): {:?}",
             built.err()
         );
 

@@ -3436,9 +3436,11 @@ dependencies = [
  "ipe-test-temp",
  "ipe_diagnostics",
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "rustix 0.38.44",
  "serde",
+ "toml",
  "win32job",
  "windows-sys 0.61.2",
 ]
@@ -3490,6 +3492,7 @@ name = "ipe_wrapper"
 version = "0.4.0"
 dependencies = [
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "ipe_sandbox",
 ]

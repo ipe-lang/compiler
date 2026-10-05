@@ -11,7 +11,7 @@
 //!    region) resolves to the bare in-module name and round-trips;
 //!  * a lifetime/generic-parameterised inspected opaque (`Element<'a, Message>`)
 //!    is unsound to emit as a stripped bare-arg path, so the whole adapter
-//!    OVER-DROPS (no wrapper) rather than breach the `ipe build ⇒ cargo build`
+//!    OVER-DROPS (no wrapper) rather than breach the `ipe dev build ⇒ cargo build`
 //!    keystone. This is why Iced's `view : Model -> Element Message` stays
 //!    refused: the bare-handle carrier cannot carry `Element`'s generic args.
 //!

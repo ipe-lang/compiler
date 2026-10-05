@@ -15,6 +15,7 @@ pub(crate) enum IpeCssLength {
     LenZero,
     LenRaw(String),
 }
+
 impl IpeStringify for IpeCssLength {
     fn ipe_show(&self) -> String {
         match self {
@@ -53,6 +54,7 @@ impl IpeStringify for IpeCssLength {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCssColor {
     Hex(String),
@@ -64,6 +66,7 @@ pub(crate) enum IpeCssColor {
     ColorCurrent,
     ColorRaw(String),
 }
+
 impl IpeStringify for IpeCssColor {
     fn ipe_show(&self) -> String {
         match self {
@@ -105,10 +108,12 @@ impl IpeStringify for IpeCssColor {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCssOpacity {
     Opacity(f64),
 }
+
 impl IpeStringify for IpeCssOpacity {
     fn ipe_show(&self) -> String {
         match self {
@@ -118,6 +123,7 @@ impl IpeStringify for IpeCssOpacity {
         }
     }
 }
+
 pub(crate) fn user_ipe_css_opacity_of(n: f64) -> IpeCssOpacity {
     let _ipe_recursion_guard = crate::recursion_guard();
     (if math_is_nan(n) {
@@ -126,16 +132,19 @@ pub(crate) fn user_ipe_css_opacity_of(n: f64) -> IpeCssOpacity {
         IpeCssOpacity::Opacity(basics_clamp(0.0, 1.0, n))
     })
 }
+
 pub(crate) fn user_ipe_css_opacity_to_string(o: IpeCssOpacity) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match o {
         IpeCssOpacity::Opacity(n) => crate::user_ipe_css_float_str(n),
     }
 }
+
 pub(crate) fn user_ipe_css_float_str(n: f64) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     string_from_float(n)
 }
+
 pub(crate) fn user_ipe_css_length_to_string(lengthVal: IpeCssLength) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match lengthVal {
@@ -153,6 +162,7 @@ pub(crate) fn user_ipe_css_length_to_string(lengthVal: IpeCssLength) -> String {
         IpeCssLength::LenRaw(s) => s,
     }
 }
+
 pub(crate) fn user_ipe_css_color_to_string(c: IpeCssColor) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match c {
@@ -270,18 +280,22 @@ pub(crate) fn user_ipe_css_color_to_string(c: IpeCssColor) -> String {
         IpeCssColor::ColorRaw(s) => s,
     }
 }
+
 pub(crate) fn user_ipe_css_px(n: i64) -> IpeCssLength {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCssLength::Px(n)
 }
+
 pub(crate) fn user_ipe_css_vh(n: i64) -> IpeCssLength {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCssLength::Vh(n)
 }
+
 pub(crate) fn user_ipe_css_vw(n: i64) -> IpeCssLength {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCssLength::Vw(n)
 }
+
 pub(crate) fn user_ipe_css_rgba(r: i64, g: i64, b: i64, a: IpeCssOpacity) -> IpeCssColor {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCssColor::Rgba(r, g, b, a)

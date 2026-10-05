@@ -61,7 +61,7 @@ fn build_run_input_callback() -> crate::support::RunOutcome {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for input_callback_maybe_field: {:?}",
+        "ipe dev build must succeed for input_callback_maybe_field: {:?}",
         built.err()
     );
 

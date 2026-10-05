@@ -76,7 +76,7 @@ readRow row =
             "rejected (schema drift — fail-closed)"
 ```
 
-Running it (`ipe run`) reads the good row and turns the three drifted rows away:
+Running it (`ipe dev run`) reads the good row and turns the three drifted rows away:
 
 ```
 well-formed row -> Ok User { id = u-42, age = 30, active = True }

@@ -11,7 +11,7 @@ import Runner
 
 
 -- Serves the playground as an Ipê-native server (start from this directory:
--- `cd server && ipe run`). The static roots are relative to the process cwd:
+-- `cd server && ipe dev run`). The static roots are relative to the process cwd:
 -- ".." is the playground root (index.html) and "../pkg" the wasm bundle.
 -- POST /run accepts the EMITTED RUST (not Ipê source); the client-side WASM
 -- compiler produced it. The server stages it into a fresh project dir under

@@ -110,14 +110,14 @@ consumed `change_queue` row is deleted. The app creates and owns the review DB.
 From this directory, against an index built at the repo root:
 
 ```bash
-IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe run
+IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe dev run
 ```
 
-`ipe run` builds and serves on <http://localhost:8000>. Set `IPE_SERVER_PORT`
-to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe run`; a value that is
+`ipe dev run` builds and serves on <http://localhost:8000>. Set `IPE_SERVER_PORT`
+to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`; a value that is
 not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
 large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
-no runtime, and `ipe build` compiles to a native binary.
+no runtime, and `ipe dev build` compiles to a native binary.
 
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
 console at `/_ipe/console` is open only while the server binds loopback, and on
@@ -142,5 +142,5 @@ compiler's runtime to avoid it:
 
 ```bash
 ver=$(ipe version | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) print $i}')
-IPE_RUNTIME_DIR="$HOME/.ipe/runtime/$ver/rust" ipe run
+IPE_RUNTIME_DIR="$HOME/.ipe/runtime/$ver/rust" ipe dev run
 ```

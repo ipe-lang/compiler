@@ -63,7 +63,7 @@ policyLine err =
     verdict ++ " " ++ Error.toString err
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 Failure -> retry policy (by error kind, not message text):

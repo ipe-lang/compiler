@@ -73,5 +73,5 @@ exit: 0
   The forms listed above need emission machinery that does not exist yet
   (return-position generics, chained bounds for nested rows) and are planned later
   increments of the same design. Until each lands, the compiler stops here rather
-  than emit Rust that would fail to build after `ipe build` already reported
+  than emit Rust that would fail to build after `ipe dev build` already reported
   success.

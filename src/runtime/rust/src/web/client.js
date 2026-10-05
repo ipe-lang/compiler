@@ -14,7 +14,7 @@ var __ipeRetryMaxAttempts = (window.__IPE_RETRY_MAX_ATTEMPTS != null) ? window._
 // fast server restart or a transient blip reconnects almost immediately;
 // jitter spreads a mass reconnect so a recovering server is not
 // thundering-herded. Past the window we fall back to exponential backoff. The
-// window must outlast the expected outage: `ipe watch` injects a longer one
+// window must outlast the expected outage: `ipe dev watch` injects a longer one
 // (a dev rebuild takes seconds) while the default stays short so a real prod
 // outage does not draw sustained fast retries.
 var __ipeRetryFastMs = (window.__IPE_RETRY_FAST_MS != null) ? window.__IPE_RETRY_FAST_MS : 200;
@@ -25,11 +25,11 @@ var __ipeMsgOffline = (window.__IPE_MSG_OFFLINE != null) ? window.__IPE_MSG_OFFL
 var __ipeMsgUpdated = (window.__IPE_MSG_UPDATED != null) ? window.__IPE_MSG_UPDATED : "updated ✓";
 var __ipeHelloTimeoutMs = (window.__IPE_HELLO_TIMEOUT_MS != null) ? window.__IPE_HELLO_TIMEOUT_MS : 8000;
 var __ipeHeartbeatTtlMs = (window.__IPE_HEARTBEAT_TTL_MS != null) ? window.__IPE_HEARTBEAT_TTL_MS : 35000;
-// Dev-watch blue-green cutover mode. Set by the `ipe watch` blue-green server
+// Dev-watch blue-green cutover mode. Set by the `ipe dev watch` blue-green server
 // (IPE_WEB_SWAP_TOAST). When on, a reconnect is an expected rebuild cutover:
 // the amber "Reconnecting…" banner is suppressed during the brief fast-window
 // drop, and a successful reconnect greets the user with a small positive
-// "updated ✓" toast instead. A release / `ipe run` server leaves this false,
+// "updated ✓" toast instead. A release / `ipe dev run` server leaves this false,
 // so the ordinary reconnect/offline chrome is unaffected in production.
 var __ipeSwapToast = (window.__IPE_SWAP_TOAST === true);
 // True once THIS page-life has seen a first `hello`. A later `hello` (or an
@@ -1461,12 +1461,12 @@ function __ipeInjectStatusBanner() {
   __ipeSetStatus(__ipeStatus, "");
 }
 // ── Swap toast (dev blue-green cutover cue) ──────────────────
-// A brief, positive, non-blocking toast shown when the `ipe watch` blue-green
+// A brief, positive, non-blocking toast shown when the `ipe dev watch` blue-green
 // proxy has cut a rebuild over. It replaces the amber "Reconnecting…" banner
 // for the expected dev-rebuild case: appears, then auto-dismisses (~1.5s). It
 // is a SEPARATE element from the connection-status banner (which stays for a
 // genuine outage). Dev-only — never fires unless __ipeSwapToast is set, which a
-// release / `ipe run` server leaves false. aria-live polite for screen readers.
+// release / `ipe dev run` server leaves false. aria-live polite for screen readers.
 var __ipeSwapToastEl = null;
 var __ipeSwapToastTimer = null;
 function __ipeShowSwapToast() {
@@ -1708,7 +1708,7 @@ function __ipeOpenSSE() {
   // `hello` on every open when running behind the proxy. It is redundant with
   // the hello-based reconnect detection above (kept as an explicit, named
   // signal), so it is likewise gated on a PRIOR hello — the first-load frame
-  // draws nothing. Never emitted by a release / `ipe run` server.
+  // draws nothing. Never emitted by a release / `ipe dev run` server.
   __ipeSSE.addEventListener("swapped", function() {
     __ipeLastSseAt = Date.now();
     if (__ipeSwapToast && __ipeHelloEverOk) __ipeShowSwapToast();
@@ -1756,9 +1756,9 @@ function __ipeOpenSSE() {
       __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
     }, 500);
   });
-  // Dev-only build-status event: server pushes this when `ipe watch`
+  // Dev-only build-status event: server pushes this when `ipe dev watch`
   // reports a compile or cargo failure, and when a subsequent build
-  // succeeds. Only reachable when `ipe watch` is running; never
+  // succeeds. Only reachable when `ipe dev watch` is running; never
   // triggered in production (the POST endpoint is not mounted there).
   __ipeSSE.addEventListener("ipe-build-status", function(e) {
     var data;

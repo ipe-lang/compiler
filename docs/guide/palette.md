@@ -50,7 +50,7 @@ scale =
     [ Sp 4, Sp 8, Sp 16 ]
 ```
 
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 Dark -> #000

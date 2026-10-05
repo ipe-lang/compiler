@@ -446,20 +446,22 @@ fn emit_web_app_inner(
             let model_ty_s = render_type(ctx, model_ty, generics)?;
             let page_ty_s = render_type(ctx, page_ty, generics)?;
             let render_s = emit_route_render(ctx, routes_e, &routes_s, page_ty, &page_ty_s)?;
+            let update = UpdateEmission::new(ctx, fields, &update_s)?;
             let set_page = set_page_closure(
                 ctx,
                 fields,
-                update_e,
+                &update.set_page,
                 &page_ty_s,
                 &model_ty_s,
                 indent,
                 child,
                 generics,
             )?;
-            return Ok(Some(format!(
+            let handler = &update.handler;
+            let call = format!(
                 "ipe_runtime::wasm::wasm_app_routed(\
                  {init_s}, \
-                 {update_s}, \
+                 {handler}, \
                  {view_s}, \
                  {subs_s}, \
                  {routes_s}, \
@@ -467,7 +469,12 @@ fn emit_web_app_inner(
                  {set_page}, \
                  {render_s}\
                  )"
-            )));
+            );
+            return Ok(Some(if update.prelude.is_empty() {
+                call
+            } else {
+                format!("{{ {}{call} }}", update.prelude)
+            }));
         }
         return Ok(Some(format!(
             "ipe_runtime::wasm::wasm_app({init_s}, {update_s}, {view_s}, {subs_s})"
@@ -487,8 +494,8 @@ fn emit_web_app_inner(
     // routed branch — single-page apps pass them as structural no-ops.
     if let Some((model_ty, page_ty)) = routed_page_field(ctx, view_e) {
         return emit_routed_web_leaf(
-            ctx, fields, &tag_const, mountable, model_ty, page_ty, update_e, &init_s, &update_s,
-            &view_s, &subs_s, indent, child, generics,
+            ctx, fields, &tag_const, mountable, model_ty, page_ty, &init_s, &update_s, &view_s,
+            &subs_s, indent, child, generics,
         );
     }
 
@@ -527,7 +534,6 @@ fn emit_routed_web_leaf(
     mountable: bool,
     model_ty: &ipe_ir::IrType,
     page_ty: &ipe_ir::IrType,
-    update_e: &Expr,
     init_s: &str,
     update_s: &str,
     view_s: &str,
@@ -543,10 +549,11 @@ fn emit_routed_web_leaf(
     let model_ty_s = render_type(ctx, model_ty, generics)?;
     let page_ty_s = render_type(ctx, page_ty, generics)?;
     let render_s = emit_route_render(ctx, routes_e, &routes_s, page_ty, &page_ty_s)?;
+    let update = UpdateEmission::new(ctx, fields, update_s)?;
     let set_page = set_page_closure(
         ctx,
         fields,
-        update_e,
+        &update.set_page,
         &page_ty_s,
         &model_ty_s,
         indent,
@@ -554,8 +561,9 @@ fn emit_routed_web_leaf(
         generics,
     )?;
     let register = granted_web_features_register_stmt(ctx);
+    let handler = &update.handler;
     let args = format!(
-        "{init_s}, {update_s}, {view_s}, {subs_s}, {routes_s}, {not_found_s}, {set_page}, \
+        "{init_s}, {handler}, {view_s}, {subs_s}, {routes_s}, {not_found_s}, {set_page}, \
          {render_s}, {WEB_STORE_ARGS}"
     );
     let handle = if mountable {
@@ -566,7 +574,10 @@ fn emit_routed_web_leaf(
              ipe_runtime::web::web_app_routed({args})))"
         )
     };
-    Ok(Some(format!("{{ {register}{tag_const} {handle} }}")))
+    let prelude = &update.prelude;
+    Ok(Some(format!(
+        "{{ {register}{tag_const} {prelude}{handle} }}"
+    )))
 }
 
 /// Emit the single-page (non-routed) `WebApp` leaf.
@@ -597,7 +608,7 @@ fn emit_single_page_web_leaf(
         )
     };
     // The additive-`Msg`-variant hot-swap descriptor: an inert emitted const the
-    // `ipe watch` classifier scans to diff the `Msg` variant surface. Empty (no
+    // `ipe dev watch` classifier scans to diff the `Msg` variant surface. Empty (no
     // emit change) unless the `hot_appearance` dev gate is on, so a release emit is
     // byte-identical.
     let msg_set_item = msg_set_descriptor_item(ctx, update_e);
@@ -984,7 +995,7 @@ fn schema_tag_const(ctx: &EmitCtx, view_e: &Expr) -> DResult<String> {
 /// under the `hot_appearance` dev gate. Returns the empty string with the flag off
 /// (the default, and every production build), so a release emit is byte-identical
 /// whether or not this is called — the descriptor is a dev-loop artefact the
-/// `ipe watch` classifier scans out of the emitted text to diff the `Msg` variant
+/// `ipe dev watch` classifier scans out of the emitted text to diff the `Msg` variant
 /// surface, never anything the running program reads.
 ///
 /// The emitted form is a `const IPE_WEB_MSG_SET: &str = "<descriptor JSON>";`. The
@@ -1016,6 +1027,43 @@ fn msg_set_descriptor_item(ctx: &EmitCtx, update_e: &Expr) -> String {
     )
 }
 
+/// How the emitted `update` reaches the runtime entry and the generated
+/// `set_page`.
+///
+/// With `onNavigate` present `set_page` dispatches through `update` too, so two
+/// consumers need the one callable. Emitting its text twice would move every
+/// non-`Clone` value the callable captures into two `move` closures (rustc
+/// E0382); instead `update` is evaluated once into an `Arc` that both share.
+/// Without `onNavigate` only the runtime entry uses `update`, and it is passed
+/// as emitted.
+struct UpdateEmission {
+    /// Statements that run before the runtime entry call.
+    prelude: String,
+    /// The `update` argument of the runtime entry.
+    handler: String,
+    /// The callable `set_page` dispatches through (empty without `onNavigate`).
+    set_page: String,
+}
+
+impl UpdateEmission {
+    fn new(ctx: &EmitCtx, fields: &[(ipe_intern::Symbol, Expr)], update_s: &str) -> DResult<Self> {
+        if lookup_optional_field(ctx, fields, "onNavigate")?.is_none() {
+            return Ok(Self {
+                prelude: String::new(),
+                handler: update_s.to_string(),
+                set_page: String::new(),
+            });
+        }
+        Ok(Self {
+            prelude: format!("let __update_shared = ::std::sync::Arc::new({update_s}); "),
+            handler: "{ let __update_app = ::std::sync::Arc::clone(&__update_shared); \
+                      move |__msg, __model| (*__update_app)(__msg, __model) }"
+                .to_string(),
+            set_page: "::std::sync::Arc::clone(&__update_shared)".to_string(),
+        })
+    }
+}
+
 /// Build the `set_page : Fn(Page, Model) -> (Model, Cmd)` entry fn the routed runtime enters a URL through.
 ///
 /// The runtime calls it once per URL-to-model entry (first GET, reload, in-app
@@ -1034,7 +1082,7 @@ fn msg_set_descriptor_item(ctx: &EmitCtx, update_e: &Expr) -> String {
 fn set_page_closure(
     ctx: &EmitCtx,
     fields: &[(ipe_intern::Symbol, Expr)],
-    update_e: &Expr,
+    shared_update: &str,
     page_ty_s: &str,
     model_ty_s: &str,
     indent: usize,
@@ -1043,12 +1091,11 @@ fn set_page_closure(
 ) -> DResult<String> {
     match lookup_optional_field(ctx, fields, "onNavigate")? {
         Some(on_navigate_e) => {
-            let update_s = emit_web_fn(ctx, update_e, indent, child, generics)?;
             let on_navigate_s = emit_web_fn(ctx, on_navigate_e, indent, child, generics)?;
             Ok(format!(
-                "{{ let __update = {update_s}; let __on_navigate = {on_navigate_s}; \
+                "{{ let __update = {shared_update}; let __on_navigate = {on_navigate_s}; \
                  move |__page: {page_ty_s}, __model: {model_ty_s}| \
-                 (__update)((__on_navigate)(__page), __model) }}"
+                 (*__update)((__on_navigate)(__page), __model) }}"
             ))
         }
         None => Ok(format!(
@@ -3170,7 +3217,7 @@ mod hot_appearance_tests {
 
     /// With the flag OFF a static `Ipe.Html` subtree emits inline (the direct
     /// `html_node_` / `html_text_node_` tree), never a template read — release /
-    /// `ipe build` output is unperturbed.
+    /// `ipe dev build` output is unperturbed.
     #[test]
     fn flag_off_static_subtree_emits_inline() -> DResult<()> {
         let mut interner = Interner::new();

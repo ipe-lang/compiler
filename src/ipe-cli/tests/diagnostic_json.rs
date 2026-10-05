@@ -1,5 +1,5 @@
 //! Integration tests for the machine-readable (`--json`) diagnostic output on
-//! `ipe build`, `ipe run`, and `ipe type-check`.
+//! `ipe dev build`, `ipe dev run`, and `ipe type-check`.
 //!
 //! Verifies:
 //! - A failing compile under `--json` emits valid, schema-conforming JSON on
@@ -275,7 +275,7 @@ fn type_check_plain_and_json_together_are_a_usage_error() {
 }
 
 // ---------------------------------------------------------------------------
-// ipe build --json
+// ipe dev build --json
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -302,6 +302,7 @@ fn build_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let out_dir = tmp.join("out");
     // Entry path must come first (before flags) — `parse_build` uses `take_leading_entry`.
     let r = run_ipe(&[
+        "dev",
         "build",
         &src.to_string_lossy(),
         "--json",
@@ -335,7 +336,7 @@ fn build_json_unknown_flag_renders_the_machine_error_envelope() {
     // human-furniture-in-a-machine-stream leak is exactly what resolving the
     // output format BEFORE the parse closes). It is the compact
     // `ipe.cli.error/1` usage envelope, not the rich diagnostic object.
-    let r = run_ipe(&["build", "--json", "--completely-unknown-flag-xyz"]);
+    let r = run_ipe(&["dev", "build", "--json", "--completely-unknown-flag-xyz"]);
     assert!(!r.ok, "an unknown flag must exit non-zero");
     let stderr = r.stderr.trim();
     assert!(
@@ -348,6 +349,25 @@ fn build_json_unknown_flag_renders_the_machine_error_envelope() {
     );
 }
 
+#[test]
+fn machine_error_command_field() {
+    // The machine error envelope names the grouped verb a caller typed, so a
+    // consumer keying on `command` sees `dev build`, never a bare verb.
+    for verb in [["dev", "build"], ["dev", "run"], ["release", "build"]] {
+        let r = run_ipe(&[verb[0], verb[1], "--json", "--bad-flag"]);
+        assert!(!r.ok, "{verb:?} with an unknown flag must exit non-zero");
+        let command = serde_json::from_str::<serde_json::Value>(r.stderr.trim())
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned));
+        assert_eq!(
+            command.as_deref(),
+            Some(verb.join(" ").as_str()),
+            "the envelope must name the grouped verb, got: {:?}",
+            r.stderr
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // mimalloc note must not reach a machine stream (#2590)
 // ---------------------------------------------------------------------------
@@ -355,7 +375,7 @@ fn build_json_unknown_flag_renders_the_machine_error_envelope() {
 /// On `--json` or `--plain`, the mimalloc opt-in `note:` must not appear on
 /// stderr. The note is human furniture — it belongs only in `--human` mode.
 ///
-/// The test drives `ipe build --static --allocator mimalloc <format>` against a
+/// The test drives `ipe dev build --static --allocator mimalloc <format>` against a
 /// non-existent entry. The process fails (preflight cannot find the musl
 /// toolchain, or the entry file is absent), but the failing path that MATTERS
 /// here is `resolve_static_plan`, which runs at plan-resolution time, before
@@ -366,6 +386,7 @@ fn mimalloc_note_absent_from_machine_stderr() {
     for format in ["--json", "--plain"] {
         for cmd in ["build", "run"] {
             let r = run_ipe(&[
+                "dev",
                 cmd,
                 "NoSuchEntry.ipe",
                 "--static",
@@ -386,7 +407,7 @@ fn mimalloc_note_absent_from_machine_stderr() {
 }
 
 // ---------------------------------------------------------------------------
-// ipe run --json
+// ipe dev run --json
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -412,6 +433,7 @@ fn run_json_on_type_error_exits_nonzero_with_schema_conforming_json() {
     let out_dir = tmp.join("out");
     // Entry path must come first — `parse_run` uses `take_leading_entry`.
     let r = run_ipe(&[
+        "dev",
         "run",
         &src.to_string_lossy(),
         "--json",

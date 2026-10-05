@@ -45,7 +45,7 @@ fn i222_match_arm_ipec_accepts_and_relays() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for match_arm_clone_relay: {:?}",
+        "ipe dev build must succeed for match_arm_clone_relay: {:?}",
         built.err()
     );
 
@@ -76,7 +76,11 @@ fn i222_match_arm_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("match_arm_clone_relay", &out);
     assert_eq!(

@@ -31,7 +31,7 @@ pub struct BuildOptions {
     /// normal dynamic build; also removes a stale generated static config.
     pub static_plan: Option<ipe_backend_rust::static_build::StaticPlan>,
     /// The compilation target (`Native` default; `WasmClient` under
-    /// `ipe build --target wasm`) — threaded into kernel resolution (the
+    /// `ipe dev build --target wasm`) — threaded into kernel resolution (the
     /// Layer-1 wasm gate), the emitted manifest, and both cache keys.
     pub target: ipe_ir::Target,
     /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
@@ -56,7 +56,7 @@ pub struct BuildOptions {
     /// `Release` (the default) rejects any development-only `Debug.*` escape
     /// hatch (IPE-L0140) and omits the runtime `dev-posture` feature, so the
     /// console stays closed until `IPE_CONSOLE_AUTH` is set. Only a dev verb
-    /// (`ipe build` / `run` / `test` / `watch`) states `Development`.
+    /// (`ipe dev build` / `run` / `test` / `watch`) states `Development`.
     pub intent: ipe_backend_rust::BuildIntent,
     /// `true` (the DEFAULT) selects the dependency-model emit: the emitted
     /// project declares the runtime as a path dependency with a
@@ -70,7 +70,7 @@ pub struct BuildOptions {
     /// a test).
     pub runtime_dep: bool,
     /// `true` tree-shakes the vendored runtime tree to only the modules the
-    /// program reaches — the `ipe eject` shape. The emitted `ipe_runtime/mod.rs`
+    /// program reaches — the `ipe release eject` shape. The emitted `ipe_runtime/mod.rs`
     /// already declares `pub mod X;` for exactly the reached top-level modules,
     /// so [`build_emit_manifest`] vendors only those source files instead of the
     /// whole runtime tree. Ignored unless the emit is the vendored shape (it has
@@ -86,7 +86,7 @@ pub struct BuildOptions {
     /// named accordingly. Empty string uses the safe `"ipe-app"` default
     /// (single-file builds with no manifest).
     pub cargo_name: String,
-    /// `true` when `ipe build --debugger` / `ipe run --debugger` was passed.
+    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed.
     /// Threaded through [`ipe_db::BuildConfig`] to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the
     /// `debugger` feature to the emitted project's runtime dependency so the TEA
@@ -97,8 +97,8 @@ pub struct BuildOptions {
     /// `true` routes style-value literals through a per-view `LiteralTable` and
     /// emits the `/_ipe/hot-appearance` endpoint, so an appearance-only source
     /// edit hot-swaps in the running app instead of forcing a recompile. Set
-    /// ONLY by the `ipe watch` entry (from [`hot_appearance_enabled`]); the
-    /// `ipe build` / `ipe run` / `ipe release` entries leave it `false` so a
+    /// ONLY by the `ipe dev watch` entry (from [`hot_appearance_enabled`]); the
+    /// `ipe dev build` / `ipe dev run` / `ipe release` entries leave it `false` so a
     /// release artifact never carries hot-swap scaffolding. Default `false`.
     pub hot_appearance: bool,
     /// `true` when the resolved delivery is `web desktop` (webview-native).
@@ -164,7 +164,7 @@ pub fn runtime_dep_from_env() -> bool {
 /// broken emit, defeating the seal the coverage sweep exists to hold. Setting a
 /// UNIQUE name per build gives each app crate its own fingerprint, so a broken
 /// emit still fails to build even against a warm target. Unset (every ordinary
-/// `ipe run` / `ipe build`), the name is empty and the emit keeps the `ipe-app`
+/// `ipe dev run` / `ipe dev build`), the name is empty and the emit keeps the `ipe-app`
 /// default — this lever changes nothing for a normal build.
 #[must_use]
 pub fn single_file_cargo_name_from_env() -> String {
@@ -189,16 +189,16 @@ fn canonical_project_dir(manifest_path: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Whether the dev-only appearance hot-swap emit is enabled for `ipe watch`.
+/// Whether the dev-only appearance hot-swap emit is enabled for `ipe dev watch`.
 ///
-/// Default ON: `ipe watch` hot-swaps appearance-only edits (e.g. `Ui.spacing`)
+/// Default ON: `ipe dev watch` hot-swaps appearance-only edits (e.g. `Ui.spacing`)
 /// without a recompile out of the box. Opt out with `IPE_WATCH_NO_HOT_APPEARANCE`
 /// (set to any non-empty value other than `0`), which forces the plain
 /// direct-literal emit. `IPE_WATCH_HOT_APPEARANCE`, when set, is honoured
 /// explicitly (`0` or empty = off, anything else = on) and overrides the
 /// default; the opt-out takes precedence over it.
 ///
-/// This lever exists ONLY in `ipe watch`. `ipe build` / `ipe run` / `ipe release`
+/// This lever exists ONLY in `ipe dev watch`. `ipe dev build` / `ipe dev run` / `ipe release`
 /// thread [`BuildOptions::hot_appearance`] `= false`, so a release artifact never
 /// carries hot-swap scaffolding regardless of these variables.
 #[must_use]
@@ -221,7 +221,7 @@ pub fn hot_appearance_from_env(no_var: Option<&str>, hot_var: Option<&str>) -> b
     hot_var.is_none_or(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether the dev-only browser build-status banner is enabled for `ipe watch`.
+/// Whether the dev-only browser build-status banner is enabled for `ipe dev watch`.
 ///
 /// Enabled unless `IPE_WEB_BANNER` is explicitly `off`/`0`/`false`. Mirrors the
 /// runtime's `watch_banner_active` disable semantics so the CLI-side poster and
@@ -236,9 +236,9 @@ pub fn watch_banner_enabled() -> bool {
     })
 }
 
-/// Whether the DEV-ONLY blue-green front proxy is enabled for `ipe watch`.
+/// Whether the DEV-ONLY blue-green front proxy is enabled for `ipe dev watch`.
 ///
-/// Default ON: `ipe watch` puts a persistent proxy on the user's port and cuts
+/// Default ON: `ipe dev watch` puts a persistent proxy on the user's port and cuts
 /// each rebuilt binary over behind it once it passes readiness, so a rebuild
 /// never drops the browser's connection (no "Reconnecting…" flash — the client
 /// gets a brief "updated ✓" toast instead). Opt out with `IPE_WATCH_NO_BLUEGREEN`
@@ -246,7 +246,7 @@ pub fn watch_banner_enabled() -> bool {
 /// kill-old-then-spawn-new path. The legacy `IPE_WATCH_BLUEGREEN` still forces a
 /// choice when set (`0`/empty ⇒ off, anything else ⇒ on) and takes precedence
 /// over the default but yields to the opt-out. This lever exists ONLY in
-/// `ipe watch`; it is never compiled into a release binary or an emitted app.
+/// `ipe dev watch`; it is never compiled into a release binary or an emitted app.
 #[must_use]
 pub fn bluegreen_enabled() -> bool {
     bluegreen_from_env_values(
@@ -279,7 +279,7 @@ impl BuildOptions {
     /// environment (dependency-model by default; vendored under
     /// `IPE_RUNTIME_VENDORED=1`). The zero-configuration entrypoints
     /// ([`build`], [`build_loose_file`], [`build_project`]) seed
-    /// this so a library caller gets the same default emit model a `ipe build`
+    /// this so a library caller gets the same default emit model a `ipe dev build`
     /// invocation does, rather than the raw `Default` (which is vendored — the
     /// fallback shape).
     #[must_use]
@@ -326,7 +326,7 @@ pub fn build_with_options_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let source =
         crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
@@ -380,7 +380,7 @@ pub fn build_with_options_into(
 ///
 /// When no manifest is present, an import `A.B` resolves to `A/B.ipe` under
 /// the entry file's directory, so a multi-file program builds via the
-/// file-path shorthand (`ipe build src/Main.ipe`).
+/// file-path shorthand (`ipe dev build src/Main.ipe`).
 ///
 /// The module set is the entry plus the sibling modules its imports reach,
 /// resolved by [`crate::loose_file::resolve_loose_file`] (see
@@ -424,7 +424,7 @@ pub fn build_loose_file_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let collected = collect_entry_and_siblings(entry)?;
 
@@ -464,7 +464,7 @@ pub fn build_test_into(
     test_entry: &Path,
     out: OutTarget<'_>,
     runtime_dir: &Path,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let project = ProjectPaths::of_file(test_entry).with_sources(project_src_root);
     let target = out.prove(&project)?;
     let collected = collect_test_sources(project_src_root, tests_root, test_entry)?;
@@ -501,7 +501,7 @@ pub struct CollectedSources {
 /// single-entry analysis paths ([`lower_entry_via_graph`], [`emit_ir_text`]) so all
 /// three see the SAME module set. It delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
-/// `ipe watch` and `ipe lsp` also use — so every surface compiles the same
+/// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
 /// bounded closure: one probed path per import, regular files contained in
 /// the entry's directory only, within
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`], and no directory
@@ -528,7 +528,7 @@ pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, CliE
 
 /// Collect the sources for a manifest-governed file analysed by itself (e.g.
 /// `ipe type-check src/Api/Handlers.ipe`): the WHOLE `src_root` tree — the
-/// same [`project::discover_modules`] set `ipe build` compiles — rather than
+/// same [`project::discover_modules`] set `ipe dev build` compiles — rather than
 /// the loose closure rooted at the file's own directory.
 ///
 /// The loose closure ([`collect_entry_and_siblings`]) resolves an import
@@ -915,7 +915,7 @@ pub fn compile_modules(
     blame_path: &Path,
     db_driver: ipe_backend_rust::DbDriver,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let cache_site = cache::env_cache_dir(&target.path()?);
     compile_modules_observed(
         sources,
@@ -970,7 +970,7 @@ pub fn compile_modules_observed(
     db_driver: ipe_backend_rust::DbDriver,
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
-) -> (Result<OwnedDir, CliError>, CacheOutcome) {
+) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
     // Inject the transitive compiled-source stdlib closure. `injected` is the
     // driver's unforgeable record of which module paths are trusted stdlib
     // source — the ONLY inputs that earn `ModuleOrigin::EmbeddedStdlib` below.
@@ -1045,6 +1045,7 @@ pub fn compile_modules_observed(
                 runtime_dir,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
+                crate::run_sandbox::EmitFloor::of(options.intent, options.target),
             ),
             CacheOutcome::Hit,
         );
@@ -1113,12 +1114,13 @@ pub fn compile_modules_observed(
                     runtime_dir,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
+                    crate::run_sandbox::EmitFloor::of(options.intent, options.target),
                 );
                 // Warm the (cheaper-to-hit) EmittedProject tier for the
                 // next build too — advisory, best-effort, and rooted in the
                 // claim the write returned.
                 if let Ok(claimed) = &written
-                    && let Some(root) = site.root(claimed)
+                    && let Some(root) = site.root(claimed.dir())
                 {
                     cache::store(&root, epoch, &cache_key, &emitted);
                 }
@@ -1175,6 +1177,7 @@ pub fn compile_modules_observed(
         runtime_dir,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
+        crate::run_sandbox::EmitFloor::of(options.intent, options.target),
     );
 
     // A writable cache root comes only from the claim the write above
@@ -1182,7 +1185,7 @@ pub fn compile_modules_observed(
     // the target is proven ipe's.
     if let Ok(claimed) = &written
         && let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref())
-        && let Some(root) = site.root(claimed)
+        && let Some(root) = site.root(claimed.dir())
     {
         cache::store(&root, epoch, &cache_key, &emitted);
         // Also store the lowered `Program` at the IR tier.
@@ -1342,7 +1345,7 @@ pub fn source_for_span_in_linked(
 /// error with a non-empty `home` resolves DIRECTLY via `home_to_source`; only
 /// one with an empty home falls back to the byte-offset heuristic over the
 /// linked program. This is the single attribution rule every post-link
-/// pipeline error shares, so `ipe build` and `ipe type-check` frame the
+/// pipeline error shares, so `ipe dev build` and `ipe type-check` frame the
 /// identical diagnostic against the identical source.
 pub fn attribute_post_link_error(
     linked: &ipe_canon::ast::Module,
@@ -2132,22 +2135,41 @@ pub fn inject_wasm_widget_bundle(
 /// from the project proven again; a claimed target is proven still the
 /// directory it claimed.
 ///
+/// A native development emit's `src/main.rs` carries the development marker
+/// as it is written ([`crate::run_sandbox::EmitFloor`]), so every binary a
+/// dev-intent path links names its posture, whichever cargo step builds it.
+///
 /// # Errors
 /// [`CliError::Io`] on any filesystem failure; [`CliError::StaticRefusal`]
 /// for a webview shape under a static plan; [`CliError::Pipeline`] on a
 /// backend-invariant breach (manifest anchor drift);
 /// [`CliError::OutputRefused`] when the target cannot be claimed or was
-/// replaced since it was claimed.
+/// replaced since it was claimed; [`CliError::Usage`] when a native
+/// development emit has no `src/main.rs` or no `fn main` anchor.
 pub fn write_emitted_project(
     emitted: &ipe_backend::EmittedProject,
     target: &EmitTarget,
     runtime_dir: &Path,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     tree_shake_vendored: bool,
-) -> Result<OwnedDir, CliError> {
+    floor: crate::run_sandbox::EmitFloor,
+) -> Result<EmittedCrate, CliError> {
     use ipe_backend_rust::static_build;
 
     let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored)?;
+    match floor {
+        crate::run_sandbox::EmitFloor::DevelopmentMarker => {
+            let main_rs = manifest
+                .get_mut(Path::new("src/main.rs"))
+                .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
+            *main_rs = crate::run_sandbox::embed_floor_text(
+                main_rs,
+                &crate::run_sandbox::dev_floor_marker_source(),
+            )?;
+        }
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+        | crate::run_sandbox::EmitFloor::NoNativeBinary => {}
+    }
     if let Some(plan) = static_plan {
         // The webview-under-static refusal reads the backend's typed
         // `uses_webview` signal (set from the resolved runtime/host), never a
@@ -2170,7 +2192,109 @@ pub fn write_emitted_project(
     if static_plan.is_none() {
         remove_stale_static_config(&crate_dir)?;
     }
-    Ok(crate_dir)
+    Ok(EmittedCrate {
+        dir: crate_dir,
+        floor,
+    })
+}
+
+/// An emitted crate together with the floor line [`write_emitted_project`]
+/// wrote into it.
+///
+/// Only [`write_emitted_project`] builds one, so the floor a cargo step reads
+/// here is the floor the crate's `src/main.rs` carries — never a claim a
+/// caller restates.
+#[derive(Debug)]
+pub struct EmittedCrate {
+    dir: OwnedDir,
+    floor: crate::run_sandbox::EmitFloor,
+}
+
+impl EmittedCrate {
+    /// The claimed directory the crate was written into.
+    #[must_use]
+    pub const fn dir(&self) -> &OwnedDir {
+        &self.dir
+    }
+
+    /// The crate directory's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// The floor line written into the crate.
+    #[must_use]
+    pub const fn floor(&self) -> crate::run_sandbox::EmitFloor {
+        self.floor
+    }
+
+    /// Give up the floor witness, keeping only the claimed directory.
+    #[must_use]
+    pub fn into_dir(self) -> OwnedDir {
+        self.dir
+    }
+
+    /// The crate as one carrying the development marker.
+    ///
+    /// # Errors
+    /// [`CliError::Pipeline`] (an internal bug) when the crate was written
+    /// with any other floor line.
+    pub fn dev_marked(&self) -> Result<DevMarkedCrate<'_>, CliError> {
+        match self.floor {
+            crate::run_sandbox::EmitFloor::DevelopmentMarker => Ok(DevMarkedCrate {
+                path: self.dir.path(),
+            }),
+            floor @ (crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+            | crate::run_sandbox::EmitFloor::NoNativeBinary) => Err(floor_mismatch_bug(
+                "ipe_cli::EmittedCrate::dev_marked",
+                format!("a development cargo step was handed a crate emitted with {floor:?}"),
+            )),
+        }
+    }
+
+    /// A witness over an already-written directory, for unit tests that
+    /// stage a crate by hand.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume_written(
+        dir: OwnedDir,
+        floor: crate::run_sandbox::EmitFloor,
+    ) -> Self {
+        Self { dir, floor }
+    }
+}
+
+/// A crate directory proven to carry the development marker: the only crate
+/// a development cargo step outside the floored build may compile.
+#[derive(Clone, Copy, Debug)]
+pub struct DevMarkedCrate<'a> {
+    path: &'a Path,
+}
+
+impl<'a> DevMarkedCrate<'a> {
+    /// The crate directory's path.
+    #[must_use]
+    pub const fn path(&self) -> &'a Path {
+        self.path
+    }
+
+    /// A witness over a hand-staged directory, for unit tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume(path: &'a Path) -> Self {
+        Self { path }
+    }
+}
+
+/// The internal-bug error for a cargo step handed a crate whose written floor
+/// is not the one the step's build needs.
+pub fn floor_mismatch_bug(where_: &'static str, detail: String) -> CliError {
+    CliError::Pipeline {
+        file: PathBuf::from("src/main.rs"),
+        src: String::new(),
+        diag: Box::new(Diagnostic::CompilerBug { where_, detail }),
+    }
 }
 
 /// Map a backend-invariant [`Diagnostic`] (a `CompilerBug` from manifest
@@ -2612,7 +2736,7 @@ pub fn build_project_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
     let discovered = project::discover_modules(&manifest.src_root)?;
 

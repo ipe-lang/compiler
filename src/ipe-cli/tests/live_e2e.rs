@@ -335,7 +335,7 @@ main =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// The `ipe build` dev-loop intent: these fixtures exercise the dev posture
+/// The `ipe dev build` dev-loop intent: these fixtures exercise the dev posture
 /// (plain cookie names, loopback upstreams), which a release binary refuses.
 fn dev_loop_options() -> ipe::BuildOptions {
     ipe::BuildOptions {
@@ -369,7 +369,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
@@ -1401,7 +1401,7 @@ fn live_onsubmit_typed_record_dispatches_decoded_payload() -> Result<(), BoxErro
 /// are already synced into `Model` via `onInput`/`onChange`; `onSubmit`
 /// just triggers the action, ignoring the posted `FormData` entirely.
 ///
-/// `ipe build` exits 0 here (`HtmlOnSubmit`'s Ipê-level scheme
+/// `ipe dev build` exits 0 here (`HtmlOnSubmit`'s Ipê-level scheme
 /// deliberately leaves the argument type unconstrained — decoupled from
 /// `msg`, see `constrain.rs`'s `HtmlEventShape::Raw` arm — so a Msg-typed
 /// value type-checks fine there). Emitting the argument unconditionally as a

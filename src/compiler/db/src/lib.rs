@@ -29,10 +29,10 @@
 //! query-demand order; the one-shot `ipe` driver demands queries in a fixed
 //! topological order against a cold database, so emitted bytes are identical
 //! to the non-incremental pipeline (enforced by the golden-oracle suite).
-//! Warm-db reuse in production (`ipe watch`, the LSP session) is covered by
+//! Warm-db reuse in production (`ipe dev watch`, the LSP session) is covered by
 //! the clean-vs-incremental parity gate
 //! (`src/ipe-cli/tests/clean_vs_incremental_parity.rs`), which drives the
-//! same [`sync_source_root`] + `compile_prepared` primitives `ipe watch`
+//! same [`sync_source_root`] + `compile_prepared` primitives `ipe dev watch`
 //! calls and proves warm output byte-identical to a cold build across the
 //! full golden corpus plus a dedicated identifier-adding edit sequence. The
 //! LSP session never reaches emission (diagnostics-only), so the byte-level
@@ -958,6 +958,13 @@ pub enum ScopedModuleTypes {
         /// The module's closed typed interface, for importers' scoped solves.
         interface: Arc<ipe_types::TypedInterface>,
     },
+    /// The module's interface is closed, so its importers solve against it,
+    /// but its own solved facts read its importers' use sites: the module's
+    /// own types come from the whole-program solve.
+    InterfaceOnly {
+        /// The module's closed typed interface, for importers' scoped solves.
+        interface: Arc<ipe_types::TypedInterface>,
+    },
     /// Fall back to the whole-program solve: the module's scoped solve was
     /// red, a dep's (or its own) interface is open (an importer can pin a
     /// residual variable — information flows against the import direction),
@@ -1039,6 +1046,11 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                     interface: Arc::new(interface),
                 }
             }
+            ipe_types::InterfaceStatus::ImporterDependent(interface) => {
+                ScopedModuleTypes::InterfaceOnly {
+                    interface: Arc::new(interface),
+                }
+            }
             ipe_types::InterfaceStatus::Open => ScopedModuleTypes::WholeProgram,
         },
         Err(_) => ScopedModuleTypes::WholeProgram,
@@ -1062,7 +1074,8 @@ pub fn typed_interface(
     module: SourceFile,
 ) -> Option<Arc<ipe_types::TypedInterface>> {
     match infer_module_scoped(db, root, module) {
-        ScopedModuleTypes::PerModule { interface, .. } => Some(interface.clone()),
+        ScopedModuleTypes::PerModule { interface, .. }
+        | ScopedModuleTypes::InterfaceOnly { interface } => Some(interface.clone()),
         ScopedModuleTypes::WholeProgram => None,
     }
 }
@@ -1081,8 +1094,8 @@ pub fn typed_interface(
 ///   elsewhere in the program does not blank this module's types
 ///   (diagnostics still come from the whole-program [`typecheck`]).
 /// - **Fallback path**: the whole-program projection, for modules the
-///   scoped tier cannot faithfully stand for (open interfaces, red scoped
-///   solve, import cycle) — exactly the joint solve's slice, with the joint
+///   scoped tier cannot faithfully stand for (open interfaces, own facts
+///   that read an importer's use site, red scoped solve, import cycle) — exactly the joint solve's slice, with the joint
 ///   solve's own error surfaced verbatim on a red program.
 ///
 /// Both paths return NORMALIZED values (see [`normalize_module_types`]);
@@ -1097,7 +1110,7 @@ pub fn typecheck_module(
 ) -> ModuleTypesResult {
     match infer_module_scoped(db, root, module) {
         ScopedModuleTypes::PerModule { types, .. } => Ok(types.clone()),
-        ScopedModuleTypes::WholeProgram => {
+        ScopedModuleTypes::InterfaceOnly { .. } | ScopedModuleTypes::WholeProgram => {
             let solved = typecheck(db, root, entry).clone()?;
             let home: Vec<Symbol> = {
                 let mut interner = db.interner().lock();
@@ -1295,7 +1308,7 @@ pub struct BuildConfig {
     #[returns(ref)]
     pub ffi: Option<ipe_backend_rust::FfiEmit>,
     /// The compilation target (`Native` | `WasmClient` under
-    /// `ipe build --target wasm`) — selects the emitted manifest template,
+    /// `ipe dev build --target wasm`) — selects the emitted manifest template,
     /// vendored runtime module set, and entry shape.
     pub target: ipe_ir::Target,
     /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
@@ -1323,7 +1336,7 @@ pub struct BuildConfig {
     /// project. Threaded to [`ipe_backend_rust::RustBackend::with_runtime_dep`].
     #[returns(ref)]
     pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
-    /// `true` when `ipe build/run --debugger` selected the development-only
+    /// `true` when `ipe dev build/run --debugger` selected the development-only
     /// time-travelling debugger. Threaded to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the runtime
     /// `debugger` feature to the emitted project's dependency feature list so the

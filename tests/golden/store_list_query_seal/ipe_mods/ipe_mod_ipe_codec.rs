@@ -12,6 +12,7 @@ pub(crate) enum IpeCodecColType {
     CMoney,
     CNull(Box<IpeCodecColType>),
 }
+
 impl IpeStringify for IpeCodecColType {
     fn ipe_show(&self) -> String {
         match self {
@@ -29,12 +30,14 @@ impl IpeStringify for IpeCodecColType {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCodecShape {
     SRecord(Vec<(String, IpeCodecColType)>),
     SScalar(IpeCodecColType),
     SBlob,
 }
+
 impl IpeStringify for IpeCodecShape {
     fn ipe_show(&self) -> String {
         match self {
@@ -48,9 +51,11 @@ impl IpeStringify for IpeCodecShape {
         }
     }
 }
+
 pub(crate) enum IpeCodecCodec<T1: 'static> {
     Codec(RecEncMkDecShp<T1>),
 }
+
 impl<T1: Clone + 'static> Clone for IpeCodecCodec<T1> {
     fn clone(&self) -> Self {
         match self {
@@ -58,6 +63,7 @@ impl<T1: Clone + 'static> Clone for IpeCodecCodec<T1> {
         }
     }
 }
+
 impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeCodecCodec<T1> {
     fn ipe_show(&self) -> String {
         match self {

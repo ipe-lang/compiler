@@ -6,7 +6,7 @@
 //!
 //! Two emit shapes are covered:
 //!
-//!   • the dependency model (the default `ipe build --target wasm` shape): the
+//!   • the dependency model (the default `ipe dev build --target wasm` shape): the
 //!     runtime is a path dependency selected by the `wasm-client` feature floor,
 //!     so the security-forbidden crates are absent from the app manifest and
 //!     pulled (only their wasm-safe subset) transitively by that feature. The
@@ -104,7 +104,7 @@ fn runtime_crate_root() -> PathBuf {
         .expect("runtime crate root canonicalizes")
 }
 
-/// The dependency-model wasm manifest — the DEFAULT `ipe build --target wasm`
+/// The dependency-model wasm manifest — the DEFAULT `ipe dev build --target wasm`
 /// shape: the app crate declares the runtime as a path dependency feature-gated
 /// by the `wasm-client` floor.
 fn emit_wasm_dep_cargo_toml() -> String {

@@ -55,7 +55,7 @@ describe raw =
             "rejected (fail-closed): " ++ raw
 ```
 
-Running it (`ipe run`) over three descriptors prints:
+Running it (`ipe dev run`) over three descriptors prints:
 
 ```
 accepted: postgres://app@db.internal:5432/store (tls=require, password=[redacted]) | driver=postgres host=db.internal port=5432

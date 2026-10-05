@@ -61,7 +61,7 @@ fn unannotated_value_sync_bounds_emitted() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     let emitted = crate::support::read_all_emitted_src(&out);
@@ -87,7 +87,7 @@ fn unannotated_value_sync_seal_builds() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     crate::support::assert_seal_builds(GOLDEN, &out);

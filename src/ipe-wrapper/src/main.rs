@@ -36,7 +36,8 @@ mod scratch;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
-use ipe_sandbox::run_jail::{self, ParseError, RunJailDefect, SandboxProfile};
+use ipe_fs_open::{ByteCap, OpenRefusal, RegularFile};
+use ipe_sandbox::run_jail::{self, ParseError, SandboxProfile};
 use scratch::ScratchDir;
 
 /// Exit non-zero, printing a typed error to stderr.
@@ -57,14 +58,16 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[OsString]) -> ExitCode {
-    // --show-profile: dump the embedded or on-disk profile text and exit.
-    // Only meaningful in embed mode (the profile is separately readable in
-    // bundle mode), but accepted in both so a script can always query it.
-    let show_profile = args.iter().any(|a| a == "--show-profile");
-
-    // Split `[wrapper-flags] [-- <app-args>...]`.
-    let dash_dash = args.iter().position(|a| a == "--");
-    let app_args: &[OsString] = dash_dash.map_or(&[], |i| args.get(i + 1..).unwrap_or(&[]));
+    let WrapperArgs {
+        show_profile,
+        app_args,
+    } = match split_args(args) {
+        Ok(parsed) => parsed,
+        Err(UnknownFlag(flag)) => fatal!(
+            "unknown wrapper flag {flag:?} — the wrapper takes only `--show-profile`; \
+             pass the app's own arguments after `--`"
+        ),
+    };
 
     // Dispatch to the compile-time selected mode.
     #[cfg(embed_mode)]
@@ -75,6 +78,53 @@ fn run(args: &[OsString]) -> ExitCode {
     {
         run_bundle(show_profile, app_args)
     }
+}
+
+/// The wrapper's command line: its own flags, then the app's arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct WrapperArgs<'a> {
+    /// Dump the embedded or on-disk profile text and exit.
+    show_profile: bool,
+    /// Everything after the first `--`, passed to the app whole.
+    app_args: &'a [OsString],
+}
+
+/// A token before the first `--` that is not a wrapper flag.
+#[derive(Debug, PartialEq, Eq)]
+struct UnknownFlag(OsString);
+
+/// Split `[wrapper-flags] [-- <app-args>...]` at the first `--`.
+///
+/// Only the segment before the first `--` is the wrapper's: everything after
+/// it, another `--` or `--show-profile` included, belongs to the app.
+///
+/// # Errors
+///
+/// [`UnknownFlag`] for any token before the first `--` other than
+/// `--show-profile`: an app argument given without the separator is refused,
+/// never dropped, so the app never runs with arguments silently missing.
+fn split_args(args: &[OsString]) -> Result<WrapperArgs<'_>, UnknownFlag> {
+    let (wrapper_flags, app_args) = args.iter().position(|a| a == "--").map_or_else(
+        || (args, &[][..]),
+        |at| {
+            args.split_at_checked(at)
+                .map_or((args, &[][..]), |(flags, rest)| {
+                    (flags, rest.get(1..).unwrap_or(&[]))
+                })
+        },
+    );
+    let mut show_profile = false;
+    for flag in wrapper_flags {
+        if flag == "--show-profile" {
+            show_profile = true;
+        } else {
+            return Err(UnknownFlag(flag.clone()));
+        }
+    }
+    Ok(WrapperArgs {
+        show_profile,
+        app_args,
+    })
 }
 
 // ── Bundle mode ─────────────────────────────────────────────────────────────
@@ -97,10 +147,13 @@ fn run_bundle(show_profile: bool, app_args: &[OsString]) -> ExitCode {
 
     // Read and parse the profile strictly before touching the binary (fail
     // early with a clear message on a missing profile).
-    let profile_text = match std::fs::read_to_string(&profile_path) {
-        Ok(t) => t,
-        Err(e) => fatal!(
-            "ipe.profile not found at {} — bundle is incomplete or tampered: {e}",
+    let profile_text = match read_capped(&profile_path, run_jail::PROFILE_READ_CAP)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| OpenRefusal::NotUtf8))
+    {
+        Ok(text) => text,
+        Err(refusal) => fatal!(
+            "cannot read ipe.profile at {}: {refusal} — refusing to run an incomplete or \
+             tampered bundle",
             profile_path.display()
         ),
     };
@@ -117,14 +170,79 @@ fn run_bundle(show_profile: bool, app_args: &[OsString]) -> ExitCode {
     }
 
     // Scan the binary for its embedded floor and verify the profile against it.
-    let app_bytes = match std::fs::read(&app_path) {
-        Ok(b) => b,
-        Err(e) => fatal!(
-            "ipe-app not found at {} — bundle is incomplete: {e}",
+    let app_bytes = match read_capped(&app_path, run_jail::APP_READ_CAP) {
+        Ok(bytes) => bytes,
+        Err(refusal) => fatal!(
+            "cannot read ipe-app at {}: {refusal} — refusing to run an incomplete or \
+             tampered bundle",
             app_path.display()
         ),
     };
-    exec_after_verify(&app_bytes, &profile, &app_path, app_args)
+    deliver_bundle_app(&app_bytes, &profile, &app_path, app_args)
+}
+
+/// Run the bundle's app from the bytes just read, sealed: the bytes the
+/// floor is verified against are the bytes the jail runs, so a swap of
+/// `ipe-app` between the read and the exec runs nothing new.
+#[cfg(all(
+    not(embed_mode),
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    )
+))]
+fn deliver_bundle_app(
+    app_bytes: &[u8],
+    profile: &SandboxProfile,
+    _app_path: &std::path::Path,
+    app_args: &[OsString],
+) -> ExitCode {
+    let sealed = match run_jail::write_sealed_app_memfd(app_bytes) {
+        Ok(s) => s,
+        Err(e) => fatal!("cannot seal ipe-app: {e}"),
+    };
+    exec_sealed_after_verify(profile, &sealed, app_args)
+}
+
+/// Run the bundle's app by path on a platform with no sealed delivery.
+#[cfg(all(
+    not(embed_mode),
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))
+))]
+fn deliver_bundle_app(
+    app_bytes: &[u8],
+    profile: &SandboxProfile,
+    app_path: &std::path::Path,
+    app_args: &[OsString],
+) -> ExitCode {
+    exec_after_verify(app_bytes, profile, app_path, app_args)
+}
+
+/// Read the whole regular file at `path`, refused past `max` bytes.
+///
+/// The open never blocks and is proven regular on the opened handle
+/// ([`RegularFile::open_user_named`]), so a FIFO, device or directory swapped
+/// in at the path is refused rather than hung on or read; at most one byte
+/// past `max` is ever read.
+///
+/// # Errors
+///
+/// The [`OpenRefusal`] the open or read met; [`OpenRefusal::TooLarge`] past
+/// `max`; an [`OpenRefusal::Io`] for a zero `max`, which admits no file.
+fn read_capped(path: &std::path::Path, max: u64) -> Result<Vec<u8>, OpenRefusal> {
+    let Some(cap) = ByteCap::new(max) else {
+        return Err(OpenRefusal::Io(std::io::ErrorKind::InvalidInput));
+    };
+    RegularFile::open_user_named(path)?.read_bytes(cap)
 }
 
 // ── Embed mode ──────────────────────────────────────────────────────────────
@@ -167,7 +285,7 @@ fn run_embed(show_profile: bool, app_args: &[OsString]) -> ExitCode {
         Err(e) => fatal!("cannot seal embedded binary: {e}"),
     };
 
-    exec_embed_after_verify(&profile, sealed, app_args)
+    exec_sealed_after_verify(&profile, &sealed, app_args)
 }
 
 // ── Embed-mode verify + exec ─────────────────────────────────────────────────
@@ -185,13 +303,21 @@ fn run_embed(show_profile: bool, app_args: &[OsString]) -> ExitCode {
 /// Fail-closed on:
 /// - read failure on the sealed source
 /// - no capfloor marker in the read bytes (missing floor → refuse)
+/// - a development build's floor (not `ipe release build` → refuse)
 /// - profile does not satisfy the floor (widened profile → refuse)
 /// - jail primitive unavailable on this platform
 /// - jail establishment failure
-#[cfg(embed_mode)]
-fn exec_embed_after_verify(
+#[cfg(any(
+    embed_mode,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
+fn exec_sealed_after_verify(
     profile: &SandboxProfile,
-    sealed: run_jail::SealedApp,
+    sealed: &run_jail::SealedApp,
     app_args: &[OsString],
 ) -> ExitCode {
     // Read the SEALED bytes for the capfloor scan. These are frozen (Linux
@@ -202,15 +328,8 @@ fn exec_embed_after_verify(
         Err(e) => fatal!("cannot read sealed embedded binary: {e}"),
     };
 
-    let Some(floor) = run_jail::scan_capfloor(&sealed_bytes) else {
-        fatal!(
-            "{}: the binary embeds no capability floor — refusing to run an artifact \
-             whose confinement cannot be verified",
-            RunJailDefect::ProfileWeakerThanFloor.code().as_str()
-        );
-    };
-    if !profile.satisfies_capfloor(&floor) {
-        fatal!("{}", RunJailDefect::ProfileWeakerThanFloor);
+    if let Err(refusal) = run_jail::verify_release_floor(profile, &sealed_bytes) {
+        fatal!("{refusal}");
     }
 
     let wants_wall_clock = profile.limits.wall_secs.is_some();
@@ -233,7 +352,7 @@ fn exec_embed_after_verify(
         profile,
         scoped_tmp.path(),
         &working_tree,
-        &sealed,
+        sealed,
         app_args,
     ) {
         Ok(never) => match never {},
@@ -246,38 +365,36 @@ fn exec_embed_after_verify(
 /// Scan `app_bytes` for the embedded capability floor, verify `profile`
 /// satisfies it, and exec the app at `app_path` inside the jail.
 ///
-/// Bundle mode only: the app is a sibling file on disk. Embed mode uses
-/// [`exec_embed_after_verify`], which verifies and delivers from a sealed
-/// descriptor instead of a host path.
+/// Bundle mode on a platform with no sealed delivery only: the app is a
+/// sibling file on disk. Elsewhere `exec_sealed_after_verify` verifies and
+/// delivers from a sealed descriptor instead of a host path.
 ///
 /// Fail-closed on:
 /// - no capfloor marker found in `app_bytes` (missing floor → refuse)
+/// - a development build's floor (not `ipe release build` → refuse)
 /// - profile does not satisfy the floor (widened profile → refuse)
 /// - jail primitive unavailable on this platform
 /// - jail establishment failure
-#[cfg(not(embed_mode))]
+#[cfg(all(
+    not(embed_mode),
+    not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))
+))]
 fn exec_after_verify(
     app_bytes: &[u8],
     profile: &SandboxProfile,
     app_path: &std::path::Path,
     app_args: &[OsString],
 ) -> ExitCode {
-    // The marker's ABSENCE means the binary was not built with `ipe release`'s
-    // embedded floor. Refuse — we cannot verify confinement correctness without
-    // the floor.
-    let Some(floor) = run_jail::scan_capfloor(app_bytes) else {
-        fatal!(
-            "{}: the binary embeds no capability floor — refusing to run an artifact \
-             whose confinement cannot be verified",
-            RunJailDefect::ProfileWeakerThanFloor.code().as_str()
-        );
-    };
-
-    // The profile must isolate at LEAST as much as the embedded floor.
-    // A widened profile (asking for MORE than the floor grants) is refused:
-    // the floor is the tamper-proof ceiling on what can be granted.
-    if !profile.satisfies_capfloor(&floor) {
-        fatal!("{}", RunJailDefect::ProfileWeakerThanFloor);
+    // A missing floor, a development build's floor, or a profile granting more
+    // than the floor (the ceiling on what can be granted) all refuse.
+    if let Err(refusal) = run_jail::verify_release_floor(profile, app_bytes) {
+        fatal!("{refusal}");
     }
 
     // Probe and exec inside the jail. On success (Unix) the process is
@@ -316,8 +433,10 @@ fn exec_after_verify(
 
 #[cfg(test)]
 mod tests {
+    use ipe_fs_open::OpenRefusal;
     use ipe_sandbox::run_jail::{
-        DatabaseAxis, FilesystemScope, SandboxProfile, profile_from_capabilities,
+        DatabaseAxis, FilesystemScope, FloorIntent, FloorRefusal, SandboxProfile,
+        profile_from_capabilities, verify_release_floor,
     };
     use std::collections::BTreeSet;
 
@@ -381,44 +500,160 @@ mod tests {
     #[test]
     fn capfloor_roundtrip() {
         let profile = net_profile();
-        let line = profile.to_capfloor_line();
+        let line = profile.to_capfloor_line(FloorIntent::Release);
         let mut payload = line.as_bytes().to_vec();
         payload.push(b'\n');
 
         let recovered =
             ipe_sandbox::run_jail::scan_capfloor(&payload).expect("marker found in payload");
-        assert_eq!(recovered.network, profile.network);
-        assert_eq!(recovered.subprocess, profile.subprocess);
-        assert!(matches!(recovered.filesystem, FilesystemScope::Isolated));
+        assert_eq!(recovered.intent, FloorIntent::Release);
+        assert_eq!(recovered.axes.network, profile.network);
+        assert_eq!(recovered.axes.subprocess, profile.subprocess);
+        assert!(matches!(
+            recovered.axes.filesystem,
+            FilesystemScope::Isolated
+        ));
     }
 
-    /// --show-profile exits SUCCESS without exec-ing anything (bundle mode
-    /// path: just parse+print then return).
+    /// The release wrapper refuses an app a development build embedded the floor of.
     #[test]
-    fn show_profile_flag_recognized() {
-        // We test the argument parsing logic, not the exec path.
+    fn capfloor_of_a_development_build_is_refused() {
+        let profile = net_profile();
+        let dev = profile
+            .to_capfloor_line(FloorIntent::Development)
+            .into_bytes();
+        assert_eq!(
+            verify_release_floor(&profile, &dev),
+            Err(FloorRefusal::NotRelease)
+        );
+        let release = profile.to_capfloor_line(FloorIntent::Release).into_bytes();
+        assert_eq!(verify_release_floor(&profile, &release), Ok(()));
+    }
+
+    /// The release wrapper refuses an app that embeds no floor marker.
+    #[test]
+    fn verify_release_floor_refuses_a_floorless_binary() {
+        let profile = net_profile();
+        let floorless: &[u8] = b"\x7fELF\x02\x01\x01\0fn main() {}\0";
+        assert_eq!(
+            verify_release_floor(&profile, floorless),
+            Err(FloorRefusal::Unreadable)
+        );
+        assert_eq!(
+            verify_release_floor(&profile, b""),
+            Err(FloorRefusal::Unreadable)
+        );
+    }
+
+    /// A read holds at most the cap: a file at the cap is read whole, one
+    /// byte over refuses, and a directory is not a regular file.
+    #[test]
+    fn read_capped_reads_at_the_cap_and_refuses_one_over() {
+        let dir = super::ScratchDir::new("ipe-wrapper-cap").expect("scratch dir");
+        let path = dir.path().join("ipe-app");
+        std::fs::write(&path, b"0123456789").expect("write app");
+        assert_eq!(
+            super::read_capped(&path, 10).expect("read"),
+            b"0123456789".to_vec()
+        );
+        assert!(matches!(
+            super::read_capped(&path, 9),
+            Err(OpenRefusal::TooLarge(_))
+        ));
+        assert!(matches!(
+            super::read_capped(dir.path(), 10),
+            Err(OpenRefusal::NotRegular(_))
+        ));
+        assert_eq!(
+            super::read_capped(&dir.path().join("absent"), 10),
+            Err(OpenRefusal::Absent)
+        );
+    }
+
+    /// A FIFO planted where a bundle file belongs is refused at once, never
+    /// blocked on waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_refuses_a_fifo_without_blocking() {
+        let dir = super::ScratchDir::new("ipe-wrapper-fifo").expect("scratch dir");
+        let fifo = dir.path().join("ipe.profile");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(super::read_capped(&fifo, 1024));
+            })
+            .expect("spawn the reader");
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_capped must not block on a FIFO");
+        assert!(
+            matches!(outcome, Err(OpenRefusal::NotRegular(_))),
+            "a FIFO is not a regular file: {outcome:?}"
+        );
+    }
+
+    /// `--show-profile` is a wrapper flag only before the first `--`.
+    #[test]
+    fn show_profile_flag_recognized_only_before_the_separator() {
         let args: Vec<std::ffi::OsString> = vec!["--show-profile".into()];
-        let show = args.iter().any(|a| a == "--show-profile");
-        assert!(show);
+        assert_eq!(
+            super::split_args(&args),
+            Ok(super::WrapperArgs {
+                show_profile: true,
+                app_args: &[]
+            })
+        );
+        let args: Vec<std::ffi::OsString> = vec!["--".into(), "--show-profile".into()];
+        let parsed = super::split_args(&args).expect("parses");
+        assert!(
+            !parsed.show_profile,
+            "an app's `--show-profile` is not the wrapper's"
+        );
+        assert_eq!(Some(parsed.app_args), args.get(1..));
     }
 
-    /// App args after `--` are correctly split.
+    /// App args after the first `--` are passed through whole, a second `--`
+    /// included.
     #[test]
-    fn app_args_split_after_dash_dash() {
+    fn app_args_split_after_first_dash_dash() {
         let args: Vec<std::ffi::OsString> = vec![
             "--show-profile".into(),
             "--".into(),
             "--port".into(),
+            "--".into(),
             "8080".into(),
         ];
-        let pos = args.iter().position(|a| a == "--");
-        assert_eq!(pos, Some(1));
-        // pos is Some(1) per the assertion above; get(2..) is safe on a 4-element vec.
-        let app_args: &[std::ffi::OsString] = pos.and_then(|i| args.get(i + 1..)).unwrap_or(&[]);
-        assert_eq!(app_args.len(), 2);
+        let parsed = super::split_args(&args).expect("parses");
+        assert!(parsed.show_profile);
+        let expected: Vec<std::ffi::OsString> = vec!["--port".into(), "--".into(), "8080".into()];
+        assert_eq!(parsed.app_args, expected.as_slice());
         assert_eq!(
-            app_args.first().map(std::ffi::OsString::as_os_str),
-            Some(std::ffi::OsStr::new("--port"))
+            super::split_args(&[]),
+            Ok(super::WrapperArgs {
+                show_profile: false,
+                app_args: &[]
+            })
         );
+    }
+
+    /// A token before the first `--` that is not a wrapper flag is refused,
+    /// never dropped from the app's arguments.
+    #[test]
+    fn app_args_split_refuses_an_unknown_token_before_the_separator() {
+        for args in [
+            vec![std::ffi::OsString::from("--port"), "8080".into()],
+            vec!["--show-profile".into(), "serve".into(), "--".into()],
+            vec!["--show-profilex".into()],
+        ] {
+            assert!(
+                matches!(super::split_args(&args), Err(super::UnknownFlag(_))),
+                "{args:?} must be refused"
+            );
+        }
     }
 }

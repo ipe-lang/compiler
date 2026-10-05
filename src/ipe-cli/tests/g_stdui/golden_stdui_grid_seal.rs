@@ -74,7 +74,7 @@ fn grid_module_resolves_and_emits_kernel() {
     let (emit, res) = build_grid_project("emit");
     assert!(
         res.is_ok(),
-        "ipe build with `import Ipe.Ui.Grid` must succeed \
+        "ipe dev build with `import Ipe.Ui.Grid` must succeed \
          (native gridTracks + compiled module): {:?}",
         res.err()
     );

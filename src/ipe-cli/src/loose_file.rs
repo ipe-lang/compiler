@@ -1,6 +1,6 @@
 //! Loose-file resolution — the one module set a `.ipe` file under no `package.ipe` compiles to.
 //!
-//! `ipe build`, `ipe watch`, `ipe lint`, the single-entry analysis commands
+//! `ipe dev build`, `ipe dev watch`, `ipe lint`, the single-entry analysis commands
 //! and `ipe lsp` all resolve a loose file here, so the editor and the batch
 //! build can never disagree about which modules make up the program. The
 //! set is the entry plus the transitive closure of the sibling modules its

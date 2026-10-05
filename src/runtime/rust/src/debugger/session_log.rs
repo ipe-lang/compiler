@@ -1,7 +1,7 @@
 //! Typed session log: the replayable form of a recorded cli/worker session.
 //!
-//! `ipe run --record` writes it beside the plain trace (see
-//! [`crate::debugger::record_sink`]); `ipe run --replay` decodes it and re-folds
+//! `ipe dev run --record` writes it beside the plain trace (see
+//! [`crate::debugger::record_sink`]); `ipe dev run --replay` decodes it and re-folds
 //! `update` over the recorded messages with every `Cmd` discarded, so no I/O,
 //! network or database effect runs again. The same program with the same log
 //! prints the same output on every run.
@@ -33,7 +33,7 @@
 //! are both encodable, [`MsgsOnly`] when only `Msg` is (an overflowed session is
 //! then unreplayable), and [`TraceOnly`] when `Msg` is not encodable (it carries
 //! a `Secret` or another value with no encoding): such a session is recorded as
-//! a trace only, which `ipe run --replay` shows (sanitised, nothing re-run)
+//! a trace only, which `ipe dev run --replay` shows (sanitised, nothing re-run)
 //! instead of folding, and a typed replay refuses with the reason.
 //!
 //! The encoder escapes every control character (`DEL` and C1 as well as C0),
@@ -106,11 +106,11 @@ impl core::fmt::Display for ReplayError {
             Self::Unreplayable(Unreplayable::MsgNotEncodable) => f.write_str(
                 "replay refused: this program's Msg type carries a value with no encoding \
                  (such as a Secret), so its sessions are recorded as a trace only, never \
-                 as a replayable log — `ipe run --replay out/session.ipelog` shows the trace",
+                 as a replayable log — `ipe dev run --replay out/session.ipelog` shows the trace",
             ),
             Self::Unreplayable(Unreplayable::TypeUnknown) => f.write_str(
                 "replay refused: the compiler could not recover this app's Msg or Model \
-                 type, so its sessions are recorded as a trace only (`ipe run --replay \
+                 type, so its sessions are recorded as a trace only (`ipe dev run --replay \
                  out/session.ipelog` shows it) — pass `update` and `view` as named \
                  functions or lambdas",
             ),

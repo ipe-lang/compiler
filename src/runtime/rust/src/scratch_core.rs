@@ -813,7 +813,7 @@ fn confined_label(label: &str) -> String {
 /// The suffix of every atomic-replace sibling name, `.<label>-<pid>-<hex>.ipe-tmp`.
 ///
 /// Such a name is hidden (it starts with `.`) and carries this suffix, so a file
-/// watcher or a directory listing can recognise and skip it; `ipe watch`
+/// watcher or a directory listing can recognise and skip it; `ipe dev watch`
 /// mirrors this value and the CLI asserts the two agree at build time.
 pub const TEMP_SIBLING_SUFFIX: &str = ".ipe-tmp";
 

@@ -10360,8 +10360,12 @@ impl StdlibKernel {
         // Server (route/cookie only — non-record arms).
         const STRING_TO_STRING_TO_ROUTE: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_ROUTE));
-        const STRING_TO_STRING_TO_COOKIE: TyShape =
-            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_COOKIE));
+        // `Server.cookie : String -> String -> Result Error Cookie` (an empty
+        // name is an `Error`).
+        const RESULT_ERROR_COOKIE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_COOKIE]);
+        const STRING_TO_STRING_TO_RESULT_COOKIE: TyShape =
+            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &RESULT_ERROR_COOKIE));
         const REQ_TO_STRING: TyShape = TyShape::Fun(&SERVER_REQUEST, &STRING);
         const STRING_TO_REQ_TO_MAYBE_STRING: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&SERVER_REQUEST, &MAYBE_STRING));
@@ -11355,11 +11359,15 @@ impl StdlibKernel {
         const HANDLER_TO_ROUTE: TyShape = TyShape::Fun(&RESP_HANDLER, &SERVER_ROUTE);
         const SERVER_ROUTE_KERNEL: TyShape = TyShape::Fun(&STRING, &HANDLER_TO_ROUTE);
         // Authed routes. `authConfig : Secret -> TokenSource -> AuthConfig`;
-        // `cookieToken : String -> TokenSource`; the route kernels take a
-        // two-argument handler `Request -> Principal -> Task Error Response`.
+        // `cookieToken : String -> Result Error TokenSource` (an empty name is
+        // an `Error`); the route kernels take a two-argument handler
+        // `Request -> Principal -> Task Error Response`.
         const SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&SECRET, &TyShape::Fun(&TOKEN_SOURCE, &AUTH_CONFIG));
-        const STRING_TO_TOKEN_SOURCE: TyShape = TyShape::Fun(&STRING, &TOKEN_SOURCE);
+        const RESULT_ERROR_TOKEN_SOURCE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, TOKEN_SOURCE]);
+        const STRING_TO_RESULT_TOKEN_SOURCE: TyShape =
+            TyShape::Fun(&STRING, &RESULT_ERROR_TOKEN_SOURCE);
         // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig` — arms the gate.
         const REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&REVOCATION_MODE, &TyShape::Fun(&AUTH_CONFIG, &AUTH_CONFIG));
@@ -11375,9 +11383,17 @@ impl StdlibKernel {
         const STRING_TO_RESPONSE: TyShape = TyShape::Fun(&STRING, &SERVER_RESPONSE);
         const RESPONSE_TO_RESPONSE: TyShape = TyShape::Fun(&SERVER_RESPONSE, &SERVER_RESPONSE);
         const SERVER_WITH_STATUS: TyShape = TyShape::Fun(&INT, &RESPONSE_TO_RESPONSE);
-        const STRING_TO_RESPONSE_TO_RESPONSE: TyShape =
-            TyShape::Fun(&STRING, &RESPONSE_TO_RESPONSE);
-        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(&STRING, &STRING_TO_RESPONSE_TO_RESPONSE);
+        // `Server.withHeader : String -> String -> Response -> Result Error Response`
+        // (a name or value with no header representation is an `Error`).
+        const RESULT_ERROR_RESPONSE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_RESPONSE]);
+        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(
+            &STRING,
+            &TyShape::Fun(
+                &STRING,
+                &TyShape::Fun(&SERVER_RESPONSE, &RESULT_ERROR_RESPONSE),
+            ),
+        );
         // Server withCookie : Cookie -> Response -> Response.
         const SERVER_WITH_COOKIE: TyShape = TyShape::Fun(&SERVER_COOKIE, &RESPONSE_TO_RESPONSE);
         // Middleware — every wrapper is a `Handler -> Handler` transform over the
@@ -12452,7 +12468,7 @@ impl StdlibKernel {
 
             // ── Server (non-record route/cookie arms). ──
             Self::ServerStatic => Some(&STRING_TO_STRING_TO_ROUTE),
-            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_COOKIE),
+            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_RESULT_COOKIE),
             Self::ServerBody | Self::ServerPath | Self::ServerMethod => Some(&REQ_TO_STRING),
             Self::ServerParam
             | Self::ServerQueryParam
@@ -12806,7 +12822,7 @@ impl StdlibKernel {
             | Self::ServerDeleteAuthed => Some(&SERVER_AUTHED_ROUTE_KERNEL),
             Self::ServerAuthConfig => Some(&SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG),
             Self::ServerTokenBearer => Some(&TOKEN_SOURCE),
-            Self::ServerCookieToken => Some(&STRING_TO_TOKEN_SOURCE),
+            Self::ServerCookieToken => Some(&STRING_TO_RESULT_TOKEN_SOURCE),
             // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig`
             Self::ServerWithRevocation => Some(&REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG),
             Self::ServerText | Self::ServerJson | Self::ServerHtml | Self::ServerRedirect => {
@@ -16010,7 +16026,7 @@ pub enum Target {
     /// The native host binary (server / CLI / TUI / desktop).
     #[default]
     Native,
-    /// A browser WASM bundle (`ipe build --target wasm`) — fully public,
+    /// A browser WASM bundle (`ipe dev build --target wasm`) — fully public,
     /// `wasm2wat`-inspectable; no server effect or secret may compile in.
     WasmClient,
     /// A co-located portable WASI bundle (`wasm32-wasip1`) — a `Direct`/`Script`

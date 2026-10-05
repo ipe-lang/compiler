@@ -568,6 +568,12 @@ mod tests {
     fn debug_fallback_renders_no_secret_of_a_runtime_value() {
         use std::collections::{BTreeMap, HashMap};
         let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
+        #[allow(clippy::expect_used)] // fixture: a non-empty cookie name always parses
+        let cookie = match crate::server::server_cookie("sid".to_owned(), "T0K3N".to_owned()) {
+            IpeResult::Ok(c) => Some(c),
+            IpeResult::Err(_) => None,
+        }
+        .expect("a non-empty cookie name");
         let g = GenAuthed {
             req: crate::server::ServerRequest {
                 method: "GET".to_owned(),
@@ -579,7 +585,7 @@ mod tests {
                 cookies: pair("sid", "T0K3N"),
                 remoteAddr: String::new(),
             },
-            cookie: crate::server::server_cookie("sid".to_owned(), "T0K3N".to_owned()),
+            cookie,
             who: crate::principal::principal_mint_with_claims(
                 "user-S3CR3T".to_owned(),
                 BTreeMap::from([("email".to_owned(), "T0K3N@example.com".to_owned())]),

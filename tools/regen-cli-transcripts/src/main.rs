@@ -151,7 +151,12 @@ fn run() -> Result<usize, RegenError> {
         if spec.hidden {
             continue;
         }
-        let args = [spec.name.to_owned(), "--help".to_owned()];
+        let args: Vec<String> = spec
+            .name
+            .split(' ')
+            .chain(["--help"])
+            .map(str::to_owned)
+            .collect();
         let transcript = capture(&ipe_bin, &repo_root, &args)?;
         goldens.push((
             cli_transcript::help_golden_name(spec.name),

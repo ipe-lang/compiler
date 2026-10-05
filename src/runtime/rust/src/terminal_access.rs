@@ -1,6 +1,6 @@
 //! Ipe.Tui — the one typed "is an interactive terminal available" probe.
 //!
-//! Std-only (no crossterm, no feature gate): both the `ipe run`/`ipe watch`
+//! Std-only (no crossterm, no feature gate): both the `ipe dev run`/`ipe dev watch`
 //! pre-build gate (over `Shape::Tui`, before any cargo work starts) and the
 //! `tui`-feature runtime guard (`TuiGuard::enter*`, right before
 //! `crossterm::terminal::enable_raw_mode`) decide from the SAME facts and the

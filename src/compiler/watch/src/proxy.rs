@@ -1,12 +1,12 @@
-//! The dev-only blue-green front proxy for `ipe watch`.
+//! The dev-only blue-green front proxy for `ipe dev watch`.
 //!
-//! DEV ONLY. This proxy is owned by the `ipe watch` process and NEVER exists
+//! DEV ONLY. This proxy is owned by the `ipe dev watch` process and NEVER exists
 //! in a release binary or an emitted app — it is watch-loop plumbing, not a
 //! runtime supervisor baked into the product.
 //!
 //! ## Why it exists
 //!
-//! Without a proxy, `ipe watch` binds the user's port directly onto the
+//! Without a proxy, `ipe dev watch` binds the user's port directly onto the
 //! supervised app binary. A rebuild must therefore kill the old binary to
 //! free the port before the new one can bind it — and killing the old binary
 //! drops every browser connection it was holding (the SSE stream in
@@ -633,7 +633,7 @@ fn read_line_capped(
 }
 
 fn write_502(client: &mut TcpStream, reason: &str) -> std::io::Result<()> {
-    let body = format!("502 Bad Gateway (ipe watch proxy): {reason}\n");
+    let body = format!("502 Bad Gateway (ipe dev watch proxy): {reason}\n");
     let resp = format!(
         "HTTP/1.1 502 Bad Gateway\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\

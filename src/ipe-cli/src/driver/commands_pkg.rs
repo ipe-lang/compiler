@@ -1,17 +1,17 @@
 use super::{
-    BuildOptions, CliError, OutTarget, attribute_canon_errors, attribute_post_link_error,
-    build_loose_file_into, build_project_into, build_source_graph, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
-    discover_manifest, emit_machine_error, emitted_bin_filename, frame_infer_error,
-    home_to_source_map, program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir,
-    run_build, runtime_context_for_message, source_graph_for_target, typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
+    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
+    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
+    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
+    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
+    typecheck_target,
 };
-use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
-};
+use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
+use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
@@ -33,6 +33,15 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
+    /// The bundle profile a native build finished in `finish` packages: a
+    /// release bundle only behind the release consent witness.
+    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
+        match finish {
+            NativeFinish::Dev => Self::Dev,
+            NativeFinish::Release { .. } => Self::Release,
+        }
+    }
+
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -42,14 +51,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The cargo build the bundle's binary is compiled with: a plain debug build
-    /// for [`Self::Dev`], an optimised `--release` build for [`Self::Release`].
-    /// The one place the profile decides the compile, so the two bundle verbs
-    /// stay a single packager parameterised by profile, not two code paths.
-    const fn cargo_release(self) -> bool {
-        matches!(self, Self::Release)
     }
 
     /// The emitted crate's area under the output root.
@@ -75,7 +76,7 @@ impl BundleProfile {
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
-    /// matching [`Self::cargo_release`].
+    /// matching the cargo profile [`FlooredBuild`] picks for the same posture.
     const fn target_subdir(self) -> &'static str {
         match self {
             Self::Dev => "debug",
@@ -138,12 +139,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    profile: BundleProfile,
+    finish: NativeFinish<'_>,
     path: Option<&str>,
 ) -> Result<(), CliError> {
     match host {
-        BundleHost::Desktop => pack_desktop(profile, path),
-        BundleHost::Mobile(os) => pack_mobile(os, profile, path),
+        BundleHost::Desktop => pack_desktop(finish, path),
+        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), path),
     }
 }
 
@@ -269,7 +270,10 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
-pub struct GatedDesktop<'a>(BundleAssembler<'a>);
+pub struct GatedDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    finish: NativeFinish<'a>,
+}
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
 /// the wrapped assembler. The ONLY way to obtain one is
@@ -285,7 +289,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.0.assemble_desktop(os)
+        self.assembler.assemble_desktop(os, self.finish)
     }
 }
 
@@ -328,11 +332,14 @@ impl<'a> BundleAssembler<'a> {
     pub fn gate_desktop(
         manifest: &'a project::ProjectManifest,
         manifest_path: &'a Path,
-        profile: BundleProfile,
+        finish: NativeFinish<'a>,
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
-        Ok(GatedDesktop(Self::new(manifest, manifest_path, profile)))
+        Ok(GatedDesktop {
+            assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
+            finish,
+        })
     }
 
     /// Run the mobile shape gate ([`validate_mobile_shape`]) and, only when it
@@ -366,7 +373,11 @@ impl<'a> BundleAssembler<'a> {
     /// # Errors
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
-    fn assemble_desktop(&self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+    fn assemble_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        finish: NativeFinish<'_>,
+    ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
         let manifest = self.manifest;
@@ -401,16 +412,13 @@ impl<'a> BundleAssembler<'a> {
         )?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
-        CargoBuild {
+        // A `release web desktop` bundle carries an optimised binary and its
+        // consented floor; the `build` dev bundle carries a plain debug one and
+        // the development marker.
+        FlooredBuild {
             cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            // A `release web desktop` bundle carries an optimised binary; the
-            // `build` dev bundle carries a plain debug one.
-            profile: if self.profile.cargo_release() {
-                CargoProfile::Release
-            } else {
-                CargoProfile::Dev
-            },
+            crate_dir: &crate_dir,
+            finish,
             target: CargoTarget::Host,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
@@ -422,7 +430,7 @@ impl<'a> BundleAssembler<'a> {
         // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
         // (macOS/Windows).
         let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
-        let bin_name = emitted_bin_filename(crate_dir.path());
+        let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
             .join(self.profile.target_subdir())
             .join(&bin_name);
@@ -495,18 +503,15 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, &identity, accepts, &bundle, icon)?;
+        let layout = pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = if os.build_runs_on_linux() {
-            "note: an Android shell project is written here; run `./gradlew assembleDebug` \
-             inside it with the Android SDK to produce an APK."
+            crate::text::mobile_android_note()
         } else {
-            "note: the iOS shell project layout is written here, but a signed, runnable \
-             .ipa must be produced on a macOS runner with Xcode + a signing identity \
-             (out of scope)."
+            crate::text::mobile_ios_note()
         };
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -540,7 +545,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), CliError> {
+pub fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -561,7 +566,7 @@ pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), Cl
     // naming its shape. The witness constructor runs the gate and is the only
     // way to obtain a runnable assembler — assembling an ungated shape has no
     // representation.
-    BundleAssembler::gate_desktop(&manifest, &manifest_path, profile, &root)?.assemble(os)
+    BundleAssembler::gate_desktop(&manifest, &manifest_path, finish, &root)?.assemble(os)
 }
 
 /// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
@@ -608,8 +613,8 @@ pub fn pack_mobile(
 
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -627,14 +632,8 @@ pub fn build_wasm_for_mobile(
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    // A dev shell hosts a `build --target wasm` bundle; a release shell hosts a
-    // production `release --target wasm` bundle (Debug.* gated, optimised).
-    let verb = match profile {
-        BundleProfile::Dev => "build",
-        BundleProfile::Release => "release",
-    };
     let status = std::process::Command::new(&exe)
-        .arg(verb)
+        .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
         .args(["--target", "wasm", "--out"])
         .arg(output_root)
@@ -651,7 +650,20 @@ pub fn build_wasm_for_mobile(
     Ok(())
 }
 
-/// `build|release --emit-permissions <ios|macos|android> [<path>]` — the
+/// The verb a mobile shell's wasm bundle is built with.
+///
+/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
+/// a production `release build --target wasm` bundle (Debug.* gated,
+/// optimised).
+#[must_use]
+pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
+    match profile {
+        BundleProfile::Dev => Verb::DEV_BUILD,
+        BundleProfile::Release => Verb::RELEASE_BUILD,
+    }
+}
+
+/// `release build --emit-permissions <ios|macos|android> [<path>]` — the
 /// read-only inspection face of the packager's permission derivation
 /// ([`pack::permissions::derive_permissions`]), the single source of truth for
 /// what a bundled app may do. Resolves the project manifest, reads its accepted
@@ -1101,7 +1113,7 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
 }
 
 /// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe build`:
+/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
 ///
 /// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
 /// 2. a `.ipe` file → itself.
@@ -1277,7 +1289,7 @@ fn classify_under_manifest(
 }
 
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe build` uses, but demands only the
+/// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
 /// 0 with a friendly framed success line when the program type-checks, or
 /// non-zero carrying the first rendered diagnostic when it does not.
@@ -1377,7 +1389,7 @@ pub fn verify_check(path: Option<&str>) -> Result<(), CliError> {
     run_type_check(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
 
-/// Stage 3: the build — the same compilation as `ipe build`.
+/// Stage 3: the build — the same compilation as `ipe dev build`.
 pub fn verify_build(path: Option<&str>) -> Result<(), CliError> {
     run_build(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
@@ -1567,10 +1579,10 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
-    CargoBuild {
+    FlooredBuild {
         cargo: cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: CargoTarget::Host,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
@@ -1581,7 +1593,7 @@ pub fn build_and_run_test_entry(
     // Locate the compiled binary via `cargo metadata` so a user-level
     // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
     // name matches the emitted crate's package name (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir);
+    let test_bin_name = emitted_bin_filename(out_dir)?;
     let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
     bin.push("debug");
     bin.push(&test_bin_name);
@@ -2497,7 +2509,7 @@ pub fn verify_capabilities(
 /// is refused and nothing is disclosed, because a union over only the entries
 /// that lowered would silently drop the failing entry's capabilities from the
 /// consumer's consent surface. Every entry links the WHOLE package source tree,
-/// exactly as `ipe build` does, so a module that does not compile at all (a
+/// exactly as `ipe dev build` does, so a module that does not compile at all (a
 /// name or type error, imported or not) fails every entry and is refused the
 /// same way.
 ///
@@ -2831,7 +2843,7 @@ fn aggregate_entry_inferences(
 /// The build's own attribution: a canon error is blamed on its own module's
 /// file via [`attribute_canon_errors`] (the root holds every package module, so
 /// an unimported sibling that fails to canonicalize fails every entry, exactly
-/// as `ipe build` refuses it); a post-link error goes through
+/// as `ipe dev build` refuses it); a post-link error goes through
 /// [`attribute_post_link_error`]. Demanded after `lower_program`, so every
 /// query here is a memo hit.
 fn attribute_entry_lowering_error(
@@ -3396,6 +3408,26 @@ mod installer_tag_tests {
             b"ipe-ipe-v0.2.5",
         ] {
             assert_eq!(parse_installer_tag(raw), None, "accepted {raw:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod self_reinvocation_tests {
+    use super::*;
+
+    /// The mobile shell's wasm build re-invokes `ipe` with the argv of the
+    /// verb its profile names, so the spelling comes from [`Verb`] alone.
+    #[test]
+    fn self_reinvocation_argv_from_verb() {
+        assert_eq!(wasm_build_verb(BundleProfile::Dev).argv(), ["dev", "build"]);
+        assert_eq!(
+            wasm_build_verb(BundleProfile::Release).argv(),
+            ["release", "build"]
+        );
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = wasm_build_verb(profile);
+            assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
         }
     }
 }

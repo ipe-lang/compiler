@@ -270,7 +270,8 @@ fn duplicate_declarations(mod_rs: &str) -> BTreeSet<String> {
 /// `<name>/mod.rs`) and return the set of top-level modules it references via an
 /// UNCONDITIONAL `use crate::<dep>` (dep = first path segment after `crate::`).
 /// cfg-/test-gated `use`s are excluded (their target is pulled in by the same
-/// cfg, not the base append).
+/// cfg, not the base append), and so is every file of a child module whose
+/// `mod` declaration is cfg-gated.
 fn unconditional_crate_deps(runtime_root: &Path, name: &str) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     let flat = runtime_root.join(format!("{name}.rs"));
@@ -283,21 +284,94 @@ fn unconditional_crate_deps(runtime_root: &Path, name: &str) -> BTreeSet<String>
     if dir.is_dir() {
         // Files under `<name>/`: `<name>/mod.rs` is `crate::<name>` (1 super to
         // root); `<name>/foo.rs` is `crate::<name>::foo` (2); each nested dir +1.
-        collect_dir_deps(&dir, 1, &mut deps);
+        collect_dir_deps(&dir, &flat, 1, &mut deps);
     }
     deps
 }
 
+/// The child modules whose `mod <child>;` declaration in `decl_src` carries a
+/// `#[cfg(...)]` attribute.
+///
+/// A cfg on a `mod` declaration gates the child's whole file, so the child's
+/// references are pulled in by that cfg, never by the parent's base append.
+/// `#[cfg_attr(..)]` gates nothing and a top-level `#[cfg(not(..))]` holds in
+/// the base build, so neither makes a child gated.
+fn cfg_gated_child_modules(decl_src: &str) -> BTreeSet<String> {
+    let mut gated = BTreeSet::new();
+    let mut cfg_pending = false;
+    for line in decl_src.lines() {
+        let t = line.trim();
+        if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
+            cfg_pending = true;
+            continue;
+        }
+        if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        if cfg_pending && let Some(child) = mod_declaration_name(t) {
+            gated.insert(child.to_owned());
+        }
+        cfg_pending = false;
+    }
+    gated
+}
+
+/// The module name of a file-backed `mod <name>;` declaration line.
+fn mod_declaration_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("pub").map_or(line, |after_pub| {
+        // `pub(crate) mod`, `pub(super) mod`, or plain `pub mod`.
+        after_pub
+            .split_once(')')
+            .filter(|_| after_pub.starts_with('('))
+            .map_or(after_pub, |(_, tail)| tail)
+    });
+    let name = rest
+        .trim_start()
+        .strip_prefix("mod ")?
+        .strip_suffix(';')?
+        .trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
+/// The child-module declarations of the module whose files live in `dir`.
+///
+/// They are in `<dir>/mod.rs`, or else in the sibling `<dir>.rs` (`outer_file`).
+fn dir_child_declarations(dir: &Path, outer_file: &Path) -> BTreeSet<String> {
+    let mod_rs = dir.join("mod.rs");
+    let decl = if mod_rs.is_file() {
+        mod_rs.as_path()
+    } else {
+        outer_file
+    };
+    std::fs::read_to_string(decl)
+        .map(|src| cfg_gated_child_modules(&src))
+        .unwrap_or_default()
+}
+
 /// Recurse a module's directory, scanning each `.rs` file for crate-root deps.
-/// `mod_depth` is the module-path depth of `<dir>/mod.rs` (= supers to root).
-fn collect_dir_deps(dir: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
+/// `mod_depth` is the module-path depth of `<dir>/mod.rs` (= supers to root);
+/// `outer_file` is the `<dir>.rs` that declares the children when there is no
+/// `<dir>/mod.rs`. A child whose `mod` declaration is cfg-gated is skipped
+/// whole, file and directory alike.
+fn collect_dir_deps(dir: &Path, outer_file: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let gated = dir_child_declarations(dir, outer_file);
     for entry in entries.flatten() {
         let path = entry.path();
+        let stem = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if gated.contains(&stem) {
+            continue;
+        }
         if path.is_dir() {
-            collect_dir_deps(&path, mod_depth + 1, deps);
+            let child_outer = dir.join(format!("{stem}.rs"));
+            collect_dir_deps(&path, &child_outer, mod_depth + 1, deps);
         } else if path.extension().is_some_and(|e| e == "rs") {
             // `mod.rs` sits at `mod_depth`; any other `<file>.rs` is one module
             // level deeper (`crate::…::<dir>::<file>`).
@@ -950,7 +1024,7 @@ fn wasm_unconditional_crate_deps(
             scan_file_deps(&flat, 1, &mut deps);
         }
         if dir.is_dir() {
-            collect_dir_deps(&dir, 1, &mut deps);
+            collect_dir_deps(&dir, &flat, 1, &mut deps);
         }
     }
     deps
@@ -1245,6 +1319,48 @@ mod tests {
     assert!(
         deps.is_empty(),
         "no production crate-root deps in this fixture; got {deps:?}"
+    );
+}
+
+/// A child module whose `mod` declaration is cfg-gated is gated whole: its
+/// file's `crate::` references are not unconditional deps of the parent, even
+/// on lines carrying no cfg of their own. An ungated sibling's still are.
+#[test]
+fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_modset_closure_gated_child_{}",
+        std::process::id()
+    ));
+    let web = root.join("web");
+    let nested = web.join("hub");
+    std::fs::create_dir_all(&nested).expect("create fixture dirs");
+    let files = [
+        (
+            web.join("mod.rs"),
+            "/// Server-only.\n#[cfg(feature = \"server\")]\n#[allow(dead_code)]\npub mod csrf;\n\
+             #[cfg(feature = \"db\")]\npub(crate) mod hub;\npub mod plain;\n\
+             #[cfg_attr(test, allow(dead_code))]\npub mod attr;\n\
+             #[cfg(not(feature = \"db\"))]\nmod fallback;\n\
+             #[cfg(feature = \"server\")]\nfn gated() {\n    crate::session::x();\n}\n",
+        ),
+        (
+            web.join("csrf.rs"),
+            "pub fn set() -> crate::server::SetCookie {\n    use crate::server::{CookieName};\n}\n",
+        ),
+        (web.join("plain.rs"), "use crate::tea::Model;\n"),
+        (web.join("attr.rs"), "use crate::alpha::A;\n"),
+        (web.join("fallback.rs"), "use crate::beta::B;\n"),
+        (nested.join("mod.rs"), "use crate::db::Pool;\n"),
+    ];
+    for (path, src) in &files {
+        std::fs::write(path, src).expect("write fixture file");
+    }
+    let deps = unconditional_crate_deps(&root, "web");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        deps,
+        BTreeSet::from(["alpha".to_owned(), "beta".to_owned(), "tea".to_owned()]),
+        "only the children whose `mod` declaration is not cfg-gated are dep sources"
     );
 }
 

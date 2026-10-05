@@ -54,7 +54,7 @@ fn list_filter_partial_app_compiles() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for list_filter_partial_app: {:?}",
+        "ipe dev build must succeed for list_filter_partial_app: {:?}",
         built.err()
     );
 
@@ -71,7 +71,7 @@ fn list_filter_partial_app_compiles() {
         let built = ipe::build(&entry, &e2e_out, &runtime);
         assert!(
             built.is_ok(),
-            "ipe build must succeed for list_filter_partial_app (E2E leg): {:?}",
+            "ipe dev build must succeed for list_filter_partial_app (E2E leg): {:?}",
             built.err()
         );
 

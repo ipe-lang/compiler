@@ -8,7 +8,7 @@
 //! genuine consume. The base scan previously skipped the base entirely, so a
 //! move there counted as 0: a non-`Clone` effect carrier reused once-in-a-base
 //! plus once-elsewhere saw only ONE consume, passed the reuse gate, and emitted a
-//! `.clone()` on a non-`Clone` type — `ipe build` exit 0 then `cargo build` E0382,
+//! `.clone()` on a non-`Clone` type — `ipe dev build` exit 0 then `cargo build` E0382,
 //! the exact accept-then-cargo-fail hole `PRINCIPLES.md` forbids.
 //!
 //! The base is now scanned for moves unless it is exactly a bare

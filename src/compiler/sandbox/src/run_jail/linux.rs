@@ -178,9 +178,9 @@ pub fn exec_in_run_jail(
 /// ([`write_sealed_app_memfd`]), verifies the capability floor by reading the
 /// SEALED fd, then calls this, which makes the sealed fd inheritable. bwrap
 /// inherits it across the process replacement and materialises the app inside
-/// the jail via `--file` at a fixed sandbox path — so the bytes executed are provably the
-/// sealed bytes that were verified; a same-uid attacker has no host path to
-/// pre-seed or swap.
+/// a jail-private tmpfs via `--file` — so the bytes executed are provably the
+/// sealed bytes that were verified, a same-uid attacker has no host path to
+/// pre-seed or swap, and no copy of the app is left on the host.
 ///
 /// # Errors
 ///
@@ -223,23 +223,17 @@ pub fn exec_embedded_in_run_jail(
         .make_inheritable()
         .map_err(|e| cloexec_err("sealed app memfd", e))?;
 
-    // The in-jail path the app is materialised at. It sits under `scoped_tmp`,
-    // the one always-writable bind, so bwrap can create it after the mounts.
-    let dest = mounts.scoped_tmp().as_path().join("ipe-app");
-
-    let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len() + 1);
-    payload.push(dest.as_os_str().to_owned());
-    payload.extend(app_args.iter().cloned());
-
+    // The builder owns the in-jail destination: a jail-private tmpfs under
+    // `scoped_tmp`, so no copy of the app reaches the host directory.
     let host_env = crate::host_env::granted;
     let argv = run_jail_argv_with_delivery(
         tools,
         profile,
         &mounts,
         Some(seccomp_fd),
-        Some((app_fd, &dest)),
+        app_fd,
         &host_env,
-        &payload,
+        app_args,
     );
 
     Err(exec_jail_argv(&argv))

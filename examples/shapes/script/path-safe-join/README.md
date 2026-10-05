@@ -6,6 +6,6 @@ value of type `Path` is proof it is clean. The worked example for the
 [Path guide](../../../../docs/guide/path.md).
 
 ```
-ipe build package.ipe
+ipe dev build package.ipe
 cargo run --manifest-path out/rust/Cargo.toml
 ```

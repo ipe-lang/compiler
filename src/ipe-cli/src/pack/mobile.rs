@@ -31,6 +31,7 @@ use ipe_fs_open::{EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::Capability;
 
 use crate::CliError;
+use crate::driver::BundleProfile;
 use crate::output_dir::OwnedDir;
 use crate::text;
 
@@ -185,12 +186,12 @@ impl std::fmt::Display for MobileRefusal {
             Self::MissingOs => write!(
                 f,
                 "error[IPE-P0020]: a mobile bundle needs an OS — \
-                 name one: `ipe build web solo <ios|android>`"
+                 name one: `ipe dev build web solo <ios|android>`"
             ),
             Self::UnknownOs(got) => write!(
                 f,
                 "error[IPE-P0021]: unknown mobile OS {got:?} \
-                 (expected `ipe build web solo <ios|android>`)"
+                 (expected `ipe dev build web solo <ios|android>`)"
             ),
             Self::NotWebShape => write!(
                 f,
@@ -745,13 +746,14 @@ impl ShellLayout {
 /// Propagates any error from the permission derivation.
 pub fn layout(
     os: MobileOs,
+    profile: BundleProfile,
     identity: &super::desktop::BundleIdentity,
     accepts: &BTreeSet<Capability>,
     bundle: &SpaBundle,
     icon: Option<&Path>,
 ) -> Result<ShellLayout, super::super::CliError> {
     match os {
-        MobileOs::Android => android_layout(identity, accepts, bundle, icon),
+        MobileOs::Android => android_layout(profile, identity, accepts, bundle, icon),
         MobileOs::Ios => ios_layout(identity, accepts, bundle, icon),
     }
 }
@@ -772,6 +774,7 @@ fn app_slug(name: &str) -> String {
 /// `file://`). The `AndroidManifest.xml` `<uses-permission>` lines come only from
 /// the permission derivation.
 fn android_layout(
+    profile: BundleProfile,
     identity: &super::desktop::BundleIdentity,
     accepts: &BTreeSet<Capability>,
     bundle: &SpaBundle,
@@ -807,7 +810,7 @@ fn android_layout(
     });
     files.push(ShellFile {
         rel_path: "README.txt".to_owned(),
-        content: ShellContent::Generated(android_readme(&root_name)),
+        content: ShellContent::Generated(android_readme(&root_name, profile)),
     });
 
     // The offline SPA assets, under the WebViewAssetLoader-served asset root.
@@ -982,9 +985,19 @@ fn render_android_activity(_identity: &super::desktop::BundleIdentity) -> String
 }
 
 /// The Android shell's build/README note.
-fn android_readme(root_name: &str) -> String {
+///
+/// The Gradle project carries no `signingConfig`, so the note states that it is
+/// unsigned and what each Gradle task yields, for either profile.
+fn android_readme(root_name: &str, profile: BundleProfile) -> String {
+    let purpose = match profile {
+        BundleProfile::Dev => "a dev bundle, for local install and inspection",
+        BundleProfile::Release => {
+            "a production bundle, distributable once signed with your own keystore"
+        }
+    };
     format!(
-        "{root_name}: an Android system-webview shell for an offline Ipê Web SPA.\n\
+        "{root_name}: an Android system-webview shell for an offline Ipê Web SPA\n\
+         ({purpose}).\n\
          \n\
          The client-wasm SPA rides under app/src/main/assets/www/; a WebViewAssetLoader\n\
          serves it at https://appassets.androidplatform.net/assets/www/index.html, so the\n\
@@ -992,7 +1005,11 @@ fn android_readme(root_name: &str) -> String {
          The <uses-permission> lines in AndroidManifest.xml are derived from the app's\n\
          accepted web capabilities — never hand-authored.\n\
          \n\
-         Build: ./gradlew assembleDebug   (requires the Android SDK; API 34).\n"
+         Signing: this Gradle project is unsigned.\n\
+         - ./gradlew assembleDebug (requires the Android SDK; API 34) builds an APK\n\
+         \x20 signed with the SDK's debug key, for local install only.\n\
+         - A store build needs your own keystore: add a signingConfig for it to\n\
+         \x20 app/build.gradle, then run ./gradlew assembleRelease.\n"
     )
 }
 
@@ -1569,8 +1586,15 @@ mod tests {
     fn www_replaced_between_collect_and_materialise_is_refused() {
         let (base, www) = www_with("replaced", &["boot.js"]);
         let spa = SpaBundle::from_www_dir(&www).expect("collect");
-        let shell =
-            layout(MobileOs::Android, &identity(), &accepts(&[]), &spa, None).expect("layout");
+        let shell = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &accepts(&[]),
+            &spa,
+            None,
+        )
+        .expect("layout");
         std::fs::rename(&www, base.join("www-collected")).expect("move www away");
         std::fs::create_dir_all(&www).expect("recreate www");
         std::fs::write(www.join("index.html"), b"swapped").expect("write swapped index");
@@ -1690,7 +1714,15 @@ mod tests {
     #[test]
     fn android_geolocation_yields_the_location_uses_permission() {
         let a = accepts(&[web(WebCapability::Geolocation)]);
-        let layout = layout(MobileOs::Android, &identity(), &a, &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &a,
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let manifest = layout
             .generated("app/src/main/AndroidManifest.xml")
             .expect("android manifest");
@@ -1704,6 +1736,7 @@ mod tests {
     fn android_app_accepting_nothing_has_no_uses_permission() {
         let layout = layout(
             MobileOs::Android,
+            BundleProfile::Dev,
             &identity(),
             &accepts(&[]),
             &bundle(),
@@ -1730,6 +1763,7 @@ mod tests {
         let hyphenated = super::super::desktop::BundleIdentity::new("wasm-spa", None, None);
         let layout = layout(
             MobileOs::Android,
+            BundleProfile::Dev,
             &hyphenated,
             &accepts(&[]),
             &bundle(),
@@ -1755,7 +1789,15 @@ mod tests {
     #[test]
     fn android_non_web_capability_backs_no_permission() {
         let a = accepts(&[Capability::Network, Capability::NativeFfi]);
-        let layout = layout(MobileOs::Android, &identity(), &a, &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &identity(),
+            &a,
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let manifest = layout
             .generated("app/src/main/AndroidManifest.xml")
             .expect("android manifest");
@@ -1766,6 +1808,7 @@ mod tests {
     fn android_layout_bundles_the_spa_assets_offline() {
         let layout = layout(
             MobileOs::Android,
+            BundleProfile::Dev,
             &identity(),
             &accepts(&[]),
             &bundle(),
@@ -1788,7 +1831,15 @@ mod tests {
     #[test]
     fn ios_geolocation_yields_the_location_usage_key() {
         let a = accepts(&[web(WebCapability::Geolocation)]);
-        let layout = layout(MobileOs::Ios, &identity(), &a, &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Ios,
+            BundleProfile::Dev,
+            &identity(),
+            &a,
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let plist = layout.generated("App/Info.plist").expect("ios plist");
         assert!(
             plist.contains("NSLocationWhenInUseUsageDescription"),
@@ -1799,8 +1850,15 @@ mod tests {
 
     #[test]
     fn ios_app_accepting_nothing_has_no_usage_keys() {
-        let layout =
-            layout(MobileOs::Ios, &identity(), &accepts(&[]), &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Ios,
+            BundleProfile::Dev,
+            &identity(),
+            &accepts(&[]),
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let plist = layout.generated("App/Info.plist").expect("ios plist");
         assert!(
             !plist.contains("UsageDescription"),
@@ -1811,8 +1869,15 @@ mod tests {
 
     #[test]
     fn ios_scheme_handler_serves_wasm_with_the_correct_mime() {
-        let layout =
-            layout(MobileOs::Ios, &identity(), &accepts(&[]), &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Ios,
+            BundleProfile::Dev,
+            &identity(),
+            &accepts(&[]),
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let handler = layout
             .generated("App/SchemeHandler.swift")
             .expect("scheme handler");
@@ -1830,8 +1895,15 @@ mod tests {
 
     #[test]
     fn ios_layout_bundles_the_spa_assets_offline() {
-        let layout =
-            layout(MobileOs::Ios, &identity(), &accepts(&[]), &bundle(), None).expect("layout");
+        let layout = layout(
+            MobileOs::Ios,
+            BundleProfile::Dev,
+            &identity(),
+            &accepts(&[]),
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let paths: Vec<&str> = layout.files.iter().map(|f| f.rel_path.as_str()).collect();
         assert!(paths.contains(&"App/www/index.html"));
         assert!(paths.contains(&"App/www/pkg/ipe_app_bg.wasm"));
@@ -1847,7 +1919,15 @@ mod tests {
             Some("com.evil.\"<x>"),
         );
         let a = accepts(&[]);
-        let android = layout(MobileOs::Android, &hostile, &a, &bundle(), None).expect("layout");
+        let android = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &hostile,
+            &a,
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let manifest = android
             .generated("app/src/main/AndroidManifest.xml")
             .expect("android manifest");
@@ -1856,7 +1936,15 @@ mod tests {
             "a hostile identity cannot inject raw XML into the manifest: {manifest}"
         );
 
-        let ios = layout(MobileOs::Ios, &hostile, &a, &bundle(), None).expect("layout");
+        let ios = layout(
+            MobileOs::Ios,
+            BundleProfile::Dev,
+            &hostile,
+            &a,
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let plist = ios.generated("App/Info.plist").expect("ios plist");
         assert!(
             !plist.contains("<x>"),
@@ -1874,8 +1962,15 @@ mod tests {
             Some("1.0.0"),
             Some("com.evil.app"),
         );
-        let android =
-            layout(MobileOs::Android, &hostile, &accepts(&[]), &bundle(), None).expect("layout");
+        let android = layout(
+            MobileOs::Android,
+            BundleProfile::Dev,
+            &hostile,
+            &accepts(&[]),
+            &bundle(),
+            None,
+        )
+        .expect("layout");
         let settings = android
             .generated("settings.gradle")
             .expect("settings.gradle");
@@ -1896,12 +1991,28 @@ mod tests {
     fn an_icon_is_placed_per_os_and_omitted_when_absent() {
         let icon = PathBuf::from("/tmp/icon.png");
         for os in [MobileOs::Ios, MobileOs::Android] {
-            let with = layout(os, &identity(), &accepts(&[]), &bundle(), Some(&icon)).expect("l");
+            let with = layout(
+                os,
+                BundleProfile::Dev,
+                &identity(),
+                &accepts(&[]),
+                &bundle(),
+                Some(&icon),
+            )
+            .expect("l");
             assert!(
                 with.files.iter().any(|f| f.content == ShellContent::Icon),
                 "an icon file is present on {os:?} when the manifest declares one"
             );
-            let without = layout(os, &identity(), &accepts(&[]), &bundle(), None).expect("l");
+            let without = layout(
+                os,
+                BundleProfile::Dev,
+                &identity(),
+                &accepts(&[]),
+                &bundle(),
+                None,
+            )
+            .expect("l");
             assert!(
                 without
                     .files
@@ -1910,5 +2021,22 @@ mod tests {
                 "no icon file on {os:?} when the manifest declares none"
             );
         }
+    }
+
+    /// The Android README states the project is unsigned under either profile, and
+    /// names the keystore step a store build needs; it never claims a signed build.
+    #[test]
+    fn android_readme_states_the_project_is_unsigned() {
+        let dev = android_readme("app-android", BundleProfile::Dev);
+        let release = android_readme("app-android", BundleProfile::Release);
+        for note in [&dev, &release] {
+            assert!(note.contains("this Gradle project is unsigned"), "{note}");
+            assert!(note.contains("debug key, for local install only"), "{note}");
+            assert!(note.contains("signingConfig"), "{note}");
+            assert!(note.contains("assembleRelease"), "{note}");
+        }
+        assert!(dev.contains("a dev bundle"), "{dev}");
+        assert!(release.contains("a production bundle"), "{release}");
+        assert_ne!(dev, release);
     }
 }
