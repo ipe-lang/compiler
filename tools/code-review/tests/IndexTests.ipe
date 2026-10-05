@@ -29,8 +29,7 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
-import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -325,7 +324,7 @@ pageReadsNoSource =
         removeFileIfAny (at.repo ++ "/src/Main.ipe")
         conn <- indexConn
         rows <- Index.loadPendingPage conn Index.Start
-        settings <- Settings.indexSettings
+        settings <- envSettings
         found <- Index.loadView conn settings.roots "u-b"
         cleanupIndex at.indexDb at.repo
         Task.succeed
@@ -370,7 +369,7 @@ probeRefusesIndexWithoutFiles =
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
         execIndex at.indexDb "DROP TABLE files" []
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         cleanupIndex at.indexDb at.repo
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 

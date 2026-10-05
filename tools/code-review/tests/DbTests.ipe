@@ -17,7 +17,6 @@ import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
-import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
@@ -66,10 +65,10 @@ drainCursorGoneAfterMigrateIn base =
         Task.succeed (tables == [ "_ipe_migrations", "review" ])
 
 
--- `LibDb.open` never migrates: on a review file that `probe` never ran on,
+-- `LibDb.openAt` never migrates: on a review file that `probe` never ran on,
 -- the next read is a typed error and no table is created. A review file
 -- deleted under a running server is therefore never silently re-created
--- empty. Red while `open` migrates.
+-- empty. Red while `openAt` migrates.
 openDoesNotMigrate : Task.Task Error Bool
 openDoesNotMigrate =
     freshDir "ipe-review-open-no-migrate" |> Task.andThen openDoesNotMigrateIn
@@ -82,8 +81,7 @@ openDoesNotMigrateIn base =
             base ++ "/review.db"
     in
     do
-        System.setenv "IPE_REVIEW_DB" dbPath
-        db <- LibDb.open
+        db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
         readFailed <- LibDb.findDecision db "u-a" "h"
             |> Task.map (\_ -> False)
             |> Task.onError (\_ -> Task.succeed True)

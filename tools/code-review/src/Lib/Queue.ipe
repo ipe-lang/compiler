@@ -17,7 +17,7 @@ import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings
+import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
 
 
 -- A pending unit plus its resurfacing state. `changed` is Just the previous
@@ -62,8 +62,8 @@ type alias Progress =
 -- decision count of the review database `db` (a decision whose drain failed,
 -- a replaced index file, a deleted review row), the copy is rebuilt once and
 -- the row read again. It never loops.
-currentProgress : Db.Db -> Db.Db -> Task.Task Error Progress
-currentProgress conn db =
+currentProgress : IndexSettings -> Db.Db -> Db.Db -> Task.Task Error Progress
+currentProgress settings conn db =
     do
         first <- Index.loadProgress conn
         decisions <- LibDb.countDecisions db
@@ -72,7 +72,7 @@ currentProgress conn db =
 
         else
             do
-                resyncReviewed db
+                resyncReviewed settings db
                 second <- Index.loadProgress conn
                 Task.succeed (progressFrom second)
 
@@ -107,22 +107,22 @@ resyncBound =
 -- The `reviewed` copy rebuilt from the review database: one index
 -- transaction empties it and drains every decided pair, so a pair's
 -- undrained queue row leaves too. Returns the count of pairs copied.
-resyncReviewed : Db.Db -> Task.Task Error Int
-resyncReviewed db =
-    resyncReviewedWithin resyncBound db
+resyncReviewed : IndexSettings -> Db.Db -> Task.Task Error Int
+resyncReviewed settings db =
+    resyncReviewedWithin settings resyncBound db
 
 
 -- `resyncReviewed` reading at most `bound.pageCeiling` pages of
 -- `bound.pageSize` decided pairs. A review database holding more refuses
 -- the rebuild and rolls it back, leaving the copy as it was. A bound below
 -- one page of one pair is refused before the copy is touched.
-resyncReviewedWithin : ResyncBound -> Db.Db -> Task.Task Error Int
-resyncReviewedWithin bound db =
+resyncReviewedWithin : IndexSettings -> ResyncBound -> Db.Db -> Task.Task Error Int
+resyncReviewedWithin settings bound db =
     if bound.pageSize < 1 || bound.pageCeiling < 1 then
         Task.fail (Error.invalidInput "a review progress rebuild needs a page size and a page ceiling of at least 1")
 
     else
-        Index.rebuildReviewed (\conn -> refillPages bound db conn)
+        Index.rebuildReviewed settings (\conn -> refillPages bound db conn)
 
 
 -- The state one `refillPages` step carries: how many pages have been read,
@@ -300,15 +300,14 @@ historyStatusText state =
 
 
 -- One History page from `cursor`, newest first, each row with the unit's
--- qualified name resolved from the index db. At most
+-- qualified name resolved from the index db named by `settings`. At most
 -- `LibDb.historyPageSize` rows are read, and one name lookup runs per row.
-loadHistoryPage : LibDb.HistoryCursor -> Task.Task Error HistoryPage
-loadHistoryPage cursor =
+loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
+loadHistoryPage settings cursor =
     do
-        db <- LibDb.open
+        db <- LibDb.openAt settings.review
         page <- LibDb.historyPage db LibDb.historyPageSize cursor
-        settings <- Settings.indexSettings
-        conn <- Index.readConnection settings
+        conn <- Index.readConnection settings.index
         rows <- Task.sequence (List.map (historyRow conn) page.rows)
         Task.succeed { rows = rows, at = cursor, next = page.next }
 
@@ -332,10 +331,10 @@ historyRow conn row =
 -- since only a verified view holds a `ShownSource`, and only after
 -- `Index.reverify` re-proves it, so the hash written is the hash of the
 -- bytes the reviewer saw.
-decide : Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
-decide db shown decision =
+decide : IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decide settings db shown decision =
     do
-        attested <- Index.reverify shown
+        attested <- Index.reverify settings shown
         n <- LibDb.insertDecision db attested decision
         Task.succeed ( attested, n )
 
@@ -627,11 +626,10 @@ sourceStatusText view =
 -- One unit's view by uid through `Index.loadView`, the one source read the
 -- unit page and the selected queue card share (decided units have no
 -- change_queue row, so it queries units directly), on one connection from
--- one settings resolution. Nothing when no unit has this uid.
-loadUnitView : String -> Task.Task Error (Maybe Index.UnitView)
-loadUnitView uid =
+-- `settings`. Nothing when no unit has this uid.
+loadUnitView : IndexSettings -> String -> Task.Task Error (Maybe Index.UnitView)
+loadUnitView settings uid =
     do
-        settings <- Settings.indexSettings
         conn <- Index.readConnection settings
         Index.loadView conn settings.roots uid
 
@@ -698,15 +696,14 @@ pageHeaderText page =
 -- The page also carries the whole-queue count, the database size and the
 -- review progress. Progress is read first, so a rebuild of the `reviewed`
 -- copy that drains an undrained decided pair is already reflected in the
--- page's rows and count. The index settings are resolved once and every
--- index read runs on the one read connection opened from them.
-loadPage : Index.Cursor -> Task.Task Error QueuePage
-loadPage cursor =
+-- page's rows and count. The settings are the value resolved at startup and
+-- every index read runs on the one read connection opened from them.
+loadPage : AppSettings -> Index.Cursor -> Task.Task Error QueuePage
+loadPage settings cursor =
     do
-        settings <- Settings.indexSettings
-        conn <- Index.readConnection settings
-        db <- LibDb.open
-        progress <- currentProgress conn db
+        conn <- Index.readConnection settings.index
+        db <- LibDb.openAt settings.review
+        progress <- currentProgress settings.index conn db
         rows <- Index.loadPendingPage conn cursor
         total <- Index.countPending conn
         bytes <- Index.dbBytes conn
@@ -714,7 +711,7 @@ loadPage cursor =
         Task.succeed
             { units = units
             , total = total
-            , dbName = SafeText.renderForeign (Settings.dbFileName settings.db)
+            , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
             , dbBytes = bytes
             , next = nextCursor rows
             , progress = progress
@@ -724,9 +721,9 @@ loadPage cursor =
 -- A decided unit drained from the index queue, then the queue page at
 -- `cursor` reloaded. The drain writes the index alone: the review database
 -- already holds the decision, so nothing is written to it here.
-drainThenLoad : Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
-drainThenLoad attested cursor =
-    Index.drainUnit attested |> Task.andThen (\_ -> loadPage cursor)
+drainThenLoad : AppSettings -> Index.Attested -> Index.Cursor -> Task.Task Error QueuePage
+drainThenLoad settings attested cursor =
+    Index.drainUnit settings.index attested |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.

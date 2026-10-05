@@ -530,11 +530,11 @@ singleInt what rows =
 -- The review app consumes and clears explicitly: after a unit is decided,
 -- `drainPair` runs in one index transaction, so the pair enters the
 -- `reviewed` copy and the unit's change_queue row leaves together, or
--- neither does. Returns the count of queue rows deleted.
-drainUnit : Attested -> Task.Task Error Int
-drainUnit attested =
+-- neither does. Returns the count of queue rows deleted. The index is the one
+-- `settings` names, resolved once at startup.
+drainUnit : IndexSettings -> Attested -> Task.Task Error Int
+drainUnit settings attested =
     do
-        settings <- Settings.indexSettings
         conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
         Db.withTransaction conn (\tx -> drainPair tx (attestedUid attested) (attestedHash attested))
 
@@ -593,11 +593,11 @@ drainPair conn uid hash =
 -- The `reviewed` copy rebuilt in one index transaction: every row is
 -- deleted, then `refill` re-adds the decided pairs through `drainDecided` on the
 -- transaction's connection it is given. A failed refill rolls the whole
--- rebuild back, leaving the copy as it was.
-rebuildReviewed : (Db.Db -> Task.Task Error a) -> Task.Task Error a
-rebuildReviewed refill =
+-- rebuild back, leaving the copy as it was. The index is the one `settings`
+-- names, resolved once at startup.
+rebuildReviewed : IndexSettings -> (Db.Db -> Task.Task Error a) -> Task.Task Error a
+rebuildReviewed settings refill =
     do
-        settings <- Settings.indexSettings
         conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
         Db.withTransaction conn
             (\tx ->
@@ -824,13 +824,14 @@ attestedHash attested =
 -- the index and its file re-hashed through `viewOf`, and the fresh view must
 -- be shown under the same hash. A unit gone from the index, or a source that
 -- changed or became unreadable since it was shown, is a conflict, so no
--- decision is recorded against bytes the reviewer did not see.
-reverify : ShownSource -> Task.Task Error Attested
-reverify shown =
+-- decision is recorded against bytes the reviewer did not see. The index and
+-- root are the one `settings` value resolved at startup, the tree the page
+-- showed the unit from.
+reverify : IndexSettings -> ShownSource -> Task.Task Error Attested
+reverify settings shown =
     case shown of
         ShownSource s ->
             do
-                settings <- Settings.indexSettings
                 conn <- readConnection settings
                 rows <- Db.queryDecode conn unitByUidSql [ SqlString s.uid ] rowDecoder
                 case List.head rows of
