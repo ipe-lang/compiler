@@ -1,4 +1,4 @@
--- | Ipe.Result — combinators over the Result ADT (Layer-3 compiled source).
+-- | Ipe.Result — combinators over the Result ADT.
 --
 -- A `Result e a` is either `Ok a` (success carrying a value) or `Err e`
 -- (failure carrying an error). It is the typed alternative to exceptions:
@@ -9,10 +9,6 @@
 -- values so you rarely need to `case` on them by hand: `map` changes the
 -- success value, `andThen` chains a step that may itself fail, `mapError`
 -- translates the error side, and `combine` collects a list of results.
---
--- Each member is a point-free `Kernel.kernel "Result_<member>"` alias resolved
--- by `detect_kernel_alias` to the registered `Result*` `StdlibKernel`
--- variant (`ipe_runtime::result::*`).
 --
 -- The `Result` type name and `Ok`/`Err` constructors are ambient builtins;
 -- this module re-exports them via `Result(..)` so

@@ -1840,7 +1840,7 @@ Ipe.Env — build-time-embedded public config.
 
 [Full reference](stdlib/Error.md)
 
-Ipe.Error — the structured `Error` type (Layer-3 Ipe source).
+Ipe.Error — the structured `Error` type.
 
 | Export | Summary |
 |--------|----------|
@@ -2197,7 +2197,7 @@ Ipe.Level — the `LogLevel` severity-tag ADT.
 
 [Full reference](stdlib/List.md)
 
-`Ipe.List` — transform, filter, and combine lists (compiled-source Layer-3).
+`Ipe.List` — transform, filter, and combine lists.
 
 | Export | Summary |
 |--------|----------|
@@ -2518,7 +2518,7 @@ Ipe.PubSub — Task-shaped publish, callable wherever a bus runs.
 
 [Full reference](stdlib/Random.md)
 
-Ipe.Random — entropy-driven and seeded random helpers (compiled-source
+Ipe.Random — entropy-driven and seeded random helpers.
 
 | Export | Summary |
 |--------|----------|
@@ -2573,7 +2573,7 @@ Ipe.Regex — RE2 regex helpers.
 
 [Full reference](stdlib/Result.md)
 
-Ipe.Result — combinators over the Result ADT (Layer-3 compiled source).
+Ipe.Result — combinators over the Result ADT.
 
 | Export | Summary |
 |--------|----------|
