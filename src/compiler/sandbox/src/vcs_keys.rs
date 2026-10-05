@@ -12,6 +12,12 @@
 //! it most specifically; a const assertion breaks the build when a spelling is
 //! malformed, the rows are out of order, or two rows that decide differently
 //! match one setting with neither more specific than the other.
+//!
+//! A Mercurial tool that runs a program named by part of a setting's key
+//! (`[merge-tools] <tool>.priority`) states its split rule in `HG_KEY_TOOLS`;
+//! every other section whose keys carry a name says in `HG_NAME_NOT_PROGRAM`
+//! why the name runs nothing, and a const assertion breaks the build when a
+//! section is decided by neither or by both.
 
 /// How a tool consumes a setting's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +84,15 @@ pub enum Include {
     Always,
     /// Only when the include's condition holds.
     Conditional,
+}
+
+/// How Mercurial takes the program a section's keys name from a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTool {
+    /// The text before the key's first `.`, or the whole key (`k.split('.')[0]`).
+    FirstSegment,
+    /// `[extdiff]`: nothing for `opts.<n>` and `gui.<n>`, `<n>` for `cmd.<n>`, the whole key otherwise.
+    ExtdiffName,
 }
 
 /// What a row decides.
@@ -2172,6 +2187,84 @@ const HG_UNDECIDED: &[(&str, &str)] = &[
     ),
 ];
 
+/// The Mercurial sections whose keys name a program Mercurial runs, each with how the key names it.
+const HG_KEY_TOOLS: &[(&str, KeyTool)] = &[
+    ("extdiff", KeyTool::ExtdiffName), // hgext/extdiff.py:773-794 findexe(name)
+    ("merge-tools", KeyTool::FirstSegment), // mercurial/filemerge.py:247 _picktool
+    ("partial-merge-tools", KeyTool::FirstSegment), // mercurial/filemerge.py:1152
+];
+
+/// The Mercurial sections whose keys carry a name (`<name>`, `*`) that runs no program, each with why.
+const HG_NAME_NOT_PROGRAM: &[(&str, &str)] = &[
+    (
+        "alias",
+        "mercurial/dispatch.py:765 a command name; the value is what runs",
+    ),
+    ("color", "mercurial/color.py:169 an effect label"),
+    (
+        "command-templates",
+        "mercurial/cmdutil.py:1221 a template name",
+    ),
+    (
+        "committemplate",
+        "mercurial/cmdutil.py:3234 a template name",
+    ),
+    (
+        "diff-tools",
+        "hgext/extdiff.py:801 read by a name `[extdiff]` supplies",
+    ),
+    (
+        "extensions",
+        "mercurial/extensions.py:303 a module imported by name, never run",
+    ),
+    (
+        "fix",
+        "hgext/fix.py:940 a fixer label; its `:command` value is what runs",
+    ),
+    ("gpg", "hgext/gpg.py:260 a key identifier"),
+    (
+        "help",
+        "mercurial/help.py:280 a command or topic hidden from help",
+    ),
+    (
+        "hooks",
+        "mercurial/hook.py:236 an event name; the value is what runs",
+    ),
+    ("hostfingerprints", "mercurial/sslutil.py:153 a host name"),
+    ("hostsecurity", "mercurial/sslutil.py:116 a host name"),
+    (
+        "logtoprocess",
+        "hgext/logtoprocess.py:79 an event name; the value is what runs",
+    ),
+    (
+        "merge-patterns",
+        "mercurial/filemerge.py:227 a file pattern; the value names the tool",
+    ),
+    (
+        "pager",
+        "mercurial/ui.py:1587 a command whose output is paged",
+    ),
+    (
+        "paths",
+        "mercurial/utils/urlutil.py:834 a path alias; the value is the URL",
+    ),
+    ("revsetalias", "mercurial/revset.py:584 a revset alias"),
+    ("schemes", "hgext/schemes.py:156 a URL scheme"),
+    (
+        "subpaths",
+        "mercurial/subrepoutil.py:108 a source URL pattern",
+    ),
+    (
+        "templatealias",
+        "mercurial/formatter.py:672 a template alias",
+    ),
+    (
+        "templateconfig",
+        "mercurial/templatefuncs.py:363 a template config name",
+    ),
+    ("templates", "mercurial/formatter.py:677 a template name"),
+];
+
 /// The Jujutsu top-level tables whose values never name code.
 const JJ_EXEMPT: &[&str] = &[
     "--when",
@@ -2275,6 +2368,93 @@ const _: () = assert!(git_rows_sound());
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a Mercurial row's spelling is malformed or out of order, or two Mercurial rows decide one setting differently at equal specificity [ledger #boundary]
 const _: () = assert!(hg_rows_sound());
 
+/// Whether every section of `rows` with a row for any name (`<name>`, `*`) is
+/// in exactly one of `tools` and `not_program`, and each section they list
+/// has such a row.
+const fn name_sections_decided(
+    rows: &[Row],
+    tools: &[(&str, KeyTool)],
+    not_program: &[(&str, &str)],
+) -> bool {
+    let mut pending = rows;
+    while let Some(((spelling, _), more)) = pending.split_first() {
+        if let Some(section) = name_section(spelling.as_bytes())
+            && lists_tool(tools, section) == lists_not_program(not_program, section)
+        {
+            return false;
+        }
+        pending = more;
+    }
+    let mut listed = tools;
+    while let Some(((section, _), more)) = listed.split_first() {
+        if !has_name_row(rows, section.as_bytes()) {
+            return false;
+        }
+        listed = more;
+    }
+    let mut excused = not_program;
+    while let Some(((section, _), more)) = excused.split_first() {
+        if !has_name_row(rows, section.as_bytes()) {
+            return false;
+        }
+        excused = more;
+    }
+    true
+}
+
+/// The section of the Mercurial spelling `spelling` when its key carries a name (`<name>`, `*`).
+const fn name_section(spelling: &[u8]) -> Option<&[u8]> {
+    let Some((section, key)) = split_once(spelling, b'.', false) else {
+        return None;
+    };
+    if find(key, b'<', false).is_some() || find(key, b'*', false).is_some() {
+        Some(section)
+    } else {
+        None
+    }
+}
+
+/// Whether some row of `rows` carries a name under `section`.
+const fn has_name_row(rows: &[Row], section: &[u8]) -> bool {
+    let mut pending = rows;
+    while let Some(((spelling, _), more)) = pending.split_first() {
+        if let Some(found) = name_section(spelling.as_bytes())
+            && bytes_eq(found, section, false)
+        {
+            return true;
+        }
+        pending = more;
+    }
+    false
+}
+
+/// Whether `tools` lists `section`.
+const fn lists_tool(tools: &[(&str, KeyTool)], section: &[u8]) -> bool {
+    let mut pending = tools;
+    while let Some(((name, _), more)) = pending.split_first() {
+        if bytes_eq(name.as_bytes(), section, false) {
+            return true;
+        }
+        pending = more;
+    }
+    false
+}
+
+/// Whether `not_program` lists `section`.
+const fn lists_not_program(not_program: &[(&str, &str)], section: &[u8]) -> bool {
+    let mut pending = not_program;
+    while let Some(((name, _), more)) = pending.split_first() {
+        if bytes_eq(name.as_bytes(), section, false) {
+            return true;
+        }
+        pending = more;
+    }
+    false
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a Mercurial section whose keys carry a name is not decided once as naming a program or not [ledger #boundary]
+const _: () = assert!(name_sections_decided(HG, HG_KEY_TOOLS, HG_NAME_NOT_PROGRAM));
+
 /// The parsed Git rows.
 static GIT_ROWS: [Parsed; GIT.len()] = parse_table::<{ GIT.len() }>(GIT, Shape::Git).rows;
 /// The parsed Mercurial rows.
@@ -2307,6 +2487,23 @@ pub fn hg(section: &str, key: &str) -> Option<Consume> {
     )? {
         Rule::Consume(consume) => Some(consume),
         Rule::AsUnscoped => None,
+    }
+}
+
+/// The program name Mercurial takes from the key of `section.key`, or `None` when the key names none.
+///
+/// Sections compare exactly, as [`hg`] compares them.
+pub fn hg_key_tool<'k>(section: &str, key: &'k str) -> Option<&'k str> {
+    let (_, how) = HG_KEY_TOOLS.iter().find(|(name, _)| *name == section)?;
+    match how {
+        KeyTool::FirstSegment => Some(key.split_once('.').map_or(key, |(name, _)| name)),
+        KeyTool::ExtdiffName => {
+            if key.starts_with("opts.") || key.starts_with("gui.") {
+                None
+            } else {
+                Some(key.strip_prefix("cmd.").unwrap_or(key))
+            }
+        }
     }
 }
 
@@ -3041,5 +3238,45 @@ mod tests {
         assert_eq!(hg("UI", "username"), None);
         assert!(jj_exempt("templates"));
         assert!(!jj_exempt("ui"));
+    }
+
+    #[test]
+    fn hg_key_tool_derivation() {
+        assert_eq!(hg_key_tool("merge-tools", "a.b.c"), Some("a"));
+        assert_eq!(hg_key_tool("merge-tools", "bin/evil"), Some("bin/evil"));
+        assert_eq!(hg_key_tool("partial-merge-tools", "x/y.order"), Some("x/y"));
+        assert_eq!(hg_key_tool("extdiff", "opts.vd"), None);
+        assert_eq!(hg_key_tool("extdiff", "gui.vd"), None);
+        assert_eq!(hg_key_tool("extdiff", "cmd.vd"), Some("vd"));
+        assert_eq!(hg_key_tool("extdiff", "vd"), Some("vd"));
+        assert_eq!(hg_key_tool("hooks", "x/y"), None);
+        assert_eq!(hg_key_tool("Merge-Tools", "x/y.priority"), None);
+    }
+
+    #[test]
+    fn hg_name_sections_all_decided() {
+        assert!(name_sections_decided(HG, HG_KEY_TOOLS, HG_NAME_NOT_PROGRAM));
+        let rows: &[Row] = &[("a.<name>.k", INERT), ("b.*", SHELL), ("c.k", INERT)];
+        let tools: &[(&str, KeyTool)] = &[("a", KeyTool::FirstSegment)];
+        assert!(name_sections_decided(rows, tools, &[("b", "why")]));
+        // A section whose keys carry a name, decided by neither list.
+        assert!(!name_sections_decided(rows, tools, &[]));
+        // Decided by both.
+        assert!(!name_sections_decided(
+            rows,
+            tools,
+            &[("a", "why"), ("b", "why")]
+        ));
+        // A listed section with no row carrying a name.
+        assert!(!name_sections_decided(
+            rows,
+            tools,
+            &[("b", "why"), ("c", "why")]
+        ));
+        assert!(!name_sections_decided(
+            rows,
+            &[("a", KeyTool::FirstSegment), ("d", KeyTool::FirstSegment)],
+            &[("b", "why")]
+        ));
     }
 }
