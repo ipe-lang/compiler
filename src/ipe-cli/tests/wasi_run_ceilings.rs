@@ -1,4 +1,4 @@
-//! The embedded WASI run honours the resource floor of its profile.
+//! The embedded WASI run honours the resource ceilings of its context.
 //!
 //! Two ceilings bound a guest, each proven by a refusal and a control:
 //!
@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ipe::CliError;
-use ipe::wasi_run::run_wasi_module;
-use ipe_sandbox::run_jail::{RunResourceLimits, SandboxProfile};
+use ipe::wasi_run::{WasiCtx, run_wasi_module};
+use ipe_sandbox::run_jail::RunResourceLimits;
 
 /// `(module (func (export "_start") (loop (br 0))))`: `_start` never returns.
 const SPIN: [u8; 41] = [
@@ -73,26 +73,23 @@ fn module_file(name: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
     (file, dir)
 }
 
-fn profile(limits: RunResourceLimits) -> SandboxProfile {
-    SandboxProfile {
-        limits,
-        ..SandboxProfile::maximally_isolated()
-    }
+const fn ctx(limits: RunResourceLimits) -> WasiCtx {
+    WasiCtx::dev_ambient_bounded(limits)
 }
 
-fn run(file: &Path, tree: &Path, profile: &SandboxProfile) -> Result<(), CliError> {
-    run_wasi_module(file, profile, tree, &[])
+fn run(file: &Path, tree: &Path, ctx: &WasiCtx) -> Result<(), CliError> {
+    run_wasi_module(file, ctx, tree, &[])
 }
 
 #[test]
 fn a_guest_that_never_returns_is_turned_back_at_the_wall_ceiling() {
     let (file, tree) = module_file("wasi_ceiling_spin", &SPIN);
-    let profile = profile(RunResourceLimits {
+    let ctx = ctx(RunResourceLimits {
         wall_secs: Some(1),
         ..RunResourceLimits::default()
     });
     let started = Instant::now();
-    let outcome = run(&file, &tree, &profile);
+    let outcome = run(&file, &tree, &ctx);
     let took = started.elapsed();
     assert!(
         matches!(outcome, Err(CliError::WasiRunFailed { .. })),
@@ -111,12 +108,12 @@ fn a_guest_that_never_returns_is_turned_back_at_the_wall_ceiling() {
 #[test]
 fn a_guest_that_returns_at_once_runs_to_ok_under_the_wall_ceiling() {
     let (file, tree) = module_file("wasi_ceiling_return", &RETURN_AT_ONCE);
-    let profile = profile(RunResourceLimits {
+    let ctx = ctx(RunResourceLimits {
         wall_secs: Some(60),
         ..RunResourceLimits::default()
     });
     let started = Instant::now();
-    let outcome = run(&file, &tree, &profile);
+    let outcome = run(&file, &tree, &ctx);
     let took = started.elapsed();
     assert!(
         matches!(outcome, Ok(())),
@@ -131,11 +128,11 @@ fn a_guest_that_returns_at_once_runs_to_ok_under_the_wall_ceiling() {
 #[test]
 fn a_guest_that_grows_memory_past_the_ceiling_is_turned_back() {
     let (file, tree) = module_file("wasi_ceiling_grow_past", &GROW_TWO_HUNDRED_PAGES);
-    let profile = profile(RunResourceLimits {
+    let ctx = ctx(RunResourceLimits {
         as_bytes: MEMORY_CEILING_BYTES,
         ..RunResourceLimits::default()
     });
-    let outcome = run(&file, &tree, &profile);
+    let outcome = run(&file, &tree, &ctx);
     assert!(
         matches!(
             &outcome,
@@ -154,7 +151,7 @@ fn the_over_ceiling_grow_runs_to_ok_once_the_ceiling_is_lifted() {
         defaults.as_bytes > 201 * 65_536,
         "the default ceiling must fit the 200-page grow for this control to mean anything"
     );
-    let outcome = run(&file, &tree, &profile(defaults));
+    let outcome = run(&file, &tree, &ctx(defaults));
     assert!(
         matches!(outcome, Ok(())),
         "the module refused under the memory ceiling must load and run under the default one, got {outcome:?}"
@@ -164,11 +161,11 @@ fn the_over_ceiling_grow_runs_to_ok_once_the_ceiling_is_lifted() {
 #[test]
 fn a_guest_that_grows_memory_within_the_ceiling_runs_to_ok() {
     let (file, tree) = module_file("wasi_ceiling_grow_within", &GROW_ONE_PAGE);
-    let profile = profile(RunResourceLimits {
+    let ctx = ctx(RunResourceLimits {
         as_bytes: MEMORY_CEILING_BYTES,
         ..RunResourceLimits::default()
     });
-    let outcome = run(&file, &tree, &profile);
+    let outcome = run(&file, &tree, &ctx);
     assert!(
         matches!(outcome, Ok(())),
         "a grow inside the memory ceiling must succeed, got {outcome:?}"
