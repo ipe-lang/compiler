@@ -1870,12 +1870,13 @@ const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
 /// # Errors
 ///
 /// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
-/// duration within the bound; a present value is never replaced by a default.
+/// duration within the bound, or naming `Web.sessionTtl` when that setting is
+/// not; a present value is never replaced by a default.
 #[cfg(feature = "server")]
 fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
     let raw = WEB_TTL.lookup();
     if matches!(raw, Err(std::env::VarError::NotPresent))
-        && let Some(secs) = crate::app_config::resolve_session_ttl_override()
+        && let Some(secs) = crate::app_config::resolve_session_ttl_override(WEB_TTL)?
     {
         return Ok(std::time::Duration::from_secs(secs));
     }
@@ -2687,6 +2688,8 @@ pub(crate) enum StartupRefusal {
     Ceiling(crate::system::EnvCeilingRefusal),
     /// `IPE_WEB_FRAME_ANCESTORS` has no `frame-ancestors` representation.
     FrameAncestors(crate::telemetry::FrameAncestorsRefusal),
+    /// `IPE_HTTP_BIND` is present but not an IP address.
+    Bind(crate::system::EnvValueRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -2700,6 +2703,7 @@ impl std::fmt::Display for StartupRefusal {
             }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
+            Self::Bind(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -4855,6 +4859,18 @@ mod handlers {
 #[cfg(feature = "server")]
 const WEB_PORT_ENV: &str = "IPE_WEB_PORT";
 
+/// The address a standalone web app binds, under `IPE_HTTP_BIND` > `Host.bind`
+/// > the posture default.
+///
+/// # Errors
+///
+/// [`StartupRefusal::Bind`] when `IPE_HTTP_BIND` is present but not an IP
+/// address.
+#[cfg(feature = "server")]
+fn web_bind_host() -> Result<std::net::IpAddr, StartupRefusal> {
+    crate::app_config::resolve_host_bind().map_err(StartupRefusal::Bind)
+}
+
 /// Shared server setup for `web_app` / `web_app_routed`: nested HTTP
 /// handlers (`page` / `sse_handler` / `event_handler`), router + bind/serve.
 /// The only per-entry difference (the `route_entry`) lives on `state`.
@@ -4926,8 +4942,11 @@ where
     // The bind host is resolved once, here, and its listen scope recorded
     // before any console gate reads it: a dev surface exists only while every
     // app listener is loopback.
-    let host = crate::app_config::resolve_host_bind();
-    crate::telemetry::record_bind(&host);
+    let host = match web_bind_host() {
+        Ok(host) => host,
+        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+    };
+    crate::telemetry::record_bind(host);
     #[cfg(feature = "http_client")]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
@@ -4964,8 +4983,11 @@ where
     // (`IPE_HTTP_BIND` > `Host.bind` setting > loopback-unless-production), so
     // an explicit loopback setting is never overridden into all-interfaces.
     // `host` is the value resolved above, before the console gates.
-    let addr = format!("{host}:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let Ok(port) = u16::try_from(port) else {
+        return IpeResult::Err(format!("Web.tea: port {port} is not a TCP port").into());
+    };
+    let addr = std::net::SocketAddr::new(host, port);
+    let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             return IpeResult::Err(resolved.addr_in_use_message().into());
@@ -9327,6 +9349,28 @@ mod emitted_router_behavior_tests {
                 "{name}={raw:?} must refuse the router, got {refused:?}"
             );
         }
+    }
+
+    /// A present `IPE_HTTP_BIND` that is not an IP address refuses the app
+    /// before it binds; an IP address is bound as given.
+    #[test]
+    fn a_bind_that_is_not_an_ip_address_refuses_the_app() {
+        for raw in ["localhost", "127.0.0.1:8080", "[::1]", ""] {
+            crate::system::locked_set_var("IPE_HTTP_BIND", raw);
+            let refused = web_bind_host();
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+            assert!(
+                matches!(&refused, Err(StartupRefusal::Bind(r)) if r.name() == "IPE_HTTP_BIND"),
+                "IPE_HTTP_BIND={raw:?} must refuse the app, got {refused:?}"
+            );
+        }
+        crate::system::locked_set_var("IPE_HTTP_BIND", "::1");
+        let bound = web_bind_host();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+        assert!(
+            matches!(bound, Ok(ip) if ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            "a bare IPv6 address is bound as given, got {bound:?}"
+        );
     }
 
     /// The router refuses an `IPE_WEB_FRAME_ANCESTORS` with no

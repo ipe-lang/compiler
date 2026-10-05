@@ -18,11 +18,11 @@
 //!
 //! # Host bind — fail-closed to loopback
 //!
-//! [`resolve_host_bind`] is the security-critical resolution: a development
+//! `resolve_host_bind` is the security-critical resolution: a development
 //! build binds `127.0.0.1` (never exposed on the LAN), a production build binds
-//! all interfaces, and `IPE_HTTP_BIND` overrides either. Absent any signal the
-//! conservative loopback is chosen — the dev console is never reachable off-box
-//! by default.
+//! all interfaces, and `IPE_HTTP_BIND` (an IP address, else startup refuses)
+//! overrides either. Absent any signal the conservative loopback is chosen —
+//! the dev console is never reachable off-box by default.
 
 use std::sync::OnceLock;
 
@@ -83,7 +83,7 @@ pub enum Setting {
     /// `Web.authSlideWindow` — the rolling re-issue window for a signed session
     /// token, in seconds. A token is re-issued once it is past `exp - window/2`,
     /// extending `exp` to `min(now + window, cap)`. Default: 30 m (1 800 s).
-    /// Clamped so `slide_window < max_lifetime`.
+    /// It must be below the max lifetime, else startup refuses.
     WebAuthSlideWindow(i64),
     /// `Web.withRevocation RevocationMode` — controls whether the per-request
     /// revocation gate is consulted. `Off` (default) skips the gate entirely;
@@ -103,7 +103,7 @@ pub enum Setting {
 /// closed set — each variant is one previously-bare env token given a typed
 /// `Secret` carrier. Always available (not `secret`-gated) so the console
 /// runtime can name a `kind` even in a build without the `secret` feature, where
-/// [`resolve_console_token`] simply returns `None`.
+/// `resolve_console_token` simply returns `None`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConsoleTokenKind {
     /// `Console.adminToken` — the admin token: authorizes `/_ipe/console*`
@@ -228,7 +228,7 @@ pub fn ipe_setting_db_url(url: crate::secret::Secret) -> Setting {
 
 /// `Console.adminToken : Secret -> Setting a`. The admin token (console and
 /// metrics), carried as a sealed [`Secret`]. The runtime reads the resolved secret
-/// (via [`resolve_console_token`]) instead of a bare `IPE_ADMIN_TOKEN` env read.
+/// (via `resolve_console_token`) instead of a bare `IPE_ADMIN_TOKEN` env read.
 #[cfg(feature = "secret")]
 #[must_use]
 pub fn ipe_setting_console_admin_token(token: crate::secret::Secret) -> Setting {
@@ -260,24 +260,24 @@ pub fn ipe_setting_web_csrf(mode_tag: i64) -> Setting {
     Setting::WebCsrf(mode_tag)
 }
 
-/// `Web.sessionTtl : Int -> Setting Web`. Carries the session lifetime (seconds).
+/// `Web.sessionTtl : Int -> Setting Web`. Carries the session lifetime
+/// (seconds); a value that is not positive or exceeds 400 days refuses startup.
 #[must_use]
 pub fn ipe_setting_web_session_ttl(seconds: i64) -> Setting {
     Setting::WebSessionTtl(seconds)
 }
 
 /// `Web.authMaxLifetime : Int -> Setting Web`. Carries the absolute hard cap on a
-/// signed session token's age (seconds from original issue). A non-positive value
-/// is dropped fail-closed (the caller's 8 h default applies).
+/// signed session token's age (seconds from original issue). A value that is not
+/// positive or exceeds one year refuses startup.
 #[must_use]
 pub fn ipe_setting_web_auth_max_lifetime(seconds: i64) -> Setting {
     Setting::WebAuthMaxLifetime(seconds)
 }
 
 /// `Web.authSlideWindow : Int -> Setting Web`. Carries the rolling re-issue
-/// window for a signed session token (seconds). A non-positive value is dropped
-/// fail-closed (the 30 m default applies). Clamped to below `max_lifetime` at
-/// resolution time.
+/// window for a signed session token (seconds). A value that is not positive or
+/// not below the max lifetime refuses startup.
 #[must_use]
 pub fn ipe_setting_web_auth_slide_window(seconds: i64) -> Setting {
     Setting::WebAuthSlideWindow(seconds)
@@ -305,6 +305,7 @@ pub fn ipe_setting_web_auth_revocation_mode(mode_tag: i64) -> Setting {
 /// (including an out-of-range one) is `Unspecified` — it leaves the default in
 /// place. There is deliberately no `Disabled` variant, so a setting cannot lower
 /// the posture below the fail-closed default; only an operator env override may.
+#[cfg(all(feature = "web-core", feature = "server"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CsrfSetting {
     /// The setting pins CSRF protection on (the strict, fail-closed posture).
@@ -313,26 +314,44 @@ enum CsrfSetting {
     Unspecified,
 }
 
+#[cfg(all(feature = "web-core", feature = "server"))]
+impl CsrfSetting {
+    /// The posture a `Web.csrf` tag requests: only `0` enforces.
+    const fn from_tag(tag: i64) -> Self {
+        if tag == 0 {
+            Self::Enforced
+        } else {
+            Self::Unspecified
+        }
+    }
+}
+
 /// The resolved, immutable process-wide config, installed once at startup. Each
 /// field is the in-code setting for one subsystem; a resolver reads it only when
 /// no operator env override is present (env always wins, so these never override
-/// a deployment-time decision).
+/// a deployment-time decision). A field exists only in a build that compiles
+/// its reader.
 #[derive(Default)]
 struct ResolvedConfig {
+    #[cfg(feature = "server")]
     host_bind: Option<HostMode>,
     log_level: Option<i64>,
+    #[cfg(all(feature = "web-core", feature = "server"))]
     csrf: Option<CsrfSetting>,
+    #[cfg(all(feature = "web-core", feature = "server"))]
     session_ttl_secs: Option<i64>,
+    #[cfg(feature = "jwt")]
     auth_max_lifetime_secs: Option<i64>,
+    #[cfg(all(feature = "jwt", feature = "server"))]
     auth_slide_window_secs: Option<i64>,
     auth_revocation_mode: Option<RevocationMode>,
-    #[cfg(feature = "secret")]
+    #[cfg(feature = "db")]
     db_url: Option<crate::secret::Secret>,
-    #[cfg(feature = "secret")]
+    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
     console_admin_token: Option<crate::secret::Secret>,
-    #[cfg(feature = "secret")]
+    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
     console_ingest_token: Option<crate::secret::Secret>,
-    #[cfg(feature = "secret")]
+    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
     console_metrics_token: Option<crate::secret::Secret>,
 }
 
@@ -342,26 +361,37 @@ static INSTALLED: OnceLock<ResolvedConfig> = OnceLock::new();
 /// in-code setting into its subsystem slot (env override is applied at read time
 /// by the per-subsystem resolvers, so env always wins); a second install is
 /// ignored (`OnceLock`), keeping the first app's config authoritative for the
-/// process.
+/// process. A setting whose reader this build does not compile is not stored.
 pub fn install_web(settings: Vec<Setting>) {
     let mut cfg = ResolvedConfig::default();
     for s in settings {
         match s {
+            #[cfg(feature = "server")]
             Setting::HostBind(mode) => cfg.host_bind = Some(mode),
+            // No reader in this build.
+            #[cfg(not(feature = "server"))]
+            Setting::HostBind(_) => {}
             Setting::LogLevel(tag) => cfg.log_level = Some(tag),
             // Stricter-only: `0` is the strict/enforced tag; every other value
             // (including a would-be "disabled" tag) leaves the default posture,
             // so an in-code setting can never weaken CSRF below fail-closed.
-            Setting::WebCsrf(tag) => {
-                cfg.csrf = Some(if tag == 0 {
-                    CsrfSetting::Enforced
-                } else {
-                    CsrfSetting::Unspecified
-                });
-            }
+            #[cfg(all(feature = "web-core", feature = "server"))]
+            Setting::WebCsrf(tag) => cfg.csrf = Some(CsrfSetting::from_tag(tag)),
+            #[cfg(all(feature = "web-core", feature = "server"))]
             Setting::WebSessionTtl(seconds) => cfg.session_ttl_secs = Some(seconds),
+            // No reader in this build.
+            #[cfg(not(all(feature = "web-core", feature = "server")))]
+            Setting::WebCsrf(_) | Setting::WebSessionTtl(_) => {}
+            #[cfg(feature = "jwt")]
             Setting::WebAuthMaxLifetime(seconds) => cfg.auth_max_lifetime_secs = Some(seconds),
+            // No reader in this build.
+            #[cfg(not(feature = "jwt"))]
+            Setting::WebAuthMaxLifetime(_) => {}
+            #[cfg(all(feature = "jwt", feature = "server"))]
             Setting::WebAuthSlideWindow(seconds) => cfg.auth_slide_window_secs = Some(seconds),
+            // No reader in this build.
+            #[cfg(not(all(feature = "jwt", feature = "server")))]
+            Setting::WebAuthSlideWindow(_) => {}
             // Stricter-only: `Store` arms the gate; `Off` only applies when no
             // prior `Store` setting was seen (take the maximum/strictest value).
             Setting::WebAuthRevocationMode(mode) => {
@@ -370,48 +400,86 @@ pub fn install_web(settings: Vec<Setting>) {
                     _ => mode,
                 });
             }
-            #[cfg(feature = "secret")]
+            #[cfg(feature = "db")]
             Setting::DbUrl(url) => cfg.db_url = Some(url),
-            #[cfg(feature = "secret")]
+            // No reader in this build.
+            #[cfg(all(feature = "secret", not(feature = "db")))]
+            Setting::DbUrl(_) => {}
+            #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
             Setting::ConsoleToken(kind, token) => match kind {
                 ConsoleTokenKind::Admin => cfg.console_admin_token = Some(token),
                 ConsoleTokenKind::Ingest => cfg.console_ingest_token = Some(token),
                 ConsoleTokenKind::Metrics => cfg.console_metrics_token = Some(token),
             },
+            // No reader in this build.
+            #[cfg(all(feature = "secret", not(all(feature = "web-core", feature = "server"))))]
+            Setting::ConsoleToken(..) => {}
         }
     }
     // First install wins; a redundant install is a no-op (never a panic).
     let _ = INSTALLED.set(cfg);
 }
 
-/// Resolve the host-bind address string, applying the one precedence:
-/// `IPE_HTTP_BIND` (env) > the installed `Host.bind` setting > the default
-/// fallback. The default is loopback unless production is explicitly declared
-/// (`ENV`/`IPE_ENV`), so a server is never reachable off-box by accident; an
-/// `EnvDriven` in-code setting defers to that same fallback. Binding all
-/// interfaces requires either an explicit `Host.bind AllInterfaces` setting, an
-/// explicit `IPE_HTTP_BIND`, or a declared-production posture.
-#[must_use]
-pub fn resolve_host_bind() -> String {
-    // Env override wins unconditionally (a non-blank value).
-    if let Ok(raw) = crate::system::read_env_var("IPE_HTTP_BIND") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
+/// The variable that overrides the bind host.
+#[cfg(feature = "server")]
+const HTTP_BIND_VAR: &str = "IPE_HTTP_BIND";
+
+/// What an `IPE_HTTP_BIND` value must be.
+#[cfg(feature = "server")]
+const HTTP_BIND_EXPECTED: &str = "an IP address (IPv4 such as 127.0.0.1, or bare IPv6 such as ::1)";
+
+/// Resolve the bind host, applying the one precedence: `IPE_HTTP_BIND` (env) >
+/// the installed `Host.bind` setting > the default fallback. The default is
+/// loopback unless production is explicitly declared (`ENV`/`IPE_ENV`), so a
+/// server is never reachable off-box by accident; an `EnvDriven` in-code
+/// setting defers to that same fallback. Binding all interfaces requires either
+/// an explicit `Host.bind AllInterfaces` setting, an explicit `IPE_HTTP_BIND`,
+/// or a declared-production posture.
+///
+/// # Errors
+///
+/// A refusal naming `IPE_HTTP_BIND` when it is present but not exactly an IP
+/// address: a hostname (`localhost` included), a socket form, brackets, a scope
+/// id, padding, or an empty value.
+#[cfg(feature = "server")]
+pub(crate) fn resolve_host_bind() -> Result<std::net::IpAddr, crate::system::EnvValueRefusal> {
+    host_bind_from(
+        crate::system::read_env_var(HTTP_BIND_VAR),
+        INSTALLED.get().and_then(|c| c.host_bind),
+        crate::telemetry::posture_is_production(),
+    )
+}
+
+/// Pure host-bind resolution over the raw `IPE_HTTP_BIND` lookup, the installed
+/// mode and the declared posture.
+#[cfg(feature = "server")]
+fn host_bind_from(
+    raw: Result<String, std::env::VarError>,
+    setting: Option<HostMode>,
+    production: bool,
+) -> Result<std::net::IpAddr, crate::system::EnvValueRefusal> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let refuse =
+        |raw: &[u8]| crate::system::EnvValueRefusal::new(HTTP_BIND_VAR, HTTP_BIND_EXPECTED, raw);
+    match raw {
+        Ok(value) => {
+            return value
+                .parse::<IpAddr>()
+                .map_err(|_| refuse(value.as_bytes()));
         }
+        Err(std::env::VarError::NotUnicode(os)) => return Err(refuse(os.as_encoded_bytes())),
+        Err(std::env::VarError::NotPresent) => {}
     }
-    let default_bind = || {
-        if crate::telemetry::posture_is_production() {
-            "0.0.0.0".to_owned()
-        } else {
-            "127.0.0.1".to_owned()
-        }
+    let all_interfaces = match setting {
+        Some(HostMode::Loopback) => false,
+        Some(HostMode::AllInterfaces) => true,
+        Some(HostMode::EnvDriven) | None => production,
     };
-    match INSTALLED.get().and_then(|c| c.host_bind) {
-        Some(HostMode::Loopback) => "127.0.0.1".to_owned(),
-        Some(HostMode::AllInterfaces) => "0.0.0.0".to_owned(),
-        Some(HostMode::EnvDriven) | None => default_bind(),
-    }
+    Ok(IpAddr::V4(if all_interfaces {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::LOCALHOST
+    }))
 }
 
 /// The installed `Log.level` tag, if a setting set one and no `IPE_LOG_LEVEL`
@@ -419,8 +487,9 @@ pub fn resolve_host_bind() -> String {
 /// (env present, or no setting) — the log subsystem owns the env read and the
 /// numeric fallback, so this is only the middle precedence tier. `env >
 /// setting-in-code > fallback`.
-#[must_use]
-pub fn resolve_log_level_override() -> Option<i64> {
+// The vendored emit compiles `log.rs`, its reader, without the `log` feature.
+#[cfg_attr(not(feature = "log"), allow(dead_code))]
+pub(crate) fn resolve_log_level_override() -> Option<i64> {
     // Env wins: when `IPE_LOG_LEVEL` is set (even to empty), the setting is not
     // consulted — the caller reads the env value directly.
     let env_present = crate::system::read_env_var("IPE_LOG_LEVEL").is_ok();
@@ -440,8 +509,8 @@ const fn log_level_from(env_present: bool, setting: Option<i64>) -> Option<i64> 
 /// precedence); a `Web.csrf` setting may only ENFORCE it, never disable it; and
 /// absent both signals the built-in fail-closed default (on) stands. A setting
 /// therefore cannot lower the posture below the default.
-#[must_use]
-pub fn resolve_csrf_enabled(env_enabled: bool, default_enabled: bool) -> bool {
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn resolve_csrf_enabled(env_enabled: bool, default_enabled: bool) -> bool {
     csrf_enabled_from(
         env_enabled,
         default_enabled,
@@ -453,6 +522,7 @@ pub fn resolve_csrf_enabled(env_enabled: bool, default_enabled: bool) -> bool {
 /// only enforce (`CsrfSetting::Enforced`), never disable; absent both the
 /// default stands. Split out so the stricter-only monotonicity is unit tested
 /// without process-wide state.
+#[cfg(all(feature = "web-core", feature = "server"))]
 const fn csrf_enabled_from(
     env_enabled: bool,
     default_enabled: bool,
@@ -468,37 +538,49 @@ const fn csrf_enabled_from(
     default_enabled || enforced_by_setting
 }
 
-/// The installed `Web.sessionTtl` seconds, if a setting set one and no
-/// `IPE_WEB_TTL` env override applies. `None` means keep resolving (env
-/// present, or no setting). A non-positive setting value is ignored
-/// (fail-closed to the caller's default rather than a zero/negative TTL that
-/// would expire every session immediately). `env > setting-in-code > fallback`.
-#[must_use]
-pub fn resolve_session_ttl_override() -> Option<u64> {
-    let env_present = crate::system::read_env_var("IPE_WEB_TTL").is_ok();
+/// The installed `Web.sessionTtl` seconds, checked against `ttl`'s bound, if a
+/// setting set one and no `ttl` env override applies. `None` means keep
+/// resolving (env present, or no setting). `env > setting-in-code > fallback`.
+///
+/// # Errors
+///
+/// A refusal naming `Web.sessionTtl` when the installed value is not positive
+/// or exceeds `ttl`'s bound.
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn resolve_session_ttl_override(
+    ttl: crate::system::EnvDuration,
+) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
+    let env_present = !matches!(ttl.lookup(), Err(std::env::VarError::NotPresent));
     session_ttl_from(
         env_present,
         INSTALLED.get().and_then(|c| c.session_ttl_secs),
+        ttl,
     )
 }
 
 /// Pure session-TTL resolution: the installed setting applies only when no env
-/// override is present, and a non-positive value is dropped (fail-closed to the
-/// caller's default). Split out for unit testing without process-wide state.
-fn session_ttl_from(env_present: bool, setting: Option<i64>) -> Option<u64> {
+/// override is present, and it must lie within `ttl`'s bound. Split out for
+/// unit testing without process-wide state.
+#[cfg(all(feature = "web-core", feature = "server"))]
+fn session_ttl_from(
+    env_present: bool,
+    setting: Option<i64>,
+    ttl: crate::system::EnvDuration,
+) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
     if env_present {
-        return None;
+        return Ok(None);
     }
-    match setting {
-        Some(secs) if secs > 0 => u64::try_from(secs).ok(),
-        _ => None,
-    }
+    setting
+        .map(|secs| ttl.check_setting("Web.sessionTtl", secs))
+        .transpose()
 }
 
 /// The longest an auth lifetime or window may be set to, in seconds (one year).
+#[cfg(feature = "jwt")]
 const AUTH_SECONDS_BOUND: u64 = 365 * 24 * 60 * 60;
 
 /// The absolute-lifetime cap of a signed session token, from `IPE_AUTH_MAX_LIFETIME`.
+#[cfg(feature = "jwt")]
 const AUTH_MAX_LIFETIME_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
     "IPE_AUTH_MAX_LIFETIME",
     8 * 60 * 60,
@@ -508,6 +590,7 @@ const AUTH_MAX_LIFETIME_CEILING: crate::system::EnvCeiling = crate::system::EnvC
 .at_most(AUTH_SECONDS_BOUND);
 
 /// The rolling re-issue window of a signed session token, from `IPE_AUTH_SLIDE_WINDOW`.
+#[cfg(all(feature = "jwt", feature = "server"))]
 const AUTH_SLIDE_WINDOW_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
     "IPE_AUTH_SLIDE_WINDOW",
     30 * 60,
@@ -516,70 +599,81 @@ const AUTH_SLIDE_WINDOW_CEILING: crate::system::EnvCeiling = crate::system::EnvC
 )
 .at_most(AUTH_SECONDS_BOUND);
 
-/// The value `ceiling`'s variable sets, or `None` while the variable is absent.
-fn env_override(
+/// One seconds value under the one precedence: `ceiling`'s variable, else the
+/// installed `setting`, else the default, each checked against the same bound.
+#[cfg(feature = "jwt")]
+fn seconds_from(
     ceiling: crate::system::EnvCeiling,
-) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
-    match ceiling.lookup() {
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        raw => ceiling.parse(raw).map(Some),
+    raw: Result<String, std::env::VarError>,
+    setting_name: &'static str,
+    setting: Option<i64>,
+) -> Result<u64, crate::system::EnvCeilingRefusal> {
+    if !matches!(raw, Err(std::env::VarError::NotPresent)) {
+        return ceiling.parse(raw);
     }
+    setting.map_or_else(
+        || ceiling.check_default(),
+        |secs| ceiling.check_setting(setting_name, secs),
+    )
 }
 
 /// The absolute-lifetime cap for a signed session token, in seconds. Applies the
 /// one precedence: `IPE_AUTH_MAX_LIFETIME` (env) > `Web.authMaxLifetime`
-/// (setting-in-code) > 8 h fallback. A non-positive in-code setting is dropped
-/// fail-closed to the fallback. The fallback of 8 h (28 800 s) bounds the value
-/// of a stolen, still-unrevoked token.
+/// (setting-in-code) > 8 h fallback. The fallback of 8 h (28 800 s) bounds the
+/// value of a stolen, still-unrevoked token.
 ///
 /// This is the single call site for the resolved cap — all callers (sign + verify)
 /// use this so the precedence is never duplicated.
 ///
 /// # Errors
 ///
-/// A refusal naming `IPE_AUTH_MAX_LIFETIME` when it is set to anything but a
-/// positive decimal second count within one year.
-pub fn resolve_auth_max_lifetime() -> Result<u64, crate::system::EnvCeilingRefusal> {
-    let installed = INSTALLED.get().and_then(|c| c.auth_max_lifetime_secs);
-    Ok(env_override(AUTH_MAX_LIFETIME_CEILING)?.unwrap_or_else(|| {
-        positive_setting(installed).unwrap_or_else(|| AUTH_MAX_LIFETIME_CEILING.default_value())
-    }))
-}
-
-/// An installed setting as seconds: a non-positive value is dropped (fail-closed
-/// to the caller's default). Split out for unit testing without process-wide state.
-fn positive_setting(setting: Option<i64>) -> Option<u64> {
-    setting
-        .filter(|secs| *secs > 0)
-        .and_then(|secs| u64::try_from(secs).ok())
+/// A refusal naming `IPE_AUTH_MAX_LIFETIME`, or the `Web.authMaxLifetime`
+/// setting, when the value that applies is not a positive second count within
+/// one year.
+#[cfg(feature = "jwt")]
+pub(crate) fn resolve_auth_max_lifetime() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    seconds_from(
+        AUTH_MAX_LIFETIME_CEILING,
+        AUTH_MAX_LIFETIME_CEILING.lookup(),
+        "Web.authMaxLifetime",
+        INSTALLED.get().and_then(|c| c.auth_max_lifetime_secs),
+    )
 }
 
 /// The rolling re-issue window for a signed session token, in seconds. Applies the
 /// one precedence: `IPE_AUTH_SLIDE_WINDOW` (env) > `Web.authSlideWindow`
-/// (setting-in-code) > 30 m fallback. A non-positive in-code setting is dropped
-/// fail-closed to the fallback. Clamped so `slide_window < max_lifetime`
-/// — a slide window equal to or larger than the max lifetime would allow a
-/// single re-issue to extend a session to its full cap in one step.
+/// (setting-in-code) > 30 m fallback. The window must be strictly below the max
+/// lifetime — one equal to or larger than it would let a single re-issue extend
+/// a session to its full cap in one step — so the bound it is checked against
+/// is the lifetime less one second.
 ///
 /// This is the single call site for the resolved slide window.
 ///
 /// # Errors
 ///
-/// A refusal naming `IPE_AUTH_SLIDE_WINDOW` (or `IPE_AUTH_MAX_LIFETIME`, which
-/// the clamp reads) when it is set to anything but a positive decimal second
-/// count within one year.
-pub fn resolve_auth_slide_window() -> Result<u64, crate::system::EnvCeilingRefusal> {
-    let max_lifetime = resolve_auth_max_lifetime()?;
-    let installed = INSTALLED.get().and_then(|c| c.auth_slide_window_secs);
-    let window = env_override(AUTH_SLIDE_WINDOW_CEILING)?.unwrap_or_else(|| {
-        positive_setting(installed).unwrap_or_else(|| AUTH_SLIDE_WINDOW_CEILING.default_value())
-    });
-    // Clamp: slide_window must be strictly less than max_lifetime.
-    Ok(if window >= max_lifetime {
-        max_lifetime.saturating_sub(1)
-    } else {
-        window
-    })
+/// A refusal naming `IPE_AUTH_SLIDE_WINDOW` or the `Web.authSlideWindow`
+/// setting when the window that applies, the default included, is not a
+/// positive second count below the max lifetime; or the
+/// [`resolve_auth_max_lifetime`] refusal.
+#[cfg(all(feature = "jwt", feature = "server"))]
+pub(crate) fn resolve_auth_slide_window() -> Result<u64, crate::system::EnvCeilingRefusal> {
+    slide_window_from(
+        resolve_auth_max_lifetime()?,
+        AUTH_SLIDE_WINDOW_CEILING.lookup(),
+        INSTALLED.get().and_then(|c| c.auth_slide_window_secs),
+    )
+}
+
+/// Pure slide-window resolution below `max_lifetime`.
+#[cfg(all(feature = "jwt", feature = "server"))]
+fn slide_window_from(
+    max_lifetime: u64,
+    raw: Result<String, std::env::VarError>,
+    setting: Option<i64>,
+) -> Result<u64, crate::system::EnvCeilingRefusal> {
+    let below_lifetime =
+        AUTH_SLIDE_WINDOW_CEILING.at_most(max_lifetime.saturating_sub(1).min(AUTH_SECONDS_BOUND));
+    seconds_from(below_lifetime, raw, "Web.authSlideWindow", setting)
 }
 
 /// The resolved revocation mode, applying the one precedence:
@@ -587,8 +681,14 @@ pub fn resolve_auth_slide_window() -> Result<u64, crate::system::EnvCeilingRefus
 /// fallback. The env var value `"store"` (case-insensitive) arms the gate; any
 /// other non-empty value is ignored and the setting applies. An empty env var
 /// is treated as absent. `Off` is the zero-overhead default.
-#[must_use]
-pub fn resolve_auth_revocation_mode() -> RevocationMode {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unread until the revocation setting is wired or removed"
+    )
+)]
+pub(crate) fn resolve_auth_revocation_mode() -> RevocationMode {
     if let Ok(raw) = crate::system::read_env_var("IPE_AUTH_REVOCATION") {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("store") || trimmed == "1" {
@@ -606,9 +706,7 @@ pub fn resolve_auth_revocation_mode() -> RevocationMode {
 }
 
 /// The per-map entry ceiling for the runtime revocation store. Applies the one
-/// precedence: `IPE_REVOCATION_CAPACITY` (env) > 1,048,576 (2^20) default. A
-/// positive integer value in the env var overrides; a non-positive or
-/// non-parseable value falls back to the default.
+/// precedence: `IPE_REVOCATION_CAPACITY` (env) > 1,048,576 (2^20) default.
 ///
 /// At roughly 64 bytes per entry (id `String` + `i64` expiry + map overhead)
 /// the default cap holds ~64 MB per map, ~128 MB for both — bounded without
@@ -620,6 +718,7 @@ pub const REVOCATION_STORE_CAPACITY: usize = 1 << 20; // 1,048,576
 /// The per-map entry ceiling of the revocation store, from `IPE_REVOCATION_CAPACITY`.
 ///
 /// The bound is 2^24 entries, about 1 GiB per map at the per-entry cost above.
+#[cfg(feature = "jwt")]
 const REVOCATION_CAPACITY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
     "IPE_REVOCATION_CAPACITY",
     REVOCATION_STORE_CAPACITY as u64,
@@ -635,19 +734,21 @@ const REVOCATION_CAPACITY_CEILING: crate::system::EnvCeiling = crate::system::En
 ///
 /// A refusal naming `IPE_REVOCATION_CAPACITY` when it is set to anything but a
 /// positive decimal entry count of at most 2^24.
-pub fn resolve_revocation_capacity() -> Result<usize, crate::system::EnvCeilingRefusal> {
+#[cfg(feature = "jwt")]
+pub(crate) fn resolve_revocation_capacity() -> Result<usize, crate::system::EnvCeilingRefusal> {
     REVOCATION_CAPACITY_CEILING.read()
 }
 
 /// Resolves every auth ceiling once, so a malformed one refuses the app at
 /// startup (`Server.listen`, `Web.tea`) rather than a later request. The
-/// slide window reads the max lifetime its clamp needs.
+/// slide window reads the max lifetime it must stay below.
 ///
 /// # Errors
 ///
 /// The first refusal among `IPE_AUTH_MAX_LIFETIME`, `IPE_AUTH_SLIDE_WINDOW`
-/// and `IPE_REVOCATION_CAPACITY`.
-pub fn auth_ceilings() -> Result<(), crate::system::EnvCeilingRefusal> {
+/// and `IPE_REVOCATION_CAPACITY`, or their in-code settings.
+#[cfg(all(feature = "jwt", feature = "server"))]
+pub(crate) fn auth_ceilings() -> Result<(), crate::system::EnvCeilingRefusal> {
     resolve_auth_slide_window()?;
     resolve_revocation_capacity()?;
     Ok(())
@@ -658,9 +759,8 @@ pub fn auth_ceilings() -> Result<(), crate::system::EnvCeilingRefusal> {
 /// at the point of use, and returned to the caller that configures the pool; it
 /// is never logged. `None` means keep resolving (env present, or no setting).
 /// `env > setting-in-code > fallback`.
-#[cfg(feature = "secret")]
-#[must_use]
-pub fn resolve_db_url_override() -> Option<String> {
+#[cfg(feature = "db")]
+pub(crate) fn resolve_db_url_override() -> Option<String> {
     if crate::system::read_env_var("DATABASE_URL").is_ok() {
         return None;
     }
@@ -676,12 +776,8 @@ pub fn resolve_db_url_override() -> Option<String> {
 /// its env var FIRST (env wins) and only consulting this in-code setting when the
 /// env var is absent. The secret is revealed only here, at the auth check, and is
 /// never logged (a `Secret` cannot be stringified to anything but `<redacted>`).
-///
-/// This replaces the previously-bare env-string token reads with a typed
-/// `Secret` carrier: a token configured in code is sealed and never appears as a
-/// plaintext `String` a log line could splice in.
-#[must_use]
-pub fn resolve_console_token(kind: ConsoleTokenKind) -> Option<String> {
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn resolve_console_token(kind: ConsoleTokenKind) -> Option<String> {
     // The token settings carry a `Secret`, so they only exist in a `secret`-
     // feature build; without it there is no in-code token to resolve and the
     // caller falls back to its env source.
@@ -751,19 +847,91 @@ mod tests {
         assert_eq!(log_level_from(false, None), None);
     }
 
+    // ── Host bind: an IP address or a startup refusal ─────────────────────
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_bind_that_is_not_exactly_an_ip_address_is_refused() {
+        for refused in [
+            "not-an-address",
+            "localhost",
+            "127.0.0.1:8080",
+            "[::1]",
+            "[::1]:8080",
+            "fe80::1%eth0",
+            " 127.0.0.1",
+            "127.0.0.1 ",
+            "",
+            " ",
+        ] {
+            let outcome = host_bind_from(Ok(refused.to_owned()), None, false);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == HTTP_BIND_VAR
+                    && r.to_string().contains("must be an IP address")),
+                "{refused:?} must be refused naming {HTTP_BIND_VAR}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_bind_ip_address_wins_over_the_setting_and_the_posture() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let bind =
+            |raw: &str| host_bind_from(Ok(raw.to_owned()), Some(HostMode::AllInterfaces), true);
+        assert_eq!(bind("127.0.0.1"), Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(bind("::1"), Ok(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(bind("::"), Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn an_unset_bind_follows_the_setting_then_the_posture() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let unset = || Err(std::env::VarError::NotPresent);
+        let loopback = Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let all = Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(host_bind_from(unset(), None, false), loopback);
+        assert_eq!(host_bind_from(unset(), None, true), all);
+        assert_eq!(
+            host_bind_from(unset(), Some(HostMode::Loopback), true),
+            loopback
+        );
+        assert_eq!(
+            host_bind_from(unset(), Some(HostMode::AllInterfaces), false),
+            all
+        );
+        assert_eq!(
+            host_bind_from(unset(), Some(HostMode::EnvDriven), false),
+            loopback
+        );
+    }
+
+    #[cfg(all(feature = "server", unix))]
+    #[test]
+    fn a_non_unicode_bind_is_refused() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = std::ffi::OsString::from_vec(b"127.0.0.\xFF".to_vec());
+        let outcome = host_bind_from(Err(std::env::VarError::NotUnicode(raw)), None, false);
+        assert!(outcome.is_err_and(|r| r.to_string().contains("\\xFF")));
+    }
+
     // ── CSRF: stricter-only, env may disable, setting may only enforce ────
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn csrf_default_on_stands_without_signals() {
         assert!(csrf_enabled_from(true, true, None));
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn csrf_enforcing_setting_turns_on_where_default_off() {
         // A setting can STRENGTHEN: default-off but the setting enforces → on.
         assert!(csrf_enabled_from(true, false, Some(CsrfSetting::Enforced)));
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn csrf_setting_cannot_disable_below_default() {
         // The stricter-only floor: no setting value (including the absence of an
@@ -776,6 +944,7 @@ mod tests {
         assert!(csrf_enabled_from(true, true, None));
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn csrf_only_operator_env_can_disable() {
         // The env override (top of precedence) is the sole disable path; an
@@ -784,59 +953,130 @@ mod tests {
         assert!(!csrf_enabled_from(false, false, None));
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn csrf_install_maps_only_zero_tag_to_enforced() {
         // The `install_web` fold: `0` → Enforced, everything else → Unspecified
         // (a "disabled" tag can never reach an Enforced/weaker-than-default state).
         for (tag, expect_enforced) in [(0i64, true), (1, false), (99, false), (-1, false)] {
-            let enforced = if tag == 0 {
-                CsrfSetting::Enforced
-            } else {
-                CsrfSetting::Unspecified
-            };
             assert_eq!(
-                matches!(enforced, CsrfSetting::Enforced),
+                matches!(CsrfSetting::from_tag(tag), CsrfSetting::Enforced),
                 expect_enforced,
                 "csrf tag {tag} enforced-mapping"
             );
         }
     }
 
-    // ── Session TTL: env > setting > fallback, non-positive dropped ───────
+    // ── Session TTL: env > setting > fallback, out of range refused ───────
 
+    /// The session TTL bound `web_ttl` applies: 400 days.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    const SESSION_TTL: crate::system::EnvDuration =
+        crate::system::EnvDuration::new("IPE_WEB_TTL", 1800, "duration")
+            .at_most(400 * 24 * 60 * 60);
+
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn session_ttl_setting_applies_when_no_env() {
-        assert_eq!(session_ttl_from(false, Some(3600)), Some(3600));
+        assert_eq!(
+            session_ttl_from(false, Some(3600), SESSION_TTL),
+            Ok(Some(3600))
+        );
+        assert_eq!(
+            session_ttl_from(false, Some(400 * 24 * 60 * 60), SESSION_TTL),
+            Ok(Some(400 * 24 * 60 * 60))
+        );
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn session_ttl_env_overrides_setting() {
-        assert_eq!(session_ttl_from(true, Some(3600)), None);
+        assert_eq!(session_ttl_from(true, Some(3600), SESSION_TTL), Ok(None));
+        assert_eq!(session_ttl_from(true, Some(0), SESSION_TTL), Ok(None));
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
-    fn session_ttl_non_positive_falls_closed_to_default() {
-        // A zero/negative TTL would expire every session immediately — drop it so
-        // the caller's safe default applies instead.
-        assert_eq!(session_ttl_from(false, Some(0)), None);
-        assert_eq!(session_ttl_from(false, Some(-5)), None);
+    fn session_ttl_out_of_range_setting_is_refused_never_defaulted() {
+        use crate::system::CeilingDefect;
+        for (secs, defect) in [
+            (0, CeilingDefect::Zero),
+            (-5, CeilingDefect::Zero),
+            (400 * 24 * 60 * 60 + 1, CeilingDefect::TooLarge),
+        ] {
+            let outcome = session_ttl_from(false, Some(secs), SESSION_TTL);
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|r| r.setting() == Some("Web.sessionTtl") && r.defect() == defect),
+                "a sessionTtl of {secs} must be refused as {defect:?}, got {outcome:?}"
+            );
+        }
     }
 
+    #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn session_ttl_absent_setting_falls_through() {
-        assert_eq!(session_ttl_from(false, None), None);
+        assert_eq!(session_ttl_from(false, None, SESSION_TTL), Ok(None));
     }
 
     // ── Auth lifetimes and revocation capacity: env > setting > default ─────
 
+    #[cfg(feature = "jwt")]
     #[test]
-    fn a_non_positive_setting_is_dropped() {
-        assert_eq!(positive_setting(Some(3600)), Some(3600));
-        assert_eq!(positive_setting(Some(0)), None);
-        assert_eq!(positive_setting(Some(-1)), None);
-        assert_eq!(positive_setting(None), None);
+    fn an_out_of_range_lifetime_setting_is_refused_never_defaulted() {
+        use crate::system::CeilingDefect;
+        let unset = || Err(std::env::VarError::NotPresent);
+        let lifetime = |secs| {
+            seconds_from(
+                AUTH_MAX_LIFETIME_CEILING,
+                unset(),
+                "Web.authMaxLifetime",
+                Some(secs),
+            )
+        };
+        for (secs, defect) in [
+            (0, CeilingDefect::Zero),
+            (-5, CeilingDefect::Zero),
+            (-1, CeilingDefect::Zero),
+            (31_536_001, CeilingDefect::TooLarge),
+        ] {
+            let outcome = lifetime(secs);
+            assert!(
+                outcome.as_ref().is_err_and(
+                    |r| r.setting() == Some("Web.authMaxLifetime") && r.defect() == defect
+                ),
+                "an authMaxLifetime of {secs} must be refused as {defect:?}, got {outcome:?}"
+            );
+        }
+        assert_eq!(lifetime(31_536_000), Ok(31_536_000));
+        assert_eq!(lifetime(3600), Ok(3600));
+        assert_eq!(
+            seconds_from(
+                AUTH_MAX_LIFETIME_CEILING,
+                unset(),
+                "Web.authMaxLifetime",
+                None
+            ),
+            Ok(8 * 60 * 60)
+        );
     }
 
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn an_env_lifetime_wins_over_a_refused_setting() {
+        assert_eq!(
+            seconds_from(
+                AUTH_MAX_LIFETIME_CEILING,
+                Ok("7200".to_owned()),
+                "Web.authMaxLifetime",
+                Some(0)
+            ),
+            Ok(7200)
+        );
+    }
+
+    #[cfg(all(feature = "jwt", feature = "server"))]
     #[test]
     fn the_auth_and_revocation_ceilings_honour_the_env_contract() {
         for ceiling in [
@@ -849,6 +1089,7 @@ mod tests {
     }
 
     /// `resolve` under `name` set to `raw`, the variable removed afterwards.
+    #[cfg(feature = "jwt")]
     fn resolve_with<T>(
         name: &str,
         raw: &str,
@@ -860,6 +1101,7 @@ mod tests {
         resolved
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
     fn a_malformed_auth_max_lifetime_is_refused_never_defaulted() {
         let name = "IPE_AUTH_MAX_LIFETIME";
@@ -881,6 +1123,7 @@ mod tests {
         assert_eq!(resolve_auth_max_lifetime(), Ok(8 * 60 * 60));
     }
 
+    #[cfg(all(feature = "jwt", feature = "server"))]
     #[test]
     fn a_malformed_auth_slide_window_is_refused_never_defaulted() {
         let name = "IPE_AUTH_SLIDE_WINDOW";
@@ -898,20 +1141,65 @@ mod tests {
         assert_eq!(resolve_auth_slide_window(), Ok(30 * 60));
     }
 
+    #[cfg(all(feature = "jwt", feature = "server"))]
     #[test]
-    fn the_slide_window_clamp_and_its_lifetime_refusal_hold() {
-        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "1800");
-        let clamped = resolve_with("IPE_AUTH_SLIDE_WINDOW", "3600", resolve_auth_slide_window);
-        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "8h");
-        let refused = resolve_auth_slide_window();
-        crate::system::locked_remove_var("IPE_AUTH_MAX_LIFETIME");
-        assert_eq!(clamped, Ok(1799));
+    fn a_slide_window_not_below_the_lifetime_is_refused_never_clamped() {
+        use crate::system::CeilingDefect;
+        let unset = || Err(std::env::VarError::NotPresent);
+        for window in ["1800", "3600"] {
+            let outcome = slide_window_from(1800, Ok(window.to_owned()), None);
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|r| r.name() == "IPE_AUTH_SLIDE_WINDOW"
+                        && r.setting().is_none()
+                        && r.defect() == CeilingDefect::TooLarge),
+                "an env window of {window} under a 1800 s lifetime must be refused, got {outcome:?}"
+            );
+        }
+        for window in [1800, 3600] {
+            let outcome = slide_window_from(1800, unset(), Some(window));
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|r| r.setting() == Some("Web.authSlideWindow")
+                        && r.defect() == CeilingDefect::TooLarge),
+                "a window setting of {window} under a 1800 s lifetime must be refused, got {outcome:?}"
+            );
+        }
+        let default_over = slide_window_from(1800, unset(), None);
         assert!(
-            refused.is_err_and(|r| r.name() == "IPE_AUTH_MAX_LIFETIME"),
-            "the clamp reads the lifetime, so its refusal reaches the window"
+            default_over
+                .as_ref()
+                .is_err_and(|r| r.name() == "IPE_AUTH_SLIDE_WINDOW"
+                    && r.to_string().contains("at most 1799")),
+            "the 1800 s default under a 1800 s lifetime must be refused, got {default_over:?}"
+        );
+        assert_eq!(
+            slide_window_from(1800, Ok("1799".to_owned()), None),
+            Ok(1799)
+        );
+        assert_eq!(slide_window_from(1800, unset(), Some(1799)), Ok(1799));
+        assert_eq!(slide_window_from(1801, unset(), None), Ok(1800));
+        assert!(
+            slide_window_from(1, unset(), Some(1)).is_err(),
+            "a one-second lifetime leaves no window"
         );
     }
 
+    #[cfg(all(feature = "jwt", feature = "server"))]
+    #[test]
+    fn the_slide_window_reaches_the_lifetime_refusal() {
+        crate::system::locked_set_var("IPE_AUTH_MAX_LIFETIME", "8h");
+        let refused = resolve_auth_slide_window();
+        crate::system::locked_remove_var("IPE_AUTH_MAX_LIFETIME");
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_AUTH_MAX_LIFETIME"),
+            "the window reads the lifetime, so its refusal reaches the window"
+        );
+    }
+
+    #[cfg(feature = "jwt")]
     #[test]
     fn a_malformed_revocation_capacity_is_refused_never_defaulted() {
         let name = "IPE_REVOCATION_CAPACITY";
@@ -927,6 +1215,18 @@ mod tests {
             Ok(1 << 24)
         );
         assert_eq!(resolve_revocation_capacity(), Ok(REVOCATION_STORE_CAPACITY));
+    }
+
+    #[test]
+    fn the_revocation_env_value_arms_or_disarms_the_gate() {
+        let name = "IPE_AUTH_REVOCATION";
+        crate::system::locked_set_var(name, "store");
+        let armed = resolve_auth_revocation_mode();
+        crate::system::locked_set_var(name, "off");
+        let disarmed = resolve_auth_revocation_mode();
+        crate::system::locked_remove_var(name);
+        assert_eq!(armed, RevocationMode::Store);
+        assert_eq!(disarmed, RevocationMode::Off);
     }
 
     // ── RevocationMode setting constructor ──────────────────────────────────

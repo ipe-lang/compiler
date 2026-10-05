@@ -1887,7 +1887,7 @@ mod tests {
         if !cfg!(feature = "dev-posture") {
             crate::system::locked_set_var("ENV", "dev");
             crate::system::locked_remove_var("IPE_HTTP_DENY_PRIVATE");
-            crate::telemetry::record_bind("127.0.0.1");
+            crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
             assert!(ssrf_deny_private_enabled());
             assert_eq!(DialPolicy::from_env(), DialPolicy::DenyPrivate);
             crate::system::locked_remove_var("ENV");
