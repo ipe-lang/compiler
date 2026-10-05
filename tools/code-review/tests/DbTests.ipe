@@ -170,24 +170,26 @@ reviewLogAppendOnly db =
         attested <- attestedFor "ipe-review-append-only-index" "u-a"
         LibDb.insertDecision db attested Approved
         head <- reviewHeadOf db
-        deleteRefused <- refused "DELETE FROM review"
-        updateRefused <- refused "UPDATE review SET decision = 'approve', reason = NULL"
-        rekeyRefused <- refused "UPDATE review SET body_hash = 'other'"
-        headDeleteRefused <- refused "DELETE FROM review_head"
-        orReplaceRan <- rewrite "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
-        replaceRan <- rewrite "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
-        upsertRan <- rewrite "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
+        refusals <- Task.sequence
+            (List.map refused
+                [ "DELETE FROM review"
+                , "UPDATE review SET decision = 'approve', reason = NULL"
+                , "UPDATE review SET body_hash = 'other'"
+                , "DELETE FROM review_head"
+                ]
+            )
+        rewrites <- Task.sequence
+            (List.map rewrite
+                [ "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+                , "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+                , "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
+                ]
+            )
         n <- countReviewRows db "u-a" (Index.attest viewA)
         kept <- LibDb.findDecision db "u-a" (Index.attest viewA)
         headAfter <- reviewHeadOf db
         Task.succeed
-            (deleteRefused
-                && updateRefused
-                && rekeyRefused
-                && headDeleteRefused
-                && orReplaceRan
-                && replaceRan
-                && upsertRan
+            (List.all (\ok -> ok) (refusals ++ rewrites)
                 && n
                 == 1
                 && isApproved kept

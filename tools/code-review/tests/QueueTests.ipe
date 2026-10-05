@@ -1387,29 +1387,44 @@ genesisStampMismatchReopens =
         firstHead <- reviewHeadOf db
         decided <- loadPageNow Index.Start
         firstStamp <- stampOf at.indexDb
-        other <- Task.succeed (String.replace "review.db" "review-other.db" at.reviewDb)
-        removeFileIfAny other
-        fresh <- migratedReviewAt other
-        insertReviewRow fresh "u-elsewhere" "h-elsewhere"
-        otherHead <- reviewHeadOf fresh
-        System.setenv "IPE_REVIEW_DB" other
+        second <- secondLogAt (String.replace "review.db" "review-other.db" at.reviewDb)
+        System.setenv "IPE_REVIEW_DB" second.path
         reopened <- loadPageNow Index.Start
         otherStamp <- stampOf at.indexDb
         System.setenv "IPE_REVIEW_DB" at.reviewDb
         cleanupProgressScratch at
-        removeFileIfAny other
-        removeFileIfAny (other ++ "-wal")
-        removeFileIfAny (other ++ "-shm")
+        removeDbFiles second.path
         Task.succeed
             (String.startsWith "genesis:" firstHead
-                && String.startsWith "genesis:" otherHead
+                && String.startsWith "genesis:" second.head
                 && firstStamp
                 == Just firstHead
                 && otherStamp
-                == Just otherHead
+                == Just second.head
                 && not (List.any (\q -> q.unit.uid == "u-a") decided.units)
                 && List.any (\q -> q.unit.uid == "u-a") reopened.units
             )
+
+
+-- A second review database at `path`: migrated afresh, holding one row of
+-- its own, with the head that row left it at.
+secondLogAt : String -> Task.Task Error { path : String, head : String }
+secondLogAt path =
+    do
+        removeFileIfAny path
+        fresh <- migratedReviewAt path
+        insertReviewRow fresh "u-elsewhere" "h-elsewhere"
+        head <- reviewHeadOf fresh
+        Task.succeed { path = path, head = head }
+
+
+-- Removes a database file and its write-ahead and shared-memory companions.
+removeDbFiles : String -> Task.Task Error ()
+removeDbFiles path =
+    [ path, path ++ "-wal", path ++ "-shm" ]
+        |> List.map removeFileIfAny
+        |> Task.sequence
+        |> Task.map (\_ -> ())
 
 
 -- Deciding and draining one pair twice keeps one copy row and counts it
@@ -1819,49 +1834,53 @@ pageCountEqualsRowsAcrossPagesIn base =
 
 checks : Task.Task Error (List ( String, Bool ))
 checks =
-    Task.sequence
-        [ check "decided unit drained from queue" drainFlow
-        , check "a drain writes nothing to the review database" drainWritesNothingToReview
-        , check "a refill drains only pairs read from the review table" refillDrainsOnlyReviewPairs
-        , check "re-queued change survives the drain" drainKeepsRequeuedChange
-        , check "unit page states are distinct" unitPageStatesDistinct
-        , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
-        , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen
-        , check "db size positive, missing index db fails the queue" dbSizeAndMissingDb
-        , check "an edited decided unit re-opens at the head with its previous review" editedUnitReopens
-        , check "a unit reverted to its decided body stays decided" revertedUnitStaysDecided
-        , check "a shown unit is decided under its attested hash" decideRecordsShownHash
-        , check "a decision after the file drifted is refused" approveRefusedAfterDrift
-        , check "a decision after a re-index is refused" approveRefusedAfterReindex
-        , check "a decision on a unit gone from the index is refused" approveRefusedAfterUnitDeleted
-        , check "a stale unit cannot be refused either" staleRefuseAlsoRefused
-        , check "only the selected unit's shown view is decidable" onlySelectedShownDecidable
-        , Task.succeed ( "a selection during a source read starts no second read", selectionsDuringReadCoalesce )
-        , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped )
-        , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles )
-        , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
-        , check "open units match whole decided pairs" openUnitsMatchWholePairs
-        , check "progress total holds while the queue drains" progressStableAcrossDrain
-        , check "a page load reads the startup settings, not the environment" pageReadsStartupSettings
-        , check "a re-hashed unit leaves reviewed and stays counted" rehashedUnitLeavesReviewed
-        , check "a removed unit leaves progress and returns when re-added" removedUnitReturnsReviewed
-        , check "an undrained decision moves the head and is counted on load" undrainedDecisionCountedOnLoad
-        , check "a copy with the log's pair count but other pairs is rebuilt" sameCountDifferentPairsResyncs
-        , check "a drain whose stamp moved elsewhere drops the stamp" drainCasMismatchDropsStamp
-        , check "a replaced review database re-opens every drained unit" replacedReviewDbReopensDrained
-        , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis
-        , check "a copy stamped at another log's genesis is rebuilt and re-opens its units" genesisStampMismatchReopens
-        , check "a pair decided and drained twice counts once" secondDecisionOfPairCountsOnce
-        , check "a failed drain keeps the queue row" drainIsAtomic
-        , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling
-        , check "a rebuild refused at its ceiling leaves the stamp" resyncCeilingLeavesStamp
-        , check "page rows, count and progress come from one read" pageCountProgressOneSnapshot
-        , check "every page walked lists each open unit once, as many as the count" pageCountEqualsRowsAcrossPages
-        , check "a progress rebuild at the deepest allowed page count copies, one past it is refused" resyncAtDeepestCeiling
-        , check "a progress rebuild refuses a bound below one pair or one page" resyncRefusesEmptyBound
-        , check "progress counts a refusal whose reason no longer parses" progressIgnoresUndecodableReason
-        , check "a progress rebuild succeeds over 6,000 one-pair pages" resyncSucceedsAtSixThousandPages
-        , check "a progress rebuild refuses one pair past a 6,000-page ceiling" resyncRefusesSixThousandAndOnePages
-        , check "a progress rebuild succeeds at exactly ceiling times page size" resyncSucceedsAtExactCeilingTimesPageSize
-        , check "a progress rebuild refuses a page ceiling that wraps past Int.max" resyncRefusesMaxIntCeiling
-        ]
+    do
+        first <- Task.sequence
+            [ check "decided unit drained from queue" drainFlow
+            , check "a drain writes nothing to the review database" drainWritesNothingToReview
+            , check "a refill drains only pairs read from the review table" refillDrainsOnlyReviewPairs
+            , check "re-queued change survives the drain" drainKeepsRequeuedChange
+            , check "unit page states are distinct" unitPageStatesDistinct
+            , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
+            , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen
+            , check "db size positive, missing index db fails the queue" dbSizeAndMissingDb
+            , check "an edited decided unit re-opens at the head with its previous review" editedUnitReopens
+            , check "a unit reverted to its decided body stays decided" revertedUnitStaysDecided
+            , check "a shown unit is decided under its attested hash" decideRecordsShownHash
+            , check "a decision after the file drifted is refused" approveRefusedAfterDrift
+            , check "a decision after a re-index is refused" approveRefusedAfterReindex
+            , check "a decision on a unit gone from the index is refused" approveRefusedAfterUnitDeleted
+            , check "a stale unit cannot be refused either" staleRefuseAlsoRefused
+            , check "only the selected unit's shown view is decidable" onlySelectedShownDecidable
+            , Task.succeed ( "a selection during a source read starts no second read", selectionsDuringReadCoalesce )
+            , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped )
+            , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles )
+            , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
+            ]
+        rest <- Task.sequence
+            [ check "open units match whole decided pairs" openUnitsMatchWholePairs
+            , check "progress total holds while the queue drains" progressStableAcrossDrain
+            , check "a page load reads the startup settings, not the environment" pageReadsStartupSettings
+            , check "a re-hashed unit leaves reviewed and stays counted" rehashedUnitLeavesReviewed
+            , check "a removed unit leaves progress and returns when re-added" removedUnitReturnsReviewed
+            , check "an undrained decision moves the head and is counted on load" undrainedDecisionCountedOnLoad
+            , check "a copy with the log's pair count but other pairs is rebuilt" sameCountDifferentPairsResyncs
+            , check "a drain whose stamp moved elsewhere drops the stamp" drainCasMismatchDropsStamp
+            , check "a replaced review database re-opens every drained unit" replacedReviewDbReopensDrained
+            , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis
+            , check "a copy stamped at another log's genesis is rebuilt and re-opens its units" genesisStampMismatchReopens
+            , check "a pair decided and drained twice counts once" secondDecisionOfPairCountsOnce
+            , check "a failed drain keeps the queue row" drainIsAtomic
+            , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling
+            , check "a rebuild refused at its ceiling leaves the stamp" resyncCeilingLeavesStamp
+            , check "page rows, count and progress come from one read" pageCountProgressOneSnapshot
+            , check "every page walked lists each open unit once, as many as the count" pageCountEqualsRowsAcrossPages
+            , check "a progress rebuild at the deepest allowed page count copies, one past it is refused" resyncAtDeepestCeiling
+            , check "a progress rebuild refuses a bound below one pair or one page" resyncRefusesEmptyBound
+            , check "progress counts a refusal whose reason no longer parses" progressIgnoresUndecodableReason
+            , check "a progress rebuild succeeds over 6,000 one-pair pages" resyncSucceedsAtSixThousandPages
+            , check "a progress rebuild refuses one pair past a 6,000-page ceiling" resyncRefusesSixThousandAndOnePages
+            , check "a progress rebuild succeeds at exactly ceiling times page size" resyncSucceedsAtExactCeilingTimesPageSize
+            , check "a progress rebuild refuses a page ceiling that wraps past Int.max" resyncRefusesMaxIntCeiling
+            ]
+        Task.succeed (first ++ rest)
