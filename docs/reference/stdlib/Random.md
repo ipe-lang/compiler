@@ -4,8 +4,7 @@
 
 [Back to stdlib index](../stdlib.md)
 
-Ipe.Random — entropy-driven and seeded random helpers (compiled-source
-Layer-3).
+Ipe.Random — entropy-driven and seeded random helpers.
 
 Two tiers:
 

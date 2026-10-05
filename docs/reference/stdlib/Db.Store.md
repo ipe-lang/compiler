@@ -21,8 +21,9 @@ construction. A caller who wants raw SQL, or a non-codec dynamic table, reaches
 for the capability-gated `Ipe.Db.Store.Unsafe`.
 
 The mental model, the secured row-security grammar, and a runnable end-to-end
-example live in the Store guide; the composable owner/tenant/RBAC/sharing
-policy algebra lives in its sibling composition guide. This doc-comment is the
+example live in the Store guide (`ipe doc guide:db-store`); the composable
+owner/tenant/RBAC/sharing policy algebra lives in its sibling composition guide
+(`ipe doc guide:db-store-rls-composition`). This doc-comment is the
 per-symbol reference — see the guides for the narrative and the worked example.
 
 ## `Draft`
