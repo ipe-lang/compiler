@@ -25,12 +25,12 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod name;
 pub mod win32_name;
 
-pub use name::EntryName;
+pub use name::{EntryName, is_one_spelled_name};
 
 #[cfg(unix)]
 mod unix;
@@ -122,6 +122,28 @@ impl fmt::Display for FileKind {
             Self::Other => "a special file",
         })
     }
+}
+
+/// What a directory listing says an entry is, taken from the listing itself without a stat.
+///
+/// A hint describes the entry as it was listed and proves nothing. Act only
+/// through [`HeldDir::child_dir`] and [`HeldDir::open_regular`], which re-prove
+/// the entry handle-relative without following a link.
+///
+/// [`HintedKind::Unknown`] is the listing declining to say; the one way to
+/// settle it is [`HeldDir::kind_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HintedKind {
+    /// A directory.
+    Dir,
+    /// A regular file.
+    Regular,
+    /// A symbolic link (on Windows, any reparse point).
+    Link,
+    /// A FIFO, socket, or device.
+    Other,
+    /// The listing did not carry a type.
+    Unknown,
 }
 
 /// Why an entry was not opened or read.
@@ -291,29 +313,69 @@ impl HeldDir {
         self.dir.kind_of(name)
     }
 
-    /// Every entry of this directory and its kind, `.` and `..` excluded.
-    ///
-    /// An entry that vanishes between the listing and its classification is
-    /// left out.
+    /// The target the link `name` stores, read relative to this handle; never followed.
     ///
     /// # Errors
-    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Link`] when
+    /// [`OpenRefusal::Absent`]; [`OpenRefusal::NotRegular`] for an entry that
+    /// is not a link; another refusal on another failure.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        self.dir.read_link(name)
+    }
+
+    /// Every entry of this directory and its kind, `.` and `..` excluded.
+    ///
+    /// The whole listing is taken by [`HeldDir::entries_hinted`] first, so a
+    /// directory past `cap` is refused before any entry is stat'ed. An entry
+    /// that vanishes between the listing and its classification is left out.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Absent`]
+    /// when the held directory was removed; [`OpenRefusal::Link`] when
     /// the held directory turned into a reparse point (Windows);
     /// [`OpenRefusal::BadName`] for a listed name no handle-relative open can
     /// take; another refusal on another failure.
     pub fn entries(&self, cap: EntryCap) -> Result<Vec<(EntryName, FileKind)>, OpenRefusal> {
         let mut found = Vec::new();
-        let mut seen: u32 = 0;
-        for name in self.dir.names()? {
-            let name = name?;
-            seen = seen.saturating_add(1);
-            if seen > cap.get() {
-                return Err(OpenRefusal::TooManyEntries(cap));
-            }
+        for (name, _) in self.entries_hinted(cap)? {
             if let Some(kind) = self.dir.kind_of(&name)? {
                 found.push((name, kind));
             }
         }
+        Ok(found)
+    }
+
+    /// Every entry of this directory and its listing type hint, `.` and `..` excluded.
+    ///
+    /// Never stats and never opens a child: the kind is read from the
+    /// directory entry itself (`d_type` on Unix, the find data on Windows).
+    /// The cap is charged as each entry is listed, so a directory holding more
+    /// than `cap` entries is refused before any entry is acted on. A removed
+    /// directory lists as empty, so the held handle is proven still linked
+    /// after the listing.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::TooManyEntries`] past `cap`; [`OpenRefusal::Absent`]
+    /// when the held directory was removed; [`OpenRefusal::Link`] when
+    /// the held directory turned into a reparse point (Windows);
+    /// [`OpenRefusal::BadName`] for a listed name no handle-relative open can
+    /// take; another refusal on another failure.
+    pub fn entries_hinted(
+        &self,
+        cap: EntryCap,
+    ) -> Result<Vec<(EntryName, HintedKind)>, OpenRefusal> {
+        let mut found = Vec::new();
+        let mut seen: u32 = 0;
+        for listed in self.dir.hinted_names()? {
+            let listed = listed?;
+            seen = seen.saturating_add(1);
+            if seen > cap.get() {
+                return Err(OpenRefusal::TooManyEntries(cap));
+            }
+            found.push(listed);
+        }
+        // A Windows held handle denies delete sharing, so the directory cannot be removed under it.
+        #[cfg(unix)]
+        self.dir.require_live()?;
         Ok(found)
     }
 
@@ -390,6 +452,14 @@ impl RegularFile {
             (FileKind::Symlink, _) => Err(OpenRefusal::Link),
             (kind, _) => Err(OpenRefusal::NotRegular(kind)),
         }
+    }
+
+    /// How many directory entries name this file now; more than one is a hard link.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn link_count(&self) -> Result<u64, OpenRefusal> {
+        sys::link_count(&self.file)
     }
 
     /// The length the proof saw; the file may have changed since.

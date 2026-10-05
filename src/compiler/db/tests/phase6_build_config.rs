@@ -286,7 +286,8 @@ fn emit_project_short_circuits_on_lower_error() {
         .clone()
         .expect_err("must propagate lower's error");
     assert_eq!(
-        lower_err, emit_err,
+        <(ipe_diagnostics::Diagnostic, Vec<ipe_intern::Symbol>)>::from(lower_err),
+        emit_err,
         "emit_project's error must be lower_program's own diagnostic, verbatim"
     );
 }

@@ -3,7 +3,7 @@
 //! Decision record: `docs/adr/0007-build-incrementality-and-release-infra.md`.
 //!
 //! Everything in-process is memoized, but nothing survives ACROSS process
-//! invocations — every `ipe build` starts a cold [`ipe_db::IpeDatabase`].
+//! invocations — every `ipe dev build` starts a cold [`ipe_db::IpeDatabase`].
 //! This module closes that gap for the coarse, whole-project granularity
 //! that genuinely exists (`ipe_db::emit_project`'s output — see this
 //! module's own doc section below for why that is a deliberate, documented
@@ -37,7 +37,7 @@
 //! `files` maps `RelPath -> String`, `cargo_toml` is a `String`), so it
 //! serializes and deserializes losslessly with zero cross-process identity
 //! risk. The practical win is AT LEAST as large as literal IR caching would
-//! give for `ipe build`'s actual use case (a cold-start cache hit skips
+//! give for `ipe dev build`'s actual use case (a cold-start cache hit skips
 //! parse -> canon -> link -> infer -> lower -> emit ENTIRELY, not just
 //! infer -> lower -> emit), at the cost of not serving a hypothetical
 //! future interpreter tier that wants to consume `ipe_ir` directly (design
@@ -88,8 +88,8 @@
 //! guess, never a build failure: a compile just runs uncached, exactly as
 //! every build did before this module existed.
 //!
-//! **Not yet ported**: `ipe watch`'s specific mid-session UX (hard-refuse a
-//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe watch'`
+//! **Not yet ported**: `ipe dev watch`'s specific mid-session UX (hard-refuse a
+//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe dev watch'`
 //! while keeping the last-good binary alive) needs a live watch session to
 //! refuse INTO. The sound foundation that UX builds on is the version-epoch
 //! gate itself.
@@ -917,7 +917,10 @@ impl CacheRoot {
     /// An entry past [`crate::io_bounded::BUILD_CACHE_ENTRY_CAP`] is skipped, since a read
     /// of it would be a miss anyway.
     fn write(&self, epoch: &str, file_name: &str, bytes: &[u8]) {
-        if !within_cap(bytes, crate::io_bounded::BUILD_CACHE_ENTRY_CAP) {
+        if !within_cap(bytes, crate::io_bounded::BUILD_CACHE_ENTRY_CAP)
+            || !ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(epoch))
+            || !ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(file_name))
+        {
             return;
         }
         match self {
@@ -976,7 +979,12 @@ fn read_in_marked(
 fn read_below(dir: &HeldDir, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
     let names = parts
         .iter()
-        .map(|part| EntryName::new(std::ffi::OsStr::new(part)))
+        .map(|part| {
+            let name = std::ffi::OsStr::new(part);
+            ipe_fs_open::is_one_spelled_name(name)
+                .then(|| EntryName::new(name))
+                .flatten()
+        })
         .collect::<Option<Vec<_>>>()?;
     let cap = ByteCap::new(cap)?;
     dir.open_rel(&names).ok()?.read_bytes(cap).ok()
@@ -1130,15 +1138,6 @@ fn create_salt(dir: &OwnerDir, name: &EntryName) -> Option<String> {
     }
 }
 
-/// Whether `part` is one plain path component, never a separator, `..` or `.`.
-fn is_plain_name(part: &str) -> bool {
-    let mut components = Path::new(part).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(std::path::Component::Normal(name)), None) if name == std::ffi::OsStr::new(part)
-    )
-}
-
 /// Write `bytes` to `<cache_root>/<epoch>/<file_name>` through held directory handles.
 ///
 /// Best-effort: every failure is swallowed. `cache_root` is opened without
@@ -1148,8 +1147,12 @@ fn is_plain_name(part: &str) -> bool {
 /// an exclusively created, process-unique temp file renamed over the name.
 fn write_entry(cache_root: &Path, epoch: &str, file_name: &str, bytes: &[u8]) {
     use crate::output_dir::held::{HeldDir, level_held};
+    use ipe_fs_open::is_one_spelled_name;
+    use std::ffi::OsStr;
     use std::io::Write as _;
-    if !is_plain_name(epoch) || !is_plain_name(file_name) || fs::create_dir_all(cache_root).is_err()
+    if !is_one_spelled_name(OsStr::new(epoch))
+        || !is_one_spelled_name(OsStr::new(file_name))
+        || fs::create_dir_all(cache_root).is_err()
     {
         return;
     }
@@ -1185,13 +1188,13 @@ pub fn try_load(site: &CacheSite, epoch: &str, key: &str) -> Option<EmittedProje
 /// `key`/`epoch`. Every failure (directory creation, serialize, write,
 /// rename) is silently swallowed — a cache-write failure must never turn a
 /// successful build into a reported failure. Writes atomically (tmp file +
-/// rename) so a concurrent reader (a second `ipe build` racing this one)
+/// rename) so a concurrent reader (a second `ipe dev build` racing this one)
 /// never observes a partially-written entry; a torn read is impossible, a
 /// missing-then-appearing file is the only visible race, which `try_load`
 /// already treats as an ordinary miss.
 ///
 /// The tmp file name is unique to this process, so two concurrent
-/// `ipe build` invocations computing the same key never write to the same
+/// `ipe dev build` invocations computing the same key never write to the same
 /// tmp path and so never interleave into one entry a third reader could load.
 ///
 /// An in-output root writes through [`OwnedDir::path_to`]: a symlink planted
@@ -2171,6 +2174,34 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// An in-output epoch or key that is not one spelled name stores nothing.
+    #[test]
+    fn in_output_store_refuses_a_name_that_is_not_one_spelled_name() {
+        let (base, owned, _) = claimed_out_and_elsewhere("spelled-store");
+        let site = in_output_site(&owned);
+        let root = site.root(&owned).expect("root from the claimed dir");
+        store(&root, "ep/och", "key", &sample_project());
+        store(&root, "epoch", "k/ey", &sample_project());
+        assert!(
+            tree(owned.path())
+                .iter()
+                .all(|p| !p.ends_with("key.json") && !p.ends_with("ey.json")),
+            "a multi-level epoch or key writes no entry"
+        );
+        store(&root, "epoch", "key", &sample_project());
+        assert!(
+            owned
+                .path()
+                .join(CACHE_DIR_NAME)
+                .join("salt")
+                .join("epoch")
+                .join("key.json")
+                .is_file(),
+            "one plain epoch and key are stored"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// An in-output site yields a writable root only from its own claimed dir.
     #[test]
     fn in_output_site_yields_no_root_from_another_claimed_dir() {
@@ -2396,7 +2427,7 @@ mod tests {
     /// **Cross-process id-drift proof, at the on-disk cache boundary.**
     /// Stores a `Program` written through one interner, then loads it
     /// through a COMPLETELY DIFFERENT, differently-polluted interner (the
-    /// scenario a real `ipe build` -> `ipe build` sequence produces: a
+    /// scenario a real `ipe dev build` -> `ipe dev build` sequence produces: a
     /// fresh `Interner::new()` per invocation). Asserts the relocated
     /// `Program`'s structural content (via `ipe_ir::pretty::pretty`,
     /// resolved-name comparison — not raw `Symbol` equality, which is not
@@ -3237,6 +3268,22 @@ mod tests {
         write_entry(&root, "../escape", "k.json", b"x");
         write_entry(&root, "e1", "../k.json", b"x");
         write_entry(&root, ".", "k.json", b"x");
+        write_entry(&root, "", "k.json", b"x");
+        write_entry(&root, "e1", "", b"x");
+        write_entry(&root, "e\0", "k.json", b"x");
+        write_entry(&root, "e1", "k\0.json", b"x");
+        #[cfg(windows)]
+        for (epoch, file_name) in [
+            ("e1.", "k.json"),
+            ("e1 ", "k.json"),
+            ("NUL", "k.json"),
+            ("e1", "k.json."),
+            ("e1", "k.json "),
+            ("e1", "con.json"),
+            ("e1", "k.json:stream"),
+        ] {
+            write_entry(&root, epoch, file_name, b"x");
+        }
         assert!(
             !base.join("escape").exists(),
             "a traversing epoch writes nothing"
@@ -3246,6 +3293,12 @@ mod tests {
             "a traversing file name writes nothing"
         );
         assert!(!root.exists(), "a refused write creates nothing");
+        write_entry(&root, "e1", "k.json", b"x");
+        assert_eq!(
+            fs::read(root.join("e1").join("k.json")).ok().as_deref(),
+            Some(b"x".as_slice()),
+            "one plain epoch and file name are written"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 

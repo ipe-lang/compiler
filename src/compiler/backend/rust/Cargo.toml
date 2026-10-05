@@ -39,6 +39,10 @@ serde = { version = "1", features = ["derive"] }
 # translates `IPE_ORACLE_SHARED_TARGET` → child `CARGO_TARGET_DIR` so the emitted
 # crate links against the warm shared dependency tree rather than cold-building.
 e2e-support = { path = "../../../../tools/e2e-support" }
+# The literal-owner ratchet (`tests/rust_literal_owner_scan.rs`) lexes every
+# backend source file and reads string-literal values through syn.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 
 [lints]
 workspace = true

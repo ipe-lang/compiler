@@ -127,6 +127,7 @@ fn stage_ipe(source: &str) -> Staged {
     std::fs::write(&entry, source).unwrap();
 
     let emit = Command::new(ipe_bin())
+        .arg("dev")
         .arg("build")
         .arg(&entry)
         .arg("--out")
@@ -135,10 +136,10 @@ fn stage_ipe(source: &str) -> Staged {
         .arg(runtime_dir())
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .output()
-        .expect("spawn ipe build");
+        .expect("spawn ipe dev build");
     assert!(
         emit.status.success(),
-        "ipe build (emit) failed:\n{}",
+        "ipe dev build (emit) failed:\n{}",
         String::from_utf8_lossy(&emit.stderr)
     );
 
@@ -177,6 +178,7 @@ fn stage_scaffold_only() -> Staged {
     )
     .unwrap();
     let emit = Command::new(ipe_bin())
+        .arg("dev")
         .arg("build")
         .arg(&entry)
         .arg("--out")
@@ -185,7 +187,7 @@ fn stage_scaffold_only() -> Staged {
         .arg(runtime_dir())
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .output()
-        .expect("spawn ipe build");
+        .expect("spawn ipe dev build");
     assert!(
         emit.status.success(),
         "scaffold emit failed:\n{}",

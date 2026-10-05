@@ -7,7 +7,7 @@
 //!
 //! Deterministic, no wall-clock race: warm salsa recompute on a tiny
 //! fixture is fast enough that racing a real file-save against it (as an
-//! end-to-end `ipe watch` test would have to) is unreliable. Instead this
+//! end-to-end `ipe dev watch` test would have to) is unreliable. Instead this
 //! test registers an event callback on the WORKER's database that signals
 //! the very FIRST `WillExecute` and parks the worker there until the edit
 //! sets salsa's cancellation flag — a two-module program (`A` imported by
@@ -144,18 +144,20 @@ fn compile_worker_is_cancelled_by_a_concurrent_input_edit() {
 
     let db_worker = db.clone();
     let entry_for_worker = main_path;
-    let worker = thread::spawn(move || {
-        salsa::Cancelled::catch(AssertUnwindSafe(|| {
-            ipe::compile_prepared(
-                &db_worker,
-                root,
-                &sources,
-                &entry_for_worker,
-                Path::new("<test>"),
-                config,
-            )
-        }))
-    });
+    let worker = thread::Builder::new()
+        .spawn(move || {
+            salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                ipe::compile_prepared(
+                    &db_worker,
+                    root,
+                    &sources,
+                    &entry_for_worker,
+                    Path::new("<test>"),
+                    config,
+                )
+            }))
+        })
+        .expect("spawn test thread");
 
     first_exec_rx
         .recv_timeout(Duration::from_secs(10))
@@ -178,7 +180,7 @@ fn compile_worker_is_cancelled_by_a_concurrent_input_edit() {
             Err(salsa::Cancelled::Local | salsa::Cancelled::PendingWrite)
         ),
         "expected the in-flight compile to be CANCELLED by the concurrent edit \
-         (the exact mechanism `ipe watch`'s Task-25 orchestrator relies on), \
+         (the exact mechanism `ipe dev watch`'s Task-25 orchestrator relies on), \
          but it was not — got Ok(..) or an unexpected Cancelled variant"
     );
 }

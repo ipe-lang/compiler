@@ -5,7 +5,7 @@
 //! save), format-on-save chains a second write shortly after the first, and
 //! a multi-file operation (branch switch, `git stash pop`) can emit dozens
 //! of events within milliseconds. Firing one rebuild per raw event would
-//! defeat the whole point of building `ipe watch` on an incremental engine —
+//! defeat the whole point of building `ipe dev watch` on an incremental engine —
 //! salsa's minimal recompute only pays off if the driver demands it once per
 //! logical change, not once per raw inotify/FSEvents wakeup.
 //!
@@ -159,7 +159,9 @@ mod tests {
             quiescence: Duration::from_millis(30),
             hard_cap: Duration::from_millis(500),
         };
-        let handle = thread::spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg));
+        let handle = thread::Builder::new()
+            .spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg))
+            .expect("spawn test thread");
 
         for i in 0..20 {
             raw_tx
@@ -188,7 +190,9 @@ mod tests {
             quiescence: Duration::from_millis(20),
             hard_cap: Duration::from_millis(300),
         };
-        let handle = thread::spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg));
+        let handle = thread::Builder::new()
+            .spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg))
+            .expect("spawn test thread");
 
         for _ in 0..5 {
             raw_tx
@@ -212,16 +216,20 @@ mod tests {
             quiescence: Duration::from_millis(60),
             hard_cap: Duration::from_millis(150),
         };
-        let handle = thread::spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg));
+        let handle = thread::Builder::new()
+            .spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg))
+            .expect("spawn test thread");
 
         // A trickle every 40ms keeps resetting the 60ms quiescence window
         // forever — only the 150ms hard cap can ever flush this batch.
-        let sender = thread::spawn(move || {
-            for i in 0..10 {
-                let _ = raw_tx.send(PathBuf::from(format!("/proj/src/T{i}.ipe")));
-                thread::sleep(Duration::from_millis(40));
-            }
-        });
+        let sender = thread::Builder::new()
+            .spawn(move || {
+                for i in 0..10 {
+                    let _ = raw_tx.send(PathBuf::from(format!("/proj/src/T{i}.ipe")));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            })
+            .expect("spawn test thread");
 
         let started = Instant::now();
         let batch = out_rx
@@ -244,7 +252,9 @@ mod tests {
         let (raw_tx, raw_rx) = mpsc::channel::<PathBuf>();
         let (out_tx, _out_rx) = mpsc::channel();
         let cfg = DebounceConfig::default();
-        let handle = thread::spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg));
+        let handle = thread::Builder::new()
+            .spawn(move || coalesce_loop(&raw_rx, &out_tx, cfg))
+            .expect("spawn test thread");
         drop(raw_tx);
         // Must return promptly, not hang forever.
         handle.join().expect("coalesce_loop thread panicked");

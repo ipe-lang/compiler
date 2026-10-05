@@ -108,7 +108,7 @@ printTable table =
         |> Task.map (\_ -> ())
 ```
 
-Running it (`ipe run`) prints the ranked table and the leader:
+Running it (`ipe dev run`) prints the ranked table and the leader:
 
 ```
 Standings

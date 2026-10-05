@@ -62,6 +62,7 @@ pub(crate) enum IpeMoneyCurrency {
     USDC,
     CurrencyRaw(String),
 }
+
 impl IpeStringify for IpeMoneyCurrency {
     fn ipe_show(&self) -> String {
         match self {
@@ -130,6 +131,7 @@ impl IpeStringify for IpeMoneyCurrency {
         }
     }
 }
+
 pub(crate) fn user_ipe_money_currency_code(c: IpeMoneyCurrency) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match c {
@@ -194,6 +196,7 @@ pub(crate) fn user_ipe_money_currency_code(c: IpeMoneyCurrency) -> String {
         IpeMoneyCurrency::CurrencyRaw(s) => s,
     }
 }
+
 pub(crate) fn user_ipe_money_parse_currency(code: String) -> IpeMaybe<IpeMoneyCurrency> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match (string_to_upper(string_trim(code))).as_str() {

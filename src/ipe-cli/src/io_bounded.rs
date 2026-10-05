@@ -48,7 +48,7 @@ pub const FFI_CACHE_READ_CAP: u64 = 4 * 1024 * 1024;
 pub const BUILD_CACHE_ENTRY_CAP: u64 = 64 * 1024 * 1024;
 
 /// Maximum bytes for a recorded session trace (`session.ipelog`) shown by
-/// `ipe run --replay`.
+/// `ipe dev run --replay`.
 ///
 /// 16 MiB holds a full recorder ring of large-model steps while refusing a
 /// planted multi-GiB file before it is buffered.
@@ -57,6 +57,13 @@ pub const SESSION_TRACE_READ_CAP: u64 = 16 * 1024 * 1024;
 /// Maximum bytes for miscellaneous small CLI-internal files (lock files,
 /// index entries, OAuth tokens, Cargo profile fragments, etc.).
 pub const SMALL_FILE_READ_CAP: u64 = 1024 * 1024;
+
+/// Maximum bytes for a deployed release app binary (`ipe-app`, or a prebuilt
+/// `ipe-wrapper` carrying an embedded app) scanned for its capability floor.
+///
+/// 512 MiB is far above any statically-linked app while refusing a planted
+/// device node or multi-GiB file before it is buffered whole.
+pub const RELEASE_APP_READ_CAP: u64 = ipe_sandbox::run_jail::APP_READ_CAP;
 
 // ── Regular-file open ─────────────────────────────────────────────────────────
 
@@ -279,6 +286,34 @@ pub fn read_opened_capped(
     path: &Path,
     max: u64,
 ) -> Result<String, CliError> {
+    let buf = read_opened_bytes_capped(reader, path, max)?;
+    String::from_utf8(buf).map_err(|e| CliError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })
+}
+
+/// Read the file at `path` as raw bytes under a `max`-byte ceiling: the
+/// byte twin of [`read_to_string_capped`] for binaries (no UTF-8 check).
+/// Opened by [`open_regular`], following a final symlink.
+///
+/// # Errors
+///
+/// - [`CliError::SourceRefused`] if the path is not a regular file or may not be opened.
+/// - [`CliError::Io`] if the file cannot otherwise be opened or read.
+/// - [`CliError::FileTooLarge`] if the file exceeds `max` bytes.
+pub fn read_bytes_capped(path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
+    let f = open_regular(path, FinalLink::Follow)?;
+    read_opened_bytes_capped(f, path, max)
+}
+
+/// The single cap implementation: read at most `max` bytes from `reader`,
+/// refusing (never truncating) a source that yields more.
+fn read_opened_bytes_capped(
+    reader: impl std::io::Read,
+    path: &Path,
+    max: u64,
+) -> Result<Vec<u8>, CliError> {
     let mut buf = Vec::new();
     reader
         .take(max.saturating_add(1))
@@ -293,10 +328,7 @@ pub fn read_opened_capped(
             max,
         });
     }
-    String::from_utf8(buf).map_err(|e| CliError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-    })
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -350,6 +382,21 @@ mod tests {
         assert!(
             matches!(result, Err(CliError::FileTooLarge { .. })),
             "file over manifest cap must be FileTooLarge"
+        );
+    }
+
+    #[test]
+    fn bytes_capped_reads_non_utf8_at_cap_and_refuses_one_over() {
+        let at = write_temp("bytes_at", &[0xff; 16]);
+        let at_result = read_bytes_capped(&at, 16);
+        let over = write_temp("bytes_over", &[0xff; 17]);
+        let over_result = read_bytes_capped(&over, 16);
+        let _ = std::fs::remove_file(&at);
+        let _ = std::fs::remove_file(&over);
+        assert_eq!(at_result.expect("at cap must succeed"), vec![0xff; 16]);
+        assert!(
+            matches!(over_result, Err(CliError::FileTooLarge { max: 16, .. })),
+            "one byte over cap must be FileTooLarge, got: {over_result:?}"
         );
     }
 

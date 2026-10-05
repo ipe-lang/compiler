@@ -65,7 +65,7 @@ main =
         Io.println (greeting ++ ", " ++ firstName argv ++ "!")
 ```
 
-Running it with no arguments (`ipe run`) prints:
+Running it with no arguments (`ipe dev run`) prints:
 
 ```
 user args: 0

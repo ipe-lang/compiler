@@ -5,7 +5,8 @@
 //! * `help/flags.md` — the flags several commands share, described once; a
 //!   command page cites one as `- @--flag`;
 //! * `help/index.md` — the top-level overview's sections, in display order;
-//! * `help/<group>.md` — a command group's one-line summary.
+//! * `help/<group>.md` — a command group's one-line summary, then an optional
+//!   one-line note.
 //!
 //! The binary embeds the pages (`include_str!`). The terminal `--help`,
 //! `--help --json`, the HTML command pages, `ipe doc <command>`, and the
@@ -254,6 +255,15 @@ pub fn summary_of(page: &'static str) -> &'static str {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("")
+}
+
+/// The optional one-line note a group page holds: its second non-blank line.
+#[must_use]
+pub fn note_of(page: &'static str) -> Option<&'static str> {
+    page.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .nth(1)
 }
 
 /// Parse the overview layout (`help/index.md`): `## <title>` headings, each

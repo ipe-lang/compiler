@@ -20,7 +20,7 @@
 //! build artifacts never touch the reference tree):
 //!
 //! ```text
-//! $ cd "$(mktemp -d)" && ipe run Main.ipe
+//! $ cd "$(mktemp -d)" && ipe dev run Main.ipe
 //! 42
 //! ```
 use std::path::{Path, PathBuf};

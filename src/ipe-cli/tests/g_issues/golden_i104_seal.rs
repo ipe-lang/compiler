@@ -56,7 +56,7 @@ fn f1_multiuse_let_clone() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for multiuse_let_clone: {:?}",
+        "ipe dev build must succeed for multiuse_let_clone: {:?}",
         built.err()
     );
 
@@ -98,7 +98,7 @@ fn f2_closure_capture_reuse() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for closure_capture_reuse: {:?}",
+        "ipe dev build must succeed for closure_capture_reuse: {:?}",
         built.err()
     );
 

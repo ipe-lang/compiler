@@ -20,7 +20,7 @@ use ipe::coverage::surface::StdlibSurface;
 
 /// The bounded worker count for the parallel build+run sweep.
 ///
-/// Each probe shells out to `ipe run`, which cargo-builds the emitted crate; the
+/// Each probe shells out to `ipe dev run`, which cargo-builds the emitted crate; the
 /// probes are independent (a unique per-symbol snippet dir and a unique emitted
 /// crate name), so the sweep fans them across a bounded pool to fit the CI
 /// deadline instead of paying every build back-to-back. The bound is read from
@@ -45,6 +45,7 @@ fn build_run_jobs() -> usize {
 /// column is `Sync` and every probe is independent, so this is sound. A single
 /// `column` is shared (its scratch dir is per-symbol-keyed), so no worker
 /// clobbers another's snippet.
+#[allow(clippy::expect_used)] // a refused worker thread is a harness setup failure
 fn build_run_holes(symbols: &[StdlibSymbol]) -> Vec<(String, String)> {
     let column = ipe::coverage::columns_runtime::BuildRunColumn::new();
     let cursor = AtomicUsize::new(0);
@@ -53,23 +54,25 @@ fn build_run_holes(symbols: &[StdlibSymbol]) -> Vec<(String, String)> {
 
     std::thread::scope(|scope| {
         for _ in 0..jobs {
-            scope.spawn(|| {
-                loop {
-                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                    let Some(sym) = symbols.get(idx) else {
-                        break;
-                    };
-                    if let Cell::Hole(message) = column.check(sym) {
-                        let path = dotted(sym);
-                        if !allowlisted("build+run", &path) {
-                            holes
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((path, message));
+            std::thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    loop {
+                        let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(sym) = symbols.get(idx) else {
+                            break;
+                        };
+                        if let Cell::Hole(message) = column.check(sym) {
+                            let path = dotted(sym);
+                            if !allowlisted("build+run", &path) {
+                                holes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push((path, message));
+                            }
                         }
                     }
-                }
-            });
+                })
+                .expect("spawn test thread");
         }
     });
 

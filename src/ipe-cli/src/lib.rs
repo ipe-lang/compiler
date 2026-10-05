@@ -79,11 +79,14 @@ pub mod style;
 #[cfg(unix)]
 mod terminate;
 pub mod text;
+pub mod threads;
 pub mod toolchain;
 pub mod unsafe_ack;
+pub mod verb;
 pub mod version_check;
 pub mod wasi_run;
 pub mod web_consent;
+pub mod wrapper_source;
 /// The embedded Ipê standard-library source now lives in the dependency-free
 /// [`ipe_stdlib`] leaf crate so the WebAssembly frontend can share one copy.
 /// Re-exported here so `crate::stdlib::…` call sites resolve unchanged.
@@ -132,7 +135,7 @@ pub use driver::{
     RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes, bluegreen_enabled,
     build, build_loose_file, build_loose_file_with_options, build_project,
     build_project_with_options, build_with_options, code_index, compile_prepared,
-    create_source_root, emit_ir_text, explain_lookup, hot_appearance_enabled,
+    create_source_root, emit_ir_text, explain_lookup, front_check_entry, hot_appearance_enabled,
     infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
     run_upgrade, runtime_dep_from_env, select_non_overlapping, verify_capabilities,
     watch_banner_enabled,
@@ -141,10 +144,10 @@ pub use driver::{
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
-    RewriteKind, build_source_graph, capabilities_including_served_widgets, default_entry,
-    find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err, lower_entry_via_graph,
-    read_progress_chunk, read_yes_no, read_yes_no_default, resolve_vendored_runtime_dir,
-    rewrite_user_file, rewrite_walked_file, run_build, run_capabilities, run_eject, run_exec,
-    run_fix, run_installer, run_package, run_release, run_run, run_test, run_type_check,
-    run_verify, run_version, run_watch, typecheck_entry_via_graph, write_emitted_project,
+    DevMarkedCrate, RewriteKind, build_source_graph, capabilities_including_served_widgets,
+    default_entry, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
+    lower_entry_via_graph, read_progress_chunk, read_yes_no, read_yes_no_default,
+    resolve_vendored_runtime_dir, rewrite_user_file, rewrite_walked_file, run_capabilities,
+    run_fix, run_installer, run_package, run_test, run_type_check, run_verify, run_version,
+    typecheck_entry_via_graph, write_emitted_project,
 };

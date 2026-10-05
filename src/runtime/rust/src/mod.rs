@@ -83,7 +83,7 @@ pub mod core;
 /// the `debugger` feature and injects this var on the executed child — and the
 /// gated recorder that reads it share ONE wire name (single source of truth).
 pub const RECORD_ENV: &str = "IPE_DEBUGGER_RECORD";
-/// Env var naming the typed session log an `ipe run --replay` child re-folds
+/// Env var naming the typed session log an `ipe dev run --replay` child re-folds
 /// instead of running live.
 ///
 /// Ungated for the same single-wire-name reason as [`RECORD_ENV`].
@@ -93,7 +93,7 @@ pub const REPLAY_ENV: &str = "IPE_DEBUGGER_REPLAY";
 /// `session.ipelog` gets the sibling `session.ipemsgs`.
 pub const TYPED_LOG_EXTENSION: &str = "ipemsgs";
 // Development-only TEA time-travelling debugger core. Only present when the
-// `debugger` feature is active (`ipe build/run --debugger`). Zero code emitted
+// `debugger` feature is active (`ipe dev build/run --debugger`). Zero code emitted
 // for a non-`--debugger` build. NOT part of the emitted `mod.rs` template —
 // the compiler injects the `debugger` feature only on `build`/`run`, never on
 // `release`, so production artifacts carry no recorder code.
@@ -101,7 +101,7 @@ pub const TYPED_LOG_EXTENSION: &str = "ipemsgs";
 pub mod debugger;
 // Shape-agnostic dev-loop control wire (hot-swap + time-travel debugger). Present
 // under any dev-loop surface: the child-side `web`/`debugger` builds (which also
-// compile `control::server`) and the parent-side `control-wire` (the `ipe watch`
+// compile `control::server`) and the parent-side `control-wire` (the `ipe dev watch`
 // sender, codec only — no tokio server). Absent from `ipe release`.
 #[cfg(any(feature = "web", feature = "debugger", feature = "control-wire"))]
 pub mod control;
@@ -193,6 +193,10 @@ pub mod system;
 // runtime guard (`TuiGuard::enter*`) and by `ipe-cli`'s pre-build gate over
 // `Shape::Tui`. Neither depends on the `tui` feature's crossterm/tokio stack.
 pub mod terminal_access;
+// `threads` is always compiled (std-only; its tokio offload is gated inside): it
+// is the one start point for OS threads and blocking-pool work, refusing with a
+// typed error where the std and tokio starts panic.
+pub mod threads;
 // wasm32: the pure future-combinator half of `Task.*` (`map`/`andThen`/
 // `mapError`/`succeed`/`fail`/`fromResult`/`andThenResult`/`onError`/`lazy`/
 // `sequence`) compiles + runs unchanged — no tokio dependency. The
@@ -558,6 +562,12 @@ pub use ws_client::*;
 // so it must exist in a headless server that never vendors `html`. Reached by
 // qualified path (`crate::escape::…`); not glob-re-exported.
 pub mod escape;
+
+// `Redacted<T>`: the field carrier whose `Debug` never prints the value, worn by
+// every secret-role field of a runtime type (server, principal, js_port). Std-only
+// and declared in every module set (the emitted floor and the wasm set too).
+// Reached by qualified path (`crate::redact::…`); not glob-re-exported.
+pub mod redact;
 
 // Ipe.Html / Ipe.Ui render surface — the Html/Attribute/Event ADTs + renderer +
 // htmlXxx kernel wrappers. Pure (std only), so always available; a non-Web

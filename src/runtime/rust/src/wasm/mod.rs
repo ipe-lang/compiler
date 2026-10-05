@@ -304,7 +304,7 @@ struct App<Model, Msg> {
     router: Option<Box<WasmRouter<Model, Msg>>>,
     /// Development-only time-travelling debugger recorder. Passive: records
     /// each live-pass `update` step without re-firing any `Cmd`. Present only
-    /// when the `debugger` feature is active (`ipe build/run --debugger`).
+    /// when the `debugger` feature is active (`ipe dev build/run --debugger`).
     #[cfg(feature = "debugger")]
     recorder: RefCell<crate::debugger::RecordBuffer<Msg, Model>>,
     /// Pre-rendered string labels for each recorded step, newest at the back.
@@ -731,11 +731,9 @@ fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, String> {
     if let Some(html_doc) = document.dyn_ref::<web_sys::HtmlDocument>()
         && let Ok(cookie_str) = html_doc.cookie()
     {
-        for pair in cookie_str.split(';') {
-            let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=') {
-                cookies.entry(k.to_owned()).or_insert_with(|| v.to_owned());
-            }
+        // The server's `Cookie` grammar: decoded, canonical names only, first value wins.
+        for (k, v) in crate::http_header::cookie::request_cookies([cookie_str.as_bytes()]) {
+            cookies.entry(k).or_insert(v);
         }
     }
 

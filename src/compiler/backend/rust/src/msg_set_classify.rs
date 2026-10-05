@@ -8,7 +8,7 @@
 //!
 //! The running Web program's `Msg` variant surface — for each constructor, its
 //! NAME and a closed [`CompilePayloadShape`] (its arity/type signature, not any
-//! runtime value). The `ipe watch` loop bakes this descriptor per emit; on a
+//! runtime value). The `ipe dev watch` loop bakes this descriptor per emit; on a
 //! source edit it compares the previous baked descriptor with the new one and, if
 //! the new set is a proven additive superset (every prior variant still present,
 //! unchanged), POSTs both to the running app's `/_ipe/hot-msg` endpoint, which
@@ -434,7 +434,7 @@ mod tests {
 
 /// The dev == prod CRUX for the `Msg` set, proven at the compiler/runtime seam.
 ///
-/// The `ipe watch` loop bakes a [`CompileMsgSet`] and POSTs its JSON; the running
+/// The `ipe dev watch` loop bakes a [`CompileMsgSet`] and POSTs its JSON; the running
 /// program's runtime decodes that JSON into a `web::msg_set::MsgSet` and runs the
 /// additive-superset proof over it. This module proves the two halves agree: a
 /// [`CompileMsgSet`], serialized by [`CompileMsgSet::to_json`], decodes into the

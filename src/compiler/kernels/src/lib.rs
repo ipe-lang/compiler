@@ -2126,15 +2126,6 @@ pub enum StdlibKernel {
     TaskWithMaxAttempts,
     /// `Task.withBaseMs : Int -> RetryPolicy e -> RetryPolicy e`
     TaskWithBaseMs,
-    // ── BackoffStrategy constructors ────────────────────────────────────────
-    /// `Task.Linear : BackoffStrategy` — constant delay, no jitter.
-    BackoffLinear,
-    /// `Task.LinearWithJitter : BackoffStrategy` — constant delay with jitter.
-    BackoffLinearWithJitter,
-    /// `Task.Exponential : BackoffStrategy` — doubling delay, no jitter.
-    BackoffExponential,
-    /// `Task.ExponentialWithJitter : BackoffStrategy` — doubling delay with jitter.
-    BackoffExponentialWithJitter,
     // ── Io ──────────────────────────────────────────────────────────────────
     IoReadLine,
     /// `Io.readSecret : String -> Task Error Secret` — write a prompt, then read
@@ -4962,32 +4953,6 @@ impl StdlibKernel {
                 IpeOrder,
             ),
             Self::TaskWithBaseMs => d("Task", "withBaseMs", 2, Pure, "task_with_base_ms", IpeOrder),
-            // ── BackoffStrategy constructors ─────────────────────────────────
-            Self::BackoffLinear => d("Task", "Linear", 0, Pure, "backoff_linear", IpeOrder),
-            Self::BackoffLinearWithJitter => d(
-                "Task",
-                "LinearWithJitter",
-                0,
-                Pure,
-                "backoff_linear_with_jitter",
-                IpeOrder,
-            ),
-            Self::BackoffExponential => d(
-                "Task",
-                "Exponential",
-                0,
-                Pure,
-                "backoff_exponential",
-                IpeOrder,
-            ),
-            Self::BackoffExponentialWithJitter => d(
-                "Task",
-                "ExponentialWithJitter",
-                0,
-                Pure,
-                "backoff_exponential_with_jitter",
-                IpeOrder,
-            ),
             // ── Io ──────────────────────────────────────────────────────────
             Self::IoReadLine => d("Io", "readLine", 1, Pure, "io_read_line", IpeOrder),
             Self::IoReadSecret => d("Io", "readSecret", 1, Pure, "io_read_secret", IpeOrder),
@@ -7987,11 +7952,6 @@ impl StdlibKernel {
         Self::TaskDefaultRetryPolicy,
         Self::TaskWithMaxAttempts,
         Self::TaskWithBaseMs,
-        // BackoffStrategy constructors
-        Self::BackoffLinear,
-        Self::BackoffLinearWithJitter,
-        Self::BackoffExponential,
-        Self::BackoffExponentialWithJitter,
         // Io
         Self::IoReadLine,
         Self::IoReadSecret,
@@ -10400,8 +10360,12 @@ impl StdlibKernel {
         // Server (route/cookie only — non-record arms).
         const STRING_TO_STRING_TO_ROUTE: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_ROUTE));
-        const STRING_TO_STRING_TO_COOKIE: TyShape =
-            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_COOKIE));
+        // `Server.cookie : String -> String -> Result Error Cookie` (an empty
+        // name is an `Error`).
+        const RESULT_ERROR_COOKIE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_COOKIE]);
+        const STRING_TO_STRING_TO_RESULT_COOKIE: TyShape =
+            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &RESULT_ERROR_COOKIE));
         const REQ_TO_STRING: TyShape = TyShape::Fun(&SERVER_REQUEST, &STRING);
         const STRING_TO_REQ_TO_MAYBE_STRING: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&SERVER_REQUEST, &MAYBE_STRING));
@@ -11395,11 +11359,15 @@ impl StdlibKernel {
         const HANDLER_TO_ROUTE: TyShape = TyShape::Fun(&RESP_HANDLER, &SERVER_ROUTE);
         const SERVER_ROUTE_KERNEL: TyShape = TyShape::Fun(&STRING, &HANDLER_TO_ROUTE);
         // Authed routes. `authConfig : Secret -> TokenSource -> AuthConfig`;
-        // `cookieToken : String -> TokenSource`; the route kernels take a
-        // two-argument handler `Request -> Principal -> Task Error Response`.
+        // `cookieToken : String -> Result Error TokenSource` (an empty name is
+        // an `Error`); the route kernels take a two-argument handler
+        // `Request -> Principal -> Task Error Response`.
         const SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&SECRET, &TyShape::Fun(&TOKEN_SOURCE, &AUTH_CONFIG));
-        const STRING_TO_TOKEN_SOURCE: TyShape = TyShape::Fun(&STRING, &TOKEN_SOURCE);
+        const RESULT_ERROR_TOKEN_SOURCE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, TOKEN_SOURCE]);
+        const STRING_TO_RESULT_TOKEN_SOURCE: TyShape =
+            TyShape::Fun(&STRING, &RESULT_ERROR_TOKEN_SOURCE);
         // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig` — arms the gate.
         const REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&REVOCATION_MODE, &TyShape::Fun(&AUTH_CONFIG, &AUTH_CONFIG));
@@ -11415,9 +11383,17 @@ impl StdlibKernel {
         const STRING_TO_RESPONSE: TyShape = TyShape::Fun(&STRING, &SERVER_RESPONSE);
         const RESPONSE_TO_RESPONSE: TyShape = TyShape::Fun(&SERVER_RESPONSE, &SERVER_RESPONSE);
         const SERVER_WITH_STATUS: TyShape = TyShape::Fun(&INT, &RESPONSE_TO_RESPONSE);
-        const STRING_TO_RESPONSE_TO_RESPONSE: TyShape =
-            TyShape::Fun(&STRING, &RESPONSE_TO_RESPONSE);
-        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(&STRING, &STRING_TO_RESPONSE_TO_RESPONSE);
+        // `Server.withHeader : String -> String -> Response -> Result Error Response`
+        // (a name or value with no header representation is an `Error`).
+        const RESULT_ERROR_RESPONSE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_RESPONSE]);
+        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(
+            &STRING,
+            &TyShape::Fun(
+                &STRING,
+                &TyShape::Fun(&SERVER_RESPONSE, &RESULT_ERROR_RESPONSE),
+            ),
+        );
         // Server withCookie : Cookie -> Response -> Response.
         const SERVER_WITH_COOKIE: TyShape = TyShape::Fun(&SERVER_COOKIE, &RESPONSE_TO_RESPONSE);
         // Middleware — every wrapper is a `Handler -> Handler` transform over the
@@ -11477,8 +11453,6 @@ impl StdlibKernel {
         const RETRY_ON: TyShape = TyShape::Fun(&A_TO_BOOL, &RETRY_POLICY_TO_RETRY_POLICY);
         // `retryWith : RetryPolicy Error -> Task e a -> Task e a`. var(0) = a.
         const RETRY_WITH: TyShape = TyShape::Fun(&RETRY_POLICY_ERROR, &TASK_A_TO_TASK_A);
-        // `BackoffStrategy` nullary constructors.
-        const BACKOFF_STRATEGY_CON: TyShape = TyShape::Con(BuiltinTag::BackoffStrategy, &[]);
         // App-entry whole signatures — `cfg -> Program <shape> msg`.
         // Each entry builder returns the uniform shape carrier `Program shape msg`
         // (not `Task ()`): the phantom `shape` tag distinguishes the surface at
@@ -12494,7 +12468,7 @@ impl StdlibKernel {
 
             // ── Server (non-record route/cookie arms). ──
             Self::ServerStatic => Some(&STRING_TO_STRING_TO_ROUTE),
-            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_COOKIE),
+            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_RESULT_COOKIE),
             Self::ServerBody | Self::ServerPath | Self::ServerMethod => Some(&REQ_TO_STRING),
             Self::ServerParam
             | Self::ServerQueryParam
@@ -12848,7 +12822,7 @@ impl StdlibKernel {
             | Self::ServerDeleteAuthed => Some(&SERVER_AUTHED_ROUTE_KERNEL),
             Self::ServerAuthConfig => Some(&SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG),
             Self::ServerTokenBearer => Some(&TOKEN_SOURCE),
-            Self::ServerCookieToken => Some(&STRING_TO_TOKEN_SOURCE),
+            Self::ServerCookieToken => Some(&STRING_TO_RESULT_TOKEN_SOURCE),
             // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig`
             Self::ServerWithRevocation => Some(&REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG),
             Self::ServerText | Self::ServerJson | Self::ServerHtml | Self::ServerRedirect => {
@@ -12885,10 +12859,6 @@ impl StdlibKernel {
             Self::TaskDefaultRetryPolicy => Some(&RETRY_POLICY),
             Self::TaskWithMaxAttempts | Self::TaskWithBaseMs => Some(&INT_TO_RETRY_TO_RETRY),
             Self::TaskRetryWith => Some(&RETRY_WITH),
-            Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter => Some(&BACKOFF_STRATEGY_CON),
             // App-entry cfg records.
             Self::WebApp => Some(&WEB_APP),
             Self::WebEmbed => Some(&WEB_EMBED),
@@ -14004,10 +13974,6 @@ impl StdlibKernel {
             | Self::TaskDefaultRetryPolicy
             | Self::TaskWithMaxAttempts
             | Self::TaskWithBaseMs
-            | Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter
             | Self::IoReadLine
             | Self::IoReadSecret
             | Self::IoWriteStdout
@@ -15578,30 +15544,16 @@ impl StdlibKernel {
     /// OFF the qualifier whitelist; their proven-pure members are admitted one
     /// by one by NAME ([`Self::is_reactor_free_time_or_system`]), so a new
     /// member of either defaults to reactor-requiring until it is audited and
-    /// listed. `Task` is likewise mixed and never gets a qualifier entry: its
-    /// reactor members are named below and its pure `BackoffStrategy`
-    /// constructors are named here.
+    /// listed. `Task` is likewise mixed and never gets a qualifier entry.
     ///
     /// Not `const`: the whole-family arms compare the kernel's canonical
     /// qualifier (`&str`), which stable Rust cannot match in a `const fn`.
     #[must_use]
     pub fn requires_async_runtime(self) -> bool {
-        // `BackoffStrategy` constructors are pure zero-arity values under the
-        // mixed `Task` qualifier; they carry no future and never touch the
-        // reactor, so they are admitted by name. Every other `Task` member —
-        // `Task.run` / `Task.perform` block on an inner task of unknown purity,
-        // `Task.parallel` spawns, `Task.retryWith` sleeps, `Task.attempt`
-        // bridges into the TEA loop — has no qualifier entry and falls to the
-        // reactor-requiring default below.
-        if matches!(
-            self,
-            Self::BackoffLinear
-                | Self::BackoffLinearWithJitter
-                | Self::BackoffExponential
-                | Self::BackoffExponentialWithJitter
-        ) {
-            return false;
-        }
+        // Every `Task` member — `Task.run` / `Task.perform` block on an inner
+        // task of unknown purity, `Task.parallel` spawns, `Task.retryWith`
+        // sleeps, `Task.attempt` bridges into the TEA loop — has no qualifier
+        // entry and falls to the reactor-requiring default below.
         // The proven-pure members of the mixed `Time` / `System` families are
         // admitted one by one by NAME, so a new member of either family
         // defaults to reactor-requiring below.
@@ -16074,7 +16026,7 @@ pub enum Target {
     /// The native host binary (server / CLI / TUI / desktop).
     #[default]
     Native,
-    /// A browser WASM bundle (`ipe build --target wasm`) — fully public,
+    /// A browser WASM bundle (`ipe dev build --target wasm`) — fully public,
     /// `wasm2wat`-inspectable; no server effect or secret may compile in.
     WasmClient,
     /// A co-located portable WASI bundle (`wasm32-wasip1`) — a `Direct`/`Script`
@@ -16915,13 +16867,6 @@ mod tests {
                     | StdlibKernel::SystemCwd
                     | StdlibKernel::SystemExit
             );
-            let pure_backoff = matches!(
-                k,
-                StdlibKernel::BackoffLinear
-                    | StdlibKernel::BackoffLinearWithJitter
-                    | StdlibKernel::BackoffExponential
-                    | StdlibKernel::BackoffExponentialWithJitter
-            );
             // The families that are pure in whole: every member resolves without
             // the reactor. Distinct from the qualifier list in production only
             // in that this test re-derives it from the audited-purity judgement
@@ -16957,7 +16902,7 @@ mod tests {
                     | "Io"
                     | "Sql"
             );
-            pure_time_system || pure_backoff || pure_whole_family
+            pure_time_system || pure_whole_family
         };
         for k in StdlibKernel::ALL {
             let q = k.decl().qualifier;

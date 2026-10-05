@@ -84,6 +84,7 @@ SCOPES: dict[str, tuple[str, ...]] = {
     + (
         "src/compiler/canon/**",
         "src/compiler/ffi/**",
+        "src/compiler/fs_open/**",
         "src/compiler/sandbox/**",
         "src/compiler/types/**",
         "src/ffi-bindgen-macro/**",

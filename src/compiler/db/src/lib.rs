@@ -29,10 +29,10 @@
 //! query-demand order; the one-shot `ipe` driver demands queries in a fixed
 //! topological order against a cold database, so emitted bytes are identical
 //! to the non-incremental pipeline (enforced by the golden-oracle suite).
-//! Warm-db reuse in production (`ipe watch`, the LSP session) is covered by
+//! Warm-db reuse in production (`ipe dev watch`, the LSP session) is covered by
 //! the clean-vs-incremental parity gate
 //! (`src/ipe-cli/tests/clean_vs_incremental_parity.rs`), which drives the
-//! same [`sync_source_root`] + `compile_prepared` primitives `ipe watch`
+//! same [`sync_source_root`] + `compile_prepared` primitives `ipe dev watch`
 //! calls and proves warm output byte-identical to a cold build across the
 //! full golden corpus plus a dedicated identifier-adding edit sequence. The
 //! LSP session never reaches emission (diagnostics-only), so the byte-level
@@ -364,15 +364,22 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         }
     }
 
-    // Known-module universe for the IPE-N0020 did-you-mean list. Strings
-    // only: interning module paths here (before their own canonicalize runs)
-    // would perturb the build-wide symbol numbering the byte-identity SEAL
-    // pins.
-    let known_modules: BTreeSet<Box<str>> = root
-        .files(db)
-        .keys()
-        .map(|path| path.join(".").into_boxed_str())
-        .collect();
+    // The importable-module catalog: project files plus compiled-source stdlib
+    // modules (the kernel paths are seeded by the catalog itself). Read only on
+    // diagnostic paths (IPE-N0020 did-you-mean, IPE-N0034 for an unbound
+    // qualifier). Strings only: interning module paths here (before their own
+    // canonicalize runs) would perturb the build-wide symbol numbering the
+    // byte-identity SEAL pins.
+    let catalog = ipe_canon::ModuleCatalog::new(
+        root.files(db)
+            .keys()
+            .map(|path| path.join(".").into_boxed_str())
+            .chain(
+                ipe_stdlib::COMPILED_STD_MODULES
+                    .iter()
+                    .map(|module| Box::<str>::from(module.dotted)),
+            ),
+    );
     let origin = file.origin(db);
 
     // One lock scope covers expected-path interning + canonicalisation — the
@@ -397,7 +404,7 @@ pub fn canonicalize(db: &dyn Db, root: SourceRoot, file: SourceFile) -> CanonRes
         &parsed,
         &expected_path,
         &deps,
-        &known_modules,
+        &catalog,
         *origin,
         &mut interner,
     )?;
@@ -712,10 +719,35 @@ pub fn kernel_types(db: &dyn Db, root: SourceRoot) -> KernelTypesResult {
 // Tracked queries: typecheck + lower — the coarse per-program SEAM
 // ---------------------------------------------------------------------------
 
-/// The memoized result of type-checking [`linked_program`]'s whole-program
-/// merge, or the failing diagnostic paired with its constraint's home module
-/// path (see [`ipe_types::infer_attributed`]).
-pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, (Diagnostic, Vec<Symbol>)>;
+/// Why [`typecheck`] produced no solved program.
+///
+/// A link refusal and a type-checker refusal are distinct stages: the link
+/// diagnostic is [`linked_program`]'s own, carried verbatim, and is never
+/// re-classified as a type-checker error (which must name its owning module).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypecheckError {
+    /// [`linked_program`] refused the program, so the type checker never ran.
+    Link(Diagnostic),
+    /// The type checker refused the linked program.
+    Infer(ipe_types::InferError),
+}
+
+impl TypecheckError {
+    /// The refusing diagnostic, whichever stage produced it.
+    #[must_use]
+    pub const fn diagnostic(&self) -> &Diagnostic {
+        match self {
+            Self::Link(diag) => diag,
+            Self::Infer(err) => err.diagnostic(),
+        }
+    }
+}
+
+/// The memoized result of type-checking [`linked_program`]'s merge.
+///
+/// The error is why it was refused: the link diagnostic, or the type-checker
+/// error sited at its owning module (see [`ipe_types::infer_attributed`]).
+pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, TypecheckError>;
 
 /// Type-check the linked whole-program module.
 ///
@@ -744,9 +776,11 @@ pub type TypecheckResult = Result<Arc<ipe_types::SolvedTypes>, (Diagnostic, Vec<
 pub fn typecheck(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> TypecheckResult {
     let linked = linked_program(db, root, entry)
         .clone()
-        .map_err(|d| (d, Vec::new()))?;
+        .map_err(TypecheckError::Link)?;
     let mut interner = db.interner().lock();
-    ipe_types::infer_attributed(&linked.module, &mut interner).map(Arc::new)
+    ipe_types::infer_attributed(&linked.module, &mut interner)
+        .map(Arc::new)
+        .map_err(TypecheckError::Infer)
 }
 
 /// The type-checker's results for ONE module, projected out of the
@@ -778,7 +812,7 @@ pub struct ModuleTypes {
 /// On the scoped path the module's own solve; on the fallback path the
 /// whole-program projection, including the whole-program failure (the same
 /// error a whole-program demand surfaces).
-pub type ModuleTypesResult = Result<Arc<ModuleTypes>, (Diagnostic, Vec<Symbol>)>;
+pub type ModuleTypesResult = Result<Arc<ModuleTypes>, TypecheckError>;
 
 /// One module's `(home, _)`-slice of a whole-program
 /// [`ipe_types::SolvedTypes`] — the [`ModuleTypes`] projection.
@@ -924,6 +958,13 @@ pub enum ScopedModuleTypes {
         /// The module's closed typed interface, for importers' scoped solves.
         interface: Arc<ipe_types::TypedInterface>,
     },
+    /// The module's interface is closed, so its importers solve against it,
+    /// but its own solved facts read its importers' use sites: the module's
+    /// own types come from the whole-program solve.
+    InterfaceOnly {
+        /// The module's closed typed interface, for importers' scoped solves.
+        interface: Arc<ipe_types::TypedInterface>,
+    },
     /// Fall back to the whole-program solve: the module's scoped solve was
     /// red, a dep's (or its own) interface is open (an importer can pin a
     /// residual variable — information flows against the import direction),
@@ -1005,6 +1046,11 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                     interface: Arc::new(interface),
                 }
             }
+            ipe_types::InterfaceStatus::ImporterDependent(interface) => {
+                ScopedModuleTypes::InterfaceOnly {
+                    interface: Arc::new(interface),
+                }
+            }
             ipe_types::InterfaceStatus::Open => ScopedModuleTypes::WholeProgram,
         },
         Err(_) => ScopedModuleTypes::WholeProgram,
@@ -1028,7 +1074,8 @@ pub fn typed_interface(
     module: SourceFile,
 ) -> Option<Arc<ipe_types::TypedInterface>> {
     match infer_module_scoped(db, root, module) {
-        ScopedModuleTypes::PerModule { interface, .. } => Some(interface.clone()),
+        ScopedModuleTypes::PerModule { interface, .. }
+        | ScopedModuleTypes::InterfaceOnly { interface } => Some(interface.clone()),
         ScopedModuleTypes::WholeProgram => None,
     }
 }
@@ -1047,8 +1094,8 @@ pub fn typed_interface(
 ///   elsewhere in the program does not blank this module's types
 ///   (diagnostics still come from the whole-program [`typecheck`]).
 /// - **Fallback path**: the whole-program projection, for modules the
-///   scoped tier cannot faithfully stand for (open interfaces, red scoped
-///   solve, import cycle) — exactly the joint solve's slice, with the joint
+///   scoped tier cannot faithfully stand for (open interfaces, own facts
+///   that read an importer's use site, red scoped solve, import cycle) — exactly the joint solve's slice, with the joint
 ///   solve's own error surfaced verbatim on a red program.
 ///
 /// Both paths return NORMALIZED values (see [`normalize_module_types`]);
@@ -1063,7 +1110,7 @@ pub fn typecheck_module(
 ) -> ModuleTypesResult {
     match infer_module_scoped(db, root, module) {
         ScopedModuleTypes::PerModule { types, .. } => Ok(types.clone()),
-        ScopedModuleTypes::WholeProgram => {
+        ScopedModuleTypes::InterfaceOnly { .. } | ScopedModuleTypes::WholeProgram => {
             let solved = typecheck(db, root, entry).clone()?;
             let home: Vec<Symbol> = {
                 let mut interner = db.interner().lock();
@@ -1072,7 +1119,7 @@ pub fn typecheck_module(
                     .iter()
                     .map(|segment| interner.intern(segment))
                     .collect::<Result<_, _>>()
-                    .map_err(|d| (d, Vec::new()))?
+                    .map_err(|d| TypecheckError::Infer(ipe_types::InferError::unsited(d)))?
             };
             Ok(Arc::new(normalize_module_types(project_module_types(
                 &solved, &home,
@@ -1081,9 +1128,48 @@ pub fn typecheck_module(
     }
 }
 
+/// Why the pipeline up to lowering refused a program.
+///
+/// A type-checker error keeps its typed site; a link or lowering error is the
+/// diagnostic paired with the module path the lowerer blamed, empty when it
+/// blamed none.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PipelineError {
+    /// The type checker refused the program.
+    Infer(ipe_types::InferError),
+    /// Linking or lowering refused the program.
+    Lower(Diagnostic, Vec<Symbol>),
+}
+
+impl From<TypecheckError> for PipelineError {
+    /// A link refusal is the link diagnostic with no blamed module, exactly as
+    /// [`lower_program`] reports a link refusal of its own.
+    fn from(err: TypecheckError) -> Self {
+        match err {
+            TypecheckError::Link(diag) => Self::Lower(diag, Vec::new()),
+            TypecheckError::Infer(err) => Self::Infer(err),
+        }
+    }
+}
+
+impl From<PipelineError> for (Diagnostic, Vec<Symbol>) {
+    /// The diagnostic with its owning module path, empty for a whole-program one.
+    fn from(err: PipelineError) -> Self {
+        match err {
+            PipelineError::Infer(ipe_types::InferError::Sited { diag, home }) => {
+                (diag, home.into_path())
+            }
+            PipelineError::Infer(ipe_types::InferError::Program(program)) => {
+                (program.into_diagnostic(), Vec::new())
+            }
+            PipelineError::Lower(diag, home) => (diag, home),
+        }
+    }
+}
+
 /// The memoized result of lowering [`linked_program`]'s whole-program merge
 /// against [`typecheck`]'s solved types into the backend-agnostic IR.
-pub type LowerResult = Result<Arc<ipe_ir::Program>, (Diagnostic, Vec<Symbol>)>;
+pub type LowerResult = Result<Arc<ipe_ir::Program>, PipelineError>;
 
 /// Lower the linked whole-program module.
 ///
@@ -1107,15 +1193,19 @@ pub type LowerResult = Result<Arc<ipe_ir::Program>, (Diagnostic, Vec<Symbol>)>;
 pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerResult {
     let linked = linked_program(db, root, entry)
         .clone()
-        .map_err(|d| (d, Vec::new()))?;
-    let types = typecheck(db, root, entry).clone()?;
+        .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
+    let types = typecheck(db, root, entry)
+        .clone()
+        .map_err(PipelineError::from)?;
     let mut interner = db.interner().lock();
     // Provide the entry file's display path and source text so the lowerer
     // can inject `<file>:<line>` into `Debug.todo` call sites.
     let src_path = entry.module_path(db).join(".");
     let src_path = format!("{src_path}.ipe");
     let src_text = entry.text(db).clone();
-    ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text).map(Arc::new)
+    ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
+        .map(Arc::new)
+        .map_err(|(diag, home)| PipelineError::Lower(diag, home))
 }
 
 /// [`lower_program`]'s IR after Phase-2 partial evaluation — the ONE program the
@@ -1218,7 +1308,7 @@ pub struct BuildConfig {
     #[returns(ref)]
     pub ffi: Option<ipe_backend_rust::FfiEmit>,
     /// The compilation target (`Native` | `WasmClient` under
-    /// `ipe build --target wasm`) — selects the emitted manifest template,
+    /// `ipe dev build --target wasm`) — selects the emitted manifest template,
     /// vendored runtime module set, and entry shape.
     pub target: ipe_ir::Target,
     /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
@@ -1246,7 +1336,7 @@ pub struct BuildConfig {
     /// project. Threaded to [`ipe_backend_rust::RustBackend::with_runtime_dep`].
     #[returns(ref)]
     pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
-    /// `true` when `ipe build/run --debugger` selected the development-only
+    /// `true` when `ipe dev build/run --debugger` selected the development-only
     /// time-travelling debugger. Threaded to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the runtime
     /// `debugger` feature to the emitted project's dependency feature list so the

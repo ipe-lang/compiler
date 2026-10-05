@@ -301,8 +301,10 @@ fn temp_root() -> io::Result<PathBuf> {
             "this target has no OS temp directory",
         ))
     } else {
-        #[allow(clippy::disallowed_methods)]
-        // the one temp-root lookup, behind every constructor's base checks
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one temp-root lookup, behind every constructor's base checks"
+        )]
         let root = std::env::temp_dir();
         Ok(root)
     }
@@ -346,7 +348,10 @@ impl TempRootRedactor {
 /// standard library directly.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[must_use]
-#[allow(clippy::disallowed_methods)] // the sanctioned test reader of the temp root
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the sanctioned test reader of the temp root"
+)]
 pub fn test_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
@@ -808,7 +813,7 @@ fn confined_label(label: &str) -> String {
 /// The suffix of every atomic-replace sibling name, `.<label>-<pid>-<hex>.ipe-tmp`.
 ///
 /// Such a name is hidden (it starts with `.`) and carries this suffix, so a file
-/// watcher or a directory listing can recognise and skip it; `ipe watch`
+/// watcher or a directory listing can recognise and skip it; `ipe dev watch`
 /// mirrors this value and the CLI asserts the two agree at build time.
 pub const TEMP_SIBLING_SUFFIX: &str = ".ipe-tmp";
 

@@ -19,17 +19,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    DResult, Diagnostic, Feature, GenericAppEntryReach, Located, LowerError, MainRetName,
-    NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
+    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
-use ipe_ir::once_closure::MovedCapture;
+use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
+    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
     ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
@@ -47,9 +47,10 @@ mod ty_templates;
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
 use clone_class::{
-    CloneClass, CloneEnv, HandlerCapture, classify_capture_clone, classify_handler_capture,
-    clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
+    CloneClass, CloneEnv, HandlerCapture, alias_rebuild_refusal, classify_capture_clone,
+    classify_handler_capture, clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
     reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
+    slice_element_alias_refusal, slice_ownership,
 };
 use generic_syms::{collect_ir_generic_syms, default_generics_to_unit};
 #[cfg(test)]
@@ -582,9 +583,10 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
             effect: Box::new(recur(*effect)),
             rest: Box::new(recur(*rest)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(recur(*list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(recur(*list)),
@@ -1661,7 +1663,7 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
 //
-// `rewrite_captured_clones`'s depth==0 bare-callee exemption for a NonClone
+// `rewrite_captured_clones`'s bare-callee exemption for a NonClone
 // (function-typed) capture is sound only when the capturing lambda is not
 // ITSELF nested inside another lambda that also captures the same symbol.
 // Each `lower_lambda` call classifies its OWN captures independently, with
@@ -1677,51 +1679,59 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 //
 // Fix: after a `let`-bound function-typed value's WHOLE remaining scope has
 // been lowered (`lower_let`'s `PVar` arm, once every later sibling binding
-// has already folded around it), check whether the symbol is referenced at
-// lambda-nesting depth >= 2, or at depth >= 1 in 2+ distinct places
-// (`needs_shared_capture`). If so:
-//   * every read of the symbol at lambda-nesting depth >= 1 is rewritten to
-//     `CloneVar` (`force_shared_capture_clones`) -- a depth-0 (non-nested)
-//     read stays bare, since calling through an `Arc<dyn Fn>` auto-derefs
-//     exactly like `Box<dyn Fn>` and needs no clone;
+// has already folded around it), check whether the symbol is referenced
+// past a `Recallable` closure, or inside `Recallable` closures in 2+ distinct
+// places (`needs_shared_capture`; scopes per `ipe_ir::once_closure`, the
+// `move |_|` around a `TaskSeq` continuation counted as a `Once` closure).
+// If so:
+//   * every read of the symbol inside a closure is rewritten to
+//     `CloneVar` (`force_shared_capture_clones`) -- a non-nested read stays
+//     bare, since calling through an `Arc<dyn Fn>` auto-derefs exactly like
+//     `Box<dyn Fn>` and needs no clone;
 //   * the let-bound closure LITERAL itself is wrapped in `Expr::SharedLambda`
 //     so the backend boxes it with `Arc::new` (`+ Send + Sync` trait-object
 //     bound) instead of `Box::new` -- `Arc<T>: Clone`, so the inserted
-//     `.clone()` calls above compile. A single depth-1 occurrence (the
-//     common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
+//     `.clone()` calls above compile. A single occurrence directly inside
+//     one `Recallable` closure (the common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
 //     ts)`) stays untouched: byte-identical `Box<dyn Fn>`, zero behaviour
 //     change for the steady-state pattern this fix must not regress.
 
-/// Record, into `depths`, the LAMBDA-NESTING DEPTH (relative to `expr`'s own
-/// scope) of every live (non-shadowed) `Var(sym)` / `CloneVar(sym)` occurrence
-/// in `expr`. `cur_depth` is the number of `Lambda` / `SharedLambda`
-/// boundaries already crossed to reach `expr`. Mirrors
-/// [`lambda_body_refs_sym`]'s shadowing discipline exactly, generalised from
-/// a boolean "does it occur" to "at what depth does it occur, possibly more
-/// than once". `Expr::Update.record` is walked too (unlike
-/// `lambda_body_refs_sym`, which treats it as borrow-only for a DIFFERENT
-/// question) -- a false positive here only costs an unneeded (but harmless)
-/// `Arc`/`.clone()`, whereas a false negative would leave a real E0507/E0382
-/// unfixed, so this walker is deliberately the more conservative of the two.
+/// Record, into `out`, the [`CaptureScope`] of every live `Var(sym)` / `CloneVar(sym)` in `expr`.
+///
+/// `scope` is where `expr` itself sits; every closure the backend emits steps
+/// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
+/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
+/// shadowing discipline exactly, generalised from a boolean "does it occur" to
+/// "where does it occur, possibly more than once". `Expr::Update.record` is
+/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
+/// for a DIFFERENT question) -- a false positive here only costs an unneeded
+/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
+/// real E0507/E0382 unfixed, so this walker is deliberately the more
+/// conservative of the two.
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
-fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depths: &mut Vec<u32>) {
+fn collect_capture_scopes(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    out: &mut Vec<CaptureScope>,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                depths.push(cur_depth);
+                out.push(scope);
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth + 1, depths);
+                collect_capture_scopes(sym, body, scope.enter_boundary(expr), out);
             }
         }
         Expr::Let { name, value, body } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if *name != sym {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Destructure {
@@ -1729,75 +1739,75 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
             value,
             body,
         } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if !pat_binds_symbol(binder, sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Match(m) => {
-            collect_lambda_capture_depths(sym, m.scrutinee(), cur_depth, depths);
+            collect_capture_scopes(sym, m.scrutinee(), scope, out);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
                     for e in arm.guard.iter().chain([&arm.body]) {
-                        collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                        collect_capture_scopes(sym, e, scope, out);
                     }
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            collect_lambda_capture_depths(sym, lhs, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rhs, cur_depth, depths);
+            collect_capture_scopes(sym, lhs, scope, out);
+            collect_capture_scopes(sym, rhs, scope, out);
         }
         Expr::If { cond, then_, else_ } => {
-            collect_lambda_capture_depths(sym, cond, cur_depth, depths);
-            collect_lambda_capture_depths(sym, then_, cur_depth, depths);
-            collect_lambda_capture_depths(sym, else_, cur_depth, depths);
+            collect_capture_scopes(sym, cond, scope, out);
+            collect_capture_scopes(sym, then_, scope, out);
+            collect_capture_scopes(sym, else_, scope, out);
         }
         Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Apply { func, args } => {
-            collect_lambda_capture_depths(sym, func, cur_depth, depths);
+            collect_capture_scopes(sym, func, scope, out);
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Cons { head, tail } => {
-            collect_lambda_capture_depths(sym, head, cur_depth, depths);
-            collect_lambda_capture_depths(sym, tail, cur_depth, depths);
+            collect_capture_scopes(sym, head, scope, out);
+            collect_capture_scopes(sym, tail, scope, out);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            collect_lambda_capture_depths(sym, list, cur_depth, depths);
+            collect_capture_scopes(sym, list, scope, out);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Update { record, fields } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            collect_lambda_capture_depths(sym, effect, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rest, cur_depth, depths);
+            collect_capture_scopes(sym, effect, scope, out);
+            collect_capture_scopes(sym, rest, scope.enter_boundary(expr), out);
         }
         Expr::Access { record, .. } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -1810,26 +1820,29 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
     }
 }
 
-/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared
-/// capture treatment? True when some occurrence is nested at least 2 lambda
-/// levels deep (the outer closure must move-capture it to hand off to the
-/// inner closure, which ALSO move-captures it) OR there are at least 2
-/// distinct depth-at-least-1 occurrences (two independent closures each
-/// move-capturing the same symbol -- the sibling-closure analogue of the
-/// same E0507/E0382 class). A single depth-1 occurrence (the common,
-/// already-sound case) returns `false`, so ordinary single-capture closures
-/// stay byte-identical `Box<dyn Fn>`.
+/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared capture?
+///
+/// True when some occurrence sits past a `Recallable` closure (the outer
+/// closure must move-capture it to hand off to the inner closure, which ALSO
+/// move-captures it, on every call) OR at least 2 occurrences sit inside
+/// `Recallable` closures (two independent closures each move-capturing the
+/// same symbol -- the sibling-closure analogue of the same E0507/E0382
+/// class). A single occurrence directly inside one `Recallable` closure (the
+/// common, already-sound case) returns `false`, so ordinary single-capture
+/// closures stay byte-identical `Box<dyn Fn>`; so do reads inside only `Once`
+/// closures, such as a top-level run-statement chain.
 fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    depths.iter().any(|&d| d >= 2) || depths.iter().filter(|&&d| d >= 1).count() >= 2
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    scopes.iter().any(|s| s.borrow_is_hazard())
+        || scopes.iter().filter(|s| s.move_is_hazard()).count() >= 2
 }
 
 // ── Usage-site (not nesting-site) shared-capture trigger ──────────────────
 //
 // `needs_shared_capture` (above) closes the class: a `let`-bound closure
 // moved into 2+ competing closure environments. It does NOT cover a narrower,
-// DIFFERENT class — a single, non-nested (depth-0) reference to a `let`-bound
+// DIFFERENT class — a single, non-nested reference to a `let`-bound
 // closure passed straight into a kernel call whose runtime consumer itself
 // requires `Send + Sync` (`KernelFn::requires_sync_capture`, e.g.
 // `Ui.onSubmit` / `Ui.onInput` / `Ipe.Html.Events.on*` / `Stream.stream`).
@@ -1845,14 +1858,14 @@ fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
 // ORs this predicate into the same `Expr::SharedLambda` promotion path.
 
 /// Does `sym` occur ANYWHERE inside `expr` as a live `Var`/`CloneVar` leaf
-/// (any lambda-nesting depth, no boundary exemptions)? Used only to test
+/// (inside any closures, no boundary exemptions)? Used only to test
 /// whether a specific kernel-call ARGUMENT subtree mentions `sym` —
 /// deliberately over-inclusive (a false positive costs one harmless
 /// `Arc`/`.clone()`; a false negative would leave a real E0277 unfixed).
 fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    !depths.is_empty()
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    !scopes.is_empty()
 }
 
 /// Does `sym` (a `let`-bound, function-typed local) flow — anywhere in
@@ -1862,7 +1875,7 @@ fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
 /// (`KernelFn::requires_sync_capture`)? See the module comment above for the
 /// bug class this closes.
 ///
-/// Traversal mirrors [`collect_lambda_capture_depths`] (recurse into every
+/// Traversal mirrors [`collect_capture_scopes`] (recurse into every
 /// `Expr` variant, lambda bodies included — a sync-requiring call reachable
 /// only through a nested closure still needs the same promotion), but asks a
 /// structurally different question at each node, so it is its own walker.
@@ -2509,9 +2522,10 @@ fn promote_unification_sibling_lambdas(
             head: Box::new(recur(*head)?),
             tail: Box::new(recur(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recur(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recur(*list)?),
@@ -4003,6 +4017,10 @@ fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
         Expr::Record { fields, .. } | Expr::Update { fields, .. } => fields
             .iter()
             .any(|(_, e)| binder_captured_in_move_closure(binder, e)),
+        // The `move |_|` around the continuation is a `Once` boundary
+        // (`ipe_ir::once_closure::boundary_kind`) whose slot asks only `Send`,
+        // so it adds no `Sync` obligation of its own; a `Fn` closure around
+        // the node already sees the continuation's reads through it.
         Expr::TaskSeq { effect, rest } => {
             binder_captured_in_move_closure(binder, effect)
                 || binder_captured_in_move_closure(binder, rest)
@@ -4192,7 +4210,7 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for h in prefix {
                 collect_ir_pat_syms(h, out);
             }
@@ -4791,7 +4809,7 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
                 pat_binder_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 pat_binder_syms(p, out);
             }
@@ -5773,8 +5791,13 @@ fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
                     .sum::<usize>()
         }
         Expr::Ctor { args, .. } => args.iter().map(|a| count_fn_value_uses(sym, a)).sum(),
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`): a
+        // read there, a borrowing call included, moves `sym` into that closure
+        // once, and the moves inside it count on their own.
         Expr::TaskSeq { effect, rest } => {
-            count_fn_value_uses(sym, effect) + count_fn_value_uses(sym, rest)
+            count_fn_value_uses(sym, effect)
+                + count_fn_value_uses(sym, rest).max(usize::from(lambda_body_refs_sym(sym, rest)))
         }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
@@ -5969,9 +5992,18 @@ fn fn_value_move_walk(
                 fn_value_move_walk(sym, e, state, payloads);
             }
         }
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`):
+        // building it is one consuming read of `sym`, after the effect. Inside
+        // it the closure owns `sym`, so its own reads start unmoved.
         Expr::TaskSeq { effect, rest } => {
             fn_value_move_walk(sym, effect, state, payloads);
-            fn_value_move_walk(sym, rest, state, payloads);
+            if lambda_body_refs_sym(sym, rest) {
+                state.read(true);
+                let mut inner = FnValueMoveState::default();
+                fn_value_move_walk(sym, rest, &mut inner, payloads);
+                state.hazard |= inner.hazard;
+            }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
@@ -7040,13 +7072,17 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 // `wrap`'s 2 flattened args, so a residual `\eta_0 -> wrap(<partial>, eta_0)`
 // capturing `wrap` exists only post-lowering).
 //
-// Read soundness for a `Box`-carried fn binding, by position:
-//   * depth-0 direct callee — borrows via `Fn::call(&self, ..)`, sound.
-//   * depth-0 non-callee, single use — a plain final move, sound.
-//   * NON-CALLEE read at closure depth ≥ 1 — the closure body moves the
-//     captured `Box` out of a `&self` env per call → E0507.
-//   * ANY read at closure depth ≥ 2 — an inner closure's construction moves
-//     the value out of the outer closure's env per call → E0507/E0525.
+// Read soundness for a `Box`-carried fn binding, by its `CaptureScope`
+// (`ipe_ir::once_closure`; the `move |_|` around a `TaskSeq` continuation is
+// a `Once` closure like any other):
+//   * direct callee short of past-`Recallable` — borrows via
+//     `Fn::call(&self, ..)`, sound.
+//   * non-callee outside every `Recallable` closure, single use — a plain
+//     final move, sound.
+//   * NON-CALLEE read inside a `Recallable` closure — the closure body moves
+//     the captured `Box` out of a `&self` env per call → E0507.
+//   * ANY read past a `Recallable` closure — an inner closure's construction
+//     moves the value out of the outer closure's env per call → E0507/E0525.
 //   * > 1 consuming use — the second move of a non-`Clone` value → E0382.
 // The last three demand the `Arc` carrier; [`fn_value_read_flags`] +
 // [`count_fn_value_uses`] detect them.
@@ -7069,12 +7105,15 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 /// whose output is byte-pinned.
 #[derive(Clone, Copy, Default)]
 struct FnValueReadFlags {
-    /// A non-callee `Var`/`CloneVar` read at closure depth ≥ 1 exists — a bare
-    /// `Box` capture would be moved out of a `Fn` env per call (E0507).
-    non_callee_ge1: bool,
-    /// Any read at closure depth ≥ 2 exists — an intermediate closure's
-    /// construction would move the `Box` out of its enclosing env (E0525).
-    any_ge2: bool,
+    /// A non-callee `Var`/`CloneVar` read inside a `Recallable` closure exists.
+    ///
+    /// A bare `Box` capture would be moved out of a `Fn` env per call (E0507).
+    move_in_recallable: bool,
+    /// Any read past a `Recallable` closure exists.
+    ///
+    /// An intermediate closure's construction would move the `Box` out of its
+    /// enclosing env per call (E0507/E0525).
+    any_past: bool,
 }
 
 /// Threaded per-symbol summary maintained across the reverse fold in
@@ -7089,12 +7128,13 @@ struct FnValueReadFlags {
 /// - `var_uses`             ← `count_var_uses(sym, acc)`
 /// - `fn_value_uses`        ← `count_fn_value_uses(sym, acc)`
 /// - `fn_flags`             ← `fn_value_read_flags(sym, acc)`
-/// - `depth1_capture_count` ← count of depth-≥1 entries in
-///   `collect_lambda_capture_depths(sym, acc, 0, ..)`
-/// - `any_depth2_capture`   ← any depth-≥2 entry in the same collection
+/// - `recallable_capture_count` ← count of entries inside a `Recallable`
+///   closure in `collect_capture_scopes(sym, acc, CaptureScope::Top, ..)`
+/// - `any_past_capture` ← any entry past a `Recallable` closure in the same
+///   collection
 ///
 /// From those last two: `needs_shared_capture(sym, acc)` =
-/// `any_depth2_capture || depth1_capture_count >= 2`.
+/// `any_past_capture || recallable_capture_count >= 2`.
 ///
 /// `flows_into_sync_kernel_call` is intentionally NOT threaded: its
 /// alias-chain resolution (`let g = f in Ui.onSubmit g` propagating `f`'s
@@ -7106,8 +7146,8 @@ struct LetAccum {
     var_uses: usize,
     fn_value_uses: usize,
     fn_flags: FnValueReadFlags,
-    depth1_capture_count: usize,
-    any_depth2_capture: bool,
+    recallable_capture_count: usize,
+    any_past_capture: bool,
 }
 
 impl LetAccum {
@@ -7120,47 +7160,47 @@ impl LetAccum {
         let fn_value_uses = count_fn_value_uses(sym, expr);
         let fn_flags = {
             let mut f = FnValueReadFlags::default();
-            fn_value_read_flags_walk(sym, expr, 0, &mut f);
+            fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut f);
             f
         };
-        let mut depths: Vec<u32> = Vec::new();
-        collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-        let depth1_capture_count = depths.iter().filter(|&&d| d >= 1).count();
-        let any_depth2_capture = depths.iter().any(|&d| d >= 2);
+        let mut scopes = Vec::new();
+        collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+        let recallable_capture_count = scopes.iter().filter(|s| s.move_is_hazard()).count();
+        let any_past_capture = scopes.iter().any(|s| s.borrow_is_hazard());
         Self {
             var_uses,
             fn_value_uses,
             fn_flags,
-            depth1_capture_count,
-            any_depth2_capture,
+            recallable_capture_count,
+            any_past_capture,
         }
     }
 
     /// Fold `other` (computed over a fresh sub-expression) into `self`
     /// (accumulated over all previously folded sub-expressions).  Correct
-    /// because the sub-expressions are at the SAME lambda-nesting depth —
-    /// they are sibling Let-value sub-trees separated by Let nodes, and a
-    /// `Let` node does not increment depth.  Counts add; boolean flags OR.
+    /// because the sub-expressions sit at the SAME capture scope — they are
+    /// sibling Let-value sub-trees separated by Let nodes, and a `Let` node
+    /// is no closure boundary.  Counts add; boolean flags OR.
     const fn merge(&mut self, other: Self) {
         // `count_var_uses` is additive across Let-separated sub-expressions
-        // at the same depth.  The MAX semantics within If/Match are already
+        // at the same scope.  The MAX semantics within If/Match are already
         // captured by `count_var_uses` when called on each individual
         // sub-expression; merging across disjoint sub-trees is always SUM.
         self.var_uses += other.var_uses;
         self.fn_value_uses += other.fn_value_uses;
-        self.fn_flags.non_callee_ge1 |= other.fn_flags.non_callee_ge1;
-        self.fn_flags.any_ge2 |= other.fn_flags.any_ge2;
-        // Depth-counts add: two distinct depth-1 captures in different
-        // sub-expressions each contribute one slot; their SUM determines
-        // whether `needs_shared_capture` fires (>= 2 depth-1 captures).
-        self.depth1_capture_count += other.depth1_capture_count;
-        self.any_depth2_capture |= other.any_depth2_capture;
+        self.fn_flags.move_in_recallable |= other.fn_flags.move_in_recallable;
+        self.fn_flags.any_past |= other.fn_flags.any_past;
+        // Capture counts add: two distinct captures inside `Recallable`
+        // closures in different sub-expressions each contribute one slot;
+        // their SUM determines whether `needs_shared_capture` fires (>= 2).
+        self.recallable_capture_count += other.recallable_capture_count;
+        self.any_past_capture |= other.any_past_capture;
     }
 
     /// Reconstruct the `needs_shared_capture` boolean from the threaded
-    /// depth-count summary.  Mirrors `needs_shared_capture`'s own condition.
+    /// capture-scope summary.  Mirrors `needs_shared_capture`'s own condition.
     const fn needs_shared(&self) -> bool {
-        self.any_depth2_capture || self.depth1_capture_count >= 2
+        self.any_past_capture || self.recallable_capture_count >= 2
     }
 }
 
@@ -7286,44 +7326,50 @@ fn batch_accum_update(accum: &mut BTreeMap<Symbol, LetAccum>, expr: &Expr) {
 }
 
 /// Gather [`FnValueReadFlags`] for `sym` over `expr`. Shadow discipline and
-/// callee-position handling mirror [`count_fn_value_uses`]; depth counting
-/// mirrors [`collect_lambda_capture_depths`]. Enumerated exhaustively (no `_`
+/// callee-position handling mirror [`count_fn_value_uses`]; scope tracking
+/// mirrors [`collect_capture_scopes`]. Enumerated exhaustively (no `_`
 /// catch-all) so a future `Expr` variant is a compile error here, not a
 /// silently-missed read.
 fn fn_value_read_flags(sym: Symbol, expr: &Expr) -> FnValueReadFlags {
     let mut flags = FnValueReadFlags::default();
-    fn_value_read_flags_walk(sym, expr, 0, &mut flags);
+    fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut flags);
     flags
 }
 
 #[allow(clippy::too_many_lines)]
-fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut FnValueReadFlags) {
+fn fn_value_read_flags_walk(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    flags: &mut FnValueReadFlags,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                flags.non_callee_ge1 |= depth >= 1;
-                flags.any_ge2 |= depth >= 2;
+                flags.move_in_recallable |= scope.move_is_hazard();
+                flags.any_past |= scope.borrow_is_hazard();
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth + 1, flags);
+                fn_value_read_flags_walk(sym, body, scope.enter_boundary(expr), flags);
             }
         }
         Expr::Apply { func, args } => {
             match func.as_ref() {
                 // Direct-callee read: borrows (`Fn::call`), so it is not a
-                // non-callee hazard — but at depth ≥ 2 its capture chain still
-                // moves the value through an intermediate closure env.
+                // non-callee hazard — but past a `Recallable` closure its
+                // capture chain still moves the value through an intermediate
+                // closure env.
                 Expr::Var(s) | Expr::CloneVar(s) if *s == sym => {
-                    flags.any_ge2 |= depth >= 2;
+                    flags.any_past |= scope.borrow_is_hazard();
                 }
-                other => fn_value_read_flags_walk(sym, other, depth, flags),
+                other => fn_value_read_flags_walk(sym, other, scope, flags),
             }
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         // A sync-capture kernel argument is the sync-promotion path's slot —
@@ -7331,14 +7377,14 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
         Expr::Call { callee, args, .. } => {
             if !matches!(callee, Callee::Kernel(k) if k.requires_sync_capture()) {
                 for a in args {
-                    fn_value_read_flags_walk(sym, a, depth, flags);
+                    fn_value_read_flags_walk(sym, a, scope, flags);
                 }
             }
         }
         Expr::Let { name, value, body } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if *name != sym {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Destructure {
@@ -7346,67 +7392,67 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
             value,
             body,
         } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if !pat_binds_symbol(binder, sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Match(m) => {
-            fn_value_read_flags_walk(sym, m.scrutinee(), depth, flags);
+            fn_value_read_flags_walk(sym, m.scrutinee(), scope, flags);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
-                    fn_value_read_flags_walk(sym, &arm.body, depth, flags);
+                    fn_value_read_flags_walk(sym, &arm.body, scope, flags);
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            fn_value_read_flags_walk(sym, lhs, depth, flags);
-            fn_value_read_flags_walk(sym, rhs, depth, flags);
+            fn_value_read_flags_walk(sym, lhs, scope, flags);
+            fn_value_read_flags_walk(sym, rhs, scope, flags);
         }
         Expr::If { cond, then_, else_ } => {
-            fn_value_read_flags_walk(sym, cond, depth, flags);
-            fn_value_read_flags_walk(sym, then_, depth, flags);
-            fn_value_read_flags_walk(sym, else_, depth, flags);
+            fn_value_read_flags_walk(sym, cond, scope, flags);
+            fn_value_read_flags_walk(sym, then_, scope, flags);
+            fn_value_read_flags_walk(sym, else_, scope, flags);
         }
         Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Cons { head, tail } => {
-            fn_value_read_flags_walk(sym, head, depth, flags);
-            fn_value_read_flags_walk(sym, tail, depth, flags);
+            fn_value_read_flags_walk(sym, head, scope, flags);
+            fn_value_read_flags_walk(sym, tail, scope, flags);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            fn_value_read_flags_walk(sym, list, depth, flags);
+            fn_value_read_flags_walk(sym, list, scope, flags);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Update { record, fields } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            fn_value_read_flags_walk(sym, effect, depth, flags);
-            fn_value_read_flags_walk(sym, rest, depth, flags);
+            fn_value_read_flags_walk(sym, effect, scope, flags);
+            fn_value_read_flags_walk(sym, rest, scope.enter_boundary(expr), flags);
         }
         Expr::Access { record, .. } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -7840,9 +7886,10 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
             head: Box::new(recurse_storage(*head)?),
             tail: Box::new(recurse_storage(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recurse(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recurse(*list)?),
@@ -7924,6 +7971,77 @@ impl FlatNestedList {
     /// open one to `.len() >= N`.
     const fn closed(&self) -> bool {
         matches!(self.tail, NestedTail::Closed)
+    }
+
+    /// Does any head element or the open tail bind a name?
+    fn binds_any(&self) -> bool {
+        self.prefix
+            .iter()
+            .any(|b| matches!(b, NestedBinder::Named(_)))
+            || matches!(self.tail, NestedTail::Rest(NestedBinder::Named(_)))
+    }
+}
+
+/// The internal error of a nested list head binder whose element type was never resolved.
+fn unresolved_nested_cons_elem() -> Diagnostic {
+    bug(
+        "ipe_lower::desugar_ctor_nested_special_args",
+        "a nested list binds a head element but its element type was not resolved",
+    )
+}
+
+/// Refuse (IPE-L0116) a binding nested list in a constructor payload over a non-`Clone` element.
+///
+/// The nested-list desugaring copies each head out by index and takes the tail
+/// by `List.drop` of the copied binder; neither exists for an
+/// [`SliceOwnership::OwnedMove`] element.
+const fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => Err(unsupported(span, Feature::NestedCtorDiscrimination)),
+    }
+}
+
+/// The ownership gates of one list arm head at `span` over `prefix`.
+///
+/// Under [`SliceOwnership::OwnedMove`] each element moves out of the owned view,
+/// so an element alias whose inner binds a name would own its part twice and is
+/// refused (IPE-L0135).
+fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => slice_element_alias_refusal(prefix, span),
+    }
+}
+
+/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
+///
+/// An owned list view moves each binder out of one view shape, so every
+/// alternative would have to bind each name at the same position of the view;
+/// the owned rendering supports alternatives that bind nothing.
+fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
+    let owned = alts.iter().any(holds_owned_slice_head);
+    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
+        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
+    }
+    Ok(())
+}
+
+/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
+fn holds_owned_slice_head(pat: &Pat) -> bool {
+    match pat {
+        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
+        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
+        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_) => false,
     }
 }
 
@@ -9126,7 +9244,7 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 collect_pat_ir_type_refs(p, enums);
             }
@@ -9448,7 +9566,7 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
         }
         Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
                 || rest
                     .as_ref()
@@ -9881,6 +9999,54 @@ fn reject_point_free_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
     Ok(())
 }
 
+/// The one context in which an intercept-only `Store.*` kernel's rewrite runs.
+///
+/// The projection elements are read structurally by `lower_store_select`'s
+/// projection walk; every other placeholder is rewritten by its saturated
+/// direct-call arm in `intercept_web_kernel_call`.
+const fn intercept_context(k: KernelFn) -> InterceptContext {
+    if matches!(
+        k,
+        KernelFn::StoreLiteral
+            | KernelFn::StoreUpper
+            | KernelFn::StoreLower
+            | KernelFn::StoreCoalesce
+            | KernelFn::StoreAdd
+            | KernelFn::StoreSub
+            | KernelFn::StoreMul
+    ) {
+        InterceptContext::SelectProjection
+    } else {
+        InterceptContext::SaturatedCall
+    }
+}
+
+/// Fail-closed SEAL gate for an intercept-only `Store.*` kernel applied off its intercept.
+///
+/// A saturated or over-applied placeholder reaching the uniform call path is
+/// one whose rewrite did not run: a projection element (`Store.add`,
+/// `Store.literal`, …) called outside a `Store.select` body, or any placeholder
+/// over-applied past its arity. Emitting it would name the never-defined
+/// placeholder symbol (`store_add`, …), so `ipe` would accept a program `cargo`
+/// rejects with E0425. Refused with IPE-L0146; the unsaturated shapes keep their
+/// own [`reject_point_free_store_kernel`] refusal. A no-op for every other callee.
+fn reject_off_intercept_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
+    if let Callee::Kernel(k) = callee
+        && k.is_accessor_intercept_placeholder()
+    {
+        let d = k.decl();
+        let kernel = format!("{}.{}", d.qualifier, d.name).into_boxed_str();
+        return Err(Diagnostic::Lower {
+            span,
+            msg: LowerError::AccessorKernelOffIntercept {
+                kernel,
+                context: intercept_context(*k),
+            },
+        });
+    }
+    Ok(())
+}
+
 /// Fail-closed SEAL gate for a partial or point-free capture-cloned handler kernel (`Stream.stream`).
 ///
 /// The backend re-wraps the handler argument with a per-call `.clone()` of
@@ -10125,7 +10291,7 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_symbol(p, target)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
@@ -10266,9 +10432,10 @@ fn rewrite_var_free_occurrences(
             head: Box::new(rewrite_var_free_occurrences(target, *head, on_hit)),
             tail: Box::new(rewrite_var_free_occurrences(target, *tail, on_hit)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
@@ -10685,8 +10852,8 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
-    /// Reverse map from union-find representative id to annotation variable
-    /// symbol for the typed def currently being lowered.  Populated by
+    /// Reverse map from solver-tagged union-find representative to annotation
+    /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
     /// into the body; cleared (restored to empty) afterward.
     ///
@@ -10699,7 +10866,7 @@ pub struct Lowerer<'a> {
     /// to `IrType::Unit`, causing E0308 (`Attribute<()>` vs `Attribute<T1>`) in
     /// the Rust emitted for polymorphic functions such as
     /// `view : (Msg -> parentMsg) -> Counter -> Html parentMsg`.
-    current_poly_tvars: std::cell::RefCell<BTreeMap<u32, Symbol>>,
+    current_poly_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, Symbol>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -13121,6 +13288,34 @@ impl<'a> Lowerer<'a> {
         self.types.regions.get(&(home, span))
     }
 
+    /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
+    ///
+    /// The part's type is the solved region type at `ty_span`, on its storage
+    /// carriers. A binding alias at a span with no recorded region type has no
+    /// part to classify, so it is refused as a compiler bug, never accepted.
+    fn refuse_nonclone_alias_part(&self, inner: &Pat, ty_span: Span, span: Span) -> DResult<()> {
+        if !clone_class::pat_binds_any_name(inner) {
+            return Ok(());
+        }
+        let ty = self.region_ty(ty_span).ok_or_else(|| {
+            bug(
+                "ipe_lower::refuse_nonclone_alias_part",
+                "no inferred type for an alias part",
+            )
+        })?;
+        let part = normalize_record_fun_carriers(self.ir_type_from_ty_json(ty, ty_span)?);
+        alias_rebuild_refusal(self.clone_env(), inner, &part, span)
+    }
+
+    /// The element type of the list at `span` on its storage carriers.
+    ///
+    /// A function directly in the element, or in a record field or tuple
+    /// component of it, is carried on the `Clone` `Arc` carrier, exactly as the
+    /// emitted `Vec` stores it, so the element's clone class is the stored one.
+    fn list_storage_elem_ir(&self, span: Span) -> DResult<IrType> {
+        Ok(normalize_record_fun_carriers(self.list_elem_ir(span)?))
+    }
+
     /// The `Ipe.Db.Store` module home, or `None` when the program does not link
     /// that module (one of its segments was never interned).
     ///
@@ -14152,8 +14347,8 @@ impl<'a> Lowerer<'a> {
                 ));
             };
             // Determine the result kind from the left operand's type (both
-            // operands must have the same type — enforced by the type constraint
-            // `coalesce : Projection a -> Projection a -> Projection a`).
+            // operands share one type — the kernel scheme `coalesce : a -> a -> a`
+            // unifies them).
             let result_ty = self.region_ty(left_expr.span);
             let Some(kind) = result_ty.and_then(|ty| ProjColKind::of_ty(ty, self.interner)) else {
                 let ty_label = result_ty.map_or_else(
@@ -16483,27 +16678,27 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(u32, Symbol)> = if let IrType::Generic(sym) = &ret
-                {
-                    if self.interner.resolve(*sym) == Some("any") {
-                        self.types
-                            .regions
-                            .get(&(def.home().to_vec(), body.span))
-                            .and_then(|body_ty| {
-                                let Ty::Con { args, .. } = body_ty else {
-                                    return None;
-                                };
-                                let Some(Ty::Var(uv)) = args.first() else {
-                                    return None;
-                                };
-                                Some((*uv, *sym))
-                            })
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
+                    if let IrType::Generic(sym) = &ret {
+                        if self.interner.resolve(*sym) == Some("any") {
+                            self.types
+                                .regions
+                                .get(&(def.home().to_vec(), body.span))
+                                .and_then(|body_ty| {
+                                    let Ty::Con { args, .. } = body_ty else {
+                                        return None;
+                                    };
+                                    let Some(Ty::Var(uv)) = args.first() else {
+                                        return None;
+                                    };
+                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
+                                })
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -17615,10 +17810,11 @@ impl<'a> Lowerer<'a> {
                 })?;
                 self.lower_record_pat(fields, ty, pat.span)
             }
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_param_binder_pat(inner, param_span)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_param_binder_pat(inner, param_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, param_span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -18706,7 +18902,9 @@ impl<'a> Lowerer<'a> {
     /// T3 capture-clone rewrite for a closure body: classify the free locals
     /// captured by the closure (from its CANON body) and rewrite the LOWERED
     /// `body` — `CloneOk` reads become `CloneVar` (`.clone()`), `NonClone` captures
-    /// outside the depth-0 callee position fail-close IPE-L0125/L0126.
+    /// outside a borrowing callee position fail-close IPE-L0126. A callee read
+    /// past the closure, such as one in a run-statement continuation inside
+    /// it, refuses at the capture's own use.
     ///
     /// A captured pure-`Fun` symbol whose binder can carry the `Arc<dyn Fn>`
     /// promotion (a plain `let` name or a def/lambda param — see
@@ -18724,10 +18922,11 @@ impl<'a> Lowerer<'a> {
         span: Span,
         body: Expr,
     ) -> DResult<Expr> {
-        let captures = self.captured_locals(all_param_pats, cur_body)?;
+        let captures = self.captured_locals_at(all_param_pats, cur_body)?;
         let mut clone_set: BTreeSet<Symbol> = BTreeSet::new();
         let mut noncl_set: BTreeSet<Symbol> = BTreeSet::new();
-        for (sym, binder_ty) in captures {
+        let mut capture_spans: BTreeMap<Symbol, Span> = BTreeMap::new();
+        for (sym, capture_span, binder_ty) in captures {
             let ir_ty = binder_ty.classified();
             if fun_value_arc_promotable(ir_ty) && self.promotable_fn_binders.borrow().contains(&sym)
             {
@@ -18740,6 +18939,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Some(false) => {
                     noncl_set.insert(sym);
+                    capture_spans.insert(sym, capture_span);
                 }
                 None => {}
             }
@@ -18747,9 +18947,9 @@ impl<'a> Lowerer<'a> {
         rewrite_captured_clones(
             &clone_set,
             &noncl_set,
-            &CaptureWalk::refusing(span),
+            &CaptureWalk::refusing_at(span, capture_spans),
             body,
-            0,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )
     }
 
@@ -18768,7 +18968,7 @@ impl<'a> Lowerer<'a> {
     ///   `Clone` `Arc` carrier when a read here would move it;
     /// * a `CloneOk` read clones, exactly as in a source lambda, or the closure
     ///   would move it out of its `Fn` environment (E0507);
-    /// * a `NonClone` read the body moves (anything but a depth-0 callee) is
+    /// * a `NonClone` read the body moves (anything but a borrowing callee) is
     ///   recorded: the closure is then `FnOnce` only and is built as an
     ///   [`Expr::OnceLambda`], which the once check admits only where its
     ///   position calls it at most once;
@@ -18807,7 +19007,11 @@ impl<'a> Lowerer<'a> {
         }
         let walk = CaptureWalk::recording(span);
         let body = Box::new(rewrite_captured_clones(
-            &clone_set, &noncl_set, &walk, body, 0,
+            &clone_set,
+            &noncl_set,
+            &walk,
+            body,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )?);
         Ok(match walk.first_moved() {
             None => Expr::Lambda { params, ret, body },
@@ -18832,7 +19036,11 @@ impl<'a> Lowerer<'a> {
     /// The previous map is restored once `f` returns, whatever path `f` exits
     /// by, so a definition's generics can never stay in scope for the next
     /// definition. `None` leaves the current map untouched.
-    fn with_poly_tvars<T>(&self, poly: Option<BTreeMap<u32, Symbol>>, f: impl FnOnce() -> T) -> T {
+    fn with_poly_tvars<T>(
+        &self,
+        poly: Option<BTreeMap<ipe_types::SolverVar, Symbol>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
         let Some(poly) = poly else {
             return f();
         };
@@ -18959,9 +19167,10 @@ impl<'a> Lowerer<'a> {
             // per call (E0507) unless it rides the `Clone` `Arc` carrier —
             // the flags walk deliberately excludes those slots, so the flow
             // check is the param-side trigger for them.
-            if flags.non_callee_ge1
-                || flags.any_ge2
+            if flags.move_in_recallable
+                || flags.any_past
                 || count_fn_value_uses(sym, &body) > 1
+                || fn_value_use_after_consume(sym, &body, &self.enum_payloads)
                 || flows_into_sync_kernel_call(sym, &body)
             {
                 let shimmed = shim_fn_value_reads(
@@ -19352,36 +19561,17 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Look up a `Ty::Var` raw union-find representative against
-    /// [`Self::current_poly_tvars`], tolerating either tagged or untagged
-    /// input.
+    /// The enclosing definition's generic named by a `Ty::Var` raw.
     ///
-    /// SEAL fix: `SolvedTypes::poly_var_map` populates
-    /// `current_poly_tvars` two different ways depending on the enclosing
-    /// binding's shape — see the doc comment on
-    /// [`ipe_types::untag_solver_var`] for the full rationale. In short: a
-    /// **typed** binding's own quantified vars are keyed by the BARE
-    /// union-find representative (its `params`/`ret` are read straight from
-    /// the annotation, never zonked), while a **boundary-scheme-promoted
-    /// untyped** binding's are keyed by the TAGGED representative (their
-    /// region/env types always come back through `zonk`, which tags). A
-    /// `Ty::Var` raw arriving HERE may be either form too — a nested lambda's
-    /// return-type slot (`region_ty`, always zonked/tagged) inside a
-    /// *typed* enclosing function needs to match against that function's
-    /// BARE keys, so a single fixed-representation lookup silently misses.
-    /// Probing both the raw and its tag-toggled form closes that gap
-    /// regardless of which side is tagged.
+    /// Every [`Self::current_poly_tvars`] key is an [`ipe_types::SolverVar`],
+    /// the tagged form `zonk` writes into every solved `Ty::Var`, so a tagged
+    /// raw is answered by exact lookup. An untagged raw is an annotation
+    /// symbol, never a solver variable, and has no key: it returns `None`, so
+    /// a symbol id equal to a variable's bare id cannot pick up that
+    /// variable's generic.
     fn poly_tvar_symbol(&self, raw: u32) -> Option<Symbol> {
-        let map = self.current_poly_tvars.borrow();
-        if let Some(&sym) = map.get(&raw) {
-            return Some(sym);
-        }
-        let toggled = if ipe_types::is_solver_var(raw) {
-            ipe_types::untag_solver_var(raw)
-        } else {
-            ipe_types::tag_solver_var(raw)
-        };
-        map.get(&toggled).copied()
+        let key = ipe_types::SolverVar::from_raw(raw)?;
+        self.current_poly_tvars.borrow().get(&key).copied()
     }
 
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
@@ -20345,8 +20535,9 @@ impl<'a> Lowerer<'a> {
             //   (a) an enclosing annotated function's generic type parameter —
             //       e.g. `parentMsg` in `view : (Msg -> parentMsg) -> Counter ->
             //       Html parentMsg`.  Region types inside the body carry this as
-            //       `Ty::Var(uf_rep)` where `uf_rep` is the union-find
-            //       representative of the rigid (skolem) created for `parentMsg`.
+            //       `Ty::Var(tag_solver_var(uf_rep))` where `uf_rep` is the
+            //       union-find representative of the rigid (skolem) created for
+            //       `parentMsg`.
             //       → emit `IrType::Generic(sym)` so the backend produces
             //       `Attribute<T1>` rather than `Attribute<()>`, avoiding E0308.
             //
@@ -20357,7 +20548,8 @@ impl<'a> Lowerer<'a> {
             //
             // `current_poly_tvars` (populated by `lower_def` for each `Def::Typed`
             // before it recurses into the body, and restored afterward) maps
-            // uf_rep → annotation var symbol for the current enclosing function.
+            // tagged uf_rep → annotation var symbol for the current enclosing
+            // function.
             // An empty map (unannotated or non-polymorphic context) always falls
             // through to `IrType::Unit`.
             Ty::Var(v) => self
@@ -23512,6 +23704,13 @@ impl<'a> Lowerer<'a> {
                 self.reject_fn_element_for_capability_kernel(&resolved, callee.span, args)?;
                 self.reject_nonclone_handler_capture(&resolved, args)?;
                 let arity = self.callee_arity(&resolved)?;
+                // An intercept-only placeholder that is saturated or over-applied
+                // here escaped its rewrite; refuse it before any arity shape can
+                // emit its placeholder symbol. The partial shape is refused by
+                // `eta_expand_partial` (IPE-L0146, point-free).
+                if args.len() >= arity {
+                    reject_off_intercept_store_kernel(&resolved, call_span)?;
+                }
                 // Close the `Arc`-vs-`Box` frontier at a higher-order kernel's
                 // mapper over stored functions, once, ahead of the arity split,
                 // so the saturated, partial, and over-applied shapes share one
@@ -25319,12 +25518,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::WebRevocationStore
                 // ── Server: bearer token source — arity 0 ────────────────
                 // `Server.bearerToken : TokenSource`
-                | KernelFn::ServerTokenBearer
-                // ── BackoffStrategy constructors — arity 0 ────────────────
-                | KernelFn::BackoffLinear
-                | KernelFn::BackoffLinearWithJitter
-                | KernelFn::BackoffExponential
-                | KernelFn::BackoffExponentialWithJitter,
+                | KernelFn::ServerTokenBearer,
             ) => Ok(0),
             Callee::Kernel(
                 KernelFn::StringFromInt
@@ -25677,7 +25871,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StoreUpper
                 | KernelFn::StoreLower
                 // ── Server: cookie token source — arity 1 ────────────────
-                // `Server.cookieToken : String -> TokenSource`
+                // `Server.cookieToken : String -> Result Error TokenSource`
                 | KernelFn::ServerCookieToken
                 // ── Ipe.Ffi.Js port — outbound. `Js.send : a -> Cmd msg`. Arity 1;
                 //    the port intercept rejects it before emission, this is the
@@ -25969,7 +26163,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ServerQueryParam
                 | KernelFn::ServerHeader
                 | KernelFn::ServerGetCookie
-                // `Server.cookie : String -> String -> Cookie`
+                // `Server.cookie : String -> String -> Result Error Cookie`
                 | KernelFn::ServerCookieNew
                 // `Server.withCookie : Cookie -> Response -> Response`
                 | KernelFn::ServerWithCookie
@@ -26056,7 +26250,7 @@ impl<'a> Lowerer<'a> {
                 // `required : String -> Decoder a -> Decoder (a -> b) -> Decoder b`
                 | KernelFn::DbDecRequired
                 // ── Server arity-3 ───────────────────────────────────────
-                // `Server.withHeader : String -> String -> Response -> Response`
+                // `Server.withHeader : String -> String -> Response -> Result Error Response`
                 | KernelFn::ServerWithHeader
                 // `Server.getAuthed/postAuthed/putAuthed/deleteAuthed :
                 //     String -> AuthConfig
@@ -28137,14 +28331,6 @@ impl<'a> Lowerer<'a> {
                         Ok(Callee::Kernel(KernelFn::TaskWithMaxAttempts))
                     }
                     ("Task", "withBaseMs") => Ok(Callee::Kernel(KernelFn::TaskWithBaseMs)),
-                    ("Task", "Linear") => Ok(Callee::Kernel(KernelFn::BackoffLinear)),
-                    ("Task", "LinearWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffLinearWithJitter))
-                    }
-                    ("Task", "Exponential") => Ok(Callee::Kernel(KernelFn::BackoffExponential)),
-                    ("Task", "ExponentialWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffExponentialWithJitter))
-                    }
                     // ── Io kernels ──────────────────────────────────────
                     ("Io", "readLine") => Ok(Callee::Kernel(KernelFn::IoReadLine)),
                     ("Io", "readSecret") => Ok(Callee::Kernel(KernelFn::IoReadSecret)),
@@ -29154,10 +29340,11 @@ impl<'a> Lowerer<'a> {
             // PList / PCons gate below. Class 4 item C2.
             canon::Pattern_::PStr(_) => Err(unsupported(p.span, Feature::NestedCtorDiscrimination)),
             // An alias `inner as name` lowers to the IR binding-with-subpattern.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_payload_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_payload_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
@@ -29264,10 +29451,11 @@ impl<'a> Lowerer<'a> {
             | canon::Pattern_::POr(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // An alias `inner as name` is irrefutable exactly when `inner` is, so
             // it recurses: a refutable inner surfaces the same IPE-L0115 gap.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_destructure_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_destructure_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             // A record pattern nested inside a tuple destructure (`(Ok {name}, y)`
             // single-arm form, `({ x }, y) = e`). The element's complete record
             // type is recovered from the per-sub-pattern region the constraint
@@ -29315,10 +29503,11 @@ impl<'a> Lowerer<'a> {
             // scrutinee's type — so a nested record still recovers its full
             // field set. Lowers to Rust's binding-with-subpattern
             // `name @ <inner>`.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_binder_pat(inner, value)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_binder_pat(inner, value)?;
+                self.refuse_nonclone_alias_part(&inner_pat, value.span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -29781,7 +29970,7 @@ impl<'a> Lowerer<'a> {
                 &noncl_set,
                 &CaptureWalk::refusing(value_span),
                 value,
-                0,
+                CaptureScope::Top.enter(ClosureKind::Recallable),
             )?
         };
         let thunk_name = self.fresh_destructure_thunk_symbol()?;
@@ -29885,11 +30074,11 @@ impl<'a> Lowerer<'a> {
         }
         // NOTE the deferred-capture signal is NOT a trigger: a deferral
         // also fires for the lean, sound capture shapes (a single
-        // depth-0-callee read inside one closure), which must keep the bare
+        // borrowing-callee read inside one closure), which must keep the bare
         // `Box` carrier byte-identically. The walkers below detect exactly
         // the read patterns a `Box` cannot serve; `needs_shared_capture`
-        // (depth ≥ 2 / 2+ closure captures) joins in the carrier-flip
-        // condition further down.
+        // (a read past a `Recallable` closure / 2+ closure captures) joins in
+        // the carrier-flip condition further down.
         // Use threaded counts from the accumulator when available (O(1)),
         // falling back to fresh walks of `acc` (O(|acc|)) only when called
         // without a precomputed summary.
@@ -29899,7 +30088,8 @@ impl<'a> Lowerer<'a> {
         // in evaluation order by ANY further read, including a borrowing
         // direct-callee call — is the third unsound shape. It is invisible to
         // `count_fn_value_uses` (which exempts the callee position) and to
-        // `non_callee_ge1` (the reuse can be two depth-0 reads), so it is
+        // `move_in_recallable` (the reuse can be two reads outside every
+        // closure), so it is
         // detected order-aware here. Like `flows_into_sync_kernel_call` it is
         // not additively threadable across `Let` siblings (a move in one
         // binding and a use in the next cross the boundary), so it is a full
@@ -29907,10 +30097,10 @@ impl<'a> Lowerer<'a> {
         let new_trigger = fun_shape.is_some()
             && (precomputed.map_or_else(
                 || {
-                    fn_value_read_flags(name, &acc).non_callee_ge1
+                    fn_value_read_flags(name, &acc).move_in_recallable
                         || count_fn_value_uses(name, &acc) > 1
                 },
-                |a| a.fn_flags.non_callee_ge1 || a.fn_value_uses > 1,
+                |a| a.fn_flags.move_in_recallable || a.fn_value_uses > 1,
             ) || fn_value_use_after_consume(name, &acc, &self.enum_payloads));
         let mut acc = match (&fun_shape, new_trigger) {
             (Some((ps, r)), true) => {
@@ -29990,20 +30180,21 @@ impl<'a> Lowerer<'a> {
         // is built INLINE at the call site, never when it is a `Var` read
         // of an already-built `Box<dyn Fn + Send>` local (capturing an
         // already-non-Sync value cannot make the capturing wrapper `Sync`).
-        // `flows_into_sync_kernel_call` detects this at depth 0 — where
+        // `flows_into_sync_kernel_call` detects this outside every closure — where
         // `needs_shared_capture` intentionally stays silent, a single
         // non-nested capture being the common sound case for THAT trigger —
         // and ORs into the same promotion path.
         let mut value = value;
-        // A NEW-trigger promotion (deferred capture / non-callee depth ≥ 1
-        // read / value reuse — decided on the LOWERED scope above) MUST flip
+        // A NEW-trigger promotion (deferred capture / non-callee read inside
+        // a `Recallable` closure / value reuse — decided on the LOWERED scope
+        // above) MUST flip
         // the carrier here or the inserted `.clone()`s hit E0599 on a `Box`.
         // OR it into the promotion alongside the existing nesting /
         // sync-kernel heuristics.
-        // `needs_shared_capture` is derived from the threaded depth-count
+        // `needs_shared_capture` is derived from the threaded capture-scope
         // summary when available.  `apply_move_ownership_precomputed` (the
         // non-new-trigger path) converts Var→CloneVar but preserves capture
-        // depths, so the threaded value remains correct post-rewrite.
+        // scopes, so the threaded value remains correct post-rewrite.
         //
         // `flows_into_sync_kernel_call` is always a full walk: its
         // alias-chain resolution cannot be accumulated incrementally across
@@ -30047,13 +30238,18 @@ impl<'a> Lowerer<'a> {
                 // alias `Var`, a top-level `FuncValue`, a fn-typed record
                 // field access, …): mint the `Arc` carrier by eta-expanding
                 // the value into a `SharedLambda` that moves the underlying
-                // value in once and forwards per call. A LEGACY-only trigger
-                // keeps the value untouched — an alias binding propagates the
-                // promoted root's `Arc` type through Rust inference (see
-                // `flows_into_sync_kernel_call`'s alias-chain doc), and that
-                // behaviour is byte-pinned.
+                // value in once and forwards per call. A nesting trigger
+                // (`needs_shared_capture`) mints it the same way, an alias
+                // `Var` included: its reads inside closures become
+                // `.clone()`s, and nothing promotes the alias root for them, so
+                // a `Box` root would leave them without `Clone`. An alias under
+                // the sync-kernel trigger alone keeps the value untouched — it
+                // propagates the promoted root's `Arc` type through Rust
+                // inference (see `flows_into_sync_kernel_call`'s alias-chain
+                // doc, which promotes the root too), and that behaviour is
+                // byte-pinned.
                 other => {
-                    value = if new_trigger {
+                    value = if new_trigger || needs_shared_val {
                         eta_shared_rebind(other, &ps, &r, self.eta_slice())?
                     } else {
                         other
@@ -30558,7 +30754,7 @@ impl<'a> Lowerer<'a> {
                     let arms_s = branches_s
                         .iter()
                         .map(|br| {
-                            let arm_pat = self.lower_arm_pat(&br.pat)?;
+                            let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
                             self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
@@ -30648,7 +30844,7 @@ impl<'a> Lowerer<'a> {
                 let (arm_pat, arm_guard, nested_bindings) =
                     match self.desugar_ctor_nested_special_args(&br.pat)? {
                         Some((pat, guard, bindings)) => (pat, guard, bindings),
-                        None => (self.lower_arm_pat(&br.pat)?, None, Vec::new()),
+                        None => (self.lower_arm_pat(&br.pat, scrut.span)?, None, Vec::new()),
                     };
                 // A pattern binder that binds a fn-typed value (the `varN`
                 // projection `Codec f -> …` case) is a promotable fn binder for
@@ -30814,7 +31010,7 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .any(|(_, p)| Self::arm_has_dispatch_needing_alias(p)),
             Pat::Ctor { args, .. } => args.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Slice { prefix, rest } => {
+            Pat::Slice { prefix, rest, .. } => {
                 prefix.iter().any(Self::arm_has_dispatch_needing_alias)
                     || rest
                         .as_deref()
@@ -30904,7 +31100,11 @@ impl<'a> Lowerer<'a> {
     /// [`Self::lower_payload_pat`]). A tuple / record head is the destructure
     /// path (handled by the single-arm branch of [`Self::lower_case`]); reaching
     /// it here is a multi-arm product `case`, the tuple-pattern gap (IPE-L0115).
-    fn lower_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// `ty_span` is the span whose solved region type is `p`'s scrutinee type:
+    /// the `case` scrutinee for a root head, the element sub-pattern for a tuple
+    /// column. An alias or or-pattern keeps it, since neither changes the type.
+    fn lower_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
         match &p.value {
             canon::Pattern_::PVar(s) => Ok(Pat::Var(*s)),
             // `()` is irrefutable and its scrutinee is unit-typed; a wildcard arm
@@ -30919,7 +31119,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PChar(c) => Ok(Pat::Char(c.clone())),
             canon::Pattern_::PStr(s) => Ok(Pat::Str(s.clone())),
             canon::Pattern_::PAlias(inner, name) => {
-                Ok(Pat::Alias(Box::new(self.lower_arm_pat(inner)?), name.value))
+                let inner_pat = self.lower_arm_pat(inner, ty_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, ty_span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
             }
             canon::Pattern_::PCtor {
                 home,
@@ -30949,7 +31151,7 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
-                    .map(|e| self.lower_arm_pat(e))
+                    .map(|e| self.lower_arm_pat(e, e.span))
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(Pat::Tuple(subs))
             }
@@ -30959,7 +31161,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PRecord(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // A list (`[a, b]`) or cons (`x :: xs`) case-arm head flattens to the
             // slice-shaped IR [`Pat::Slice`].
-            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => self.lower_list_arm_pat(p),
+            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
+                self.lower_list_arm_pat(p, ty_span)
+            }
             // An or-pattern `p1 | p2 | …` lowers each alternative through this
             // same arm lowerer into a single [`Pat::Or`]. The backend renders it
             // as the native Rust or-pattern `p1 | p2 | …` with the arm body
@@ -30969,8 +31173,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
-                    .map(|a| self.lower_arm_pat(a))
+                    .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
+                owned_or_refusal(&lowered, p.span)?;
                 Ok(Pat::Or(lowered))
             }
         }
@@ -31084,6 +31289,10 @@ impl<'a> Lowerer<'a> {
                 // is the root-cause fix — `flat` itself still supplies the
                 // prefix/tail shape used below, so it stays in scope.
                 //
+                // The prelude copies each head out by `ListIndexClone` and takes
+                // the tail by `List.drop`, so a binding shape over a non-`Clone`
+                // element has no sound rendering here. [IPE-L0116]
+                let elem = self.nested_cons_elem(&flat, a.span)?;
                 // Replace this ctor arg with a fresh `Vec` binder and record the
                 // guard + per-element prelude bindings against it.
                 let fresh = self.fresh_nested_cons_binder()?;
@@ -31096,13 +31305,15 @@ impl<'a> Lowerer<'a> {
                 });
                 // Head-element binders BORROW `fresh` (index + clone), so they
                 // precede the tail binder that MOVES it.
-                for (idx, elem) in flat.prefix.iter().enumerate() {
-                    if let NestedBinder::Named(sym) = elem {
+                for (idx, binder) in flat.prefix.iter().enumerate() {
+                    if let NestedBinder::Named(sym) = binder {
+                        let elem = elem.clone().ok_or_else(unresolved_nested_cons_elem)?;
                         bindings.push((
                             *sym,
                             Expr::ListIndexClone {
                                 list: Box::new(Expr::Var(fresh)),
                                 index: idx,
+                                elem,
                             },
                         ));
                     }
@@ -31142,6 +31353,20 @@ impl<'a> Lowerer<'a> {
             rhs: Box::new(g),
         });
         Ok(Some((ir_pat, guard, bindings)))
+    }
+
+    /// The element type of the nested list `flat` at `span`, when it binds a part.
+    ///
+    /// A binding shape copies each head out by `ListIndexClone` and takes the
+    /// tail by `List.drop`, so its element must be `Clone`; any other element
+    /// is refused (IPE-L0116). A shape that binds nothing reads no element.
+    fn nested_cons_elem(&self, flat: &FlatNestedList, span: Span) -> DResult<Option<IrType>> {
+        if !flat.binds_any() {
+            return Ok(None);
+        }
+        let elem = self.list_storage_elem_ir(span)?;
+        nested_cons_ownership_refusal(slice_ownership(self.clone_env(), &elem), span)?;
+        Ok(Some(elem))
     }
 
     /// Classify a constructor-arg sub-pattern as a SUPPORTABLE nested list for
@@ -31202,7 +31427,24 @@ impl<'a> Lowerer<'a> {
     /// sub-pattern lowers through [`Self::lower_payload_pat`] (variable /
     /// wildcard / literal / alias / nested tuple / constructor); the open tail
     /// binds a variable / wildcard / alias via [`Self::lower_rest_pat`].
-    fn lower_list_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// The slice's [`SliceOwnership`] is decided here, once, from the element
+    /// type of the list at `ty_span` (see [`slice_ownership`]).
+    fn lower_list_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
+        let elem = self.list_storage_elem_ir(ty_span)?;
+        let own = slice_ownership(self.clone_env(), &elem);
+        let (prefix, rest) = self.lower_list_arm_shape(p)?;
+        owned_slice_refusal(own, &prefix, p.span)?;
+        Ok(Pat::Slice {
+            prefix,
+            rest,
+            own,
+            elem,
+        })
+    }
+
+    /// Flatten a list / cons arm head into its element prefix and its open tail binder.
+    fn lower_list_arm_shape(&self, p: &canon::Pattern) -> DResult<(Vec<Pat>, Option<Box<Pat>>)> {
         let mut prefix = Vec::new();
         let mut cur = p;
         loop {
@@ -31212,7 +31454,7 @@ impl<'a> Lowerer<'a> {
                     for e in elems {
                         prefix.push(self.lower_payload_pat(e)?);
                     }
-                    return Ok(Pat::Slice { prefix, rest: None });
+                    return Ok((prefix, None));
                 }
                 canon::Pattern_::PCons(head, tail) => {
                     prefix.push(self.lower_payload_pat(head)?);
@@ -31226,10 +31468,7 @@ impl<'a> Lowerer<'a> {
                         // the remaining list.
                         canon::Pattern_::PVar(_) | canon::Pattern_::PAnything => {
                             let rest = Self::lower_rest_pat(tail)?;
-                            return Ok(Pat::Slice {
-                                prefix,
-                                rest: Some(Box::new(rest)),
-                            });
+                            return Ok((prefix, Some(Box::new(rest))));
                         }
                         // Any other tail shape (an alias / literal / constructor /
                         // tuple / record in tail position) is not a list pattern
@@ -31806,6 +32045,36 @@ mod tests {
                 lowerer.binder_ir_type(Some(UNIT_SPAN)),
                 Ok(Some(super::BinderType::Resolved(super::IrType::Unit)))
             ));
+        });
+    }
+
+    /// An untagged raw equal to a generic's bare variable id is a symbol and names no generic.
+    ///
+    /// The generic map is keyed by the tagged variable; probing the raw's
+    /// tag-flipped form would read the symbol as that variable and lower it to
+    /// the enclosing generic.
+    #[test]
+    fn poly_tvar_lookup_never_reads_a_symbol_raw_as_a_variable_key() {
+        const BARE_VAR: u32 = 7;
+        with_binder_type_lowerer(|lowerer, generic| {
+            let poly = BTreeMap::from([(ipe_types::SolverVar::from_var(BARE_VAR), generic)]);
+            lowerer.with_poly_tvars(Some(poly), || {
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),
+                    Some(generic),
+                    "the tagged variable names its generic"
+                );
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(BARE_VAR),
+                    None,
+                    "an untagged raw is an annotation symbol, never a variable key"
+                );
+                let msg_slot = lowerer.ir_type_from_ty_ui_msg(&Ty::Var(BARE_VAR), UNIT_SPAN);
+                assert!(
+                    matches!(msg_slot, Ok(super::IrType::Unit)),
+                    "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
+                );
+            });
         });
     }
 
@@ -32489,11 +32758,15 @@ mod tests {
     /// prevent (a `.clone()` on a non-`Clone` carrier is cargo E0599 after
     /// ipe exit 0).
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture table drives every agreement assertion
     fn carrier_clone_authority_agrees_with_clone_class() {
         use ipe_intern::Symbol;
-        use ipe_ir::{EnumPayloadTable, IrType, ModPath, carrier_is_clone};
+        use ipe_ir::{
+            EnumPayloadTable, IrType, ModPath, SliceOwnership, carrier_is_clone,
+            carrier_is_clone_bounded,
+        };
 
-        use super::{CloneClass, CloneEnv, clone_class};
+        use super::{CloneClass, CloneEnv, clone_class, slice_ownership};
 
         // The shared authority agreement is checked on non-FFI types (an FFI
         // foreign-interface `Enum` is intentionally NonClone in `clone_class`
@@ -32570,7 +32843,76 @@ mod tests {
         assert!(carrier_is_clone(&named(shared_fn, Vec::new()), &payloads));
         assert!(carrier_is_clone(&named(wrap, vec![IrType::Int]), &payloads));
         assert!(!carrier_is_clone(&named(boxed_fn, Vec::new()), &payloads));
-        assert!(!carrier_is_clone(&named(wrap, vec![fun]), &payloads));
+        assert!(!carrier_is_clone(
+            &named(wrap, vec![fun.clone()]),
+            &payloads
+        ));
+
+        // The list-`case` ownership decision and the emitter's generic-aware
+        // authority agree exactly on every non-FFI type: a slice element moves
+        // out of an owned view exactly when its carrier is not `Clone` under
+        // the emitted bound. A generic or row-generic leaf at any depth carries
+        // that bound, so a composite over one copies out of the borrow.
+        let generic = IrType::Generic(Symbol::from_raw(8));
+        let row = IrType::RowGeneric(Symbol::from_raw(9));
+        let bounded_samples = [
+            generic.clone(),
+            row.clone(),
+            IrType::Tuple(vec![generic.clone(), IrType::Int]),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+            IrType::List(Box::new(generic)),
+        ];
+        for ty in &bounded_samples {
+            assert_eq!(
+                slice_ownership(env, ty),
+                SliceOwnership::BorrowClone,
+                "a generic-bounded element must copy out: {ty:?}"
+            );
+        }
+        for ty in samples.iter().chain(&bounded_samples) {
+            assert_eq!(
+                slice_ownership(env, ty) == SliceOwnership::OwnedMove,
+                !carrier_is_clone_bounded(ty, &payloads),
+                "slice_ownership / carrier_is_clone_bounded drift on {ty:?}"
+            );
+        }
+        assert_eq!(slice_ownership(env, &fun), SliceOwnership::OwnedMove);
+        assert_eq!(
+            slice_ownership(env, &IrType::Task(Box::new(IrType::Int))),
+            SliceOwnership::OwnedMove
+        );
+
+        // `carrier_is_clone_bounded` is not FFI-aware: it calls an opaque
+        // `Rust.*` handle `Clone`. The list-`case` decision gives such a handle
+        // no `Clone` fact, bare or nested, so its elements move.
+        let mut ffi_interner = Interner::new();
+        let ffi_home = ModPath(vec![
+            ffi_interner.intern("Rust").expect("intern"),
+            ffi_interner.intern("Bevy_ecs").expect("intern"),
+        ]);
+        let handle = IrType::Enum {
+            home: ffi_home,
+            name: ffi_interner.intern("World").expect("intern"),
+            args: Vec::new(),
+        };
+        let ffi_env = CloneEnv {
+            interner: &ffi_interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        for ty in [
+            handle.clone(),
+            IrType::Tuple(vec![handle.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(handle)),
+        ] {
+            assert!(carrier_is_clone_bounded(&ty, &payloads));
+            assert_eq!(
+                slice_ownership(ffi_env, &ty),
+                SliceOwnership::OwnedMove,
+                "an opaque FFI handle element must move out: {ty:?}"
+            );
+        }
     }
 
     /// SEAL: an FFI foreign opaque handle (`Rust.*`-homed `Enum`) is a real
@@ -33150,6 +33492,59 @@ mod tests {
             vec![user_call(vec![Expr::Var(w)]), user_call(vec![read_tag()])],
         );
         assert!(nonclone_read_after_move(env, w, &wrap_task, &unordered));
+    }
+
+    /// A run-statement continuation is the body of the `move |_|` closure
+    /// `task_and_then` receives, so any read of a function value there,
+    /// a borrowing direct call included, moves the value into it.
+    #[test]
+    fn taskseq_continuation_read_moves_the_fn_value() {
+        use ipe_ir::{CallPin, Callee, Expr, FuncId, OnFormKind};
+
+        use super::{count_fn_value_uses, fn_value_use_after_consume};
+
+        let mut interner = Interner::new();
+        let f = interner.intern("f").expect("intern");
+        let payloads = ipe_ir::EnumPayloadTable::new();
+        let pass = || Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args: vec![Expr::Var(f)],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+        let call_f = || Expr::Apply {
+            func: Box::new(Expr::Var(f)),
+            args: vec![Expr::Int(1)],
+        };
+        let seq = |effect: Expr, rest: Expr| Expr::TaskSeq {
+            effect: Box::new(effect),
+            rest: Box::new(rest),
+        };
+
+        // `do { use f ; f 1 }`: the effect moves `f`, the continuation closure
+        // captures it again.
+        let moved_then_called = seq(pass(), call_f());
+        assert_eq!(count_fn_value_uses(f, &moved_then_called), 2);
+        assert!(fn_value_use_after_consume(f, &moved_then_called, &payloads));
+
+        // `do { f 1 ; f 1 }`: the effect borrows; the one capture is sound.
+        let called_twice = seq(call_f(), call_f());
+        assert_eq!(count_fn_value_uses(f, &called_twice), 1);
+        assert!(!fn_value_use_after_consume(f, &called_twice, &payloads));
+
+        // `do { f 1 ; use f }`: inside the continuation the closure owns `f`.
+        let called_then_moved = seq(call_f(), pass());
+        assert_eq!(count_fn_value_uses(f, &called_then_moved), 1);
+        assert!(!fn_value_use_after_consume(
+            f,
+            &called_then_moved,
+            &payloads
+        ));
+
+        // A continuation that never reads `f` captures nothing.
+        let unrelated = seq(pass(), Expr::Unit);
+        assert_eq!(count_fn_value_uses(f, &unrelated), 1);
+        assert!(!fn_value_use_after_consume(f, &unrelated, &payloads));
     }
 
     /// A sequenced task whose capture-clone rewrite would clone a non-Clone
@@ -36726,6 +37121,477 @@ mod tests {
         assert!(
             super::instance_tvars(&[], &IrType::Int, msg, &instance(vec![], vec![]), &caller)
                 .is_empty()
+        );
+    }
+
+    /// The shared fixture of the list-`case` ownership tests: an interner and empty FFI and payload tables.
+    struct OwnFixture {
+        interner: Interner,
+        transparent: BTreeSet<(ipe_ir::ModPath, ipe_intern::Symbol)>,
+        payloads: ipe_ir::EnumPayloadTable,
+    }
+
+    impl OwnFixture {
+        fn new() -> Self {
+            Self {
+                interner: Interner::new(),
+                transparent: BTreeSet::new(),
+                payloads: ipe_ir::EnumPayloadTable::new(),
+            }
+        }
+
+        fn sym(&mut self, name: &str) -> ipe_intern::Symbol {
+            self.interner.intern(name).expect("intern")
+        }
+
+        const fn env(&self) -> super::CloneEnv<'_> {
+            super::CloneEnv {
+                interner: &self.interner,
+                transparent_ffi: &self.transparent,
+                payloads: &self.payloads,
+            }
+        }
+    }
+
+    /// `case ts of x :: r -> 1 ; _ -> 0` over the list binding `ts`, with the given ownership.
+    fn cons_case(
+        ts: ipe_intern::Symbol,
+        x: ipe_intern::Symbol,
+        r: ipe_intern::Symbol,
+        own: ipe_ir::SliceOwnership,
+    ) -> ipe_ir::Expr {
+        use ipe_ir::{Arm, Expr, Match, Pat};
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: Some(Box::new(Pat::Var(r))),
+            own,
+            elem: ipe_ir::IrType::Int,
+        };
+        Expr::Match(
+            Match::new_flat(
+                Expr::Var(ts),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        )
+    }
+
+    /// A list `case` moves its binders out of an owned view exactly when the element is non-`Clone`.
+    #[test]
+    fn slice_ownership_follows_the_element_clone_class() {
+        use ipe_ir::{IrType, ModPath, SliceOwnership};
+
+        use super::{flip_fun_in_storage_element, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let a = fx.sym("a");
+        let env = fx.env();
+        let task = IrType::Task(Box::new(IrType::Int));
+        let ffi_handle = IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        };
+        let fun = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+        let owned = [
+            task.clone(),
+            IrType::Maybe(Box::new(task)),
+            ffi_handle,
+            IrType::Tuple(vec![IrType::Int, IrType::Cmd(Box::new(IrType::Unit))]),
+        ];
+        for elem in &owned {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::OwnedMove,
+                "{elem:?}"
+            );
+        }
+        // A function element sits on the `Arc` storage carrier, as `list_elem_ir` stores it.
+        let borrowed = [
+            IrType::Int,
+            IrType::Str,
+            flip_fun_in_storage_element(fun),
+            IrType::Generic(a),
+        ];
+        for elem in &borrowed {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
+    /// A composite over a row witness carries the emitted `Clone` bound, so its elements copy out.
+    #[test]
+    fn row_generic_composite_elements_copy_out() {
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::slice_ownership;
+
+        let mut fx = OwnFixture::new();
+        let r = fx.sym("r");
+        let env = fx.env();
+        let row = IrType::RowGeneric(r);
+        for elem in [
+            row.clone(),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+        ] {
+            assert_eq!(
+                slice_ownership(env, &elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
+    /// A second use of a `List (Task ..)` moved by a list `case` is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let case = cons_case(ts, x, r, SliceOwnership::OwnedMove);
+        let reused = Expr::Tuple(vec![case.clone(), Expr::Var(ts)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &reused, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // The case alone is one consume and is accepted.
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &case, span),
+            Ok(())
+        );
+    }
+
+    /// A field-path read of a `List (Task ..)` after a list `case` moved it is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_field_read_after_move_fails_closed() {
+        use std::collections::BTreeMap;
+
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Arm, Expr, IrType, Match, Pat, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let model = fx.sym("model");
+        let tasks = fx.sym("tasks");
+        let x = fx.sym("x");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let record = IrType::Record(BTreeMap::from([(tasks, list_task.clone())]));
+        let field = || Expr::Access {
+            record: Box::new(Expr::Var(model)),
+            field: tasks,
+            field_ty: list_task.clone(),
+        };
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: None,
+            own: SliceOwnership::OwnedMove,
+            elem: IrType::Task(Box::new(IrType::Int)),
+        };
+        let case = Expr::Match(
+            Match::new_flat(
+                field(),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        );
+        let read_after = Expr::Tuple(vec![case, field()]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, model, &record, &read_after, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A second use of an FFI-handle list moved by a list `case` is refused by the foreign-handle gate.
+    #[test]
+    fn owned_ffi_handle_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, ModPath, SliceOwnership};
+
+        use super::{reject_foreign_handle_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let hs = fx.sym("hs");
+        let h = fx.sym("h");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let handles = IrType::List(Box::new(IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        }));
+        let reused = Expr::Tuple(vec![
+            cons_case(hs, h, r, SliceOwnership::OwnedMove),
+            Expr::Var(hs),
+        ]);
+        assert_eq!(
+            reject_foreign_handle_reuse(env, hs, &handles, &reused, span),
+            Err(unsupported(span, Feature::ForeignHandleReuse))
+        );
+    }
+
+    /// A list `case` over a non-`Clone` capture inside a re-callable closure is refused with IPE-L0126.
+    #[test]
+    fn owned_list_case_in_recallable_closure_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::SliceOwnership;
+        use ipe_ir::once_closure::CaptureScope;
+
+        use super::{CaptureWalk, rewrite_captured_clones, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let span = Span::new(17, 23);
+        let noncl = BTreeSet::from([ts]);
+        let refused = rewrite_captured_clones(
+            &BTreeSet::new(),
+            &noncl,
+            &CaptureWalk::refusing(span),
+            cons_case(ts, x, r, SliceOwnership::OwnedMove),
+            CaptureScope::InRecallable,
+        );
+        assert_eq!(
+            refused.map(|_| ()),
+            Err(unsupported(span, Feature::NonCloneCapture))
+        );
+    }
+
+    /// An owned-move list element alias whose inner binds is refused with IPE-L0135.
+    #[test]
+    fn owned_slice_element_alias_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{ModPath, Pat, SliceOwnership};
+
+        use super::{owned_slice_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let maybe = fx.sym("Maybe");
+        let just = fx.sym("Just");
+        let t = fx.sym("t");
+        let m = fx.sym("m");
+        let span = Span::new(17, 23);
+        let just_t = Pat::Ctor {
+            home: ModPath(vec![maybe]),
+            ty: maybe,
+            variant: just,
+            args: vec![Pat::Var(t)],
+        };
+        let aliased = [Pat::Alias(Box::new(just_t), m)];
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::OwnedMove, &aliased, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // A borrowed slice copies each element, so the alias stays accepted.
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::BorrowClone, &aliased, span),
+            Ok(())
+        );
+    }
+
+    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
+    #[test]
+    fn owned_or_pattern_binding_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Pat, SliceOwnership};
+
+        use super::{owned_or_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let x = fx.sym("x");
+        let span = Span::new(17, 23);
+        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
+            prefix,
+            rest: None,
+            own,
+            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
+        };
+        let binding = [
+            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
+        ];
+        assert_eq!(
+            owned_or_refusal(&binding, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        let unbound = [
+            slice(SliceOwnership::OwnedMove, vec![]),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
+        ];
+        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
+        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
+        let borrowed = [
+            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
+            slice(
+                SliceOwnership::BorrowClone,
+                vec![Pat::Wildcard, Pat::Var(x)],
+            ),
+        ];
+        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
+    }
+
+    /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.
+    #[test]
+    fn nested_owned_cons_in_ctor_payload_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::{nested_cons_ownership_refusal, slice_ownership, unsupported};
+
+        let fx = OwnFixture::new();
+        let span = Span::new(17, 23);
+        let own = slice_ownership(fx.env(), &IrType::Task(Box::new(IrType::Int)));
+        assert_eq!(
+            nested_cons_ownership_refusal(own, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        assert_eq!(
+            nested_cons_ownership_refusal(SliceOwnership::BorrowClone, span),
+            Ok(())
+        );
+    }
+
+    /// An alias whose inner binds over a non-`Clone` part is refused with IPE-L0135.
+    #[test]
+    fn alias_rebuild_over_nonclone_part_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, Pat};
+
+        use super::{alias_rebuild_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let a = fx.sym("a");
+        let b = fx.sym("b");
+        let g = fx.sym("g");
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let task = IrType::Task(Box::new(IrType::Int));
+        let pair = Pat::Tuple(vec![Pat::Var(a), Pat::Var(b)]);
+        let nonclone = IrType::Tuple(vec![task, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &nonclone, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // An inner that binds nothing takes no part.
+        let unbound = Pat::Tuple(vec![Pat::Wildcard, Pat::Wildcard]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &unbound, &nonclone, span),
+            Ok(())
+        );
+        // A `Clone` part and a generic part copy.
+        let clone_part = IrType::Tuple(vec![IrType::Str, IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &clone_part, span), Ok(()));
+        assert_eq!(
+            alias_rebuild_refusal(env, &Pat::Var(a), &IrType::Generic(g), span),
+            Ok(())
+        );
+        // A composite over a row witness carries the emitted `Clone` bound.
+        let row_part = IrType::Tuple(vec![IrType::RowGeneric(g), IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &row_part, span), Ok(()));
+        // An opaque FFI handle nested in the part has no `Clone` fact.
+        let handle = IrType::Enum {
+            home: ipe_ir::ModPath(vec![rust, bevy]),
+            name: entity,
+            args: Vec::new(),
+        };
+        let ffi_part = IrType::Tuple(vec![handle, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &ffi_part, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A binding alias whose part has no recorded region type is refused as a compiler bug.
+    #[test]
+    fn alias_part_without_region_type_is_a_compiler_bug() {
+        use ipe_diagnostics::Diagnostic;
+        use ipe_ir::Pat;
+
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let main = interner.intern("Main").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![main],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let unrecorded = Span::new(17, 23);
+        let refused = lowerer.refuse_nonclone_alias_part(&Pat::Var(x), unrecorded, unrecorded);
+        assert!(
+            matches!(
+                refused,
+                Err(Diagnostic::CompilerBug {
+                    where_: "ipe_lower::refuse_nonclone_alias_part",
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // An inner that binds nothing takes no part and needs no type.
+        assert_eq!(
+            lowerer.refuse_nonclone_alias_part(&Pat::Wildcard, unrecorded, unrecorded),
+            Ok(())
+        );
+    }
+
+    /// A borrowed list `case` over `List Int` leaves the list owned, so a later reuse stays accepted.
+    #[test]
+    fn borrowed_list_case_reuse_is_accepted() {
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{owned_slice_refusal, reject_nonclone_value_reuse, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let xs = fx.sym("xs");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_int = IrType::List(Box::new(IrType::Int));
+        let own = slice_ownership(env, &IrType::Int);
+        assert_eq!(own, SliceOwnership::BorrowClone);
+        assert_eq!(owned_slice_refusal(own, &[], span), Ok(()));
+        let reused = Expr::Tuple(vec![cons_case(xs, x, r, own), Expr::Var(xs)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, xs, &list_int, &reused, span),
+            Ok(())
         );
     }
 }

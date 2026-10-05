@@ -41,7 +41,7 @@
 //!
 //! Every parse-time check the manifest must carry runs here against the
 //! extracted literal, via the *same* shared functions the rest of the CLI uses —
-//! the `publicEnv` secret-name denylist, semver parsing, capability validation,
+//! the `publicEnv` name parse (`PublicEnvName`), semver parsing, capability validation,
 //! the allocator vocabulary, and the wrapper path jail.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,8 +59,8 @@ use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
     BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape, IpeDep,
-    MobileDelivery, Program, ProjectManifest, RustDep, ScreenOrientation, WasmConfig,
-    is_denylisted_public_env_name,
+    MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName, RustDep,
+    ScreenOrientation, WasmConfig,
 };
 use crate::text;
 
@@ -961,8 +961,8 @@ impl Reader<'_> {
     }
 
     /// Read the `wasm` field: `Off` (no bundle) or `On { mode, entry, mount,
-    /// publicEnv, optLevel }`. The `publicEnv` list runs the UNCHANGED secret-name
-    /// denylist. Fields other than `mode` default to absent.
+    /// publicEnv, optLevel }`. The `publicEnv` list parses into a
+    /// [`PublicEnvAllowlist`]. Fields other than `mode` default to absent.
     fn read_wasm(&self, expr: &Expr) -> Result<WasmConfig, CliError> {
         let (ctor, args) = self.expect_ctor_app(expr, "a wasm setting")?;
         match ctor {
@@ -991,11 +991,7 @@ impl Reader<'_> {
                 }
                 "entry" => wasm.entry = Some(self.expect_string(value)?),
                 "mount" => wasm.mount = Some(self.expect_string(value)?),
-                "publicEnv" => {
-                    let names = self.expect_string_list(value)?;
-                    self.check_public_env(value.span, &names)?;
-                    wasm.public_env = names;
-                }
+                "publicEnv" => wasm.public_env = self.read_public_env(value)?,
                 "optLevel" => wasm.opt_level = Some(self.expect_string(value)?),
                 other => {
                     return Err(self.reject(
@@ -1120,25 +1116,21 @@ impl Reader<'_> {
         Ok(modules)
     }
 
-    /// Run the UNCHANGED `publicEnv` secret-name denylist over the extracted
-    /// names. A denylisted name is a read-time build error — the single most
-    /// security-load-bearing check, preserved via the shared
-    /// [`is_denylisted_public_env_name`].
-    fn check_public_env(&self, span: Span, names: &[String]) -> Result<(), CliError> {
-        for name in names {
-            if is_denylisted_public_env_name(name) {
-                return Err(self.reject(
-                    span,
-                    &format!(
-                        "`publicEnv` lists {name:?}, which matches the secret-name denylist \
-                         (a SECRET / TOKEN / KEY / PASSWORD / PASSWD / CREDENTIAL / AUTH / APIKEY \
-                         word, DATABASE_URL, or the internal IPE_* namespace) — a secret \
-                         environment variable can never be allowlisted into the public wasm bundle"
-                    ),
-                ));
-            }
+    /// Parse the `publicEnv` list into the typed allowlist.
+    ///
+    /// Each entry goes through [`PublicEnvName::parse`] (the name grammar, the
+    /// secret-name denylist, the temp-root and home names) and
+    /// [`PublicEnvAllowlist::insert`] (no repeat); a refusal is a read-time
+    /// build error at that entry's span.
+    fn read_public_env(&self, expr: &Expr) -> Result<PublicEnvAllowlist, CliError> {
+        let mut allowlist = PublicEnvAllowlist::default();
+        for item in self.expect_list(expr)? {
+            let raw = self.expect_string(item)?;
+            PublicEnvName::parse(&raw)
+                .and_then(|name| allowlist.insert(name))
+                .map_err(|refusal| self.reject(item.span, &refusal.reason()))?;
         }
-        Ok(())
+        Ok(allowlist)
     }
 
     /// Read a `[ Network, Clock, … ]` list into the typed capability set. An
@@ -1596,7 +1588,7 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
         let names = wasm
             .public_env
             .iter()
-            .map(|n| quote(n))
+            .map(|n| quote(n.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
         parts.push(format!("publicEnv = [ {names} ]"));
@@ -2066,7 +2058,7 @@ mod tests {
 
     const HEADER: &str = "module Package exposing (package)\n\n";
 
-    /// A bare `package.ipe` filename (as `ipe build package.ipe` passes it from
+    /// A bare `package.ipe` filename (as `ipe dev build package.ipe` passes it from
     /// inside the project dir) has an EMPTY parent, not an absolute one. The
     /// path-containment root must resolve to the current directory, so a
     /// legitimate in-tree `src/` is accepted rather than refused as an escape.
@@ -2081,7 +2073,7 @@ mod tests {
             format!("{HEADER}package =\n    {{ name = \"bare\" }}\n"),
         )
         .expect("write package.ipe");
-        // `ipe build package.ipe` runs with cwd == project root and a bare path.
+        // `ipe dev build package.ipe` runs with cwd == project root and a bare path.
         let _guard = CWD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2205,7 +2197,10 @@ mod tests {
         assert_eq!(m.wasm.mode.as_deref(), Some("solo"));
         assert_eq!(m.wasm.entry.as_deref(), Some("src/Client.ipe"));
         assert_eq!(m.wasm.mount.as_deref(), Some("#app"));
-        assert_eq!(m.wasm.public_env, vec!["API_BASE_URL", "APP_VERSION"]);
+        assert_eq!(
+            m.wasm.public_env.to_names(),
+            vec!["API_BASE_URL", "APP_VERSION"]
+        );
         assert_eq!(m.wasm.opt_level.as_deref(), Some("z"));
     }
 
@@ -2295,6 +2290,129 @@ mod tests {
                 "error names the secret: {msg}"
             );
         }
+    }
+
+    /// Read a manifest whose `wasm` field allowlists `entries` (each already a
+    /// quoted Ipê string literal).
+    fn read_public_env_list(
+        test_name: &str,
+        entries: &[&str],
+    ) -> Result<ProjectManifest, CliError> {
+        let list = entries.join(", ");
+        read(
+            test_name,
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo, publicEnv = [ {list} ] }} }}\n"
+            ),
+        )
+    }
+
+    /// The refusal reason a `publicEnv` read returned, or `None` when it was
+    /// accepted or refused through another channel.
+    fn public_env_refusal(test_name: &str, entries: &[&str]) -> Option<String> {
+        match read_public_env_list(test_name, entries) {
+            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reject_temp_root_public_env_in_any_case() {
+        for (i, name) in ["TMPDIR", "TMP", "TEMP", "tmpdir", "Temp"]
+            .iter()
+            .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_temp_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("temp root")),
+                "{name} must be refused as the temp root, naming it: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_home_public_env() {
+        for (i, name) in ["HOME", "USERPROFILE", "HomePath"].iter().enumerate() {
+            let msg = public_env_refusal(&format!("reject_home_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("home directory")),
+                "{name} must be refused as a home variable, naming it: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_ill_formed_public_env_name() {
+        for (i, name) in ["", "1ST", "A-B", "A B", "A=B", "\u{c9}TAT"]
+            .iter()
+            .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_bad_env_{i}"), &[&format!("\"{name}\"")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains("not an environment variable name")),
+                "{name:?} must be refused as ill-formed: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_duplicate_public_env_ignoring_case() {
+        for (i, pair) in [
+            ["\"APP_VERSION\"", "\"APP_VERSION\""],
+            ["\"APP_VERSION\"", "\"app_version\""],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_dup_env_{i}"), pair);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains("repeats") && m.contains("APP_VERSION")),
+                "a repeated entry must be refused, naming the first: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_public_env_refusals_are_unchanged() {
+        for (i, name) in [
+            "DATABASE_URL",
+            "STRIPE_SECRET_KEY",
+            "IPE_ANYTHING",
+            "api_key",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg =
+                public_env_refusal(&format!("reject_secret_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("secret-name denylist")),
+                "{name} must be refused by the secret-name denylist: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbouring_public_env_names_stay_allowed() {
+        let m = read_public_env_list(
+            "ok_env_neighbours",
+            &[
+                "\"TMPDIR_HINT\"",
+                "\"TEMPLATE_ID\"",
+                "\"HOME_URL\"",
+                "\"_X1\"",
+            ],
+        )
+        .expect("names that only embed a refused name are accepted");
+        assert_eq!(
+            m.wasm.public_env.to_names(),
+            vec!["TMPDIR_HINT", "TEMPLATE_ID", "HOME_URL", "_X1"]
+        );
     }
 
     #[test]
@@ -2469,7 +2587,7 @@ mod tests {
             ),
         );
         let m = r.expect("allowed env must parse");
-        assert_eq!(m.wasm.public_env, vec!["API_BASE_URL"]);
+        assert_eq!(m.wasm.public_env.to_names(), vec!["API_BASE_URL"]);
     }
 
     #[test]

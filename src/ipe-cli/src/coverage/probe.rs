@@ -273,7 +273,7 @@ pub fn nested_program(sym: &StdlibSymbol) -> Result<String, ProbeUnavailable> {
 /// Lower a probe program, returning whether it lowered.
 ///
 /// Writes the source to `snippet` and drives it through the same source-graph
-/// lowering pipeline `ipe build --emit-ir` uses (name-resolution + type-check +
+/// lowering pipeline `ipe dev build --emit-ir` uses (name-resolution + type-check +
 /// lower), so a symbol that resolves and type-checks but does not lower is
 /// reported as a stage failure.
 #[must_use]
@@ -336,10 +336,10 @@ pub fn typechecks(source: &str, snippet: &Path) -> StageOutcome {
 const ORACLE_SHARED_TARGET: &str = "IPE_ORACLE_SHARED_TARGET";
 
 /// The env var naming a unique emitted-crate package name, honoured by the
-/// single-file `ipe run` emit ([`crate::driver::single_file_cargo_name_from_env`]).
+/// single-file `ipe dev run` emit ([`crate::driver::single_file_cargo_name_from_env`]).
 const EMIT_PACKAGE_NAME: &str = "IPE_EMIT_PACKAGE_NAME";
 
-/// Locate the `ipe` binary the probe drives `ipe run` through.
+/// Locate the `ipe` binary the probe drives `ipe dev run` through.
 ///
 /// Cargo sets `CARGO_BIN_EXE_ipe` in every integration test's environment,
 /// pointing at the compiled `ipe` binary — the one that must run the probe. That
@@ -399,8 +399,8 @@ fn unique_package_name(seq: u64) -> String {
 /// Build and RUN a probe program, returning whether the emitted crate builds and
 /// the produced binary runs to a zero exit.
 ///
-/// Re-invokes this binary as `ipe run <snippet>` from a per-probe working
-/// directory — the same emit → cargo build → execute path a user's `ipe run`
+/// Re-invokes this binary as `ipe dev run <snippet>` from a per-probe working
+/// directory — the same emit → cargo build → execute path a user's `ipe dev run`
 /// takes — so a symbol whose program emits and type-checks but whose emitted
 /// crate does not build or whose binary does not run is a real gap. Heavy: the
 /// caller gates this behind the E2E path.
@@ -416,12 +416,12 @@ fn unique_package_name(seq: u64) -> String {
 /// source hash under its own package id, so a genuinely broken emit still fails
 /// to build even against a warm target — the shared target reuses only
 /// DEPENDENCY artifacts, never masking a broken app. Without the shared-target
-/// env the build inherits the ambient target unchanged (a local `ipe run` is
+/// env the build inherits the ambient target unchanged (a local `ipe dev run` is
 /// untouched).
 ///
 /// The emit location is selected by the subprocess working directory rather
 /// than a `--out` flag, so the invocation surface stays exactly the plain
-/// `ipe run <snippet>` — the entry is passed absolute, and `out/rust` resolves
+/// `ipe dev run <snippet>` — the entry is passed absolute, and `out/rust` resolves
 /// under the per-probe working directory.
 #[must_use]
 pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
@@ -461,7 +461,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         };
     }
 
-    // `ipe run` reads the snippet by an absolute path so it resolves regardless
+    // `ipe dev run` reads the snippet by an absolute path so it resolves regardless
     // of the working directory the subprocess is launched in.
     let entry = match std::path::absolute(snippet) {
         Ok(p) => p,
@@ -474,7 +474,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
     };
 
     let mut cmd = Command::new(&ipe_bin);
-    cmd.arg("run")
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
         .arg(&entry)
         .current_dir(&work_dir)
         .env(EMIT_PACKAGE_NAME, &package_name);
@@ -490,7 +490,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         Err(e) => {
             return StageOutcome::Failed {
                 code: None,
-                message: format!("ipe run failed to spawn: {e}"),
+                message: format!("ipe dev run failed to spawn: {e}"),
             };
         }
     };
@@ -500,7 +500,7 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         let stderr = String::from_utf8_lossy(&output.stderr);
         StageOutcome::Failed {
             code: None,
-            message: format!("ipe run exited non-zero: {stderr}"),
+            message: format!("ipe dev run exited non-zero: {stderr}"),
         }
     }
 }

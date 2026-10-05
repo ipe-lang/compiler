@@ -1,9 +1,9 @@
-//! `ipe watch`.
+//! `ipe dev watch`.
 //!
 //! The salsa-aware orchestrator that wires [`ipe_watch`]'s salsa-agnostic
 //! primitives (confined watcher, debounce, process supervisor) to THIS
 //! crate's warm compile pipeline. This is the first real CONSUMER of
-//! incremental compilation's speed benefit — a naive "re-run `ipe build`
+//! incremental compilation's speed benefit — a naive "re-run `ipe dev build`
 //! from scratch on every save" watch mode would defeat the entire point of
 //! the salsa port.
 //!
@@ -89,6 +89,7 @@ use std::time::{Duration, Instant};
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
 use crate::project;
 use crate::text;
+use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
 
 /// A lifecycle notification from a running watch session.
@@ -144,7 +145,7 @@ pub enum RestartOutcomeKind {
     NothingRunning,
 }
 
-/// Configuration for one `ipe watch` session. Every field has a sound
+/// Configuration for one `ipe dev watch` session. Every field has a sound
 /// default via [`WatchOptions::new`]; the CLI layer (`run_watch` in
 /// `lib.rs`) is the only place that overrides them from flags.
 // The flags are independent dev toggles (quiet / blue-green / reset-state /
@@ -174,7 +175,7 @@ pub struct WatchOptions {
     /// Suppress progress chatter — only warnings and errors are printed.
     /// Passes `-q` to cargo and skips the lifecycle status lines.
     pub quiet: bool,
-    /// DEV-ONLY blue-green cutover. When set, `ipe watch` puts a persistent
+    /// DEV-ONLY blue-green cutover. When set, `ipe dev watch` puts a persistent
     /// front proxy on `port` and runs each rebuilt binary behind it on a fresh
     /// internal loopback port, cutting traffic over once the new binary passes
     /// readiness — so a rebuild never drops the browser's connection. The CLI
@@ -188,12 +189,12 @@ pub struct WatchOptions {
     /// receives `IPE_WEB_RESET_STATE=1`, which makes the runtime skip the
     /// session-checkpoint hydration and force every returning session to a fresh
     /// `init` for the lifetime of that process. The flag is off by default (the
-    /// additive-preserve algorithm runs normally). Exposed as `ipe watch
+    /// additive-preserve algorithm runs normally). Exposed as `ipe dev watch
     /// --reset-state`. Never compiled into a release binary.
     pub reset_state: bool,
     /// DEV-ONLY debugger. When set, each rebuild emits with the `debugger`
     /// runtime feature so the served app carries the in-app time-travelling
-    /// debugger overlay. Exposed as `ipe watch --debugger`; off by default (the
+    /// debugger overlay. Exposed as `ipe dev watch --debugger`; off by default (the
     /// recorder adds runtime weight). Never compiled into a release binary.
     pub debugger: bool,
     /// DEV-ONLY appearance hot-swap. When set, each rebuild emits with a
@@ -269,7 +270,7 @@ enum WatchRole {
 /// sent only after it appears is provably a later request, so it ends the
 /// process by the signal (after ending every remote transfer) instead of
 /// waiting on a teardown that may hang.
-pub const SIGTERM_TEARDOWN_MARKER: &str = "[ipe watch] SIGTERM received; shutting down";
+pub const SIGTERM_TEARDOWN_MARKER: &str = "[ipe dev watch] SIGTERM received; shutting down";
 
 /// `text` is already-sanitised [`TerminalSafe`], mirroring [`crate::screen::error_screen`]:
 /// the line's own gutter/colour escapes are the only control bytes the output may
@@ -320,7 +321,7 @@ fn emit_watch_line(text: &crate::style::TerminalSafe, role: WatchRole) {
 ///
 /// Off by default: [`RebuildTimings::enabled`] reads the env gate ONCE at
 /// cycle start; when unset, the `report` is a no-op and the per-phase
-/// `Instant` reads it guards cost nothing, so the normal `ipe watch` path is
+/// `Instant` reads it guards cost nothing, so the normal `ipe dev watch` path is
 /// unaffected.
 ///
 /// Each field is the wall-clock of a real phase boundary in the orchestrator
@@ -409,7 +410,7 @@ impl RebuildTimings {
         };
         let residual = total.saturating_sub(self.summed());
         let body = format!(
-            "[ipe watch timing] generation {generation}\n\
+            "[ipe dev watch timing] generation {generation}\n\
              settle    {} ms   (edit -> settled batch)\n\
              resolve   {} ms   (read sources + ffi + salsa sync)\n\
              compile   {} ms   (canon+link+typecheck+lower+emit-IR)\n\
@@ -436,7 +437,7 @@ impl RebuildTimings {
 
 /// One resolved project snapshot — the ingredients [`compile_modules`]
 /// (the one-shot driver) would consume, but returned to the CALLER instead
-/// of immediately compiled, so `ipe watch` can re-resolve on every settled
+/// of immediately compiled, so `ipe dev watch` can re-resolve on every settled
 /// batch and feed the result through a WARM, reused database via
 /// `ipe_db::sync_source_root` rather than constructing a fresh one per
 /// build. Deliberately mirrors `run_build`'s own manifest-resolution
@@ -508,7 +509,7 @@ impl ScopeSpec {
 /// ([`crate::loose_file::resolve_loose_file`]).
 ///
 /// `entry_text_override`, when given, shadows the entry `.ipe` file's disk
-/// bytes in the no-manifest branch. `ipe watch` always passes `None` (disk
+/// bytes in the no-manifest branch. `ipe dev watch` always passes `None` (disk
 /// is its truth).
 ///
 /// # Errors
@@ -558,7 +559,7 @@ pub(crate) fn resolve_project_sources(
             entry_path,
             blame_path: manifest_path,
             db_driver: manifest.driver,
-            wasm_public_env: manifest.wasm.public_env,
+            wasm_public_env: manifest.wasm.public_env.to_names(),
             cargo_name,
             scope: ScopeSpec::Package {
                 root: package_root,
@@ -567,7 +568,7 @@ pub(crate) fn resolve_project_sources(
         });
     }
 
-    // No manifest: the loose-file closure, the same one `ipe build` compiles.
+    // No manifest: the loose-file closure, the same one `ipe dev build` compiles.
     let loaded = crate::loose_file::resolve_loose_file(
         entry,
         entry_text_override,
@@ -657,7 +658,7 @@ fn rescope(
 /// current one.
 enum OrchestratorEvent {
     /// A settled batch of filesystem changes — the coalescer's output.
-    /// Carries no paths: `ipe watch` re-resolves the WHOLE project on every
+    /// Carries no paths: `ipe dev watch` re-resolves the WHOLE project on every
     /// cycle (cheap — a directory walk over a bounded file set) and lets
     /// `sync_source_root`'s own byte-equal no-op boundary do the real
     /// dirty-vs-clean filtering, so there is no need to thread individual
@@ -710,23 +711,43 @@ const SHUTDOWN_WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// unrelated edit.
 const RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// The target every watch rebuild emits for.
+const REBUILD_TARGET: ipe_ir::Target = ipe_ir::Target::Native;
+
+/// The intent every watch rebuild emits with: a development loop, so `Debug.*`
+/// is allowed.
+const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WATCH.intent();
+
+/// The floor every watch rebuild's crate carries: the development marker.
+const REBUILD_FLOOR: crate::run_sandbox::EmitFloor =
+    crate::run_sandbox::EmitFloor::of(REBUILD_INTENT, REBUILD_TARGET);
+
 /// Schedule one follow-up [`OrchestratorEvent::FsBatch`] after
 /// [`RESOLVE_RETRY_DELAY`] — the recovery path for a `resolve_project_sources`
 /// failure. Without this, a transient failure has no other route back into
 /// the orchestrator's event loop: the triggering save is lost until an
 /// unrelated future filesystem event happens to arrive.
+///
+/// When the OS refuses the retry's thread the session keeps running and says
+/// the retry is skipped; the next filesystem event rebuilds as usual.
 fn schedule_resolve_retry(evt_tx: &mpsc::Sender<OrchestratorEvent>) {
     let retry_tx = evt_tx.clone();
-    thread::spawn(move || {
+    let scheduled = threads::spawn_named(ThreadRole::WatchResolveRetry, move || {
         thread::sleep(RESOLVE_RETRY_DELAY);
         let _ = retry_tx.send(OrchestratorEvent::FsBatch { settle: None });
     });
+    if let Err(refused) = scheduled {
+        emit_watch_line(
+            &crate::style::TerminalSafe::sanitize(&text::watch_thread_refused(&refused)),
+            WatchRole::Info,
+        );
+    }
 }
 
 /// A handle to a running [`spawn`]ed watch session.
 ///
 /// Lets the caller request a clean shutdown from another thread — the seam
-/// integration tests use to stop `ipe watch` deterministically instead of
+/// integration tests use to stop `ipe dev watch` deterministically instead of
 /// relying on a process signal.
 ///
 /// `Drop` is a genuine safety net, not merely `stop()` called for you: an
@@ -798,7 +819,7 @@ impl Drop for WatchHandle {
     }
 }
 
-/// Spawn `ipe watch` on its own thread, returning a join handle plus a
+/// Spawn `ipe dev watch` on its own thread, returning a join handle plus a
 /// [`WatchHandle`] the caller can use to stop it.
 ///
 /// Identical behaviour to [`run`], with one addition: an external `stop()`
@@ -807,8 +828,13 @@ impl Drop for WatchHandle {
 /// (as an [`OrchestratorEvent::Shutdown`]), so shutdown ordering is
 /// serialised with every other event exactly like a real Ctrl-C would be —
 /// no separate code path to keep in sync.
-#[must_use]
-pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, WatchHandle) {
+///
+/// # Errors
+///
+/// [`CliError::ThreadRefused`] when the OS refuses the session's thread.
+pub fn spawn(
+    opts: WatchOptions,
+) -> Result<(thread::JoinHandle<Result<(), CliError>>, WatchHandle), CliError> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     // `done_tx` is moved into the spawned thread's own closure (never handed
     // to `run_inner` itself) and is unconditionally dropped the instant that
@@ -817,18 +843,18 @@ pub fn spawn(opts: WatchOptions) -> (thread::JoinHandle<Result<(), CliError>>, W
     // `WatchHandle::wait_for_shutdown` therefore unblocks promptly even if
     // `run_inner` fails before ever reaching its main loop.
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let handle = thread::spawn(move || {
+    let handle = threads::spawn_named(ThreadRole::WatchSession, move || {
         let result = run_inner(&opts, Some(stop_rx));
         let _ = done_tx.send(());
         result
-    });
-    (
+    })?;
+    Ok((
         handle,
         WatchHandle {
             stop_tx,
             done_rx: Mutex::new(Some(done_rx)),
         },
-    )
+    ))
 }
 
 enum CompileOutcome {
@@ -864,7 +890,7 @@ impl CargoChild {
     }
 }
 
-/// Run `ipe watch` until the process receives a shutdown signal (Ctrl-C) or
+/// Run `ipe dev watch` until the process receives a shutdown signal (Ctrl-C) or
 /// every event source disconnects.
 ///
 /// Never returns an `Err` for a build failure — INV-3 means a red build is
@@ -904,7 +930,7 @@ fn run_inner(
     if !opts.quiet {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(&format!(
-                "[ipe watch] watching {} ({} source files)",
+                "[ipe dev watch] watching {} ({} source files)",
                 scope.root().display(),
                 scope.file_count()
             )),
@@ -997,13 +1023,14 @@ fn run_inner(
 
     let (batch_tx, batch_rx) = mpsc::channel::<ipe_watch::Batch>();
     let debounce_cfg = opts.debounce;
-    let coalesce_handle =
-        thread::spawn(move || ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg));
+    let coalesce_handle = threads::spawn_named(ThreadRole::WatchCoalesce, move || {
+        ipe_watch::coalesce_loop(&raw_rx, &batch_tx, debounce_cfg);
+    })?;
 
     let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
     {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchFsRelay, move || {
             for batch in batch_rx {
                 // The settle window is the batch's arrival now minus when its
                 // first raw event opened the window — the true edit→settled
@@ -1014,7 +1041,7 @@ fn run_inner(
                     return;
                 }
             }
-        });
+        })?;
     }
     // SIGTERM → orderly shutdown, for the CLI `run()` path ONLY (`external_stop`
     // is `None` exactly there). A supervisor's `kill -TERM <ipe-pid>` (systemd's
@@ -1038,7 +1065,7 @@ fn run_inner(
             let evt_tx = evt_tx.clone();
             // Errors are logged, never fatal — a platform where signal
             // registration fails degrades to no PID-only-SIGTERM handling,
-            // never a hard failure of `ipe watch`.
+            // never a hard failure of `ipe dev watch`.
             if let Err(e) = crate::terminate::on_shutdown(move || {
                 // Announce, on the owner's thread, that the FIRST SIGTERM has
                 // arrived and the orderly teardown is starting. This notice is
@@ -1056,7 +1083,7 @@ fn run_inner(
             }) {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(&format!(
-                        "[ipe watch] warning: could not install SIGTERM handler: {e}"
+                        "[ipe dev watch] warning: could not install SIGTERM handler: {e}"
                     )),
                     WatchRole::Info,
                 );
@@ -1065,17 +1092,17 @@ fn run_inner(
     }
     if let Some(stop_rx) = external_stop {
         let evt_tx = evt_tx.clone();
-        thread::spawn(move || {
+        threads::spawn_named(ThreadRole::WatchStopRelay, move || {
             if stop_rx.recv().is_ok() {
                 let _ = evt_tx.send(OrchestratorEvent::Shutdown);
             }
-        });
+        })?;
     }
 
     // Resolve the runtime crate root once, fail-closed, before the event loop
     // starts. The path-dependency emit needs the CRATE ROOT (the directory
     // holding the runtime `Cargo.toml`), not the source sub-tree. This
-    // mirrors how `ipe build` resolves it via `runtime_embed::resolve()`.
+    // mirrors how `ipe dev build` resolves it via `runtime_embed::resolve()`.
     let runtime_dep_root = crate::runtime_embed::resolve()?.root().to_path_buf();
 
     // The DEV-ONLY blue-green front proxy. When engaged it binds the user's port
@@ -1218,7 +1245,7 @@ fn run_inner(
                     Ok(r) => r,
                     Err(e) => {
                         emit_watch_line(
-                            &crate::style::TerminalSafe::sanitize(&format!("[ipe watch] {e}")),
+                            &crate::style::TerminalSafe::sanitize(&format!("[ipe dev watch] {e}")),
                             WatchRole::Failure,
                         );
                         // This cycle's `generation` bump and cargo-kill
@@ -1247,7 +1274,7 @@ fn run_inner(
                     Err(e) => {
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
-                                "[ipe watch] FFI catalog error: {e}"
+                                "[ipe dev watch] FFI catalog error: {e}"
                             )),
                             WatchRole::Failure,
                         );
@@ -1310,26 +1337,25 @@ fn run_inner(
                         &db_main,
                         resolved.db_driver,
                         ffi_prep.emit,
-                        ipe_ir::Target::Native,
+                        REBUILD_TARGET,
                         resolved.wasm_public_env.clone(),
                         false,
-                        // `ipe watch` is a development loop — Debug.* is allowed.
-                        ipe_backend_rust::BuildIntent::Development,
+                        REBUILD_INTENT,
                         // Dependency-model emit: the project links the runtime as a
-                        // path dependency (what `ipe build` uses by default), so
+                        // path dependency (what `ipe dev build` uses by default), so
                         // no runtime source is vendored into `src/ipe_runtime/`.
                         // `runtime_dep_root` is the verified crate root (holds
                         // `Cargo.toml`), resolved once before the loop via
-                        // `runtime_embed::resolve()`, matching `ipe build`'s path.
+                        // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
                         Some(ipe_backend_rust::RuntimeDep {
                             root: runtime_dep_root.clone(),
                         }),
-                        // `ipe watch --debugger` compiles the in-app debugger
+                        // `ipe dev watch --debugger` compiles the in-app debugger
                         // overlay into the rebuilt runtime loop.
                         opts.debugger,
                         resolved.cargo_name.clone(),
                         opts.hot_appearance,
-                        // `ipe watch` reloads the served-live web app; the
+                        // `ipe dev watch` reloads the served-live web app; the
                         // webview-native desktop delivery is not a watch target.
                         false,
                     );
@@ -1352,8 +1378,8 @@ fn run_inner(
                 let db_worker = db_main.clone();
                 let entry_path = resolved.entry_path.clone();
                 let blame_path = resolved.blame_path.clone();
-                let evt_tx = evt_tx.clone();
-                compile_worker = Some(thread::spawn(move || {
+                let worker_tx = evt_tx.clone();
+                let spawned = threads::spawn_named(ThreadRole::WatchCompile, move || {
                     // Measure the salsa warm-compile on the worker thread: the
                     // orchestrator only sees the event, so the span has to be
                     // taken here at the real call boundary.
@@ -1373,12 +1399,24 @@ fn run_inner(
                             Ok(Err(e)) => CompileOutcome::Red(e.to_string()),
                             Err(_cancelled) => CompileOutcome::Cancelled,
                         };
-                    let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                    let _ = worker_tx.send(OrchestratorEvent::CompileDone {
                         generation: this_gen,
                         outcome,
                         compile: compile_started.elapsed(),
                     });
-                }));
+                });
+                // A refused worker is this generation's red compile, so the
+                // session reports it and waits for the next edit.
+                match spawned {
+                    Ok(worker) => compile_worker = Some(worker),
+                    Err(refused) => {
+                        let _ = evt_tx.send(OrchestratorEvent::CompileDone {
+                            generation: this_gen,
+                            outcome: CompileOutcome::Red(refused.to_string()),
+                            compile: Duration::ZERO,
+                        });
+                    }
+                }
             }
 
             OrchestratorEvent::CompileDone {
@@ -1395,7 +1433,7 @@ fn run_inner(
                         emit(opts, WatchEvent::CompileCancelled { generation: g });
                     }
                     CompileOutcome::Red(msg) => {
-                        // Frame the diagnostic like `ipe run`: a blank line
+                        // Frame the diagnostic like `ipe dev run`: a blank line
                         // above, every line guttered two spaces (so the whole
                         // report sits inset, not just the header), a blank line
                         // below to set it off from the next watch line. Light
@@ -1596,12 +1634,27 @@ fn run_inner(
                             &opts.runtime_dir,
                             None,
                             false,
+                            REBUILD_FLOOR,
                         ) {
                             Ok(dir) => dir,
                             Err(e) => {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
-                                        "[ipe watch] failed to write emitted project: {e}"
+                                        "[ipe dev watch] failed to write emitted project: {e}"
+                                    )),
+                                    WatchRole::Failure,
+                                );
+                                continue;
+                            }
+                        };
+                        // The watch cargo step compiles only a crate written
+                        // with the development marker.
+                        let marked = match crate_dir.dev_marked() {
+                            Ok(marked) => marked,
+                            Err(e) => {
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(&format!(
+                                        "[ipe dev watch] failed to write emitted project: {e}"
                                     )),
                                     WatchRole::Failure,
                                 );
@@ -1629,7 +1682,7 @@ fn run_inner(
                             if generation == 1 {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(
-                                        "[ipe watch] building (first run — compiling \
+                                        "[ipe dev watch] building (first run — compiling \
                                          dependencies, this is the slow one)…",
                                     ),
                                     WatchRole::Info,
@@ -1637,7 +1690,7 @@ fn run_inner(
                             } else {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(
-                                        "[ipe watch] change detected — rebuilding…",
+                                        "[ipe dev watch] change detected — rebuilding…",
                                     ),
                                     WatchRole::Info,
                                 );
@@ -1655,7 +1708,7 @@ fn run_inner(
                         }
                         match spawn_cargo_build(
                             &opts.cargo_path,
-                            crate_dir.path(),
+                            marked,
                             opts.target_dir.as_deref(),
                             generation,
                             evt_tx.clone(),
@@ -1663,11 +1716,11 @@ fn run_inner(
                         ) {
                             Ok(child) => {
                                 cargo_child = Some(child);
-                                building = Some(crate_dir);
+                                building = Some(crate_dir.into_dir());
                             }
                             Err(e) => emit_watch_line(
                                 &crate::style::TerminalSafe::sanitize(&format!(
-                                    "[ipe watch] cannot start cargo build: {e}"
+                                    "[ipe dev watch] cannot start cargo build: {e}"
                                 )),
                                 WatchRole::Failure,
                             ),
@@ -1693,7 +1746,7 @@ fn run_inner(
                     CargoOutcome::Red(msg) => {
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
-                                "[ipe watch] cargo build failed (last-good binary stays \
+                                "[ipe dev watch] cargo build failed (last-good binary stays \
                                      up):\n{msg}"
                             )),
                             WatchRole::Failure,
@@ -1715,7 +1768,7 @@ fn run_inner(
                             Err(reason) => {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
-                                        "[ipe watch] refusing the build: {reason}"
+                                        "[ipe dev watch] refusing the build: {reason}"
                                     )),
                                     WatchRole::Failure,
                                 );
@@ -1737,7 +1790,7 @@ fn run_inner(
                             if !opts.quiet {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
-                                        "[ipe watch] blue-green proxy holding port {} \
+                                        "[ipe dev watch] blue-green proxy holding port {} \
                                              (rebuilds cut over with no dropped connection)",
                                         opts.port
                                     )),
@@ -1761,7 +1814,7 @@ fn run_inner(
                                 Err(e) => {
                                     emit_watch_line(
                                         &crate::style::TerminalSafe::sanitize(&format!(
-                                            "[ipe watch] cannot allocate an internal port for \
+                                            "[ipe dev watch] cannot allocate an internal port for \
                                                  the blue-green cutover: {e}"
                                         )),
                                         WatchRole::Failure,
@@ -2110,7 +2163,7 @@ fn child_env(
         port.to_string(),
     )];
     // The loopback control-socket port for the shape-agnostic control channel
-    // (tui/cli/worker hot-swap + time-travel debugger). Allocated by `ipe watch`
+    // (tui/cli/worker hot-swap + time-travel debugger). Allocated by `ipe dev watch`
     // and injected like the relocation var above; the child opens its control listener
     // only when BOTH this and `IPE_WATCH_HOT_TOKEN` are present (fail-closed to no
     // control surface). A release build's runtime never reads it.
@@ -2209,7 +2262,7 @@ fn push_appearance_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] appearance hot-swap push failed — falling back to a \
+                        "[ipe dev watch] appearance hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2221,7 +2274,7 @@ fn push_appearance_patches(
     if !quiet {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] appearance edit hot-swapped (no rebuild)",
+                "[ipe dev watch] appearance edit hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2376,7 +2429,7 @@ fn push_control_appearance(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] tui appearance hot-swap failed — falling back to a \
+                        "[ipe dev watch] tui appearance hot-swap failed — falling back to a \
                              full rebuild",
                     ),
                     WatchRole::Info,
@@ -2388,7 +2441,7 @@ fn push_control_appearance(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] tui appearance edit hot-swapped (no rebuild)",
+                "[ipe dev watch] tui appearance edit hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2417,7 +2470,7 @@ fn push_transition_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] transition hot-swap push failed — falling back to a \
+                        "[ipe dev watch] transition hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2429,7 +2482,7 @@ fn push_transition_patches(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] update-arm edit hot-swapped (no rebuild)",
+                "[ipe dev watch] update-arm edit hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2488,7 +2541,7 @@ fn push_msg_set_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] Msg-set hot-swap push failed — falling back to a \
+                        "[ipe dev watch] Msg-set hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2500,7 +2553,7 @@ fn push_msg_set_patches(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] added Msg variant hot-swapped (no rebuild)",
+                "[ipe dev watch] added Msg variant hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2529,7 +2582,7 @@ fn push_sub_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] subscription hot-swap push failed — falling back to a \
+                        "[ipe dev watch] subscription hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2541,7 +2594,7 @@ fn push_sub_patches(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] subscriptions edit hot-swapped (no rebuild)",
+                "[ipe dev watch] subscriptions edit hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2635,7 +2688,7 @@ fn push_init_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] init hot-swap push failed — falling back to a \
+                        "[ipe dev watch] init hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2647,7 +2700,7 @@ fn push_init_patches(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] init edit hot-swapped for new sessions (no rebuild)",
+                "[ipe dev watch] init edit hot-swapped for new sessions (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2712,7 +2765,7 @@ fn push_wiring_patches(
             if !quiet {
                 emit_watch_line(
                     &crate::style::TerminalSafe::sanitize(
-                        "[ipe watch] wiring hot-swap push failed — falling back to a \
+                        "[ipe dev watch] wiring hot-swap push failed — falling back to a \
                          full rebuild",
                     ),
                     WatchRole::Info,
@@ -2724,7 +2777,7 @@ fn push_wiring_patches(
     if !quiet && !patches.is_empty() {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] update-arm Cmd wiring hot-swapped (no rebuild)",
+                "[ipe dev watch] update-arm Cmd wiring hot-swapped (no rebuild)",
             ),
             WatchRole::Info,
         );
@@ -2780,13 +2833,13 @@ fn child_command(exe_path: &Path, env: &[(String, String)]) -> Command {
 /// Spawn the dev child through the runtime's parent-death floor.
 ///
 /// The supervisor reaps this child on every GRACEFUL path (shutdown /
-/// termination request / Drop), but a SIGKILL/OOM/panic-abort of `ipe watch`
+/// termination request / Drop), but a SIGKILL/OOM/panic-abort of `ipe dev watch`
 /// would otherwise orphan it holding the dev port. `spawn_hardened` forks it
 /// from the runtime's process-lifetime spawner thread, so on Linux the kernel
-/// SIGTERMs it when `ipe watch` dies by ANY means, and never earlier (the
+/// SIGTERMs it when `ipe dev watch` dies by ANY means, and never earlier (the
 /// signal is bound to the forking thread, which lives as long as the process),
 /// and on every Unix the child inherits stdio and no other descriptor of
-/// `ipe watch`. A refused hardened spawn surfaces as a spawn error; it never degrades to an
+/// `ipe dev watch`. A refused hardened spawn surfaces as a spawn error; it never degrades to an
 /// unhardened spawn.
 fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<Child> {
     ipe_runtime_rust::system::spawn_hardened(child_command(exe_path, env))
@@ -2794,7 +2847,7 @@ fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<C
 }
 
 /// Frame a compiler diagnostic for the watch stderr build-failed report: the
-/// guttered, soft-yellow block `ipe watch` prints when a compile fails while the
+/// guttered, soft-yellow block `ipe dev watch` prints when a compile fails while the
 /// last-good binary stays up.
 ///
 /// The diagnostic carries `.ipe` source-span snippets — untrusted text that
@@ -2808,7 +2861,7 @@ fn compile_failed_frame(msg: &str, p: &crate::style::Palette) -> String {
     // soft warning amber, not the red a hard failure wears — the last-good binary
     // stays up.
     let body = format!(
-        "{}{} [ipe watch] build failed (last-good binary stays up):{}\n{}",
+        "{}{} [ipe dev watch] build failed (last-good binary stays up):{}\n{}",
         p.bright_yellow,
         crate::style::outcome_glyph(crate::style::Outcome::Failure),
         p.reset,
@@ -2939,7 +2992,7 @@ fn warn_if_memory_store() {
     if ipe_env::var("IPE_WEB_STORE").as_deref() == Ok("memory") {
         emit_watch_line(
             &crate::style::TerminalSafe::sanitize(
-                "[ipe watch] warning: IPE_WEB_STORE=memory is set — session state will NOT \
+                "[ipe dev watch] warning: IPE_WEB_STORE=memory is set — session state will NOT \
                  survive a watch-triggered restart. Unset it (watch defaults to a file-backed \
                  store) or set IPE_WEB_STORE=file explicitly to keep your session across rebuilds.",
             ),
@@ -2979,7 +3032,7 @@ fn report_restart_outcome(outcome: &ipe_watch::RestartOutcome, quiet: bool) {
         ipe_watch::RestartOutcome::Spawned => {
             if !quiet {
                 emit_watch_line(
-                    &crate::style::TerminalSafe::sanitize("[ipe watch] app started"),
+                    &crate::style::TerminalSafe::sanitize("[ipe dev watch] app started"),
                     WatchRole::Success,
                 );
             }
@@ -2988,14 +3041,14 @@ fn report_restart_outcome(outcome: &ipe_watch::RestartOutcome, quiet: bool) {
         ipe_watch::RestartOutcome::Restarted => {
             if !quiet {
                 emit_watch_line(
-                    &crate::style::TerminalSafe::sanitize("[ipe watch] app reloaded"),
+                    &crate::style::TerminalSafe::sanitize("[ipe dev watch] app reloaded"),
                     WatchRole::Success,
                 );
             }
         }
         ipe_watch::RestartOutcome::RespawnedLastGood { broken } => emit_watch_line(
             &crate::style::TerminalSafe::sanitize(&format!(
-                "[ipe watch] new binary failed its readiness probe ({}); kept the previous \
+                "[ipe dev watch] new binary failed its readiness probe ({}); kept the previous \
                      last-good binary running instead",
                 broken.display()
             )),
@@ -3007,7 +3060,7 @@ fn report_restart_outcome(outcome: &ipe_watch::RestartOutcome, quiet: bool) {
         } => {
             emit_watch_line(
                 &crate::style::TerminalSafe::sanitize(&format!(
-                    "[ipe watch] new binary failed its readiness probe ({}); no previous \
+                    "[ipe dev watch] new binary failed its readiness probe ({}); no previous \
                          last-good binary could be brought up{}",
                     broken.display(),
                     last_good_error
@@ -3036,7 +3089,7 @@ const fn restart_outcome_kind(outcome: &ipe_watch::RestartOutcome) -> RestartOut
 
 /// Spawn `cargo build --message-format=json` in `out_dir` and a companion
 /// Opt-out env gate for the dev-loop incremental rebuild path. When set to any
-/// value other than `0`, `ipe watch` keeps the machine's normal build
+/// value other than `0`, `ipe dev watch` keeps the machine's normal build
 /// configuration (sccache wrapper, non-incremental) for the emitted-app rebuild
 /// instead of the fast incremental path.
 const NO_INCREMENTAL_ENV: &str = "IPE_WATCH_NO_INCREMENTAL";
@@ -3059,7 +3112,7 @@ const NO_INCREMENTAL_ENV: &str = "IPE_WATCH_NO_INCREMENTAL";
 ///
 /// Behaviour-identical either way — incremental changes codegen partitioning, not
 /// program semantics (enforced by the clean-vs-incremental parity gate) — and
-/// scoped to the watch child: `ipe build` (release / clean / CI) never calls this.
+/// scoped to the watch child: `ipe dev build` (release / clean / CI) never calls this.
 pub(crate) enum BuildAccel {
     /// Explicit opt-out ([`NO_INCREMENTAL_ENV`]): leave the machine's build
     /// configuration untouched for the emitted-app rebuild.
@@ -3189,16 +3242,16 @@ fn env_flag_on(name: &str) -> bool {
 /// An I/O error if the `cargo` process itself cannot be spawned.
 fn spawn_cargo_build(
     cargo_path: &Path,
-    out_dir: &Path,
+    krate: crate::DevMarkedCrate<'_>,
     target_dir: Option<&Path>,
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
-    let accel = choose_build_accel(out_dir, target_dir, env_flag_on(NO_INCREMENTAL_ENV));
+    let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
     let build = crate::cargo_step::WatchBuild {
         cargo: cargo_path,
-        crate_dir: out_dir,
+        krate,
         target_dir,
         accel: &accel,
         verbosity: crate::cargo_step::Verbosity::of_quiet(quiet),
@@ -3214,7 +3267,7 @@ fn spawn_cargo_build(
     }));
     let shared_for_waiter = Arc::clone(&shared);
 
-    thread::spawn(move || {
+    let waiter = threads::spawn_os(ThreadRole::WatchCargoWaiter, move || {
         // Both pipes drain on threads scoped to this waiter while it polls, so
         // the drains end with the build and are joined before the event goes out.
         let drained = pipes.drain_while(|| {
@@ -3267,6 +3320,15 @@ fn spawn_cargo_build(
             cargo: cargo_started.elapsed(),
         });
     });
+    if let Err(refused) = waiter {
+        // No waiter would ever reap the build, so it is stopped and reaped
+        // here before the refusal goes back.
+        let mut cargo = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = cargo.child.kill();
+        let _ = cargo.child.wait();
+        drop(cargo);
+        return Err(refused);
+    }
 
     Ok(shared)
 }
@@ -3914,29 +3976,31 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind an ephemeral loopback listener");
         let port = listener.local_addr().expect("local addr").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept the sender");
-            // Read the token record: 4-byte length prefix then the token bytes.
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).expect("read token length");
-            let token_len = u32::from_be_bytes(len_buf) as usize;
-            let mut token = vec![0u8; token_len];
-            stream.read_exact(&mut token).expect("read token body");
-            // Drain the frame record (prefix + body) so the sender's write completes.
-            stream.read_exact(&mut len_buf).expect("read frame length");
-            let frame_len = u32::from_be_bytes(len_buf) as usize;
-            let mut frame = vec![0u8; frame_len];
-            stream.read_exact(&mut frame).expect("read frame body");
-            // Reply with a positive Ack, mirroring the child's ack stub.
-            let ack = ControlFrame::Ack {
-                ok: true,
-                detail: "ack".to_string(),
-            };
-            let out = encode_frame(&ack).expect("encode the ack");
-            stream.write_all(&out).expect("write the ack");
-            stream.flush().expect("flush the ack");
-            String::from_utf8(token).expect("token is utf8")
-        });
+        let server = std::thread::Builder::new()
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept the sender");
+                // Read the token record: 4-byte length prefix then the token bytes.
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).expect("read token length");
+                let token_len = u32::from_be_bytes(len_buf) as usize;
+                let mut token = vec![0u8; token_len];
+                stream.read_exact(&mut token).expect("read token body");
+                // Drain the frame record (prefix + body) so the sender's write completes.
+                stream.read_exact(&mut len_buf).expect("read frame length");
+                let frame_len = u32::from_be_bytes(len_buf) as usize;
+                let mut frame = vec![0u8; frame_len];
+                stream.read_exact(&mut frame).expect("read frame body");
+                // Reply with a positive Ack, mirroring the child's ack stub.
+                let ack = ControlFrame::Ack {
+                    ok: true,
+                    detail: "ack".to_string(),
+                };
+                let out = encode_frame(&ack).expect("encode the ack");
+                stream.write_all(&out).expect("write the ack");
+                stream.flush().expect("flush the ack");
+                String::from_utf8(token).expect("token is utf8")
+            })
+            .expect("spawn test thread");
 
         let frame = ControlFrame::Ack {
             ok: true,
@@ -4184,9 +4248,15 @@ mod tests {
     ) -> Option<super::CargoOutcome> {
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, rx) = mpsc::channel();
-        let child =
-            super::spawn_cargo_build(cargo, out_dir, Some(&out_dir.join("target")), 1, tx, true)
-                .expect("spawn fake cargo");
+        let child = super::spawn_cargo_build(
+            cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        )
+        .expect("spawn fake cargo");
         before_exit(child.as_ref());
         let event = rx.recv_timeout(Duration::from_secs(30));
         let _ = std::fs::remove_dir_all(out_dir);
@@ -4221,6 +4291,67 @@ mod tests {
         assert!(
             matches!(outcome, Some(super::CargoOutcome::Killed)),
             "a superseded build must report Killed"
+        );
+    }
+
+    /// A build whose waiter thread the OS refuses is an error, and the build
+    /// it had started is killed and reaped before that error goes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_cargo_waiter_reaps_the_build() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchCargoWaiter);
+        let cargo = fake_cargo("waiter_refused", "exec sleep 30");
+        let out_dir = cargo.parent().expect("fake cargo has a parent dir");
+        let (tx, _rx) = mpsc::channel();
+        let spawned = super::spawn_cargo_build(
+            &cargo,
+            crate::DevMarkedCrate::assume(out_dir),
+            Some(&out_dir.join("target")),
+            1,
+            tx,
+            true,
+        );
+        let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
+        let _ = std::fs::remove_dir_all(out_dir);
+        assert!(
+            spawned.is_err(),
+            "a refused waiter must fail the build start"
+        );
+        assert_eq!(
+            left.err(),
+            Some(rustix::io::Errno::CHILD),
+            "the refused build's child must already be reaped"
+        );
+    }
+
+    /// A watch session whose thread the OS refuses is a typed error, not a
+    /// panic in the embedder.
+    #[test]
+    fn a_refused_session_thread_is_a_typed_error() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchSession);
+        let opts = super::WatchOptions::new(
+            PathBuf::from("Main.ipe"),
+            PathBuf::from("out"),
+            PathBuf::from("runtime"),
+        );
+        assert!(matches!(
+            super::spawn(opts),
+            Err(crate::CliError::ThreadRefused {
+                role: crate::threads::ThreadRole::WatchSession,
+                ..
+            })
+        ));
+    }
+
+    /// A refused retry thread skips the retry and leaves the session running.
+    #[test]
+    fn a_refused_resolve_retry_is_skipped() {
+        crate::threads::refusal::refuse(crate::threads::ThreadRole::WatchResolveRetry);
+        let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
+        schedule_resolve_retry(&evt_tx);
+        assert!(
+            evt_rx.recv_timeout(RESOLVE_RETRY_DELAY * 2).is_err(),
+            "a refused retry sends nothing"
         );
     }
 
@@ -4286,5 +4417,45 @@ mod tests {
             "an untouched crate is handed back to run, got {proven:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A watch rebuild links its crate through `cargo` directly, so the crate
+    /// carries the development marker from the moment it is written: a release
+    /// reader refuses the binary as a development build.
+    #[test]
+    fn watch_rebuild_embeds_the_development_marker() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            super::REBUILD_FLOOR,
+            crate::run_sandbox::EmitFloor::DevelopmentMarker
+        );
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-watch-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+        let claimed = crate::output_dir::OwnedDir::claim(&base.join("crate"))?;
+        let written = super::write_emitted_project(
+            &emitted_with_main("fn main() {\n    run();\n}\n"),
+            &super::EmitTarget::Claimed(claimed),
+            &base.join("no-runtime"),
+            None,
+            false,
+            super::REBUILD_FLOOR,
+        )?;
+        assert!(
+            written.dev_marked().is_ok(),
+            "a watch rebuild's crate is dev-marked for its cargo step"
+        );
+        let main_rs = std::fs::read_to_string(written.path().join("src").join("main.rs"))?;
+        assert!(
+            main_rs.contains(&crate::run_sandbox::dev_floor_marker_source()),
+            "the development marker is embedded, got {main_rs}"
+        );
+        assert!(
+            main_rs.contains("fn main() {\n    // Retain the embedded capability floor"),
+            "fn main retains the marker, got {main_rs}"
+        );
+        assert_eq!(main_rs.matches("static IPE_CAPABILITY_FLOOR").count(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 }

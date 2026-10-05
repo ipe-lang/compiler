@@ -72,7 +72,7 @@ main =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Compile a Ipê program string as `ipe build` does (Development intent), build
+/// Compile a Ipê program string as `ipe dev build` does (Development intent), build
 /// the emitted Rust project, and return the path to the compiled binary.
 ///
 /// # Errors
@@ -118,7 +118,7 @@ fn compile_and_build_as(
         ..ipe::BuildOptions::from_env()
     };
     ipe::build_with_options(&entry, &out_dir, &runtime, options)
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
@@ -1321,6 +1321,150 @@ fn server_honours_ipe_server_port_over_a_hardcoded_literal() -> Result<(), BoxEr
     assert_eq!(
         body, "hardcoded ok",
         "{test_name}: the ephemeral IPE_SERVER_PORT must answer even though the source hardcodes 8000\n--- actual ---\n{body}"
+    );
+    Ok(())
+}
+
+/// Routes over `Server.cookie`, `Server.withHeader` and `Server.redirect`.
+///
+/// * `GET /empty`    → `refused` when `Server.cookie ""` is an `Error`
+/// * `GET /set`      → sets the cookie `my sid` to `é;%`
+/// * `GET /read`     → the decoded `my sid` cookie, or `absent`
+/// * `GET /raw`      → `refused` when `Server.withHeader "set-cookie"` is an `Error`
+/// * `GET /redirect` → a 302 to `/a b/café`
+const IPE_COOKIE_PROGRAM: &str = r#"module Main exposing (main)
+
+import Ipe.Http.Server as Server
+import Ipe.Maybe
+import Ipe.String
+import Ipe.System
+import Ipe.Task
+
+main =
+    let port = Maybe.withDefault 8080 (String.toInt (System.getenvOr "IPE_SERVER_PORT" "8080"))
+    in
+    Server.listen port
+        [ Server.get "/empty" (\req ->
+            case Server.cookie "" "a=b" of
+                Ok c ->
+                    Task.succeed (Server.withCookie c (Server.text "accepted"))
+
+                Err _ ->
+                    Task.succeed (Server.text "refused"))
+        , Server.get "/set" (\req ->
+            case Server.cookie "my sid" "é;%" of
+                Ok c ->
+                    Task.succeed (Server.withCookie c (Server.text "set"))
+
+                Err _ ->
+                    Task.succeed (Server.text "refused"))
+        , Server.get "/read" (\req ->
+            Task.succeed (Server.text (Maybe.withDefault "absent" (Server.getCookie "my sid" req))))
+        , Server.get "/raw" (\req ->
+            case Server.withHeader "set-cookie" "sid=1" (Server.text "accepted") of
+                Ok r ->
+                    Task.succeed r
+
+                Err _ ->
+                    Task.succeed (Server.text "refused"))
+        , Server.get "/redirect" (\req -> Task.succeed (Server.redirect "/a b/café"))
+        ]
+"#;
+
+/// The `GET` request for `path`, carrying `cookie` as its `Cookie` header when given.
+fn get_request(path: &str, cookie: Option<&str>) -> String {
+    let cookie = cookie.map_or_else(String::new, |c| format!("Cookie: {c}\r\n"));
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}Connection: close\r\n\r\n")
+}
+
+/// The values of every `name` header of `resp`.
+fn header_values<'a>(resp: &'a RawResponse, name: &str) -> Vec<&'a str> {
+    resp.headers
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// `Server.cookie ""` is an `Error` the program handles, and the response
+/// carries no `Set-Cookie` line.
+///
+/// # Errors
+///
+/// Propagates any pipeline, build, spawn, or HTTP error as a test error.
+#[test]
+fn cookie_empty_name_is_refused() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "cookie_empty_name_is_refused";
+    let exe = compile_and_build(test_name, IPE_COOKIE_PROGRAM)?;
+    let port = pick_ephemeral_port()?;
+    let _guard = spawn_and_wait_ready(test_name, &exe, port)?;
+    let addr = format!("127.0.0.1:{port}");
+
+    let resp = send_raw_request(test_name, &addr, &get_request("/empty", None))?;
+    assert_eq!(resp.status, 200, "{test_name}: {}", resp.body);
+    assert_eq!(resp.body, "refused", "{test_name}");
+    assert!(
+        header_values(&resp, "set-cookie").is_empty(),
+        "{test_name}: {:?}",
+        resp.headers
+    );
+    Ok(())
+}
+
+/// A cookie name and value round-trip encoded through a real server, a raw
+/// `Set-Cookie` header is refused, and a redirect `Location` is encoded.
+///
+/// # Errors
+///
+/// Propagates any pipeline, build, spawn, or HTTP error as a test error.
+#[test]
+fn cookie_header_and_redirect_are_encoded_on_the_wire() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "cookie_header_and_redirect_are_encoded_on_the_wire";
+    let exe = compile_and_build(test_name, IPE_COOKIE_PROGRAM)?;
+    let port = pick_ephemeral_port()?;
+    let _guard = spawn_and_wait_ready(test_name, &exe, port)?;
+    let addr = format!("127.0.0.1:{port}");
+
+    let set = send_raw_request(test_name, &addr, &get_request("/set", None))?;
+    let lines = header_values(&set, "set-cookie");
+    assert_eq!(lines.len(), 1, "{test_name}: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("my%20sid=%C3%A9%3B%25; Path=/;")),
+        "{test_name}: {lines:?}"
+    );
+
+    for (cookie, body) in [
+        ("my%20sid=%C3%A9%3B%25", "é;%"),
+        ("my%20sid=%ZZ", "absent"),
+        ("my sid=x", "absent"),
+        ("other=1; my%20sid=v; my%20sid=w", "v"),
+    ] {
+        let read = send_raw_request(test_name, &addr, &get_request("/read", Some(cookie)))?;
+        assert_eq!(read.body, body, "{test_name}: Cookie: {cookie}");
+    }
+
+    let raw = send_raw_request(test_name, &addr, &get_request("/raw", None))?;
+    assert_eq!(raw.body, "refused", "{test_name}");
+    assert!(
+        header_values(&raw, "set-cookie").is_empty(),
+        "{test_name}: {:?}",
+        raw.headers
+    );
+
+    let redirect = send_raw_request(test_name, &addr, &get_request("/redirect", None))?;
+    assert_eq!(redirect.status, 302, "{test_name}: {}", redirect.body);
+    assert_eq!(
+        header_values(&redirect, "location"),
+        ["/a%20b/caf%C3%A9"],
+        "{test_name}"
     );
     Ok(())
 }

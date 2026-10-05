@@ -300,9 +300,11 @@ mod tests {
     #[cfg(unix)]
     fn load_promptly(dir: PathBuf) -> Option<Result<crate::LintConfig, LintConfigLoadError>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(load_lint_config(&dir));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(load_lint_config(&dir));
+            })
+            .expect("spawn test thread");
         rx.recv_timeout(Duration::from_secs(10)).ok()
     }
 

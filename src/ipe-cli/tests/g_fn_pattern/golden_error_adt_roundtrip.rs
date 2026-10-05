@@ -39,7 +39,7 @@ fn error_adt_roundtrip_compiles() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for error_adt_roundtrip: {:?}",
+        "ipe dev build must succeed for error_adt_roundtrip: {:?}",
         built.err()
     );
 }
@@ -62,7 +62,7 @@ fn error_adt_roundtrip_runs_and_prints_expected_output() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for error_adt_roundtrip: {:?}",
+        "ipe dev build must succeed for error_adt_roundtrip: {:?}",
         built.err()
     );
 

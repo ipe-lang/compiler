@@ -1,17 +1,17 @@
 use super::{
-    BuildOptions, CliError, OutTarget, attribute_canon_errors, attribute_post_link_error,
-    build_loose_file_into, build_project_into, build_source_graph, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
-    discover_manifest, emit_machine_error, emitted_bin_filename, home_to_source_map,
-    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
-    runtime_context_for_message, source_graph_for_target, typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
+    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
+    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
+    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
+    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
+    typecheck_target,
 };
-use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
-};
+use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
+use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
@@ -33,6 +33,15 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
+    /// The bundle profile a native build finished in `finish` packages: a
+    /// release bundle only behind the release consent witness.
+    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
+        match finish {
+            NativeFinish::Dev => Self::Dev,
+            NativeFinish::Release { .. } => Self::Release,
+        }
+    }
+
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -42,14 +51,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The cargo build the bundle's binary is compiled with: a plain debug build
-    /// for [`Self::Dev`], an optimised `--release` build for [`Self::Release`].
-    /// The one place the profile decides the compile, so the two bundle verbs
-    /// stay a single packager parameterised by profile, not two code paths.
-    const fn cargo_release(self) -> bool {
-        matches!(self, Self::Release)
     }
 
     /// The emitted crate's area under the output root.
@@ -75,7 +76,7 @@ impl BundleProfile {
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
-    /// matching [`Self::cargo_release`].
+    /// matching the cargo profile [`FlooredBuild`] picks for the same posture.
     const fn target_subdir(self) -> &'static str {
         match self {
             Self::Dev => "debug",
@@ -138,12 +139,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    profile: BundleProfile,
+    finish: NativeFinish<'_>,
     path: Option<&str>,
 ) -> Result<(), CliError> {
     match host {
-        BundleHost::Desktop => pack_desktop(profile, path),
-        BundleHost::Mobile(os) => pack_mobile(os, profile, path),
+        BundleHost::Desktop => pack_desktop(finish, path),
+        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), path),
     }
 }
 
@@ -269,7 +270,10 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
-pub struct GatedDesktop<'a>(BundleAssembler<'a>);
+pub struct GatedDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    finish: NativeFinish<'a>,
+}
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
 /// the wrapped assembler. The ONLY way to obtain one is
@@ -285,7 +289,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.0.assemble_desktop(os)
+        self.assembler.assemble_desktop(os, self.finish)
     }
 }
 
@@ -328,11 +332,14 @@ impl<'a> BundleAssembler<'a> {
     pub fn gate_desktop(
         manifest: &'a project::ProjectManifest,
         manifest_path: &'a Path,
-        profile: BundleProfile,
+        finish: NativeFinish<'a>,
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
-        Ok(GatedDesktop(Self::new(manifest, manifest_path, profile)))
+        Ok(GatedDesktop {
+            assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
+            finish,
+        })
     }
 
     /// Run the mobile shape gate ([`validate_mobile_shape`]) and, only when it
@@ -366,7 +373,11 @@ impl<'a> BundleAssembler<'a> {
     /// # Errors
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
-    fn assemble_desktop(&self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+    fn assemble_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        finish: NativeFinish<'_>,
+    ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
         let manifest = self.manifest;
@@ -401,16 +412,13 @@ impl<'a> BundleAssembler<'a> {
         )?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
-        CargoBuild {
+        // A `release web desktop` bundle carries an optimised binary and its
+        // consented floor; the `build` dev bundle carries a plain debug one and
+        // the development marker.
+        FlooredBuild {
             cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            // A `release web desktop` bundle carries an optimised binary; the
-            // `build` dev bundle carries a plain debug one.
-            profile: if self.profile.cargo_release() {
-                CargoProfile::Release
-            } else {
-                CargoProfile::Dev
-            },
+            crate_dir: &crate_dir,
+            finish,
             target: CargoTarget::Host,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
@@ -422,7 +430,7 @@ impl<'a> BundleAssembler<'a> {
         // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
         // (macOS/Windows).
         let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
-        let bin_name = emitted_bin_filename(crate_dir.path());
+        let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
             .join(self.profile.target_subdir())
             .join(&bin_name);
@@ -495,18 +503,15 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, &identity, accepts, &bundle, icon)?;
+        let layout = pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = if os.build_runs_on_linux() {
-            "note: an Android shell project is written here; run `./gradlew assembleDebug` \
-             inside it with the Android SDK to produce an APK."
+            crate::text::mobile_android_note()
         } else {
-            "note: the iOS shell project layout is written here, but a signed, runnable \
-             .ipa must be produced on a macOS runner with Xcode + a signing identity \
-             (out of scope)."
+            crate::text::mobile_ios_note()
         };
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -540,7 +545,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), CliError> {
+pub fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -561,7 +566,7 @@ pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), Cl
     // naming its shape. The witness constructor runs the gate and is the only
     // way to obtain a runnable assembler — assembling an ungated shape has no
     // representation.
-    BundleAssembler::gate_desktop(&manifest, &manifest_path, profile, &root)?.assemble(os)
+    BundleAssembler::gate_desktop(&manifest, &manifest_path, finish, &root)?.assemble(os)
 }
 
 /// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
@@ -608,8 +613,8 @@ pub fn pack_mobile(
 
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -627,14 +632,8 @@ pub fn build_wasm_for_mobile(
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    // A dev shell hosts a `build --target wasm` bundle; a release shell hosts a
-    // production `release --target wasm` bundle (Debug.* gated, optimised).
-    let verb = match profile {
-        BundleProfile::Dev => "build",
-        BundleProfile::Release => "release",
-    };
     let status = std::process::Command::new(&exe)
-        .arg(verb)
+        .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
         .args(["--target", "wasm", "--out"])
         .arg(output_root)
@@ -651,7 +650,20 @@ pub fn build_wasm_for_mobile(
     Ok(())
 }
 
-/// `build|release --emit-permissions <ios|macos|android> [<path>]` — the
+/// The verb a mobile shell's wasm bundle is built with.
+///
+/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
+/// a production `release build --target wasm` bundle (Debug.* gated,
+/// optimised).
+#[must_use]
+pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
+    match profile {
+        BundleProfile::Dev => Verb::DEV_BUILD,
+        BundleProfile::Release => Verb::RELEASE_BUILD,
+    }
+}
+
+/// `release build --emit-permissions <ios|macos|android> [<path>]` — the
 /// read-only inspection face of the packager's permission derivation
 /// ([`pack::permissions::derive_permissions`]), the single source of truth for
 /// what a bundled app may do. Resolves the project manifest, reads its accepted
@@ -1101,7 +1113,7 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
 }
 
 /// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe build`:
+/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
 ///
 /// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
 /// 2. a `.ipe` file → itself.
@@ -1126,32 +1138,40 @@ pub fn resolve_analysis_entry(path: &Path) -> Result<PathBuf, CliError> {
 /// The source file `ipe type-check` uses as its analysis root for a manifest
 /// project.
 ///
-/// An application uses `<src_root>/Main.ipe`. A library (a manifest declaring
-/// `exposedModules` with no `src/Main.ipe` and no runnable program) has no
-/// `main` to check, so its analysis root is its first exposed module's file —
-/// checking the public surface is a library's meaningful verification. A
-/// declared-program entry (when a `programs` stage names one) takes precedence,
-/// resolved through the same [`contained_path::ContainedRelPath`] gate the build
-/// path uses so an absolute or `..` entry cannot escape the source root.
+/// The entry is the build's ([`project::ProjectManifest::resolved_entry`]): a
+/// declared program's entry module (when a `programs` stage names one) wins, its
+/// file resolved through the [`contained_path::ContainedRelPath`] gate so it
+/// cannot escape the source root; otherwise
+/// `<src_root>/Main.ipe`. A library (a manifest declaring `exposedModules` with
+/// no `src/Main.ipe` and no runnable program) has no `main` to check, so its
+/// analysis root is its first exposed module's file — checking the public
+/// surface is a library's meaningful verification.
 ///
 /// # Errors
-/// [`CliError::PathEscape`] when a declared program's entry resolves outside the
-/// source root.
+/// [`CliError::Usage`] when a declared program's entry names no module (the
+/// build's own refusal); [`CliError::PathEscape`] when its file resolves outside
+/// the source root.
 pub fn analysis_root_of(parsed: &project::ProjectManifest) -> Result<PathBuf, CliError> {
+    if let Some(program) = parsed.default_program() {
+        // The build's own module path for the entry, never the raw `entry`
+        // string: an entry the build refuses is refused here.
+        let module = parsed.resolved_entry()?;
+        let rel = format!("{}.ipe", module.join("/"));
+        let contained =
+            contained_path::ContainedRelPath::parse(&parsed.src_root, &rel).map_err(|reason| {
+                CliError::PathEscape {
+                    raw: program.entry.clone(),
+                    reason,
+                }
+            })?;
+        return Ok(contained.resolved().to_path_buf());
+    }
+    // No declared program: `Main.ipe`, else the first exposed module's file.
+    // Fall back to `Main.ipe` (the caller surfaces a clean missing-entry
+    // diagnostic) when the manifest names neither.
     let main = parsed.src_root.join("Main.ipe");
     if main.is_file() {
         return Ok(main);
-    }
-    // No Main: prefer a declared program's entry file, else the first exposed
-    // module's file. Fall back to `Main.ipe` (the caller surfaces a clean
-    // missing-entry diagnostic) when the manifest names neither.
-    if let Some(program) = parsed.default_program() {
-        let contained = contained_path::ContainedRelPath::parse(&parsed.src_root, &program.entry)
-            .map_err(|reason| CliError::PathEscape {
-            raw: program.entry.clone(),
-            reason,
-        })?;
-        return Ok(contained.resolved().to_path_buf());
     }
     if let Some(module) = parsed.exposed_modules.first() {
         let rel: PathBuf = module.split('.').collect();
@@ -1168,26 +1188,25 @@ const TESTS_DIR_NAME: &str = "tests";
 /// The analysis an `ipe type-check`-family `<path>` argument resolved to.
 ///
 /// A FILE argument is always analysed as itself. It is project-rooted
-/// ([`Self::SourceFile`] or [`Self::TestFile`]) exactly when its canonical path
+/// ([`Self::Source`] or [`Self::Test`]) exactly when its canonical path
 /// lies under the governing manifest's canonical `src/` or `tests/` root, and
-/// loose ([`Self::LooseFile`]) otherwise. Only a DIRECTORY argument (or none)
-/// resolves to the project's own entry, [`Self::Project`].
+/// loose ([`Self::Loose`]) otherwise. A DIRECTORY argument (or none) names
+/// the project's own entry file, which is then classified exactly like a file
+/// argument — so every form shares one root resolution, the build's `src` root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisTarget {
-    /// A directory (or omitted) argument: the project's own entry file.
-    Project(PathBuf),
     /// A file no manifest roots, canonicalised like every other file
     /// variant so each diagnostic names it the same way.
-    LooseFile(ResolvedPath),
+    Loose(ResolvedPath),
     /// A file under a governing manifest's `src/` root.
-    SourceFile {
+    Source {
         /// The named file.
         file: ResolvedPath,
         /// The governing manifest's `src/` root.
         src_root: ResolvedPath,
     },
     /// A file under a governing manifest's `tests/` root.
-    TestFile {
+    Test {
         /// The named test file.
         file: ResolvedPath,
         /// The governing manifest's `src/` root.
@@ -1200,25 +1219,53 @@ pub enum AnalysisTarget {
 
 /// Resolve a `check`/analysis `<path>` argument to its [`AnalysisTarget`].
 ///
-/// A directory (or no) argument resolves to the project's own entry. A FILE
-/// argument is canonicalised once; the manifest governing that canonical path
-/// is found, and the file is project-rooted only when its canonical path lies
-/// strictly under that manifest's canonical `tests/` or `src/` root.
+/// A directory (or no) argument names its own manifest's entry
+/// ([`analysis_root_of`]), classified against that same manifest's roots (never
+/// one nested nearer the entry), so the directory form analyses the same
+/// `src`-rooted module set the build compiles rather than a closure rooted at
+/// the entry's own directory. A FILE argument is canonicalised once; the
+/// manifest governing that canonical path is found, and the file is
+/// project-rooted only when its canonical path lies strictly under that
+/// manifest's canonical `tests/` or `src/` root.
 ///
 /// # Errors
 /// Same as [`resolve_analysis_entry`] for a directory argument;
-/// [`CliError::Io`] when a file argument cannot be canonicalised (`NotFound`
-/// for a missing file), or a project, `src/`, or existing `tests/` root cannot
-/// be; a manifest's own parse errors for a file under a governing manifest.
+/// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
+/// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
+/// existing `tests/` root cannot be; a manifest's own parse errors for a file
+/// under a governing manifest.
 pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> {
     if path.is_dir() {
-        return Ok(AnalysisTarget::Project(resolve_analysis_entry(path)?));
+        let Some(manifest_path) = discover_manifest(path)? else {
+            return resolve_file_target(path);
+        };
+        // The directory's own manifest roots its entry, as it roots the build;
+        // the entry is never re-governed by a manifest nested beneath it.
+        let parsed = project::parse_manifest(&manifest_path)?;
+        let entry = analysis_root_of(&parsed)?;
+        let file = ResolvedPath::of(&entry).map_err(|e| io_err(&entry, e))?;
+        return classify_under_manifest(file, &parsed);
     }
+    resolve_file_target(path)
+}
+
+/// Classify a FILE against the manifest governing its canonical path.
+fn resolve_file_target(path: &Path) -> Result<AnalysisTarget, CliError> {
     let file = ResolvedPath::of(path).map_err(|e| io_err(path, e))?;
     let Some(manifest_path) = discover_manifest(file.as_path())? else {
-        return Ok(AnalysisTarget::LooseFile(file));
+        return Ok(AnalysisTarget::Loose(file));
     };
     let parsed = project::parse_manifest(&manifest_path)?;
+    classify_under_manifest(file, &parsed)
+}
+
+/// Classify a canonical `file` against `parsed`'s canonical `tests/` and `src/`
+/// roots: the one root resolution every [`resolve_analysis_target`] form
+/// routes through.
+fn classify_under_manifest(
+    file: ResolvedPath,
+    parsed: &project::ProjectManifest,
+) -> Result<AnalysisTarget, CliError> {
     let project_root = ResolvedPath::of(&parsed.root).map_err(|e| io_err(&parsed.root, e))?;
     let src_root = ResolvedPath::of(&parsed.src_root).map_err(|e| io_err(&parsed.src_root, e))?;
     let tests_dir = parsed.root.join(TESTS_DIR_NAME);
@@ -1229,20 +1276,20 @@ pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> 
     }
     .filter(|root| root.is_strictly_under(&project_root));
     if let Some(tests_root) = tests_root.filter(|root| file.is_strictly_under(root)) {
-        return Ok(AnalysisTarget::TestFile {
+        return Ok(AnalysisTarget::Test {
             file,
             src_root,
             tests_root,
         });
     }
     if file.is_strictly_under(&src_root) {
-        return Ok(AnalysisTarget::SourceFile { file, src_root });
+        return Ok(AnalysisTarget::Source { file, src_root });
     }
-    Ok(AnalysisTarget::LooseFile(file))
+    Ok(AnalysisTarget::Loose(file))
 }
 
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe build` uses, but demands only the
+/// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
 /// 0 with a friendly framed success line when the program type-checks, or
 /// non-zero carrying the first rendered diagnostic when it does not.
@@ -1342,7 +1389,7 @@ pub fn verify_check(path: Option<&str>) -> Result<(), CliError> {
     run_type_check(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
 
-/// Stage 3: the build — the same compilation as `ipe build`.
+/// Stage 3: the build — the same compilation as `ipe dev build`.
 pub fn verify_build(path: Option<&str>) -> Result<(), CliError> {
     run_build(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
@@ -1532,10 +1579,10 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
-    CargoBuild {
+    FlooredBuild {
         cargo: cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: CargoTarget::Host,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
@@ -1546,7 +1593,7 @@ pub fn build_and_run_test_entry(
     // Locate the compiled binary via `cargo metadata` so a user-level
     // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
     // name matches the emitted crate's package name (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir);
+    let test_bin_name = emitted_bin_filename(out_dir)?;
     let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
     bin.push("debug");
     bin.push(&test_bin_name);
@@ -2462,7 +2509,7 @@ pub fn verify_capabilities(
 /// is refused and nothing is disclosed, because a union over only the entries
 /// that lowered would silently drop the failing entry's capabilities from the
 /// consumer's consent surface. Every entry links the WHOLE package source tree,
-/// exactly as `ipe build` does, so a module that does not compile at all (a
+/// exactly as `ipe dev build` does, so a module that does not compile at all (a
 /// name or type error, imported or not) fails every entry and is refused the
 /// same way.
 ///
@@ -2661,14 +2708,13 @@ fn infer_entry(
             package,
             program,
         )),
-        Err((diag, home)) => Err(attribute_entry_lowering_error(
+        Err(err) => Err(attribute_entry_lowering_error(
             db,
             source_root,
             package,
             module,
             entry_file,
-            diag.clone(),
-            home,
+            err.clone(),
         )),
     }
 }
@@ -2797,7 +2843,7 @@ fn aggregate_entry_inferences(
 /// The build's own attribution: a canon error is blamed on its own module's
 /// file via [`attribute_canon_errors`] (the root holds every package module, so
 /// an unimported sibling that fails to canonicalize fails every entry, exactly
-/// as `ipe build` refuses it); a post-link error goes through
+/// as `ipe dev build` refuses it); a post-link error goes through
 /// [`attribute_post_link_error`]. Demanded after `lower_program`, so every
 /// query here is a memo hit.
 fn attribute_entry_lowering_error(
@@ -2806,8 +2852,7 @@ fn attribute_entry_lowering_error(
     package: &PackageSourceSet,
     entry: &project::DiscoveredModule,
     entry_file: ipe_db::SourceFile,
-    diag: Diagnostic,
-    home: &[ipe_intern::Symbol],
+    err: ipe_db::PipelineError,
 ) -> CliError {
     if let Err(canon_err) =
         attribute_canon_errors(db, source_root, &package.sources, entry_file, entry.path())
@@ -2823,16 +2868,22 @@ fn attribute_entry_lowering_error(
             .unwrap_or_default(),
     );
     let home_to_source = home_to_source_map(ipe_db::Db::interner(db), &package.sources);
-    if let Ok(linked) = ipe_db::linked_program(db, source_root, entry_file) {
-        attribute_post_link_error(&linked.module, &home_to_source, &entry_source, diag, home)
-    } else {
-        // A link failure has no linked program to scan: frame the lowering
-        // diagnostic against its home module when known, else the entry.
-        let (file, src) = home_to_source.get(home).cloned().unwrap_or(entry_source);
-        CliError::Pipeline {
-            file,
-            src,
-            diag: Box::new(diag),
+    match (ipe_db::linked_program(db, source_root, entry_file), err) {
+        (Ok(linked), err) => {
+            attribute_post_link_error(&linked.module, &home_to_source, &entry_source, err)
+        }
+        (Err(_), ipe_db::PipelineError::Infer(infer)) => {
+            frame_infer_error(&home_to_source, &entry_source, infer)
+        }
+        (Err(_), ipe_db::PipelineError::Lower(diag, home)) => {
+            // A link failure has no linked program to scan: frame the lowering
+            // diagnostic against its home module when known, else the entry.
+            let (file, src) = home_to_source.get(&home).cloned().unwrap_or(entry_source);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
         }
     }
 }
@@ -2905,15 +2956,15 @@ pub fn select_non_overlapping(mut suggestions: Vec<Suggestion>, src_len: usize) 
 /// Apply `fixes` to `src`, returning the patched text.
 ///
 /// `fixes` are assumed non-overlapping and ordered back-to-front. Returns `None`
-/// if any span is out of bounds or not on a UTF-8 char boundary. Never indexes
-/// raw bytes.
+/// if any span is out of bounds, not on a UTF-8 char boundary, or holds text
+/// other than the suggestion's `replaces`. Never indexes raw bytes.
 #[must_use]
 pub fn apply_fixes(src: &str, fixes: &[Suggestion]) -> Option<String> {
     let mut out = src.to_owned();
     for s in fixes {
         let lo = usize::try_from(s.span.lo).ok()?;
         let hi = usize::try_from(s.span.hi).ok()?;
-        if lo > hi || hi > out.len() || !out.is_char_boundary(lo) || !out.is_char_boundary(hi) {
+        if out.get(lo..hi) != Some(&*s.replaces) {
             return None;
         }
         let before = out.get(..lo)?;
@@ -3357,6 +3408,26 @@ mod installer_tag_tests {
             b"ipe-ipe-v0.2.5",
         ] {
             assert_eq!(parse_installer_tag(raw), None, "accepted {raw:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod self_reinvocation_tests {
+    use super::*;
+
+    /// The mobile shell's wasm build re-invokes `ipe` with the argv of the
+    /// verb its profile names, so the spelling comes from [`Verb`] alone.
+    #[test]
+    fn self_reinvocation_argv_from_verb() {
+        assert_eq!(wasm_build_verb(BundleProfile::Dev).argv(), ["dev", "build"]);
+        assert_eq!(
+            wasm_build_verb(BundleProfile::Release).argv(),
+            ["release", "build"]
+        );
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = wasm_build_verb(profile);
+            assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
         }
     }
 }

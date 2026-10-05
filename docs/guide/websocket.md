@@ -69,7 +69,7 @@ configFor wsUrl =
         |> WebSocket.withPingInterval (Duration.seconds 15)
 ```
 
-Running it (`ipe run`) shows the `wss` and `ws` candidates sealed with their
+Running it (`ipe dev run`) shows the `wss` and `ws` candidates sealed with their
 hosts, the two wrong candidates rejected, and the config's timeout and ping
 interval as milliseconds.
 

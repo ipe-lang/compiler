@@ -825,10 +825,6 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::TaskDefaultRetryPolicy
         | KernelFn::TaskWithMaxAttempts
         | KernelFn::TaskWithBaseMs
-        | KernelFn::BackoffLinear
-        | KernelFn::BackoffLinearWithJitter
-        | KernelFn::BackoffExponential
-        | KernelFn::BackoffExponentialWithJitter
         | KernelFn::IoReadLine
         | KernelFn::IoReadSecret
         | KernelFn::IoWriteStdout
@@ -1624,7 +1620,7 @@ pub const fn is_tui_appearance_kernel(k: KernelFn) -> bool {
 /// * **Neither** — `&[]`: no dev-loop repaint surface, so nothing hoists.
 ///
 /// The hoist itself is still additionally gated on `EmitCtx::hot_appearance`
-/// (armed only under `ipe watch`) and on `hoist_style_literal`'s top-level /
+/// (armed only under `ipe dev watch`) and on `hoist_style_literal`'s top-level /
 /// direct-literal fences; this function only narrows *which kernels* are
 /// hoist-eligible per shape.
 pub const fn shape_appearance_literal_args(

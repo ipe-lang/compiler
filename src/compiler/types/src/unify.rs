@@ -32,6 +32,7 @@ use ipe_intern::Interner;
 
 use crate::constrain::zonk;
 use crate::doc::{VarNamer, ty_to_doc};
+use crate::homed::{InferError, ModuleHome};
 use crate::solve::Budget;
 use crate::ty::{Content, FlatType, Ty, TyBounds};
 use crate::unionfind::{UnionFind, VarId};
@@ -53,34 +54,70 @@ use crate::unionfind::{UnionFind, VarId};
 /// ([`crate::concrete_super_ok`]), which has the resolved type in hand; here at
 /// the head a function is the only outright rejection for equality.
 fn super_concrete_ok(interner: &Interner, bounds: TyBounds, flat: &FlatType) -> bool {
-    // A function supports none of the super-types: not numeric, not ordered, and
-    // not equatable (Rust never derives `PartialEq` for a function).
-    if matches!(flat, FlatType::Fun(_, _)) {
-        return false;
-    }
-    // Numeric / ordering need a bare scalar primitive. Equality imposes no head
-    // restriction beyond the non-function rejection above.
-    let prim = match flat {
-        FlatType::Con { module, name, args } if module.is_empty() && args.is_empty() => {
-            interner.resolve(*name)
+    super_head_ok(bounds, SuperHead::of(interner, flat))
+}
+
+/// The head of a concrete structure, classified by what super-type obligations
+/// read from it.
+#[derive(Clone, Copy, Debug)]
+pub enum SuperHead<'a> {
+    /// A function arrow.
+    Fun,
+    /// A nullary unqualified constructor, by its resolved name (`Int`, `String`).
+    Scalar(Option<&'a str>),
+    /// The one-argument unqualified `List`.
+    List,
+    /// Every other head: records, tuples, unit, and any other constructor.
+    Other,
+}
+
+impl<'a> SuperHead<'a> {
+    /// Classify `flat`'s head.
+    #[must_use]
+    pub fn of(interner: &'a Interner, flat: &FlatType) -> Self {
+        match flat {
+            FlatType::Fun(_, _) => Self::Fun,
+            FlatType::Con { module, name, args } if module.is_empty() && args.is_empty() => {
+                Self::Scalar(interner.resolve(*name))
+            }
+            FlatType::Con { module, name, args }
+                if module.is_empty()
+                    && args.len() == 1
+                    && interner.resolve(*name) == Some("List") =>
+            {
+                Self::List
+            }
+            FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::Record(_, _)
+            | FlatType::EmptyRecord => Self::Other,
         }
-        _ => None,
+    }
+}
+
+/// Whether a structure with head `head` satisfies the obligations `bounds`.
+///
+/// The predicate behind [`super_concrete_ok`] and [`super_admits_record`].
+#[must_use]
+pub fn super_head_ok(bounds: TyBounds, head: SuperHead<'_>) -> bool {
+    // A function supports none of the super-types: not numeric, not ordered, and
+    // not equatable (Rust never derives `PartialEq` for a function). Numeric /
+    // ordering need a bare scalar primitive; equality imposes no head
+    // restriction beyond the non-function rejection.
+    let prim = match head {
+        SuperHead::Fun => return false,
+        SuperHead::Scalar(prim) => prim,
+        SuperHead::List | SuperHead::Other => None,
     };
     let number_ok = crate::super_bounds::prim_satisfies_number(prim);
     // Head-pin unification uses `ConcretePin`: `String` satisfies ordering
     // here (borrows; no `Copy` constraint at the unifier level).
     let ord_ok =
         crate::super_bounds::prim_satisfies_ord(prim, crate::super_bounds::BoundSite::ConcretePin);
-    // `++` accepts `String` (bare scalar) or `List _` (one type arg). The `prim`
-    // path already covers `String`; `List` must be checked separately because it
-    // carries one argument and the `args.is_empty()` guard above excludes it.
-    let appendable_ok = crate::super_bounds::prim_satisfies_append_prim(prim)
-        || matches!(flat,
-            FlatType::Con { module, name, args }
-                if module.is_empty()
-                    && args.len() == 1
-                    && interner.resolve(*name) == Some("List")
-        );
+    // `++` accepts `String` (bare scalar) or `List _` (one type arg).
+    let appendable_ok =
+        crate::super_bounds::prim_satisfies_append_prim(prim) || matches!(head, SuperHead::List);
     // A `Set` element / `Dict` key obligation is a Ipê `comparable` — the same
     // scalar set ordering admits. `Float` passes here (it IS `comparable` in
     // Ipê, so the typing follows Ipê), and the Rust-backend reality that `f64`
@@ -91,6 +128,16 @@ fn super_concrete_ok(interner: &Interner, bounds: TyBounds, flat: &FlatType) -> 
         && (!bounds.has_ord() || ord_ok)
         && (!bounds.has_comparable_key() || key_ok)
         && (!bounds.has_append() || appendable_ok)
+}
+
+/// Whether a non-rigid super variable owing `bounds` may still pin to a record.
+///
+/// The same head predicate [`unify`] applies when it pins a super variable to a
+/// record structure, so a deferred pass waiting on such a variable and the
+/// unifier that later settles it cannot disagree.
+#[must_use]
+pub fn super_admits_record(bounds: TyBounds) -> bool {
+    super_head_ok(bounds, SuperHead::Other)
 }
 
 /// Unify the types of variables `a` and `b` in place.
@@ -104,7 +151,10 @@ fn super_concrete_ok(interner: &Interner, bounds: TyBounds, flat: &FlatType) -> 
 /// * [`TypeError::InfiniteType`] when a bind would create a cyclic type.
 /// * [`TypeError::StepBudgetExceeded`] when the step budget is exhausted.
 /// * [`Diagnostic::CompilerBug`] on a union-find invariant violation.
-pub fn unify(
+///
+/// Private: every caller outside this module goes through [`unify_at`], so a
+/// unification failure cannot leave without the module owning its span.
+fn unify(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
@@ -123,6 +173,27 @@ pub fn unify(
         unify_step(uf, budget, interner, span, a, b, &mut stack)?;
     }
     Ok(())
+}
+
+/// Unify `a` with `b`, siting any failure in the module `home` owning `span`.
+///
+/// The one entry point to unification outside this module: `span` belongs to
+/// `home`'s file, so a mismatch frames against exactly that file.
+///
+/// # Errors
+/// [`InferError::Sited`] at `home` for a source failure (a mismatch or an
+/// infinite type); [`InferError::Program`] for a step-budget exhaustion or a
+/// union-find invariant violation.
+pub fn unify_at(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    interner: &Interner,
+    home: &ModuleHome,
+    span: Span,
+    a: VarId,
+    b: VarId,
+) -> Result<(), InferError> {
+    unify(uf, budget, interner, span, a, b).map_err(|diag| InferError::sited(diag, home))
 }
 
 /// Process a single `(found, expected)` obligation: agree the two heads and
@@ -189,6 +260,10 @@ fn unify_step(
                 _ => false,
             };
             if pins {
+                // The super variable adopts the structure, so it must not occur
+                // inside it (`a == [ a ]`), exactly as the `Flex` arms above.
+                let (super_var, structure_var) = if a_is_structure { (rb, ra) } else { (ra, rb) };
+                occurs_guard(uf, budget, interner, span, super_var, structure_var)?;
                 uf.union(ra, rb, structure)
             } else if !rigid && bounds.has_interpolable() {
                 // An interpolation hole names the capability the value lacks
@@ -704,7 +779,7 @@ fn unify_open_record_rows(
 
 /// Reject binding flexible `var` to `structure` if `var` occurs inside it,
 /// surfacing an owned [`TypeError::InfiniteType`] at the real `span`.
-fn occurs_guard(
+pub fn occurs_guard(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
@@ -933,6 +1008,37 @@ mod tests {
     fn super_var(uf: &mut UnionFind<Content>, rigid: bool, bounds: TyBounds) -> VarId {
         uf.fresh(Content::Super { rigid, bounds })
             .expect("fresh var")
+    }
+
+    /// `super_admits_record` is `super_concrete_ok`'s verdict on a record head.
+    #[test]
+    fn super_admits_record_agrees_with_concrete_ok() {
+        let mut uf = UnionFind::new();
+        let interner = Interner::new();
+        let tail = uf.fresh(Content::Flex).expect("fresh var");
+        let record = FlatType::Record(BTreeMap::new(), tail);
+        for bounds in [
+            TyBounds::add(),
+            TyBounds::sub(),
+            TyBounds::mul(),
+            TyBounds::ord(),
+            TyBounds::eq(),
+            TyBounds::set_elem(),
+            TyBounds::dict_key(),
+            TyBounds::show(),
+            TyBounds::appendable(),
+            TyBounds::hof_kernel_result(),
+            TyBounds::sql_param(),
+            TyBounds::interpolable(),
+        ] {
+            assert_eq!(
+                super_admits_record(bounds),
+                super_concrete_ok(&interner, bounds, &record),
+                "{bounds:?}"
+            );
+        }
+        assert!(super_admits_record(TyBounds::hof_kernel_result()));
+        assert!(!super_admits_record(TyBounds::add()));
     }
 
     fn do_unify(

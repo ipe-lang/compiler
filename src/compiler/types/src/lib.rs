@@ -48,21 +48,22 @@ use ipe_intern::{Interner, Symbol};
 
 pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
-pub use homed::{HomedDiagnostic, HomedWarning};
+pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
-    RETRY_POLICY_FIELDS, RowTail, Ty, TyBounds, is_solver_var, tag_solver_var, untag_solver_var,
+    RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, VarCeiling, is_solver_var,
+    tag_solver_var,
 };
 
 use constrain::{
-    Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp,
+    Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
     promote_untyped_boundaries, reify_scheme, zonk,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
 pub use unify::con_heads_compatible;
-use unify::unify;
+use unify::{occurs_guard, super_admits_record, unify_at};
 use unionfind::{UnionFind, VarId};
 
 /// The result of inference: resolved types for bindings and for every region.
@@ -129,13 +130,16 @@ pub struct SolvedTypes {
     /// severity is refused at construction and returned as the inference error,
     /// so a `SolvedTypes` witnesses a program that compiles.
     pub warnings: Vec<HomedWarning>,
-    /// Per-typed-binding map from union-find representative id to annotation
-    /// variable symbol, keyed by `(home, def_name)`.
+    /// Per-binding map from solver-tagged union-find representative to
+    /// annotation variable symbol, keyed by `(home, def_name)`.
     ///
     /// After solving, every annotation type variable for a `Def::Typed` binding
     /// is represented as a `Ty::Var(u32)` in the zonked region types, where the
-    /// `u32` is the union-find representative of the rigid (skolem) that was
-    /// used while checking the binding's body.  This map records that
+    /// `u32` is [`tag_solver_var`] of the union-find representative of the
+    /// rigid (skolem) that was used while checking the binding's body.  Every
+    /// key is in that tagged form, for typed and boundary-promoted untyped
+    /// bindings alike, so a lookup is exact: an untagged raw is an annotation
+    /// symbol and never names a key.  This map records that
     /// correspondence so the lowerer can tell apart a "this `Ty::Var` is a
     /// generic type parameter of the enclosing function" from a "this `Ty::Var`
     /// is a truly unconstrained, message-free subtree placeholder".
@@ -146,7 +150,7 @@ pub struct SolvedTypes {
     /// map the lowerer fell back to `IrType::Unit` (the `Attribute<()>` path),
     /// producing E0308 in the emitted Rust.  With it, the lowerer emits
     /// `IrType::Generic(parentMsg_sym)` → `Attribute<T1>`.
-    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>>,
+    pub poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>>,
     /// Generalized type-variable symbols of each untyped top-level binding
     /// that Boundary Scheme Promotion generalized, in synthesis order (`"a"`,
     /// `"b"`, …), keyed by `(home, def_name)`. Absent or empty for a def that
@@ -194,6 +198,253 @@ pub struct SignatureWildcards {
     pub pins: BTreeMap<usize, Ty>,
 }
 
+/// Which solver variables a renumbering treats as one variable.
+///
+/// A solver variable's raw id is only meaningful inside the solve that
+/// minted it, so the same raw in two modules' slices names two variables
+/// unless those slices came from one joint solve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VarScope {
+    /// One raw id is one variable across every module: the joint solve's
+    /// numbering, where a variable shared by two modules stays one variable.
+    Program,
+    /// One raw id is one variable only within its owning module: slices that
+    /// were solved separately and merged, so equal raws in different modules
+    /// are distinct variables.
+    PerHome,
+}
+
+/// A renumbering ran out of ids below its [`VarCeiling`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CanonicalizeError {
+    /// More distinct solver variables than the ceiling admits.
+    VarSpaceExhausted,
+}
+
+/// A [`SolvedTypes`] in canonical form.
+///
+/// Its solver variables are densely numbered in the first-encounter order of
+/// [`canonicalize`] and its warnings are in canonical order. Built only by
+/// [`canonicalize`], so two producers of the same typed program that both pass
+/// through it agree byte for byte.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CanonicalTypes(SolvedTypes);
+
+impl CanonicalTypes {
+    /// The canonical typed program.
+    #[must_use]
+    pub const fn as_solved(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CanonicalTypes {
+    type Target = SolvedTypes;
+
+    fn deref(&self) -> &SolvedTypes {
+        &self.0
+    }
+}
+
+/// Dense ids for the solver variables of one typed program.
+///
+/// The one walker over every position that holds a solver-variable id: `Ty`
+/// values and the `poly_var_map` keys are renumbered through the same table.
+struct Renumbering {
+    scope: VarScope,
+    ceiling: VarCeiling,
+    /// Dense index of each owning-module key; under [`VarScope::Program`]
+    /// every module shares the one empty key.
+    homes: BTreeMap<Vec<Symbol>, u32>,
+    /// The dense variable assigned to each `(home index, original variable)`.
+    assigned: BTreeMap<(u32, SolverVar), SolverVar>,
+}
+
+impl Renumbering {
+    const fn new(scope: VarScope, ceiling: VarCeiling) -> Self {
+        Self {
+            scope,
+            ceiling,
+            homes: BTreeMap::new(),
+            assigned: BTreeMap::new(),
+        }
+    }
+
+    /// The dense index of the module owning a key.
+    fn home(&mut self, home: &[Symbol]) -> Result<u32, CanonicalizeError> {
+        let key: &[Symbol] = match self.scope {
+            VarScope::Program => &[],
+            VarScope::PerHome => home,
+        };
+        if let Some(&index) = self.homes.get(key) {
+            return Ok(index);
+        }
+        let index =
+            u32::try_from(self.homes.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        self.homes.insert(key.to_vec(), index);
+        Ok(index)
+    }
+
+    /// The dense variable for `var` in module `home`, minting the next id on first sight.
+    fn var(&mut self, home: u32, var: SolverVar) -> Result<SolverVar, CanonicalizeError> {
+        if let Some(&dense) = self.assigned.get(&(home, var)) {
+            return Ok(dense);
+        }
+        let next =
+            u32::try_from(self.assigned.len()).map_err(|_| CanonicalizeError::VarSpaceExhausted)?;
+        if next >= self.ceiling.get() {
+            return Err(CanonicalizeError::VarSpaceExhausted);
+        }
+        let dense = SolverVar::from_var(next);
+        self.assigned.insert((home, var), dense);
+        Ok(dense)
+    }
+
+    /// A raw id from the [`Ty::Var`] id space.
+    ///
+    /// A solver variable is renumbered; an annotation-symbol raw is kept.
+    fn raw(&mut self, home: u32, raw: u32) -> Result<u32, CanonicalizeError> {
+        let Some(var) = SolverVar::from_raw(raw) else {
+            return Ok(raw);
+        };
+        Ok(self.var(home, var)?.raw())
+    }
+
+    /// Renumber every solver variable of `ty` in place, in pre-order.
+    fn ty(&mut self, home: u32, ty: &mut Ty) -> Result<(), CanonicalizeError> {
+        match ty {
+            Ty::Var(raw) => *raw = self.raw(home, *raw)?,
+            Ty::Unit => {}
+            Ty::Fun(arg, result) => {
+                self.ty(home, arg)?;
+                self.ty(home, result)?;
+            }
+            Ty::Tuple(elems) => {
+                for elem in elems {
+                    self.ty(home, elem)?;
+                }
+            }
+            Ty::Record(fields, tail) => {
+                for field in fields.values_mut() {
+                    self.ty(home, field)?;
+                }
+                match tail {
+                    RowTail::Closed => {}
+                    RowTail::Open(raw) => *raw = self.raw(home, *raw)?,
+                }
+            }
+            Ty::Con {
+                module: _,
+                name: _,
+                args,
+            } => {
+                for arg in args {
+                    self.ty(home, arg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Renumber in place every `Ty` value of a map keyed by `(home, _)`.
+    fn ty_map<K>(
+        &mut self,
+        map: &mut BTreeMap<(Vec<Symbol>, K), Ty>,
+    ) -> Result<(), CanonicalizeError> {
+        for ((home, _), ty) in map {
+            let home = self.home(home)?;
+            self.ty(home, ty)?;
+        }
+        Ok(())
+    }
+}
+
+/// The canonical order of warnings: owning module, then span, then code.
+fn sort_warnings(mut warnings: Vec<HomedWarning>) -> Vec<HomedWarning> {
+    fn key(warning: &HomedWarning) -> (&[Symbol], u32, u32, &'static str) {
+        let span = warning.diagnostic().primary_span();
+        (
+            warning.home(),
+            span.lo,
+            span.hi,
+            warning.diagnostic().code().as_str(),
+        )
+    }
+    warnings.sort_by(|a, b| key(a).cmp(&key(b)));
+    warnings
+}
+
+/// Put a typed program into canonical form.
+///
+/// Solver variables are renumbered densely from 0 in first-encounter order
+/// over a fixed traversal: `env`, `regions`, `expected`, the
+/// `signature_wildcards` pins, then the `poly_var_map` keys, each in map
+/// order. The `Ty` values and the `poly_var_map` keys share one table, so a
+/// generic keyed in `poly_var_map` stays the variable its region types name.
+/// Only solver-tagged raws are renumbered; an untagged raw is an annotation
+/// symbol and is kept. Warnings are put in canonical order.
+///
+/// `scope` decides whether equal raws in different modules are one variable
+/// ([`VarScope::Program`]) or two ([`VarScope::PerHome`]); a program in which
+/// a variable is shared between modules numbers differently under the two.
+///
+/// # Errors
+/// [`CanonicalizeError::VarSpaceExhausted`] when the program holds more
+/// distinct solver variables than `ceiling` admits. The count never
+/// saturates, so no two variables ever share an id.
+pub fn canonicalize(
+    types: SolvedTypes,
+    scope: VarScope,
+    ceiling: VarCeiling,
+) -> Result<CanonicalTypes, CanonicalizeError> {
+    let SolvedTypes {
+        mut env,
+        mut regions,
+        mut expected,
+        bounds,
+        warnings,
+        mut poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        mut signature_wildcards,
+    } = types;
+    let mut table = Renumbering::new(scope, ceiling);
+    table.ty_map(&mut env)?;
+    table.ty_map(&mut regions)?;
+    table.ty_map(&mut expected)?;
+    for ((home, _), wildcards) in &mut signature_wildcards {
+        let SignatureWildcards {
+            param_counts: _,
+            pins,
+        } = wildcards;
+        let home = table.home(home)?;
+        for pin in pins.values_mut() {
+            table.ty(home, pin)?;
+        }
+    }
+    for ((home, _), vars) in &mut poly_var_map {
+        let home = table.home(home)?;
+        // Injective per home, so no two keys collapse into one entry.
+        *vars = std::mem::take(vars)
+            .into_iter()
+            .map(|(var, name)| -> Result<_, CanonicalizeError> {
+                Ok((table.var(home, var)?, name))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+    }
+    Ok(CanonicalTypes(SolvedTypes {
+        env,
+        regions,
+        expected,
+        bounds,
+        warnings: sort_warnings(warnings),
+        poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        signature_wildcards,
+    }))
+}
+
 /// Infer the types of a canonical module.
 ///
 /// # Errors
@@ -208,25 +459,21 @@ pub fn infer(m: &canon::Module, interner: &mut Interner) -> DResult<SolvedTypes>
     infer_with_budget(m, interner, &mut budget)
 }
 
-/// Like [`infer`] but on a type-error from the constraint solver also returns
-/// the **home module path** of the failing constraint.
+/// Like [`infer`] but every error names the module that owns it.
 ///
-/// This lets the compiler driver's error-attribution path select the correct
-/// source file for a cross-module type error without relying on the
-/// byte-offset heuristic that can fail when two merged modules share the same
-/// numeric span range.
-///
-/// On a non-solver error (constraint generation, field-access pass, etc.) the
-/// returned home is `Vec::new()` and callers should fall back to the heuristic.
-/// Every warning in the result carries its home ([`HomedWarning`]).
+/// In a linked multi-module program spans are byte offsets every module
+/// shares, so a span alone cannot name its file. A source error comes back as
+/// [`InferError::Sited`] with its owning module; only an internal or
+/// whole-program diagnostic comes back as [`InferError::Program`]. Every
+/// warning in the result carries its home ([`HomedWarning`]).
 ///
 /// # Errors
-/// Same conditions as [`infer`]; on failure the tuple carries both the
-/// diagnostic and the failing constraint's home module path.
+/// Same conditions as [`infer`], each paired with its owning module when it
+/// has one.
 pub fn infer_attributed(
     m: &canon::Module,
     interner: &mut Interner,
-) -> Result<SolvedTypes, (Diagnostic, Vec<Symbol>)> {
+) -> Result<SolvedTypes, InferError> {
     let mut budget = Budget::from_env();
     infer_with_budget_attributed(m, interner, &mut budget)
 }
@@ -286,8 +533,15 @@ pub struct TypedInterface {
 /// disagrees with.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InterfaceStatus {
-    /// Every exported scheme is closed; the interface is faithful.
+    /// Every exported scheme is closed and the module's own solved facts
+    /// read no importer's use site: the interface and the module's own
+    /// result are both faithful.
     Closed(TypedInterface),
+    /// Every exported scheme is closed, so the interface is faithful for
+    /// importers, but the module's own solved facts read its importers' use
+    /// sites (an exported UI-message slot whose default depends on every
+    /// use): only the whole-program solve is faithful for the module itself.
+    ImporterDependent(TypedInterface),
     /// Some exported scheme is open; only the whole-program solve is
     /// faithful for this module and its importers.
     Open,
@@ -344,7 +598,7 @@ pub fn infer_module(
     exports: &ModuleExports,
     deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
     interner: &mut Interner,
-) -> Result<ModuleInference, (Diagnostic, Vec<Symbol>)> {
+) -> Result<ModuleInference, InferError> {
     let mut budget = Budget::from_env();
     let scoped = ScopedContext { exports, deps };
     let (solved, interface) = infer_core(m, interner, &mut budget, Some(&scoped))?;
@@ -385,17 +639,15 @@ fn infer_with_budget(
     interner: &mut Interner,
     budget: &mut Budget,
 ) -> DResult<SolvedTypes> {
-    infer_with_budget_attributed(m, interner, budget).map_err(|(diag, _home)| diag)
+    infer_with_budget_attributed(m, interner, budget).map_err(InferError::into_diagnostic)
 }
 
-/// Like [`infer_with_budget`] but on a solver error also returns the failing
-/// constraint's home module path.  Non-solver errors (constraint generation,
-/// post-solve passes) return `Vec::new()` as the home.
+/// Like [`infer_with_budget`] but every error names its owning module.
 fn infer_with_budget_attributed(
     m: &canon::Module,
     interner: &mut Interner,
     budget: &mut Budget,
-) -> Result<SolvedTypes, (Diagnostic, Vec<Symbol>)> {
+) -> Result<SolvedTypes, InferError> {
     infer_core(m, interner, budget, None).map(|(solved, _interface)| solved)
 }
 
@@ -410,14 +662,13 @@ fn infer_core(
     interner: &mut Interner,
     budget: &mut Budget,
     scoped: Option<&ScopedContext<'_>>,
-) -> Result<(SolvedTypes, Option<InterfaceStatus>), (Diagnostic, Vec<Symbol>)> {
-    // Convenience: wrap a `DResult`-returning expression so `?` works inside
-    // this function whose error type is `(Diagnostic, Vec<Symbol>)`.  Non-solver
-    // errors (constraint generation, post-solve passes) carry no meaningful home,
-    // so they surface with an empty home and callers fall back to the heuristic.
+) -> Result<(SolvedTypes, Option<InterfaceStatus>), InferError> {
+    // Wrap a `DResult` step that can only fail on an internal invariant (a
+    // union-find lookup, an intern, a read-back): its error has no owning
+    // module, so a source error reaching it is refused as a compiler bug.
     macro_rules! lift {
         ($e:expr) => {
-            $e.map_err(|d: Diagnostic| (d, Vec::<Symbol>::new()))?
+            $e.map_err(InferError::unsited)?
         };
     }
 
@@ -441,7 +692,7 @@ fn infer_core(
     let fn_enums = fn_embedding_enums(&m.unions, &dep_unions);
     let enum_embeds_fn = |home: &[Symbol], name: Symbol| fn_enums.contains(&(home.to_vec(), name));
     let generated = match scoped {
-        None => lift!(Builder::run(&mut uf, interner, m)),
+        None => Builder::run(&mut uf, interner, m)?,
         Some(ctx) => {
             let mut seed: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>> = BTreeMap::new();
             for (path, iface) in ctx.deps {
@@ -449,7 +700,7 @@ fn infer_core(
                     seed.insert((path.clone(), *name), Rc::new(scheme.ty.clone()));
                 }
             }
-            lift!(Builder::run_seeded(&mut uf, interner, m, &dep_unions, seed))
+            Builder::run_seeded(&mut uf, interner, m, &dep_unions, seed)?
         }
     };
 
@@ -489,11 +740,8 @@ fn infer_core(
         web_req: &web_req_fields,
         err: &err_fields,
     };
-    // Unlike the other post-solve passes, `resolve_deferred` returns the failing
-    // field-access / record-update's `home` module path so a IPE-T0012 attributes
-    // to the source file that actually owns the access — not the byte-offset
-    // heuristic's best guess, which can mis-blame `info.message` in one module
-    // on a `class` call in another.
+    // Every error `resolve_deferred` returns is sited at the failing field
+    // access's / record update's owning module.
     resolve_deferred(
         &mut uf,
         budget,
@@ -510,12 +758,7 @@ fn infer_core(
     // run BEFORE `resolve_routed_web_checks` so route constructors pin the
     // page variable before the `notFound ≟ Model.page` gate reads it.  See
     // the `RouteWitnessCheck` doc comment for the full rationale.
-    lift!(resolve_route_witness_checks(
-        &mut uf,
-        budget,
-        interner,
-        &generated.route_witness_checks
-    ));
+    resolve_route_witness_checks(&mut uf, budget, interner, &generated.route_witness_checks)?;
 
     // Warnings collected during the post-solve deferred passes and the
     // exhaustiveness pass (IPE-L0124, IPE-T0011), each homed at construction.
@@ -585,6 +828,14 @@ fn infer_core(
     // nor a kernel-alias route, marks the whole interface open — fail closed.
     let mut reified_untyped: BTreeMap<Symbol, Ty> = BTreeMap::new();
     let mut interface_open = false;
+    // Scoped solve only: whether the module's own solved facts read a use
+    // site in an importer, which the scoped solve cannot see.
+    let mut own_facts_importer_dependent = false;
+    // Scoped solve only: whether `key` is one of this module's exported values
+    // (a binding an importer's use sites can reach).
+    let exported_by_scoped_module = |key: &(Vec<Symbol>, Symbol)| {
+        scoped.is_some_and(|ctx| key.0 == m.name && ctx.exports.values.contains(&key.1))
+    };
     if let Some(ctx) = scoped {
         for name in &ctx.exports.values {
             if ctx.exports.kernel_aliases.contains_key(name) {
@@ -645,8 +896,20 @@ fn infer_core(
         .iter()
         .map(|w| uf.find(*w))
         .collect::<Result<_, _>>()
-        .map_err(|d| (d, Vec::new()))?;
-    for (v, orig_bounds, span, home) in &generated.super_vars {
+        .map_err(InferError::unsited)?;
+    // Every pinned variable's deep check reads its nested variables, which a
+    // LATER entry's default may still pin (`{ x = n }` compared before
+    // `n + 1` defaults `n` to `Int`). The checks therefore run after every
+    // default, so the verdict never depends on the order the obligations were
+    // generated in.
+    let mut pinned: Vec<(VarId, TyBounds, Span, &ModuleHome)> = Vec::new();
+    for SuperVar {
+        var: v,
+        bounds: orig_bounds,
+        span,
+        home,
+    } in &generated.super_vars
+    {
         let root = lift!(uf.find(*v));
         match lift!(uf.content(root)) {
             // An unpinned `Number` flex defaults to `Int` — an untyped
@@ -663,9 +926,9 @@ fn infer_core(
                     args: Vec::new(),
                 };
                 if !concrete_super_ok(interner, bounds, &int_ty, &enum_embeds_fn) {
-                    return Err((
+                    return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &int_ty, *span),
-                        home.clone(),
+                        home,
                     ));
                 }
                 lift!(uf.set_content(
@@ -689,9 +952,9 @@ fn infer_core(
                     args: Vec::new(),
                 };
                 if !concrete_super_ok(interner, bounds, &sqlvalue_ty, &enum_embeds_fn) {
-                    return Err((
+                    return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &sqlvalue_ty, *span),
-                        home.clone(),
+                        home,
                     ));
                 }
                 lift!(uf.set_content(
@@ -715,9 +978,9 @@ fn infer_core(
                     args: Vec::new(),
                 };
                 if !concrete_super_ok(interner, bounds, &string_ty, &enum_embeds_fn) {
-                    return Err((
+                    return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &string_ty, *span),
-                        home.clone(),
+                        home,
                     ));
                 }
                 lift!(uf.set_content(
@@ -735,22 +998,23 @@ fn infer_core(
             // rigid `Super`), but those arms are covered for totality and need no
             // action either.
             Content::Super { .. } | Content::Flex | Content::Rigid => {}
-            // The variable pinned to a concrete type during solving. Verify —
-            // deeply, against the fully-resolved type — that the type really
-            // supports the operation. The unifier's head pin-check already
-            // cleared a function HEAD; this catches a function NESTED inside a
-            // tuple / record / enum under an equality obligation (Rust cannot
-            // compare it), failing closed with IPE-T0014 instead of emitting
-            // code `cargo` rejects.
-            Content::Structure(_) => {
-                let ty = lift!(zonk(&mut uf, budget, root));
-                if !concrete_super_ok(interner, *orig_bounds, &ty, &enum_embeds_fn) {
-                    return Err((
-                        super_unsatisfied(interner, *orig_bounds, &ty, *span),
-                        home.clone(),
-                    ));
-                }
-            }
+            // The variable pinned to a concrete type during solving: checked
+            // below, once every default has been applied.
+            Content::Structure(_) => pinned.push((root, *orig_bounds, *span, home)),
+        }
+    }
+    // Verify — deeply, against the fully-resolved type — that each pinned type
+    // really supports the operation. The unifier's head pin-check already
+    // cleared a function HEAD; this catches a function NESTED inside a tuple /
+    // record / enum under an equality obligation (Rust cannot compare it),
+    // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    for (root, orig_bounds, span, home) in pinned {
+        let ty = lift!(zonk(&mut uf, budget, root));
+        if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds_fn) {
+            return Err(InferError::sited(
+                super_unsatisfied(interner, orig_bounds, &ty, span),
+                home,
+            ));
         }
     }
 
@@ -770,7 +1034,22 @@ fn infer_core(
         .into_iter()
         .map(|n| interner.intern(n))
         .collect::<Result<_, _>>()
-        .map_err(|d| (d, Vec::new()))?;
+        .map_err(InferError::unsited)?;
+    // Each untyped binding's cross-module discharge outcome (see the untyped
+    // defaulting below), read before any slot is pinned to `Unit`. A use that
+    // threads the slot into an enclosing generic -- a typed helper's `Rigid`
+    // msg, or an untyped helper's quantified root that itself stays generic --
+    // keeps it generic too (`Lib.nav` inside `Mid.wrap`, which `Main.view :
+    // Html Msg` pins), as the typed path counts a `Rigid` instantiation pinned.
+    // `msg_classes.generic` holds every quantified untyped root that stays
+    // generic, so a typed use threaded into one counts as pinned below.
+    let msg_classes = lift!(msg_slot_classes(
+        &mut uf,
+        budget,
+        &generated.pending_instantiations,
+        &untyped_schemes,
+        &ui_msg_cons,
+    ));
     let mut msg_defaulted_vars: BTreeMap<(Vec<Symbol>, Symbol), BTreeSet<Symbol>> = BTreeMap::new();
     {
         let mut apps_by_binding: SchemeAppVars<'_> = BTreeMap::new();
@@ -785,7 +1064,7 @@ fn infer_core(
         // own resolution (the lowerer substitutes its concrete type from the
         // body's solved region, e.g. a `view` whose body pins the msg via an
         // event handler), which defaulting to `Unit` would clobber.
-        let any_sym = interner.intern("any").map_err(|d| (d, Vec::new()))?;
+        let any_sym = interner.intern("any").map_err(InferError::unsited)?;
         for (key, ty) in &generated.top_level {
             let mut ui_msg_vars = BTreeSet::new();
             let mut other_vars = BTreeSet::new();
@@ -811,6 +1090,13 @@ fn infer_core(
             if candidates.is_empty() {
                 continue;
             }
+            // Whether a candidate defaults depends on EVERY use site, importers'
+            // included, so an exported candidate makes this module's own solved
+            // facts importer-dependent. Its exported scheme is the annotation,
+            // which no use site changes.
+            if exported_by_scoped_module(key) {
+                own_facts_importer_dependent = true;
+            }
             let empty = Vec::new();
             let apps = apps_by_binding.get(key).unwrap_or(&empty);
             let mut defaulted = BTreeSet::new();
@@ -821,14 +1107,23 @@ fn infer_core(
                 // `sharedRow`'s msg to `MsgA`) OR to a `Rigid` -- the msg is
                 // threaded into an enclosing generic a further-out use will pin
                 // (`class` called inside the generic `sharedRow` binds its msg to
-                // `sharedRow`'s own type parameter). The unpinned states are
-                // `Flex` (never constrained) and `Unit` (a message-free use).
+                // `sharedRow`'s own type parameter) -- OR to a `Flex` that is a
+                // still-generic untyped binding's quantified root (`badge` inside
+                // the unannotated `wrap` a further-out use pins). The unpinned
+                // states are any other `Flex` (never constrained) and `Unit` (a
+                // message-free use).
                 let mut pinned = false;
                 for vars in apps {
                     if let Some(&inst) = vars.get(&raw) {
                         let root = lift!(uf.find(inst));
                         match lift!(uf.content(root)) {
-                            Content::Structure(FlatType::Unit) | Content::Flex => {}
+                            Content::Structure(FlatType::Unit) => {}
+                            Content::Flex => {
+                                if msg_classes.generic.contains(&root) {
+                                    pinned = true;
+                                    break;
+                                }
+                            }
                             Content::Structure(_) | Content::Rigid | Content::Super { .. } => {
                                 pinned = true;
                                 break;
@@ -850,20 +1145,23 @@ fn infer_core(
     // the skolems its body constrained. A variable the body never constrained
     // stays a plain rigid (no obligation, absent from the map).
     //
-    // Also build `poly_var_map`: the reverse mapping from union-find representative
-    // id → annotation var symbol, keyed by `(home, def_name)`.  The lowerer uses
+    // Also build `poly_var_map`: the reverse mapping from the solver-tagged
+    // union-find representative (`tag_solver_var(rep)`, the raw `zonk` writes
+    // into every region `Ty::Var`) → annotation var symbol, keyed by
+    // `(home, def_name)`.  The lowerer uses
     // this to distinguish "this `Ty::Var` is a generic type parameter of the
     // enclosing function" from "this `Ty::Var` is a message-free UI subtree
     // placeholder" when lowering attribute-list element types inside polymorphic
     // functions.
     let mut bounds: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>> = BTreeMap::new();
-    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<u32, Symbol>> = BTreeMap::new();
+    let mut poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>> =
+        BTreeMap::new();
     for ((home, def_name), var_rigids) in &generated.typed_rigids {
         let mut var_bounds = BTreeMap::new();
-        let mut rep_to_sym: BTreeMap<u32, Symbol> = BTreeMap::new();
+        let mut rep_to_sym: BTreeMap<SolverVar, Symbol> = BTreeMap::new();
         for (var_sym, rigid) in var_rigids {
             let rep = lift!(uf.find(*rigid));
-            rep_to_sym.insert(rep, *var_sym);
+            rep_to_sym.insert(SolverVar::from_var(rep), *var_sym);
             if let Content::Super { bounds: b, .. } = lift!(uf.content(*rigid))
                 && !b.is_empty()
             {
@@ -940,7 +1238,7 @@ fn infer_core(
                     WildcardFact::Dependent(dependence) => Some(dependence),
                 };
                 if let Some(dependence) = dependence {
-                    return Err((
+                    return Err(InferError::sited_at_path(
                         Diagnostic::Type {
                             span: entry.span,
                             msg: TypeError::WildcardNotIndependent {
@@ -948,7 +1246,7 @@ fn infer_core(
                                 dependence,
                             },
                         },
-                        Vec::new(),
+                        &entry.key.0,
                     ));
                 }
             }
@@ -964,14 +1262,9 @@ fn infer_core(
 
     // Fold each Boundary-Scheme-Promoted untyped def's quantified vars into
     // `untyped_type_params` / `poly_var_map`, alongside the typed bindings'
-    // entries above. Region/env `Ty::Var`s for these defs come from `zonk`
-    // (see the `env` read-back below), which always tags a solver
-    // representative with `tag_solver_var` before storing it — so these
-    // `poly_var_map` keys must be tagged too, or `current_poly_tvars` lookups
-    // in the lowerer would never match (unlike the typed-rigids loop above,
-    // which is keyed by the untagged skolem representative because a typed
-    // binding's own `params`/`ret` are read from its ANNOTATION type, never
-    // zonked).
+    // entries above. Every `poly_var_map` key is a solver-tagged raw, the one
+    // form `zonk` writes into region/env `Ty::Var`s, so the lowerer's lookup is
+    // exact and an annotation-symbol raw can never match a variable key.
     // Unconstrained UI-msg defaulting for UNTYPED bindings -- the counterpart of
     // the typed `msg_defaulted_vars` computation above. A fully unannotated
     // message-free view helper (`nav = Html.div [] [ Html.text "x" ]`, no
@@ -1008,58 +1301,23 @@ fn infer_core(
     // the actual DISCHARGE OUTCOME off each promoted placeholder rather than the
     // coarse boolean: default the slot to `Unit` exactly when no cross-module
     // use pins it to a concrete `Msg`, and keep it generic when ≥1 use does.
-    let mut cross_module_placeholders: BTreeMap<(Vec<Symbol>, Symbol), Vec<VarId>> =
-        BTreeMap::new();
-    for pi in &generated.pending_instantiations {
-        cross_module_placeholders
-            .entry(pi.source.clone())
-            .or_default()
-            .push(pi.placeholder);
-    }
-    let mut discharge_outcomes: BTreeMap<(Vec<Symbol>, Symbol), MsgDischargeOutcome> =
-        BTreeMap::new();
-    for (key, placeholders) in &cross_module_placeholders {
-        let mut pinned: BTreeSet<MsgConId> = BTreeSet::new();
-        for &placeholder in placeholders {
-            let discharged = lift!(zonk(&mut uf, budget, placeholder));
-            collect_ui_msg_concrete_cons(&discharged, &ui_msg_cons, false, &mut pinned);
+    //
+    // The decision is taken per union-find CLASS, not per binding: a
+    // same-module reference is the one shared variable, so `nav` and `wrap =
+    // Html.div [] [ nav ]` own the same slot, and pinning it for `nav` would
+    // pin `wrap` too. `msg_classes` was settled before the typed defaulting
+    // above, from the pre-pin classification: a class is pinned to `Unit`
+    // only when it is message-only for every owner and no owner stays
+    // generic.
+    for (&rep, owners) in &msg_classes.defaulted {
+        // A cross-module use may keep this slot generic in the joint solve, so
+        // a defaulted class an exported binding owns makes this module's own
+        // solved facts importer-dependent. Its exported scheme was reified
+        // before this pin.
+        if owners.iter().any(|owner| exported_by_scoped_module(owner)) {
+            own_facts_importer_dependent = true;
         }
-        discharge_outcomes.insert(
-            key.clone(),
-            MsgDischargeOutcome::from_distinct_pin_count(pinned.len()),
-        );
-    }
-    for (key, scheme) in &untyped_schemes {
-        if scheme.quantified.is_empty() {
-            continue;
-        }
-        // A cross-module reference keeps the binding generic only when a use
-        // discharges its ui-msg slot to a concrete `Msg`; an unpinned outcome
-        // falls through to the same `Unit`-defaulting the same-module path uses.
-        if let Some(outcome) = discharge_outcomes.get(key)
-            && !outcome.should_default()
-        {
-            continue;
-        }
-        let scheme_ty = lift!(zonk(&mut uf, budget, scheme.root));
-        let mut ui_msg_vars = BTreeSet::new();
-        let mut other_vars = BTreeSet::new();
-        collect_ui_msg_and_other_vars(
-            &scheme_ty,
-            &ui_msg_cons,
-            false,
-            &mut ui_msg_vars,
-            &mut other_vars,
-        );
-        for &root in scheme.quantified.keys() {
-            // A zonked unresolved var reads back as `Ty::Var(tag_solver_var(root))`.
-            let tagged_sym = Symbol::from_raw(tag_solver_var(root));
-            let msg_only = ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym);
-            if msg_only {
-                let rep = lift!(uf.find(root));
-                lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
-            }
-        }
+        lift!(uf.set_content(rep, Content::Structure(FlatType::Unit)));
     }
 
     let mut untyped_type_params: BTreeMap<(Vec<Symbol>, Symbol), Vec<Symbol>> = BTreeMap::new();
@@ -1081,9 +1339,9 @@ fn infer_core(
         if quantified.is_empty() {
             continue;
         }
-        let tagged: BTreeMap<u32, Symbol> = quantified
+        let tagged: BTreeMap<SolverVar, Symbol> = quantified
             .iter()
-            .map(|(&root, &sym)| (tag_solver_var(root), sym))
+            .map(|(&root, &sym)| (SolverVar::from_var(root), sym))
             .collect();
         untyped_type_params.insert(key.clone(), quantified.values().copied().collect());
         poly_var_map.insert(key.clone(), tagged);
@@ -1109,14 +1367,14 @@ fn infer_core(
         merged
     });
     let bounds_for_apps = merged_bounds.as_ref().unwrap_or(&bounds);
-    lift!(check_scheme_applications(
+    check_scheme_applications(
         &mut uf,
         budget,
         interner,
         bounds_for_apps,
         &generated.scheme_apps,
-        &enum_embeds_fn
-    ));
+        &enum_embeds_fn,
+    )?;
     // A pinned parameter wildcard lowers to its one ground type: hold every use
     // — same module, or a dependent one through the interface — to it.
     // Every wildcard-carrying binding has an entry (possibly empty), so a use
@@ -1132,13 +1390,13 @@ fn infer_core(
             }
         }
     }
-    lift!(check_wildcard_pins(
+    check_wildcard_pins(
         &mut uf,
         budget,
         interner,
         &pins_for_apps,
-        &generated.scheme_apps
-    ));
+        &generated.scheme_apps,
+    )?;
 
     // Scoped solve only: assemble the module's typed interface — exported
     // typed bindings carry their normalized annotation scheme + recorded
@@ -1177,10 +1435,15 @@ fn infer_core(
                 );
             }
         }
-        InterfaceStatus::Closed(TypedInterface {
+        let interface = TypedInterface {
             values,
             unions: m.unions.iter().map(erase_union_spans).collect(),
-        })
+        };
+        if own_facts_importer_dependent {
+            InterfaceStatus::ImporterDependent(interface)
+        } else {
+            InterfaceStatus::Closed(interface)
+        }
     });
 
     // Read back every region's resolved type — AFTER numeric/SQL defaulting, so
@@ -1346,13 +1609,20 @@ type MsgConId = (Vec<Symbol>, Symbol);
 /// * `MultiplyPinned` — ≥2 distinct concrete `Msg` types fix the slot (`viewA :
 ///   Html MsgA`, `viewB : Html MsgB`): genuinely message-polymorphic across the
 ///   boundary. Kept generic; each caller instantiates its own message type.
+/// * `Threaded` — no use pins a concrete `Msg`, but one threads the slot into
+///   an enclosing generic: a typed helper's own message variable, or an
+///   untyped helper's slot that itself stays generic (`Lib.nav` inside
+///   `Mid.wrap`, which `Main.view : Html Msg` pins). Kept generic: the
+///   enclosing helper's generic body fixes `T1` at each use, and a `Unit`
+///   default would mismatch its `Html<T1>` (E0308).
 ///
-/// The defaulting DECISION collapses `Pinned` and `MultiplyPinned` (both keep
-/// the binding generic), but the three-way distinction records WHY — a
+/// The defaulting DECISION collapses `Threaded`, `Pinned` and `MultiplyPinned`
+/// (all keep the binding generic), but the distinction records WHY — a
 /// single-type pin is monomorphic-but-inferable, not polymorphic — so the
 /// outcome is legible on its own terms rather than a bare "keep / default" bit.
 enum MsgDischargeOutcome {
     Unpinned,
+    Threaded,
     Pinned,
     MultiplyPinned,
 }
@@ -1369,12 +1639,184 @@ impl MsgDischargeOutcome {
     }
 
     /// Default the slot to `Unit` only when no cross-module use pins it to any
-    /// concrete `Msg` — the sole outcome for which `Html<()>` cannot mismatch a
-    /// caller's concrete message type. A single- or multiply-pinned slot stays
-    /// generic.
+    /// concrete `Msg` nor threads it into an enclosing generic — the sole
+    /// outcome for which `Html<()>` cannot mismatch a caller's message type. A
+    /// threaded, single- or multiply-pinned slot stays generic.
     const fn should_default(&self) -> bool {
         matches!(self, Self::Unpinned)
     }
+}
+
+/// An untyped binding's key.
+type BindingKey = (Vec<Symbol>, Symbol);
+
+/// Each quantified untyped root's representative, split by whether the
+/// untyped msg defaulting may pin it to `Unit`.
+struct QuantifiedMsgRoots<'a> {
+    /// Message-only roots, mapped to the bindings owning them.
+    msg_only_owners: BTreeMap<VarId, Vec<&'a BindingKey>>,
+    /// Every other root: no defaulting touches it, so it always stays generic.
+    always_generic: BTreeSet<VarId>,
+}
+
+/// Classify every quantified untyped root (see [`QuantifiedMsgRoots`]).
+fn quantified_msg_roots<'a>(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    untyped_schemes: &'a constrain::UntypedSchemes,
+    ui_msg_cons: &BTreeSet<Symbol>,
+) -> DResult<QuantifiedMsgRoots<'a>> {
+    let mut msg_only_owners: BTreeMap<VarId, Vec<&BindingKey>> = BTreeMap::new();
+    let mut always_generic: BTreeSet<VarId> = BTreeSet::new();
+    for (key, scheme) in untyped_schemes {
+        if scheme.quantified.is_empty() {
+            continue;
+        }
+        let scheme_ty = zonk(uf, budget, scheme.root)?;
+        let mut ui_msg_vars = BTreeSet::new();
+        let mut other_vars = BTreeSet::new();
+        collect_ui_msg_and_other_vars(
+            &scheme_ty,
+            ui_msg_cons,
+            false,
+            &mut ui_msg_vars,
+            &mut other_vars,
+        );
+        for &root in scheme.quantified.keys() {
+            let tagged_sym = Symbol::from_raw(tag_solver_var(root));
+            let rep = uf.find(root)?;
+            if ui_msg_vars.contains(&tagged_sym) && !other_vars.contains(&tagged_sym) {
+                msg_only_owners.entry(rep).or_default().push(key);
+            } else {
+                always_generic.insert(rep);
+            }
+        }
+    }
+    Ok(QuantifiedMsgRoots {
+        msg_only_owners,
+        always_generic,
+    })
+}
+
+/// The untyped msg defaulting's decision over the union-find classes of the
+/// quantified untyped roots, taken once per class before any slot is pinned.
+///
+/// A same-module reference to an untyped binding is the one shared variable,
+/// so a single class can be the quantified root of several bindings (`nav` and
+/// `wrap = Html.div [] [ nav ]`). Pinning the class for one owner pins it for
+/// every owner, so the decision belongs to the class: it stays generic when it
+/// is not message-only for some owner, or when any owner's
+/// [`MsgDischargeOutcome`] keeps that owner generic.
+struct MsgSlotClasses<'a> {
+    /// Every class that stays generic.
+    generic: BTreeSet<VarId>,
+    /// Every message-only class pinned to `Unit`, with the bindings owning it.
+    defaulted: BTreeMap<VarId, Vec<&'a BindingKey>>,
+}
+
+/// Settle every untyped binding's cross-module [`MsgDischargeOutcome`], then
+/// decide each class (see [`MsgSlotClasses`]).
+///
+/// A use threads the slot into an enclosing generic when a discharged msg
+/// slot holds a `Rigid` / `Super` (a typed helper's own message variable), a
+/// quantified root that is not message-only (always generic), or the
+/// message-only root of a binding that is itself kept generic. The last is a
+/// dependency between bindings, settled by a worklist: each binding turns
+/// `Threaded` at most once, so the pass ends after at most one visit per
+/// binding.
+fn msg_slot_classes<'a>(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    pending: &[constrain::PendingInstantiation],
+    untyped_schemes: &'a constrain::UntypedSchemes,
+    ui_msg_cons: &BTreeSet<Symbol>,
+) -> DResult<MsgSlotClasses<'a>> {
+    let mut placeholders: BTreeMap<&BindingKey, Vec<VarId>> = BTreeMap::new();
+    for pi in pending {
+        placeholders
+            .entry(&pi.source)
+            .or_default()
+            .push(pi.placeholder);
+    }
+    let QuantifiedMsgRoots {
+        msg_only_owners,
+        always_generic,
+    } = quantified_msg_roots(uf, budget, untyped_schemes, ui_msg_cons)?;
+    let mut outcomes: BTreeMap<BindingKey, MsgDischargeOutcome> = BTreeMap::new();
+    // Binding -> the bindings whose discharged slot threads into its root.
+    let mut threaded_into: BTreeMap<&BindingKey, BTreeSet<&BindingKey>> = BTreeMap::new();
+    for (&key, vars) in &placeholders {
+        let mut pinned: BTreeSet<MsgConId> = BTreeSet::new();
+        let mut slot_vars: BTreeSet<Symbol> = BTreeSet::new();
+        for &placeholder in vars {
+            let discharged = zonk(uf, budget, placeholder)?;
+            collect_ui_msg_concrete_cons(&discharged, ui_msg_cons, false, &mut pinned);
+            let mut other_vars = BTreeSet::new();
+            collect_ui_msg_and_other_vars(
+                &discharged,
+                ui_msg_cons,
+                false,
+                &mut slot_vars,
+                &mut other_vars,
+            );
+        }
+        let mut anchored = false;
+        for sym in &slot_vars {
+            let Some(var) = SolverVar::from_raw(sym.as_raw()) else {
+                continue;
+            };
+            let rep = uf.find(var.var())?;
+            match uf.content(rep)? {
+                Content::Rigid | Content::Super { .. } => anchored = true,
+                Content::Flex => {
+                    if always_generic.contains(&rep) {
+                        anchored = true;
+                    }
+                    for &owner in msg_only_owners.get(&rep).into_iter().flatten() {
+                        if owner != key {
+                            threaded_into.entry(owner).or_default().insert(key);
+                        }
+                    }
+                }
+                Content::Structure(_) => {}
+            }
+        }
+        let outcome = match MsgDischargeOutcome::from_distinct_pin_count(pinned.len()) {
+            MsgDischargeOutcome::Unpinned if anchored => MsgDischargeOutcome::Threaded,
+            outcome => outcome,
+        };
+        outcomes.insert(key.clone(), outcome);
+    }
+    let mut work: Vec<&BindingKey> = outcomes
+        .iter()
+        .filter(|(_, outcome)| !outcome.should_default())
+        .map(|(key, _)| key)
+        .filter_map(|key| placeholders.get_key_value(key).map(|(k, _)| *k))
+        .collect();
+    while let Some(kept) = work.pop() {
+        for &dependent in threaded_into.get(kept).into_iter().flatten() {
+            if let Some(outcome) = outcomes.get_mut(dependent)
+                && outcome.should_default()
+            {
+                *outcome = MsgDischargeOutcome::Threaded;
+                work.push(dependent);
+            }
+        }
+    }
+    let mut generic = always_generic;
+    let mut defaulted: BTreeMap<VarId, Vec<&BindingKey>> = BTreeMap::new();
+    for (rep, owners) in msg_only_owners {
+        let kept = generic.contains(&rep)
+            || owners
+                .iter()
+                .any(|owner| outcomes.get(*owner).is_some_and(|o| !o.should_default()));
+        if kept {
+            generic.insert(rep);
+        } else {
+            defaulted.insert(rep, owners);
+        }
+    }
+    Ok(MsgSlotClasses { generic, defaulted })
 }
 
 /// Collect the concrete `Msg` identities occupying a ui-msg slot of `ty` — the
@@ -1431,6 +1873,8 @@ fn collect_ui_msg_concrete_cons(
 /// an enclosing generic, e.g. `f x = double x`) is also rejected: propagating a
 /// super-type obligation across binding boundaries is not yet supported, so it
 /// is a fail-closed limitation rather than unsound emission.
+///
+/// A violation is sited at the use's module, not at the binding's.
 fn check_scheme_applications(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
@@ -1438,7 +1882,7 @@ fn check_scheme_applications(
     bounds: &BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>>,
     apps: &[SchemeApp],
     enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool,
-) -> DResult<()> {
+) -> Result<(), InferError> {
     for app in apps {
         // (AUD-05) keyed by (home, name) — a bare-name lookup would check a
         // same-named binding from a DIFFERENT module's obligations, both
@@ -1453,13 +1897,13 @@ fn check_scheme_applications(
                     // The definition and its use instantiate one signature, so
                     // their wildcard counts agree; a drift must not pass unchecked.
                     None => {
-                        return Err(Diagnostic::CompilerBug {
+                        return Err(InferError::unsited(Diagnostic::CompilerBug {
                             where_: "ipe_types::check_scheme_applications",
                             detail: format!(
                                 "use site has {} wildcard(s), binding obligates wildcard {i}",
                                 app.wildcards.len()
                             ),
-                        });
+                        }));
                     }
                 },
                 None => match app.vars.get(&var_sym.as_raw()) {
@@ -1467,9 +1911,12 @@ fn check_scheme_applications(
                     None => continue,
                 },
             };
-            let ty = zonk(uf, budget, *fresh)?;
+            let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, &enum_embeds_fn) {
-                return Err(super_unsatisfied(interner, *b, &ty, app.span));
+                return Err(InferError::sited(
+                    super_unsatisfied(interner, *b, &ty, app.span),
+                    &app.use_home,
+                ));
             }
         }
     }
@@ -1508,51 +1955,58 @@ pub fn wildcard_bound_index(interner: &Interner, sym: Symbol) -> Option<usize> {
 ///
 /// A use that instantiates wildcards of a binding the pin table has no entry
 /// for is a compiler bug: the table holds every wildcard-carrying binding, so a
-/// missing entry must never read as "nothing pinned".
+/// missing entry must never read as "nothing pinned". A mismatch is sited at
+/// the use's module, not at the binding's.
 fn check_wildcard_pins(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
     pins: &PinTable,
     apps: &[SchemeApp],
-) -> DResult<()> {
+) -> Result<(), InferError> {
     for app in apps {
         let Some(binding_pins) = pins.get(&(app.home.clone(), app.name)) else {
             if app.wildcards.is_empty() {
                 continue;
             }
-            return Err(Diagnostic::CompilerBug {
+            return Err(InferError::unsited(Diagnostic::CompilerBug {
                 where_: "ipe_types::check_wildcard_pins",
                 detail: format!(
                     "use site instantiates {} wildcard(s) of a binding with no pin entry",
                     app.wildcards.len()
                 ),
-            });
+            }));
         };
         for (i, pinned) in binding_pins {
             // The definition and its use instantiate one signature, so their
             // wildcard counts agree; a drift must not pass unchecked.
             let Some(fresh) = app.wildcards.get(*i) else {
-                return Err(Diagnostic::CompilerBug {
+                return Err(InferError::unsited(Diagnostic::CompilerBug {
                     where_: "ipe_types::check_wildcard_pins",
                     detail: format!(
                         "use site has {} wildcard(s), binding pins wildcard {i}",
                         app.wildcards.len()
                     ),
-                });
+                }));
             };
-            let found = zonk(uf, budget, *fresh)?;
+            let found = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
             if found != *pinned {
                 let mut namer = VarNamer::new();
-                return Err(Diagnostic::Type {
-                    span: app.span,
-                    msg: TypeError::TypeMismatch {
-                        expected: Box::new(ty_to_doc(pinned, interner, &mut namer)?),
-                        found: Box::new(ty_to_doc(&found, interner, &mut namer)?),
-                        definition: None,
-                        path: Box::new([]),
+                let expected =
+                    ty_to_doc(pinned, interner, &mut namer).map_err(InferError::unsited)?;
+                let found = ty_to_doc(&found, interner, &mut namer).map_err(InferError::unsited)?;
+                return Err(InferError::sited(
+                    Diagnostic::Type {
+                        span: app.span,
+                        msg: TypeError::TypeMismatch {
+                            expected: Box::new(expected),
+                            found: Box::new(found),
+                            definition: None,
+                            path: Box::new([]),
+                        },
                     },
-                });
+                    &app.use_home,
+                ));
             }
         }
     }
@@ -1637,13 +2091,14 @@ enum WildcardFact {
 
 /// Classify one parameter wildcard by its solved root.
 ///
-/// `rigid_names` maps the binding's signature-variable roots to their names;
+/// `rigid_names` maps the binding's solver-tagged signature-variable roots to
+/// their names;
 /// `bare` says whether the wildcard is the parameter's whole annotation.
 fn classify_param_wildcard(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &Interner,
-    rigid_names: Option<&BTreeMap<u32, Symbol>>,
+    rigid_names: Option<&BTreeMap<SolverVar, Symbol>>,
     wildcard: VarId,
     bare: bool,
 ) -> DResult<WildcardFact> {
@@ -1652,7 +2107,7 @@ fn classify_param_wildcard(
         Content::Rigid | Content::Super { rigid: true, .. } => {
             let root = uf.find(wildcard)?;
             let name = rigid_names
-                .and_then(|names| names.get(&root))
+                .and_then(|names| names.get(&SolverVar::from_var(root)))
                 .and_then(|sym| interner.resolve(*sym))
                 .map(Box::from);
             Ok(WildcardFact::Dependent(WildcardDependence::TypeVariable {
@@ -2303,7 +2758,8 @@ impl ErrorRecordFields {
 /// The 3-way outcome of resolving one [`FieldAccess`]'s base (helper of
 /// [`resolve_deferred`]; built by [`field_access_state`]).
 enum FieldState {
-    /// The base var is still `Flex` — defer to the next fixpoint pass.
+    /// The base is still undecided ([`base_state`]) — defer to the next
+    /// fixpoint pass.
     Deferred,
     /// The base is a record (or a fixed-field builtin Con) and has the
     /// field; the payload is the field's type var.
@@ -2343,13 +2799,64 @@ enum Peek {
 enum RuPeek {
     /// `(field, value_var, field_var-if-present)` per updated field.
     Fields(Vec<(Symbol, VarId, Option<VarId>)>),
-    Flex,
+    /// The base is still undecided ([`base_state`]) — defer to the next pass.
+    Undecided,
     /// The base is a nominal BUILTIN with a fixed READABLE field table
     /// (`PanicInfo` / `TypeInfo` / `ErrorInfo` / `Request`) — field access
     /// works, record UPDATE does not. Reported as the dedicated IPE-T0017
     /// rather than a misleading "no field" IPE-T0012.
     BuiltinCon(Symbol),
     Other,
+}
+
+/// How far unification has decided a deferred obligation's base variable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BaseState {
+    /// An unconstrained variable: a record may still be grown onto it.
+    Flex,
+    /// A non-rigid super variable whose obligations admit a record head: a
+    /// later pass, or [`unify`], may still pin it to a record.
+    PinnableSuper,
+    /// Unification will never make it a record it is not already.
+    Decided,
+}
+
+impl BaseState {
+    /// Whether a later pass could still settle the base to a record.
+    const fn is_undecided(self) -> bool {
+        matches!(self, Self::Flex | Self::PinnableSuper)
+    }
+}
+
+/// Classify a base descriptor, exhaustively over [`Content`].
+///
+/// The one rule every deferred pass (field access, its row tail, record update,
+/// the no-progress settle) asks, so no pass decides against a variable another
+/// pass would still wait on.
+fn base_state(content: &Content) -> BaseState {
+    match content {
+        Content::Flex => BaseState::Flex,
+        Content::Super {
+            rigid: false,
+            bounds,
+        } if super_admits_record(*bounds) => BaseState::PinnableSuper,
+        Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::Record(_, _)
+            | FlatType::EmptyRecord,
+        ) => BaseState::Decided,
+    }
+}
+
+/// Whether the variable `var` is still undecided ([`BaseState::is_undecided`]).
+fn base_is_undecided(uf: &mut UnionFind<Content>, var: VarId) -> DResult<bool> {
+    let root = uf.find(var)?;
+    Ok(base_state(uf.root_content(root)?).is_undecided())
 }
 
 /// Resolve one [`FieldAccess`]'s base to its [`FieldState`].
@@ -2397,22 +2904,40 @@ fn field_access_state(
         {
             Peek::ErrCon(*name)
         }
-        Content::Flex => Peek::Deferred, // not settled yet
-        _ => Peek::Missing,              // rigid / super / non-record structure — error
+        // Undecided (a `Flex`, or a super that may still pin to a record) →
+        // wait; a rigid, a record-refusing super, or a non-record structure →
+        // a genuine "no field".
+        content @ (Content::Flex
+        | Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::EmptyRecord,
+        )) => {
+            if base_state(content).is_undecided() {
+                Peek::Deferred
+            } else {
+                Peek::Missing
+            }
+        }
     };
     Ok(match peek {
         // Present → Found. Missing on an OPEN tail (Flex root) → GrowOpen (the
-        // record is row-polymorphic and absorbs the new field); missing on a
-        // CLOSED tail (`EmptyRecord` / any non-Flex) → Missing (IPE-T0012).
+        // record is row-polymorphic and absorbs the new field); on a tail that
+        // may still pin to a record → Deferred; on a CLOSED or otherwise decided
+        // tail → Missing (IPE-T0012).
         Peek::Record(Some(v), _) => FieldState::Found(v),
         Peek::Record(None, ext) => {
             // Resolve the tail's root (mutable `find`) BEFORE the immutable
             // `root_content` read so the two borrows don't overlap.
             let ext_root = uf.find(ext)?;
-            if matches!(uf.root_content(ext_root)?, Content::Flex) {
-                FieldState::GrowOpen
-            } else {
-                FieldState::Missing
+            match base_state(uf.root_content(ext_root)?) {
+                BaseState::Flex => FieldState::GrowOpen,
+                BaseState::PinnableSuper => FieldState::Deferred,
+                BaseState::Decided => FieldState::Missing,
             }
         }
         Peek::Req => found_or_missing(tables.req.field_var(uf, field)?),
@@ -2430,16 +2955,13 @@ fn resolve_deferred(
     tables: &BuiltinFieldTables,
     accesses: &[FieldAccess],
     updates: &[RecordUpdate],
-) -> Result<(), (Diagnostic, Vec<Symbol>)> {
-    // Incidental union-find failures (`find` / `content` / `unify` / the
-    // `Request` field lookup) carry no user-facing home — they are compiler
-    // bugs, not source-attributed type errors — so they surface with an empty
-    // home and the caller falls back to the byte-offset heuristic.  Only a
-    // genuine IPE-T0012 (built below with the failing item's `home`) attributes
-    // to a specific module.
+) -> Result<(), InferError> {
+    // A union-find or field-table step fails only on an internal invariant, so
+    // its error has no owning module. Every source error — a field mismatch
+    // from `unify_at`, an IPE-T0012 — is sited at the failing item's `home`.
     macro_rules! lift {
         ($e:expr) => {
-            $e.map_err(|d: Diagnostic| (d, Vec::<Symbol>::new()))?
+            $e.map_err(InferError::unsited)?
         };
     }
     // References avoid collecting indices and the `clippy::indexing_slicing`
@@ -2457,7 +2979,11 @@ fn resolve_deferred(
         let mut made_progress = false;
 
         // ── Field accesses ────────────────────────────────────────────────────
+        // Every visit of a pending item is a solver step: a pass may discharge
+        // only one of `n` items (a chain `r.f.f…f` settles one base per pass), so
+        // the fixpoint costs O(n²) visits and the solver budget is its ceiling.
         for fa in &pending_fa {
+            lift!(budget.tick());
             let root = lift!(uf.find(fa.record));
             // See [`field_access_state`] for the encoding + borrow discipline.
             match lift!(field_access_state(uf, tables, root, fa.field)) {
@@ -2466,7 +2992,7 @@ fn resolve_deferred(
                 }
                 FieldState::Found(v) => {
                     made_progress = true;
-                    lift!(unify(uf, budget, interner, fa.span, fa.result, v));
+                    unify_at(uf, budget, interner, &fa.home, fa.span, fa.result, v)?;
                 }
                 FieldState::GrowOpen => {
                     // Row-poly growth: the base is an open record missing this
@@ -2475,11 +3001,19 @@ fn resolve_deferred(
                     // field map (the `field_access_state` borrow has ended),
                     // insert, and re-seat with a FRESH open tail.
                     made_progress = true;
-                    let mut fields = match lift!(uf.root_content(root)).clone() {
-                        Content::Structure(FlatType::Record(fs, _)) => fs,
-                        // Unreachable: `GrowOpen` is only produced from a
-                        // `Record` root above; treat any drift as a fresh map.
-                        _ => BTreeMap::new(),
+                    // The record adopts `fa.result` as a field, so the base must
+                    // not occur inside it (`let a = r.a in g r.next`): a cycle is
+                    // an infinite type, never written.
+                    occurs_guard(uf, budget, interner, fa.span, root, fa.result)
+                        .map_err(|d| InferError::sited(d, &fa.home))?;
+                    let Content::Structure(FlatType::Record(mut fields, _)) =
+                        lift!(uf.root_content(root)).clone()
+                    else {
+                        // `GrowOpen` is only produced from a `Record` root.
+                        return Err(InferError::unsited(Diagnostic::CompilerBug {
+                            where_: "ipe_types::resolve_deferred",
+                            detail: "a grow-open field access base is not a record".into(),
+                        }));
                     };
                     fields.insert(fa.field, fa.result);
                     let new_ext = lift!(uf.fresh(Content::Flex));
@@ -2489,9 +3023,9 @@ fn resolve_deferred(
                     ));
                 }
                 FieldState::Missing => {
-                    return Err((
+                    return Err(InferError::sited(
                         no_such_field(uf, budget, interner, fa.record, fa.field, fa.span),
-                        fa.home.clone(),
+                        &fa.home,
                     ));
                 }
             }
@@ -2503,6 +3037,7 @@ fn resolve_deferred(
             // Deferred → carry to the next pass; Discharged → progress; Error →
             // propagate. Extracted into a helper so this fixpoint driver stays
             // under the readability line-cap.
+            lift!(budget.tick());
             match resolve_one_record_update(uf, budget, interner, tables, ru)? {
                 RuOutcome::Deferred => next_ru.push(ru),
                 RuOutcome::Discharged => made_progress = true,
@@ -2512,9 +3047,9 @@ fn resolve_deferred(
 
         if !made_progress {
             // Nothing was discharged this pass — every remaining item's base var
-            // is still `Flex` (no closed record ever pinned it).
+            // is still undecided (no closed record ever pinned it).
             //
-            // A `Flex` base is NOT an error: it is a field access on a parameter
+            // An undecided base is NOT an error: it is a field access on a parameter
             // no call site constrained (an un-called `viewJob job = … job.running`),
             // which the reference infers row-polymorphically — Ipe's `Access`
             // constrain (`Ipe.Type.Constrain.Expression`) unifies the target with
@@ -2525,33 +3060,47 @@ fn resolve_deferred(
             // base (`job.result`, `job.id`) absorb into the open tail via the
             // open-record unify path; the loop makes progress and terminates.
             //
-            // A base that has settled to a NON-record structure (rigid var, a
-            // concrete non-record type) still falls through to IPE-T0012 — those
-            // are genuine "not a record" errors, never reached here because a
-            // settled non-record makes `field_access_state` return `Missing`
-            // during the pass (handled above), not `Deferred`.
-            if let Some(fa) = pending_fa.first() {
-                let root = lift!(uf.find(fa.record));
-                if matches!(lift!(uf.root_content(root)), Content::Flex) {
-                    let mut fields = BTreeMap::new();
-                    fields.insert(fa.field, fa.result);
-                    let ext = lift!(uf.fresh(Content::Flex));
-                    lift!(uf.set_content(root, Content::Structure(FlatType::Record(fields, ext)),));
-                    continue;
+            // The settle goes through `unify`, never a raw write: it checks a
+            // super base's obligations and runs the occurs check, so
+            // `g r = g r.next` is an infinite type, not a cyclic record.
+            //
+            // When no pending base is undecided (each is a record waiting on a
+            // super tail), the first access falls through to IPE-T0012.
+            let mut undecided = None;
+            for fa in &pending_fa {
+                if lift!(base_is_undecided(uf, fa.record)) {
+                    undecided = Some(*fa);
+                    break;
                 }
-                return Err((
+            }
+            if let Some(fa) = undecided {
+                let mut fields = BTreeMap::new();
+                fields.insert(fa.field, fa.result);
+                let ext = lift!(uf.fresh(Content::Flex));
+                let rec = lift!(uf.fresh(Content::Structure(FlatType::Record(fields, ext))));
+                unify_at(uf, budget, interner, &fa.home, fa.span, fa.record, rec)?;
+                continue;
+            }
+            if let Some(fa) = pending_fa.first() {
+                return Err(InferError::sited(
                     no_such_field(uf, budget, interner, fa.record, fa.field, fa.span),
-                    fa.home.clone(),
+                    &fa.home,
                 ));
             }
             if let Some(ru) = pending_ru.first()
                 && let Some((field, _)) = ru.fields.first()
             {
-                return Err((
+                return Err(InferError::sited(
                     no_such_field(uf, budget, interner, ru.record, *field, ru.span),
-                    ru.home.clone(),
+                    &ru.home,
                 ));
             }
+            // A pass that made no progress, settled nothing and named no failing
+            // item would repeat itself forever: fail closed instead.
+            return Err(InferError::unsited(Diagnostic::CompilerBug {
+                where_: "ipe_types::resolve_deferred",
+                detail: "a deferred pass made no progress and reported no item".into(),
+            }));
         }
     }
 }
@@ -2574,7 +3123,7 @@ enum RuOutcome {
 ///   field's type var (or IPE-T0012 on a missing field);
 /// * a nominal builtin (`PanicInfo`/`TypeInfo`/`ErrorInfo`/`Request`) → the
 ///   dedicated IPE-T0017 (readable fields, no update form);
-/// * `Flex` → defer to the next pass;
+/// * an undecided base ([`base_state`]) → defer to the next pass;
 /// * anything else → IPE-T0012 on the first updated field (degenerate empty
 ///   update on a non-record base is treated as discharged so the loop can't
 ///   stall on it).
@@ -2584,10 +3133,10 @@ fn resolve_one_record_update(
     interner: &Interner,
     tables: &BuiltinFieldTables,
     ru: &RecordUpdate,
-) -> Result<RuOutcome, (Diagnostic, Vec<Symbol>)> {
+) -> Result<RuOutcome, InferError> {
     macro_rules! lift {
         ($e:expr) => {
-            $e.map_err(|d: Diagnostic| (d, Vec::<Symbol>::new()))?
+            $e.map_err(InferError::unsited)?
         };
     }
     let root = lift!(uf.find(ru.record));
@@ -2606,36 +3155,54 @@ fn resolve_one_record_update(
         {
             RuPeek::BuiltinCon(*name)
         }
-        Content::Flex => RuPeek::Flex,
-        _ => RuPeek::Other,
+        // An update never grows a record: an undecided base waits, a decided
+        // non-record base is a genuine "no field".
+        content @ (Content::Flex
+        | Content::Super { .. }
+        | Content::Rigid
+        | Content::Structure(
+            FlatType::Fun(_, _)
+            | FlatType::Con { .. }
+            | FlatType::Unit
+            | FlatType::Tuple(_)
+            | FlatType::EmptyRecord,
+        )) => {
+            if base_state(content).is_undecided() {
+                RuPeek::Undecided
+            } else {
+                RuPeek::Other
+            }
+        }
     };
     match peek {
         RuPeek::Fields(fields) => {
             for (field, value_var, field_var) in fields {
                 match field_var {
                     Some(field_var) => {
-                        lift!(unify(uf, budget, interner, ru.span, value_var, field_var));
+                        unify_at(
+                            uf, budget, interner, &ru.home, ru.span, value_var, field_var,
+                        )?;
                     }
                     None => {
-                        return Err((
+                        return Err(InferError::sited(
                             no_such_field(uf, budget, interner, ru.record, field, ru.span),
-                            ru.home.clone(),
+                            &ru.home,
                         ));
                     }
                 }
             }
             Ok(RuOutcome::Discharged)
         }
-        RuPeek::Flex => Ok(RuOutcome::Deferred),
-        RuPeek::BuiltinCon(name) => Err((
+        RuPeek::Undecided => Ok(RuOutcome::Deferred),
+        RuPeek::BuiltinCon(name) => Err(InferError::sited(
             lift!(builtin_record_update(interner, name, ru.span)),
-            ru.home.clone(),
+            &ru.home,
         )),
         RuPeek::Other => {
             if let Some((field, _)) = ru.fields.first() {
-                return Err((
+                return Err(InferError::sited(
                     no_such_field(uf, budget, interner, ru.record, *field, ru.span),
-                    ru.home.clone(),
+                    &ru.home,
                 ));
             }
             // Empty update on a non-record base: degenerate; treat as
@@ -2677,22 +3244,31 @@ fn resolve_route_witness_checks(
     budget: &mut Budget,
     interner: &Interner,
     checks: &[RouteWitnessCheck],
-) -> DResult<()> {
+) -> Result<(), InferError> {
     for check in checks {
-        let mut cur = uf.find(check.builder_var)?;
+        let mut cur = uf.find(check.builder_var).map_err(InferError::unsited)?;
         let mut fuel: u32 = 1024;
         while fuel > 0 {
-            match uf.content(cur)? {
+            match uf.content(cur).map_err(InferError::unsited)? {
                 Content::Structure(FlatType::Fun(_, ret)) => {
-                    cur = uf.find(ret)?;
+                    cur = uf.find(ret).map_err(InferError::unsited)?;
                 }
                 _ => break,
             }
             fuel -= 1;
         }
         // Unify the built page type with the route's page variable.  A
-        // mismatch is a normal IPE-T0001 blamed at the `Web.route` span.
-        unify(uf, budget, interner, check.span, cur, check.page_var)?;
+        // mismatch is a normal IPE-T0001 blamed at the `Web.route` span in
+        // the module owning it.
+        unify_at(
+            uf,
+            budget,
+            interner,
+            &check.home,
+            check.span,
+            cur,
+            check.page_var,
+        )?;
     }
     Ok(())
 }
@@ -2711,7 +3287,8 @@ fn resolve_route_witness_checks(
 /// `Page -> Msg` in a routed app (IPE-T0001 otherwise) and refused in an
 /// unrouted one (IPE-L0162), where nothing would call it.
 ///
-/// Every error and warning carries the home of the `Web.tea` call it concerns.
+/// Every source error and warning is sited at the home of the `Web.tea` call
+/// it concerns; a union-find invariant violation has no home.
 fn resolve_routed_web_checks(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
@@ -2720,14 +3297,13 @@ fn resolve_routed_web_checks(
     has_routes: bool,
     route_count: usize,
     warnings: &mut Vec<HomedWarning>,
-) -> Result<(), HomedDiagnostic> {
+) -> Result<(), InferError> {
     for check in checks {
-        let homed = |d: Diagnostic| (d, check.home.clone());
         // Find the settled root of the Model type variable.
-        let model_root = uf.find(check.model_var).map_err(homed)?;
+        let model_root = uf.find(check.model_var).map_err(InferError::unsited)?;
         // Clone the content to avoid borrowing `uf` across the subsequent
         // `unify` call.
-        let model_content = uf.content(model_root).map_err(homed)?;
+        let model_content = uf.content(model_root).map_err(InferError::unsited)?;
         // Extract the `page` field's VarId from the settled Model Record, if
         // any.  A non-Record descriptor (Flex, Con, etc.) or a Record without
         // a `page` field means this is a non-routed app — silently skip.
@@ -2738,31 +3314,42 @@ fn resolve_routed_web_checks(
                 .map(|(_, v)| *v),
             _ => None,
         };
-        let on_navigate =
-            row_tail_field(uf, interner, check.cfg_tail_var, "onNavigate").map_err(homed)?;
+        let on_navigate = row_tail_field(uf, interner, check.cfg_tail_var, "onNavigate")
+            .map_err(InferError::unsited)?;
         if let Some(page_var) = page_var {
             // Routed app: `notFound` must be the same type as `Model.page`.
             // `unify` produces IPE-T0001 (TypeMismatch) if they differ.
-            unify(
+            unify_at(
                 uf,
                 budget,
                 interner,
+                &check.home,
                 check.span,
                 check.not_found_var,
                 page_var,
-            )
-            .map_err(homed)?;
+            )?;
             if let Some(on_navigate) = on_navigate {
                 let page_to_msg = uf
                     .fresh(Content::Structure(FlatType::Fun(page_var, check.msg_var)))
-                    .map_err(homed)?;
-                unify(uf, budget, interner, check.span, on_navigate, page_to_msg).map_err(homed)?;
+                    .map_err(InferError::unsited)?;
+                unify_at(
+                    uf,
+                    budget,
+                    interner,
+                    &check.home,
+                    check.span,
+                    on_navigate,
+                    page_to_msg,
+                )?;
             }
         } else if on_navigate.is_some() {
-            return Err(homed(Diagnostic::Lower {
-                span: check.span,
-                msg: LowerError::OnNavigateWithoutPage,
-            }));
+            return Err(InferError::sited(
+                Diagnostic::Lower {
+                    span: check.span,
+                    msg: LowerError::OnNavigateWithoutPage,
+                },
+                &check.home,
+            ));
         } else if has_routes {
             // Non-routed Model (no `page` field) BUT the program declared a
             // non-empty `routes` list: the routes are forwarded to the
@@ -2781,7 +3368,7 @@ fn resolve_routed_web_checks(
                     span: check.span,
                     msg: LowerError::RoutedAppMissingPageField { route_count },
                 },
-                &check.home,
+                check.home.path(),
             )?);
         }
         // Non-routed with no routes → genuinely non-routed → silently skip.
@@ -2912,6 +3499,45 @@ mod tests {
     }
 
     const M2C_HDR: &str = "module Main exposing (main)\n\n";
+
+    /// A typed binding's generic-variable keys are solver-tagged, the form its zonked regions carry.
+    ///
+    /// The lowerer looks a region `Ty::Var` up by exact key, so an untagged
+    /// key would leave the binding's generic unfound in its own body.
+    #[test]
+    fn typed_binding_poly_var_keys_are_solver_tagged_region_vars() {
+        let src = format!("{M2C_HDR}identity : a -> a\nidentity x =\n    x\n\nmain = identity 1\n");
+        let (solved, i, m) = infer_src(&src);
+        assert!(
+            matches!((&solved, &m), (Ok(_), Some(_))),
+            "identity must typecheck: {solved:?}"
+        );
+        let (Ok(solved), Some(m)) = (solved, m) else {
+            return;
+        };
+        let identity = def_key(&i, &m, "identity");
+        assert!(identity.is_some(), "identity must be defined in canon");
+        let Some(identity) = identity else { return };
+        let keys = solved.poly_var_map.get(&identity);
+        assert!(
+            keys.is_some_and(|k| !k.is_empty()),
+            "identity's generic must be recorded"
+        );
+        let Some(keys) = keys else { return };
+        let region_vars: BTreeSet<SolverVar> = solved
+            .regions
+            .iter()
+            .filter(|((home, _), _)| *home == identity.0)
+            .filter_map(|(_, ty)| match ty {
+                Ty::Var(raw) => SolverVar::from_raw(*raw),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.keys().any(|key| region_vars.contains(key)),
+            "the body's region var is a key verbatim: keys {keys:?}, region vars {region_vars:?}"
+        );
+    }
 
     #[test]
     fn generic_record_signature_typechecks() {
@@ -3434,6 +4060,141 @@ mod tests {
     }
 
     const LIB1_IDENT: (&str, &str) = ("Lib1", "module Lib1 exposing (ident)\n\nident x =\n    x\n");
+
+    /// A dependency exposing a record alias, linked ahead of `Main`.
+    const DEP_POINT: &str = "module Dep exposing (Point, origin)\n\n\
+                             type alias Point =\n    { x : Int, y : Int }\n\n\
+                             origin : Point\n\
+                             origin =\n    { x = 0, y = 0 }\n";
+
+    /// Link `Dep` then `Main` and infer the program, returning the error's
+    /// diagnostic and the dotted module it is sited at (`None` when unsited),
+    /// or `None` when the program links and infers cleanly.
+    fn linked_error_site(dep_src: &str, main_src: &str) -> Option<(Diagnostic, Option<String>)> {
+        let (m, mut i) = link_modules(&[("Dep", dep_src), ("Main", main_src)])?;
+        let err = infer_attributed(&m, &mut i).err()?;
+        let home = err.home().map(|home| {
+            home.path()
+                .iter()
+                .filter_map(|seg| i.resolve(*seg))
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+        Some((err.into_diagnostic(), home))
+    }
+
+    /// A field read whose type disagrees with its use is sited in the module
+    /// owning the read, never left homeless for a surface to guess a file.
+    #[test]
+    fn field_access_type_mismatch_is_sited_in_owning_module() {
+        let main_src = "module Main exposing (getX)\n\n\
+                        import Dep exposing (Point)\n\n\
+                        getX : Point -> String\n\
+                        getX p =\n    p.x\n";
+        let site = linked_error_site(DEP_POINT, main_src);
+        assert!(
+            matches!(&site, Some((Diagnostic::Type { .. }, Some(home))) if home == "Main"),
+            "a field mismatch must be sited at Main, got {site:?}"
+        );
+    }
+
+    /// A record update storing the wrong type is sited in the module owning
+    /// the update.
+    #[test]
+    fn record_update_type_mismatch_is_sited_in_owning_module() {
+        let main_src = "module Main exposing (bump)\n\n\
+                        import Dep exposing (Point)\n\n\
+                        bump : Point -> Point\n\
+                        bump p =\n    { p | x = \"a\" }\n";
+        let site = linked_error_site(DEP_POINT, main_src);
+        assert!(
+            matches!(&site, Some((Diagnostic::Type { .. }, Some(home))) if home == "Main"),
+            "a record-update mismatch must be sited at Main, got {site:?}"
+        );
+    }
+
+    /// A route whose builder disagrees with the page type is sited in the
+    /// module owning the `Web.route` reference.
+    #[test]
+    fn route_witness_mismatch_is_sited() {
+        let mut interner = Interner::new();
+        let mut budget = Budget::unbounded();
+        let mut uf = UnionFind::new();
+        let Ok(main) = interner.intern("Main") else {
+            return;
+        };
+        let Some(home) = ModuleHome::new(vec![main]) else {
+            return;
+        };
+        let Ok(builder_var) = uf.fresh(Content::Structure(FlatType::Unit)) else {
+            return;
+        };
+        let Ok(page_var) = uf.fresh(Content::Structure(FlatType::EmptyRecord)) else {
+            return;
+        };
+        let check = RouteWitnessCheck {
+            builder_var,
+            page_var,
+            span: Span::DUMMY,
+            home: home.clone(),
+        };
+        let result = resolve_route_witness_checks(&mut uf, &mut budget, &interner, &[check]);
+        assert!(
+            matches!(&result, Err(InferError::Sited { home: sited, .. }) if *sited == home),
+            "a route witness mismatch must be sited at its route's module, got {result:?}"
+        );
+    }
+
+    /// A refusal raised while generating a def's constraints is sited in the
+    /// module owning that def.
+    #[test]
+    fn constraint_generation_error_is_sited() {
+        let main_src = "module Main exposing (f)\n\n\
+                        import Dep exposing (Point)\n\n\
+                        f : Int -> Int\n\
+                        f a b =\n    a\n";
+        let site = linked_error_site(DEP_POINT, main_src);
+        assert!(
+            matches!(
+                &site,
+                Some((
+                    Diagnostic::Type {
+                        msg: TypeError::TooManyParameters { .. },
+                        ..
+                    },
+                    Some(home)
+                )) if home == "Main"
+            ),
+            "a constraint-generation refusal must be sited at Main, got {site:?}"
+        );
+    }
+
+    /// A use that instantiates a bounded generic at a type violating its bound
+    /// is sited at the use's module, not at the binding's.
+    #[test]
+    fn scheme_app_bound_violation_is_sited_at_use() {
+        let dep_src = "module Dep exposing (double)\n\n\
+                       double : a -> a\n\
+                       double x =\n    x + x\n";
+        let main_src = "module Main exposing (doubleBool)\n\n\
+                        import Dep exposing (double)\n\n\
+                        doubleBool : Bool -> Bool\n\
+                        doubleBool x =\n    double x\n";
+        let site = linked_error_site(dep_src, main_src);
+        assert!(
+            matches!(
+                &site,
+                Some((
+                    Diagnostic::Type {
+                        msg: TypeError::SuperTypeUnsatisfied { .. },
+                        ..
+                    },
+                    Some(home)
+                )) if home == "Main"
+            ),
+            "a bound violation must be sited at the use in Main, got {site:?}"
+        );
+    }
 
     /// Test matrix item 1: a cross-module untyped helper used at two
     /// DIFFERENT concrete types from two DIFFERENT importers must be
@@ -4418,16 +5179,19 @@ mod tests {
         let (m, mut i) = link_modules(&[("Lib", lib_src), ("Main", main_src)])
             .expect("fixture modules parse, canonicalise, and link");
         let r = infer_attributed(&m, &mut i);
-        assert!(r.is_err(), "a closed-union catch-all must fail compilation");
-        let Err((err, home)) = r else {
+        assert!(
+            matches!(r, Err(InferError::Sited { .. })),
+            "a closed-union catch-all must fail compilation, sited, got {r:?}"
+        );
+        let Err(InferError::Sited { diag: err, home }) = r else {
             return;
         };
         let Ok(lib) = i.intern("Lib") else {
             return;
         };
         assert_eq!(
-            home,
-            vec![lib],
+            home.path(),
+            [lib].as_slice(),
             "the error must carry the owning module's home, not an empty one"
         );
         assert!(
@@ -4917,7 +5681,7 @@ mod tests {
             not_found_var,
             cfg_tail_var,
             span: Span::DUMMY,
-            home: home.clone(),
+            home: ModuleHome::new(home.clone()).expect("a non-empty home"),
         };
         let mut warnings: Vec<HomedWarning> = Vec::new();
         resolve_routed_web_checks(
@@ -4986,7 +5750,8 @@ mod tests {
             not_found_var,
             cfg_tail_var,
             span: Span::DUMMY,
-            home: vec![interner.intern("Main").expect("intern Main")],
+            home: ModuleHome::new(vec![interner.intern("Main").expect("intern Main")])
+                .expect("a non-empty home"),
         };
         let mut warnings: Vec<HomedWarning> = Vec::new();
         resolve_routed_web_checks(
@@ -5002,58 +5767,6 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "empty-routes non-routed app must be silent, got {warnings:?}"
-        );
-    }
-
-    /// An IPE-L0124 finding on a `Web.tea` check with no owning module is
-    /// refused as a compiler bug rather than surfacing as an unframeable warning.
-    #[test]
-    fn routed_app_warning_without_home_is_refused() {
-        let mut interner = Interner::new();
-        let count_sym = interner.intern("count").expect("intern count");
-        let mut budget = Budget::unbounded();
-        let mut uf = UnionFind::new();
-
-        let count_var = uf.fresh(Content::Flex).expect("fresh count var");
-        let ext = uf
-            .fresh(Content::Structure(FlatType::EmptyRecord))
-            .expect("fresh ext");
-        let mut fields = BTreeMap::new();
-        fields.insert(count_sym, count_var);
-        let model_var = uf
-            .fresh(Content::Structure(FlatType::Record(fields, ext)))
-            .expect("fresh model var");
-        let not_found_var = uf.fresh(Content::Flex).expect("fresh notFound var");
-
-        let msg_var = uf.fresh(Content::Flex).expect("fresh msg var");
-        let cfg_tail_var = uf
-            .fresh(Content::Structure(FlatType::EmptyRecord))
-            .expect("fresh cfg tail");
-        let check = RoutedWebCheck {
-            model_var,
-            msg_var,
-            not_found_var,
-            cfg_tail_var,
-            span: Span::DUMMY,
-            home: Vec::new(),
-        };
-        let mut warnings: Vec<HomedWarning> = Vec::new();
-        let result = resolve_routed_web_checks(
-            &mut uf,
-            &mut budget,
-            &interner,
-            &[check],
-            /* has_routes */ true,
-            /* route_count */ 1,
-            &mut warnings,
-        );
-        assert!(
-            matches!(result, Err((Diagnostic::CompilerBug { .. }, _))),
-            "a homeless warning must be refused, got {result:?}"
-        );
-        assert!(
-            warnings.is_empty(),
-            "nothing reaches the sink, got {warnings:?}"
         );
     }
 
@@ -5101,7 +5814,8 @@ mod tests {
             not_found_var,
             cfg_tail_var,
             span: Span::DUMMY,
-            home: vec![interner.intern("Main").expect("intern Main")],
+            home: ModuleHome::new(vec![interner.intern("Main").expect("intern Main")])
+                .expect("a non-empty home"),
         };
         (check, page_var, msg_var)
     }
@@ -5110,7 +5824,7 @@ mod tests {
         interner: &Interner,
         uf: &mut UnionFind<Content>,
         check: RoutedWebCheck,
-    ) -> Result<(), HomedDiagnostic> {
+    ) -> Result<(), InferError> {
         let mut budget = Budget::unbounded();
         let mut warnings: Vec<HomedWarning> = Vec::new();
         resolve_routed_web_checks(
@@ -5159,7 +5873,13 @@ mod tests {
         let (check, _, _) = on_navigate_fixture(&mut interner, &mut uf, true, Some(FlatType::Unit));
         let result = run_routed_check(&interner, &mut uf, check);
         assert!(
-            matches!(result, Err((Diagnostic::Type { .. }, _))),
+            matches!(
+                result,
+                Err(InferError::Sited {
+                    diag: Diagnostic::Type { .. },
+                    ..
+                })
+            ),
             "a non-function onNavigate must be a type mismatch, got {result:?}"
         );
     }
@@ -5177,13 +5897,13 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err((
-                    Diagnostic::Lower {
+                Err(InferError::Sited {
+                    diag: Diagnostic::Lower {
                         msg: LowerError::OnNavigateWithoutPage,
                         ..
                     },
-                    _
-                ))
+                    ..
+                })
             ),
             "onNavigate without a page field must be refused, got {result:?}"
         );
@@ -5626,6 +6346,174 @@ mod tests {
                 })
             ),
             "a field on a non-record must be NoSuchField, got {r:?}"
+        );
+    }
+
+    /// Module header for the deferred-base tests. The compiled-source stdlib
+    /// modules (`Ipe.List`, `Ipe.Maybe`) do not canonicalise in this crate, so
+    /// the higher-order-kernel callback-result shapes are pinned end to end in
+    /// `negative_suite.rs` and `g_misc/golden_lambda_field_access_seal.rs`.
+    const DEFERRED_HDR: &str = "module Main exposing (ok)\n\n";
+
+    /// Infer `body` under [`DEFERRED_HDR`], returning the result.
+    fn infer_deferred(body: &str) -> DResult<SolvedTypes> {
+        let (solved, ..) = infer_src(&format!("{DEFERRED_HDR}{body}"));
+        solved
+    }
+
+    /// Whether `r` is a type error satisfying `is_msg`.
+    fn is_type_error(r: &DResult<SolvedTypes>, is_msg: fn(&TypeError) -> bool) -> bool {
+        matches!(r, Err(Diagnostic::Type { msg, .. }) if is_msg(msg))
+    }
+
+    /// A record of one `depth`-read chain `r.f.f…f` beside `riders` reads
+    /// `sK.a`, each on its own never-settled parameter.
+    fn chain_with_riders(depth: usize, riders: usize) -> String {
+        let params = (0..riders)
+            .map(|k| format!(" s{k}"))
+            .collect::<Vec<_>>()
+            .concat();
+        let reads = (0..riders)
+            .map(|k| format!(", a{k} = s{k}.a"))
+            .collect::<Vec<_>>()
+            .concat();
+        format!(
+            "{DEFERRED_HDR}ok r{params} =\n    {{ c = r{}{reads} }}\n",
+            ".f".repeat(depth)
+        )
+    }
+
+    /// The fewest solver steps `src` infers within; `None` when it fails for a
+    /// reason other than the budget, or needs more than `2^20` steps.
+    fn min_solver_steps(src: &str) -> Option<u64> {
+        let fits = |steps: u64| -> Option<bool> {
+            let (m, mut i) = canon_src(src)?;
+            match infer_with_budget(&m, &mut i, &mut Budget::new(steps)) {
+                Ok(_) => Some(true),
+                Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                }) => Some(false),
+                Err(_) => None,
+            }
+        };
+        let (mut lo, mut hi) = (0_u64, 1_u64 << 20);
+        if !fits(hi)? {
+            return None;
+        }
+        // `lo` does not fit, `hi` fits.
+        while hi.checked_sub(lo)? > 1 {
+            let mid = lo.checked_add(hi.checked_sub(lo)? / 2)?;
+            if fits(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(hi)
+    }
+
+    #[test]
+    fn deferred_fixpoint_charges_the_solver_budget() {
+        // The chain settles one base per pass, so the deferred fixpoint runs
+        // about `2 * depth` passes, and a rider read whose base nothing settles
+        // is revisited on every one of them. Each visit is a solver step, so the
+        // budget bounds the fixpoint's work, not only the unifications inside
+        // it: the riders cost at least `riders * depth` steps over the chain
+        // alone, where their own unifications cost a constant each.
+        let (depth, riders) = (64_usize, 8_usize);
+        let alone = min_solver_steps(&chain_with_riders(depth, 0));
+        let ridden = min_solver_steps(&chain_with_riders(depth, riders));
+        assert!(
+            alone.is_some() && ridden.is_some(),
+            "both chains must infer under some budget: {alone:?} {ridden:?}"
+        );
+        let (Some(alone), Some(ridden)) = (alone, ridden) else {
+            return;
+        };
+        let floor = u64::try_from(riders * depth).unwrap_or(u64::MAX);
+        assert!(
+            ridden.saturating_sub(alone) >= floor,
+            "{riders} riders over a {depth}-deep chain cost {} steps, under {floor}",
+            ridden.saturating_sub(alone)
+        );
+    }
+
+    #[test]
+    fn field_access_on_number_super_is_no_such_field() {
+        // A `number` super can never be a record, so the access is decided at
+        // once rather than deferred.
+        let r = infer_deferred("ok n =\n    n + n.x\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::NoSuchField { .. })),
+            "a field on a number super must be NoSuchField, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn self_referential_access_is_infinite_type() {
+        // The access's result is its own base: the no-progress settle goes
+        // through `unify`, whose occurs check refuses the cyclic record.
+        let r = infer_deferred("ok r =\n    ok r.next\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a self-referential field access must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn self_referential_grow_open_is_infinite_type() {
+        // `r.a` settles `r` to an open record; `r.next` then grows it with a
+        // field whose type is `r` itself — refused before the write.
+        let r = infer_deferred("ok r =\n    let a = r.a in ok r.next\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a self-referential grown field must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn super_pinned_to_containing_structure_is_infinite_type() {
+        // The equality super `a` would pin to `List a`: an infinite type, not a
+        // solver spin to the step budget.
+        let r = infer_deferred("ok a =\n    a == [ a ]\n");
+        assert!(
+            is_type_error(&r, |m| matches!(m, TypeError::InfiniteType { .. })),
+            "a super pinned to a structure containing it must be InfiniteType, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn equality_on_a_deferred_record_base_is_order_independent() {
+        // `a` owes equality and settles to `{ x : Int }` only in the deferred
+        // pass; the verdict must not depend on which operand was constrained
+        // first.
+        let fwd = infer_deferred("ok a =\n    a.x == 1 && a == a\n");
+        assert!(
+            fwd.is_ok(),
+            "field read before equality must infer: {fwd:?}"
+        );
+        let rev = infer_deferred("ok a =\n    a == a && a.x == 1\n");
+        assert!(
+            rev.is_ok(),
+            "equality before field read must infer: {rev:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_super_check_sees_a_later_default() {
+        // `p == p` is constrained before `n + 1` makes `n` numeric: the deep
+        // equality check on `{ x = n }` must read `n` after it defaults to
+        // `Int`, exactly as the reversed spelling does.
+        let rev = infer_deferred("ok n =\n    (let p = { x = n } in p == p) && n + 1 > 0\n");
+        assert!(
+            rev.is_ok(),
+            "equality before the numeric use must infer: {rev:?}"
+        );
+        let fwd = infer_deferred("ok n =\n    n + 1 > 0 && (let p = { x = n } in p == p)\n");
+        assert!(
+            fwd.is_ok(),
+            "numeric use before equality must infer: {fwd:?}"
         );
     }
 
@@ -6342,15 +7230,17 @@ mod tests {
             .find("Just uid")
             .expect("main source must contain the unrelated `Just uid` arm");
 
-        let main_home = vec![i.intern("Main").expect("intern Main")];
+        let main_home = ModuleHome::new(vec![i.intern("Main").expect("intern Main")]);
 
         // First run establishes the blamed span + home; every subsequent run
         // must reproduce them byte-for-byte.
-        let mut settled: Option<(Span, Vec<Symbol>)> = None;
+        let mut settled: Option<(Span, Option<ModuleHome>)> = None;
         for run in 0..50 {
             let mut budget = Budget::from_env();
-            let (diag, home) = infer_with_budget_attributed(&m, &mut i, &mut budget)
+            let err = infer_with_budget_attributed(&m, &mut i, &mut budget)
                 .expect_err("Wrap stamp (Int vs Stamp) must be a type error");
+            let home = err.home().cloned();
+            let diag = err.into_diagnostic();
 
             assert!(
                 matches!(
@@ -6612,7 +7502,7 @@ h x =
 ";
 
     /// The result of one module's scoped solve ([`infer_module`]).
-    type ScopedResult = Result<ModuleInference, (Diagnostic, Vec<Symbol>)>;
+    type ScopedResult = Result<ModuleInference, InferError>;
 
     /// Scoped-solve each module over its predecessors' closed interfaces.
     ///
@@ -6636,7 +7526,8 @@ h x =
                 ipe_canon::canonicalise_module(&parsed, &path, &exports_by_path, &mut i).ok()?;
             let result = infer_module(&cm, &exports, &interfaces, &mut i);
             if let Ok(ModuleInference {
-                interface: InterfaceStatus::Closed(iface),
+                interface:
+                    InterfaceStatus::Closed(iface) | InterfaceStatus::ImporterDependent(iface),
                 ..
             }) = &result
             {
@@ -6687,7 +7578,10 @@ h x =
             }))
         ) && matches!(
             results.get(1),
-            Some(Err((Diagnostic::Type { msg, .. }, _))) if refused(msg)
+            Some(Err(InferError::Sited {
+                diag: Diagnostic::Type { msg, .. },
+                ..
+            })) if refused(msg)
         )
     }
 
@@ -7126,5 +8020,436 @@ h x =
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::*;
+    use ipe_diagnostics::{NameError, ParseError};
+    use std::num::NonZeroU32;
+
+    fn syms<const N: usize>(names: [&str; N]) -> Result<[Symbol; N], String> {
+        let mut interner = Interner::new();
+        let minted = names
+            .iter()
+            .map(|name| interner.intern(name).map_err(|e| format!("{e:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        minted
+            .try_into()
+            .map_err(|_| "symbol count drifted".to_owned())
+    }
+
+    const fn empty() -> SolvedTypes {
+        SolvedTypes {
+            env: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            expected: BTreeMap::new(),
+            bounds: BTreeMap::new(),
+            warnings: Vec::new(),
+            poly_var_map: BTreeMap::new(),
+            untyped_type_params: BTreeMap::new(),
+            msg_defaulted_vars: BTreeMap::new(),
+            signature_wildcards: BTreeMap::new(),
+        }
+    }
+
+    /// The `Ty::Var` of solver variable `id`.
+    const fn tv(id: u32) -> Ty {
+        Ty::Var(SolverVar::from_var(id).raw())
+    }
+
+    const fn at(lo: u32) -> Span {
+        Span { lo, hi: lo + 1 }
+    }
+
+    fn ceiling(n: u32) -> Result<VarCeiling, String> {
+        NonZeroU32::new(n)
+            .map(VarCeiling::at_most)
+            .ok_or_else(|| "zero ceiling".to_owned())
+    }
+
+    fn run(
+        types: SolvedTypes,
+        scope: VarScope,
+        ceiling: VarCeiling,
+    ) -> Result<CanonicalTypes, String> {
+        canonicalize(types, scope, ceiling).map_err(|e| format!("{e:?}"))
+    }
+
+    fn region_values(types: &CanonicalTypes) -> Vec<Ty> {
+        types.regions.values().cloned().collect()
+    }
+
+    /// Equal raws in two modules are one variable under `Program` and two under `PerHome`.
+    ///
+    /// The two scopes therefore disagree exactly when a variable is shared
+    /// between modules, which is what makes an equality oracle between a
+    /// joint solve and a per-module merge catch cross-module sharing.
+    #[test]
+    fn a_variable_shared_between_homes_numbers_differently_per_scope() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        let mut shared = empty();
+        shared.regions.insert((vec![a], at(0)), tv(5));
+        shared.regions.insert((vec![b], at(0)), tv(5));
+
+        let program = run(shared.clone(), VarScope::Program, VarCeiling::SOLVER)?;
+        let per_home = run(shared, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(region_values(&program), vec![tv(0), tv(0)]);
+        assert_eq!(region_values(&per_home), vec![tv(0), tv(1)]);
+        assert_ne!(program, per_home);
+
+        let mut distinct = empty();
+        distinct.regions.insert((vec![a], at(0)), tv(5));
+        distinct.regions.insert((vec![b], at(0)), tv(6));
+        assert_eq!(
+            run(distinct.clone(), VarScope::Program, VarCeiling::SOLVER)?,
+            run(distinct, VarScope::PerHome, VarCeiling::SOLVER)?,
+            "without sharing the two scopes agree"
+        );
+        Ok(())
+    }
+
+    /// More distinct variables than the ceiling admits is refused, never wrapped or saturated.
+    #[test]
+    fn a_program_with_more_variables_than_the_ceiling_is_refused() -> Result<(), String> {
+        let [a, f] = syms(["A", "f"])?;
+        let mut types = empty();
+        types.regions.insert((vec![a], at(0)), tv(1));
+        types.regions.insert((vec![a], at(1)), tv(2));
+        types.regions.insert((vec![a], at(2)), tv(3));
+
+        let refused = canonicalize(types.clone(), VarScope::Program, ceiling(2)?);
+        assert_eq!(refused, Err(CanonicalizeError::VarSpaceExhausted));
+        assert!(canonicalize(types, VarScope::Program, ceiling(3)?).is_ok());
+
+        let mut keyed = empty();
+        keyed.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([
+                (SolverVar::from_var(1), f),
+                (SolverVar::from_var(2), f),
+                (SolverVar::from_var(3), f),
+            ]),
+        );
+        assert_eq!(
+            canonicalize(keyed, VarScope::Program, ceiling(2)?),
+            Err(CanonicalizeError::VarSpaceExhausted),
+            "a `poly_var_map` key counts against the ceiling"
+        );
+        Ok(())
+    }
+
+    /// A `poly_var_map` key is renumbered through the table its region types use.
+    #[test]
+    fn poly_var_keys_and_region_vars_share_one_table() -> Result<(), String> {
+        let [a, f, g, name] = syms(["A", "f", "g", "t"])?;
+        let mut types = empty();
+        types
+            .regions
+            .insert((vec![a], at(0)), Ty::Fun(Box::new(tv(9)), Box::new(tv(4))));
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(4), name)]),
+        );
+        types.poly_var_map.insert(
+            (vec![a], g),
+            BTreeMap::from([(SolverVar::from_var(77), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![Ty::Fun(Box::new(tv(0)), Box::new(tv(1)))]
+        );
+        let keys_of = |def: Symbol| -> Vec<SolverVar> {
+            canonical
+                .poly_var_map
+                .get(&(vec![a], def))
+                .map(|vars| vars.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            keys_of(f),
+            vec![SolverVar::from_var(1)],
+            "the key stays the variable its region type names"
+        );
+        assert_eq!(
+            keys_of(g),
+            vec![SolverVar::from_var(2)],
+            "a key no region names takes the next fresh id"
+        );
+        Ok(())
+    }
+
+    /// An annotation-symbol raw is kept and takes no dense id; a row tail shares the variable table.
+    #[test]
+    fn untagged_raws_are_kept_and_row_tails_are_renumbered() -> Result<(), String> {
+        let [a, field, con] = syms(["A", "x", "T"])?;
+        let mut types = empty();
+        types.regions.insert(
+            (vec![a], at(0)),
+            Ty::Con {
+                module: Vec::new(),
+                name: con,
+                args: vec![Ty::Var(7), tv(3)],
+            },
+        );
+        types.regions.insert(
+            (vec![a], at(1)),
+            Ty::Record(
+                BTreeMap::from([(field, tv(4))]),
+                RowTail::Open(SolverVar::from_var(4).raw()),
+            ),
+        );
+        types.regions.insert(
+            (vec![a], at(2)),
+            Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            region_values(&canonical),
+            vec![
+                Ty::Con {
+                    module: Vec::new(),
+                    name: con,
+                    args: vec![Ty::Var(7), tv(0)],
+                },
+                Ty::Record(
+                    BTreeMap::from([(field, tv(1))]),
+                    RowTail::Open(SolverVar::from_var(1).raw()),
+                ),
+                Ty::Record(BTreeMap::new(), RowTail::Open(8)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Two programs that differ only in their raw solver ids canonicalize equal, and the form is a fixed point.
+    #[test]
+    fn canonical_form_ignores_raw_ids_and_is_idempotent() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let build = |first: u32, second: u32| {
+            let mut types = empty();
+            types.regions.insert(
+                (vec![a], at(0)),
+                Ty::Fun(Box::new(tv(first)), Box::new(tv(second))),
+            );
+            types.poly_var_map.insert(
+                (vec![a], f),
+                BTreeMap::from([(SolverVar::from_var(second), name)]),
+            );
+            types
+        };
+        let one = run(build(5, 9), VarScope::PerHome, VarCeiling::SOLVER)?;
+        let other = run(build(100, 3), VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(one, other);
+        let again = run(
+            one.as_solved().clone(),
+            VarScope::PerHome,
+            VarCeiling::SOLVER,
+        )?;
+        assert_eq!(one, again);
+        Ok(())
+    }
+
+    /// Every var-bearing position is renumbered through the one table, in the documented traversal order.
+    ///
+    /// `env`, `regions`, `expected`, the `signature_wildcards` pins and the
+    /// `poly_var_map` keys each hold one distinct variable, numbered so the
+    /// traversal meets them in reverse raw order: a skipped position keeps
+    /// its raw and a reordered traversal assigns a different dense id.
+    #[test]
+    fn every_var_position_is_renumbered_in_traversal_order() -> Result<(), String> {
+        let [a, f, name] = syms(["A", "f", "t"])?;
+        let mut types = empty();
+        types.env.insert((vec![a], f), tv(50));
+        types.regions.insert((vec![a], at(0)), tv(40));
+        types.expected.insert((vec![a], at(0)), tv(30));
+        types.signature_wildcards.insert(
+            (vec![a], f),
+            SignatureWildcards {
+                param_counts: vec![1],
+                pins: BTreeMap::from([(0, tv(20))]),
+            },
+        );
+        types.poly_var_map.insert(
+            (vec![a], f),
+            BTreeMap::from([(SolverVar::from_var(10), name)]),
+        );
+
+        let canonical = run(types, VarScope::PerHome, VarCeiling::SOLVER)?;
+        assert_eq!(
+            canonical.env.values().cloned().collect::<Vec<_>>(),
+            vec![tv(0)]
+        );
+        assert_eq!(region_values(&canonical), vec![tv(1)]);
+        assert_eq!(
+            canonical.expected.values().cloned().collect::<Vec<_>>(),
+            vec![tv(2)]
+        );
+        assert_eq!(
+            canonical
+                .signature_wildcards
+                .get(&(vec![a], f))
+                .map(|wildcards| wildcards.pins.values().cloned().collect::<Vec<_>>()),
+            Some(vec![tv(3)])
+        );
+        assert_eq!(
+            canonical
+                .poly_var_map
+                .get(&(vec![a], f))
+                .map(|vars| vars.keys().copied().collect::<Vec<_>>()),
+            Some(vec![SolverVar::from_var(4)])
+        );
+        Ok(())
+    }
+
+    fn warning(diagnostic: Diagnostic, home: Symbol) -> Result<HomedWarning, String> {
+        HomedWarning::new(diagnostic, &[home]).map_err(|e| format!("{e:?}"))
+    }
+
+    fn redundant(lo: u32, hi: u32) -> Diagnostic {
+        Diagnostic::Type {
+            span: Span { lo, hi },
+            msg: TypeError::RedundantCaseBranch {
+                constructor: "Red".into(),
+            },
+        }
+    }
+
+    /// Warnings come out ordered by home, then span, then code, whatever order they arrived in.
+    #[test]
+    fn warnings_are_sorted_by_home_span_then_code() -> Result<(), String> {
+        let [a, b] = syms(["A", "B"])?;
+        assert!(a < b, "the ordering below relies on interning order");
+        let mut types = empty();
+        let doc_warning = Diagnostic::Parse {
+            span: Span { lo: 0, hi: 2 },
+            msg: ParseError::DocOnUnexported { name: "f".into() },
+        };
+        let doc_code = doc_warning.code();
+        let redundant_code = redundant(0, 1).code();
+        assert_ne!(doc_code, redundant_code, "the tie-break needs two codes");
+        types.warnings = vec![
+            warning(redundant(0, 1), b)?,
+            warning(redundant(5, 6), a)?,
+            warning(redundant(0, 9), a)?,
+            warning(redundant(0, 2), a)?,
+            warning(doc_warning, a)?,
+        ];
+        let canonical = run(types, VarScope::Program, VarCeiling::SOLVER)?;
+        let order: Vec<_> = canonical
+            .warnings
+            .iter()
+            .map(|w| {
+                let span = w.diagnostic().primary_span();
+                let home = w.home().first().copied().unwrap_or(a);
+                (home, span.lo, span.hi, w.diagnostic().code())
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (a, 0, 2, doc_code),
+                (a, 0, 2, redundant_code),
+                (a, 0, 9, redundant_code),
+                (a, 5, 6, redundant_code),
+                (b, 0, 1, redundant_code),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Reads every field of each warning-severity variant with its concrete type.
+    ///
+    /// `canonicalize` carries warnings through without renumbering, so no
+    /// payload may depend on solver-variable ids: the diagnostics crate cannot
+    /// name [`Ty`], and a rendered type names its variables in first-seen order
+    /// ([`VarNamer`]). Adding a field to one of these variants breaks this
+    /// destructure (it names every field, with no `..`), so the new field has
+    /// to be classified here before it can ship. A new warning variant is
+    /// classified by [`Diagnostic::severity`], not here.
+    fn warning_payload_is_ty_free(diagnostic: &Diagnostic) -> bool {
+        match diagnostic {
+            Diagnostic::Parse {
+                span: _,
+                msg: ParseError::DocOnUnexported { name } | ParseError::MissingDocString { name },
+            } => {
+                let _: &str = name;
+                true
+            }
+            Diagnostic::Name {
+                span: _,
+                msg:
+                    NameError::ScriptImportsShapeView {
+                        shape_ui_module,
+                        shape,
+                        entry,
+                    },
+            } => {
+                let _: [&str; 3] = [shape_ui_module, shape, entry];
+                true
+            }
+            Diagnostic::Type {
+                span: _,
+                msg: TypeError::RedundantCaseBranch { constructor },
+            } => {
+                let _: &str = constructor;
+                true
+            }
+            Diagnostic::Lower {
+                span: _,
+                msg: LowerError::RoutedAppMissingPageField { route_count },
+            } => {
+                let _: &usize = route_count;
+                true
+            }
+            Diagnostic::Parse { .. }
+            | Diagnostic::Name { .. }
+            | Diagnostic::Type { .. }
+            | Diagnostic::Lower { .. }
+            | Diagnostic::CompilerBug { .. }
+            | Diagnostic::Ffi { .. }
+            | Diagnostic::Sandbox { .. }
+            | Diagnostic::Consent { .. }
+            | Diagnostic::RegistryUnreachable { .. } => false,
+        }
+    }
+
+    /// Each of the five warning-severity variants is accepted as a warning and has a `Ty`-free payload.
+    #[test]
+    fn no_warning_variant_embeds_a_ty() -> Result<(), String> {
+        let [home] = syms(["A"])?;
+        let span = Span { lo: 0, hi: 1 };
+        let warnings = [
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::DocOnUnexported { name: "f".into() },
+            },
+            Diagnostic::Parse {
+                span,
+                msg: ParseError::MissingDocString { name: "f".into() },
+            },
+            Diagnostic::Name {
+                span,
+                msg: NameError::ScriptImportsShapeView {
+                    shape_ui_module: "M".into(),
+                    shape: "S".into(),
+                    entry: "e".into(),
+                },
+            },
+            redundant(0, 1),
+            Diagnostic::Lower {
+                span,
+                msg: LowerError::RoutedAppMissingPageField { route_count: 2 },
+            },
+        ];
+        for diagnostic in warnings {
+            assert!(warning_payload_is_ty_free(&diagnostic), "{diagnostic:?}");
+            warning(diagnostic, home)?;
+        }
+        Ok(())
     }
 }

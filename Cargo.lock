@@ -3041,6 +3041,7 @@ dependencies = [
  "ipe_watch",
  "notify",
  "panic-scan",
+ "proc-macro2",
  "rustix 0.38.44",
  "rustls-pki-types",
  "salsa",
@@ -3050,6 +3051,7 @@ dependencies = [
  "signal-hook",
  "sigstore",
  "sigstore_protobuf_specs",
+ "syn 3.0.6",
  "toml",
  "toml_edit 0.25.15+spec-1.1.0",
  "ureq",
@@ -3200,10 +3202,12 @@ dependencies = [
  "ipe_intern",
  "ipe_ir",
  "ipe_kernels",
+ "proc-macro2",
  "ryu",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -3432,9 +3436,11 @@ dependencies = [
  "ipe-test-temp",
  "ipe_diagnostics",
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "rustix 0.38.44",
  "serde",
+ "toml",
  "win32job",
  "windows-sys 0.61.2",
 ]
@@ -3444,6 +3450,7 @@ name = "ipe_stdlib"
 version = "0.4.0"
 dependencies = [
  "ipe_canon",
+ "ipe_diagnostics",
  "ipe_intern",
  "ipe_kernels",
  "ipe_parse",
@@ -3485,6 +3492,7 @@ name = "ipe_wrapper"
 version = "0.4.0"
 dependencies = [
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "ipe_sandbox",
 ]
@@ -5509,6 +5517,7 @@ name = "regen-cli-transcripts"
 version = "0.4.0"
 dependencies = [
  "ipe",
+ "ipe_docs",
  "serde_json",
 ]
 
@@ -5518,6 +5527,7 @@ version = "0.4.0"
 dependencies = [
  "e2e-support",
  "ipe",
+ "ipe_docs",
 ]
 
 [[package]]

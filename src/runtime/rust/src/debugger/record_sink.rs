@@ -3,7 +3,7 @@
 //!
 //! Beside a file destination it also writes the session's typed log (same
 //! stem, extension [`crate::TYPED_LOG_EXTENSION`]) through the program's
-//! [`SessionCodec`] — the replayable form `ipe run --replay` reads. A program
+//! [`SessionCodec`] — the replayable form `ipe dev run --replay` reads. A program
 //! with no typed log (see [`crate::debugger::session_log`]) gets the trace
 //! only, and any stale typed log from an earlier build is removed.
 //!
@@ -15,14 +15,19 @@
 //! The recorder's portable form ([`RecordBuffer::replay_log`]) is plain by
 //! construction — every half renders through `IpeStringify::ipe_show`, which
 //! emits no ANSI/control byte. This sink is the OUTPUT boundary that keeps it
-//! plain regardless: [`plain_line`] strips every control byte before a line
-//! reaches a file/pipe, so a redirected log receives ZERO control codes even if
-//! a body somehow carried one. Absent proof the body is control-free, the sink
-//! still cannot feed a control byte to the destination — fail closed.
+//! plain regardless: [`plain_line`] strips every log hazard before a line
+//! reaches a file/pipe, so a redirected log receives ZERO control codes and no
+//! bidi, zero-width or tag character even if a body somehow carried one.
+//! Absent proof the body is hazard-free, the sink still cannot feed one to the
+//! destination — fail closed.
 //!
-//! The strip rule is a `char::is_control` filter plus one settling newline,
-//! pinned by a unit test here. A trace read back by the cli is sanitised again,
-//! line by line, through `ipe_diagnostics::terminal::TerminalLine`.
+//! The strip rule drops every `crate::system::is_log_hazard` character (Unicode
+//! `Cc ∪ Cf ∪ Zl ∪ Zp`, the runtime's one hazard set, equal to the compiler's
+//! `ipe_diagnostics::terminal::is_display_hazard`) and appends one settling
+//! newline; a unit test here pins it against the compiler-side predicate for
+//! every scalar value. A trace read back by the cli is sanitised again, line
+//! by line, through `ipe_diagnostics::terminal::TerminalLine`, which drops the
+//! same character set (and, unlike this filter, whole ANSI sequence bodies).
 
 #![cfg(feature = "debugger")]
 
@@ -60,16 +65,21 @@ impl RecordDest {
     }
 }
 
-/// Render one replay-log line as plain, control-code-free text ending in exactly
-/// one newline — the fail-closed output-boundary form.
+/// Render one replay-log line as plain, hazard-free text ending in exactly one
+/// newline — the fail-closed output-boundary form.
 ///
-/// Every control byte is stripped (C0/C1 and DEL — every ANSI-escape introducer,
-/// carriage return, and cursor-motion byte), then a single settling newline is
-/// appended. A test in this module pins the rule.
+/// Every `crate::system::is_log_hazard` character is stripped (C0/C1 and DEL —
+/// every ANSI-escape introducer, carriage return and cursor-motion byte — plus
+/// the bidi, zero-width, tag and line/paragraph-separator characters), then a
+/// single settling newline is appended. A test in this module pins the rule.
 #[must_use]
 pub fn plain_line(body: &str) -> String {
-    let plain: String = body.chars().filter(|c| !c.is_control()).collect();
-    format!("{plain}\n")
+    let mut plain: String = body
+        .chars()
+        .filter(|&c| !crate::system::is_log_hazard(c))
+        .collect();
+    plain.push('\n');
+    plain
 }
 
 /// Render the whole replay log as one plain, control-free blob — one
@@ -257,6 +267,30 @@ mod tests {
         assert!(!body.contains('\x1b'), "no ANSI escape may survive");
         // Printable payload preserved verbatim; only control bytes drop.
         assert_eq!(body, "[31mModel { n = 7 }[0m[2K");
+    }
+
+    // plain_line drops the whole hazard set (`Cc ∪ Cf ∪ Zl ∪ Zp`), not only
+    // controls: a bidi override, zero-width space, tag character or line
+    // separator in a model string never reaches the replay dump.
+    #[test]
+    fn plain_line_drops_the_hazard_set() {
+        assert_eq!(
+            plain_line("a\u{202E}b\u{200B}c\u{E0041}d\u{2028}e\x1b"),
+            "abcde\n"
+        );
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let expected = if ipe_diagnostics::terminal::is_display_hazard(c) {
+                "\n".to_string()
+            } else {
+                format!("{c}\n")
+            };
+            assert_eq!(
+                plain_line(&c.to_string()),
+                expected,
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
     }
 
     // render_replay_blob is the plain replay log: one `"<msg> => <model>"` line

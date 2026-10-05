@@ -38,6 +38,9 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const MOUSE_ON: &str = "\x1b[?1000;1006h";
 const MOUSE_OFF: &str = "\x1b[?1000;1006l";
 
+/// The name of the key reader thread every TUI app starts.
+const KEY_READER_THREAD: &str = "ipe-tui-keys";
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether a TUI session is currently active (terminal in raw mode + alt screen).
@@ -322,7 +325,7 @@ where
 /// (`reconstruct(n) == live`) is preserved by construction: the seam borrows the
 /// model read-only and re-fires no `Cmd`.
 ///
-/// Gated on `control-wire` (a superset of `debugger`), so a DEFAULT `ipe watch`
+/// Gated on `control-wire` (a superset of `debugger`), so a DEFAULT `ipe dev watch`
 /// on a tui app mounts the bridge for the appearance hot-swap path; `--debugger`
 /// (which implies `control-wire`) additionally carries the scrub/inspect frames.
 #[cfg(all(feature = "control-wire", not(target_arch = "wasm32")))]
@@ -396,7 +399,7 @@ fn control_bridge_channel() -> (
 ///
 /// Fail-closed and dev-loop-only: [`serve_control`](crate::control::server::serve_control)
 /// itself binds nothing unless BOTH `IPE_CONTROL_PORT` and the session token env
-/// vars are present (a child with no `ipe watch` parent opens no socket), binds
+/// vars are present (a child with no `ipe dev watch` parent opens no socket), binds
 /// loopback only, and token-checks every connection before its frame is decoded.
 /// The whole surface is absent from a release build — the module is gated on a
 /// dev-loop feature (`control-wire`), which no `ipe release` artifact selects.
@@ -446,8 +449,10 @@ where
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
 
+        // A refused key reader ends the app with an `Unavailable` error; the
+        // guard restores the terminal.
         let key_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
             read_keys_loop(&key_tx, |k| {
                 // Under the debugger, fold a Ctrl modifier on Left/Right into the
                 // kind (`ctrlleft`/`ctrlright`) so the history step keys are
@@ -463,6 +468,11 @@ where
                 (kind, k.value)
             });
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(KEY_READER_THREAD, &e).into_error(),
+            );
+        }
 
         let (mut model, cmd0) = init(());
         cli_run_cmd(cmd0, &tx);
@@ -727,7 +737,7 @@ impl TuiSurface {
     /// appearance path never drifts from the layout input contract. Returns the
     /// frame string and the freshly-rendered focusables.
     ///
-    /// This is the render the `control-wire` (default-`ipe watch`) appearance
+    /// This is the render the `control-wire` (default-`ipe dev watch`) appearance
     /// apply uses: no `TuiDebugger` in scope, so a hot-swap needs no recorder. A
     /// `--debugger` build renders through `render_debug_annotated` instead so the
     /// status-line overlay is preserved — the sole appearance path within each
@@ -756,7 +766,7 @@ impl TuiSurface {
     }
 
     /// Realize an incoming control frame onto the surface — the ONE apply seam
-    /// on a default `ipe watch` (no debugger).
+    /// on a default `ipe dev watch` (no debugger).
     ///
     /// The single parent→child command a `control-wire`-only build carries is the
     /// appearance hot-swap; the debugger's scrub/inspect frames are added by the
@@ -1055,8 +1065,9 @@ where
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
+        // A refused key reader ends the app as in `tui_app`.
         let key_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(KEY_READER_THREAD, move || {
             read_keys_loop(&key_tx, |k| {
                 // The (kind, value) channel is flat, so fold the ctrl modifier on
                 // Left/Right into the kind (`ctrlleft`/`ctrlright`) for the input
@@ -1069,6 +1080,11 @@ where
                 (kind, k.value)
             });
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(KEY_READER_THREAD, &e).into_error(),
+            );
+        }
 
         let (mut model, cmd0) = init(());
         cli_run_cmd(cmd0, &tx);
@@ -1081,7 +1097,7 @@ where
             TuiDebugger::new(model.clone(), move |msg, mdl| upd(msg, mdl))
         };
 
-        // The loopback control channel: `ipe watch` (parent) delivers hot-swap
+        // The loopback control channel: `ipe dev watch` (parent) delivers hot-swap
         // (default watch) and time-travel (`--debugger`) frames here; the run loop
         // applies each through the ONE apply seam on its own thread (below).
         // Fail-closed and release-absent — `spawn_control_bridge` binds nothing
@@ -1137,7 +1153,7 @@ where
                     None => break,
                 },
             };
-            // Default `ipe watch` (control-wire, no debugger): drain the control
+            // Default `ipe dev watch` (control-wire, no debugger): drain the control
             // channel for the appearance hot-swap only — the sole parent→child
             // command a non-debugger build carries. Applied on THIS thread (the
             // single writer of `model`/the render surface) through the ONE seam,
@@ -1820,7 +1836,7 @@ mod apply_seam_tests {
         );
     }
 
-    // (g) The FULL loopback path — the socket-crossing integration `ipe watch`
+    // (g) The FULL loopback path — the socket-crossing integration `ipe dev watch`
     // exercises, driven directly over a real TCP connection (no PTY, no `unsafe`):
     // a parent client frames a token record + a control-frame record exactly as
     // `ipe`-cli's `send_control_frame` does, the child's real accept-loop
@@ -1848,7 +1864,7 @@ mod apply_seam_tests {
         const SESSION_TOKEN: &str = "s3cr3t-loopback-token";
 
         // The child-side accept-loop reads its session token from the env, exactly
-        // as a spawned `ipe watch` child does; a `full` feature build also runs the
+        // as a spawned `ipe dev watch` child does; a `full` feature build also runs the
         // recorder-round-trip test in this module, so this must not race — but each
         // connection is served once, synchronously here.
         crate::system::locked_set_var(transport::CONTROL_TOKEN_ENV, SESSION_TOKEN);
@@ -1863,7 +1879,7 @@ mod apply_seam_tests {
             out
         }
 
-        // Bind an ephemeral loopback listener (the port `ipe watch` would lease and
+        // Bind an ephemeral loopback listener (the port `ipe dev watch` would lease and
         // hand the child as `IPE_CONTROL_PORT`), learn its addr for the client.
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1991,7 +2007,7 @@ mod apply_seam_tests {
 
 // ── The default-watch (control-wire, no debugger) apply-seam tests ───────────
 //
-// A default `ipe watch` on a tui app mounts the seam WITHOUT the recorder: the
+// A default `ipe dev watch` on a tui app mounts the seam WITHOUT the recorder: the
 // only parent→child command it carries is the appearance hot-swap. These pin
 // that debugger-free path — the appearance apply, the minimal-repaint dedup, the
 // preserved input state, the fail-closed reply-frame rejection, and the bridge's
@@ -2078,7 +2094,7 @@ mod control_wire_seam_tests {
     }
 
     // (c) Fail closed: with the run loop's receiver dropped (child exiting), the
-    // bridge handler never hangs — it returns a REJECTING Ack so `ipe watch` falls
+    // bridge handler never hangs — it returns a REJECTING Ack so `ipe dev watch` falls
     // back to a full rebuild rather than believe a frame applied.
     #[tokio::test]
     async fn bridge_fails_closed_when_the_run_loop_is_gone() {

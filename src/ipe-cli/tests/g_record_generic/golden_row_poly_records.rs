@@ -13,7 +13,7 @@
 //!
 //! No compiler code change accompanies this file: it is verification +
 //! hardening, matching the spec's proof-matrix rows P1 through P7 by direct
-//! `ipe build` / `cargo build` observation, not by assumption.
+//! `ipe dev build` / `cargo build` observation, not by assumption.
 //!
 //! | Fixture | Proof-matrix row(s) | Gate | Asserts |
 //! |---|---|---|---|
@@ -80,7 +80,7 @@ fn subset_access_ipec_accepts_and_resolves_superset_struct() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_subset_access (P2, subset field \
+        "ipe dev build must accept row_poly_subset_access (P2, subset field \
          access over a superset record): {:?}",
         built.err()
     );
@@ -118,7 +118,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_subset_access: {:?}",
+        "ipe dev build must succeed for row_poly_subset_access: {:?}",
         built.err()
     );
 
@@ -158,7 +158,7 @@ fn subset_pattern_ipec_accepts_and_completes_superset_pattern() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_subset_pattern (P5 case pattern + \
+        "ipe dev build must accept row_poly_subset_pattern (P5 case pattern + \
          P7 lambda-through-HOF pattern, both subset over a superset \
          scrutinee): {:?}",
         built.err()
@@ -197,7 +197,7 @@ fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_subset_pattern: {:?}",
+        "ipe dev build must succeed for row_poly_subset_pattern: {:?}",
         built.err()
     );
 
@@ -369,7 +369,7 @@ fn accessor_ipec_accepts_and_resolves_concrete_getter() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_accessor (P8, first-class accessor \
+        "ipe dev build must accept row_poly_accessor (P8, first-class accessor \
          `.name` over a superset record list): {:?}",
         built.err()
     );
@@ -406,7 +406,7 @@ fn accessor_cargo_builds_and_prints_names() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_accessor: {:?}",
+        "ipe dev build must succeed for row_poly_accessor: {:?}",
         built.err()
     );
 
@@ -448,7 +448,7 @@ fn row_poly_greet_lowers_and_monomorphises_two_shapes() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_greet (one row-poly fn at two shapes): \
+        "ipe dev build must accept row_poly_greet (one row-poly fn at two shapes): \
          {:?}",
         built.err()
     );
@@ -498,7 +498,7 @@ fn row_poly_greet_cargo_builds_and_prints_both() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_greet: {:?}",
+        "ipe dev build must succeed for row_poly_greet: {:?}",
         built.err()
     );
 
@@ -534,7 +534,7 @@ fn row_poly_task_seq_row_read_routes_effect_through_getter() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_task_seq_row_read: {:?}",
+        "ipe dev build must accept row_poly_task_seq_row_read: {:?}",
         built.err()
     );
 
@@ -588,7 +588,7 @@ fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_task_seq_row_read: {:?}",
+        "ipe dev build must succeed for row_poly_task_seq_row_read: {:?}",
         built.err()
     );
 
@@ -762,7 +762,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_accessor_two_shapes: {:?}",
+        "ipe dev build must succeed for row_poly_accessor_two_shapes: {:?}",
         built.err()
     );
 
@@ -802,7 +802,7 @@ fn row_poly_multi_lowers_with_one_witness_bound_per_field() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept row_poly_multi (a two-field row at two shapes): \
+        "ipe dev build must accept row_poly_multi (a two-field row at two shapes): \
          {:?}",
         built.err()
     );
@@ -853,7 +853,7 @@ fn row_poly_multi_cargo_builds_and_prints_both() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for row_poly_multi: {:?}",
+        "ipe dev build must succeed for row_poly_multi: {:?}",
         built.err()
     );
 
@@ -928,7 +928,7 @@ fn row_poly_passthrough_cargo_builds_and_runs() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name}: {:?}",
+        "ipe dev build must succeed for {name}: {:?}",
         built.err()
     );
 
@@ -1016,7 +1016,7 @@ fn row_poly_update_cargo_builds_and_runs() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name}: {:?}",
+        "ipe dev build must succeed for {name}: {:?}",
         built.err()
     );
 
@@ -1081,7 +1081,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name}: {:?}",
+        "ipe dev build must succeed for {name}: {:?}",
         built.err()
     );
 

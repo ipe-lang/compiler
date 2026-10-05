@@ -75,7 +75,6 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
     let mut stderr = Vec::new();
     let err = unsafe_ack::gate(
         &inferred,
-        /* accept_risks_flag */ false,
         /* manifest_accept */ &BTreeSet::new(),
         &via,
         /* interactive */ false,
@@ -91,7 +90,7 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
         msg.contains("cross-site scripting"),
         "names the risk: {msg}"
     );
-    assert!(msg.contains("--accept-risks"), "offers the flag: {msg}");
+    assert!(!msg.contains("--accept-risks"), "offers no flag: {msg}");
     assert!(
         msg.contains("[capabilities]"),
         "offers the manifest token: {msg}"
@@ -110,33 +109,9 @@ fn non_interactive_unsafe_without_consent_fails_closed() -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// The `--accept-risks` flag pre-accepts the same program silently.
-#[test]
-fn accept_risks_flag_proceeds_clean() -> Result<(), Box<dyn Error>> {
-    let dir = scratch_project("flag", UNSAFE_MAIN)?;
-    let inferred = ipe::infer_package_capabilities(&dir.join("package.ipe"))?;
-    let via = unsafe_ack::unsafe_modules_in_sources([UNSAFE_MAIN]);
-
-    let mut stdin = Cursor::new(Vec::new());
-    let mut stderr = Vec::new();
-    unsafe_ack::gate(
-        &inferred,
-        /* accept_risks_flag */ true,
-        &BTreeSet::new(),
-        &via,
-        /* interactive */ false,
-        &mut stdin,
-        &mut stderr,
-    )
-    .expect("--accept-risks proceeds");
-    assert!(stderr.is_empty(), "a pre-accepted build is silent");
-
-    let _ = fs::remove_dir_all(&dir);
-    Ok(())
-}
-
 /// A `Package.accepts [ Capability.unsafe ]` manifest stage parses into the
-/// typed accept set and pre-accepts durably, so CI needs no flag.
+/// typed accept set and pre-accepts durably — the one way a headless build
+/// proceeds.
 #[test]
 fn manifest_accept_token_parses_and_proceeds() -> Result<(), Box<dyn Error>> {
     let dir = scratch_project("manifest", UNSAFE_MAIN)?;
@@ -162,7 +137,6 @@ fn manifest_accept_token_parses_and_proceeds() -> Result<(), Box<dyn Error>> {
     let mut stderr = Vec::new();
     unsafe_ack::gate(
         &inferred,
-        /* accept_risks_flag */ false,
         &manifest.capabilities_accept,
         &via,
         /* interactive */ false,
@@ -192,7 +166,6 @@ fn safe_program_is_unaffected() -> Result<(), Box<dyn Error>> {
     let mut stderr = Vec::new();
     unsafe_ack::gate(
         &inferred,
-        false,
         &BTreeSet::new(),
         &[],
         false,
@@ -203,5 +176,77 @@ fn safe_program_is_unaffected() -> Result<(), Box<dyn Error>> {
     assert!(stderr.is_empty(), "the safe path is completely silent");
 
     let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The ceilings a spawned `ipe` build runs under: a wedged or flooding child
+/// is killed rather than hanging the suite.
+const BUILD_BOUNDS: e2e_support::BoundedRun = e2e_support::BoundedRun {
+    max_total: std::time::Duration::from_mins(20),
+    idle_window: std::time::Duration::from_mins(10),
+    out_cap: 64 * 1024 * 1024,
+};
+
+/// Run `ipe <mode> build <project>/package.ipe --out <project>/out` with stdin
+/// closed (never a terminal), returning (success, stderr).
+fn spawn_build(mode: &str, dir: &std::path::Path) -> Result<(bool, String), Box<dyn Error>> {
+    let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
+    cmd.args([mode, "build"])
+        .arg(dir.join("package.ipe"))
+        .arg("--out")
+        .arg(dir.join("out"))
+        .current_dir(dir)
+        .env(
+            "IPE_RUNTIME_DIR",
+            e2e_support::require_runtime().into_path_buf(),
+        )
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null());
+    let out = e2e_support::run_bounded(cmd, BUILD_BOUNDS)?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// `ipe dev build` checks no capability: an unsafe-importing program builds
+/// with stdin closed and no manifest acceptance, and no consent refusal is
+/// printed.
+#[test]
+fn dev_build_asks_no_consent() -> Result<(), Box<dyn Error>> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    let dir = scratch_project("devnoconsent", UNSAFE_MAIN)?;
+    let (ok, stderr) = spawn_build("dev", &dir)?;
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        ok,
+        "a dev build of an unsafe-importing program succeeds:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("S0001"),
+        "a dev build asks no consent:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe release build` still gates the same program: with stdin closed and no
+/// manifest acceptance it fails closed with the consent refusal, before any
+/// cargo build.
+#[test]
+fn release_build_still_asks_consent() -> Result<(), Box<dyn Error>> {
+    let dir = scratch_project("releaseconsent", UNSAFE_MAIN)?;
+    let (ok, stderr) = spawn_build("release", &dir)?;
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !ok,
+        "a headless release build without consent fails:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S0001") && stderr.contains("Ipe.Html.Unsafe"),
+        "the release refusal is the consent gate naming the module:\n{stderr}"
+    );
     Ok(())
 }

@@ -1,0 +1,380 @@
+module ViewTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
+
+
+isKeyword : String -> Token -> Bool
+isKeyword kw tok =
+    case tok of
+        Keyword k ->
+            k == kw
+
+        Str _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+isIdent : String -> Token -> Bool
+isIdent s tok =
+    case tok of
+        Ident t ->
+            t == s
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+isNum : String -> Token -> Bool
+isNum s tok =
+    case tok of
+        Num t ->
+            t == s
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+isStr : String -> Token -> Bool
+isStr s tok =
+    case tok of
+        Str t ->
+            t == s
+
+        Keyword _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+isComment : String -> Token -> Bool
+isComment s tok =
+    case tok of
+        Comment t ->
+            t == s
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+isPlain : String -> Token -> Bool
+isPlain s tok =
+    case tok of
+        Plain t ->
+            t == s
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+
+isShell : Lang -> Bool
+isShell lang =
+    case lang of
+        Shell ->
+            True
+
+        Rust ->
+            False
+
+        Ipe ->
+            False
+
+        Unknown ->
+            False
+
+
+isUnknown : Lang -> Bool
+isUnknown lang =
+    case lang of
+        Unknown ->
+            True
+
+        Rust ->
+            False
+
+        Shell ->
+            False
+
+        Ipe ->
+            False
+
+
+-- The language every stored `files.lang` value highlights as agrees with
+-- ipe-index's language vectors, row by row. Red if the vectors file is
+-- absent or empty, or if `langFor` maps a stored value differently.
+type alias LangVector =
+    { stored : String
+    , highlight : String
+    }
+
+
+langVectorsHold : Task.Task Error Bool
+langVectorsHold =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "lang_vectors.json"))
+        text <- File.readFileLimit path (ByteSize.kib 16)
+        vectors <- Task.fromResult (Decode.decodeString (Decode.list langVectorDecoder) text)
+        Task.succeed (not (List.isEmpty vectors) && List.all (\v -> langName (Highlight.langFor v.stored) == v.highlight) vectors)
+
+
+langVectorDecoder : Decode.Decoder LangVector
+langVectorDecoder =
+    Decode.map2
+        (\stored highlight -> { stored = stored, highlight = highlight })
+        (Decode.field "stored" Decode.string)
+        (Decode.field "highlight" Decode.string)
+
+
+-- A token's raw text, unrendered.
+rawText : Token -> String
+rawText tok =
+    case tok of
+        Keyword t ->
+            t
+
+        Str t ->
+            t
+
+        Comment t ->
+            t
+
+        Num t ->
+            t
+
+        Ident t ->
+            t
+
+        Plain t ->
+            t
+
+
+-- Tokenizing loses and reorders nothing: the tokens' texts, in order, are
+-- the source. Red if a closed block comment is rebuilt reversed, or if
+-- `/*/` is taken for a closed comment.
+reassembles : Lang -> String -> Bool
+reassembles lang src =
+    String.concat (List.map rawText (Highlight.tokenize lang src)) == src
+
+
+-- A one-mebibyte single-line source, the largest a shown unit's line can
+-- reach in practice, tokenizes whole. Red if a tokenizer step recurses per
+-- character outside tail position, or copies the unread input or the tokens
+-- so far per character (quadratic: the run never ends).
+largeLineTokenizes : Bool
+largeLineTokenizes =
+    let
+        src =
+            String.repeat 131072 "a1 \"s\"; "
+    in
+    String.length src == 1048576 && reassembles Highlight.Rust src
+
+
+-- A one-mebibyte block comment is one Comment token. Red if the tokenizer
+-- copies the open token's text per character (quadratic in one long token).
+largeTokenTokenizes : Bool
+largeTokenTokenizes =
+    let
+        src =
+            "/*" ++ String.repeat 1048572 "x" ++ "*/"
+    in
+    String.length src == 1048576 && Highlight.tokenize Highlight.Rust src == [ Comment src ]
+
+
+-- The keyboard shortcuts drive exactly the messages the buttons send: a/r
+-- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
+-- confirm/cancel an open refuse panel, and every key is ignored while the
+-- refuse reason input is open (so typing a reason is not hijacked).
+testKeys : Bool
+testKeys =
+    List.all identity
+        [ Keys.label (Keys.keyAction False 3 0 "a") == "approve"
+        , Keys.label (Keys.keyAction False 3 0 "r") == "refuse"
+        , Keys.label (Keys.keyAction False 3 0 "j") == "select1"
+        , Keys.label (Keys.keyAction False 3 0 "k") == "select0"
+        , Keys.label (Keys.keyAction False 3 2 "g") == "select0"
+        , Keys.label (Keys.keyAction False 3 0 "2") == "select1"
+        , Keys.label (Keys.keyAction False 3 0 "5") == "select2"
+        , Keys.label (Keys.keyAction False 3 2 "j") == "select2"
+        , Keys.label (Keys.keyAction False 3 1 "Enter") == "ignore"
+        , Keys.label (Keys.keyAction False 0 0 "a") == "ignore"
+        , Keys.label (Keys.keyAction True 3 0 "a") == "ignore"
+        , Keys.label (Keys.keyAction True 3 0 "j") == "ignore"
+        , Keys.label (Keys.keyAction True 3 0 "Enter") == "confirm"
+        , Keys.label (Keys.keyAction True 3 0 "Escape") == "cancel"
+        ]
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ Task.succeed
+            ( "formatReviewedAt renders UTC"
+            , Format.formatReviewedAt (Timestamp.fromUnixMillis 0)
+                == "1970-01-01 00:00:00"
+                && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000)
+                == "2023-11-14 22:13:20"
+            )
+        , Task.succeed
+            ( "numberedLines counts from line_start"
+            , Format.numberedLines 10 "a\nb\nc"
+                == [ ( 10, "a" ), ( 11, "b" ), ( 12, "c" ) ]
+            )
+        , Task.succeed
+            ( "highlight: rust keywords vs identifiers"
+            , List.any (isKeyword "fn") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isIdent "answer") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isNum "42") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isStr "\"hi\"") (Highlight.tokenize Highlight.Rust "let s = \"hi\";")
+                && List.any (isComment "// note") (Highlight.tokenize Highlight.Rust "// note\nfn f() {}")
+            )
+        , Task.succeed
+            ( "highlight: shell tokenizes"
+            , List.any (isKeyword "echo") (Highlight.tokenize Highlight.Shell "echo hi")
+                && List.any (isIdent "hi") (Highlight.tokenize Highlight.Shell "echo hi")
+                && isShell (Highlight.langFor "sh")
+            )
+        , Task.succeed
+            ( "highlight: malformed degrades to plain"
+            , List.any (isPlain "\"unterminated") (Highlight.tokenize Highlight.Rust "\"unterminated")
+                && List.any (isPlain "/* open") (Highlight.tokenize Highlight.Rust "/* open")
+                && List.any (isPlain "any old text") (Highlight.tokenize Highlight.Unknown "any old text")
+                && isUnknown (Highlight.langFor "weird")
+            )
+        , Task.succeed
+            ( "percent: decided over queued"
+            , Format.percent 3 4
+                == "75%"
+                && Format.percent 0 4
+                == "0%"
+                && Format.percent 4 4
+                == "100%"
+                && Format.percent 5 4
+                == "125%"
+                && Format.percent 0 0
+                == "0%"
+            )
+        , Task.succeed ( "keyboard shortcuts map to the button msgs", testKeys )
+        , check "highlight languages match the shared ipe-index language vectors" langVectorsHold
+        , Task.succeed
+            ( "highlight tokens reassemble the source"
+            , reassembles Highlight.Rust "/* a */ x"
+                && reassembles Highlight.Rust "/*/ y"
+                && reassembles Highlight.Rust "a /* b */ c /* d"
+                && List.any (isComment "/* a */") (Highlight.tokenize Highlight.Rust "/* a */ x")
+                && List.any (isPlain "/*/ y") (Highlight.tokenize Highlight.Rust "/*/ y")
+            )
+        , Task.succeed ( "a one-mebibyte single-line source tokenizes", largeLineTokenizes )
+        , Task.succeed ( "a one-mebibyte block comment is one token", largeTokenTokenizes )
+        , Task.succeed
+            ( "an escaped quote stays inside its string literal"
+            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c"
+                == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
+                && Highlight.tokenize Highlight.Rust "\"ab\\"
+                == [ Plain "\"ab\\" ]
+                && Highlight.tokenize Highlight.Rust "x // c\ny"
+                == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
+                && Highlight.tokenize Highlight.Rust "a/b**/"
+                == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
+                && Highlight.tokenize Highlight.Rust "/**/1.5_"
+                == [ Comment "/**/", Num "1.5_" ]
+            )
+        ]

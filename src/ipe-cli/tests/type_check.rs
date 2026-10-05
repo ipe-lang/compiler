@@ -128,7 +128,7 @@ fn crypto_typed_key_path_type_checks() -> TestResult {
 
 /// A program importing `Ipe.Test` — a compiled-source stdlib module that
 /// declares its own `Test` type — must resolve through injection and type-check,
-/// exactly as `ipe build` would. A bare single-module path fails name
+/// exactly as `ipe dev build` would. A bare single-module path fails name
 /// resolution here (IPE-N0004) because the module's source is never injected.
 #[test]
 fn program_using_ipe_test_resolves_and_type_checks() -> TestResult {
@@ -247,7 +247,7 @@ fn location_and_caret(report: &str) -> Option<(String, String)> {
     Some((loc.trim().to_owned(), caret.to_owned()))
 }
 
-/// Run `ipe build` on a fixture entry, returning its combined stderr. Skips the
+/// Run `ipe dev build` on a fixture entry, returning its combined stderr. Skips the
 /// caller's assertions (returns `None`) when no runtime tree is resolvable in
 /// this environment — the diagnostic under test fires at compile time, before
 /// any runtime is read, so a resolvable runtime is only needed to get `build`
@@ -255,7 +255,7 @@ fn location_and_caret(report: &str) -> Option<(String, String)> {
 fn build_stderr(entry: &Path) -> Option<String> {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = Command::new(support::ipe_bin())
-        .args(["build", &entry.to_string_lossy()])
+        .args(["dev", "build", &entry.to_string_lossy()])
         .arg("--out")
         .arg(crate::support::scratch_root().join(format!("ipe_caret_build_{}", std::process::id())))
         .env("IPE_RUNTIME_DIR", &runtime)
@@ -266,7 +266,7 @@ fn build_stderr(entry: &Path) -> Option<String> {
 
 /// `ipe type-check` must frame an unresolved-import diagnostic against the DEPENDENCY
 /// module that owns it, with the caret under the real import token — identical
-/// to `ipe build`. The fixture's error lives in `src/Lib/Helper.ipe`, one line
+/// to `ipe dev build`. The fixture's error lives in `src/Lib/Helper.ipe`, one line
 /// below a comment; a report framed against the entry file (the caret bug) would
 /// point at an unrelated `src/Main.ipe` line instead.
 #[test]
@@ -303,7 +303,7 @@ fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult
 
 /// `ipe type-check` must frame a stdlib-qualifier-without-import diagnostic against
 /// the dependency module that owns it, caret under the qualifier — identical to
-/// `ipe build`. The fixture uses `Crypto.sha256` in `src/Lib/Calc.ipe` without
+/// `ipe dev build`. The fixture uses `Crypto.sha256` in `src/Lib/Calc.ipe` without
 /// importing `Ipe.Crypto`.
 #[test]
 fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult {
@@ -359,7 +359,7 @@ fn closed_union_catch_all_fails_check_nonzero() -> TestResult {
     Ok(())
 }
 
-/// FAIL-CLOSED, no artifact: the same closed-union catch-all through `ipe build`
+/// FAIL-CLOSED, no artifact: the same closed-union catch-all through `ipe dev build`
 /// must exit non-zero and write NO emitted crate. The entry is copied into a
 /// fresh directory so any `out/` emission would be unmistakable. This proves the
 /// error stops the pipeline before code generation, not merely at print time.
@@ -377,7 +377,7 @@ fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
     let out_dir = dir.join("out");
 
     let output = Command::new(support::ipe_bin())
-        .args(["build", &src.to_string_lossy()])
+        .args(["dev", "build", &src.to_string_lossy()])
         .arg("--out")
         .arg(&out_dir)
         .env("IPE_RUNTIME_DIR", &runtime)

@@ -204,10 +204,10 @@ impl BuildPosture {
     };
 }
 
-/// Whether the HTTP listener is reachable from beyond this host.
+/// Whether one HTTP listener is reachable from beyond this host.
 ///
-/// Parsed once from the resolved bind host. Only a literal loopback IP address
-/// is `Loopback`; a hostname (`localhost` included), a wildcard, any other
+/// Parsed from a resolved bind host. Only a literal loopback IP address is
+/// `Loopback`; a hostname (`localhost` included), a wildcard, any other
 /// address, or an unparsable value is `Exposed`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ListenScope {
@@ -231,80 +231,119 @@ impl ListenScope {
                 }
             })
     }
+}
 
-    /// Record the listen scope of the bind host, before any console gate runs.
-    ///
-    /// The first install wins; a later call leaves the recorded scope unchanged.
-    pub fn install(host: &str) {
-        let _ = LISTEN_SCOPE.set(Self::parse(host));
+/// The join of every app listener this process has bound.
+///
+/// Ordered `Unbound < Loopback < Exposed`; a bind only moves it toward
+/// `Exposed`, so a later loopback bind never masks an earlier exposed one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcessScope {
+    /// No app listener has been bound yet.
+    Unbound,
+    /// Every app listener bound so far is loopback.
+    Loopback,
+    /// At least one app listener is, or may be, reachable from beyond this host.
+    Exposed,
+}
+
+impl ProcessScope {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::Unbound => 0,
+            Self::Loopback => 1,
+            Self::Exposed => 2,
+        }
     }
 
-    /// The listen scope installed by the web server, `Exposed` when none is.
+    /// Decode a stored byte; an out-of-range byte reads `Exposed`.
+    const fn from_byte(byte: u8) -> Self {
+        match byte {
+            0 => Self::Unbound,
+            1 => Self::Loopback,
+            _ => Self::Exposed,
+        }
+    }
+
+    /// The scope after one more listener of `bound` scope.
     #[must_use]
-    pub fn installed() -> Self {
-        scope_or_exposed(LISTEN_SCOPE.get())
+    pub const fn join(self, bound: ListenScope) -> Self {
+        let next = match bound {
+            ListenScope::Loopback => Self::Loopback,
+            ListenScope::Exposed => Self::Exposed,
+        };
+        if next.to_byte() > self.to_byte() {
+            next
+        } else {
+            self
+        }
+    }
+
+    /// The scope recorded by every [`record_bind`] so far.
+    #[must_use]
+    pub fn current() -> Self {
+        Self::from_byte(PROCESS_SCOPE.load(std::sync::atomic::Ordering::SeqCst))
     }
 }
 
-/// The listen scope of this process's web listener, installed once at startup.
-static LISTEN_SCOPE: std::sync::OnceLock<ListenScope> = std::sync::OnceLock::new();
+/// The monotone [`ProcessScope`] of this process, as its byte encoding.
+static PROCESS_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// An absent scope is `Exposed`: the console default never opens unproven.
-const fn scope_or_exposed(installed: Option<&ListenScope>) -> ListenScope {
-    match installed {
-        Some(scope) => *scope,
-        None => ListenScope::Exposed,
-    }
+/// Record an app listener's bind host before it binds, returning its scope.
+///
+/// Every app bind path (`serve_web`, `Server.listen`) calls this, so the
+/// process scope is the join of all of them.
+pub fn record_bind(host: &str) -> ListenScope {
+    let scope = ListenScope::parse(host);
+    let byte = ProcessScope::Unbound.join(scope).to_byte();
+    PROCESS_SCOPE.fetch_max(byte, std::sync::atomic::Ordering::SeqCst);
+    scope
 }
 
-/// The deployment posture every dev-open gate keys off.
+/// The deployment posture of this process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Posture {
-    /// Local development: dev-only conveniences may open.
+    /// Local development: a dev-intent binary with no non-dev marker set.
     Dev,
-    /// Production: every dev-open gate stays closed.
+    /// Production: every dev-only relaxation stays closed.
     Production,
 }
 
 impl Posture {
     /// Parse the posture from the raw `ENV` and `IPE_ENV` reads.
     ///
-    /// `ENV` then `IPE_ENV` selects the posture: an explicit dev marker
-    /// (`dev`/`development`/`local`, case-insensitive) is `Dev`; any other
-    /// explicit value, a non-UTF-8 one included, is `Production`. An absent
-    /// or empty variable defers to the next source; with neither set, the
-    /// compiled `build` intent decides.
+    /// A `Release` build is `Production` whatever the variables say. In a
+    /// `Development` build `ENV` then `IPE_ENV` selects the posture: an
+    /// explicit dev marker (`dev`/`development`/`local`, case-insensitive) is
+    /// `Dev`; any other explicit value, a non-UTF-8 one included, is
+    /// `Production`. An absent or empty variable defers to the next source;
+    /// with neither set, the posture is `Dev`.
     #[must_use]
     pub fn parse(env: RawEnv<'_>, ipe_env: RawEnv<'_>, build: BuildPosture) -> Self {
-        for raw in [env, ipe_env] {
-            match raw {
-                RawEnv::NotUnicode => return Self::Production,
-                RawEnv::Absent => {}
-                RawEnv::Value("") => {}
-                RawEnv::Value(value) => {
-                    let dev = ["dev", "development", "local"]
-                        .iter()
-                        .any(|marker| value.eq_ignore_ascii_case(marker));
-                    return if dev { Self::Dev } else { Self::Production };
-                }
-            }
-        }
         match build {
             BuildPosture::Release => Self::Production,
-            BuildPosture::Development => Self::Dev,
+            BuildPosture::Development => match selected_marker(env, ipe_env) {
+                Selected::Unset | Selected::DevMarker => Self::Dev,
+                Selected::Other => Self::Production,
+            },
         }
     }
 
     /// Resolve the posture from the process environment and compiled intent.
+    ///
+    /// A release binary that reads a dev marker logs, once, that it ignores it.
     #[must_use]
     pub fn from_env() -> Self {
         let env = crate::system::read_env_var("ENV");
         let ipe_env = crate::system::read_env_var("IPE_ENV");
-        Self::parse(
-            RawEnv::from_read(&env),
-            RawEnv::from_read(&ipe_env),
-            BuildPosture::COMPILED,
-        )
+        let (env, ipe_env) = (RawEnv::from_read(&env), RawEnv::from_read(&ipe_env));
+        if release_ignores_dev_marker(env, ipe_env, BuildPosture::COMPILED) {
+            static DEV_MARKER_NOTICE: std::sync::Once = std::sync::Once::new();
+            DEV_MARKER_NOTICE.call_once(|| {
+                crate::system::emit_runtime_log("posture", RELEASE_IGNORES_DEV_MARKER);
+            });
+        }
+        Self::parse(env, ipe_env, BuildPosture::COMPILED)
     }
 
     /// The label logged at startup (`posture=<label>`).
@@ -317,40 +356,119 @@ impl Posture {
     }
 }
 
-/// Whether an unauthenticated dev-only surface may open.
+/// The one-line notice a release binary logs when it reads a dev marker.
+const RELEASE_IGNORES_DEV_MARKER: &str =
+    "ENV/IPE_ENV dev marker ignored: a release build always runs in production";
+
+/// What the first non-empty of `ENV` / `IPE_ENV` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Selected {
+    /// Neither variable holds a non-empty value.
+    Unset,
+    /// `dev` / `development` / `local`, case-insensitive.
+    DevMarker,
+    /// Any other value, a non-UTF-8 one included.
+    Other,
+}
+
+fn selected_marker(env: RawEnv<'_>, ipe_env: RawEnv<'_>) -> Selected {
+    for raw in [env, ipe_env] {
+        match raw {
+            RawEnv::NotUnicode => return Selected::Other,
+            RawEnv::Absent | RawEnv::Value("") => {}
+            RawEnv::Value(value) => {
+                let dev = ["dev", "development", "local"]
+                    .iter()
+                    .any(|marker| value.eq_ignore_ascii_case(marker));
+                return if dev {
+                    Selected::DevMarker
+                } else {
+                    Selected::Other
+                };
+            }
+        }
+    }
+    Selected::Unset
+}
+
+/// Whether a `Release` build is reading a dev marker it ignores.
+fn release_ignores_dev_marker(env: RawEnv<'_>, ipe_env: RawEnv<'_>, build: BuildPosture) -> bool {
+    build == BuildPosture::Release && selected_marker(env, ipe_env) == Selected::DevMarker
+}
+
+/// Proof that this binary has the dev-loop build intent and a dev posture.
 ///
-/// True only for a binary emitted with the dev-loop intent, running in a dev
-/// posture, on a loopback listener. An `ENV=dev` override cannot open a
-/// release binary, and a dev binary on an exposed bind stays closed.
-#[must_use]
-pub const fn dev_open(build: BuildPosture, posture: Posture, scope: ListenScope) -> bool {
-    matches!(
-        (build, posture, scope),
-        (
-            BuildPosture::Development,
-            Posture::Dev,
-            ListenScope::Loopback
-        )
-    )
+/// Constructible only through `dev_intent`; not `Clone`/`Copy`, so a
+/// consumer borrows it for one decision. Every dev-only relaxation that needs
+/// no listener proof (a token-gated route, a dev-only push, non-`Secure`
+/// cookies, SSRF deny-private off) takes `Option<&DevIntent>`.
+#[derive(Debug)]
+pub struct DevIntent(());
+
+/// Proof of [`DevIntent`] and that every app listener of this process is loopback.
+///
+/// Constructible only through `dev_surface`. Every unauthenticated
+/// listener-facing dev surface (console default, token-less ingest, the
+/// console banner, the WebSocket origin waiver) takes `Option<&DevSurface>`.
+/// Never cached: the process scope can widen after it is minted.
+#[derive(Debug)]
+pub struct DevSurface {
+    _intent: DevIntent,
 }
 
-/// [`dev_open`] over the compiled intent, the process posture, and the
-/// installed listen scope.
+/// A [`DevIntent`] when `build` is `Development` and `posture` is `Dev`.
 #[must_use]
-pub fn dev_open_from_env() -> bool {
-    dev_open(
-        BuildPosture::COMPILED,
-        Posture::from_env(),
-        ListenScope::installed(),
-    )
+pub(crate) const fn dev_intent(build: BuildPosture, posture: Posture) -> Option<DevIntent> {
+    match (build, posture) {
+        (BuildPosture::Development, Posture::Dev) => Some(DevIntent(())),
+        (BuildPosture::Development, Posture::Production) | (BuildPosture::Release, _) => None,
+    }
 }
 
-/// Production gate over [`Posture::from_env`]. A release-intent binary deployed
-/// without env vars is production, so every dev-open gate (unauthenticated
-/// console, token-less ingest, SSRF deny-private, non-Secure cookies) fails
-/// closed.
+/// [`dev_intent`] over the compiled intent and the process posture.
 #[must_use]
-pub fn production_from_env() -> bool {
+pub(crate) fn dev_intent_from_env() -> Option<DevIntent> {
+    dev_intent(BuildPosture::COMPILED, Posture::from_env())
+}
+
+/// A [`DevSurface`] when every app listener of this process is loopback.
+///
+/// An `Unbound` process has no listener to prove loopback, so it gets none.
+#[must_use]
+pub(crate) fn dev_surface(intent: DevIntent, scope: ProcessScope) -> Option<DevSurface> {
+    match scope {
+        ProcessScope::Loopback => Some(DevSurface { _intent: intent }),
+        ProcessScope::Unbound | ProcessScope::Exposed => None,
+    }
+}
+
+/// [`dev_surface`] over [`dev_intent_from_env`] and the recorded process scope.
+#[must_use]
+pub(crate) fn dev_surface_from_env() -> Option<DevSurface> {
+    dev_intent_from_env().and_then(|intent| dev_surface(intent, ProcessScope::current()))
+}
+
+/// A [`DevIntent`] for a unit test of a pure `*_with` gate.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) const fn test_dev_intent() -> DevIntent {
+    DevIntent(())
+}
+
+/// A [`DevSurface`] for a unit test of a pure `*_with` gate.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) const fn test_dev_surface() -> DevSurface {
+    DevSurface {
+        _intent: DevIntent(()),
+    }
+}
+
+/// Whether the process posture is production, for closing-direction reads only.
+///
+/// A dev-only relaxation never negates this: it takes a [`DevIntent`] or
+/// [`DevSurface`]. The source inventory `tests/posture_read_inventory.rs`
+/// admits every caller by name.
+#[must_use]
+pub(crate) fn posture_is_production() -> bool {
     Posture::from_env() == Posture::Production
 }
 
@@ -367,9 +485,9 @@ pub enum ConsoleAuthMode {
     Token,
     /// Explicit `app`: the app-supplied `consoleAuth` callback decides.
     App,
-    /// Unset where [`dev_open`] fails: an admin token is required.
+    /// Unset where `dev_surface` fails: an admin token is required.
     UnsetProd,
-    /// Unset where [`dev_open`] holds: open.
+    /// Unset where `dev_surface` holds: open.
     DevOpen,
 }
 
@@ -383,7 +501,7 @@ impl ConsoleAuthMode {
         raw: RawEnv<'_>,
         build: BuildPosture,
         posture: Posture,
-        scope: ListenScope,
+        scope: ProcessScope,
     ) -> Self {
         ConsoleAuthResolution::resolve(raw, build, posture, scope).mode
     }
@@ -458,7 +576,7 @@ impl ConsoleAuthResolution {
         raw: RawEnv<'_>,
         build: BuildPosture,
         posture: Posture,
-        scope: ListenScope,
+        scope: ProcessScope,
     ) -> Self {
         let default = Self::posture_default(build, posture, scope);
         let (mode, source) = match raw {
@@ -487,13 +605,16 @@ impl ConsoleAuthResolution {
         }
     }
 
-    /// The unset default: open only where [`dev_open`] holds.
-    const fn posture_default(
+    /// The unset default: open only where [`dev_surface`] holds.
+    fn posture_default(
         build: BuildPosture,
         posture: Posture,
-        scope: ListenScope,
+        scope: ProcessScope,
     ) -> ConsoleAuthMode {
-        if dev_open(build, posture, scope) {
+        if dev_intent(build, posture)
+            .and_then(|intent| dev_surface(intent, scope))
+            .is_some()
+        {
             ConsoleAuthMode::DevOpen
         } else {
             ConsoleAuthMode::UnsetProd
@@ -508,7 +629,7 @@ impl ConsoleAuthResolution {
             RawEnv::from_read(&read),
             BuildPosture::COMPILED,
             Posture::from_env(),
-            ListenScope::installed(),
+            ProcessScope::current(),
         )
     }
 
@@ -533,8 +654,9 @@ impl ConsoleAuthResolution {
 /// where the `live` module is DCE'd out of server-only builds) can reach it too.
 ///
 /// Suppressed for a sub-app (`base` non-empty — e.g. the bundled console child
-/// itself; a console link inside the console is recursive), in production
-/// (`ENV`/`IPE_ENV` non-dev), when the banner is turned off (`IPE_DEV_BANNER=off|0`,
+/// itself; a console link inside the console is recursive), without a
+/// [`DevSurface`] (it advertises the console, so it agrees with the console
+/// default), when the banner is turned off (`IPE_DEV_BANNER=off|0`,
 /// ), and when the console surface is disabled (`IPE_CONSOLE_EMBED=off`
 /// / `IPE_CONSOLE_AUTH` resolving to `off`). The union of  and the live path's gates —
 /// suppression only ever makes bodies match MORE often across odd configs, and
@@ -545,7 +667,13 @@ impl ConsoleAuthResolution {
 /// stays default so the link is clickable.
 #[must_use]
 pub fn dev_console_banner(base: &str) -> String {
-    if !base.is_empty() || production_from_env() {
+    dev_console_banner_with(base, dev_surface_from_env().as_ref())
+}
+
+/// [`dev_console_banner`] under an explicit dev-surface proof: `None` is `""`.
+#[must_use]
+pub(crate) fn dev_console_banner_with(base: &str, dev: Option<&DevSurface>) -> String {
+    if !base.is_empty() || dev.is_none() {
         return String::new();
     }
     if matches!(
@@ -612,31 +740,136 @@ pub fn inject_dev_banner(body: &str, banner: &str) -> String {
     }
 }
 
-/// `Some(value)` when responses run in cross-origin-iframe mode
-/// (`IPE_WEB_FRAME_ANCESTORS` set). Snapshotted once into a `OnceLock` so env
-/// is read only once (eliminates the TOCTOU window where a dynamic env mutation
-/// could split the cookie name / CSP framing decision within a single request).
+/// The environment variable holding the `frame-ancestors` source list.
+pub const FRAME_ANCESTORS_ENV: &str = "IPE_WEB_FRAME_ANCESTORS";
+
+/// The `Content-Security-Policy` value `frame-ancestors <sources>` of an
+/// operator-configured embed allow-list.
 ///
-/// Lives here (the always-compiled telemetry module) rather than under `web`
-/// so the Ipe.Http.Server path (`server.rs`) can reach it too — the `web`
-/// module is DCE'd out of server-only builds.
-pub fn frame_ancestors() -> Option<&'static str> {
+/// Built only by [`FrameAncestors::parse`], so the value holds only visible
+/// ASCII, spaces and tabs, at least one source, and no `;` or `,`: it is
+/// always a header value, and it adds no directive and no second policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameAncestors(String);
+
+/// Why an `IPE_WEB_FRAME_ANCESTORS` value has no `frame-ancestors` representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAncestorsRefusal {
+    /// A byte outside visible ASCII, space and tab: a control (CR, LF, NUL), DEL,
+    /// a non-ASCII byte, or a value that is not UTF-8.
+    NotVisibleAscii,
+    /// A `;`, which starts another policy directive.
+    DirectiveSeparator,
+    /// A `,`, which starts another policy.
+    PolicySeparator,
+    /// Only spaces or tabs: no source at all.
+    Blank,
+}
+
+impl std::fmt::Display for FrameAncestorsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let why = match self {
+            Self::NotVisibleAscii => {
+                "holds a control, DEL or non-ASCII byte (write an internationalised host in its \
+                 `xn--` form)"
+            }
+            Self::DirectiveSeparator => "holds `;`, which would start another policy directive",
+            Self::PolicySeparator => "holds `,`, which would start another policy",
+            Self::Blank => "holds only whitespace",
+        };
+        write!(
+            f,
+            "{FRAME_ANCESTORS_ENV} {why}; set it to space-separated sources such as \
+             `https://app.example.com`, or unset it to refuse every embedding"
+        )
+    }
+}
+
+impl std::error::Error for FrameAncestorsRefusal {}
+
+impl FrameAncestors {
+    /// Parse a raw `IPE_WEB_FRAME_ANCESTORS` value.
+    ///
+    /// The empty value is `Ok(None)`: no embedding, as when the variable is
+    /// unset. Surrounding spaces and tabs are dropped.
+    ///
+    /// # Errors
+    ///
+    /// A [`FrameAncestorsRefusal`] for a value with a byte outside visible
+    /// ASCII, space and tab, a `;` or `,`, or only whitespace.
+    pub fn parse(raw: &str) -> Result<Option<Self>, FrameAncestorsRefusal> {
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        for b in raw.bytes() {
+            match b {
+                b';' => return Err(FrameAncestorsRefusal::DirectiveSeparator),
+                b',' => return Err(FrameAncestorsRefusal::PolicySeparator),
+                b'\t' | b' '..=b'~' => {}
+                _ => return Err(FrameAncestorsRefusal::NotVisibleAscii),
+            }
+        }
+        let sources = raw.trim_matches([' ', '\t']);
+        if sources.is_empty() {
+            return Err(FrameAncestorsRefusal::Blank);
+        }
+        Ok(Some(Self(format!("frame-ancestors {sources}"))))
+    }
+
+    /// Parse a lookup of `IPE_WEB_FRAME_ANCESTORS`: absent is `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`]; a value that is not UTF-8 is
+    /// [`FrameAncestorsRefusal::NotVisibleAscii`].
+    pub fn from_lookup(
+        raw: &Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, FrameAncestorsRefusal> {
+        match raw {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(FrameAncestorsRefusal::NotVisibleAscii),
+            Ok(v) => Self::parse(v),
+        }
+    }
+
+    /// The `Content-Security-Policy` header value, `frame-ancestors <sources>`.
+    #[must_use]
+    pub const fn csp_value(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// The process's parsed `IPE_WEB_FRAME_ANCESTORS`: `Ok(Some)` in
+/// cross-origin-iframe mode, `Ok(None)` when unset or empty.
+///
+/// The one reader of the variable, parsed once into a `OnceLock` so the cookie
+/// `SameSite` and the framing header never decide on two different values.
+/// `Server.listen` and every `Ipe.Web` router refuse to start on the `Err`.
+///
+/// Lives in the always-compiled telemetry module so the `Ipe.Http.Server`
+/// path reaches it in server-only builds.
+///
+/// # Errors
+///
+/// The [`FrameAncestorsRefusal`] of a present, unrepresentable value.
+pub fn frame_ancestors_config() -> Result<Option<&'static FrameAncestors>, FrameAncestorsRefusal> {
     use std::sync::OnceLock;
-    static FA: OnceLock<String> = OnceLock::new();
-    let v = FA.get_or_init(|| {
-        // Strip CR / LF / NUL: this value is spliced verbatim into the
-        // Content-Security-Policy response header. A CR or LF would terminate
-        // the header line and inject a new response header (HTTP response
-        // splitting); NUL is rejected by header encoders. The remaining
-        // `frame-ancestors` source-list grammar is the operator's
-        // responsibility — we only close the response-splitting vector.
-        crate::system::read_env_var("IPE_WEB_FRAME_ANCESTORS")
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
-            .collect()
-    });
-    if v.is_empty() { None } else { Some(v.as_str()) }
+    static FA: OnceLock<Result<Option<FrameAncestors>, FrameAncestorsRefusal>> = OnceLock::new();
+    match FA.get_or_init(|| {
+        FrameAncestors::from_lookup(&crate::system::read_env_var(FRAME_ANCESTORS_ENV))
+    }) {
+        Ok(fa) => Ok(fa.as_ref()),
+        Err(refusal) => Err(*refusal),
+    }
+}
+
+/// `Some` when responses run in cross-origin-iframe mode.
+///
+/// A refused value is `None`: cookies keep the same-site default, and the
+/// security headers refuse the response (see [`security_headers`]).
+#[must_use]
+pub fn frame_ancestors() -> Option<&'static FrameAncestors> {
+    frame_ancestors_config().ok().flatten()
 }
 
 /// The closed, ordered `Permissions-Policy` directive vocabulary Ipê emits an
@@ -742,8 +975,20 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
 /// `(name, value)` pairs so each
 /// caller splices them into its response builder only when the header is unset
 /// (an explicit handler override wins).
-#[must_use]
-pub fn security_headers() -> Vec<(&'static str, String)> {
+///
+/// # Errors
+///
+/// The [`FrameAncestorsRefusal`] of a refused `IPE_WEB_FRAME_ANCESTORS`: the
+/// caller answers `500` rather than send a response without its framing policy.
+pub fn security_headers() -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
+    security_headers_with(frame_ancestors_config())
+}
+
+/// [`security_headers`] under an explicit framing configuration.
+fn security_headers_with(
+    framing: Result<Option<&FrameAncestors>, FrameAncestorsRefusal>,
+) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
+    let framing = framing?;
     let mut h: Vec<(&'static str, String)> = vec![
         //
         ("x-content-type-options", "nosniff".to_string()),
@@ -759,12 +1004,12 @@ pub fn security_headers() -> Vec<(&'static str, String)> {
         ("permissions-policy", permissions_policy_value()),
     ];
     // Framing: CSP frame-ancestors when an embed origin is configured, else
-    // X-Frame-Options: SAMEORIGIN (mutually exclusive
-    match frame_ancestors() {
-        Some(fa) => h.push(("content-security-policy", format!("frame-ancestors {fa}"))),
+    // X-Frame-Options: SAMEORIGIN (mutually exclusive).
+    match framing {
+        Some(fa) => h.push(("content-security-policy", fa.csp_value().to_owned())),
         None => h.push(("x-frame-options", "SAMEORIGIN".to_string())),
     }
-    h
+    Ok(h)
 }
 
 /// Record a structured log line (called from `Ipe.Log.*`). Errors also land in
@@ -1140,34 +1385,17 @@ pub fn recent_errors(limit: usize) -> Vec<LogEntry> {
     g.iter().skip(n.saturating_sub(limit)).cloned().collect()
 }
 
-/// Minimal JSON string escaping for hand-built console payloads (avoids coupling
-/// the always-compiled sink to serde).
+/// The JSON string body of `s` for every JSON log record and console payload.
+///
+/// The display/log escaper is `crate::escape::json_str_body`, which spells
+/// every log hazard (`Cc ∪ Cf ∪ Zl ∪ Zp`, C1 and bidi controls included) as a
+/// `\u` escape, so a JSON log line read in a terminal carries no live control.
+/// Its callers are `log.rs` JSON mode, `core.rs`'s foreign-error and panic
+/// records and the console API payloads, each written or served as JSON; no
+/// inline `<script>` embeds this output.
 #[must_use]
 pub fn json_escape(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            // cast is safe: we just checked c as u32 < 0x20
-            #[allow(clippy::cast_sign_loss)]
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are valid JSON
-            // but are JS line terminators — unescaped, they break this payload
-            // when it is embedded in an inline <script> block (the console
-            // bootstrap does exactly that). Escape them defensively.
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            c => out.push(c),
-        }
-    }
-    out
+    crate::escape::json_str_body(s)
 }
 
 /// Render a log-entry slice as a JSON array.
@@ -1193,6 +1421,89 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+
+    /// Every byte class with no `frame-ancestors` representation is refused,
+    /// the empty value is no embedding, and a source list is kept as written.
+    #[test]
+    fn frame_ancestors_parse_refuses_each_unrepresentable_class() {
+        let refused = [
+            ("https://\u{e9}.x", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\rb", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\nb", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\0b", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\u{7f}b", FrameAncestorsRefusal::NotVisibleAscii),
+            (
+                "'self'; script-src *",
+                FrameAncestorsRefusal::DirectiveSeparator,
+            ),
+            (
+                "https://a.example, https://b.example",
+                FrameAncestorsRefusal::PolicySeparator,
+            ),
+            ("  ", FrameAncestorsRefusal::Blank),
+            (" \t ", FrameAncestorsRefusal::Blank),
+        ];
+        for (raw, want) in refused {
+            assert_eq!(FrameAncestors::parse(raw), Err(want), "{raw:?}");
+        }
+        assert_eq!(FrameAncestors::parse(""), Ok(None));
+        let kept = FrameAncestors::parse(" https://a.example https://b.example ");
+        assert_eq!(
+            kept.as_ref()
+                .map(|fa| fa.as_ref().map(FrameAncestors::csp_value)),
+            Ok(Some("frame-ancestors https://a.example https://b.example"))
+        );
+        assert_eq!(
+            FrameAncestors::from_lookup(&Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+        assert_eq!(
+            FrameAncestors::from_lookup(&not_unicode()),
+            Err(FrameAncestorsRefusal::NotVisibleAscii)
+        );
+    }
+
+    /// The refusal names the variable and the remedy and never echoes the value.
+    #[test]
+    fn frame_ancestors_refusal_names_the_variable_not_the_value() {
+        let Err(refusal) = FrameAncestors::parse("https://evil\rX-Injected: 1") else {
+            panic!("a CR must be refused");
+        };
+        let text = refusal.to_string();
+        assert!(text.starts_with("IPE_WEB_FRAME_ANCESTORS "), "{text}");
+        assert!(text.contains("https://app.example.com"), "{text}");
+        assert!(
+            !text.contains("evil") && !text.contains("Injected"),
+            "{text}"
+        );
+    }
+
+    /// The security headers carry the parsed framing policy, and a refused
+    /// value yields no header set at all, so no response ships without framing.
+    #[test]
+    fn security_headers_follow_the_parsed_framing_policy() {
+        let embed = FrameAncestors::parse("https://a.example").ok().flatten();
+        let framed = security_headers_with(Ok(embed.as_ref()));
+        assert!(
+            framed
+                .as_ref()
+                .is_ok_and(|h| h.iter().any(|(k, v)| *k == "content-security-policy"
+                    && v == "frame-ancestors https://a.example")
+                    && !h.iter().any(|(k, _)| *k == "x-frame-options")),
+            "{framed:?}"
+        );
+        let same_origin = security_headers_with(Ok(None));
+        assert!(
+            same_origin.as_ref().is_ok_and(|h| h
+                .iter()
+                .any(|(k, v)| *k == "x-frame-options" && v == "SAMEORIGIN")),
+            "{same_origin:?}"
+        );
+        assert_eq!(
+            security_headers_with(Err(FrameAncestorsRefusal::Blank)),
+            Err(FrameAncestorsRefusal::Blank)
+        );
+    }
 
     fn not_unicode() -> Result<String, std::env::VarError> {
         Err(std::env::VarError::NotUnicode(std::ffi::OsString::new()))
@@ -1235,31 +1546,68 @@ mod tests {
     }
 
     #[test]
-    fn posture_explicit_value_wins_over_build_intent() {
-        for build in [BuildPosture::Development, BuildPosture::Release] {
-            for marker in ["dev", "Development", "LOCAL"] {
-                assert_eq!(
-                    Posture::parse(RawEnv::Value(marker), RawEnv::Absent, build),
-                    Posture::Dev
-                );
-                assert_eq!(
-                    Posture::parse(RawEnv::Absent, RawEnv::Value(marker), build),
-                    Posture::Dev
-                );
-            }
-            for other in ["prod", "staging", " dev", "devel"] {
-                assert_eq!(
-                    Posture::parse(RawEnv::Value(other), RawEnv::Absent, build),
-                    Posture::Production,
-                    "ENV={other:?} must resolve to production"
-                );
-            }
-            // `ENV` takes precedence over `IPE_ENV`.
+    fn posture_explicit_value_wins_over_dev_build_intent() {
+        let build = BuildPosture::Development;
+        for marker in ["dev", "Development", "LOCAL"] {
             assert_eq!(
-                Posture::parse(RawEnv::Value("prod"), RawEnv::Value("dev"), build),
-                Posture::Production
+                Posture::parse(RawEnv::Value(marker), RawEnv::Absent, build),
+                Posture::Dev
+            );
+            assert_eq!(
+                Posture::parse(RawEnv::Absent, RawEnv::Value(marker), build),
+                Posture::Dev
             );
         }
+        for other in ["prod", "production", "staging", " dev", "devel"] {
+            assert_eq!(
+                Posture::parse(RawEnv::Value(other), RawEnv::Absent, build),
+                Posture::Production,
+                "ENV={other:?} must resolve to production"
+            );
+        }
+        // `ENV` takes precedence over `IPE_ENV`.
+        assert_eq!(
+            Posture::parse(RawEnv::Value("prod"), RawEnv::Value("dev"), build),
+            Posture::Production
+        );
+    }
+
+    // A release artifact ignores every dev marker in either variable: the
+    // posture is production, and the ignored marker is reported once.
+    #[test]
+    fn env_dev_marker_on_release_binary_is_production() {
+        let release = BuildPosture::Release;
+        for marker in ["dev", "development", "local", "Dev", "DEVELOPMENT", "LoCaL"] {
+            for (env, ipe_env) in [
+                (RawEnv::Value(marker), RawEnv::Absent),
+                (RawEnv::Absent, RawEnv::Value(marker)),
+                (RawEnv::Value(""), RawEnv::Value(marker)),
+                (RawEnv::Value(marker), RawEnv::Value(marker)),
+            ] {
+                assert_eq!(
+                    Posture::parse(env, ipe_env, release),
+                    Posture::Production,
+                    "{env:?} {ipe_env:?} on release"
+                );
+                assert!(release_ignores_dev_marker(env, ipe_env, release));
+                assert!(!release_ignores_dev_marker(
+                    env,
+                    ipe_env,
+                    BuildPosture::Development
+                ));
+            }
+        }
+        for (env, ipe_env) in [
+            (RawEnv::Absent, RawEnv::Absent),
+            (RawEnv::Value("prod"), RawEnv::Value("dev")),
+            (RawEnv::NotUnicode, RawEnv::Value("dev")),
+        ] {
+            assert!(
+                !release_ignores_dev_marker(env, ipe_env, release),
+                "no dev marker is selected by {env:?} {ipe_env:?}"
+            );
+        }
+        assert!(!RELEASE_IGNORES_DEV_MARKER.contains('\n'));
     }
 
     #[test]
@@ -1293,18 +1641,30 @@ mod tests {
         assert_eq!(BuildPosture::COMPILED, BuildPosture::Development);
     }
 
-    // Only a dev-intent binary in a dev posture on a loopback listener
-    // defaults the console open; every other triple fails closed.
+    const SCOPES: [ProcessScope; 3] = [
+        ProcessScope::Unbound,
+        ProcessScope::Loopback,
+        ProcessScope::Exposed,
+    ];
+
+    fn surface_holds(build: BuildPosture, posture: Posture, scope: ProcessScope) -> bool {
+        dev_intent(build, posture)
+            .and_then(|intent| dev_surface(intent, scope))
+            .is_some()
+    }
+
+    // Only a dev-intent binary in a dev posture whose every listener is
+    // loopback defaults the console open; every other triple fails closed.
     #[test]
     fn console_default_opens_only_for_dev_build_dev_posture_on_loopback() {
         use ConsoleAuthMode as M;
         for build in [BuildPosture::Development, BuildPosture::Release] {
             for posture in [Posture::Dev, Posture::Production] {
-                for scope in [ListenScope::Loopback, ListenScope::Exposed] {
+                for scope in SCOPES {
                     let open = build == BuildPosture::Development
                         && posture == Posture::Dev
-                        && scope == ListenScope::Loopback;
-                    assert_eq!(dev_open(build, posture, scope), open);
+                        && scope == ProcessScope::Loopback;
+                    assert_eq!(surface_holds(build, posture, scope), open);
                     let mode = if open { M::DevOpen } else { M::UnsetProd };
                     for raw in [RawEnv::Absent, RawEnv::Value(""), RawEnv::Value(" ")] {
                         assert_eq!(
@@ -1318,26 +1678,77 @@ mod tests {
         }
     }
 
-    // An explicit `ENV=dev` on a release binary bound to loopback (a release
-    // service behind a same-host reverse proxy) leaves the console closed.
+    // No posture opens a release binary: neither token exists for it, on a
+    // loopback listener or any other.
     #[test]
-    fn env_dev_on_release_binary_keeps_console_closed() {
-        let posture = Posture::parse(RawEnv::Value("dev"), RawEnv::Absent, BuildPosture::Release);
-        assert_eq!(posture, Posture::Dev);
-        assert!(!dev_open(
-            BuildPosture::Release,
-            posture,
-            ListenScope::Loopback
-        ));
+    fn dev_intent_none_on_release_whatever_env() {
+        for posture in [Posture::Dev, Posture::Production] {
+            assert!(dev_intent(BuildPosture::Release, posture).is_none());
+        }
+        assert!(dev_intent(BuildPosture::Development, Posture::Production).is_none());
+        assert!(dev_intent(BuildPosture::Development, Posture::Dev).is_some());
+        for scope in [ProcessScope::Unbound, ProcessScope::Exposed] {
+            let intent = dev_intent(BuildPosture::Development, Posture::Dev);
+            assert!(intent.and_then(|i| dev_surface(i, scope)).is_none());
+        }
         assert_eq!(
             ConsoleAuthMode::parse(
                 RawEnv::Absent,
                 BuildPosture::Release,
-                posture,
-                ListenScope::Loopback
+                Posture::parse(RawEnv::Value("dev"), RawEnv::Absent, BuildPosture::Release),
+                ProcessScope::Loopback
             ),
             ConsoleAuthMode::UnsetProd
         );
+    }
+
+    // `ENV=dev` on the release test binary, with a loopback listener
+    // recorded, mints neither token.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn env_dev_on_release_binary_mints_no_token() {
+        crate::system::locked_set_var("ENV", "dev");
+        crate::system::locked_set_var("IPE_ENV", "dev");
+        record_bind("127.0.0.1");
+        assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
+        assert_eq!(Posture::from_env(), Posture::Production);
+        assert!(dev_intent_from_env().is_none());
+        assert!(dev_surface_from_env().is_none());
+        assert!(posture_is_production());
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
+    }
+
+    // A dev-intent binary with nothing set, on a recorded loopback listener,
+    // mints both tokens; an exposed bind afterwards withdraws the surface.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    fn dev_posture_pin_loopback_mints_surface_until_exposed() {
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
+        assert!(dev_intent_from_env().is_some());
+        assert!(dev_surface_from_env().is_none(), "unbound: no surface");
+        record_bind("127.0.0.1");
+        assert!(dev_surface_from_env().is_some());
+        assert!(!dev_console_banner("").is_empty());
+        record_bind("0.0.0.0");
+        assert!(dev_surface_from_env().is_none());
+        assert_eq!(dev_console_banner(""), "");
+        assert!(dev_intent_from_env().is_some());
+    }
+
+    // The banner advertises the console, so without a dev surface it is
+    // empty: on the release test binary under `ENV=dev` on loopback, and for
+    // the pure gate given no surface.
+    #[test]
+    fn dev_banner_empty_on_release_under_env_dev() {
+        assert_eq!(dev_console_banner_with("", None), "");
+        if !cfg!(feature = "dev-posture") {
+            crate::system::locked_set_var("ENV", "dev");
+            record_bind("127.0.0.1");
+            assert_eq!(dev_console_banner(""), "");
+            crate::system::locked_remove_var("ENV");
+        }
     }
 
     // An explicit `token` is enforced on every posture and scope.
@@ -1345,7 +1756,7 @@ mod tests {
     fn explicit_token_wins_on_every_posture_and_scope() {
         for build in [BuildPosture::Development, BuildPosture::Release] {
             for posture in [Posture::Dev, Posture::Production] {
-                for scope in [ListenScope::Loopback, ListenScope::Exposed] {
+                for scope in SCOPES {
                     assert_eq!(
                         ConsoleAuthMode::parse(RawEnv::Value("token"), build, posture, scope),
                         ConsoleAuthMode::Token
@@ -1361,7 +1772,7 @@ mod tests {
     fn release_intent_with_nothing_set_is_production_closed() {
         let posture = Posture::parse(RawEnv::Absent, RawEnv::Absent, BuildPosture::Release);
         assert_eq!(posture, Posture::Production);
-        for scope in [ListenScope::Loopback, ListenScope::Exposed] {
+        for scope in SCOPES {
             assert_eq!(
                 ConsoleAuthMode::parse(RawEnv::Absent, BuildPosture::Release, posture, scope),
                 ConsoleAuthMode::UnsetProd
@@ -1394,7 +1805,7 @@ mod tests {
                     raw,
                     BuildPosture::Development,
                     posture,
-                    ListenScope::Loopback,
+                    ProcessScope::Loopback,
                 );
                 assert_eq!(
                     resolved,
@@ -1410,7 +1821,7 @@ mod tests {
                         raw,
                         BuildPosture::Development,
                         posture,
-                        ListenScope::Loopback
+                        ProcessScope::Loopback
                     ),
                     mode
                 );
@@ -1449,7 +1860,7 @@ mod tests {
                 raw,
                 BuildPosture::Development,
                 posture,
-                ListenScope::Loopback,
+                ProcessScope::Loopback,
             )
             .startup_line();
             assert_eq!(line, expected);
@@ -1588,6 +1999,38 @@ mod tests {
         assert_eq!(json_escape("\u{0001}"), "\\u0001");
     }
 
+    /// Log and span records escape every hazard and stay JSON that decodes to the input.
+    #[test]
+    #[allow(clippy::expect_used)] // an invalid record fails the test
+    fn json_records_escape_the_hazard_set() {
+        let hostile = "a\u{9b}\u{202e}\u{200b}b";
+        let entries = entries_json(&[LogEntry {
+            ts_ms: 1,
+            level: hostile.to_string(),
+            message: hostile.to_string(),
+        }]);
+        record_span(hostile, 7, true);
+        let spans = spans_json(SPAN_CAP);
+        for json in [&entries, &spans] {
+            for raw in ['\u{9b}', '\u{202e}', '\u{200b}'] {
+                assert!(!json.contains(raw), "{raw:?} survived: {json}");
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&entries).expect("entries JSON");
+        let entry = parsed.get(0).expect("one entry");
+        assert_eq!(entry.get("message").and_then(|v| v.as_str()), Some(hostile));
+        assert_eq!(entry.get("level").and_then(|v| v.as_str()), Some(hostile));
+        let parsed: serde_json::Value = serde_json::from_str(&spans).expect("spans JSON");
+        let spans_list = parsed.as_array().expect("span array");
+        assert!(
+            spans_list
+                .iter()
+                .any(|s| s.get("name").and_then(|v| v.as_str()) == Some(hostile)),
+            "{spans}"
+        );
+        assert_eq!(json_escape(hostile), crate::escape::json_str_body(hostile));
+    }
+
     // Synthetic Debug types for `variant_name_extracts_only_the_bounded_variant_ident`.
     struct LongIdent;
     impl std::fmt::Debug for LongIdent {
@@ -1666,11 +2109,17 @@ mod tests {
     }
 
     #[test]
+    fn dev_surface_holds_only_on_a_loopback_scope() {
+        assert!(dev_surface(test_dev_intent(), ProcessScope::Loopback).is_some());
+        assert!(dev_surface(test_dev_intent(), ProcessScope::Unbound).is_none());
+        assert!(dev_surface(test_dev_intent(), ProcessScope::Exposed).is_none());
+    }
+
+    #[test]
     fn dev_banner_markup_is_exact() {
         // Fixed id, target/rel/title, monospace blue style, `&#128269;` ENTITY
-        // (not a literal emoji). The banner renders only under a dev posture.
-        crate::system::locked_set_var("ENV", "dev");
-        let b = dev_console_banner("");
+        // (not a literal emoji). The banner renders only under a dev surface.
+        let b = dev_console_banner_with("", Some(&test_dev_surface()));
         let expected = "<a id=\"__ipe-dev-console\" href=\"/_ipe/console\" target=\"_blank\" \
             rel=\"noopener\" title=\"Ipe Console (dev only)\" \
             style=\"position:fixed;right:12px;bottom:12px;z-index:2147483646;\
@@ -1742,16 +2191,46 @@ mod tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod listen_scope_tests {
-    use super::ListenScope;
-    use super::scope_or_exposed;
+    use super::{ListenScope, ProcessScope, record_bind};
 
     #[test]
-    fn uninstalled_scope_reads_exposed() {
-        assert_eq!(scope_or_exposed(None), ListenScope::Exposed);
+    fn process_scope_bytes_decode_closed() {
+        for scope in [
+            ProcessScope::Unbound,
+            ProcessScope::Loopback,
+            ProcessScope::Exposed,
+        ] {
+            assert_eq!(ProcessScope::from_byte(scope.to_byte()), scope);
+        }
+        for byte in [3, 7, u8::MAX] {
+            assert_eq!(ProcessScope::from_byte(byte), ProcessScope::Exposed);
+        }
+    }
+
+    // The join only moves toward `Exposed`: a loopback bind after an exposed
+    // one, or before it, leaves the process exposed.
+    #[test]
+    fn exposed_bind_after_loopback_stays_exposed() {
+        let unbound = ProcessScope::Unbound;
+        assert_eq!(unbound.join(ListenScope::Loopback), ProcessScope::Loopback);
         assert_eq!(
-            scope_or_exposed(Some(&ListenScope::Loopback)),
-            ListenScope::Loopback
+            unbound
+                .join(ListenScope::Loopback)
+                .join(ListenScope::Exposed),
+            ProcessScope::Exposed
         );
+        assert_eq!(
+            unbound
+                .join(ListenScope::Exposed)
+                .join(ListenScope::Loopback),
+            ProcessScope::Exposed
+        );
+        assert_eq!(ProcessScope::current(), ProcessScope::Unbound);
+        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
+        assert_eq!(record_bind("0.0.0.0"), ListenScope::Exposed);
+        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(ProcessScope::current(), ProcessScope::Exposed);
     }
 
     #[test]
@@ -1779,5 +2258,39 @@ mod listen_scope_tests {
                 "bind host {host:?} must read as loopback"
             );
         }
+    }
+}
+
+/// Runs one ignored test of this test binary as a child process holding a
+/// given `IPE_WEB_FRAME_ANCESTORS`, so the process-wide parse is made under
+/// that value and no other test of the parent can have made it first.
+#[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
+pub(crate) mod frame_ancestors_child {
+    /// Printed by a child test once it has observed the startup refusal.
+    pub(crate) const REFUSED: &str = "frame-ancestors startup refusal observed";
+
+    /// Run the ignored test `name` of `module` (a `module_path!()`) with
+    /// `IPE_WEB_FRAME_ANCESTORS` set to `raw`. `true` when the child exited 0
+    /// having printed [`REFUSED`]; the child's stdout comes back for the report.
+    #[allow(clippy::expect_used)] // test helper: a test binary that cannot re-run itself is an environment issue
+    pub(crate) fn refused(module: &str, name: &str, raw: &str) -> (bool, String) {
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::{name}");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(super::FRAME_ANCESTORS_ENV, raw)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let ran = out.status.success();
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        (ran && stdout.contains(REFUSED), stdout)
     }
 }

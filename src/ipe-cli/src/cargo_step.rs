@@ -132,11 +132,11 @@ pub enum CargoCrate<'a> {
     /// before cargo starts and again after it succeeds: cargo reaches it by
     /// path, so a swap while it runs is detected, never trusted.
     Emitted(&'a OwnedDir),
-    /// The `ipe_wrapper` package of the compiler workspace at
-    /// `workspace_root`, a tree ipe does not own, so no claim is proven.
+    /// The `ipe_wrapper` package of the verified compiler workspace `source`,
+    /// a tree ipe does not own, so no output claim is proven.
     ReleaseWrapper {
-        /// The workspace root holding the `ipe_wrapper` package.
-        workspace_root: &'a Path,
+        /// The verified workspace holding the `ipe_wrapper` package.
+        source: &'a crate::wrapper_source::WrapperSource,
         /// The app the wrapper embeds, when the release is a single file.
         embed: Option<EmbeddedApp<'a>>,
     },
@@ -188,7 +188,7 @@ impl CargoBuild<'_> {
     fn dir(&self) -> &Path {
         match self.krate {
             CargoCrate::Emitted(dir) => dir.path(),
-            CargoCrate::ReleaseWrapper { workspace_root, .. } => workspace_root,
+            CargoCrate::ReleaseWrapper { source, .. } => source.root(),
         }
     }
 
@@ -306,7 +306,7 @@ pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, C
         .ok_or_else(|| CliError::Usage(text::msg::cargo_metadata_no_target_dir()))
 }
 
-/// One `ipe watch` rebuild: [`WatchBuild::spawn`] starts it and returns at
+/// One `ipe dev watch` rebuild: [`WatchBuild::spawn`] starts it and returns at
 /// once, so the watch loop can kill a superseded build.
 ///
 /// A watch rebuild passes no `--locked`: the emitted crate's dependencies
@@ -316,8 +316,9 @@ pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, C
 pub struct WatchBuild<'a> {
     /// The `cargo` to run ([`crate::watch::WatchOptions::cargo_path`]).
     pub cargo: &'a Path,
-    /// The emitted crate; cargo runs with it as its working directory.
-    pub crate_dir: &'a Path,
+    /// The emitted crate, proven to carry the development marker; cargo runs
+    /// with it as its working directory.
+    pub krate: crate::DevMarkedCrate<'a>,
     /// A target directory overriding the inherited `CARGO_TARGET_DIR`.
     pub target_dir: Option<&'a Path>,
     /// The compiler acceleration for this rebuild.
@@ -331,7 +332,7 @@ impl WatchBuild<'_> {
     fn command(&self) -> Command {
         let mut cmd = build_command(
             self.cargo,
-            self.crate_dir,
+            self.krate.path(),
             CargoProfile::Dev,
             CargoTarget::Host,
             CargoOutput::JsonStream(self.verbosity),
@@ -715,6 +716,7 @@ mod tests {
     };
     use crate::toolchain::CargoBin;
     use crate::watch::BuildAccel;
+    use crate::wrapper_source::WrapperSource;
     use ipe_backend_rust::static_build::StaticTriple;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -750,13 +752,10 @@ mod tests {
     }
 
     /// A release wrapper build over `root`.
-    fn wrapper<'a>(root: &'a Path, embed: Option<EmbeddedApp<'a>>) -> CargoBuild<'a> {
+    fn wrapper<'a>(source: &'a WrapperSource, embed: Option<EmbeddedApp<'a>>) -> CargoBuild<'a> {
         CargoBuild {
             cargo: &CARGO,
-            krate: CargoCrate::ReleaseWrapper {
-                workspace_root: root,
-                embed,
-            },
+            krate: CargoCrate::ReleaseWrapper { source, embed },
             profile: CargoProfile::Release,
             target: CargoTarget::Static(StaticTriple::X8664LinuxMusl),
             output: CargoOutput::Human(Verbosity::Quiet),
@@ -768,13 +767,14 @@ mod tests {
     #[test]
     fn every_build_runs_the_build_subcommand_in_its_crate() {
         let root = Path::new("/ws");
-        let cmd = wrapper(root, None).command();
+        let source = WrapperSource::unverified_for_test(root);
+        let cmd = wrapper(&source, None).command();
         assert_eq!(args(&cmd).first().map(String::as_str), Some("build"));
         assert_eq!(cmd.get_current_dir(), Some(root));
         let accel = BuildAccel::MachineDefault;
         let watch = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: None,
             accel: &accel,
             verbosity: Verbosity::Progress,
@@ -786,7 +786,8 @@ mod tests {
 
     #[test]
     fn the_wrapper_build_names_its_package_profile_target_and_quiet_flag() {
-        let a = args(&wrapper(Path::new("/ws"), None).command());
+        let source = WrapperSource::unverified_for_test(Path::new("/ws"));
+        let a = args(&wrapper(&source, None).command());
         for want in [
             "--release",
             "--package",
@@ -802,13 +803,14 @@ mod tests {
 
     #[test]
     fn only_an_embedding_wrapper_carries_the_embed_env() {
-        let plain = wrapper(Path::new("/ws"), None).command();
+        let source = WrapperSource::unverified_for_test(Path::new("/ws"));
+        let plain = wrapper(&source, None).command();
         assert_eq!(env(&plain, "IPE_EMBED_APP"), Env::Inherited);
         let app = EmbeddedApp {
             binary: Path::new("/app"),
             profile: Path::new("/app.profile"),
         };
-        let embedding = wrapper(Path::new("/ws"), Some(app)).command();
+        let embedding = wrapper(&source, Some(app)).command();
         assert_eq!(
             env(&embedding, "IPE_EMBED_APP"),
             Env::Set(OsStr::new("/app"))
@@ -861,7 +863,7 @@ mod tests {
         let accel = BuildAccel::WarmIncremental;
         let cmd = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: Some(Path::new("/t")),
             accel: &accel,
             verbosity: Verbosity::Quiet,
@@ -1031,10 +1033,11 @@ mod tests {
         fn the_wrapper_build_replays_the_committed_lock_and_never_rewrites_it() {
             let base = scratch("wrapper");
             let cargo = stub(&base, "true");
+            let source = crate::wrapper_source::WrapperSource::unverified_for_test(&base);
             let built = build(
                 &cargo,
                 CargoCrate::ReleaseWrapper {
-                    workspace_root: &base,
+                    source: &source,
                     embed: None,
                 },
             );

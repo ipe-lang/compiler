@@ -1232,7 +1232,8 @@ pub fn panic_500_body(payload: &(dyn std::any::Any + Send)) -> String {
 ///      panic into a `JoinError`.  The async-FFI binding bodies use this to satisfy
 ///      C5 (foreign `async fn` panics → `IpeResult::Err`).
 ///
-///   2. `block_on`'s `std::thread::spawn(…).join()` catches a panicking entry
+///   2. `block_on` polls the entry future on a thread started through
+///      `std::thread::Builder::spawn`; its `.join()` catches a panicking entry
 ///      future at the OS-thread boundary and maps it to `IpeResult::Err`.
 ///
 /// By resuming the unwind, both mechanisms can absorb the panic after the hook

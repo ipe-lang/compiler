@@ -4,6 +4,7 @@ use crate::*;
 pub(crate) enum IpeDbStoreColumn {
     Column(RecColTypeName),
 }
+
 impl IpeStringify for IpeDbStoreColumn {
     fn ipe_show(&self) -> String {
         match self {
@@ -13,6 +14,7 @@ impl IpeStringify for IpeDbStoreColumn {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreColumnSpec {
     PrimaryKey(String),
@@ -23,6 +25,7 @@ pub(crate) enum IpeDbStoreColumnSpec {
     DefaultInt(String, i64),
     TouchOnUpdate(String),
 }
+
 impl IpeStringify for IpeDbStoreColumnSpec {
     fn ipe_show(&self) -> String {
         match self {
@@ -57,12 +60,14 @@ impl IpeStringify for IpeDbStoreColumnSpec {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStorePrimaryKeyDecl {
     NoPk,
     SinglePk(String),
     CompositePk(String, String, Vec<String>),
 }
+
 impl IpeStringify for IpeDbStorePrimaryKeyDecl {
     fn ipe_show(&self) -> String {
         match self {
@@ -80,11 +85,13 @@ impl IpeStringify for IpeDbStorePrimaryKeyDecl {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreIndexSpec {
     Index(Vec<String>),
     IndexNamed(String, Vec<String>),
 }
+
 impl IpeStringify for IpeDbStoreIndexSpec {
     fn ipe_show(&self) -> String {
         match self {
@@ -99,11 +106,13 @@ impl IpeStringify for IpeDbStoreIndexSpec {
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreSchemaOp {
     RenameColumn(String, String),
     RenameTable(String, String),
 }
+
 impl IpeStringify for IpeDbStoreSchemaOp {
     fn ipe_show(&self) -> String {
         match self {
@@ -120,9 +129,11 @@ impl IpeStringify for IpeDbStoreSchemaOp {
         }
     }
 }
+
 pub(crate) enum IpeDbStoreDraft<T1: 'static> {
     Draft(RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable<T1>),
 }
+
 impl<T1: Clone + 'static> Clone for IpeDbStoreDraft<T1> {
     fn clone(&self) -> Self {
         match self {
@@ -130,6 +141,7 @@ impl<T1: Clone + 'static> Clone for IpeDbStoreDraft<T1> {
         }
     }
 }
+
 impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreDraft<T1> {
     fn ipe_show(&self) -> String {
         match self {
@@ -137,9 +149,11 @@ impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreDr
         }
     }
 }
+
 pub(crate) enum IpeDbStoreStore<T1: 'static> {
     Store(RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable<T1>),
 }
+
 impl<T1: Clone + 'static> Clone for IpeDbStoreStore<T1> {
     fn clone(&self) -> Self {
         match self {
@@ -147,6 +161,7 @@ impl<T1: Clone + 'static> Clone for IpeDbStoreStore<T1> {
         }
     }
 }
+
 impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreStore<T1> {
     fn ipe_show(&self) -> String {
         match self {
@@ -154,6 +169,7 @@ impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreSt
         }
     }
 }
+
 pub(crate) fn user_ipe_db_store_valid_sql_ident_plain(name: String) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
     (basics_not(string_is_empty(name.clone()))
@@ -166,6 +182,7 @@ pub(crate) fn user_ipe_db_store_valid_sql_ident_plain(name: String) -> bool {
         name,
     ))
 }
+
 pub(crate) fn user_ipe_db_store_plain_ident_char(c: char) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
@@ -176,23 +193,28 @@ pub(crate) fn user_ipe_db_store_plain_ident_char(c: char) -> bool {
                     || (code == crate::user_ipe_db_store_underscore_code()))))
     })
 }
+
 pub(crate) fn user_ipe_db_store_is_ascii_digit(code: i64) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
     ((code >= 48i64) && (code <= 57i64))
 }
+
 pub(crate) fn user_ipe_db_store_is_ascii_upper(code: i64) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
     ((code >= 65i64) && (code <= 90i64))
 }
+
 pub(crate) fn user_ipe_db_store_is_ascii_lower(code: i64) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
     ((code >= 97i64) && (code <= 122i64))
 }
+
 pub(crate) fn user_ipe_db_store_underscore_code() -> i64 {
     let _ipe_recursion_guard = crate::recursion_guard();
     static CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     CELL.get_or_init(|| 95i64).clone()
 }
+
 pub(crate) fn user_ipe_db_store_column(name: String, colType: IpeCodecColType) -> IpeDbStoreColumn {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeDbStoreColumn::Column(RecColTypeName {
@@ -200,10 +222,12 @@ pub(crate) fn user_ipe_db_store_column(name: String, colType: IpeCodecColType) -
         name: name,
     })
 }
+
 pub(crate) fn user_ipe_db_store_text_column(name: String) -> IpeDbStoreColumn {
     let _ipe_recursion_guard = crate::recursion_guard();
     crate::user_ipe_db_store_column(name, IpeCodecColType::CText)
 }
+
 pub(crate) fn user_ipe_db_store_from_columns(
     table: String,
     columns: Vec<IpeDbStoreColumn>,
@@ -215,6 +239,7 @@ pub(crate) fn user_ipe_db_store_from_columns(
         crate::user_ipe_db_store_row_codec(columns),
     )
 }
+
 pub(crate) fn user_ipe_db_store_build_store<T1: Clone>(
     table: String,
     columns: Vec<IpeDbStoreColumn>,
@@ -248,6 +273,7 @@ pub(crate) fn user_ipe_db_store_build_store<T1: Clone>(
         }
     })
 }
+
 pub(crate) fn user_ipe_db_store_first_invalid_column(
     columns: Vec<IpeDbStoreColumn>,
 ) -> IpeMaybe<String> {
@@ -273,12 +299,14 @@ pub(crate) fn user_ipe_db_store_first_invalid_column(
         }
     }
 }
+
 pub(crate) fn user_ipe_db_store_column_name(col: IpeDbStoreColumn) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match col {
         IpeDbStoreColumn::Column(r) => (r).name.clone(),
     }
 }
+
 pub(crate) fn user_ipe_db_store_row_codec(
     columns: Vec<IpeDbStoreColumn>,
 ) -> IpeCodecCodec<HashMap<String, String>> {
@@ -329,6 +357,7 @@ pub(crate) fn user_ipe_db_store_row_codec(
         })
     })
 }
+
 pub(crate) fn user_ipe_db_store_row_fields(
     names: Vec<String>,
     row: HashMap<String, String>,
@@ -348,6 +377,7 @@ pub(crate) fn user_ipe_db_store_row_fields(
         names,
     )
 }
+
 pub(crate) fn user_ipe_db_store_row_cell(name: String, row: HashMap<String, String>) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match dict_get(name, row.clone()) {
@@ -355,6 +385,7 @@ pub(crate) fn user_ipe_db_store_row_cell(name: String, row: HashMap<String, Stri
         IpeMaybe::Nothing => "".to_string(),
     }
 }
+
 pub(crate) fn user_ipe_db_store_public<T1: Clone>(
     draft: IpeDbStoreDraft<T1>,
 ) -> IpeDbStoreStore<T1> {
@@ -375,6 +406,7 @@ pub(crate) fn user_ipe_db_store_public<T1: Clone>(
         ),
     }
 }
+
 pub(crate) fn user_ipe_db_store_key_decl_fault(
     pk: IpeResult<ipe_runtime::error::IpeError, IpeDbStorePrimaryKeyDecl>,
 ) -> IpeMaybe<ipe_runtime::error::IpeError> {
@@ -384,6 +416,7 @@ pub(crate) fn user_ipe_db_store_key_decl_fault(
         IpeResult::Ok(_) => IpeMaybe::Nothing,
     }
 }
+
 pub(crate) fn user_ipe_db_store_all<T1: 'static + Send + Sync + Clone>(
     conn: Db,
     store: IpeDbStoreStore<T1>,
@@ -406,6 +439,7 @@ pub(crate) fn user_ipe_db_store_all<T1: 'static + Send + Sync + Clone>(
         },
     }
 }
+
 pub(crate) fn user_ipe_db_store_always_true() -> ipe_runtime::db::SqlFragment {
     let _ipe_recursion_guard = crate::recursion_guard();
     sql_eq(
@@ -413,6 +447,7 @@ pub(crate) fn user_ipe_db_store_always_true() -> ipe_runtime::db::SqlFragment {
         sql_param(MainSqlValue::SqlInt(1i64)),
     )
 }
+
 pub(crate) fn user_ipe_db_store_read_cells<T1: 'static + Send + Clone>(
     conn: Db,
     store: IpeDbStoreStore<T1>,
@@ -423,10 +458,12 @@ pub(crate) fn user_ipe_db_store_read_cells<T1: 'static + Send + Clone>(
         IpeDbStoreStore::Store(r) => db_find_where_masked(conn.clone(), (r.clone()).table.clone(), list_map_consume({ let __ipe_fn: Box<dyn Fn(IpeDbStoreColumn) -> ipe_runtime::db::SqlFragment + Send + Sync + 'static> = Box::new(move |col: IpeDbStoreColumn| -> ipe_runtime::db::SqlFragment { sql_column(crate::user_ipe_db_store_column_name(col)) }); __ipe_fn }, (r).currentColumns.clone()), cond, crate::user_ipe_db_store_cells_decoder()),
     }
 }
+
 pub(crate) fn user_ipe_db_store_cells_decoder() -> Decoder<HashMap<String, IpeMaybe<String>>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     config_dict(config_nullable(decode_one_of(vec![json_decode_string::<IpeError>(), decode_map({ let __ipe_fn: Box<dyn Fn(i64) -> String + Send + Sync + 'static> = Box::new(string_from_int); __ipe_fn }, json_decode_int::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(f64) -> String + Send + Sync + 'static> = Box::new(string_from_float); __ipe_fn }, json_decode_float::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(bool) -> String + Send + Sync + 'static> = Box::new(string_from_bool); __ipe_fn }, json_decode_bool::<IpeError>())])))
 }
+
 pub(crate) fn user_ipe_db_store_decode_rows<T1: 'static + Send + Sync + Clone>(
     codec: IpeCodecCodec<T1>,
     rows: Vec<HashMap<String, IpeMaybe<String>>>,
@@ -453,6 +490,7 @@ pub(crate) fn user_ipe_db_store_decode_rows<T1: 'static + Send + Sync + Clone>(
         }
     }
 }
+
 pub(crate) fn user_ipe_db_store_read_text(
     name: String,
     row: HashMap<String, String>,
@@ -463,6 +501,7 @@ pub(crate) fn user_ipe_db_store_read_text(
         IpeMaybe::Nothing => IpeResult::Err(crate::user_ipe_db_store_missing_column_error(name)),
     }
 }
+
 pub(crate) fn user_ipe_db_store_invalid_ident_error(
     kind: String,
     name: String,
@@ -476,6 +515,7 @@ pub(crate) fn user_ipe_db_store_invalid_ident_error(
         "\" — not a valid SQL identifier".to_string(),
     ]))
 }
+
 pub(crate) fn user_ipe_db_store_missing_column_error(name: String) -> ipe_runtime::error::IpeError {
     let _ipe_recursion_guard = crate::recursion_guard();
     ipe_error_invalid_input(string_concat(vec![

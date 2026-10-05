@@ -73,7 +73,7 @@ sqrtReport v =
         "sqrt " ++ String.fromFloat v ++ " = " ++ String.fromFloat r
 ```
 
-Running it (`ipe run`) prints — note the four rounding directions differ on a
+Running it (`ipe dev run`) prints — note the four rounding directions differ on a
 fractional length, and the negative square root is caught:
 
 ```

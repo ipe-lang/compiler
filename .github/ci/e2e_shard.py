@@ -9,7 +9,7 @@ that the same plan partitions the archive exactly: every test is selected by
 exactly one shard and no shard selects a test outside the archive. `--lint`
 proves ci.yml wires exactly that: the `e2e` matrix enumerates shards
 1..SHARDS, its one nextest run reads its selection only from the plan, and
-`seal-slice` proves the cover of that same plan; manifest-guard runs it.
+`seal-slice` proves the cover of that same plan; artifact-guard runs it.
 
 Modes:
   --plan    write `plan=<JSON {"K": {"filter", "partition"}}>` to $GITHUB_OUTPUT.

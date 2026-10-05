@@ -24,13 +24,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::redact::{Redacted, redacting_debug};
+
 /// Ipe.Http.Server.Request — opaque parsed request handle.
 // camelCase field names are required because accessor kernels (server_body,
-// server_path, server_method, …) read these fields directly by name. These
-// fields are NOT part of the Ipê API — Ipê code always goes through a kernel.
+// server_path, server_method, …) read these fields directly by name, and Ipê
+// `req.<field>` access lowers to `(req).<field>.clone()` against the field
+// types of `RequestFields` in `ipe_types` — so every field keeps its plain type.
 // `build_request` populates every field exactly once at the axum boundary.
+// Every field but the method is client-supplied data that can carry a credential
+// (an `Authorization` header, a session cookie, a token in the path, query or
+// body), so `Debug` masks it.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerRequest {
     pub method: String,
     pub path: String,
@@ -42,32 +48,74 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
+redacting_debug!(ServerRequest {
+    shown: [method],
+    masked: [path, body, headers, params, query, cookies, remoteAddr],
+});
+
+/// Emitted `req.<field>` reads each field at the plain type `ipe_types`'
+/// `RequestFields` table gives it (`String`, or `Dict String String` =
+/// `HashMap<String, String>`); a field whose type changes breaks this build,
+/// not a downstream cargo build of an emitted program.
+#[allow(clippy::type_complexity)]
+const _: fn(
+    ServerRequest,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) = |r| {
+    (
+        r.method,
+        r.path,
+        r.body,
+        r.remoteAddr,
+        r.headers,
+        r.params,
+        r.query,
+        r.cookies,
+    )
+};
+
 /// Ipe.Http.Server.Response — opaque response handle built by accessor kernels.
 // camelCase field names are required because builder/emit kernels (server_text,
 // server_with_status, to_axum_response, …) write/read these fields directly.
 // These fields are NOT part of the Ipê API — Ipê code always uses builder kernels.
 #[allow(non_snake_case)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerResponse {
     pub status: i64,
     pub body: String,
     pub headers: HashMap<String, String>,
     pub contentType: String,
-    /// Pre-built `Set-Cookie` header VALUES (e.g. `"sid=abc; Path=/; HttpOnly"`),
+    /// Typed `Set-Cookie` header values (e.g. `"sid=abc; Path=/; HttpOnly"`),
     /// one entry per cookie. Kept separate from `headers` because `headers` is a
     /// `HashMap` (one value per key) and HTTP allows/requires MULTIPLE
     /// `Set-Cookie` response headers when a response needs to set more than one
     /// cookie (RFC 6265 §4.1 — Set-Cookie is the one header that must NEVER be
     /// comma-folded). A second caller writing into `headers["Set-Cookie"]` would
     /// silently clobber the first.
-    pub cookies: Vec<String>,
+    pub cookies: Vec<SetCookie>,
 }
 
+// The body, headers and `Set-Cookie` values can carry a session id or a token;
+// the emitter builds this struct by field name, so the masking lives in `Debug`.
+redacting_debug!(ServerResponse {
+    shown: [status, contentType],
+    masked: [body, headers, cookies],
+});
+
 /// Ipe.Http.Server.Cookie (opaque) — safe defaults applied at attach time.
+// The value is the cookie's secret half (a session id, a token); the name is not.
 #[derive(Clone, Debug)]
 pub struct ServerCookie {
-    pub name: String,
-    pub value: String,
+    pub name: CookieName,
+    pub value: Redacted<CookieValue>,
 }
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
@@ -306,7 +354,7 @@ pub enum TokenSource {
     /// `Authorization: Bearer <token>`.
     BearerHeader,
     /// A named request cookie carrying the token.
-    Cookie(String),
+    Cookie(CookieName),
 }
 
 /// Ipe.Server.AuthConfig (opaque) — the secret, token source, claim key, and
@@ -364,11 +412,17 @@ pub fn server_token_bearer() -> TokenSource {
 }
 
 #[cfg(feature = "jwt")]
-/// Ipe.Server.cookieToken : String -> TokenSource. Reads the token from the
-/// named request cookie.
+/// Ipe.Server.cookieToken : String -> Result Error TokenSource. Reads the token
+/// from the named request cookie; an empty name is an `InvalidInput` error, so a
+/// cookie source always names a cookie a request can carry.
 #[must_use]
-pub fn server_cookie_token(name: String) -> TokenSource {
-    TokenSource::Cookie(name)
+pub fn server_cookie_token(name: String) -> IpeResult<IpeError, TokenSource> {
+    match CookieName::parse(&name) {
+        Some(name) => IpeResult::Ok(TokenSource::Cookie(name)),
+        None => IpeResult::Err(IpeError::invalid_input(
+            "Server.cookieToken: a cookie name must not be empty".to_owned(),
+        )),
+    }
 }
 
 #[cfg(feature = "jwt")]
@@ -390,7 +444,7 @@ fn read_token(source: &TokenSource, req: &ServerRequest) -> Option<String> {
         }
         TokenSource::Cookie(name) => req
             .cookies
-            .get(name)
+            .get(name.text())
             .filter(|v| !v.is_empty())
             .map(ToString::to_string),
     }
@@ -415,35 +469,56 @@ fn unauthorized() -> ServerResponse {
 /// in `page_response` (`csrf::cookies_secure() || request_is_https(headers)`):
 /// a re-issued cookie must never be less-Secure than the initial session cookie.
 fn reissue_set_cookie(
-    cookie_name: &str,
+    cookie_name: &CookieName,
     token: &str,
     slide_window_secs: u64,
     is_https: bool,
-) -> String {
+) -> SetCookie {
     // The cookie-security signal lives in `web::csrf` for a program that emits the
     // web surface; a server-only program (no `web` module) falls back to the
-    // production-env signal. `feature = "web"` is the exact condition under which
+    // process `Secure` floor. `feature = "web"` is the exact condition under which
     // `crate::web` is present, so the reference is compiled out when it is absent.
     #[cfg(feature = "web")]
     let base_secure = crate::web::csrf::cookies_secure();
     #[cfg(not(feature = "web"))]
-    let base_secure = crate::telemetry::production_from_env();
-    let secure = if base_secure || is_https {
-        "; Secure"
-    } else {
-        ""
-    };
+    let base_secure = cookie_secure_floor();
+    reissue_set_cookie_with(
+        cookie_name,
+        token,
+        slide_window_secs,
+        base_secure || is_https,
+    )
+}
 
-    // Frame-ancestors (CSP embedding) is a web-surface concept; a server-only
-    // program cannot be framed, so `SameSite=Lax` is the fail-closed default.
+#[cfg(feature = "jwt")]
+/// [`reissue_set_cookie`] under an explicit `Secure` decision.
+fn reissue_set_cookie_with(
+    cookie_name: &CookieName,
+    token: &str,
+    slide_window_secs: u64,
+    secure: bool,
+) -> SetCookie {
+    // A server-only program has no double-submit CSRF check, so its session
+    // cookie stays `SameSite=Lax` even when `frame-ancestors` admits embedding.
     #[cfg(feature = "web")]
     let embeddable = crate::web::csrf::frame_ancestors().is_some();
     #[cfg(not(feature = "web"))]
     let embeddable = false;
-    let same_site = if embeddable { "None" } else { "Lax" };
-    format!(
-        "{}={}; Path=/; HttpOnly; SameSite={same_site}{secure}; Max-Age={slide_window_secs}",
-        cookie_name, token
+    let same_site = if embeddable {
+        SameSite::None
+    } else {
+        SameSite::Lax
+    };
+    SetCookie::new(
+        cookie_name,
+        &CookieValue::encode(token),
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: true,
+            same_site,
+            secure,
+            max_age_secs: Some(slide_window_secs),
+        },
     )
 }
 
@@ -522,55 +597,62 @@ where
 
             // Sliding re-issue — cookie-source only (bearer tokens are API
             // credentials; the client manages re-issue itself via re-auth).
-            let reissue_cookie: Option<String> = if let TokenSource::Cookie(ref name) = cfg.source {
-                if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                    let slide_window_secs = crate::app_config::resolve_auth_slide_window();
-                    let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
-                    let now = crate::jwt::now_unix_seconds();
-                    // Throttle: re-issue only once past exp - slide_window/2.
-                    // Parse exp from the verified claims string representation.
-                    let past_threshold = claims
-                        .get("exp")
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .map(|exp| now > exp.saturating_sub(slide_i64 / 2))
-                        .unwrap_or(false);
-                    if past_threshold && now < ctx.cap {
-                        // Extra claims to carry into the re-issued token (all
-                        // verified claims except the time anchors and subject —
-                        // those come from the ReissueContext).
-                        let extra: HashMap<String, String> = claims
-                            .iter()
-                            .filter(|(k, _)| {
-                                // Time anchors and session-identity fields come from
-                                // ReissueContext verbatim; skip them in extra_claims.
-                                *k != "exp"
-                                    && *k != "iat"
-                                    && *k != "cap"
-                                    && *k != "jti"
-                                    && *k != "sub"
-                            })
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        match crate::auth::auth_reissue_token::<String>(
-                            &secret, &ctx, extra, slide_i64,
-                        ) {
-                            Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
-                                name,
-                                &new_token,
-                                slide_window_secs,
-                                is_https,
-                            )),
-                            _ => None,
+            let reissue_cookie: Option<SetCookie> =
+                if let TokenSource::Cookie(ref name) = cfg.source {
+                    if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
+                        // A malformed window refuses the request rather than
+                        // re-issuing under an unknown bound; the detail stays out of
+                        // the response.
+                        let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                        else {
+                            return ok_res(plain_resp(503, "service unavailable", &[]));
+                        };
+                        let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
+                        let now = crate::jwt::now_unix_seconds();
+                        // Throttle: re-issue only once past exp - slide_window/2.
+                        // Parse exp from the verified claims string representation.
+                        let past_threshold = claims
+                            .get("exp")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|exp| now > exp.saturating_sub(slide_i64 / 2))
+                            .unwrap_or(false);
+                        if past_threshold && now < ctx.cap {
+                            // Extra claims to carry into the re-issued token (all
+                            // verified claims except the time anchors and subject —
+                            // those come from the ReissueContext).
+                            let extra: HashMap<String, String> = claims
+                                .iter()
+                                .filter(|(k, _)| {
+                                    // Time anchors and session-identity fields come from
+                                    // ReissueContext verbatim; skip them in extra_claims.
+                                    *k != "exp"
+                                        && *k != "iat"
+                                        && *k != "cap"
+                                        && *k != "jti"
+                                        && *k != "sub"
+                                })
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            match crate::auth::auth_reissue_token::<String>(
+                                &secret, &ctx, extra, slide_i64,
+                            ) {
+                                Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
+                                    name,
+                                    &new_token,
+                                    slide_window_secs,
+                                    is_https,
+                                )),
+                                _ => None,
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let mut resp = handler(req, principal).await;
             // Attach the re-issue cookie when warranted. The handler returns an
@@ -662,16 +744,111 @@ pub fn server_with_status(status: i64, mut r: ServerResponse) -> ServerResponse 
     r.status = status;
     r
 }
-pub fn server_with_header(k: String, v: String, mut r: ServerResponse) -> ServerResponse {
-    r.headers.insert(k, v);
-    r
+/// Why a response header has no representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderRefusal {
+    /// The name is not an RFC 7230 `token`.
+    Name,
+    /// The value holds a control byte (CR, LF, NUL, ...) or a non-ASCII byte.
+    Value,
+    /// `Set-Cookie`, in any case: every cookie line is built by `SetCookie`.
+    SetCookie,
+    /// `Content-Length` or `Transfer-Encoding`, in any case: the server frames
+    /// the body it sends, so a handler's value could only disagree with it.
+    Framing,
 }
-/// Ipê `redirect : String -> Response` — a 302 to `location`. Matches the Ipê
-/// kernel's one-arg contract and  `Server_redirectT` (status is hardcoded,
-/// not a parameter; use `withStatus` to override).
+
+impl HeaderRefusal {
+    /// The refusal as the `Server.withHeader` error message; it never echoes the input.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Name => "Server.withHeader: the header name is not an HTTP token",
+            Self::Value => {
+                "Server.withHeader: the header value holds a control character (such as CR or LF) or a non-ASCII character"
+            }
+            Self::SetCookie => {
+                "Server.withHeader: `Set-Cookie` is not a raw header; set a cookie with `Server.withCookie` and `Server.cookie`"
+            }
+            Self::Framing => {
+                "Server.withHeader: `Content-Length` and `Transfer-Encoding` are set by the server from the body it sends"
+            }
+        }
+    }
+}
+
+/// Parse one response header into its typed name and value.
+///
+/// `Set-Cookie` in any case is refused, so a cookie line is only ever the one
+/// `SetCookie` builds from typed parts. `Content-Length` and
+/// `Transfer-Encoding` in any case are refused, so the body framing is only
+/// ever the server's own.
+fn parse_response_header(
+    name: &str,
+    value: &str,
+) -> Result<(axum::http::HeaderName, axum::http::HeaderValue), HeaderRefusal> {
+    let name =
+        axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| HeaderRefusal::Name)?;
+    if name == axum::http::header::SET_COOKIE {
+        return Err(HeaderRefusal::SetCookie);
+    }
+    if name == axum::http::header::CONTENT_LENGTH || name == axum::http::header::TRANSFER_ENCODING {
+        return Err(HeaderRefusal::Framing);
+    }
+    if !value.is_ascii() {
+        return Err(HeaderRefusal::Value);
+    }
+    let value = axum::http::HeaderValue::from_str(value).map_err(|_| HeaderRefusal::Value)?;
+    Ok((name, value))
+}
+
+/// `Server.withHeader : String -> String -> Response -> Result Error Response`.
+///
+/// The header enters the response only when its name is a `token` other than
+/// `Set-Cookie`, `Content-Length` and `Transfer-Encoding` and its value a
+/// visible-ASCII header value; any other header is an `InvalidInput` error.
+#[must_use]
+pub fn server_with_header(
+    k: String,
+    v: String,
+    mut r: ServerResponse,
+) -> IpeResult<IpeError, ServerResponse> {
+    match parse_response_header(&k, &v) {
+        Ok(_) => {
+            r.headers.insert(k, v);
+            IpeResult::Ok(r)
+        }
+        Err(refusal) => IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+    }
+}
+
+/// Bytes a `Location` value never holds raw.
+///
+/// CTLs, space, non-ASCII (always encoded by `utf8_percent_encode`) and the
+/// ASCII characters RFC 3986 neither reserves nor leaves unreserved. `%` and
+/// every reserved character are kept, so an already-encoded URI is unchanged.
+const LOCATION_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Ipê `redirect : String -> Response` — a 302 to `location`.
+///
+/// `location` is percent-encoded into a visible-ASCII URI reference, so every
+/// redirect is a valid response. The status is fixed; `withStatus` overrides it.
+#[must_use]
 pub fn server_redirect(location: String) -> ServerResponse {
     let mut r = resp(302, String::new(), "text/plain");
-    r.headers.insert("Location".to_string(), location);
+    r.headers.insert(
+        "Location".to_string(),
+        percent_encoding::utf8_percent_encode(&location, LOCATION_ESCAPE).to_string(),
+    );
     r
 }
 
@@ -702,6 +879,11 @@ pub fn server_header(name: String, req: ServerRequest) -> IpeMaybe<String> {
         None => IpeMaybe::Nothing,
     }
 }
+/// `Server.getCookie name req` — the decoded value of the cookie `name`.
+///
+/// `req.cookies` holds only pairs whose wire name is the encoding of their
+/// decoded name and whose value decodes, so this matches exactly the cookie
+/// `Server.cookie name` writes.
 pub fn server_get_cookie(name: String, req: ServerRequest) -> IpeMaybe<String> {
     match req.cookies.get(&name) {
         Some(v) => IpeMaybe::Just(v.clone()),
@@ -725,51 +907,201 @@ pub fn server_method(req: ServerRequest) -> String {
 
 // ─── cookies ──────────────────────────────────────────────────────────────
 
-pub fn server_cookie(name: String, value: String) -> ServerCookie {
-    ServerCookie { name, value }
+pub use crate::http_header::cookie::{CookieName, CookieValue, RuntimeCookie, request_cookies};
+pub use cookie_octets::{CookieAttributes, CookiePath, SameSite, SetCookie};
+
+/// The `Set-Cookie` line grammar, held in types.
+///
+/// A [`SetCookie`] line is assembled only from a [`CookieName`], a
+/// [`CookieValue`] (the shared RFC 6265 grammar in `http_header::cookie`) and a
+/// typed attribute set, so every `Set-Cookie` value the server emits is a valid
+/// header value and carries no attribute or line the caller supplied.
+mod cookie_octets {
+    use super::{CookieName, CookieValue};
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
+    /// Bytes outside RFC 6265 `av-octet` (a `Path` attribute value): CTLs and `;`.
+    const NOT_AV_OCTET: &AsciiSet = &CONTROLS.add(b';');
+
+    /// The `SameSite` attribute of a `Set-Cookie` line.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SameSite {
+        Lax,
+        Strict,
+        None,
+    }
+
+    impl SameSite {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::Lax => "Lax",
+                Self::Strict => "Strict",
+                Self::None => "None",
+            }
+        }
+    }
+
+    /// A `Path` attribute value: starts with `/` and holds only `av-octet` bytes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CookiePath(String);
+
+    impl CookiePath {
+        /// The root path `/`.
+        #[must_use]
+        pub fn root() -> Self {
+            Self("/".to_owned())
+        }
+
+        /// Parse `raw`, percent-encoding every byte that is not an `av-octet`.
+        ///
+        /// A value without a leading `/` gets one, so the browser never falls
+        /// back to the request's default path.
+        #[must_use]
+        pub fn encode(raw: &str) -> Self {
+            let encoded = utf8_percent_encode(raw, NOT_AV_OCTET).to_string();
+            if encoded.starts_with('/') {
+                Self(encoded)
+            } else {
+                Self(format!("/{encoded}"))
+            }
+        }
+
+        /// The encoded path.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// The attributes of a `Set-Cookie` line.
+    ///
+    /// `SameSite=None` always renders `Secure`: a browser drops a cross-site
+    /// cookie that lacks it, so the pair is never emitted apart.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CookieAttributes {
+        pub path: CookiePath,
+        pub http_only: bool,
+        pub same_site: SameSite,
+        pub secure: bool,
+        pub max_age_secs: Option<u64>,
+    }
+
+    /// One `Set-Cookie` header value built from typed parts.
+    ///
+    /// The line carries the cookie's value (a session id, a token), so its
+    /// `Debug` prints [`crate::redact::REDACTED`], never the line.
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct SetCookie(String);
+
+    impl std::fmt::Debug for SetCookie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("SetCookie")
+                .field(&crate::redact::Redacted::new(()))
+                .finish()
+        }
+    }
+
+    impl SetCookie {
+        /// Render `name=value; Path=<path>` and then `attributes` in a fixed order.
+        #[must_use]
+        pub fn new(name: &CookieName, value: &CookieValue, attributes: CookieAttributes) -> Self {
+            let http_only = if attributes.http_only {
+                "; HttpOnly"
+            } else {
+                ""
+            };
+            let same_site = attributes.same_site.as_str();
+            let secure = if attributes.secure || attributes.same_site == SameSite::None {
+                "; Secure"
+            } else {
+                ""
+            };
+            let max_age = attributes
+                .max_age_secs
+                .map_or_else(String::new, |secs| format!("; Max-Age={secs}"));
+            Self(format!(
+                "{}={}; Path={}{http_only}; SameSite={same_site}{secure}{max_age}",
+                name.as_str(),
+                value.as_str(),
+                attributes.path.as_str()
+            ))
+        }
+
+        /// The header value.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+
+        /// The line as a `Set-Cookie` header value.
+        ///
+        /// The one place a cookie line becomes a header: every response path
+        /// appends this, and answers `500` on `None` rather than send the
+        /// response without the cookie.
+        #[must_use]
+        pub fn header_value(&self) -> Option<axum::http::HeaderValue> {
+            axum::http::HeaderValue::from_str(&self.0).ok()
+        }
+
+        /// A line holding `raw` verbatim, bypassing the grammar.
+        #[cfg(test)]
+        #[must_use]
+        pub fn unchecked_for_test(raw: &str) -> Self {
+            Self(raw.to_owned())
+        }
+    }
+
+    impl std::ops::Deref for SetCookie {
+        type Target = str;
+
+        fn deref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for SetCookie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
 }
 
-/// Strip any byte that could smuggle extra cookie attributes or inject a header
-/// line. We drop CTLs (incl. CR/LF), `;`, `,`, and whitespace from both the
-/// cookie name and value rather than reject (a total, never-panicking transform):
-/// the resulting Set-Cookie carries exactly one attribute set we control, and the
-/// downstream `builder.header` can't see a CRLF to error on. Conservative — these
-/// bytes are not valid in a cookie name/value per RFC 6265 token/cookie-octet
-/// grammar anyway.
-fn sanitise_cookie_field(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            !c.is_control()
-                && c != ';'
-                && c != ','
-                && c != ' '
-                && c != '\t'
-                && c != '"'
-                && c != '\\'
-        })
-        .collect()
+/// `Server.cookie : String -> String -> Result Error Cookie`.
+///
+/// Parses both fields into their cookie grammar; an empty name is an
+/// `InvalidInput` error, so a `Cookie` always carries a non-empty name.
+#[must_use]
+pub fn server_cookie(name: String, value: String) -> IpeResult<IpeError, ServerCookie> {
+    match CookieName::parse(&name) {
+        Some(name) => IpeResult::Ok(ServerCookie {
+            name,
+            value: Redacted::new(CookieValue::encode(&value)),
+        }),
+        None => IpeResult::Err(IpeError::invalid_input(
+            "Server.cookie: a cookie name must not be empty".to_owned(),
+        )),
+    }
 }
 
+/// `Server.withCookie` — attach `c` with `Path=/; HttpOnly; SameSite=Lax`.
+///
+/// `Secure` is added unless the process holds a dev intent (a dev-intent
+/// binary in a dev posture), so an auth/session cookie never crosses a
+/// cleartext hop; only a dev-intent process omits it, so cookies work over
+/// plain-http localhost. The gate is `cookie_secure_floor`.
+#[must_use]
 pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerResponse {
-    // Minimal Set-Cookie with safe defaults; full attributes land with step 4.
-    // name/value are sanitised so a value containing `;`/`,`/CRLF can't smuggle
-    // extra attributes or inject a second header line.
-    let name = sanitise_cookie_field(&c.name);
-    let value = sanitise_cookie_field(&c.value);
-    // Add `Secure` in production so an auth/session cookie is never transmitted
-    // over the cleartext proxy→app hop (SSL-strip / sniff). Omit it in dev so
-    // cookies still work over plain-http localhost. Gate matches the rest of the
-    // runtime's production detection (ENV / IPE_ENV via productionFromEnv).
-    let secure = if crate::telemetry::production_from_env() {
-        "; Secure"
-    } else {
-        ""
-    };
-    let v = format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Lax{}",
-        name, value, secure
-    );
-    r.cookies.push(v);
+    r.cookies.push(SetCookie::new(
+        &c.name,
+        &c.value,
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: true,
+            same_site: SameSite::Lax,
+            secure: cookie_secure_floor(),
+            max_age_secs: None,
+        },
+    ));
     r
 }
 
@@ -821,6 +1153,8 @@ struct ListenCeilings {
 fn listen_ceilings() -> Result<ListenCeilings, crate::system::EnvCeilingRefusal> {
     max_body()?;
     ws_ceilings()?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings()?;
     Ok(ListenCeilings {
         request_timeout_secs: REQUEST_TIMEOUT_CEILING.read()?,
         max_inflight: MAX_INFLIGHT_CEILING.read()?,
@@ -1037,13 +1371,39 @@ fn strict_serve_dir_with(
     )
 }
 
-fn parse_cookies(header: &str, out: &mut HashMap<String, String>) {
-    for c in header.split(';') {
-        let c = c.trim();
-        if let Some((k, v)) = c.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
-        }
+/// Add the decoded cookies of one request's jar to `out`; the first value of a name wins.
+#[cfg(test)]
+fn parse_cookies<'a, I>(jar: I, out: &mut HashMap<String, String>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    I::IntoIter: 'a,
+{
+    for (name, value) in request_cookies(jar) {
+        out.entry(name).or_insert(value);
     }
+}
+
+/// The decoded `(name, value)` pairs of every `Cookie` header in `headers`, in order.
+///
+/// Read from the raw header bytes through [`request_cookies`], so a pair with
+/// a byte outside visible ASCII drops only itself, never the other cookies.
+pub fn request_cookie_jar(
+    headers: &axum::http::HeaderMap,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    request_cookies(
+        headers
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+    )
+}
+
+/// The decoded value of the request cookie `name`, read from every `Cookie` header.
+///
+/// The first value of `name` wins, as in `parse_cookies`.
+#[must_use]
+pub fn request_cookie(headers: &axum::http::HeaderMap, name: &CookieName) -> Option<String> {
+    request_cookie_jar(headers).find_map(|(k, v)| (k == name.text()).then_some(v))
 }
 
 /// Build the Ipê `ServerRequest` from the axum request.
@@ -1062,11 +1422,14 @@ async fn build_request(
     let query = strict_url_query(&uri)?;
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
+    // Read from the raw bytes of every `Cookie` header, outside the text gate
+    // below, so one pair with a non-ASCII byte drops only itself. The first
+    // value of a name wins.
+    for (name, value) in request_cookie_jar(req.headers()) {
+        cookies.entry(name).or_insert(value);
+    }
     for (k, v) in req.headers() {
         if let Ok(s) = v.to_str() {
-            if k.as_str().eq_ignore_ascii_case("cookie") {
-                parse_cookies(s, &mut cookies);
-            }
             // Store under  canonical MIME casing (`content-type` ->
             // `Content-Type`), aligning with  request-header storage and the
             // Ipe.Web path, so `server_header` (which canonicalises its lookup
@@ -1164,6 +1527,14 @@ async fn build_request(
 }
 
 fn to_axum_response(r: ServerResponse) -> axum::response::Response {
+    to_axum_response_with(r, crate::telemetry::security_headers())
+}
+
+/// [`to_axum_response`] over the outcome of reading the security headers.
+fn to_axum_response_with(
+    r: ServerResponse,
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     // Ipe.Http.Server.Stream: a streaming response carries a sentinel body the
     // handler stashed via ServerStream.stream. Detect it + serve the chunked
@@ -1190,8 +1561,14 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     if !r.contentType.is_empty() && !has_ct_header {
         builder = builder.header("content-type", r.contentType.clone());
     }
+    // Every header is parsed again here, whatever built it: a `Response`
+    // record update can carry headers `Server.withHeader` never saw. A header
+    // with no representation (CR/LF, non-token name, `Set-Cookie`) answers 500.
     for (k, v) in &r.headers {
-        builder = builder.header(k.as_str(), v.as_str());
+        let Ok((name, value)) = parse_response_header(k, v) else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        builder = builder.header(name, value);
     }
     // Multiple Set-Cookie response headers (RFC 6265 §4.1 forbids comma-folding
     // them into one line) — kept in a dedicated Vec (see `ServerResponse.cookies`)
@@ -1200,12 +1577,20 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     // single-valued `headers` map. `builder.header` APPENDS, so repeated calls
     // with the same key name produce separate header lines on the wire.
     for cookie_v in &r.cookies {
-        builder = builder.header("set-cookie", cookie_v.as_str());
+        let Some(value) = cookie_v.header_value() else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        builder = builder.header(axum::http::header::SET_COOKIE, value);
     }
     // Safe-by-default security headers — applied only when the handler hasn't
     // already set them, so an explicit handler override wins. Values are
     // env/static (no request-derived strings → no header-injection surface).
-    for (name, value) in crate::telemetry::security_headers() {
+    // A refused framing policy answers 500: `Server.listen` refuses to start on
+    // it, and this second check keeps a response from ever shipping without it.
+    let Ok(security) = security else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    for (name, value) in security {
         if !r.headers.keys().any(|k| k.eq_ignore_ascii_case(name)) {
             builder = builder.header(name, value);
         }
@@ -1430,6 +1815,11 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             Ok(ceilings) => ceilings,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
         };
+        // The framing policy every response carries is parsed before bind, so
+        // a value with no header representation refuses the listener.
+        if let Err(refusal) = crate::telemetry::frame_ancestors_config() {
+            return IpeResult::Err(format!("Server.listen: {refusal}").into());
+        }
         let mut app: axum::Router = axum::Router::new();
         // At most ONE mounted web app per server: the embedded app's cookie /
         // CSRF / asset paths are scoped through the process-wide base path
@@ -1532,7 +1922,7 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             .layer(tower_http::timeout::TimeoutLayer::new(
                 std::time::Duration::from_secs(ceilings.request_timeout_secs),
             ));
-        // Port precedence: the supervisor's relocation var (`ipe watch` placing
+        // Port precedence: the supervisor's relocation var (`ipe dev watch` placing
         // the app behind its proxy) > `IPE_SERVER_PORT` (operator) > the port the
         // program passed to `Server.listen`. A malformed env layer falls through,
         // never to `0`.
@@ -1549,6 +1939,8 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         // (loopback in debug, all interfaces in release). The conservative
         // loopback default keeps a dev console off the LAN by construction.
         let host = crate::app_config::resolve_host_bind();
+        // Recorded before the bind, so no dev surface outlives an exposed listener.
+        crate::telemetry::record_bind(&host);
         let addr = format!("{}:{}", host, port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -1892,19 +2284,34 @@ fn ws_cross_origin(req: &ServerRequest) -> bool {
     crate::http_header::origin_host_mismatch(origin, host)
 }
 
+/// The refusal for a WebSocket upgrade with no origin allowlist, if any.
+///
+/// Waived only under a [`DevSurface`](crate::telemetry::DevSurface): a dev
+/// build whose every listener is loopback falls back to the same-origin check.
+const fn ws_origin_decision(
+    patterns_empty: bool,
+    dev: Option<&crate::telemetry::DevSurface>,
+) -> Option<(i64, &'static str)> {
+    if patterns_empty && dev.is_none() {
+        Some((403, "websocket: origin allowlist required in production"))
+    } else {
+        None
+    }
+}
+
 /// ServerWebSocket_upgrade : Request -> WebSocketServerCfg -> Task Error Response
 pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
     req: ServerRequest,
     cfg: WsServerCfg<E>,
 ) -> IpeTask<E, ServerResponse> {
     Box::pin(async move {
-        // Origin allowlist. Production with no patterns → reject ( With
+        // Origin allowlist. No patterns and no dev surface → reject. With
         // patterns set (any mode), the request's Origin must match one of them.
-        if crate::telemetry::production_from_env() && cfg.originPatterns.is_empty() {
-            return ok_res(ws_resp(
-                403,
-                "websocket: origin allowlist required in production",
-            ));
+        if let Some((status, body)) = ws_origin_decision(
+            cfg.originPatterns.is_empty(),
+            crate::telemetry::dev_surface_from_env().as_ref(),
+        ) {
+            return ok_res(ws_resp(status, body));
         }
         if !cfg.originPatterns.is_empty() {
             let origin = req
@@ -2597,9 +3004,9 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 
 /// `__Host-` prefix requires Secure + Path=/ + no Domain — mirrors
 /// `live/csrf.rs::csrf_cookie_name`'s reasoning, gated on the SAME
-/// process-wide production signal `server_with_cookie` already uses
-/// (`telemetry::production_from_env`), so naming stays internally consistent
-/// with the rest of `server.rs`'s cookie handling.
+/// process-wide [`cookie_secure_floor`] `server_with_cookie` already uses, so
+/// naming stays internally consistent with the rest of `server.rs`'s cookie
+/// handling.
 ///
 /// This stays process-global (NOT request-scoped) deliberately, same
 /// reasoning as the session cookie's `__Host-` name decision
@@ -2608,12 +3015,28 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 /// spuriously fail whenever proxy-scheme detection flips between requests.
 /// Only the `Secure` ATTRIBUTE (`csrf_set_cookie_value`) becomes
 /// request-scoped.
-fn csrf_cookie_name() -> &'static str {
-    if crate::telemetry::production_from_env() {
-        "__Host-ipe_csrf"
+fn csrf_cookie_name() -> CookieName {
+    csrf_cookie_name_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// [`csrf_cookie_name`] under an explicit dev-intent proof.
+fn csrf_cookie_name_with(dev: Option<&crate::telemetry::DevIntent>) -> CookieName {
+    let base = if cookie_secure_floor_with(dev) {
+        RuntimeCookie::HostCsrf
     } else {
-        "ipe_csrf"
-    }
+        RuntimeCookie::ServerCsrf
+    };
+    CookieName::runtime(base, "")
+}
+
+/// The process `Secure` floor for an `Ipe.Http.Server` cookie: [`cookie_secure_floor_with`].
+fn cookie_secure_floor() -> bool {
+    cookie_secure_floor_with(crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// `Secure` unless `dev` proves a dev-intent binary in a dev posture.
+const fn cookie_secure_floor_with(dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    dev.is_none()
 }
 
 /// 64 lowercase-hex chars (two concatenated UUIDv4s, ~244 combined random
@@ -2654,15 +3077,15 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// cross-origin page because SOP blocks that page from reading the
 /// victim-origin cookie).
 ///
-/// `Secure` is set when EITHER `production_from_env()` is true (unconditional
-/// floor — a production deploy always gets `Secure`, matching
+/// `Secure` is set when EITHER [`cookie_secure_floor`] holds (unconditional
+/// floor — every release build and production deploy gets `Secure`, matching
 /// `server_with_cookie`'s gate and the session cookie's
 /// `csrf::cookies_secure()` half) OR `request_is_https` is true (THIS
 /// specific request arrived over TLS at a trusted proxy, opt-in via
-/// `IPE_TRUSTED_PROXY` — closes the gap where a dev process (`ENV` unset)
+/// `IPE_TRUSTED_PROXY` — closes the gap where a dev-intent process
 /// fronted by a TLS-terminating proxy would otherwise emit a non-Secure CSRF
 /// cookie even though the browser connection was HTTPS). Same OR-gate shape as
-/// the session cookie in `live/mod.rs::page_response`.
+/// the session cookie in `web/mod.rs::page_response`.
 ///
 /// `request_is_https` MUST be computed from the ORIGINAL request headers
 /// before the request is consumed — see the call site in
@@ -2670,14 +3093,28 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// moving `req` into the wrapped handler `h(req)`. By the time this function
 /// runs (after the handler's `Task` resolves), the request itself is gone;
 /// only the pre-captured bool survives.
-fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> String {
-    let name = csrf_cookie_name();
-    let secure = if crate::telemetry::production_from_env() || request_is_https {
-        "; Secure"
-    } else {
-        ""
-    };
-    format!("{name}={token}; Path=/; SameSite=Strict{secure}")
+fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> SetCookie {
+    let dev = crate::telemetry::dev_intent_from_env();
+    csrf_set_cookie_value_with(token, request_is_https, dev.as_ref())
+}
+
+/// [`csrf_set_cookie_value`] under an explicit dev-intent proof.
+fn csrf_set_cookie_value_with(
+    token: &str,
+    request_is_https: bool,
+    dev: Option<&crate::telemetry::DevIntent>,
+) -> SetCookie {
+    SetCookie::new(
+        &csrf_cookie_name_with(dev),
+        &CookieValue::encode(token),
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: false,
+            same_site: SameSite::Strict,
+            secure: cookie_secure_floor_with(dev) || request_is_https,
+            max_age_secs: None,
+        },
+    )
 }
 
 /// Middleware.withCsrf : Handler -> Handler. Double-submit-cookie CSRF guard
@@ -2701,7 +3138,7 @@ where
             "GET" | "HEAD" | "OPTIONS"
         );
         let cookie_name = csrf_cookie_name();
-        let existing = req.cookies.get(cookie_name).cloned();
+        let existing = req.cookies.get(cookie_name.text()).cloned();
         let token = existing
             .clone()
             .filter(|t| csrf_token_well_formed(t))
@@ -2871,7 +3308,7 @@ mod tests {
         assert!(
             resolve(None, None)
                 .addr_in_use_message()
-                .contains("IPE_SERVER_PORT=8123 ipe run")
+                .contains("IPE_SERVER_PORT=8123 ipe dev run")
         );
         assert!(
             !resolve(Some("9100"), None)
@@ -2977,13 +3414,54 @@ mod tests {
             "a malformed parameter name must refuse the listener"
         );
         let IpeResult::Err(msg) = listened else {
-            return;
+            panic!("a malformed parameter name must refuse the listener");
         };
         assert!(
             msg.contains("endpoint `GET /:id/:id` has a malformed path parameter")
                 && msg.contains("parameter `id` appears twice"),
             "{msg}"
         );
+    }
+
+    /// The listener refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation before it binds. The value is read
+    /// once per process, so the check runs in a child holding it.
+    #[test]
+    fn listen_refuses_an_unrepresentable_frame_ancestors() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "listen_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `listen_refuses_an_unrepresentable_frame_ancestors`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by listen_refuses_an_unrepresentable_frame_ancestors"]
+    async fn listen_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        // A listener that got past the refusal would bind and serve forever;
+        // the timeout turns that regression into a failure instead of a hang.
+        let listened: IpeResult<String, ()> = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server_listen(0, Vec::new()),
+        )
+        .await
+        .expect("a refused framing policy must return before binding, not serve");
+        let IpeResult::Err(msg) = listened else {
+            panic!("a `;` in IPE_WEB_FRAME_ANCESTORS must refuse the listener");
+        };
+        assert!(
+            msg.starts_with("Server.listen: IPE_WEB_FRAME_ANCESTORS holds `;`"),
+            "{msg}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
     }
 
     #[test]
@@ -3013,6 +3491,88 @@ mod tests {
             server_header("x-missing".to_string(), req.clone()),
             IpeMaybe::Nothing
         ));
+    }
+
+    /// A request carrying a planted credential in every client-supplied field.
+    fn secret_laden_request() -> ServerRequest {
+        let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
+        ServerRequest {
+            method: "POST".to_owned(),
+            path: "/reset/P4THT0K".to_owned(),
+            body: "password=PW0RD".to_owned(),
+            headers: pair("Authorization", "Bearer S3CR3T"),
+            params: pair("id", "P4R4M"),
+            query: pair("token", "QT0K3N"),
+            cookies: pair("sid", "T0K3N"),
+            remoteAddr: "203.0.113.9".to_owned(),
+        }
+    }
+
+    const PLANTED: [&str; 7] = [
+        "S3CR3T",
+        "T0K3N",
+        "PW0RD",
+        "P4R4M",
+        "QT0K3N",
+        "203.0.113.9",
+        "P4THT0K",
+    ];
+
+    #[test]
+    fn request_debug_prints_no_client_supplied_value() {
+        let req = secret_laden_request();
+        for shown in [format!("{req:?}"), format!("{req:#?}")] {
+            for secret in PLANTED {
+                assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+            }
+            assert!(shown.contains("\"POST\""), "{shown}");
+            assert!(shown.contains(crate::redact::REDACTED));
+        }
+        assert!(matches!(
+            server_get_cookie("sid".to_owned(), req),
+            IpeMaybe::Just(ref v) if v == "T0K3N"
+        ));
+    }
+
+    #[test]
+    fn cookie_and_response_debug_print_no_secret() {
+        let cookie = cookie("sid", "T0K3N");
+        let shown = format!("{cookie:?}");
+        assert!(!shown.contains("T0K3N"), "{shown}");
+        assert!(shown.contains("\"sid\""));
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: true,
+                max_age_secs: None,
+            },
+        );
+        let shown = format!("{line:?}");
+        assert_eq!(shown, "SetCookie(<redacted>)");
+
+        let mut resp = server_text("session=T0K3N".to_owned());
+        resp.headers
+            .insert("Authorization".to_owned(), "Bearer S3CR3T".to_owned());
+        resp.cookies.push(SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: false,
+                max_age_secs: None,
+            },
+        ));
+        let shown = format!("{resp:?}");
+        for secret in ["T0K3N", "S3CR3T"] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("status: 200"));
     }
 
     /// Run `build_request` inside a router matched on `pattern`.
@@ -3056,6 +3616,27 @@ mod tests {
             build_request(wire).await,
             Err(RequestRejection::BadRequest)
         ));
+    }
+
+    /// A `Cookie` header with one non-ASCII byte keeps every other cookie: the
+    /// pair holding the byte is skipped, the session cookie beside it is read.
+    #[tokio::test]
+    async fn build_request_keeps_the_cookies_beside_a_non_ascii_pair() {
+        let tossed = axum::http::HeaderValue::from_bytes(b"x=\x80; sid=v")
+            .expect("obs-text is a valid header value");
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(axum::http::header::COOKIE, tossed)
+            .header(axum::http::header::COOKIE, "csrf=t")
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let Some(Ok(req)) = routed_build("/", wire).await else {
+            panic!("the request builds");
+        };
+        assert_eq!(req.cookies.get("sid").map(String::as_str), Some("v"));
+        assert_eq!(req.cookies.get("csrf").map(String::as_str), Some("t"));
+        assert!(!req.cookies.contains_key("x"), "{:?}", req.cookies);
     }
 
     /// Serve `uri` through a real `method_router` routed on `/u/:id`.
@@ -3433,7 +4014,9 @@ mod tests {
             .expect("test request builds");
         let built = routed_build("/", wire).await;
         assert!(matches!(built, Some(Ok(_))), "a routed request must build");
-        let Some(Ok(req)) = built else { return };
+        let Some(Ok(req)) = built else {
+            panic!("a routed request must build");
+        };
         assert_eq!(
             req.headers.get("X-Trace-Id").map(String::as_str),
             Some("abc123")
@@ -3470,11 +4053,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    // A dev surface (dev build, loopback listener) emits the banner;
+    // `inject_dev_banner` runs on every text/html buffered response.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn to_axum_response_injects_dev_banner_into_html_before_body_close() {
-        // A dev posture emits the banner; injectDevBanner runs on every
-        // text/html buffered response.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -3489,6 +4075,19 @@ mod tests {
             banner_at < body_close,
             "banner must sit before </body>: {out}"
         );
+    }
+
+    // A release binary under `ENV=dev` on a loopback listener has no dev
+    // surface, so its HTML responses never carry the console banner.
+    #[cfg(not(feature = "dev-posture"))]
+    #[tokio::test]
+    async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        crate::telemetry::record_bind("127.0.0.1");
+        let html = "<html><body><h1>hi</h1></body></html>";
+        let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
+        crate::system::locked_remove_var("ENV");
+        assert_eq!(out, html, "release HTML must be verbatim");
     }
 
     #[tokio::test]
@@ -3598,11 +4197,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_upgrade_dev_rejects_cross_origin_without_allowlist() {
-        // The CSWSH default-deny path: dev posture (`ENV=dev`), empty
-        // originPatterns, cross-origin Origin/Host pair.
+    async fn ws_upgrade_rejects_cross_origin_without_allowlist() {
+        // The CSWSH default-deny path: `ENV=dev` on a loopback listener, empty
+        // originPatterns, cross-origin Origin/Host pair. A dev surface falls
+        // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
+        crate::telemetry::record_bind("127.0.0.1");
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -3612,39 +4213,17 @@ mod tests {
         // that PASSES the origin check would hit the `None => 400` upgrader
         // branch instead of 403 — the origin check must short-circuit before
         // that point for this assertion to distinguish the two paths.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 403,
-                "cross-origin WS upgrade must be rejected outside production too"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(403), got Err({e})"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ws_upgrade_dev_allows_same_origin_without_allowlist() {
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
-        let cfg = ws_server_default_cfg::<String>();
-        let req = mk_ws_req(&[
-            ("origin", "https://victim.example"),
-            ("host", "victim.example"),
-        ]);
-        // Same-origin passes the CSWSH check; falls through to the "no
-        // upgrader present" 400 (this unit test doesn't drive a real axum
-        // WS upgrade), which is enough to prove it did NOT hit the 403
-        // cross-origin branch.
-        match server_web_socket_upgrade::<String>(req, cfg).await {
-            IpeResult::Ok(r) => assert_eq!(
-                r.status, 400,
-                "same-origin WS upgrade must pass the origin check (400 = no real upgrader in this unit test, not 403)"
-            ),
-            IpeResult::Err(e) => panic!("expected Ok(400), got Err({e})"),
-        }
+        let result = server_web_socket_upgrade::<String>(req, cfg).await;
+        crate::system::locked_remove_var("ENV");
+        let IpeResult::Ok(r) = result else {
+            assert!(matches!(result, IpeResult::Ok(_)), "upgrade returned Err");
+            return;
+        };
+        assert_eq!(r.status, 403, "cross-origin WS upgrade must be rejected");
     }
 
     /// The status a same-origin upgrade with no allowlist gets under the
-    /// given `ENV` / `IPE_ENV` (`None` = unset).
+    /// given `ENV` / `IPE_ENV` (`None` = unset), on a loopback listener.
     async fn same_origin_ws_status(env: Option<&str>, ipe_env: Option<&str>) -> i64 {
         for (key, value) in [("ENV", env), ("IPE_ENV", ipe_env)] {
             match value {
@@ -3652,6 +4231,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
+        crate::telemetry::record_bind("127.0.0.1");
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3667,16 +4247,42 @@ mod tests {
         resp.status
     }
 
-    // The WS origin gate reads the one posture parse: a release binary with
-    // nothing set is production (403 without an allowlist); an empty `ENV`
-    // defers to `IPE_ENV`.
+    // The no-allowlist refusal is waived only by a dev surface: never on a
+    // release binary, whatever dev marker `ENV`/`IPE_ENV` carry, even on a
+    // loopback listener.
     #[tokio::test]
-    async fn ws_origin_gate_reads_the_build_posture() {
+    async fn ws_origin_required_on_release_under_env_dev() {
+        let refusal = Some((403, "websocket: origin allowlist required in production"));
+        assert_eq!(ws_origin_decision(true, None), refusal);
+        assert_eq!(ws_origin_decision(false, None), None);
+        let surface = crate::telemetry::test_dev_surface();
+        assert_eq!(ws_origin_decision(true, Some(&surface)), None);
+        assert_eq!(ws_origin_decision(false, Some(&surface)), None);
         if !cfg!(feature = "dev-posture") {
-            assert_eq!(same_origin_ws_status(None, None).await, 403);
+            for (env, ipe_env) in [
+                (None, None),
+                (Some("dev"), None),
+                (Some(""), Some("dev")),
+                (Some("Development"), None),
+                (None, Some("LOCAL")),
+            ] {
+                assert_eq!(
+                    same_origin_ws_status(env, ipe_env).await,
+                    403,
+                    "{env:?} {ipe_env:?}"
+                );
+            }
         }
         assert_eq!(same_origin_ws_status(Some(""), Some("prod")).await, 403);
         assert_eq!(same_origin_ws_status(Some("staging"), None).await, 403);
+    }
+
+    // A dev build on a loopback listener passes a same-origin upgrade through
+    // the origin check (400 = no real upgrader in this unit test, not 403).
+    #[cfg(feature = "dev-posture")]
+    #[tokio::test]
+    async fn dev_posture_pin_ws_same_origin_passes_without_allowlist() {
+        assert_eq!(same_origin_ws_status(None, None).await, 400);
         assert_eq!(same_origin_ws_status(Some(""), Some("dev")).await, 400);
         assert_eq!(same_origin_ws_status(Some("dev"), None).await, 400);
     }
@@ -3686,10 +4292,8 @@ mod tests {
         // Pre-fill the live-peer registry to the ceiling, then a valid
         // same-origin upgrade must be turned away with 503 BEFORE any id/channel
         // is minted — distinguished from the `400 no-upgrader` fall-through the
-        // same-origin path would otherwise hit in a unit test. Dev posture,
-        // so the no-allowlist origin gate passes a same-origin request.
-        crate::system::locked_set_var("ENV", "dev");
-        crate::system::locked_remove_var("IPE_ENV");
+        // same-origin path would otherwise hit in a unit test. The allowlist
+        // names the request's Origin, so the origin gate passes it.
         crate::system::locked_remove_var("IPE_WS_MAX_CONNECTIONS");
         let ceiling = usize::try_from(WS_MAX_CONNECTIONS_CEILING.default_value()).unwrap();
         {
@@ -3700,7 +4304,8 @@ mod tests {
                 reg.insert(i, tx);
             }
         }
-        let cfg = ws_server_default_cfg::<String>();
+        let mut cfg = ws_server_default_cfg::<String>();
+        cfg.originPatterns = vec!["https://victim.example".to_owned()];
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -3765,6 +4370,24 @@ mod tests {
         assert!(zero_inflight.is_err_and(|r| r.name() == "IPE_HTTP_MAX_INFLIGHT"));
     }
 
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn a_malformed_auth_ceiling_refuses_listen() {
+        for (name, raw) in [
+            ("IPE_AUTH_MAX_LIFETIME", "8h"),
+            ("IPE_AUTH_SLIDE_WINDOW", "0"),
+            ("IPE_REVOCATION_CAPACITY", " 1024"),
+        ] {
+            crate::system::locked_set_var(name, raw);
+            let refused = listen_ceilings();
+            crate::system::locked_remove_var(name);
+            assert!(
+                refused.is_err_and(|r| r.name() == name),
+                "{name}={raw:?} must refuse Server.listen"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn serve_times_out_slow_handler() {
         // The same layer stack `server_listen` applies must turn a handler that
@@ -3815,7 +4438,9 @@ mod tests {
     fn query_and_cookies() {
         let parsed = parse_query(Some("a=1&b=two%20words&a=ignored&flag"));
         assert!(parsed.is_ok(), "a well-formed query must parse");
-        let Ok(q) = parsed else { return };
+        let Ok(q) = parsed else {
+            panic!("a well-formed query must parse");
+        };
         assert_eq!(q.get("a").map(String::as_str), Some("1")); // first value wins
         assert_eq!(q.get("b").map(String::as_str), Some("two words"));
         assert_eq!(q.get("flag").map(String::as_str), Some(""));
@@ -3826,7 +4451,7 @@ mod tests {
         );
 
         let mut c = std::collections::HashMap::new();
-        parse_cookies("sid=abc; theme=dark", &mut c);
+        parse_cookies([b"sid=abc; theme=dark".as_slice()], &mut c);
         assert_eq!(c.get("sid").map(String::as_str), Some("abc"));
         assert_eq!(c.get("theme").map(String::as_str), Some("dark"));
     }
@@ -3847,8 +4472,8 @@ mod tests {
     #[tokio::test]
     async fn two_set_cookie_headers_both_survive() {
         let mut r = server_text("ok".to_string());
-        r = server_with_cookie(server_cookie("a".into(), "1".into()), r);
-        r = server_with_cookie(server_cookie("b".into(), "2".into()), r);
+        r = server_with_cookie(cookie("a", "1"), r);
+        r = server_with_cookie(cookie("b", "2"), r);
         let resp = to_axum_response(r);
         let cookies: Vec<_> = resp
             .headers()
@@ -3856,6 +4481,580 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(cookies.len(), 2, "both Set-Cookie lines must survive");
+    }
+
+    /// The cookie `Server.cookie name value` builds for a non-empty `name`.
+    #[allow(clippy::expect_used)] // fixture: every caller passes a non-empty name
+    fn cookie(name: &str, value: &str) -> ServerCookie {
+        let built = match server_cookie(name.to_owned(), value.to_owned()) {
+            IpeResult::Ok(c) => Some(c),
+            IpeResult::Err(_) => None,
+        };
+        built.expect("a non-empty cookie name")
+    }
+
+    /// The parsed cookie name for a non-empty `raw`.
+    #[allow(clippy::expect_used)] // fixture: every caller passes a non-empty name
+    fn parsed_name(raw: &str) -> CookieName {
+        CookieName::parse(raw).expect("a non-empty cookie name")
+    }
+
+    /// The `Set-Cookie` lines of `r` once it is an HTTP response.
+    fn set_cookie_lines(r: ServerResponse) -> Vec<String> {
+        to_axum_response(r)
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect()
+    }
+
+    /// RFC 6265 `cookie-octet`, written out independently of the encoder's set.
+    const fn is_cookie_octet(b: u8) -> bool {
+        matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+    }
+
+    /// RFC 7230 `tchar`, written out independently of the encoder's set.
+    const fn is_tchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    #[test]
+    fn cookie_value_encodes_every_byte_outside_cookie_octet() {
+        for (raw, encoded) in [
+            ("é", "%C3%A9"),
+            (";", "%3B"),
+            (",", "%2C"),
+            (" ", "%20"),
+            ("\t", "%09"),
+            ("\"", "%22"),
+            ("\\", "%5C"),
+            ("a\r\nSet-Cookie: x=y", "a%0D%0ASet-Cookie:%20x=y"),
+            ("\u{7f}", "%7F"),
+            ("😀", "%F0%9F%98%80"),
+            ("%", "%25"),
+            ("%41", "%2541"),
+        ] {
+            assert_eq!(CookieValue::encode(raw).as_str(), encoded, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn cookie_value_keeps_cookie_octets_byte_for_byte() {
+        let octets: String = (0u8..=0x7F)
+            .filter(|&b| is_cookie_octet(b) && b != b'%')
+            .map(char::from)
+            .collect();
+        assert_eq!(CookieValue::encode(&octets).as_str(), octets);
+        assert_eq!(CookieValue::encode("").as_str(), "");
+    }
+
+    #[test]
+    fn cookie_name_encodes_every_byte_outside_token() {
+        for (raw, encoded) in [
+            ("a=b", "a%3Db"),
+            ("sé", "s%C3%A9"),
+            ("a b", "a%20b"),
+            ("a;b", "a%3Bb"),
+            ("(x)", "%28x%29"),
+            ("%", "%25"),
+            ("s%69d", "s%2569d"),
+        ] {
+            assert_eq!(parsed_name(raw).as_str(), encoded, "name {raw:?}");
+            assert_eq!(parsed_name(raw).text(), raw, "name {raw:?}");
+        }
+        let tchars: String = (0u8..=0x7F)
+            .filter(|&b| is_tchar(b) && b != b'%')
+            .map(char::from)
+            .collect();
+        assert_eq!(parsed_name(&tchars).as_str(), tchars);
+    }
+
+    /// Every ASCII byte and non-ASCII text, in name and value, yields a line of
+    /// grammar bytes that is a valid header value.
+    #[test]
+    fn set_cookie_from_any_text_is_a_valid_header_value() {
+        let mut inputs: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        inputs.extend(["é".to_owned(), "\u{2028}".to_owned(), "日本".to_owned()]);
+        for raw in &inputs {
+            let name = parsed_name(raw);
+            let value = CookieValue::encode(raw);
+            assert!(name.as_str().bytes().all(is_tchar), "name {raw:?}");
+            assert!(value.as_str().bytes().all(is_cookie_octet), "value {raw:?}");
+            let line = SetCookie::new(
+                &name,
+                &value,
+                CookieAttributes {
+                    path: CookiePath::root(),
+                    http_only: true,
+                    same_site: SameSite::Lax,
+                    secure: true,
+                    max_age_secs: Some(60),
+                },
+            );
+            assert!(
+                axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+                "{line}"
+            );
+            assert_eq!(
+                line.matches(';').count(),
+                5,
+                "no smuggled attribute: {line}"
+            );
+        }
+    }
+
+    /// A non-ASCII, `;`, `,`, whitespace or `"` value no longer fails the whole
+    /// response: it is answered with the encoded cookie.
+    #[tokio::test]
+    async fn with_cookie_non_cookie_octet_value_keeps_the_response() {
+        let r = server_with_cookie(
+            cookie("sid", "é; a, b \"c\""),
+            server_text("ok".to_string()),
+        );
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(cookies.len(), 1, "{cookies:?}");
+        let Some(Ok(line)) = cookies.first() else {
+            panic!("the Set-Cookie header must be visible ASCII: {cookies:?}");
+        };
+        assert!(
+            line.starts_with("sid=%C3%A9%3B%20a%2C%20b%20%22c%22; Path=/; HttpOnly; SameSite=Lax"),
+            "{line}"
+        );
+    }
+
+    /// `SameSite=None` without `Secure` has no representation: the line
+    /// carries `Secure` even when the caller's `secure` flag is off.
+    #[test]
+    fn same_site_none_always_renders_secure() {
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::None,
+                secure: false,
+                max_age_secs: None,
+            },
+        );
+        assert_eq!(
+            line.as_str(),
+            "sid=v; Path=/; HttpOnly; SameSite=None; Secure"
+        );
+        let lax = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: false,
+                same_site: SameSite::Lax,
+                secure: false,
+                max_age_secs: Some(5),
+            },
+        );
+        assert_eq!(lax.as_str(), "sid=v; Path=/; SameSite=Lax; Max-Age=5");
+    }
+
+    /// A `Path` value keeps every `av-octet`, encodes CTLs, `;` and non-ASCII,
+    /// and always starts with `/`.
+    #[test]
+    fn cookie_path_encodes_every_byte_outside_av_octet() {
+        for (raw, encoded) in [
+            ("/", "/"),
+            ("", "/"),
+            ("/shop", "/shop"),
+            ("shop", "/shop"),
+            ("/a;b", "/a%3Bb"),
+            ("/a\r\nSet-Cookie: x=y", "/a%0D%0ASet-Cookie: x=y"),
+            ("/caf\u{e9}", "/caf%C3%A9"),
+            ("/a b,c\"d", "/a b,c\"d"),
+        ] {
+            assert_eq!(CookiePath::encode(raw).as_str(), encoded, "path {raw:?}");
+        }
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::encode("/a;Domain=evil.example\r\nX: y"),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: true,
+                max_age_secs: None,
+            },
+        );
+        assert!(
+            axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+            "{line}"
+        );
+        assert_eq!(
+            line.matches(';').count(),
+            4,
+            "no smuggled attribute: {line}"
+        );
+    }
+
+    /// An empty cookie name is an `InvalidInput` error, so no `Set-Cookie`
+    /// line starts with `=`.
+    #[tokio::test]
+    async fn with_cookie_never_emits_nameless_line() {
+        assert!(matches!(
+            server_cookie(String::new(), "a=b".into()),
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+        ));
+        let mut names: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        names.extend(["=".to_owned(), " ".to_owned(), "é".to_owned()]);
+        for raw in &names {
+            let lines = set_cookie_lines(server_with_cookie(
+                cookie(raw, "v"),
+                server_text("ok".to_owned()),
+            ));
+            assert_eq!(lines.len(), 1, "name {raw:?}: {lines:?}");
+            for line in &lines {
+                assert!(!line.starts_with('='), "name {raw:?}: {line}");
+                let Some((wire, _)) = line.split_once('=') else {
+                    panic!("name {raw:?}: the Set-Cookie line has no `=`: {line}");
+                };
+                assert!(!wire.is_empty(), "name {raw:?}: {line}");
+                assert!(wire.bytes().all(is_tchar), "name {raw:?}: {line}");
+            }
+        }
+    }
+
+    /// Any name and value `Server.cookie` writes reads back unchanged through
+    /// the request parser and `Server.getCookie`.
+    #[tokio::test]
+    async fn cookie_round_trips_through_get_cookie() {
+        let mut texts: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        texts.extend(
+            [
+                "%41", "%", "%%", "%ZZ", "é", "日本", "my sid", "\u{2028}", "😀", "a=b; c",
+            ]
+            .map(str::to_owned),
+        );
+        for name in &texts {
+            for value in [name.as_str(), "", "%41", "é;%"] {
+                let lines = set_cookie_lines(server_with_cookie(
+                    cookie(name, value),
+                    server_text("ok".to_owned()),
+                ));
+                assert_eq!(lines.len(), 1, "name {name:?}: {lines:?}");
+                let Some((pair, _)) = lines.first().and_then(|l| l.split_once(';')) else {
+                    panic!("name {name:?} value {value:?}: no `name=value;` pair in {lines:?}");
+                };
+                let mut jar = HashMap::new();
+                parse_cookies([format!("other=1; {pair}").as_bytes()], &mut jar);
+                let req = mk_req("GET", jar, HashMap::new());
+                assert_eq!(
+                    server_get_cookie(name.clone(), req),
+                    IpeMaybe::Just(value.to_owned()),
+                    "name {name:?} value {value:?} via {pair:?}"
+                );
+            }
+        }
+    }
+
+    /// A `%` without two hex digits, or bytes that are not UTF-8, have no
+    /// decoding: the cookie is absent, never a lossy value.
+    #[test]
+    fn undecodable_cookie_is_nothing() {
+        for wire in ["%ZZ", "%C3", "%FF%FE", "%4", "%", "a%G1"] {
+            assert_eq!(
+                crate::http_header::cookie::decode(wire),
+                None,
+                "wire {wire:?}"
+            );
+        }
+        assert_eq!(
+            crate::http_header::cookie::decode("%C3%A9%25"),
+            Some("é%".to_owned())
+        );
+        let mut jar = HashMap::new();
+        parse_cookies(
+            [b"a=%ZZ; b=%C3; c=%FF%FE; d=%4; e=ok; =v; s%69d=v".as_slice()],
+            &mut jar,
+        );
+        assert_eq!(jar.len(), 1, "{jar:?}");
+        assert_eq!(jar.get("e").map(String::as_str), Some("ok"));
+        for name in ["a", "b", "c", "d", "", "sid", "s%69d"] {
+            let req = mk_req("GET", jar.clone(), HashMap::new());
+            assert_eq!(
+                server_get_cookie(name.to_owned(), req),
+                IpeMaybe::Nothing,
+                "name {name:?}"
+            );
+        }
+    }
+
+    /// Every header lookup keys on the encoded name: a lookup by `ipe_sid`
+    /// never matches a cookie whose wire name only decodes to it.
+    #[test]
+    fn request_cookie_keys_on_the_encoded_name() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("ipe%5Fsid=forged; my%20sid=a%3Bb"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("ipe_sid=real; ipe_sid=second"),
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("ipe_sid")),
+            Some("real".to_owned())
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("my sid")),
+            Some("a;b".to_owned())
+        );
+        assert_eq!(request_cookie(&headers, &parsed_name("ipe%5Fsid")), None);
+    }
+
+    /// A lookup reads the session cookie beside a pair with a non-ASCII byte.
+    #[test]
+    fn request_cookie_reads_beside_a_non_ascii_pair() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"x=\x80; ipe_sid=real")
+                .expect("obs-text is a valid header value"),
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("ipe_sid")),
+            Some("real".to_owned())
+        );
+        assert_eq!(request_cookie(&headers, &parsed_name("x")), None);
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: no response ships with
+    /// a header set missing its framing policy.
+    #[test]
+    fn response_refuses_a_refused_framing_policy() {
+        let refused = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(refused.headers().get("x-frame-options").is_none());
+        let framed = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Ok(vec![("x-frame-options", "SAMEORIGIN".to_owned())]),
+        );
+        assert_eq!(framed.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            framed
+                .headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("SAMEORIGIN")
+        );
+    }
+
+    /// The `InvalidInput` message of a refused `Server.withHeader`, or `None`
+    /// when the header was accepted.
+    fn with_header_refusal(name: &str, value: &str) -> Option<String> {
+        match server_with_header(
+            name.to_owned(),
+            value.to_owned(),
+            server_text("ok".to_owned()),
+        ) {
+            IpeResult::Ok(_) => None,
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, info)) => Some(info.message),
+            IpeResult::Err(IpeError::Error(_, info)) => {
+                Some(format!("wrong kind: {}", info.message))
+            }
+        }
+    }
+
+    /// A header value with CR/LF, a name that is not a `token`, and
+    /// `Set-Cookie` in any case are refused; a valid header is kept.
+    #[tokio::test]
+    async fn with_header_refuses_unrepresentable_headers() {
+        for (name, value) in [
+            ("X-Ok", "a\r\nSet-Cookie: x=y"),
+            ("X-Ok", "a\nb"),
+            ("X-Ok", "caf\u{e9}"),
+            ("X Bad", "v"),
+            ("X-Bad:", "v"),
+            ("", "v"),
+        ] {
+            let refusal = with_header_refusal(name, value);
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("Server.withHeader:")),
+                "{name:?}: {value:?} -> {refusal:?}"
+            );
+        }
+        for name in ["Set-Cookie", "set-cookie", "SET-COOKIE"] {
+            let refusal = with_header_refusal(name, "sid=1");
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.contains("Server.withCookie")),
+                "{name:?} -> {refusal:?}"
+            );
+        }
+        for name in [
+            "Content-Length",
+            "content-length",
+            "Transfer-Encoding",
+            "TRANSFER-ENCODING",
+        ] {
+            let refusal = with_header_refusal(name, "5");
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.contains("set by the server")),
+                "{name:?} -> {refusal:?}"
+            );
+        }
+        assert_eq!(with_header_refusal("X-Frame-Options", "DENY"), None);
+        let IpeResult::Ok(r) = server_with_header(
+            "X-Frame-Options".to_owned(),
+            "DENY".to_owned(),
+            server_text("ok".to_owned()),
+        ) else {
+            panic!("`X-Frame-Options: DENY` must be accepted by `withHeader`");
+        };
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
+    /// A raw header a `Response` record update carries past `withHeader` is
+    /// parsed again: a `Set-Cookie` or CR/LF header answers 500, never a line.
+    #[tokio::test]
+    async fn to_axum_response_refuses_a_raw_unrepresentable_header() {
+        for (name, value) in [
+            ("Set-Cookie", "sid=forged; Path=/"),
+            ("set-cookie", "sid=forged"),
+            ("X-Ok", "a\r\nSet-Cookie: sid=forged"),
+            ("X Bad", "v"),
+            ("Content-Length", "0"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let mut r = server_text("ok".to_owned());
+            r.headers.insert(name.to_owned(), value.to_owned());
+            let resp = to_axum_response(r);
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name:?}: {value:?}"
+            );
+            assert!(
+                resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+                "{name:?}: {value:?}"
+            );
+        }
+    }
+
+    /// A cookie line with no header representation answers 500, never a
+    /// response that drops the cookie or splits the line.
+    #[tokio::test]
+    async fn to_axum_response_refuses_an_unrepresentable_cookie_line() {
+        let mut r = server_text("ok".to_owned());
+        r.cookies
+            .push(SetCookie::unchecked_for_test("sid=a\r\nX-Injected: 1"));
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// `redirect` percent-encodes CTLs, space, non-ASCII and the characters
+    /// RFC 3986 neither reserves nor leaves unreserved; reserved characters
+    /// and existing `%XX` escapes are kept.
+    #[tokio::test]
+    async fn redirect_location_is_percent_encoded() {
+        for (raw, location) in [
+            ("/a b/caf\u{e9}?q=1&r=[x]#f", "/a%20b/caf%C3%A9?q=1&r=[x]#f"),
+            ("/%41", "/%41"),
+            ("/a\r\nSet-Cookie: x=y", "/a%0D%0ASet-Cookie:%20x=y"),
+            (
+                "https://e.example/p?x=\"<{|}>\"",
+                "https://e.example/p?x=%22%3C%7B%7C%7D%3E%22",
+            ),
+            ("/\u{65e5}", "/%E6%97%A5"),
+        ] {
+            let resp = to_axum_response(server_redirect(raw.to_owned()));
+            assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "{raw:?}");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some(location),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// A parsed non-empty cookie name for a test.
+    #[cfg(feature = "jwt")]
+    fn sid(raw: &str) -> CookieName {
+        CookieName::parse(raw).unwrap()
+    }
+
+    /// `Server.cookieToken ""` is an `InvalidInput` error: no cookie source
+    /// names a cookie no request can carry.
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn cookie_token_empty_name_is_refused() {
+        assert!(matches!(
+            server_cookie_token(String::new()),
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, ref info))
+                if info.message.starts_with("Server.cookieToken:")
+        ));
+        assert!(matches!(
+            server_cookie_token("my sid".to_owned()),
+            IpeResult::Ok(TokenSource::Cookie(ref name)) if name.as_str() == "my%20sid"
+        ));
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn reissue_set_cookie_encodes_name_and_token() {
+        let line = reissue_set_cookie(&sid("my sid"), "t;ok", 1800, false);
+        assert!(
+            line.starts_with("my%20sid=t%3Bok; Path=/; HttpOnly; SameSite="),
+            "{line}"
+        );
+        assert!(
+            axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+            "{line}"
+        );
     }
 
     fn mk_req(
@@ -3892,7 +5091,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_without_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "a".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "a".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
             Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
                 as IpeTask<String, ServerResponse>
@@ -3906,11 +5105,9 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_post_with_matching_cookie_and_header_allowed() {
-        // Dev posture: the CSRF cookie carries its plain-http name `ipe_csrf`.
-        crate::system::locked_set_var("ENV", "dev");
         let tok = "b".repeat(64);
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), tok.clone());
+        cookies.insert(csrf_cookie_name().text().to_owned(), tok.clone());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), tok);
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3927,7 +5124,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_mismatched_cookie_and_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "c".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "c".repeat(64));
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "d".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3948,7 +5145,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_matching_but_malformed_tokens_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert("ipe_csrf".to_string(), "x".to_string());
+        cookies.insert(csrf_cookie_name().text().to_owned(), "x".to_string());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "x".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -3991,29 +5188,58 @@ mod tests {
         assert!(!request_is_https_with_trust(&headers, true));
     }
 
-    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER
-    /// production OR the (pre-captured) request-scoped TLS signal is true.
-    /// Exercises all four (production, request_is_https) combinations —
-    /// this is the pure-function core, independent of env-var mutation.
+    /// `csrf_set_cookie_value`'s combined gate: `Secure` when EITHER there is
+    /// no dev intent OR the (pre-captured) request-scoped TLS signal is true.
+    /// Exercises all four (dev intent, `request_is_https`) combinations and
+    /// the cookie name — the pure-function core, independent of env mutation.
     #[test]
     fn csrf_cookie_secure_or_gate_truth_table() {
-        // production=false is simulated by calling with request_is_https
-        // directly; production is exercised via the ENV-var tests below
-        // (per-process under nextest, so mutating ENV here is safe).
         let tok = "a".repeat(64);
+        let dev = crate::telemetry::test_dev_intent();
+        // (a) dev intent, request IS https -> Secure.
+        assert!(
+            csrf_set_cookie_value_with(&tok, true, Some(&dev)).contains("; Secure"),
+            "TLS-detected request must get Secure regardless of posture"
+        );
+        // (b) dev intent, request NOT https -> no Secure (dev-mode-correct).
+        let plain = csrf_set_cookie_value_with(&tok, false, Some(&dev));
+        assert!(!plain.contains("; Secure"), "{plain}");
+        assert!(plain.starts_with("ipe_csrf="), "{plain}");
+        // (c)/(d) no dev intent -> Secure and `__Host-`, TLS or not.
+        for https in [false, true] {
+            let cookie = csrf_set_cookie_value_with(&tok, https, None);
+            assert!(cookie.contains("; Secure"), "{cookie}");
+            assert!(cookie.starts_with("__Host-ipe_csrf="), "{cookie}");
+        }
+        assert!(cookie_secure_floor_with(None));
+        assert!(!cookie_secure_floor_with(Some(&dev)));
+    }
 
+    // A release binary under `ENV=dev` keeps every `Ipe.Http.Server` cookie
+    // `Secure`, and the CSRF cookie `__Host-`-prefixed.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn cookies_secure_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
+        crate::system::locked_set_var("IPE_ENV", "dev");
+        let tok = "e".repeat(64);
+        let csrf = csrf_set_cookie_value(&tok, false);
+        let name = csrf_cookie_name();
+        let resp = server_with_cookie(cookie("sid", "v"), server_text("ok".into()));
+        #[cfg(feature = "web")]
+        let web_secure = crate::web::csrf::cookies_secure();
+        #[cfg(not(feature = "web"))]
+        let web_secure = true;
+        crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        // (a) not production, request IS https -> Secure.
+        assert!(csrf.contains("; Secure"), "{csrf}");
+        assert_eq!(name.as_str(), "__Host-ipe_csrf");
         assert!(
-            csrf_set_cookie_value(&tok, true).contains("; Secure"),
-            "TLS-detected request must get Secure regardless of ENV"
+            resp.cookies.iter().all(|c| c.contains("; Secure")),
+            "{:?}",
+            resp.cookies
         );
-        // (b) not production, request NOT https -> no Secure (dev-mode-correct).
-        assert!(
-            !csrf_set_cookie_value(&tok, false).contains("; Secure"),
-            "plain-HTTP dev request must NOT get Secure"
-        );
+        assert!(web_secure);
     }
 
     #[test]
@@ -4047,13 +5273,15 @@ mod tests {
 
     /// End-to-end through `middleware_with_csrf` (not just the pure
     /// `csrf_set_cookie_value` helper): a GET request carrying
-    /// `X-Forwarded-Proto: https` mints a Secure cookie when
-    /// `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
+    /// `X-Forwarded-Proto: https` on a dev build mints a non-Secure cookie
+    /// unless `IPE_TRUSTED_PROXY` is honoured, proving the signal survives the
     /// capture-before-move + thread-through-the-closure adaptation.
+    #[cfg(feature = "dev-posture")]
     #[tokio::test]
-    async fn csrf_middleware_mints_secure_cookie_for_trusted_https_request() {
-        // Dev posture, so `Secure` can only come from the forwarded scheme.
-        crate::system::locked_set_var("ENV", "dev");
+    async fn dev_posture_pin_csrf_middleware_ignores_untrusted_forwarded_proto() {
+        // Dev build, nothing set, so `Secure` can only come from the forwarded scheme.
+        crate::system::locked_remove_var("ENV");
+        crate::system::locked_remove_var("IPE_ENV");
         let mut headers = HashMap::new();
         headers.insert("x-forwarded-proto".to_string(), "https".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4066,17 +5294,20 @@ mod tests {
         // `IPE_TRUSTED_PROXY` set never trusts the header — so this test
         // documents the untrusted-by-default floor: no Secure without the
         // operator's opt-in, even though the header claims https.
-        match h(req).await {
-            IpeResult::Ok(r) => {
-                assert_eq!(r.cookies.len(), 1);
-                assert!(
-                    !r.cookies[0].contains("; Secure"),
-                    "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {}",
-                    r.cookies[0]
-                );
-            }
-            IpeResult::Err(_) => panic!("GET must never be rejected"),
-        }
+        let result = h(req).await;
+        let IpeResult::Ok(r) = result else {
+            assert!(
+                matches!(result, IpeResult::Ok(_)),
+                "GET must never be rejected"
+            );
+            return;
+        };
+        assert_eq!(r.cookies.len(), 1);
+        assert!(
+            r.cookies.iter().all(|c| !c.contains("; Secure")),
+            "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {:?}",
+            r.cookies
+        );
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────
@@ -4181,7 +5412,7 @@ mod tests {
             let token = hs256(&serde_json::json!({ "sub": "user-9", "exp": 9_999_999_999i64 }));
             let cfg = server_auth_config(
                 crate::secret::secret_from_string(SECRET.to_string()),
-                TokenSource::Cookie("ipe_sid".to_string()),
+                TokenSource::Cookie(sid("ipe_sid")),
             );
             let resp = run(cfg, req_with(&[], &[("ipe_sid", &token)])).await;
             assert_eq!(resp.status, 200, "a valid cookie token must dispatch");
@@ -4215,7 +5446,7 @@ mod tests {
         fn cookie_cfg() -> AuthConfig {
             server_auth_config(
                 crate::secret::secret_from_string(SECRET.to_string()),
-                TokenSource::Cookie("ipe_sid".to_string()),
+                TokenSource::Cookie(sid("ipe_sid")),
             )
         }
 
@@ -4313,66 +5544,70 @@ mod tests {
 
         // ── reissue Secure parity ──────────────────────────────────────────
 
-        /// `reissue_set_cookie` pure-function truth-table:
-        ///   (cookies_secure=false, is_https=true)  → Secure
-        ///   (cookies_secure=false, is_https=false) → no Secure
+        /// `reissue_set_cookie_with` truth-table under a dev intent:
+        ///   (`is_https`=true)  → Secure
+        ///   (`is_https`=false) → no Secure
         /// Mirrors the combined gate in `page_response`:
         /// a re-issued cookie must never be less-Secure than the initial one.
         #[test]
         fn reissue_set_cookie_secure_matches_initial_gate() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
+            let dev = crate::telemetry::test_dev_intent();
+            let floor = cookie_secure_floor_with(Some(&dev));
 
-            // is_https=true, cookies_secure()=false → Secure must fire.
-            let c_https = reissue_set_cookie("ipe_sid", "tok", 1800, true);
+            let c_https = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, true);
             assert!(
                 c_https.contains("; Secure"),
                 "reissue behind TLS proxy must carry Secure: {c_https}"
             );
 
-            // is_https=false, cookies_secure()=false → no Secure (dev default).
-            let c_plain = reissue_set_cookie("ipe_sid", "tok", 1800, false);
+            let c_plain = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, floor);
             assert!(
                 !c_plain.contains("; Secure"),
                 "reissue over plain HTTP in dev must NOT carry Secure: {c_plain}"
             );
         }
 
-        /// End-to-end: a cookie-source authed route where the request carries
-        /// `X-Forwarded-Proto: https` (trusted-proxy opt-in via the testable
-        /// `request_is_https_with_trust` overload) produces a re-issued cookie
-        /// that carries `Secure`.
+        /// A trusted `X-Forwarded-Proto: https` header produces a re-issued
+        /// cookie that carries `Secure`, on every build.
         ///
         /// Uses `request_is_https_with_trust(..., true)` directly to bypass the
         /// `OnceLock`-cached `trust_proxy_headers()` without mutating process env.
         #[test]
         fn reissue_set_cookie_https_proxy_sets_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let mut headers = HashMap::new();
             headers.insert("x-forwarded-proto".to_string(), "https".to_string());
             let is_https = request_is_https_with_trust(&headers, true);
             assert!(is_https, "trusted HTTPS header must be detected");
 
-            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, is_https);
+            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, is_https);
             assert!(
                 cookie.contains("; Secure"),
                 "reissue with HTTPS proxy signal must carry Secure: {cookie}"
             );
         }
 
-        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure on reissue.
+        // A release binary under `ENV=dev` re-issues a `Secure` cookie even
+        // over plain HTTP.
+        #[cfg(not(feature = "dev-posture"))]
+        #[test]
+        fn reissue_set_cookie_secure_on_release_under_env_dev() {
+            crate::system::locked_set_var("ENV", "dev");
+            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, false);
+            crate::system::locked_remove_var("ENV");
+            assert!(cookie.contains("; Secure"), "{cookie}");
+        }
+
+        /// Non-proxy default: no `X-Forwarded-Proto`, trust=false → no Secure
+        /// on a dev-intent reissue.
         #[test]
         fn reissue_set_cookie_plain_http_no_secure() {
-            crate::system::locked_set_var("ENV", "dev");
-            crate::system::locked_remove_var("IPE_ENV");
-
             let headers = HashMap::new();
             let is_https = request_is_https_with_trust(&headers, false);
             assert!(!is_https);
 
-            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, is_https);
+            let dev = crate::telemetry::test_dev_intent();
+            let secure = cookie_secure_floor_with(Some(&dev)) || is_https;
+            let cookie = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, secure);
             assert!(
                 !cookie.contains("; Secure"),
                 "reissue over plain HTTP must NOT carry Secure: {cookie}"

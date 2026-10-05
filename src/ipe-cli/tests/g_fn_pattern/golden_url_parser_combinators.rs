@@ -42,7 +42,7 @@ fn url_parser_combinators_ipec_cargo_and_run_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for url_parser_combinators: {:?}",
+        "ipe dev build must succeed for url_parser_combinators: {:?}",
         built.err()
     );
 

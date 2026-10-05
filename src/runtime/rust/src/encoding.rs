@@ -109,11 +109,12 @@ impl std::fmt::Display for DecodeRefusal {
 ///
 /// This is the single percent-decoder of the runtime: every URL component (a
 /// path parameter, a query key or value, `Encoding.urlDecode`,
-/// `Encoding.percentDecode`, `Http.parseQuery`, a database DSN part) is decoded
-/// here. It is total and strict: a `%` not followed by two hex digits, decoded
-/// bytes that are not UTF-8 (overlong forms such as `%C0%AF` included), and a
-/// component longer than `MAX_URL_COMPONENT_LEN` are each a typed refusal,
-/// never a lossy or pass-through success.
+/// `Encoding.percentDecode`, `Http.parseQuery`, a database DSN part) and every
+/// cookie name and value is decoded here. It is total and strict: a `%` not
+/// followed by two hex digits, decoded bytes that are not UTF-8 (overlong forms
+/// such as `%C0%AF` included), and a component longer than
+/// `MAX_URL_COMPONENT_LEN` are each a typed refusal, never a lossy or
+/// pass-through success.
 ///
 /// # Errors
 ///

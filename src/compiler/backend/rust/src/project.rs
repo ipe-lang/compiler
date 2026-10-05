@@ -2,16 +2,15 @@
 //! types + functions into the final `src/main.rs`, and pair it with the project
 //! `Cargo.toml`.
 //!
-//! Layout (matching the golden, line by line):
+//! Layout — each section, and each item in it, separated by one blank line
+//! through the single [`crate::items::Items`] joiner (an empty section leaves
+//! no trace):
 //! ```text
-//! <preamble: 1..=30>           header, imports, basic aliases, USER TYPES banner
-//! <user types: 31..=43>        emitted from the IR (emit_enum)
-//! <blank: 44>
-//! <runtime bindings: 45..=127> fixed kernel-wrapper prelude
-//! <blank: 128>
-//! <user functions: 129..=137>  emitted from the IR (emit_func)
-//! <blank: 138>
-//! <epilogue: 139..>            list helpers, FFI-placeholder banner, entry point
+//! <preamble>          header, imports, basic aliases, USER TYPES banner
+//! <user types>        emitted from the IR (emit_enum, emit_record_struct, …)
+//! <runtime bindings>  fixed kernel-wrapper prelude (+ TEA aliases, Auth wrappers)
+//! <user functions>    emitted from the IR (emit_func)
+//! <epilogue>          list helpers, entry point
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +24,7 @@ use crate::EmitCtx;
 use crate::crate_specs;
 use crate::emit_expr::emit_func;
 use crate::emit_types::{emit_enum, emit_record_struct, emit_row_witnesses};
+use crate::items::Items;
 use crate::preamble::{epilogue, preamble};
 use crate::rust_file;
 use crate::rust_file::{Partitioned, RustFileId, partition_items};
@@ -78,6 +78,25 @@ const RUNTIME_MOD_RS: &str = include_str!("../templates/ipe_runtime/mod.rs");
 
 /// The generated `ipe_runtime/config.rs` (DB/config bindings — empty by default).
 const RUNTIME_CONFIG_RS: &str = include_str!("../templates/ipe_runtime/config.rs");
+
+/// The runtime crate's own `clippy.toml`, vendored next to the emitted `Cargo.toml`.
+///
+/// A vendored runtime compiles inside the app crate, so clippy reads the app
+/// crate's config: without the runtime's `disallowed-methods`/`disallowed-types`
+/// bans, every runtime `#[expect(clippy::disallowed_*)]` would be an unfulfilled
+/// expectation in the emitted project. Embedded from the runtime file itself, so
+/// the two cannot drift.
+const RUNTIME_CLIPPY_TOML: &str = include_str!("../../../../../src/runtime/rust/clippy.toml");
+
+/// Insert [`RUNTIME_CLIPPY_TOML`] at the project root of a vendored-runtime emit.
+///
+/// # Errors
+///
+/// Propagates a [`Diagnostic`] from building the fixed relative path.
+fn insert_vendored_runtime_clippy_config(files: &mut BTreeMap<RelPath, String>) -> DResult<()> {
+    files.insert(RelPath::new("clippy.toml")?, RUNTIME_CLIPPY_TOML.to_owned());
+    Ok(())
+}
 
 // ── Browser-WASM manifest + runtime module set ─────────────────────────────
 
@@ -247,6 +266,7 @@ pub mod ct_eq;
 pub mod crypto_core;
 pub mod decimal;
 pub mod task;
+pub mod threads;
 pub mod dict;
 pub mod encoding;
 pub mod error;
@@ -268,6 +288,7 @@ pub mod scratch_host;
 pub mod path_core;
 pub mod path;
 pub mod random;
+pub mod redact;
 pub mod regex_kernel;
 pub mod secret;
 pub mod app_config;
@@ -645,16 +666,18 @@ fn epilogue_wasm(ctx: &EmitCtx) -> DResult<String> {
     if head.len() == full.len() {
         return Err(anchor_missing(BANNER));
     }
-    let mut out = head.to_owned();
-    out.push_str(BANNER);
-    out.push_str("// ===========================================\n\n");
-    out.push_str(WASM_ENTRY);
+    let mut out = Items::new();
+    out.push(head);
+    out.push(&format!(
+        "{BANNER}// ==========================================="
+    ));
+    out.push(WASM_ENTRY);
     if ctx.wasm_hydrate_mode
         && let Some(ty) = ctx.hydration_state_rust_name.as_deref()
     {
-        out.push_str(&wasm_hydrate_entry(ty));
+        out.push(&wasm_hydrate_entry(ty));
     }
-    Ok(out)
+    Ok(out.render())
 }
 
 /// Layer-3 defence-in-depth: a server-surface flag under the wasm target is
@@ -1345,32 +1368,32 @@ const TEA_TYPE_ALIASES: &str = "pub type IpeCmd<M> = ipe_runtime::tea::IpeCmd<M>
 const AUTH_WRAPPERS: &str = "\
 pub fn auth_hash_password(pw: String) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_hash_password(pw)\n\
-}\n\
+}\n\n\
 pub fn auth_hash_password_cost(pw: String, cost: i64) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_hash_password_cost(pw, cost)\n\
-}\n\
+}\n\n\
 pub fn auth_verify_password(pw: String, hash: String) -> IpeResult<IpeError, bool> {\n    \
     ipe_runtime::auth::auth_verify_password(pw, hash)\n\
-}\n\
+}\n\n\
 pub fn auth_password_strength(pw: String) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_password_strength(pw)\n\
-}\n\
+}\n\n\
 pub fn auth_sign_token(\n    \
     secret: ipe_runtime::secret::Secret, claims: HashMap<String, String>, expiry_seconds: i64,\n\
 ) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_sign_token(ipe_runtime::secret::secret_reveal(secret), claims, expiry_seconds)\n\
-}\n\
+}\n\n\
 pub fn auth_verify_token(secret: ipe_runtime::secret::Secret, token: String) -> IpeResult<IpeError, HashMap<String, String>> {\n    \
     ipe_runtime::auth::auth_verify_token(ipe_runtime::secret::secret_reveal(secret), token)\n\
-}\n\
+}\n\n\
 #[cfg(feature = \"db\")]\n\
 pub fn auth_register(conn: Db, email: String, password: String) -> IpeTask<i64> {\n    \
     ipe_runtime::auth::auth_register(conn, email, password)\n\
-}\n\
+}\n\n\
 #[cfg(feature = \"db\")]\n\
 pub fn auth_login(conn: Db, email: String, password: String) -> IpeTask<i64> {\n    \
     ipe_runtime::auth::auth_login(conn, email, password)\n\
-}\n\
+}\n\n\
 #[cfg(feature = \"db\")]\n\
 pub fn auth_set_role(conn: Db, user_id: i64, role: String) -> IpeTask<()> {\n    \
     ipe_runtime::auth::auth_set_role(conn, user_id, role)\n\
@@ -1533,10 +1556,10 @@ fn drop_prelude_section(text: &str, header: &str, next_header: &str) -> DResult<
 /// keeping that wrapper would fail to resolve (E0433). The `Http` section is the
 /// final block of the prelude (`http_parse_query` is its `END` anchor — see
 /// [`runtime_bindings`]), so everything from its comment header onward is cut in
-/// one slice, and a trailing newline is preserved so the following kernel-family
-/// bindings (`AUTH_WRAPPERS`, the TEA aliases, …) are not glued onto the last
-/// kept line. The `HTTP_SECTION` anchor is content-addressed, so a prelude drift
-/// that renamed it fails loud (a `CompilerBug`) rather than mis-slicing. The
+/// one slice; the [`Items`] joiner separates what follows (`AUTH_WRAPPERS`, the
+/// TEA aliases, …) from the last kept line. The `HTTP_SECTION` anchor is
+/// content-addressed, so a prelude drift that renamed it fails loud (a
+/// `CompilerBug`) rather than mis-slicing. The
 /// mid-prelude `Log` / `Time` / `Random` sections are cut the same way when
 /// their modules are dropped.
 fn native_runtime_bindings(reach: PreludeReach) -> DResult<String> {
@@ -1630,14 +1653,51 @@ fn native_runtime_bindings(reach: PreludeReach) -> DResult<String> {
              cannot drop the http_client wrappers for a non-HTTP program"
             ),
         })?;
-    let mut out = filtered.get(..cut).unwrap_or("").to_owned();
-    // The slice ends immediately before the `Http` comment (the byte before it
-    // is the newline that terminated the previous wrapper's `}`), so `out`
-    // already ends in `\n` — the following bindings start on their own line.
-    if !out.ends_with('\n') {
-        out.push('\n');
+    // The slice ends immediately before the `Http` comment; the blank line that
+    // separates it from the next section is the `Items` joiner's to place.
+    Ok(filtered.get(..cut).unwrap_or("").to_owned())
+}
+
+/// The kernel-wrapper prelude section between the user types and the user
+/// functions: the target's runtime bindings, then the TEA aliases and the Auth
+/// wrappers when the program reaches them.
+fn prelude_section(ctx: &EmitCtx) -> DResult<String> {
+    let mut section = Items::new();
+    match ctx.target {
+        // Co-located WASI shares the native emission (block_on drives a
+        // `Direct`/`Script` `main` over WASI) — only the target triple differs.
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
+            section.push(&native_runtime_bindings(PreludeReach {
+                http_client: ctx.reaches_http_client(),
+                random: ctx.reaches_random(),
+                log: ctx.reaches_log(),
+                time_core: ctx.reaches_time_core(),
+                crypto_core: ctx.reaches_crypto_core(),
+                json: ctx.reaches_json(),
+                secret: ctx.reaches_secret(),
+            })?);
+        }
+        // The wasm target takes the floor-filtered subset.
+        ipe_ir::Target::WasmClient => section.push(&wasm_runtime_bindings()?),
     }
-    Ok(out)
+    // TEA kernels → the IpeCmd<M> / IpeSub<M> type aliases.
+    if ctx.uses_tea {
+        section.push(TEA_TYPE_ALIASES);
+    }
+    // Ipe.Auth kernels → concrete E = IpeError wrappers.
+    if ctx.uses_auth {
+        section.push(AUTH_WRAPPERS);
+    }
+    Ok(section.render())
+}
+
+/// The fixed epilogue for the program's target: the native `fn main`, or the
+/// wasm-bindgen entry.
+fn epilogue_for_target(ctx: &EmitCtx) -> DResult<String> {
+    match ctx.target {
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => epilogue(),
+        ipe_ir::Target::WasmClient => epilogue_wasm(ctx),
+    }
 }
 
 /// Emit the complete project for `program`.
@@ -1730,39 +1790,7 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         // record structs, DB-projection impls, kernel-wrapper prelude, epilogue,
         // `fn main()`) + the flat glob barrel that re-exports every module's
         // items at the crate root.
-        let mut main_rs = emit_spine(ctx, program)?;
-        // Barrel lines (§2.1), one pair per distinct IpeModule home, in the
-        // deterministic first-encounter order computed above:
-        //   #[path = "ipe_mods/ipe_mod_<home>.rs"]
-        //   mod ipe_mod_<home>;
-        //   pub(crate) use ipe_mod_<home>::*;
-        // The `#[path]` attribute is load-bearing: `main.rs` is the crate root,
-        // so a BARE `mod ipe_mod_<home>;` would resolve to a crate-root sibling
-        // `src/ipe_mod_<home>.rs`, NOT the `src/ipe_mods/<ident>.rs` file this
-        // design places (§2.1). `#[path]` is resolved relative to the declaring
-        // file's directory (`src/`), so it points the module at the real file
-        // under `ipe_mods/` — closing an E0583 "file not found for module"
-        // exit-0-then-cargo-fail (THE SEAL) that a bare `mod` decl would ship.
-        // Because every user name is already globally unique (§1.3) and this
-        // re-exports every module at the crate root, each per-module file's
-        // `use crate::*;` sees every Spine item and every other module's item.
-        main_rs.push('\n');
-        for id in &module_homes {
-            let RustFileId::IpeModule(home) = id else {
-                continue;
-            };
-            let ident = rust_file::resolve_mod_ident(home, ctx.interner)?;
-            // Built via `push_str` fragments rather than one `push_str(&format!)`
-            // to satisfy `clippy::format_push_string` (denied via pedantic) —
-            // no intermediate allocation, same bytes.
-            main_rs.push_str("#[path = \"ipe_mods/");
-            main_rs.push_str(&ident);
-            main_rs.push_str(".rs\"]\nmod ");
-            main_rs.push_str(&ident);
-            main_rs.push_str(";\npub(crate) use ");
-            main_rs.push_str(&ident);
-            main_rs.push_str("::*;\n");
-        }
+        let main_rs = split_main_rs(ctx, &emit_spine(ctx, program)?, &module_homes)?;
         rust_sources.push((RelPath::new("src/main.rs")?, main_rs));
 
         // One `src/ipe_mods/<ident>.rs` per module, carrying ONLY that home's
@@ -1789,116 +1817,62 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
             func_order,
         } = &partition;
 
-        // Capacity hint only — bytes pushed are identical. `GOLDEN` (the
-        // embedded reference main.rs the preamble/epilogue are cut from) is a
-        // sound floor for the fixed sections; user code grows beyond it via the
-        // usual doubling.
-        let mut out = String::with_capacity(GOLDEN.len() + 4096);
-        out.push_str(&preamble(ctx.reaches_json())?);
-        // The preamble ends with the USER-TYPES banner and its single closing
-        // blank line. Anything emitted below (types, record structs, Db
-        // projections) is that section's body; the runtime bindings that follow
-        // need one blank line of separation from it. When the section is empty,
-        // the banner's own closing blank already provides that separation, so a
-        // second blank must NOT be pushed (rustfmt collapses runs of blank lines
-        // to one — emitting two would fail `cargo fmt --check`).
-        let after_banner = out.len();
+        // Every section and every item in it goes through the one `Items`
+        // joiner, which separates them by exactly one blank line and skips an
+        // empty section, so no section spaces itself by hand.
+        let mut file = Items::new();
+        // The preamble ends with the USER-TYPES banner; everything below it up to
+        // the kernel-wrapper prelude (types, record structs, Db projections) is
+        // that section's body.
+        file.push(&preamble(ctx.reaches_json())?);
 
         // User types, walked via `type_order` — `partition_items`'s
         // FIRST-ENCOUNTER order over `program.modules[..].types`, a
         // warm/cold-stable linker topological order (NOT alphabetical, NOT
         // symbol-id — see [`Partitioned`]'s doc comment). A single-bucket
-        // program has nothing to reorder; this is a byte-identical no-op.
+        // program has nothing to reorder.
         for file_id in type_order {
             let (enums, _) = bucket_or_bug(buckets, file_id)?;
             for &def in enums {
-                out.push_str(&emit_enum(ctx, def)?);
+                file.push(&emit_enum(ctx, def)?);
             }
         }
         if let Some((spine_enums, _)) = buckets.get(&RustFileId::Spine) {
             for &def in spine_enums {
-                out.push_str(&emit_enum(ctx, def)?);
+                file.push(&emit_enum(ctx, def)?);
             }
         }
         // Synthesised record structs, one per distinct closed record shape.
         // Item order is irrelevant in Rust, so these can reference one another
         // freely; a program with no records emits nothing here.
         for rec in ctx.record_structs() {
-            out.push_str(&emit_record_struct(ctx, rec)?);
+            file.push(&emit_record_struct(ctx, rec)?);
         }
         // Per-field witness traits + impls for any row-polymorphic function.
         // Empty (nothing pushed) when the program has no row annotation.
-        out.push_str(&emit_row_witnesses(ctx, program)?);
+        file.push(&emit_row_witnesses(ctx, program)?);
 
-        // boundary-projection impl blocks.  When the program uses Db QUERY
-        // kernels, the lowerer injected synthetic `SqlValue` / `SqlField`
-        // enums, and the Db call sites project Ipê ADT values to the runtime's
-        // concrete `SqlParam` / `Option<SqlParam>`. Keyed on the injected enum's
-        // PRESENCE, not on `uses_db`: a program that only NAMES a `db`-gated type
-        // (`Dsn` / `Connection`) forces the `db` feature (for `dsn.rs` /
-        // `external_conn.rs`) through the type-closure fold without injecting a
-        // `SqlValue` enum, so there is no projection to emit — gating on
-        // `uses_db` would then reference an enum that does not exist.
-        if ctx.sqlvalue_rust_name.is_some() {
-            out.push_str(&emit_db_projection_impls(ctx)?);
-        }
+        // Boundary-projection impls from the injected `SqlValue` / `SqlField`
+        // enums to the runtime's `SqlParam`; empty when none was injected.
+        file.push(&emit_db_projection_impls(ctx)?);
 
-        if out.len() != after_banner {
-            out.push('\n');
-        }
-
-        // Fixed kernel-wrapper prelude (IpeError, IpeTask<A>, Decoder<T>, …);
-        // the wasm target takes the floor-filtered subset.
-        match ctx.target {
-            // Co-located WASI shares the native emission (block_on drives a
-            // `Direct`/`Script` `main` over WASI) — only the target triple differs.
-            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
-                out.push_str(&native_runtime_bindings(PreludeReach {
-                    http_client: ctx.reaches_http_client(),
-                    random: ctx.reaches_random(),
-                    log: ctx.reaches_log(),
-                    time_core: ctx.reaches_time_core(),
-                    crypto_core: ctx.reaches_crypto_core(),
-                    json: ctx.reaches_json(),
-                    secret: ctx.reaches_secret(),
-                })?);
-            }
-            ipe_ir::Target::WasmClient => out.push_str(&wasm_runtime_bindings()?),
-        }
-
-        // TEA kernels → the IpeCmd<M> / IpeSub<M> type aliases.
-        if ctx.uses_tea {
-            out.push_str(TEA_TYPE_ALIASES);
-        }
-        // Ipe.Auth kernels → concrete E = IpeError wrappers.
-        if ctx.uses_auth {
-            out.push_str(AUTH_WRAPPERS);
-        }
-        out.push('\n');
+        // Fixed kernel-wrapper prelude (IpeError, IpeTask<A>, Decoder<T>, …)
+        // plus the TEA aliases and Auth wrappers the program reaches.
+        file.push(&prelude_section(ctx)?);
 
         // User functions, walked via `func_order` (its OWN first-encounter
         // order over `program.modules[..].funcs`). `partition_items` never
         // routes a `Func` into `Spine`, so funcs land purely in `IpeModule`
         // buckets.
-        let before_funcs = out.len();
         for file_id in func_order {
             let (_, funcs) = bucket_or_bug(buckets, file_id)?;
             for &func in funcs {
-                out.push_str(&emit_func(ctx, func)?);
+                file.push(&emit_func(ctx, func)?);
             }
         }
-        // Separate the user functions from the epilogue with one blank line. The
-        // blank pushed above already separates an EMPTY function section from the
-        // epilogue, so a second blank is added only when functions were emitted
-        // (rustfmt collapses blank-line runs to one; two would fail fmt-check).
-        if out.len() != before_funcs {
-            out.push('\n');
-        }
 
-        match ctx.target {
-            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => out.push_str(&epilogue()?),
-            ipe_ir::Target::WasmClient => out.push_str(&epilogue_wasm(ctx)?),
-        }
+        file.push(&epilogue_for_target(ctx)?);
+        let mut out = file.render();
 
         // Shape-app entry switch (Native only).
         //
@@ -1953,23 +1927,41 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
     assemble_project_files(ctx, rust_sources)
 }
 
-/// Assemble the final [`EmittedProject`] from the already-rendered Rust source
-/// files (`src/main.rs` plus, in the real split, each `src/ipe_mods/<ident>.rs`)
-/// — appending the manifest (`Cargo.toml`) and the trimmed runtime module
-/// files (`ipe_runtime/mod.rs` + `config.rs`).
+/// Refuse a project whose emitted Rust holds a character the Rust lexer
+/// refuses raw.
 ///
-/// **Factored out of [`emit_program`] (design doc §4.4).** This block
-/// is file-count-agnostic — it depends ONLY on `ctx`'s used-kernel flags, never
-/// on how many Rust source files `rust_sources` carries — so the salsa
-/// `emit_manifest` query (`ipe_db`) reuses it verbatim after assembling
-/// `rust_sources` from the per-file [`emit_spine`]/[`emit_module_file`] query
-/// outputs, guaranteeing byte-identity with the single-file `emit_program`
-/// path. Kept a shared helper rather than duplicated, exactly as §4.4 requires.
+/// The output-side half of the lexable seal: every text spliced into emitted
+/// Rust goes through an `ipe_intern::rust_literal` renderer, and this total
+/// scan over every emitted `.rs` file turns a site that bypassed them into an
+/// `ipe`-time [`Diagnostic::CompilerBug`], never a `cargo` lexer error. The
+/// detail names the codepoint as `U+XXXX`, never raw.
 ///
 /// # Errors
 ///
-/// Propagates any [`Diagnostic`] from the `Cargo.toml`/runtime-module
-/// construction (e.g. a drifted server/db/tui/webview manifest anchor).
+/// [`Diagnostic::CompilerBug`] at [`ipe_intern::EMIT_LEXABLE`] on the first
+/// hazard found.
+fn refuse_lexer_hazards(project: &EmittedProject) -> DResult<()> {
+    for (path, text) in &project.files {
+        let is_rust = std::path::Path::new(path.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            continue;
+        }
+        if let Some(hazard) = ipe_intern::find_lexer_hazard(text) {
+            return Err(Diagnostic::CompilerBug {
+                where_: ipe_intern::EMIT_LEXABLE,
+                detail: format!(
+                    "emitted {:?} holds {hazard}; every text spliced into emitted Rust must \
+                     go through an `ipe_intern::rust_literal` renderer",
+                    path.as_str()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A string that is safe to use as the body of a TOML basic (double-quoted)
 /// string. The only constructor is [`SafeTomlString::escape`], which runs the
 /// exhaustive escaper over raw input, so no caller can reach a manifest `"..."`
@@ -2696,8 +2688,44 @@ const _: () = assert!(
      and MOD_APPENDS must carry no append text absent from ALL_MOD_APPEND_TEXTS"
 );
 
-#[allow(clippy::too_many_lines)] // one linear manifest/runtime assembly pass
+/// Assemble the final [`EmittedProject`] and refuse it when an emitted `.rs`
+/// text holds a raw lexer hazard.
+///
+/// The one join point of [`emit_program`] and [`assemble_split_manifest`], so
+/// the lexable seal covers the single-file and the split emit alike.
+///
+/// # Errors
+///
+/// Every [`Diagnostic`] of [`assemble_project_text`] and of
+/// [`refuse_lexer_hazards`].
 fn assemble_project_files(
+    ctx: &EmitCtx,
+    rust_sources: Vec<(RelPath, String)>,
+) -> DResult<EmittedProject> {
+    let project = assemble_project_text(ctx, rust_sources)?;
+    refuse_lexer_hazards(&project)?;
+    Ok(project)
+}
+
+/// Assemble the final [`EmittedProject`] from the already-rendered Rust source
+/// files (`src/main.rs` plus, in the real split, each `src/ipe_mods/<ident>.rs`)
+/// — appending the manifest (`Cargo.toml`) and the trimmed runtime module
+/// files (`ipe_runtime/mod.rs` + `config.rs`).
+///
+/// **Shared by [`emit_program`] and [`assemble_split_manifest`].** This block
+/// is file-count-agnostic — it depends ONLY on `ctx`'s used-kernel flags, never
+/// on how many Rust source files `rust_sources` carries — so the salsa
+/// `emit_manifest` query (`ipe_db`) reuses it verbatim after assembling
+/// `rust_sources` from the per-file [`emit_spine`]/[`emit_module_file`] query
+/// outputs, guaranteeing byte-identity with the single-file `emit_program`
+/// path.
+///
+/// # Errors
+///
+/// Propagates any [`Diagnostic`] from the `Cargo.toml`/runtime-module
+/// construction (e.g. a drifted server/db/tui/webview manifest anchor).
+#[allow(clippy::too_many_lines)] // one linear manifest/runtime assembly pass
+fn assemble_project_text(
     ctx: &EmitCtx,
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
@@ -2766,6 +2794,7 @@ fn assemble_project_files(
             WASM_RUNTIME_MOD_RS.to_owned()
         };
         files.insert(RelPath::new("src/ipe_runtime/mod.rs")?, wasm_mod_rs);
+        insert_vendored_runtime_clippy_config(&mut files)?;
         files.insert(
             RelPath::new("src/ipe_runtime/config.rs")?,
             RUNTIME_CONFIG_RS.to_owned(),
@@ -3155,6 +3184,7 @@ fn assemble_project_files(
         files.insert(path, text);
     }
     files.insert(RelPath::new("src/ipe_runtime/mod.rs")?, runtime_mod_rs);
+    insert_vendored_runtime_clippy_config(&mut files)?;
     files.insert(
         RelPath::new("src/ipe_runtime/config.rs")?,
         runtime_config_rs,
@@ -3486,12 +3516,10 @@ fn hydration_target_field_types<'p>(
 pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     check_hydration_state_fields(ctx, program)?;
 
-    let mut out = String::with_capacity(GOLDEN.len() + 4096);
-    out.push_str(&preamble(ctx.reaches_json())?);
-    // See the single-file emit path: the banner's closing blank already
-    // separates an EMPTY user-types section from the runtime bindings, so the
-    // second blank is pushed only when this section emitted content.
-    let after_banner = out.len();
+    // The same one-joiner layout as the single-file path, minus the user
+    // functions (they are `emit_module_file`'s).
+    let mut file = Items::new();
+    file.push(&preamble(ctx.reaches_json())?);
 
     let Partitioned { buckets, .. } = partition_items(program, ctx.interner);
 
@@ -3501,56 +3529,19 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     // `IpeModule` bucket enums are emitted here — those are `emit_module_file`.
     if let Some((spine_enums, _)) = buckets.get(&RustFileId::Spine) {
         for &def in spine_enums {
-            out.push_str(&emit_enum(ctx, def)?);
+            file.push(&emit_enum(ctx, def)?);
         }
     }
     for rec in ctx.record_structs() {
-        out.push_str(&emit_record_struct(ctx, rec)?);
+        file.push(&emit_record_struct(ctx, rec)?);
     }
     // Per-field witness traits + impls for any row-polymorphic function.
-    out.push_str(&emit_row_witnesses(ctx, program)?);
-    if ctx.uses_db {
-        out.push_str(&emit_db_projection_impls(ctx)?);
-    }
+    file.push(&emit_row_witnesses(ctx, program)?);
+    file.push(&emit_db_projection_impls(ctx)?);
 
-    if out.len() != after_banner {
-        out.push('\n');
-    }
-
-    match ctx.target {
-        // Co-located WASI shares the native emission: a `Direct`/`Script`
-        // program's native effect floor runs over WASI (block_on drives `main`),
-        // NOT the browser TEA sink — only the wasip1 target triple differs.
-        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
-            out.push_str(&native_runtime_bindings(PreludeReach {
-                http_client: ctx.reaches_http_client(),
-                random: ctx.reaches_random(),
-                log: ctx.reaches_log(),
-                time_core: ctx.reaches_time_core(),
-                crypto_core: ctx.reaches_crypto_core(),
-                json: ctx.reaches_json(),
-                secret: ctx.reaches_secret(),
-            })?);
-        }
-        ipe_ir::Target::WasmClient => out.push_str(&wasm_runtime_bindings()?),
-    }
-    if ctx.uses_tea {
-        out.push_str(TEA_TYPE_ALIASES);
-    }
-    if ctx.uses_auth {
-        out.push_str(AUTH_WRAPPERS);
-    }
-    // The spine carries NO user functions — they are `emit_module_file`'s — so a
-    // single blank line separates the runtime bindings from the epilogue.
-    // (rustfmt collapses blank-line runs to one; the two blanks the single-file
-    // layout emits around its function block would collapse here anyway, and
-    // emitting them would fail `cargo fmt --check` on the raw output.)
-    out.push('\n');
-
-    match ctx.target {
-        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => out.push_str(&epilogue()?),
-        ipe_ir::Target::WasmClient => out.push_str(&epilogue_wasm(ctx)?),
-    }
+    file.push(&prelude_section(ctx)?);
+    file.push(&epilogue_for_target(ctx)?);
+    let mut out = file.render();
 
     // Shape-app epilogue switch in the spine (Native only).
     //
@@ -3614,24 +3605,24 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
 pub fn emit_module_file(ctx: &EmitCtx, program: &Program, home: &RustFileId) -> DResult<String> {
     let Partitioned { buckets, .. } = partition_items(program, ctx.interner);
 
-    let mut out = String::new();
+    let mut file = Items::new();
     // Every module file opens with the flat glob barrel (§2.1): because
     // `main.rs` re-exports every module's items at the crate root and every
     // name is already globally unique, `use crate::*;` gives this file every
     // Spine item and every other module's item with zero per-symbol
     // bookkeeping.
-    out.push_str("use crate::*;\n\n");
+    file.push("use crate::*;");
 
     if let Some((enums, funcs)) = buckets.get(home) {
         for &def in enums {
-            out.push_str(&pub_crate_item(&emit_enum(ctx, def)?));
+            file.push(&pub_crate_item(&emit_enum(ctx, def)?));
         }
         for &func in funcs {
             // `pub(crate) fn ` is emitted directly (not by rewriting a rendered
             // `pub fn `) so the signature's width decision already accounts for the
             // wider prefix — a borderline signature breaks here that would stay flat
             // in the single-file `pub fn ` layout.
-            out.push_str(&crate::emit_expr::emit_func_vis(
+            file.push(&crate::emit_expr::emit_func_vis(
                 ctx,
                 func,
                 "pub(crate) fn ",
@@ -3639,7 +3630,36 @@ pub fn emit_module_file(ctx: &EmitCtx, program: &Program, home: &RustFileId) -> 
         }
     }
 
-    Ok(out)
+    Ok(file.render())
+}
+
+/// The split layout's `main.rs`: `spine` followed by the flat glob barrel, one
+/// `#[path]`/`mod`/`use` group per distinct `IpeModule` home in `module_homes`
+/// order.
+///
+/// The `#[path]` attribute is load-bearing: `main.rs` is the crate root, so a
+/// BARE `mod ipe_mod_<home>;` would resolve to a crate-root sibling
+/// `src/ipe_mod_<home>.rs`, NOT the `src/ipe_mods/<ident>.rs` file this design
+/// places (§2.1). `#[path]` is resolved relative to the declaring file's
+/// directory (`src/`), so it points the module at the real file under
+/// `ipe_mods/` — closing an E0583 "file not found for module"
+/// exit-0-then-cargo-fail (THE SEAL) that a bare `mod` decl would ship. Because
+/// every user name is already globally unique (§1.3) and this re-exports every
+/// module at the crate root, each per-module file's `use crate::*;` sees every
+/// Spine item and every other module's item.
+fn split_main_rs(ctx: &EmitCtx, spine: &str, module_homes: &[RustFileId]) -> DResult<String> {
+    let mut file = Items::new();
+    file.push(spine);
+    for id in module_homes {
+        let RustFileId::IpeModule(home) = id else {
+            continue;
+        };
+        let ident = rust_file::resolve_mod_ident(home, ctx.interner)?;
+        file.push(&format!(
+            "#[path = \"ipe_mods/{ident}.rs\"]\nmod {ident};\npub(crate) use {ident}::*;"
+        ));
+    }
+    Ok(file.render())
 }
 
 /// Assemble the full split [`EmittedProject`] from ALREADY-RENDERED per-file
@@ -3710,24 +3730,9 @@ pub fn assemble_split_manifest(
 
     let mut rust_sources: Vec<(RelPath, String)> = Vec::new();
 
-    // `main.rs` = the given spine text + the flat glob barrel, one pair per
-    // distinct IpeModule home in first-encounter order (byte-identical to
-    // `emit_program`'s split branch).
-    let mut main_rs = spine_text.to_owned();
-    main_rs.push('\n');
-    for id in &module_homes {
-        let RustFileId::IpeModule(home) = id else {
-            continue;
-        };
-        let ident = rust_file::resolve_mod_ident(home, ctx.interner)?;
-        main_rs.push_str("#[path = \"ipe_mods/");
-        main_rs.push_str(&ident);
-        main_rs.push_str(".rs\"]\nmod ");
-        main_rs.push_str(&ident);
-        main_rs.push_str(";\npub(crate) use ");
-        main_rs.push_str(&ident);
-        main_rs.push_str("::*;\n");
-    }
+    // `main.rs` = the given spine text + the flat glob barrel (byte-identical
+    // to `emit_program`'s split branch: both render through `split_main_rs`).
+    let main_rs = split_main_rs(ctx, spine_text, &module_homes)?;
     rust_sources.push((RelPath::new("src/main.rs")?, main_rs));
 
     // One `src/ipe_mods/<ident>.rs` per module, its text taken verbatim from
@@ -5560,30 +5565,33 @@ fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
 /// variants is 1-to-1.  Only the enum's Rust *type name* (e.g. `MainSqlValue`)
 /// varies per program (depends on the module name prefix).
 ///
+/// The one gate for both emit paths: the impls exist exactly when the lowerer
+/// injected the `SqlValue` / `SqlField` enums. `uses_db` alone is not the key —
+/// a program that only NAMES a `db`-gated type (`Dsn` / `Connection`) forces
+/// the `db` feature through the type-closure fold without injecting either
+/// enum, and then there is no projection to emit.
+///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] when `ctx.uses_db` is `true` but the
-/// Rust names were not computed — an internal invariant violation (the detection
-/// in `EmitCtx::build` and the injection in `Lowerer::run` must agree).
+/// Returns [`Diagnostic::CompilerBug`] when exactly one of the two enums was
+/// injected — the lowerer injects them together, so a lone one is an internal
+/// invariant violation.
 fn emit_db_projection_impls(ctx: &EmitCtx) -> DResult<String> {
-    let sv = ctx
-        .sqlvalue_rust_name
-        .as_deref()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::emit_db_projection_impls",
-            detail: "uses_db is true but sqlvalue_rust_name is None — \
-                 SqlValue was not injected into enum_names"
-                .to_owned(),
-        })?;
-    let sf = ctx
-        .sqlfield_rust_name
-        .as_deref()
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::emit_db_projection_impls",
-            detail: "uses_db is true but sqlfield_rust_name is None — \
-                 SqlField was not injected into enum_names"
-                .to_owned(),
-        })?;
+    let (sv, sf) = match (
+        ctx.sqlvalue_rust_name.as_deref(),
+        ctx.sqlfield_rust_name.as_deref(),
+    ) {
+        (None, None) => return Ok(String::new()),
+        (Some(sv), Some(sf)) => (sv, sf),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::project::emit_db_projection_impls",
+                detail: "exactly one of the SqlValue / SqlField enums was injected \
+                         into enum_names; the lowerer injects them together"
+                    .to_owned(),
+            });
+        }
+    };
 
     // `SqlTime` stores a Unix-millisecond timestamp as `i64` — maps to
     // `SqlParam::Int`.  `SqlDecimal` carries a native `Decimal`, rendered to a
@@ -5623,6 +5631,7 @@ impl {sv} {{
         }}
     }}
 }}
+
 /// Allow `SqlParam::from(sql_value)` so the emitter can use the same
 /// `ipe_runtime::db::SqlParam::from` projection for ALL element types in
 /// the polymorphic `Db.exec`/`query` params list (`List a` where `a` may
@@ -5632,6 +5641,7 @@ impl From<{sv}> for ipe_runtime::db::SqlParam {{
         v.into_sql_param()
     }}
 }}
+
 impl {sf} {{
     pub fn into_field_param(self) -> Option<ipe_runtime::db::SqlParam> {{
         match self {{
@@ -6735,6 +6745,9 @@ mod escape_toml_basic_tests {
 
 #[cfg(test)]
 mod non_serde_tests {
+    use std::collections::BTreeMap;
+
+    use ipe_backend::RelPath;
     use ipe_diagnostics::DResult;
     use ipe_intern::Interner;
     use ipe_ir::{EnumDef, EnumPayloadTable, IrType, ModPath, Variant, enum_payload_table};
@@ -6813,5 +6826,74 @@ mod non_serde_tests {
             &IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
             &table
         ));
+    }
+
+    /// A project of the given `(path, text)` files.
+    fn project_of(files: &[(&str, &str)]) -> ipe_backend::EmittedProject {
+        let mut map = BTreeMap::new();
+        for (path, text) in files {
+            let Ok(path) = RelPath::new(*path) else {
+                return ipe_backend::EmittedProject {
+                    files: BTreeMap::new(),
+                    cargo_toml: String::new(),
+                    uses_webview: false,
+                };
+            };
+            map.insert(path, (*text).to_owned());
+        }
+        ipe_backend::EmittedProject {
+            files: map,
+            cargo_toml: String::new(),
+            uses_webview: false,
+        }
+    }
+
+    /// The output-side lexable seal `emit_program` ends with refuses a raw bidi
+    /// control and a bare CR in any emitted `.rs` file, naming the codepoint as
+    /// `U+XXXX` and never raw; a clean project, CRLF and a hazard in a
+    /// non-Rust file are accepted.
+    #[test]
+    fn emit_program_refuses_a_raw_lexer_hazard() {
+        for (path, text, shown) in [
+            (
+                "src/main.rs",
+                "fn main() { let _ = \"a\u{202E}b\"; }\n",
+                "U+202E",
+            ),
+            (
+                "src/ipe_runtime/x.rs",
+                "// line one\rpub fn f() {}\n",
+                "U+000D",
+            ),
+            (
+                "src/ipe_mods/upper.RS",
+                "pub fn g() { let _ = \"\u{2066}\"; }\n",
+                "U+2066",
+            ),
+        ] {
+            let project = project_of(&[("src/lib_ok.rs", "pub fn ok() {}\n"), (path, text)]);
+            assert_eq!(project.files.len(), 2, "{path}");
+            let refused = super::refuse_lexer_hazards(&project);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, detail })
+                        if *where_ == ipe_intern::EMIT_LEXABLE
+                            && detail.contains(shown)
+                            && detail.contains(path)
+                            && ipe_intern::find_lexer_hazard(detail).is_none()
+                ),
+                "{path}: {refused:?}"
+            );
+        }
+        let clean = project_of(&[
+            (
+                "src/main.rs",
+                "fn main() {\r\n    let _ = \"\\u{202e}\";\r\n}\r\n",
+            ),
+            ("assets/notes.txt", "a\u{202E}b\r"),
+        ]);
+        assert_eq!(clean.files.len(), 2);
+        assert!(super::refuse_lexer_hazards(&clean).is_ok());
     }
 }

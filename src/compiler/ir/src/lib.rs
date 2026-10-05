@@ -30,10 +30,10 @@ pub use held::{
 pub use ir::{
     Arm, BinOp, BoundSet, CallPin, Callee, Carried, CarrierLeaf, EnumDef, EvalOrder, Expr, Func,
     FuncId, HtmlEventShape, IrType, KernelClass, KernelFn, Match, ModPath, Module, OnFormKind, Pat,
-    Program, RowParam, RuntimeFeatureId, RuntimeModule, TypeDef, UiCtor, UiPlain, Variant,
-    carrier_is_clone, carrier_leaf, fun_value_arc_promotable, ir_type_feature_requirement,
-    ir_type_has_effect_carrier, ir_type_is_derivable, ir_type_is_serde, is_dispatch_free,
-    is_irrefutable,
+    Program, RowParam, RuntimeFeatureId, RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain,
+    Variant, carrier_is_clone, carrier_is_clone_bounded, carrier_leaf, fun_value_arc_promotable,
+    ir_type_feature_requirement, ir_type_has_effect_carrier, ir_type_is_derivable,
+    ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};

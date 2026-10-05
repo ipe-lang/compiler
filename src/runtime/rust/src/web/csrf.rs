@@ -38,21 +38,18 @@ use axum::response::{IntoResponse, Response};
 /// Both SET and READ paths must call this with the same `base` for a given app,
 /// so a token minted by app A validates only against app A's cookie — a token
 /// set by the host app cannot satisfy a sub-app's validator, and vice-versa.
-pub fn csrf_cookie_name_for(base: &str) -> String {
+pub fn csrf_cookie_name_for(base: &str) -> crate::server::CookieName {
+    use crate::server::{CookieName, RuntimeCookie};
     let prefix = if cookies_secure() {
-        "__Host-ipe_csrf"
+        RuntimeCookie::HostCsrf
     } else {
-        "__ipe_csrf"
+        RuntimeCookie::WebCsrf
     };
-    if base.is_empty() {
-        prefix.to_string()
-    } else {
-        let suffix: String = base
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        format!("{prefix}{suffix}")
-    }
+    let suffix: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    CookieName::runtime(prefix, &suffix)
 }
 
 /// The header the client echoes the CSRF token in (`X-Ipê-Csrf`).
@@ -86,8 +83,7 @@ pub fn csrf_enabled() -> bool {
 // `csrf::frame_ancestors` / `csrf::security_headers` call sites keep resolving.
 pub use crate::telemetry::{frame_ancestors, security_headers};
 
-/// Whether to mark cookies `Secure`. Production (or frame-ancestors mode, which
-/// is always HTTPS) → Secure (env `IPE_WEB_SECURE` or `X-Forwarded-Proto: https`).
+/// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.
 ///
 /// Snapshotted once into a `OnceLock` on first call (env is stable at process
 /// start; eliminates per-request `getenv` + the TOCTOU race between
@@ -95,7 +91,21 @@ pub use crate::telemetry::{frame_ancestors, security_headers};
 pub fn cookies_secure() -> bool {
     use std::sync::OnceLock;
     static SECURE: OnceLock<bool> = OnceLock::new();
-    *SECURE.get_or_init(|| telemetry::production_from_env() || frame_ancestors().is_some())
+    *SECURE.get_or_init(|| {
+        cookies_secure_with(
+            telemetry::dev_intent_from_env().as_ref(),
+            frame_ancestors().is_some(),
+        )
+    })
+}
+
+/// Whether cookies are `Secure` under an explicit dev-intent proof.
+///
+/// `Secure` unless `dev` holds; frame-ancestors mode (always HTTPS) is
+/// `Secure` even then. Every release build is therefore `Secure`.
+#[must_use]
+pub const fn cookies_secure_with(dev: Option<&telemetry::DevIntent>, framed: bool) -> bool {
+    dev.is_none() || framed
 }
 
 /// ~244 random bits (two concatenated UUIDv4s) as 64 lowercase-hex chars —
@@ -120,24 +130,13 @@ pub use crate::server::csrf_token_well_formed as token_is_well_formed;
 #[cfg(feature = "server")]
 pub use crate::server::csrf_pair_valid;
 
-/// Read a named cookie value from the `Cookie:` header (generic; the session
+/// The decoded value of the request cookie `name` (generic; the session
 /// cookie has its own base-path-aware reader in `mod.rs`).
 ///
-/// Uses `split_once('=')` and compares the key exactly (after trim) so a cookie
-/// named `ipe_csrf` never accidentally matches `__Host-ipe_csrf` or vice-versa
-/// (the old `strip_prefix` shape would match any name that is a prefix of the
-/// cookie key).
-pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=')
-            && k.trim() == name
-        {
-            return Some(v.to_string());
-        }
-    }
-    None
+/// Names compare whole, so a cookie named `ipe_csrf` never matches
+/// `__Host-ipe_csrf` or the reverse.
+pub fn cookie_value(headers: &HeaderMap, name: &crate::server::CookieName) -> Option<String> {
+    crate::server::request_cookie(headers, name)
 }
 
 /// Build the `Set-Cookie` value for the CSRF cookie.
@@ -151,20 +150,28 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// `Path=/` is always `/` — the `__Host-` prefix mandates it, and keeping it
 /// constant means the browser sends the cookie on every request regardless of
 /// sub-path, so the double-submit validate path always sees it.
-pub fn csrf_set_cookie(token: &str, base: &str) -> String {
-    let name = csrf_cookie_name_for(base);
-    if frame_ancestors().is_some() {
-        // Cross-site iframe: the cookie must cross sites → None+Secure (Secure is
-        // mandatory for SameSite=None). `__Host-` is compatible (it only forbids
-        // Domain=, not SameSite=None).
-        format!("{name}={token}; Path=/; HttpOnly; SameSite=None; Secure")
-    } else if cookies_secure() {
-        // Production / TLS: `__Host-` name → Secure is mandatory.
-        format!("{name}={token}; Path=/; HttpOnly; SameSite=Strict; Secure")
+pub fn csrf_set_cookie(token: &str, base: &str) -> crate::server::SetCookie {
+    use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
+    // Cross-site iframe: the cookie must cross sites -> `SameSite=None`, which
+    // always renders `Secure`. Production / TLS: the `__Host-` name makes
+    // `Secure` mandatory. Plain-HTTP dev: bare name, no `Secure` (a browser
+    // drops a `Secure` cookie on `http://`).
+    let same_site = if frame_ancestors().is_some() {
+        SameSite::None
     } else {
-        // Plain-HTTP dev: bare name, no Secure (Secure would drop the cookie on http://).
-        format!("{name}={token}; Path=/; HttpOnly; SameSite=Strict")
-    }
+        SameSite::Strict
+    };
+    SetCookie::new(
+        &csrf_cookie_name_for(base),
+        &CookieValue::encode(token),
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: true,
+            same_site,
+            secure: cookies_secure(),
+            max_age_secs: None,
+        },
+    )
 }
 
 /// Paths exempt from CSRF validation (observability paths, console prefix,
@@ -172,7 +179,7 @@ pub fn csrf_set_cookie(token: &str, base: &str) -> String {
 ///
 /// The `/_ipe/hot-*` family (`hot-appearance`, `hot-transition`, `hot-msg`,
 /// `hot-subs`, `hot-init`, `hot-wiring`) is exempt because these are not
-/// browser-driven POSTs: each is a server-to-server call from the `ipe watch`
+/// browser-driven POSTs: each is a server-to-server call from the `ipe dev watch`
 /// process, authenticated by its own per-process `X-Ipe-Hot-Token` (a stronger
 /// control here than the browser-oriented CSRF cookie, which the watch does not
 /// hold). All these routes are mounted only under the dev overlay gate, so they do
@@ -312,7 +319,7 @@ mod tests {
     }
 
     // The dev-only transition-hot-swap POST is CSRF-exempt for the same reason as
-    // the appearance one: a loopback `ipe watch` call carrying its own
+    // the appearance one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_transition_is_csrf_exempt() {
@@ -321,7 +328,7 @@ mod tests {
     }
 
     // The dev-only additive-`Msg`-set POST is CSRF-exempt for the same reason as
-    // the appearance/transition ones: a loopback `ipe watch` call carrying its own
+    // the appearance/transition ones: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_msg_is_csrf_exempt() {
@@ -330,7 +337,7 @@ mod tests {
     }
 
     // The dev-only subscription-hot-swap POST is CSRF-exempt for the same reason
-    // as the transition one: a loopback `ipe watch` call carrying its own
+    // as the transition one: a loopback `ipe dev watch` call carrying its own
     // `X-Ipe-Hot-Token`, mounted only under the dev overlay gate.
     #[test]
     fn hot_subs_is_csrf_exempt() {
@@ -340,7 +347,7 @@ mod tests {
 
     // The dev-only init-datum and Cmd-wiring hot-swap POSTs are CSRF-exempt for
     // the same reason as the appearance and transition siblings: loopback `ipe
-    // watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
+    // dev watch` calls authenticated by `X-Ipe-Hot-Token`, mounted only under the
     // dev overlay gate, never reachable in a production build.
     #[test]
     fn hot_init_and_hot_wiring_are_csrf_exempt() {
@@ -412,11 +419,11 @@ mod tests {
         let name = csrf_cookie_name_for("");
         // Prefix only — no trailing characters.
         assert!(
-            name == "__Host-ipe_csrf" || name == "__ipe_csrf",
+            name.text() == "__Host-ipe_csrf" || name.text() == "__ipe_csrf",
             "root app must produce a bare name, got: {name}"
         );
         // No app-specific suffix: the name ends immediately after the base.
-        assert!(!name.ends_with('_'));
+        assert!(!name.text().ends_with('_'));
     }
 
     // Two sub-apps with different base paths get different cookie names,
@@ -477,6 +484,24 @@ mod tests {
         );
     }
 
+    /// The typed CSRF line keeps the exact bytes of each posture's line, so an
+    /// existing browser CSRF cookie is replaced, never duplicated.
+    #[test]
+    fn csrf_set_cookie_keeps_the_csrf_line_bytes() {
+        let tok = well_formed_tok();
+        let attrs = if frame_ancestors().is_some() {
+            "; Path=/; HttpOnly; SameSite=None; Secure"
+        } else if cookies_secure() {
+            "; Path=/; HttpOnly; SameSite=Strict; Secure"
+        } else {
+            "; Path=/; HttpOnly; SameSite=Strict"
+        };
+        for base in ["", "/shop"] {
+            let expected = format!("{}={tok}{attrs}", csrf_cookie_name_for(base));
+            assert_eq!(csrf_set_cookie(&tok, base).as_str(), expected);
+        }
+    }
+
     // The Set-Cookie string always carries Path=/ regardless of the base path,
     // so the __Host- security invariant holds for every app.
     #[test]
@@ -505,6 +530,7 @@ mod tests {
             // Our transform maps everything non-alphanumeric to `_`, so the name
             // contains only alphanumerics, `_`, and `-` (from the `__Host-` prefix).
             let bad: Vec<char> = name
+                .as_str()
                 .chars()
                 .filter(|&c| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
                 .collect();
