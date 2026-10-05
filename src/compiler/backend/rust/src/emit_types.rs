@@ -1453,10 +1453,68 @@ mod show_pin_agreement {
             .collect()
     }
 
-    /// A Rust type's own name: its last path segment, type arguments dropped.
-    fn type_name(spelled: &str) -> &str {
-        let head = spelled.split_once('<').map_or(spelled, |(head, _)| head);
-        head.rsplit_once("::").map_or(head, |(_, name)| name).trim()
+    /// The runtime path of each name an emitted crate spells bare or at the
+    /// runtime's root: in scope through its `pub use ipe_runtime::*` glob or a
+    /// preamble alias, each re-exported from the module that defines it.
+    const SCOPE_PATHS: &[(&str, &str)] = &[
+        ("IpeTask", "ipe_runtime::core::IpeTask"),
+        ("JsonVal", "ipe_runtime::json::JsonVal"),
+        ("Decoder", "ipe_runtime::json::Decoder"),
+        ("Db", "ipe_runtime::db::Db"),
+        ("IpeCmd", "ipe_runtime::tea::IpeCmd"),
+        ("IpeSub", "ipe_runtime::tea::IpeSub"),
+        ("ServerRequest", "ipe_runtime::server::ServerRequest"),
+        ("ServerResponse", "ipe_runtime::server::ServerResponse"),
+        ("ServerRoute", "ipe_runtime::server::ServerRoute"),
+        ("ServerCookie", "ipe_runtime::server::ServerCookie"),
+        ("WsHandle", "ipe_runtime::server::WsHandle"),
+        ("WsServerCfg", "ipe_runtime::server::WsServerCfg"),
+        ("StreamWriter", "ipe_runtime::server_stream::StreamWriter"),
+        ("HttpRequest", "ipe_runtime::http_client::HttpRequest"),
+        ("HttpMethod", "ipe_runtime::http_client::HttpMethod"),
+        ("RedirectPolicy", "ipe_runtime::http_client::RedirectPolicy"),
+        (
+            "ProcessRunWithCfg",
+            "ipe_runtime::system::ProcessRunWithCfg",
+        ),
+        (
+            "ProcessRunInPtyCfg",
+            "ipe_runtime::system::ProcessRunInPtyCfg",
+        ),
+        ("CacheCfg", "ipe_runtime::cache::CacheCfg"),
+        ("CacheStats", "ipe_runtime::cache::CacheStats"),
+        ("IpeCacheHandle", "ipe_runtime::cache::IpeCacheHandle"),
+        ("WsClientCfg", "ipe_runtime::ws_client::WsClientCfg"),
+        ("CsvDoc", "ipe_runtime::csv::CsvDoc"),
+        ("EmailMessage", "ipe_runtime::email::EmailMessage"),
+        ("EmailAttachment", "ipe_runtime::email::EmailAttachment"),
+        ("SesConfig", "ipe_runtime::email::SesConfig"),
+        ("SmtpConfig", "ipe_runtime::email::SmtpConfig"),
+        ("EmailProvider", "ipe_runtime::email::EmailProvider"),
+        ("ChunkEvent", "ipe_runtime::http_stream::ChunkEvent"),
+        ("IpeStreamId", "ipe_runtime::http_stream::IpeStreamId"),
+    ];
+
+    /// A Rust type's resolved path, type arguments dropped: the runtime crate
+    /// spelled `ipe_runtime` (the pins name it `ipe_runtime_rust`), and a bare
+    /// or root-level name replaced by its [`SCOPE_PATHS`] path. A name with no
+    /// entry keeps its spelling, so it matches only a pin spelled the same way.
+    fn resolved_path(spelled: &str) -> String {
+        let head = spelled
+            .split_once('<')
+            .map_or(spelled, |(head, _)| head)
+            .trim();
+        let head = head
+            .strip_prefix("ipe_runtime_rust::")
+            .map_or_else(|| head.to_owned(), |rest| format!("ipe_runtime::{rest}"));
+        let in_scope = head
+            .strip_prefix("ipe_runtime::")
+            .filter(|rest| !rest.contains("::"))
+            .unwrap_or(head.as_str());
+        SCOPE_PATHS
+            .iter()
+            .find(|(name, _)| *name == in_scope)
+            .map_or_else(|| head.clone(), |(_, path)| (*path).to_owned())
     }
 
     fn leaf_of(ty: &IrType) -> Option<ShowLeaf> {
@@ -1563,7 +1621,12 @@ mod show_pin_agreement {
             IrType::UrlRelative,
             IrType::Dsn,
             IrType::Connection,
+            IrType::ConnReadOnly,
+            IrType::ConnReadWrite,
             IrType::Setting,
+            IrType::ShapeWeb,
+            IrType::ShapeWebView,
+            IrType::ShapeTerminal,
             IrType::Locale,
             IrType::WebApp,
             IrType::TuiApp,
@@ -1599,9 +1662,11 @@ mod show_pin_agreement {
         .collect()
     }
 
-    /// The Rust type `render_type` spells for each shown leaf is a type the
-    /// runtime's `show_rows.rs` pins to that leaf, and every shown leaf has a
-    /// sample here, so a renamed render or a moved pin breaks this test.
+    /// The Rust type `render_type` spells for each shown leaf resolves to the
+    /// full path of a type the runtime's `show_rows.rs` pins to that leaf, every
+    /// shown leaf has a sample here, and every [`SCOPE_PATHS`] entry resolves a
+    /// sample, so a renamed render, a moved pin or a same-named type in another
+    /// module breaks this test.
     #[test]
     fn every_rendered_leaf_type_is_its_pinned_row_type() {
         let mut interner = Interner::new();
@@ -1622,17 +1687,26 @@ mod show_pin_agreement {
             })
             .chain(bridged)
             .collect();
+        let mut resolved: Vec<String> = Vec::new();
         for (leaf, ty) in &samples {
             let rendered = render_type(&ctx, ty, GenericScope::new(&[])).expect("render");
-            let pinned: Vec<&str> = pins
+            let pinned: Vec<String> = pins
                 .iter()
                 .filter(|(name, _)| *name == leaf.name())
-                .map(|(_, pin)| type_name(pin))
+                .map(|(_, pin)| resolved_path(pin))
                 .collect();
+            let path = resolved_path(&rendered);
             assert!(
-                pinned.contains(&type_name(&rendered)),
-                "leaf {} renders as `{rendered}`, but show_rows.rs pins it to {pinned:?}",
+                pinned.contains(&path),
+                "leaf {} renders as `{rendered}` (`{path}`), but show_rows.rs pins it to {pinned:?}",
                 leaf.name()
+            );
+            resolved.push(path);
+        }
+        for (name, path) in SCOPE_PATHS {
+            assert!(
+                resolved.iter().any(|p| p == path),
+                "`SCOPE_PATHS` entry {name} resolves no rendered sample"
             );
         }
         for (name, policy) in SHOWN_LEAVES {
@@ -1653,11 +1727,34 @@ mod show_pin_agreement {
             parse_pins(text),
             vec![("Int", "i64"), ("Task", "a::IpeTask<b::E, ()>")]
         );
-        assert_eq!(type_name("a::IpeTask<b::E, ()>"), "IpeTask");
-        assert_eq!(type_name("()"), "()");
+        assert_eq!(resolved_path("()"), "()");
+        assert_eq!(resolved_path("Vec<u8>"), "Vec");
+        assert_eq!(
+            resolved_path("IpeTask<()>"),
+            resolved_path("ipe_runtime_rust::core::IpeTask<ipe_runtime_rust::error::IpeError, ()>")
+        );
+        assert_eq!(
+            resolved_path("ipe_runtime::HttpMethod"),
+            "ipe_runtime::http_client::HttpMethod"
+        );
+    }
+
+    /// Two types sharing a last segment in different modules never match, and
+    /// a bare name with no [`SCOPE_PATHS`] entry resolves to no module path.
+    #[test]
+    fn a_same_named_type_in_another_module_is_refused() {
         assert_ne!(
-            type_name("ipe_runtime::url::Url"),
-            type_name("x::UrlRelative")
+            resolved_path("ipe_runtime::html::Attribute<()>"),
+            resolved_path("ipe_runtime_rust::ui::element::Attribute<()>")
+        );
+        assert_ne!(
+            resolved_path("ipe_runtime::url::Url"),
+            resolved_path("x::Url")
+        );
+        assert_eq!(resolved_path("Attribute<()>"), "Attribute");
+        assert_ne!(
+            resolved_path("ipe_runtime::Attribute"),
+            resolved_path("ipe_runtime_rust::html::Attribute")
         );
     }
 }

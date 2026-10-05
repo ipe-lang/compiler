@@ -24,13 +24,25 @@
 //! show table.
 //!
 //! The compiler backend's sources (`src`, `rust/src`, `rust/templates`) get a
-//! positive check: outside test code, every string literal, macro token and
-//! path that renders through `Debug` (a `{…:?}` spec, `fmt::Debug`) sits in a
-//! function [`DEBUG_SITES`] lists with its exact count and the reason it is
-//! never emitted or is sound to emit. A new site, or one more in a listed
-//! function, fails the scan; so does a listed entry that matches nothing. The
-//! removed `Debug` fallback ([`FALLBACK_TEXT`]) is refused at every site, so an
-//! emitted field renders through its show row or as a fixed marker.
+//! positive check: outside test code, every site that renders through `Debug`
+//! sits in a function [`DEBUG_SITES`] lists with its exact count and the reason
+//! it is never emitted or is sound to emit. A site is one of:
+//!
+//! - a string, byte-string or C-string literal, macro tokens included, whose
+//!   decoded value holds a [`DEBUG_TEXT`] spelling: a `{…:?}` spec (`{:#?}`,
+//!   `{x:?}`), `fmt::Debug`, `Debug::fmt` or `dbg!`. The value is read with its
+//!   escapes decoded, so `"{:\x3f}"` counts as `"{:?}"`;
+//! - a path with a `fmt::Debug` or `Debug::fmt` step (a `use` included),
+//!   counted once per path;
+//! - a `dbg!` invocation.
+//!
+//! A new site, or one more in a listed function, fails the scan; so does a
+//! listed entry that matches nothing. The removed `Debug` fallback
+//! ([`FALLBACK_TEXT`]) is refused at every site, so an emitted field renders
+//! through its show row or as a fixed marker.
+//!
+//! LIMIT: each literal is matched alone. A spelling assembled from pieces at
+//! run time (`"{:?"` then `"}"`, a `char` pushed onto a `String`) is not seen.
 //!
 //! A node is skipped only when its `cfg` is proven test-only, so an
 //! unrecognised shape keeps it scanned.
@@ -38,12 +50,12 @@
 
 use std::collections::BTreeMap;
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Literal, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Fields, GenericArgument, ImplItem, Item, ItemEnum, ItemFn, ItemImpl, ItemMod,
-    ItemStruct, LitByteStr, LitCStr, LitStr, Macro, Path, PathArguments, TraitItem, Type, UsePath,
-    UseTree,
+    ItemStruct, Lit, LitByteStr, LitCStr, LitStr, Macro, Path, PathArguments, TraitItem, Type,
+    UsePath, UseTree,
 };
 
 // The `cfg` classification shared with the dial and print-macro scans.
@@ -118,9 +130,9 @@ const ALLOWED: [Allowed; 1] = [Allowed {
 /// own module, which holds the container and primitive rows.
 const SHOW_IMPL_FILES: &[&str] = &["stringify.rs"];
 
-/// Text that marks a `Debug` rendering: a `{…:?}` format spec or the
-/// `fmt::Debug` trait's name.
-const DEBUG_TEXT: &[&str] = &["?}", "fmt::Debug"];
+/// Text that marks a `Debug` rendering: a `{…:?}` format spec, the
+/// `fmt::Debug` trait's name, a call of its `Debug::fmt` method, or `dbg!`.
+const DEBUG_TEXT: &[&str] = &["?}", "fmt::Debug", "Debug::fmt", "dbg!"];
 
 /// The removed `Debug` fallback's spellings: refused at every site the scan
 /// reads, never admitted by a [`DEBUG_SITES`] entry.
@@ -539,7 +551,7 @@ impl DebugScan<'_> {
         self.found.fallback.push(site);
     }
 
-    /// Check one literal's source text.
+    /// Check one literal's decoded value.
     fn text(&mut self, text: &str) {
         if DEBUG_TEXT.iter().any(|needle| text.contains(needle)) {
             self.debug_site();
@@ -551,39 +563,71 @@ impl DebugScan<'_> {
         }
     }
 
-    /// Check one `first::second` path step.
-    fn path_step(&mut self, first: &str, second: &str) {
-        match (first, second) {
-            ("fmt", "Debug") => self.debug_site(),
-            ("stringify", "Wrap") => self.fallback("stringify::Wrap"),
-            _ => {}
+    /// Check one unparsed literal token by its decoded value.
+    fn literal(&mut self, token: Literal) {
+        let source = token.to_string();
+        match Lit::new(token) {
+            Lit::Str(lit) => self.text(&lit.value()),
+            Lit::ByteStr(lit) => self.text(&String::from_utf8_lossy(&lit.value())),
+            Lit::CStr(lit) => self.text(&lit.value().to_string_lossy()),
+            // `Lit` is `#[non_exhaustive]`; a number, `char`, byte or bool
+            // literal holds no format text, and its source is still read.
+            _ => self.text(&source),
         }
     }
 
-    /// Check a macro's unparsed tokens: their literals and `a::b` steps.
+    /// Check one path's `first::second` steps: a `Debug` step counts the path
+    /// once, a fallback step is refused at each spelling.
+    fn path(&mut self, names: &[String]) {
+        let mut debug = false;
+        for step in names.windows(2) {
+            if let [first, second] = step {
+                match (first.as_str(), second.as_str()) {
+                    ("fmt", "Debug") | ("Debug", "fmt") => debug = true,
+                    ("stringify", "Wrap") => self.fallback("stringify::Wrap"),
+                    _ => {}
+                }
+            }
+        }
+        if debug {
+            self.debug_site();
+        }
+    }
+
+    /// Check a macro's unparsed tokens: their literals, `a::b::…` paths and
+    /// nested `dbg!` invocations.
     fn tokens(&mut self, stream: TokenStream) {
         let trees: Vec<TokenTree> = stream.into_iter().collect();
         let mut rest = trees.as_slice();
         while let Some((head, tail)) = rest.split_first() {
+            rest = tail;
             match head {
                 TokenTree::Group(group) => self.tokens(group.stream()),
-                TokenTree::Literal(lit) => self.text(&lit.to_string()),
+                TokenTree::Literal(lit) => self.literal(lit.clone()),
                 TokenTree::Ident(first) => {
-                    if let [
+                    let mut names = vec![first.to_string()];
+                    while let [
                         TokenTree::Punct(a),
                         TokenTree::Punct(b),
-                        TokenTree::Ident(second),
-                        ..,
-                    ] = tail
+                        TokenTree::Ident(next),
+                        more @ ..,
+                    ] = rest
                         && a.as_char() == ':'
                         && b.as_char() == ':'
                     {
-                        self.path_step(&first.to_string(), &second.to_string());
+                        names.push(next.to_string());
+                        rest = more;
+                    }
+                    let bang =
+                        matches!(rest.first(), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+                    if names.len() > 1 {
+                        self.path(&names);
+                    } else if bang && first == "dbg" {
+                        self.debug_site();
                     }
                 }
                 TokenTree::Punct(_) => {}
             }
-            rest = tail;
         }
     }
 
@@ -655,36 +699,35 @@ impl<'ast> Visit<'ast> for DebugScan<'_> {
     }
 
     fn visit_lit_str(&mut self, node: &'ast LitStr) {
-        self.text(&node.token().to_string());
+        self.text(&node.value());
     }
 
     fn visit_lit_byte_str(&mut self, node: &'ast LitByteStr) {
-        self.text(&node.token().to_string());
+        self.text(&String::from_utf8_lossy(&node.value()));
     }
 
     fn visit_lit_cstr(&mut self, node: &'ast LitCStr) {
-        self.text(&node.token().to_string());
+        self.text(&node.value().to_string_lossy());
     }
 
     fn visit_macro(&mut self, node: &'ast Macro) {
         visit::visit_macro(self, node);
+        if node.path.segments.last().is_some_and(|s| s.ident == "dbg") {
+            self.debug_site();
+        }
         self.tokens(node.tokens.clone());
     }
 
     fn visit_path(&mut self, node: &'ast Path) {
         let names: Vec<String> = node.segments.iter().map(|s| s.ident.to_string()).collect();
-        for step in names.windows(2) {
-            if let [first, second] = step {
-                self.path_step(first, second);
-            }
-        }
+        self.path(&names);
         visit::visit_path(self, node);
     }
 
     fn visit_use_path(&mut self, node: &'ast UsePath) {
         let first = node.ident.to_string();
         for second in use_leaves(&node.tree) {
-            self.path_step(&first, &second);
+            self.path(&[first.clone(), second]);
         }
         visit::visit_use_path(self, node);
     }
@@ -1181,6 +1224,57 @@ fn one_more_debug_site_in_a_listed_function_is_refused() {
         unlisted_debug_sites(&debug_findings(&two).sites, &listed),
         ["emit.rs:report: 2 `Debug` sites, listed 1"]
     );
+}
+
+/// A literal is read by its decoded value, so an escaped `{:?}` still counts,
+/// and every other way to render through `Debug` counts too: a `Debug::fmt`
+/// path or spelling, and `dbg!` as an invocation or a spelling.
+#[test]
+fn an_escaped_or_other_debug_entry_is_refused() {
+    let src = r#"
+        fn hex_escape(v: u8) -> String { format!("{:\x3f}", v) }
+        fn unicode_escape() -> String { String::from("{:\u{3f}}") }
+        fn alternate_escape() -> String { String::from("{v:#\x3f}") }
+        fn byte_escape() -> &'static [u8] { b"{:\x3f}" }
+        fn cstr_escape() -> &'static CStr { c"{:\x3f}" }
+        fn trait_name_escape() -> String { String::from("fmt::Debu\x67") }
+        fn method_text() -> String { String::from("Debug::fmt(&v, f)") }
+        fn method_path(v: &u8, f: &mut Formatter) -> Result { Debug::fmt(v, f) }
+        fn full_path(v: &u8, f: &mut Formatter) -> Result { std::fmt::Debug::fmt(v, f) }
+        fn method_in_macro(v: &u8, f: &mut Formatter) -> Vec<Result> { vec![Debug::fmt(v, f)] }
+        fn dbg_text() -> String { String::from("dbg!(v)") }
+        fn dbg_call(v: u8) -> u8 { dbg!(v) }
+        fn dbg_qualified(v: u8) -> u8 { std::dbg!(v) }
+        fn dbg_in_macro() -> Vec<u8> { vec![dbg!(1)] }
+        fn plain(v: &str) -> String { format!("{v}") }
+    "#;
+    let sources = [("emit.rs".to_owned(), src.to_owned())];
+    let found = debug_findings(&sources);
+    let sites: Vec<(&str, usize)> = found
+        .sites
+        .iter()
+        .map(|((_, func), count)| (func.as_str(), *count))
+        .collect();
+    assert_eq!(
+        sites,
+        [
+            ("alternate_escape", 1),
+            ("byte_escape", 1),
+            ("cstr_escape", 1),
+            ("dbg_call", 1),
+            ("dbg_in_macro", 1),
+            ("dbg_qualified", 1),
+            ("dbg_text", 1),
+            ("full_path", 1),
+            ("hex_escape", 1),
+            ("method_in_macro", 1),
+            ("method_path", 1),
+            ("method_text", 1),
+            ("trait_name_escape", 1),
+            ("unicode_escape", 1),
+        ]
+    );
+    assert_eq!(found.fallback, Vec::<String>::new());
 }
 
 #[test]
