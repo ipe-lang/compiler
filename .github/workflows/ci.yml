@@ -294,9 +294,10 @@ jobs:
         if: steps.classify.outputs.panic_scan == 'false'
         run: echo "No panic-scan-relevant paths changed; gate is a no-op for this PR."
 
-  # The Windows-only code of `ipe` and `ipe_fs_open` (held directory handles,
-  # reparse-point refusal) never compiles on a Linux runner, so a cfg(windows)
-  # break would otherwise surface only at release. Type-checks both crates and
+  # The Windows-only code of `ipe`, `ipe_fs_open` and `ipe_sandbox` (held
+  # directory handles, reparse-point refusal, the Windows jail and tool-name
+  # checks) never compiles on a Linux runner, so a cfg(windows)
+  # break would otherwise surface only at release. Type-checks the crates and
   # their tests for Windows on every code change; the Windows test suites do
   # not run in CI.
   windows-check:
@@ -309,7 +310,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --locked -p ipe -p ipe_fs_open --all-targets
+      - run: cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets
 
   # No compiler-internal jargon or raw Rust types leak into user-facing text
   # (rendered diagnostic goldens + `ipe explain` pages). Pure git + ripgrep, no

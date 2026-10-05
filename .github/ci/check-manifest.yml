@@ -84,8 +84,9 @@ checks:
     local:
       ci-only: platform
     guards: >-
-      The Windows output-directory and `ipe_fs_open` code compiles, so its
-      held-handle, reparse-point-refusing file operations ship rather than rot
+      The Windows output-directory, `ipe_fs_open` and `ipe_sandbox` code
+      compiles, tests included, so its held-handle, reparse-point-refusing
+      file operations and Windows-only refusals ship rather than rot
       unbuilt.
   - context: quick-check
     disposition: gate

@@ -2562,10 +2562,12 @@ impl Scan<'_> {
                 self.judge_words(ctx, value, Runner::None)
             }
             Role::KeyTool => {
-                let reaches = value.is_empty()
-                    || value.contains(['/', '\\', ':', '~', '$', '%'])
-                    || value.contains("..");
-                if reaches || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
+                let bare = !value.is_empty()
+                    && !value.contains("..")
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
+                    });
+                if !bare || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
                     return Err(unproven(Unprovable::ToolPath));
                 }
                 value_checks(value).map_err(unproven)?;
@@ -4645,6 +4647,9 @@ mod tests {
             "[partial-merge-tools]\nx/y.disable = False\n",
             "[merge-tools]\n%USERPROFILE%.priority = 1\n",
             "[merge-tools]\n.priority = 1\n",
+            "[partial-merge-tools]\nx\" & evil & \".order = 1\n",
+            "[extdiff]\ncmd.a b =\n",
+            "[merge-tools]\nx;y.priority = 1\n",
         ] {
             let result = scan_hg(&f, text);
             assert_eq!(

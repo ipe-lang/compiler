@@ -2371,35 +2371,74 @@ const _: () = assert!(hg_rows_sound());
 /// Whether every section of `rows` with a row for any name (`<name>`, `*`) is
 /// in exactly one of `tools` and `not_program`, and each section they list
 /// has such a row.
+///
+/// One pass over `rows`: each listed section owns one bit of `seen`, so the
+/// work is linear in the rows however many sections are listed.
 const fn name_sections_decided(
     rows: &[Row],
     tools: &[(&str, KeyTool)],
     not_program: &[(&str, &str)],
 ) -> bool {
+    let listed = tools.len().saturating_add(not_program.len());
+    if listed > 64 {
+        return false;
+    }
+    let mut seen = 0u64;
     let mut pending = rows;
     while let Some(((spelling, _), more)) = pending.split_first() {
-        if let Some(section) = name_section(spelling.as_bytes())
-            && lists_tool(tools, section) == lists_not_program(not_program, section)
-        {
-            return false;
+        if let Some(section) = name_section(spelling.as_bytes()) {
+            let bit = section_bit(tools, not_program, section);
+            if bit == 0 {
+                return false;
+            }
+            seen |= bit;
         }
         pending = more;
     }
-    let mut listed = tools;
-    while let Some(((section, _), more)) = listed.split_first() {
-        if !has_name_row(rows, section.as_bytes()) {
-            return false;
+    seen == all_bits(listed)
+}
+
+/// The bit of the one list entry naming `section`, or 0 when no entry or several lists name it.
+const fn section_bit(
+    tools: &[(&str, KeyTool)],
+    not_program: &[(&str, &str)],
+    section: &[u8],
+) -> u64 {
+    let mut bit = 1u64;
+    let mut tool_bit = 0u64;
+    let mut excused_bit = 0u64;
+    let mut pending = tools;
+    while let Some(((name, _), more)) = pending.split_first() {
+        if tool_bit == 0 && bytes_eq(name.as_bytes(), section, false) {
+            tool_bit = bit;
         }
-        listed = more;
+        bit <<= 1;
+        pending = more;
     }
-    let mut excused = not_program;
-    while let Some(((section, _), more)) = excused.split_first() {
-        if !has_name_row(rows, section.as_bytes()) {
-            return false;
+    let mut pending = not_program;
+    while let Some(((name, _), more)) = pending.split_first() {
+        if excused_bit == 0 && bytes_eq(name.as_bytes(), section, false) {
+            excused_bit = bit;
         }
-        excused = more;
+        bit <<= 1;
+        pending = more;
     }
-    true
+    if (tool_bit == 0) == (excused_bit == 0) {
+        0
+    } else {
+        tool_bit | excused_bit
+    }
+}
+
+/// A mask of the low `count` bits, for `count` at most 64.
+const fn all_bits(count: usize) -> u64 {
+    let mut left = count;
+    let mut mask = 0u64;
+    while left > 0 {
+        mask = (mask << 1) | 1;
+        left = left.saturating_sub(1);
+    }
+    mask
 }
 
 /// The section of the Mercurial spelling `spelling` when its key carries a name (`<name>`, `*`).
@@ -2412,44 +2451,6 @@ const fn name_section(spelling: &[u8]) -> Option<&[u8]> {
     } else {
         None
     }
-}
-
-/// Whether some row of `rows` carries a name under `section`.
-const fn has_name_row(rows: &[Row], section: &[u8]) -> bool {
-    let mut pending = rows;
-    while let Some(((spelling, _), more)) = pending.split_first() {
-        if let Some(found) = name_section(spelling.as_bytes())
-            && bytes_eq(found, section, false)
-        {
-            return true;
-        }
-        pending = more;
-    }
-    false
-}
-
-/// Whether `tools` lists `section`.
-const fn lists_tool(tools: &[(&str, KeyTool)], section: &[u8]) -> bool {
-    let mut pending = tools;
-    while let Some(((name, _), more)) = pending.split_first() {
-        if bytes_eq(name.as_bytes(), section, false) {
-            return true;
-        }
-        pending = more;
-    }
-    false
-}
-
-/// Whether `not_program` lists `section`.
-const fn lists_not_program(not_program: &[(&str, &str)], section: &[u8]) -> bool {
-    let mut pending = not_program;
-    while let Some(((name, _), more)) = pending.split_first() {
-        if bytes_eq(name.as_bytes(), section, false) {
-            return true;
-        }
-        pending = more;
-    }
-    false
 }
 
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a Mercurial section whose keys carry a name is not decided once as naming a program or not [ledger #boundary]
@@ -3278,5 +3279,14 @@ mod tests {
             &[("a", KeyTool::FirstSegment), ("d", KeyTool::FirstSegment)],
             &[("b", "why")]
         ));
+        // A section listed twice.
+        assert!(!name_sections_decided(
+            rows,
+            &[("a", KeyTool::FirstSegment), ("a", KeyTool::FirstSegment)],
+            &[("b", "why")]
+        ));
+        // More listed sections than the mask holds.
+        let many: &[(&str, &str)] = &[("b", "why"); 65];
+        assert!(!name_sections_decided(rows, tools, many));
     }
 }
