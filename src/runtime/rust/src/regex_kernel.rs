@@ -46,6 +46,8 @@ fn within_input_ceiling(s: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct Regex(Arc<regex::Regex>);
 
+crate::stringify::show_row!("Regex", Redacted, [] Regex, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// `Regex.compile : String -> Result Error Regex` — THE construction boundary.
 /// Every [`Regex`] value traces back to one of these calls; an invalid pattern
 /// surfaces here as a typed `Err`, never anywhere downstream as a silent

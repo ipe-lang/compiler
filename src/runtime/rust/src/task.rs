@@ -848,6 +848,13 @@ pub enum BackoffStrategy {
     ExponentialWithJitter,
 }
 
+crate::stringify::show_row!("BackoffStrategy", Value, [] BackoffStrategy, |b| match b {
+    BackoffStrategy::Linear => "Linear".to_owned(),
+    BackoffStrategy::LinearWithJitter => "LinearWithJitter".to_owned(),
+    BackoffStrategy::Exponential => "Exponential".to_owned(),
+    BackoffStrategy::ExponentialWithJitter => "ExponentialWithJitter".to_owned(),
+});
+
 // Task.retryWith : RetryPolicy e -> Task e a -> Task e a
 //
 // A real retry loop, faithful to  The two things

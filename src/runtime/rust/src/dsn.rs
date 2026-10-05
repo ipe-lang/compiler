@@ -286,6 +286,8 @@ pub struct Dsn {
     tls: TlsMode,
 }
 
+crate::stringify::show_row!("Dsn", Redacted, [] Dsn, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 impl std::fmt::Debug for Dsn {
     /// Redact the whole descriptor. The password is already a `Secret` (its own
     /// `Debug` is the fixed placeholder), but the struct-level impl stays

@@ -11,6 +11,7 @@
 //! of cannot drift.
 
 use crate::ir::{CarrierLeaf, IrType, carrier_leaf};
+use crate::show_policy::{ShowLeaf, show_leaf};
 
 /// Which trait families a named enum's rendered Rust type implements.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +128,21 @@ impl RuntimeBridgedEnum {
                 derivable: false,
                 serde: false,
             },
+        }
+    }
+
+    /// The show leaf of the runtime's Rust type.
+    #[must_use]
+    pub const fn show_leaf(self) -> ShowLeaf {
+        match self {
+            Self::CacheHandle => show_leaf::CACHE_HANDLE,
+            Self::ConfigDecoder => show_leaf::DECODER,
+            // A topic lowers to its `String` name.
+            Self::PubSubTopic => show_leaf::STRING,
+            Self::EmailProvider => show_leaf::EMAIL_PROVIDER,
+            Self::ChunkEvent => show_leaf::CHUNK_EVENT,
+            Self::StreamId => show_leaf::STREAM_ID,
+            Self::RedirectPolicy => show_leaf::REDIRECT_POLICY,
         }
     }
 

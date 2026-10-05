@@ -21,6 +21,7 @@ mod pairing;
 mod pretty;
 pub mod record_shapes;
 pub mod seq_clone;
+mod show_policy;
 
 pub use enum_facts::{EnumTraits, RuntimeBridgedEnum, payload_leaf_is_clone};
 pub use held::{
@@ -37,6 +38,10 @@ pub use ir::{
 };
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};
+pub use show_policy::{
+    MAX_SHOWN_TUPLE_ARITY, NamedShow, SHOWN_LEAVES, ShowLeaf, ShowPolicy, ShowShape,
+    ir_type_holds_refused, named_enum_shape, show_leaf,
+};
 
 /// The compilation target (kernel-availability axis) — re-exported so
 /// backend/db consumers reach it through the IR crate like `KernelFn`.

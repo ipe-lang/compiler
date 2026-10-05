@@ -41,13 +41,15 @@ use url::{Url as UrlCrate, form_urlencoded};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url(UrlCrate);
 
-impl super::stringify::IpeStringify for Url {
-    /// Backs Ipê's `toString` / interpolation on a `Url`: the serialized URL
-    /// string. Identical to [`url_to_string`].
-    fn ipe_show(&self) -> String {
-        self.0.as_str().to_string()
-    }
-}
+// The serialized URL with its userinfo removed: a password or user name in
+// the authority never reaches an implicit rendering. `Url.toString` keeps the
+// full URL.
+crate::stringify::show_row!("Url", Redacted, [] Url, |u| {
+    let mut shown = u.0.clone();
+    let _ = shown.set_password(None);
+    let _ = shown.set_username("");
+    shown.as_str().to_owned()
+});
 
 /// `Ipe.Url.fromString : String -> Result Error Url` — THE seal. The only public
 /// constructor: every `Url` value in a Ipê program traces back to one of these
@@ -243,14 +245,8 @@ pub struct UrlRelative {
     fragment: Option<String>,
 }
 
-impl super::stringify::IpeStringify for UrlRelative {
-    /// Backs Ipê's `toString` / interpolation on a `Relative`: the reference
-    /// string (`path` + `?query` + `#fragment`). Identical to
-    /// [`url_relative_to_string`].
-    fn ipe_show(&self) -> String {
-        self.render()
-    }
-}
+// The reference string, identical to [`url_relative_to_string`].
+crate::stringify::show_row!("UrlRelative", Value, [] UrlRelative, |r| r.render());
 
 impl UrlRelative {
     /// Re-serialise the path + optional query + optional fragment triple. The single place
