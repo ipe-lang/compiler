@@ -1,5 +1,7 @@
+use ipe_diagnostics::{Candidates, NameError};
+
 use super::{
-    BTreeMap, Builder, DResult, Diagnostic, Feature, FlatType, LowerError, ModuleHome,
+    BTreeMap, Builder, CtorKey, DResult, Diagnostic, Feature, FlatType, LowerError, ModuleHome,
     PendingInstantiation, RouteWitnessCheck, RoutedWebCheck, STAGE, SchemeApp, SchemeKey, Span,
     StdlibKernel, Symbol, Ty, TyBounds, TypeError, VarId, WildcardAnyUse, WildcardEntry, canon,
     canon_type_to_doc, from_canon,
@@ -1014,15 +1016,18 @@ impl Builder<'_> {
         }
         Ok(())
     }
-    /// Constrain a constructor referenced as a value: its scheme instantiated
-    /// fresh. A nullary constructor's value type is the enum itself; a payload
+    /// Constrain a constructor referenced as a value: its scheme instantiated fresh.
+    ///
+    /// A nullary constructor's value type is the enum itself; a payload
     /// constructor's is the curried arrow `field0 -> … -> T vars`. Each reference
     /// instantiates independently, so the same generic constructor used at `Int`
-    /// and at `Bool` in one module yields two separately-satisfiable types. A
-    /// constructor with no registered scheme (imported, outside the single-module
-    /// subset) falls back to the bare enum type, sound for the nullary case.
+    /// and at `Bool` in one module yields two separately-satisfiable types.
+    ///
+    /// # Errors
+    /// See [`Self::ctor_scheme_miss`] for a constructor with no scheme.
     pub fn constrain_var_ctor(
         &mut self,
+        span: Span,
         home: &[Symbol],
         type_name: Symbol,
         name: Symbol,
@@ -1031,15 +1036,42 @@ impl Builder<'_> {
         // referenced as a value resolves against its own declaring module's
         // scheme, never a same-named constructor from another module.
         let key = (home.to_vec(), type_name, name);
-        if let Some(scheme) = self.ctors.get(&key).cloned() {
-            let (arg_vars, result_var) = self.instantiate_ctor(&scheme)?;
-            let mut t = result_var;
-            for av in arg_vars.into_iter().rev() {
-                t = self.structure(FlatType::Fun(av, t))?;
-            }
-            Ok(t)
-        } else {
-            self.con_var(home.to_vec(), type_name, Vec::new())
+        let Some(scheme) = self.ctors.get(&key).cloned() else {
+            return Err(self.ctor_scheme_miss(span, &key));
+        };
+        let (arg_vars, result_var) = self.instantiate_ctor(&scheme)?;
+        let mut t = result_var;
+        for av in arg_vars.into_iter().rev() {
+            t = self.structure(FlatType::Fun(av, t))?;
+        }
+        Ok(t)
+    }
+
+    /// The refusal for a constructor `key` that has no registered scheme.
+    ///
+    /// A sealed builtin capability handle (`StreamId`) is a user error,
+    /// `ConstructorNotFound` with no suggestions. Any other miss means canon
+    /// resolved a constructor the table does not carry: a `CompilerBug`, never
+    /// an unconstrained fallback type.
+    pub fn ctor_scheme_miss(&self, span: Span, key: &CtorKey) -> Diagnostic {
+        let (_, type_name, name) = key;
+        let resolved = self.interner.resolve(*name);
+        match resolved {
+            Some(s) if self.sealed_ctors.contains(key) => Diagnostic::Name {
+                span,
+                msg: NameError::ConstructorNotFound {
+                    name: Box::from(s),
+                    suggestions: Candidates::at(None, Box::new([])),
+                },
+            },
+            _ => Diagnostic::CompilerBug {
+                where_: "constrain.ctor_scheme",
+                detail: format!(
+                    "constructor `{}` of type `{}` has no registered scheme",
+                    resolved.unwrap_or("<unresolved>"),
+                    self.interner.resolve(*type_name).unwrap_or("<unresolved>"),
+                ),
+            },
         }
     }
 }

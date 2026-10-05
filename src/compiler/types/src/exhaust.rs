@@ -59,10 +59,10 @@ const SIGNATURE_STAGE: &str = "exhaust.signature";
 /// The compiler bug a constructor absent from its union's signature raises.
 ///
 /// Every ADT head the matrix walk meets names a constructor of a union in
-/// [`Sigs`]: [`pattern_uses_unknown_ctor`] excludes any `case` naming another,
-/// and witness heads are read back from the same tables. A miss is therefore a
-/// broken invariant, refused rather than read as arity `0` or an incomplete
-/// column.
+/// [`Sigs`] at its declared arity: constraint generation refuses any other, and
+/// witness heads are read back from the same tables. A miss or an arity
+/// disagreement is therefore a broken invariant, refused rather than read as
+/// arity `0`, an incomplete column, or a skipped `case`.
 fn ctor_not_in_signature() -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: SIGNATURE_STAGE,
@@ -354,7 +354,11 @@ enum UPat {
 /// one the hand-written alternatives would produce, the usefulness algorithm's
 /// coverage / redundancy proofs carry over unchanged — no new [`Head`] and no
 /// re-proving.
-fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<UPat>> {
+fn expand_upats(
+    p: &canon::Pattern_,
+    sigs: &Sigs,
+    budget: &mut ExhaustBudget,
+) -> DResult<Vec<UPat>> {
     match p {
         // The unit pattern matches the single value of the unit type, so — like a
         // wildcard, the dev-only `Debug._`, a variable, or a field-pun record —
@@ -370,20 +374,28 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         canon::Pattern_::PCtor {
             home, name, args, ..
         } => {
+            // A constructor outside every signature, or one whose sub-pattern
+            // count disagrees with its declared arity, is a broken invariant
+            // (constraint generation already refused both): never padded,
+            // truncated, or skipped.
+            let head = Head::Adt(home.clone(), *name);
+            if sigs.arity(&head)? != args.len() {
+                return Err(ctor_not_in_signature());
+            }
             let mut columns = Vec::with_capacity(args.len());
             for a in args {
-                columns.push(expand_upats(&a.value, budget)?);
+                columns.push(expand_upats(&a.value, sigs, budget)?);
             }
             let combos = cartesian(columns, budget)?;
             Ok(combos
                 .into_iter()
-                .map(|combo| UPat::Ctor(Head::Adt(home.clone(), *name), combo))
+                .map(|combo| UPat::Ctor(head.clone(), combo))
                 .collect())
         }
         canon::Pattern_::PTuple(elems) => {
             let mut columns = Vec::with_capacity(elems.len());
             for e in elems {
-                columns.push(expand_upats(&e.value, budget)?);
+                columns.push(expand_upats(&e.value, sigs, budget)?);
             }
             let combos = cartesian(columns, budget)?;
             Ok(combos
@@ -410,7 +422,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         }
         // An alias is transparent for coverage — it matches exactly what its
         // inner pattern matches (and expands the same way).
-        canon::Pattern_::PAlias(inner, _) => expand_upats(&inner.value, budget),
+        canon::Pattern_::PAlias(inner, _) => expand_upats(&inner.value, sigs, budget),
         // `List` is the closed two-constructor type `Nil | Cons`. A cons pattern
         // `head :: tail` abstracts to a [`Head::Cons`] over its two sub-patterns;
         // a list literal `[a, b, c]` desugars to the right-nested cons spine
@@ -418,8 +430,8 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         // judged with the SAME `Nil | Cons` signature. Each sub-position expands,
         // so a nested or-pattern multiplies the rows cartesian-wise.
         canon::Pattern_::PCons(head, tail) => {
-            let head_rows = expand_upats(&head.value, budget)?;
-            let tail_rows = expand_upats(&tail.value, budget)?;
+            let head_rows = expand_upats(&head.value, sigs, budget)?;
+            let tail_rows = expand_upats(&tail.value, sigs, budget)?;
             let combos = cartesian(vec![head_rows, tail_rows], budget)?;
             Ok(combos
                 .into_iter()
@@ -440,7 +452,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
             }
             let mut rows = vec![UPat::Ctor(Head::Nil, Vec::new())];
             for e in elems.iter().rev() {
-                let heads = expand_upats(&e.value, budget)?;
+                let heads = expand_upats(&e.value, sigs, budget)?;
                 // Every product row is charged before allocation, so a breadth
                 // blow-up (a wide list of or-patterns) fails closed rather than
                 // exhausting memory.
@@ -459,7 +471,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         canon::Pattern_::POr(alts) => {
             let mut out = Vec::new();
             for a in alts {
-                out.extend(expand_upats(&a.value, budget)?);
+                out.extend(expand_upats(&a.value, sigs, budget)?);
             }
             budget.charge(out.len() as u64)?;
             Ok(out)
@@ -490,61 +502,6 @@ fn cartesian(columns: Vec<Vec<UPat>>, budget: &mut ExhaustBudget) -> DResult<Vec
         acc = next;
     }
     Ok(acc)
-}
-
-/// Does `p` reference a name this end-of-checking pass cannot analyse soundly
-/// here? The one excluded case is a constructor outside this module's unions (an
-/// imported / unknown enum whose full constructor set is unavailable — the
-/// lowerer rejects the unknown scrutinee enum separately). List / cons patterns
-/// are NOT excluded: they are analysed via the built-in closed `Nil | Cons`
-/// signature (see `to_upat`), so their exhaustiveness (IPE-T0010) is enforced
-/// here — a nested unknown constructor inside one still excludes the `case`.
-fn pattern_uses_unknown_ctor(p: &canon::Pattern_, sigs: &Sigs) -> bool {
-    match p {
-        // Wildcards (`_` / `Debug._`), variables, field-pun records, and literal
-        // leaves reference no ADT constructor.
-        canon::Pattern_::PAnything
-        | canon::Pattern_::PDebugAnything
-        | canon::Pattern_::PVar(_)
-        | canon::Pattern_::PUnit
-        | canon::Pattern_::PRecord(_)
-        | canon::Pattern_::PInt(_)
-        | canon::Pattern_::PBool(_)
-        | canon::Pattern_::PChar(_)
-        | canon::Pattern_::PStr(_) => false,
-        canon::Pattern_::PCtor {
-            home, name, args, ..
-        } => {
-            !sigs
-                .ctor_to_union
-                .get(home.as_slice())
-                .is_some_and(|by_ctor| by_ctor.contains_key(name))
-                || args
-                    .iter()
-                    .any(|a| pattern_uses_unknown_ctor(&a.value, sigs))
-        }
-        canon::Pattern_::PTuple(elems) => elems
-            .iter()
-            .any(|e| pattern_uses_unknown_ctor(&e.value, sigs)),
-        canon::Pattern_::PAlias(inner, _) => pattern_uses_unknown_ctor(&inner.value, sigs),
-        // List / cons patterns are over the built-in closed `Nil | Cons` type —
-        // analysable here. Their element / tail sub-patterns recurse (a nested
-        // unknown constructor still excludes the `case`).
-        canon::Pattern_::PCons(head, tail) => {
-            pattern_uses_unknown_ctor(&head.value, sigs)
-                || pattern_uses_unknown_ctor(&tail.value, sigs)
-        }
-        canon::Pattern_::PList(elems) => elems
-            .iter()
-            .any(|e| pattern_uses_unknown_ctor(&e.value, sigs)),
-        // An or-pattern is analysable iff every alternative is — any alternative
-        // referencing an unknown constructor excludes the whole `case` from the
-        // matrix walk, so no expansion is attempted against an incomplete
-        // signature.
-        canon::Pattern_::POr(alts) => alts
-            .iter()
-            .any(|a| pattern_uses_unknown_ctor(&a.value, sigs)),
-    }
 }
 
 /// Locate the outermost **refutable** sub-pattern of a parameter / binder
@@ -790,8 +747,8 @@ fn check_expr_ctx(e: &canon::Expr, ctx: &Ctx<'_>, warnings: &mut Vec<Diagnostic>
 /// Check one `case`: first redundancy (a later arm useless against the earlier
 /// ones), then exhaustiveness (the wildcard row useful against the whole arm
 /// matrix), and finally the wildcard-covers-known-constructors lint. A `case`
-/// mentioning a constructor outside this module's unions is skipped — its
-/// signature is unavailable, so it cannot be judged soundly here.
+/// mentioning a constructor outside every known signature is a `CompilerBug`
+/// ([`ctor_not_in_signature`]), never skipped unjudged.
 ///
 /// Redundant-branch findings are pushed onto `warnings` (IPE-T0011 is a
 /// Warning-severity diagnostic that must not abort compilation).
@@ -805,13 +762,6 @@ fn check_case(
 ) -> DResult<()> {
     let sigs = ctx.sigs;
     let interner = ctx.interner;
-    if branches
-        .iter()
-        .any(|br| pattern_uses_unknown_ctor(&br.pat.value, sigs))
-    {
-        return Ok(());
-    }
-
     // A per-`case` work budget bounds both the or-pattern row expansion and the
     // usefulness walk. A crafted-but-small `case` (e.g. many independent
     // 2-alternative or-patterns whose product is exponential) would otherwise
@@ -862,7 +812,7 @@ fn check_case(
             other => vec![(br.pat.span, other)],
         };
         for (span, unit_pat) in units {
-            let rows = expand_upats(unit_pat, &mut budget)?;
+            let rows = expand_upats(unit_pat, sigs, &mut budget)?;
             let mut alternative_covered = true;
             for row in &rows {
                 if !useful(&prior, std::slice::from_ref(row), sigs, 1, &mut budget)?.is_empty() {
@@ -891,7 +841,7 @@ fn check_case(
     // enumerating a union via `A | B | C` covers all three constructors.
     let mut matrix: Vec<Vec<UPat>> = Vec::new();
     for br in branches {
-        for p in expand_upats(&br.pat.value, &mut budget)? {
+        for p in expand_upats(&br.pat.value, sigs, &mut budget)? {
             matrix.push(vec![p]);
         }
     }
@@ -1419,6 +1369,15 @@ mod tests {
     use super::*;
     use ipe_diagnostics::Located;
 
+    /// Signature tables with no unions, for patterns that name no constructor.
+    const fn empty_sigs() -> Sigs {
+        Sigs {
+            ctor_to_union: BTreeMap::new(),
+            union_ctors: BTreeMap::new(),
+            ctor_arity: BTreeMap::new(),
+        }
+    }
+
     fn boolp(b: bool) -> canon::Pattern {
         Located::new(Span::DUMMY, canon::Pattern_::PBool(b))
     }
@@ -1446,7 +1405,7 @@ mod tests {
         // never materialising the rows.
         let pat = wide_or_tuple(40);
         let mut budget = ExhaustBudget::with_limit(1_000);
-        let result = expand_upats(&pat, &mut budget);
+        let result = expand_upats(&pat, &empty_sigs(), &mut budget);
         assert!(
             matches!(
                 result,
@@ -1467,7 +1426,8 @@ mod tests {
         // proving the ceiling is the only thing the trip depends on.
         let pat = wide_or_tuple(8);
         let mut budget = ExhaustBudget::unbounded();
-        let rows = expand_upats(&pat, &mut budget).expect("unbounded budget never errors");
+        let rows =
+            expand_upats(&pat, &empty_sigs(), &mut budget).expect("unbounded budget never errors");
         assert_eq!(rows.len(), 1 << 8, "8-wide product expands to 2^8 rows");
     }
 
@@ -1483,7 +1443,7 @@ mod tests {
             .collect();
         let pat = canon::Pattern_::PList(elems);
         let mut budget = ExhaustBudget::unbounded();
-        let result = expand_upats(&pat, &mut budget);
+        let result = expand_upats(&pat, &empty_sigs(), &mut budget);
         assert!(
             matches!(
                 result,
@@ -1508,7 +1468,7 @@ mod tests {
         let pat = canon::Pattern_::PList(elems);
         let mut budget = ExhaustBudget::unbounded();
         assert!(
-            expand_upats(&pat, &mut budget).is_ok(),
+            expand_upats(&pat, &empty_sigs(), &mut budget).is_ok(),
             "a list pattern at the cap must still expand"
         );
     }
@@ -1520,7 +1480,8 @@ mod tests {
         // single `True | False` is two rows.
         let pat = true_or_false().value;
         let mut budget = ExhaustBudget::from_env();
-        let rows = expand_upats(&pat, &mut budget).expect("small pattern fits any default budget");
+        let rows = expand_upats(&pat, &empty_sigs(), &mut budget)
+            .expect("small pattern fits any default budget");
         assert_eq!(rows.len(), 2, "True | False expands to two rows");
     }
 
