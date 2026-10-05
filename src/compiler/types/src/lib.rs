@@ -7412,8 +7412,19 @@ mod tests {
         let src =
             format!("{M2C_HDR}f s =\n    case s of\n        StreamId n -> n\n\nmain =\n    0\n");
         let (r, _, _) = infer_src(&src);
-        let found = ctor_not_found(&r).map(|(name, n, _)| (name, n));
-        assert_eq!(found, Some(("StreamId", 0)), "bug={:?}", bug_site(&r));
+        let found = ctor_not_found(&r);
+        assert_eq!(
+            found.map(|(name, n, _)| (name, n)),
+            Some(("StreamId", 0)),
+            "bug={:?}",
+            bug_site(&r)
+        );
+        let Some((_, _, span)) = found else {
+            return;
+        };
+        let lo = usize::try_from(span.lo).unwrap();
+        let hi = usize::try_from(span.hi).unwrap();
+        assert_eq!(src.get(lo..hi), Some("StreamId n"), "the whole pattern");
     }
 
     /// The capability-handle constructor `StreamId` is sealed as a value.
