@@ -1090,9 +1090,10 @@ enum Runner {
     /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`.
     Bang,
     /// A Git `alias.*`: one leading `!` makes the rest a shell command;
-    /// otherwise the first word names a Git command, which Git runs as the
-    /// program `git-<word>` (`execv_dashed_external`), relative to its working
-    /// directory once the word holds a `/`.
+    /// otherwise Git reads its own options off the front, and the first word
+    /// left names a Git command, which Git runs as the program `git-<word>`
+    /// (`execv_dashed_external`), relative to its working directory once the
+    /// word holds a `/`.
     GitAlias,
     /// A Git `credential.helper`: one leading `!` makes the rest a shell
     /// command, an absolute path runs as written, and anything else runs as
@@ -1103,21 +1104,46 @@ enum Runner {
     Python,
 }
 
+/// The command line a tool runs for a value, as [`Runner::consume`] composes it.
+struct Line<'v> {
+    /// The text split into words.
+    text: Cow<'v, str>,
+    /// The program prefix the tool adds to the first word not shaped like an option.
+    command_prefix: Option<&'static str>,
+}
+
+impl<'v> Line<'v> {
+    /// A command line run as written.
+    const fn of(text: Cow<'v, str>) -> Self {
+        Self {
+            text,
+            command_prefix: None,
+        }
+    }
+}
+
 impl Runner {
     /// The command line the tool runs for `value`.
-    fn consume(self, value: &str) -> Cow<'_, str> {
-        let (prefix, program) = match self {
-            Self::None => return Cow::Borrowed(value),
-            Self::GitHelper if is_git_absolute(value) => return Cow::Borrowed(value),
-            Self::Bang => ("!", None),
-            Self::GitAlias => ("!", Some("git-")),
-            Self::GitHelper => ("!", Some("git-credential-")),
-            Self::Python => ("python:", None),
+    fn consume(self, value: &str) -> Line<'_> {
+        let prefix = match self {
+            Self::None => return Line::of(Cow::Borrowed(value)),
+            Self::GitHelper if is_git_absolute(value) => return Line::of(Cow::Borrowed(value)),
+            Self::Bang | Self::GitAlias | Self::GitHelper => "!",
+            Self::Python => "python:",
         };
-        match (value.strip_prefix(prefix), program) {
-            (Some(rest), _) => Cow::Borrowed(rest),
-            (None, None) => Cow::Borrowed(value),
-            (None, Some(program)) => Cow::Owned(format!("{program}{value}")),
+        if let Some(rest) = value.strip_prefix(prefix) {
+            return Line::of(Cow::Borrowed(rest));
+        }
+        match self {
+            Self::GitHelper => Line::of(Cow::Owned(format!("git-credential-{value}"))),
+            // Git splits an alias into words and reads its own options
+            // (`-p`, `-c <name>`) off the front before the word naming a
+            // command, so the prefix lands on a word, not on the value's text.
+            Self::GitAlias => Line {
+                text: Cow::Borrowed(value),
+                command_prefix: Some("git-"),
+            },
+            Self::None | Self::Bang | Self::Python => Line::of(Cow::Borrowed(value)),
         }
     }
 }
@@ -2678,10 +2704,14 @@ impl Scan<'_> {
             Syntax::Git | Syntax::Hg | Syntax::Darcs | Syntax::GitRemote => Tilde::Shell,
             Syntax::Toml => Tilde::Verbatim,
         };
+        let line = runner.consume(value);
         let mut words = Words::default();
         words
-            .push_split(&runner.consume(value), Position::Program, tilde)
+            .push_split(&line.text, Position::Program, tilde)
             .map_err(unproven)?;
+        if let Some(prefix) = line.command_prefix {
+            words.prefix_command(prefix);
+        }
         self.judge_queue(ctx, &mut words)
     }
 
@@ -2889,6 +2919,21 @@ struct Words {
 }
 
 impl Words {
+    /// Prefix `prefix` to the first pushed word not shaped like an option, at the position it stands.
+    ///
+    /// A word after a leading option keeps its argument position: it may be
+    /// that option's argument (`-c <name>`), and the command then follows it.
+    fn prefix_command(&mut self, prefix: &str) {
+        if let Some((word, _, _)) = self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|(word, _, _)| !word.starts_with('-'))
+        {
+            word.insert_str(0, prefix);
+        }
+    }
+
     /// Push one word not yet looked at.
     fn push(&mut self, word: String, position: Position) -> Result<(), Unprovable> {
         self.push_staged(word, position, Stage::Fresh)
@@ -3374,7 +3419,9 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         return Route::Judge(Role::Exempt);
     }
     let runner = match shape {
-        ("alias", false, _) => Runner::GitAlias,
+        // The subsection form (`[alias "x"] command`) is judged the same way:
+        // an alias Git does not read runs nothing, one it reads runs so.
+        ("alias", _, _) => Runner::GitAlias,
         ("credential", _, "helper") => Runner::GitHelper,
         _ => Runner::None,
     };
@@ -5532,7 +5579,6 @@ mod tests {
         for text in [
             format!("[core]\n\tpager = !{out}/a {out}/b\n"),
             format!("[credential]\n\tusername = !{out}/helper\n"),
-            format!("[alias \"x\"]\n\tcommand = !{out}/helper\n"),
         ] {
             git_config(&f, &text);
             let result = scan_git(&f);
@@ -5549,6 +5595,10 @@ mod tests {
         let out = f.out.display();
         for text in [
             format!("[alias]\n\tx = {out}/x\n"),
+            format!("[alias]\n\tx = -p {out}/x\n"),
+            format!("[alias]\n\tx = \"'-p' {out}/x\"\n"),
+            format!("[alias]\n\tx = --paginate {out}/x\n"),
+            format!("[alias \"x\"]\n\tcommand = {out}/x\n"),
             "[alias]\n\tx = ~/x\n".to_owned(),
             "[credential]\n\thelper = ~/x\n".to_owned(),
             "[credential \"https://example.com\"]\n\thelper = ~/x\n".to_owned(),
@@ -5560,8 +5610,13 @@ mod tests {
                 "{text:?}: {result:?}"
             );
         }
+        // An option's argument (`-c <name>`) may stand before the command word.
+        git_config(&f, &format!("[alias]\n\tx = -c a.b {out}/x\n"));
+        assert!(scan_git(&f).is_err());
         for text in [
             "[alias]\n\tco = checkout\n".to_owned(),
+            "[alias]\n\tlg = log --oneline\n".to_owned(),
+            format!("[alias \"x\"]\n\tcommand = !{out}/x\n"),
             "[alias]\n\tx = !~/x\n".to_owned(),
             "[credential]\n\thelper = store\n".to_owned(),
             format!("[credential]\n\thelper = {out}/helper\n"),
