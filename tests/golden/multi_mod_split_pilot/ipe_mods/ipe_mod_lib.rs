@@ -5,6 +5,7 @@ pub(crate) enum LibStatus {
     Empty,
     Seeded,
 }
+
 impl IpeStringify for LibStatus {
     fn ipe_show(&self) -> String {
         match self {
@@ -13,6 +14,7 @@ impl IpeStringify for LibStatus {
         }
     }
 }
+
 pub(crate) fn lib_label(status: LibStatus) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match status {
@@ -20,6 +22,7 @@ pub(crate) fn lib_label(status: LibStatus) -> String {
         LibStatus::Seeded => "seeded".to_string(),
     }
 }
+
 pub(crate) fn lib_seed_and_count() -> IpeTask<i64> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(

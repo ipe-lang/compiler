@@ -2,8 +2,8 @@
 //!
 //! The Ipê → Rust codegen wraps the user's emitted types and functions in a
 //! fixed prologue (header, imports, basic type aliases, runtime re-exports) and
-//! a fixed epilogue (list helpers, FFI-placeholder banner, entry point). Those
-//! two fixed regions are produced here.
+//! a fixed epilogue (list helpers, entry point). Those two fixed regions are
+//! produced here.
 //!
 //! The byte source of truth is the hand-maintained template at
 //! `templates/main.rs` — a canonical whole-program rendering that owns the fixed
@@ -92,8 +92,8 @@ pub fn preamble(keep_json: bool) -> DResult<String> {
 
 /// The fixed epilogue emitted after the user's function definitions.
 ///
-/// Spans the list helpers, the FFI-placeholder banner, and the entry point
-/// (`fn main`) — the tail of the golden program. `Ffi.kernel` calls are routed
+/// Spans the list helpers and the entry point (`fn main`) — the tail of the
+/// golden program. `Ffi.kernel` calls are routed
 /// directly by codegen, so no runtime polyfill is emitted; a construction path
 /// that could not be routed is rejected at ipe-time, never left to a runtime
 /// panic in emitted pure-Ipê Rust.

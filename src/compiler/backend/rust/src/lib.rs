@@ -34,6 +34,7 @@ mod emit_ui_template;
 mod emit_web;
 mod emit_webview;
 mod emit_worker;
+mod items;
 mod layout_sweep;
 mod naming;
 mod preamble;

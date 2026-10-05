@@ -8,6 +8,7 @@ pub(crate) fn main_summary(count: i64) -> String {
         format!("{}{}", ":".to_string(), string_from_int(count))
     )
 }
+
 pub(crate) fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(
