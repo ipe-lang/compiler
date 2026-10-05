@@ -14,8 +14,9 @@
 //! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
 //! resolved against the configuration file's directory and the working tree,
 //! `~` through the injected [`Home`]; an option's argument is judged as a word
-//! of its own and the option word whole besides; a program name, less any
-//! runner prefix (`!`, `=`), passes; any other word, a `--` or `-` ending a
+//! of its own and the option word whole besides; a program name passes, less
+//! only the one runner prefix (`!`, `python:`) its setting's tool consumes
+//! (anywhere else `!/x` is a relative path); any other word, a `--` or `-` ending a
 //! program's options, a command substitution, an expansion, a glob or brace
 //! expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
@@ -1048,8 +1049,8 @@ struct FileCtx {
 enum Role {
     /// Never names code: not judged.
     Exempt,
-    /// Every word is judged.
-    Words,
+    /// Every word is judged, after the runner prefix the tool consumes.
+    Words(Runner),
     /// The words of this text, and this text as one command path whatever its shape.
     ///
     /// The text is the part of the value the tool runs or loads: the whole
@@ -1072,6 +1073,33 @@ enum Role {
     /// any other, and as one URL otherwise. Both readings are judged; a quote,
     /// which the list parser groups and unescapes by, refuses.
     UrlList,
+}
+
+/// The prefix a tool consumes from the start of a setting's value before running the rest as a command line.
+///
+/// A tool strips it once, from the first character of the value as written,
+/// and only for the settings that declare it. Everywhere else a runner-shaped
+/// word (`!/x`, `=/x`) is run as written: a relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runner {
+    /// No prefix is consumed.
+    None,
+    /// One leading `!` makes the rest a shell command: a Git `alias.*` or `credential.helper`, a Mercurial `[alias]`.
+    Bang,
+    /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
+    Python,
+}
+
+impl Runner {
+    /// `value` without the prefix this runner consumes, when it starts with it.
+    fn consume(self, value: &str) -> &str {
+        let prefix = match self {
+            Self::None => return value,
+            Self::Bang => "!",
+            Self::Python => "python:",
+        };
+        value.strip_prefix(prefix).unwrap_or(value)
+    }
 }
 
 /// What becomes of a value.
@@ -2195,7 +2223,7 @@ impl Scan<'_> {
                     git_route(&entry.setting, &entry.value)
                 }
                 Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
-                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
+                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words(Runner::None)),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
             if let Some(rewrite) = rewrite_of(ctx, &entry.setting, &entry.value) {
@@ -2222,7 +2250,7 @@ impl Scan<'_> {
                 }
                 Route::Judge(
                     Role::Exempt
-                    | Role::Words
+                    | Role::Words(_)
                     | Role::Forced(_)
                     | Role::Include(_)
                     | Role::HooksPath,
@@ -2517,7 +2545,7 @@ impl Scan<'_> {
                 TomlNode::Value(value) => match value {
                     toml::Value::String(text) => {
                         let judged = match pos {
-                            TomlPos::Text => self.judge(ctx, &Role::Words, text),
+                            TomlPos::Text => self.judge(ctx, &Role::Words(Runner::None), text),
                             TomlPos::Word(position) => self.judge_word(ctx, text, position),
                         };
                         judged.map_err(|stop| {
@@ -2554,9 +2582,9 @@ impl Scan<'_> {
         }
         match role {
             Role::Exempt => Ok(()),
-            Role::Words => self.judge_words(ctx, value),
+            Role::Words(runner) => self.judge_words(ctx, value, *runner),
             Role::Forced(path) => {
-                self.judge_words(ctx, path)?;
+                self.judge_words(ctx, path, Runner::None)?;
                 self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
             Role::Include(include) => {
@@ -2581,7 +2609,7 @@ impl Scan<'_> {
                 Ok(())
             }
             Role::HooksPath => {
-                self.judge_words(ctx, value)?;
+                self.judge_words(ctx, value, Runner::None)?;
                 for (_, found) in self.judge_forced(ctx, value, Reach::Command)? {
                     if let End::Dir(dir) = found.end {
                         self.list_held(&dir, &found.path).map_err(Stop::Refused)?;
@@ -2593,7 +2621,7 @@ impl Scan<'_> {
                 if is_network_url(value, *scp) {
                     return Ok(());
                 }
-                self.judge_words(ctx, value)?;
+                self.judge_words(ctx, value, Runner::None)?;
                 self.judge_forced(ctx, value, Reach::Command).map(drop)
             }
             Role::UrlList => {
@@ -2609,15 +2637,19 @@ impl Scan<'_> {
         }
     }
 
-    /// Judge every word of the command line `value`.
-    fn judge_words(&mut self, ctx: &FileCtx, value: &str) -> Result<(), Stop> {
+    /// Judge every word of the command line `value`, once `runner` consumed its prefix.
+    ///
+    /// The prefix is stripped from the value as written, before it is split,
+    /// so only the first word loses it, and only when the tool sees it there:
+    /// a quoted `'!'/x` keeps it, and the shell then runs `!/x`.
+    fn judge_words(&mut self, ctx: &FileCtx, value: &str, runner: Runner) -> Result<(), Stop> {
         let tilde = match ctx.syntax {
             Syntax::Git | Syntax::Hg | Syntax::Darcs | Syntax::GitRemote => Tilde::Shell,
             Syntax::Toml => Tilde::Verbatim,
         };
         let mut words = Words::default();
         words
-            .push_split(value, Position::Program, tilde)
+            .push_split(runner.consume(value), Position::Program, tilde)
             .map_err(unproven)?;
         self.judge_queue(ctx, &mut words)
     }
@@ -2645,8 +2677,10 @@ impl Scan<'_> {
     /// only when it is path-shaped (and resolved), empty, a program name, or an
     /// option; any other word, a number included, may name a file relative to
     /// the directory the tool runs in, so it is unprovable, and `--` or `-`
-    /// lets a program read any later word as such a file. Runner prefixes are
-    /// stripped from a program word only ([`command_text`]).
+    /// lets a program read any later word as such a file. Every word is judged
+    /// as written: a runner prefix a tool consumes is gone before the value is
+    /// split ([`Runner`]), so a runner-shaped word left here (`!/x`, `=/x`) is
+    /// the relative path the shell runs.
     ///
     /// Every queued word is strictly shorter than the word that queued it,
     /// but an option word queued back once to be judged whole, and
@@ -2660,7 +2694,7 @@ impl Scan<'_> {
                 return Err(unproven(Unprovable::Glob));
             }
             if stage == Stage::Fresh
-                && let Some(argument) = option_argument(command_text(&word, position))
+                && let Some(argument) = option_argument(&word)
                     .filter(|argument| !argument.is_empty())
                     .map(str::to_owned)
             {
@@ -2672,7 +2706,7 @@ impl Scan<'_> {
                     .map_err(unproven)?;
                 continue;
             }
-            let text = command_text(&word, position);
+            let text = word.as_str();
             if text == "-" || text == "--" {
                 return Err(unproven(Unprovable::EndOfOptions));
             }
@@ -2684,12 +2718,6 @@ impl Scan<'_> {
             let shaped = is_path_shaped(text);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
-            }
-            if text.len() != word.len() && is_path_shaped(&word) {
-                // A tool that consumes no runner prefix runs the word as
-                // written: `!/x` is then the path `!/x`, relative to the
-                // directory it runs in.
-                self.judge_path(ctx, &word, Reach::Command)?;
             }
             if text.contains(is_word_separator) {
                 words.push_pieces(text, position).map_err(unproven)?;
@@ -3093,32 +3121,6 @@ fn option_argument(word: &str) -> Option<&str> {
     Some(rest.strip_prefix('=').unwrap_or(rest))
 }
 
-/// The text of `word` judged at `position`: a program word without its runner prefixes.
-///
-/// Only a program word may carry a prefix a tool consumes before running what
-/// follows; an argument reaches its program verbatim, so `=/x` there is the
-/// relative path `=/x`, never `/x`.
-fn command_text(word: &str, position: Position) -> &str {
-    match position {
-        Position::Program => strip_runners(word),
-        Position::Argument => word,
-    }
-}
-
-/// `word` without the prefixes that make a tool run what follows (`=`, `!`, `ext::`, `python:`).
-fn strip_runners(word: &str) -> &str {
-    let mut rest = word;
-    while let Some(next) = rest
-        .strip_prefix('=')
-        .or_else(|| rest.strip_prefix('!'))
-        .or_else(|| rest.strip_prefix("ext::"))
-        .or_else(|| rest.strip_prefix("python:"))
-    {
-        rest = next;
-    }
-    rest
-}
-
 /// Whether `word` is shaped like a path: it holds a separator, starts with `~`, or is `.` or `..`.
 fn is_path_shaped(word: &str) -> bool {
     word.contains(is_separator) || word.starts_with('~') || word == "." || word == ".."
@@ -3306,7 +3308,7 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         key,
     } = setting
     else {
-        return Route::Judge(Role::Words);
+        return Route::Judge(Role::Words(Runner::None));
     };
     let key = key.to_ascii_lowercase();
     let subsection = subsection.as_deref();
@@ -3338,10 +3340,16 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         return Route::RemoteName;
     }
     if exempt(VcsKind::Git, (&**section, subsection, key.as_str())) {
-        Route::Judge(Role::Exempt)
-    } else {
-        Route::Judge(Role::Words)
+        return Route::Judge(Role::Exempt);
     }
+    // Git strips one `!` from an alias (`git.c`) and a credential helper
+    // (`credential.c`), then runs the rest through the shell.
+    let runner = if matches!(shape, ("alias", false, _) | ("credential", _, "helper")) {
+        Runner::Bang
+    } else {
+        Runner::None
+    };
+    Route::Judge(Role::Words(runner))
 }
 
 /// Whether `setting` of a file in `syntax` gives a Git remote a URL: `remote.<name>.url` or `pushurl`, or a line of a `remotes/` or `branches/` file.
@@ -3398,7 +3406,7 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
     let (section, key) = match setting {
         Setting::Key { section, key, .. } => (section, key),
         Setting::Include => return Role::Include(Reading::Always),
-        Setting::Line(_) => return Role::Words,
+        Setting::Line(_) => return Role::Words(Runner::None),
     };
     if &**section == "extensions" {
         // A leading `!` disables the extension; the path after it is still judged.
@@ -3421,10 +3429,16 @@ fn hg_role(setting: &Setting, value: &str) -> Role {
         return Role::Url { scp: false };
     }
     if exempt(VcsKind::Mercurial, (&**section, None, key.as_str())) {
-        Role::Exempt
-    } else {
-        Role::Words
+        return Role::Exempt;
     }
+    // Mercurial runs an `[alias]` after one `!` through the shell, and calls
+    // a `[hooks]` value after `python:` as a Python callable it imports.
+    let runner = match &**section {
+        "alias" => Runner::Bang,
+        "hooks" => Runner::Python,
+        _ => Runner::None,
+    };
+    Role::Words(runner)
 }
 
 /// A character stream with Git's line handling: `\r\n` reads as `\n`, the end reads as `\n`.
@@ -5448,7 +5462,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_prefixed_program_word_judged_as_written_too() {
+    fn runner_prefix_judged_as_written_where_no_tool_consumes_it() {
         let f = fixture("runnerwhole");
         let out = f.out.display();
         for text in [
@@ -5456,6 +5470,11 @@ mod tests {
             format!("[core]\n\tpager = ={out}/less\n"),
             format!("[core]\n\teditor = !{out}/e\n"),
             format!("[alias]\n\tx = !!{out}/x\n"),
+            format!("[alias]\n\tx = \"'!'{out}/x\"\n"),
+            format!("[credential]\n\thelper = !!{out}/helper\n"),
+            format!("[core]\n\tpager = less;!{out}/x\n"),
+            format!("[alias]\n\tx = !sh -c '!{out}/x'\n"),
+            format!("[alias]\n\tx = !sh -c '!{out}/x {out}/y'\n"),
         ] {
             git_config(&f, &text);
             let result = scan_git(&f);
@@ -5466,6 +5485,69 @@ mod tests {
         }
         git_config(&f, "[alias]\n\tst = !git\n");
         assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn runner_prefix_consumed_once_where_the_tool_declares_it() {
+        let f = fixture("runnerdeclared");
+        let out = f.out.display();
+        for text in [
+            format!("[alias]\n\tx = !{out}/a {out}/b\n"),
+            format!("[credential]\n\thelper = !{out}/helper\n"),
+            format!("[credential \"https://example.com\"]\n\thelper = !{out}/helper\n"),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+        // Under a key not declared to consume the prefix, the same values refuse.
+        for text in [
+            format!("[core]\n\tpager = !{out}/a {out}/b\n"),
+            format!("[credential]\n\tusername = !{out}/helper\n"),
+            format!("[alias \"x\"]\n\tcommand = !{out}/helper\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hg_runner_prefix_consumed_only_by_alias_and_hooks() {
+        let f = fixture("hgrunner");
+        let dot_hg = f.tree.join(".hg");
+        let out = f.out.display();
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        for text in [
+            format!("[alias]\nx = !{out}/x\n"),
+            "[hooks]\nx = python:hgext.hook.run\n".to_owned(),
+            format!("[hooks]\nx = python:{out}/mod.run\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            assert_eq!(
+                scan_with(&f, &roots, ConfigLimits::DEFAULT),
+                Ok(()),
+                "{text:?}"
+            );
+        }
+        for text in [
+            format!("[alias]\nx = !!{out}/x\n"),
+            format!("[alias]\nx = python:{out}/mod.run\n"),
+            format!("[hooks]\nx = !{out}/x\n"),
+            format!("[ui]\neditor = !{out}/x\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
