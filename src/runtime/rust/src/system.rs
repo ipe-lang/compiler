@@ -3285,16 +3285,16 @@ mod env_ceiling_tests {
     #[test]
     fn an_env_value_refusal_escapes_and_truncates_its_echo() {
         let refusal = EnvValueRefusal::new(
-            "IPE_TEST_VALUE",
+            "EXAMPLE_VALUE",
             "an IP address",
             format!("\u{1b}[31m\n{}", "x".repeat(ENV_VALUE_SHOWN_CHARS * 2)).as_bytes(),
         );
         let shown = refusal.to_string();
-        assert_eq!(refusal.name(), "IPE_TEST_VALUE");
+        assert_eq!(refusal.name(), "EXAMPLE_VALUE");
         assert!(!shown.contains('\u{1b}'), "ESC is escaped: {shown}");
         assert!(!shown.contains('\n'), "a newline is escaped: {shown}");
         assert!(
-            shown.starts_with("IPE_TEST_VALUE must be an IP address (got \"\\u{1b}[31m\\n"),
+            shown.starts_with("EXAMPLE_VALUE must be an IP address (got \"\\u{1b}[31m\\n"),
             "{shown}"
         );
         assert_eq!(
@@ -3302,10 +3302,10 @@ mod env_ceiling_tests {
             ENV_VALUE_SHOWN_CHARS - 6,
             "the echo stops after its first source characters: {shown}"
         );
-        let invalid = EnvValueRefusal::new("IPE_TEST_VALUE", "an IP address", b"\xFF1");
+        let invalid = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", b"\xFF1");
         assert_eq!(
             invalid.to_string(),
-            "IPE_TEST_VALUE must be an IP address (got \"\\xFF1\")"
+            "EXAMPLE_VALUE must be an IP address (got \"\\xFF1\")"
         );
     }
 

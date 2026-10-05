@@ -340,7 +340,7 @@ pub fn log_warn_with<E: Send + 'static, A: IpeInterpolate>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod threshold_tests {
     use super::{
         LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LogThreshold,
