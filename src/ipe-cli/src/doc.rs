@@ -2800,9 +2800,8 @@ fn check(path: &Path) -> Result<(), CliError> {
     for gap in &gaps {
         let _ = writeln!(report, "  {}.{}", gap.module, gap.name);
     }
-    let _ = write!(
-        report,
-        "add a `{-| … -}` doc-comment above each, or hide it from the module's exposing list"
+    report.push_str(
+        "add a `{-| … -}` doc-comment above each, or hide it from the module's exposing list",
     );
     Err(CliError::DocCoverage(crate::style::TerminalSafe::sanitize(
         &report,
