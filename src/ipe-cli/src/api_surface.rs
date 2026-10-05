@@ -235,9 +235,16 @@ fn signature_doc(ty: &Ty, interner: &ipe_intern::Interner) -> Result<TyDoc, Diag
     ty_to_doc(ty, interner, &mut namer)
 }
 
-/// Project one module's [`TypedInterface`] into a [`ModuleApi`].
+/// Project one module's [`TypedInterface`] plus its exported kernel aliases into
+/// a [`ModuleApi`].
+///
+/// A kernel alias (`f = Kernel.kernel "Module_function"`) emits no body, so the
+/// typed interface omits it; its public scheme is the kernel's own, from the
+/// kernel type table. Both enter the same `values` map, so every exported value
+/// reaches the surface whichever way it is bound.
 fn project_interface(
     interface: &TypedInterface,
+    kernel_aliases: &[(ipe_intern::Symbol, Ty)],
     interner: &ipe_intern::Interner,
     module: &ModulePath,
 ) -> Result<ModuleApi, DiffError> {
@@ -253,6 +260,17 @@ fn project_interface(
             continue;
         };
         let doc = signature_doc(&scheme.ty, interner).map_err(typecheck_err)?;
+        values.insert(name.to_owned(), render_ty(&doc));
+        value_types.insert(name.to_owned(), doc);
+    }
+    for (name, ty) in kernel_aliases {
+        let Some(name) = interner.resolve(*name) else {
+            continue;
+        };
+        if values.contains_key(name) {
+            continue;
+        }
+        let doc = signature_doc(ty, interner).map_err(typecheck_err)?;
         values.insert(name.to_owned(), render_ty(&doc));
         value_types.insert(name.to_owned(), doc);
     }
@@ -523,11 +541,13 @@ fn extract_from_db(
         let Some(interface) = ipe_db::typed_interface(db, source_root, *file) else {
             return Err(closed_interface_refusal(db, source_root, *file, path));
         };
+        // Demanded before the interner lock: both queries lock it themselves.
+        let kernel_aliases = exported_kernel_aliases(db, source_root, *file, path)?;
         // Scope the interner lock to the projection only — it must not outlive
         // this statement, and the mutex is not reentrant.
         let module_api = {
             let interner = db.interner().lock();
-            project_interface(interface, &interner, path)?
+            project_interface(interface, &kernel_aliases, &interner, path)?
         };
         modules.insert(path.clone(), module_api);
     }
@@ -536,6 +556,42 @@ fn extract_from_db(
         return Err(DiffError::OpenInterface { module: Vec::new() });
     }
     Ok(PublicApi { modules })
+}
+
+/// The exported kernel aliases of `file`, each paired with its kernel's scheme.
+///
+/// An alias whose kernel has no scheme in the table is left out: it is not
+/// callable, and the surface carries only values with a checker signature.
+fn exported_kernel_aliases(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+    path: &[String],
+) -> Result<Vec<(ipe_intern::Symbol, Ty)>, DiffError> {
+    let typecheck_err = |diag: Diagnostic| DiffError::Typecheck {
+        module: path.to_vec(),
+        diag: Box::new(diag),
+    };
+    let canonical = ipe_db::canonicalize(db, source_root, file)
+        .clone()
+        .map_err(typecheck_err)?;
+    if canonical.exports.kernel_aliases.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = ipe_db::kernel_types(db, source_root)
+        .clone()
+        .map_err(typecheck_err)?;
+    Ok(canonical
+        .exports
+        .kernel_aliases
+        .iter()
+        .filter_map(|(name, alias)| {
+            table
+                .iter()
+                .find(|(kernel, _)| *kernel == alias.id)
+                .map(|(_, ty)| (*name, ty.clone()))
+        })
+        .collect())
 }
 
 /// Why a module has no typed interface: a red program or an open one.
