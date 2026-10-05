@@ -453,11 +453,13 @@ fn reaches_raw_passthrough(src: &str) -> bool {
 }
 
 /// Whether `src` names a procfs environment file (`/proc/self/environ`, a
-/// `join("environ")`): literals included, line comments not.
+/// `join("environ")`): literals included, line comments not. The literal's
+/// last path component must be exactly `environ`, so a key that merely ends in
+/// those letters (`exportableenviron`) is not a procfs read.
 fn reads_proc_environ(src: &str) -> bool {
     src.lines()
         .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-        .any(|line| line.contains("environ\""))
+        .any(|line| line.contains("\"environ\"") || line.contains("/environ\""))
 }
 
 /// How many times `src`'s code (comments and literals aside) names the
@@ -874,6 +876,10 @@ fn a_planted_passthrough_or_procfs_bypass_is_detected() {
     assert!(!names_ident("let e = granted_envs;", JAIL_ENV_FN));
     assert!(!reads_proc_environ("// read /proc/self/environ\"x\""));
     assert!(!reads_proc_environ("let e = \"the environment\";"));
+    assert!(!reads_proc_environ(
+        "(\"experimental.exportableenviron\", INERT),"
+    ));
+    assert!(!reads_proc_environ("let k = \"hooks.subenviron\";"));
 }
 
 #[test]
