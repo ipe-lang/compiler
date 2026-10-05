@@ -48,7 +48,6 @@ button label html =
 
 
 -- ── fixtures ────────────────────────────────────────────────────────────
-
 -- A model on the queue page, nothing loaded.
 baseModel : Model
 baseModel =
@@ -203,7 +202,6 @@ withSeededIndex name body =
 
 
 -- ── decision buttons exist only for a verified source ───────────
-
 type alias Withheld =
     { view : SourceView
     , reason : String
@@ -260,7 +258,6 @@ withheldRefusePanelRefuses loaded entry =
 
 
 -- ── queue states and counts ─────────────────────────────────────
-
 -- The queue page in each state that shows no card, with the text that state
 -- shows: loading, failed, an empty queue, and a page with no open unit while
 -- the queue holds some.
@@ -334,7 +331,6 @@ countsFollowModel a b =
 
 
 -- ── error text ──────────────────────────────────────────────────────
-
 -- A refusal error is shown in the open refusal panel, escaped.
 refuseErrorEscaped : Index.UnitView -> Bool
 refuseErrorEscaped loaded =
@@ -374,7 +370,6 @@ decisionErrorEscaped loaded =
 
 
 -- ── the address the page reports ────────────────────────────────────
-
 -- The path an address reports is an attribute value, escaped at the sink; the
 -- three pages report their fixed paths.
 pathAttributeEscaped : Index.UnitView -> Bool
@@ -398,7 +393,6 @@ pathAttributeEscaped loaded =
 
 
 -- ── links ──────────────────────────────────────────────────────────
-
 withLinks : List Link -> Index.UnitView -> Index.UnitView
 withLinks links loaded =
     { loaded | links = { links = links, hidden = NoneHidden } }
@@ -445,7 +439,6 @@ safeLinkHasHref loaded =
 
 
 -- ── checks on the seeded fixture units ──────────────────────────────────
-
 seededChecks : Index.UnitView -> Index.UnitView -> List ( String, Bool )
 seededChecks a b =
     let
@@ -496,7 +489,6 @@ showsNoStateText html =
 
 
 -- ── a hostile source token ──────────────────────────────────────────────
-
 -- The fixture unit's four lines with a comment holding `hostileText`.
 hostileView : String
 hostileView =
@@ -524,7 +516,6 @@ hostileSourceChecks =
 
 
 -- ── stored decisions ────────────────────────────────────────────
-
 -- A reason one character past the bound, written to the review table as an
 -- older or edited file may hold it.
 overlongReason : String
@@ -603,7 +594,6 @@ storedPure loaded long ok yes =
 
 
 -- ── harness ─────────────────────────────────────────────────────────────
-
 -- A group whose fixtures fail to build reports one failed check by name, with
 -- the error, instead of ending the run.
 group : String -> Task.Task Error (List ( String, Bool )) -> Task.Task Error (List ( String, Bool ))
