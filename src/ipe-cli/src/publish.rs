@@ -850,6 +850,9 @@ impl CurlRunError {
             Self::CouldNotRun(RunError::PipeDrainTimeout(stream)) => {
                 CliError::ChildPipeHeld(stream)
             }
+            Self::CouldNotRun(RunError::PipeRead(stream, kind)) => {
+                CliError::ChildPipeUnread(stream, kind)
+            }
             Self::Scratch(_) | Self::CouldNotRun(_) | Self::Status(_) | Self::Body => other(),
         }
     }
@@ -1373,6 +1376,8 @@ enum GitStepFailure {
     Exceeded(IngestRefusal),
     /// git finished, but a process it started held an output pipe open and was stopped.
     PipeHeld(remote_ingest::Stream),
+    /// Reading one of git's output pipes failed, so its output was not used.
+    PipeUnread(remote_ingest::Stream, std::io::ErrorKind),
 }
 
 impl GitStepFailure {
@@ -1382,6 +1387,7 @@ impl GitStepFailure {
             Self::Git(git) => on_git(&git),
             Self::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             Self::PipeHeld(stream) => CliError::ChildPipeHeld(stream),
+            Self::PipeUnread(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         }
     }
 }
@@ -1392,10 +1398,11 @@ fn git_step(result: Result<Captured, RunError>) -> Result<(), GitStepFailure> {
     match result {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(GitStepFailure::Git(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            out.stderr.to_terminal().as_str().to_owned(),
         )),
         Err(RunError::Exceeded(refusal)) => Err(GitStepFailure::Exceeded(refusal)),
         Err(RunError::PipeDrainTimeout(stream)) => Err(GitStepFailure::PipeHeld(stream)),
+        Err(RunError::PipeRead(stream, kind)) => Err(GitStepFailure::PipeUnread(stream, kind)),
         Err(RunError::Spawn(e)) => Err(GitStepFailure::Git(format!("could not run `git`: {e}"))),
         Err(other @ (RunError::Wait(_) | RunError::Measure(..))) => {
             Err(GitStepFailure::Git(other.to_string()))
@@ -1619,6 +1626,7 @@ fn run_git_capture(root: &Path, args: &[&str]) -> Result<Option<String>, CliErro
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::LocalLimitExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if output.status.success() {
         Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
