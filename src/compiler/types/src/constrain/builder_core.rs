@@ -45,6 +45,9 @@ impl<'a> Builder<'a> {
         seed_top_level: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>>,
     ) -> Result<Generated, InferError> {
         let builtins = Builtins::new(interner).map_err(InferError::unsited)?;
+        let builtin_ctors = builtins
+            .ctor_schemes(interner)
+            .map_err(InferError::unsited)?;
         let mut builder = Self {
             uf,
             interner,
@@ -63,6 +66,7 @@ impl<'a> Builder<'a> {
             wildcard_any_return_bindings: BTreeSet::new(),
             wildcard_any_use_results: Vec::new(),
             ctors: BTreeMap::new(),
+            sealed_ctors: builtin_ctors.sealed,
             typed_rigids: Vec::new(),
             scheme_apps: Vec::new(),
             super_vars: Vec::new(),
@@ -73,29 +77,13 @@ impl<'a> Builder<'a> {
             scheme_cache: RefCell::new(vec![SchemeSlot::Unresolved; StdlibKernel::COUNT]),
         };
 
-        // Register the Prelude-built-in constructor schemes (`True` / `False` /
-        // `Just` / `Nothing` / `Ok` / `Err`) first, so a reference or pattern
-        // instantiates `Maybe a` / `Result e a` / `Bool` fresh per use site. A
-        // user `type` cannot shadow these names (the canon §3.2 gate rejects it),
-        // so the module-union loop below never collides with them.
-        for (name, scheme) in builder.builtins.ctor_schemes() {
-            // Every built-in scheme's `result` is the enum type it builds, a
-            // home-less `Ty::Con` (`Bool` / `Maybe` / `Result` / …). Its
-            // `(module, name)` is exactly the `(home, type_name)` half of the
-            // qualified key — the same empty-home identity canon stamps on a
-            // `PCtor` for these ambient built-ins — so the key agrees with the
-            // lookup side by construction. A non-`Con` result would be a
-            // built-in table bug, not user input, so fall back to the empty
-            // home + the constructor's own name rather than panic.
-            let (home, type_name) = match &scheme.result {
-                Ty::Con {
-                    module, name: ty, ..
-                } => (module.clone(), *ty),
-                _ => (Vec::new(), name),
-            };
-            builder
-                .ctors
-                .insert((home, type_name, name), Rc::new(scheme));
+        // Register the built-in constructor schemes (derived from canon's
+        // `BUILTIN_UNIONS`) first, so a reference or pattern instantiates
+        // `Maybe a` / `Result e a` / `Bool` fresh per use site. A user `type`
+        // cannot shadow these names (the canon §3.2 gate rejects it), so the
+        // module-union loop below never collides with them.
+        for (key, scheme) in builtin_ctors.schemes {
+            builder.ctors.insert(key, Rc::new(scheme));
         }
 
         // Register every data constructor's scheme up front, so a `VarCtor`
