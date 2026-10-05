@@ -128,7 +128,8 @@ const _: () = assert!(
     shown_eq(
         &ipe_ir::SHOWN_LEAVES,
         &ipe_runtime_rust::stringify::SHOWN_RUNTIME_TYPES,
-    ) && ipe_ir::MAX_SHOWN_TUPLE_ARITY == ipe_runtime_rust::stringify::MAX_SHOWN_TUPLE_ARITY,
+    ) && ipe_ir::MAX_SHOWN_TUPLE_ARITY == ipe_runtime_rust::stringify::MAX_SHOWN_TUPLE_ARITY
+        && ipe_types::MAX_SHOWN_TUPLE_ARITY == ipe_ir::MAX_SHOWN_TUPLE_ARITY,
     "the compiler's show leaves must match the runtime's show rows"
 );
 

@@ -18,6 +18,8 @@ strum = { version = "0.26" }
 
 [dev-dependencies]
 ipe_parse = { path = "../parse" }
+# `SHOWN_LEAVES`: the show gate is pinned against the compiler's show table.
+ipe_ir = { path = "../ir" }
 
 [lints]
 workspace = true

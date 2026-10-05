@@ -3473,6 +3473,7 @@ dependencies = [
  "ipe_diagnostics",
  "ipe_env",
  "ipe_intern",
+ "ipe_ir",
  "ipe_kernels",
  "ipe_parse",
  "strum 0.26.3",
