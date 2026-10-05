@@ -17,6 +17,14 @@
 //! writes its `Debug` through `redacting_debug!` instead of deriving it, which
 //! takes it out of this scan's reach and into the macro's exhaustive field list.
 //!
+//! A value's `IpeStringify` text is the second way it prints, so the same walk
+//! pins where that text is written. Outside test code, an `impl IpeStringify`
+//! written by hand sits only in [`SHOW_IMPL_FILES`]; every other runtime type
+//! renders through a `show_row!` row, which lists its leaf and policy in the
+//! show table. The compiler backend never spells the removed `Debug` fallback
+//! ([`REFUSED_BACKEND_SPELLINGS`]), so an emitted field renders through its
+//! show row or as a fixed marker.
+//!
 //! A node is skipped only when its `cfg` is proven test-only, so an
 //! unrecognised shape keeps it scanned.
 #![cfg(not(target_arch = "wasm32"))]
@@ -95,6 +103,13 @@ const ALLOWED: [Allowed; 1] = [Allowed {
     field: "user",
     why: "a DSN user name is an identifier; the password beside it is `Secret`",
 }];
+
+/// The runtime files allowed a hand-written `impl IpeStringify`: the trait's
+/// own module, which holds the container and primitive rows.
+const SHOW_IMPL_FILES: &[&str] = &["stringify.rs"];
+
+/// Spellings of the `Debug` fallback the backend must never emit.
+const REFUSED_BACKEND_SPELLINGS: &[&str] = &["stringify::Wrap", ")).dispatch()"];
 
 /// The words of an identifier, split at `_` and at lower-to-upper case changes.
 fn words(ident: &str) -> Vec<String> {
@@ -212,11 +227,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         // A `#[test]` / `#[tokio::test]` function exists only under `test`.
-        let test_fn = node
-            .attrs
-            .iter()
-            .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"));
-        if !test_fn && !cfg_test_only(&node.attrs) {
+        if !is_test_fn(&node.attrs) && !cfg_test_only(&node.attrs) {
             visit::visit_item_fn(self, node);
         }
     }
@@ -307,6 +318,170 @@ fn no_derived_debug_prints_a_secret() {
             entry.field
         );
     }
+}
+
+/// Whether `attrs` mark a `#[test]` / `#[tokio::test]` function.
+fn is_test_fn(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"))
+}
+
+/// Collects every non-test hand-written `impl IpeStringify` of one file, as
+/// `file:Type`.
+struct ShowImplScan<'a> {
+    file: &'a str,
+    hits: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for ShowImplScan<'_> {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if !cfg_test_only(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        if !is_test_fn(&node.attrs) && !cfg_test_only(&node.attrs) {
+            visit::visit_item_fn(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        if cfg_test_only(&node.attrs) {
+            return;
+        }
+        let shows = node.trait_.as_ref().is_some_and(|(_, path, _)| {
+            path.segments
+                .last()
+                .is_some_and(|seg| seg.ident == "IpeStringify")
+        });
+        if shows {
+            let ty = match &*node.self_ty {
+                Type::Path(tp) => tp
+                    .path
+                    .segments
+                    .last()
+                    .map_or_else(String::new, |seg| seg.ident.to_string()),
+                _ => "<type>".to_owned(),
+            };
+            self.hits.push(format!("{}:{ty}", self.file));
+        }
+        visit::visit_item_impl(self, node);
+    }
+}
+
+/// Every non-test hand-written `impl IpeStringify` of `src`, read as `file`.
+#[allow(clippy::expect_used)] // an unparsable source must fail the scan, never be skipped
+fn show_impls(file: &str, src: &str) -> Vec<String> {
+    let tree = syn::parse_file(src).expect("a runtime source parses");
+    let mut scan = ShowImplScan {
+        file,
+        hits: Vec::new(),
+    };
+    scan.visit_file(&tree);
+    scan.hits
+}
+
+/// The hand-written `impl IpeStringify` sites of `sources` outside
+/// [`SHOW_IMPL_FILES`].
+fn stray_show_impls(sources: &[(String, String)]) -> Vec<String> {
+    sources
+        .iter()
+        .filter(|(name, _)| !SHOW_IMPL_FILES.contains(&name.as_str()))
+        .flat_map(|(name, src)| show_impls(name, src))
+        .collect()
+}
+
+/// Every `file: spelling` of `sources` that spells a refused backend form.
+fn refused_spellings(sources: &[(String, String)]) -> Vec<String> {
+    sources
+        .iter()
+        .flat_map(|(name, src)| {
+            REFUSED_BACKEND_SPELLINGS
+                .iter()
+                .filter(|spelling| src.contains(**spelling))
+                .map(move |spelling| format!("{name}: {spelling}"))
+        })
+        .collect()
+}
+
+/// Outside test code, a runtime type's `IpeStringify` is a `show_row!` row
+/// unless it sits in [`SHOW_IMPL_FILES`], and each listed file still holds one.
+#[test]
+fn every_runtime_show_impl_is_a_listed_row() {
+    let root = e2e_support::manifest_dir!().join("src");
+    let sources = rust_sources(&root);
+    assert_eq!(stray_show_impls(&sources), Vec::<String>::new());
+    for file in SHOW_IMPL_FILES {
+        let held = sources
+            .iter()
+            .find(|(name, _)| name == file)
+            .map(|(name, src)| show_impls(name, src));
+        assert!(
+            held.is_some_and(|impls| !impls.is_empty()),
+            "stale show-impl file {file}"
+        );
+    }
+}
+
+/// The backend's source and templates never spell the `Debug` fallback.
+#[test]
+fn the_backend_never_spells_the_debug_fallback() {
+    let backend = e2e_support::manifest_dir!().join("../../compiler/backend");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for dir in ["src", "rust/src", "rust/templates"] {
+        let root = backend.join(dir);
+        assert!(root.is_dir(), "the backend tree has no {}", root.display());
+        sources.extend(
+            rust_sources(&root)
+                .into_iter()
+                .map(|(name, src)| (format!("{dir}/{name}"), src)),
+        );
+    }
+    assert!(
+        sources
+            .iter()
+            .any(|(name, _)| name == "rust/src/emit_types.rs"),
+        "the backend walk did not read rust/src/emit_types.rs"
+    );
+    assert_eq!(refused_spellings(&sources), Vec::<String>::new());
+}
+
+#[test]
+fn a_hand_written_show_impl_outside_the_listed_files_is_refused() {
+    let src = "impl IpeStringify for Widget { fn ipe_show(&self) -> String { String::new() } }
+        impl<T> crate::stringify::IpeStringify for Holder<T> { fn ipe_show(&self) -> String { String::new() } }
+        impl std::fmt::Display for Widget { fn fmt(&self, f: &mut Formatter) -> Result { Ok(()) } }
+        show_row!(\"Widget\", Value, [] Widget, |w| w.0.ipe_show());
+        #[cfg(test)] mod tests { impl IpeStringify for Probe { fn ipe_show(&self) -> String { String::new() } } }
+        #[cfg(all(test, feature = \"tui\"))] impl IpeStringify for Gated { fn ipe_show(&self) -> String { String::new() } }";
+    let sources = [
+        ("widget.rs".to_owned(), src.to_owned()),
+        ("stringify.rs".to_owned(), src.to_owned()),
+    ];
+    assert_eq!(
+        stray_show_impls(&sources),
+        ["widget.rs:Widget", "widget.rs:Holder"]
+    );
+}
+
+#[test]
+fn a_backend_spelling_of_the_debug_fallback_is_refused() {
+    let sources = [
+        (
+            "emit.rs".to_owned(),
+            "format!(\"(&ipe_runtime::stringify::Wrap({b})).dispatch()\")".to_owned(),
+        ),
+        (
+            "ctor.rs".to_owned(),
+            "// `Msg::Wrap(a)` and `IpeStringify::ipe_show(p0)`".to_owned(),
+        ),
+    ];
+    assert_eq!(
+        refused_spellings(&sources),
+        ["emit.rs: stringify::Wrap", "emit.rs: )).dispatch()"]
+    );
 }
 
 /// The flagged fields of a fixture, as `type.field` strings.
