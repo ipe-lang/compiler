@@ -38,6 +38,9 @@ uidParseRefuses =
         , "%2e%2e"
         , String.repeat 63 "a" ++ codeText 8238
         , codeText 8238 ++ String.repeat 63 "a"
+        , String.repeat 63 "a" ++ "\n"
+        , String.repeat 63 "a" ++ codeText 65345
+        , String.repeat 63 "a" ++ codeText 1635
         ]
         && Result.map Uid.toString (Uid.parse hex)
         == Ok hex
@@ -239,34 +242,35 @@ uncheckedReview name rows =
 
 
 -- True when `task` fails with an error that names `unit`.
-failsNaming : Uid -> Task.Task Error a -> Task.Task Error Bool
-failsNaming unit task =
+failsNaming : Uid -> String -> Task.Task Error a -> Task.Task Error Bool
+failsNaming unit stored task =
     task
         |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (String.contains (Uid.toString unit) (Error.toString e)))
+        |> Task.onError (\e -> Task.succeed (String.contains (Uid.toString unit) (Error.toString e) && not (String.contains stored (Error.toString e))))
 
 
--- True when `task` fails.
-fails : Task.Task Error a -> Task.Task Error Bool
-fails task =
+-- True when `task` fails with an error that does not repeat `stored`.
+failsWithout : String -> Task.Task Error a -> Task.Task Error Bool
+failsWithout stored task =
     task
         |> Task.map (\_ -> False)
-        |> Task.onError (\_ -> Task.succeed True)
+        |> Task.onError (\e -> Task.succeed (not (String.contains stored (Error.toString e))))
 
 
 -- A stored decision that is neither `approve` nor `refuse` fails every read
 -- of its row with a typed error naming the row's uid, never reading as an
--- approval; a stored uid that is not a unit id fails the History page.
+-- approval; a stored uid that is not a unit id fails the History page. Neither
+-- error repeats the stored text.
 -- Red if an unknown decision reads as any decision.
 unknownStoredDecisionRefused : Task.Task Error Bool
 unknownStoredDecisionRefused =
     do
         db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
-        byPair <- failsNaming (uid "u-m") (LibDb.findDecision db (uid "u-m") "h")
-        byUid <- failsNaming (uid "u-m") (LibDb.findLatestForUid db (uid "u-m"))
-        page <- failsNaming (uid "u-m") (LibDb.historyPage db PageSize.history HistoryStart)
+        byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision db (uid "u-m") "h")
+        byUid <- failsNaming (uid "u-m") "maybe" (LibDb.findLatestForUid db (uid "u-m"))
+        page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage db PageSize.history HistoryStart)
         bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
-        badUid <- fails (LibDb.historyPage bad PageSize.history HistoryStart)
+        badUid <- failsWithout "zz" (LibDb.historyPage bad PageSize.history HistoryStart)
         Task.succeed (byPair && byUid && page && badUid)
 
 
@@ -290,10 +294,18 @@ blankRefusal decision =
             False
 
 
+-- Two labels longer than a unit id differ only past the 64th character, so a
+-- fixture that truncated would collapse them into one uid.
+longLabelsStayDistinct : Bool
+longLabelsStayDistinct =
+    uid (String.repeat 40 "a") /= uid (String.repeat 41 "a")
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ Task.succeed ( "a unit id is exactly 64 lowercase hex digits", uidParseRefuses )
+        , Task.succeed ( "fixture uids for long labels stay distinct", longLabelsStayDistinct )
         , Task.succeed ( "a route uid that is not a unit id is refused before any load", routeUidRefusedNotQueried )
         , Task.succeed ( "a link target that is not a unit id renders as text", badLinkUidRendersText )
         , Task.succeed ( "a page size below one row or past the ceiling has no representation", pageSizeRefuses )

@@ -124,9 +124,9 @@ tableExists db name =
 
 -- The fixture unit id named by `label`: the label's bytes in lowercase hex,
 -- right-padded with `0` to 64 digits, so fixture ids keep the order of their
--- labels. It goes through `Uid.parse` like any id; a label past 32 bytes is
--- not an id and reads as the all-zero id, which no fixture names, so the
--- test using it finds no unit.
+-- labels. A label past 32 bytes is named by the hash of the label instead,
+-- so two distinct long labels stay distinct ids. It goes through `Uid.parse`
+-- like any id.
 uid : String -> Uid
 uid label =
     case Uid.parse (fixtureHex label) of
@@ -139,7 +139,15 @@ uid label =
 
 fixtureHex : String -> String
 fixtureHex label =
-    String.padRight 64 '0' (Bytes.toHex (Bytes.fromString label))
+    let
+        hex =
+            Bytes.toHex (Bytes.fromString label)
+    in
+    if String.length hex > 64 then
+        Crypto.sha256 label
+
+    else
+        String.padRight 64 '0' hex
 
 
 -- A rebuild bound of `pageCeiling` pages of `rows` pairs, parsed the one
