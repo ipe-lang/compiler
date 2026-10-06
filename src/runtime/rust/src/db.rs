@@ -2202,14 +2202,14 @@ fn migrate_checksum(sql: &str) -> String {
 ///
 /// DB-ops mode (`Db_migrateApply`): when the `IPE_DB_OP` env var
 /// is set — the CLI `ipe db status` / `ipe db migrate --backend rust` sets it — the
-/// task PRINTS a human report and `process::exit`s instead of returning, so the
+/// task PRINTS a human report and ends the process through `system::exit_process` instead of returning, so the
 /// surrounding app never starts serving:
 ///
 /// - `status`: print applied / pending / drifted, exit 0 (1 if drift)
 /// - `migrate`: apply pending, print summary, exit 0 (1 on error, to stderr)
 /// - unset: normal Task behaviour (apply, return Ok/Err) — UNCHANGED
 ///
-/// `process::exit` is reachable ONLY under the CLI-set env op (never from a normal
+/// The exit is reachable ONLY under the CLI-set env op (never from a normal
 /// well-typed Ipê `Db.migrate` call), and it is a deliberate CLI termination, not a
 /// panic — the no-runtime-panic thesis is about faults, not intentional exits.
 pub fn db_migrate_apply<E: Send + From<String> + 'static>(
@@ -2228,8 +2228,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                 if op == "migrate" {
                     crate::system::write_stderr_line(&format!("db: {} failed", $ctx));
                     let _ = std::io::Write::flush(&mut std::io::stderr());
-                    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: a migration infra failure exits the process (library path returns a Task Err instead) [ledger #boundary]
-                    std::process::exit(1);
+                    // `ipe db migrate` CLI-op boundary: a migration infra failure exits the process (library path returns a Task Err instead)
+                    crate::system::exit_process(1);
                 }
                 return IpeResult::Err($err);
             }};
@@ -2315,11 +2315,11 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                     "\ndb: drift detected — an applied migration's SQL was edited. \
                      Restore its original text, or ship a new compensating migration.",
                 );
-                // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` status-op boundary: drift detected, exit non-zero [ledger #boundary]
-                std::process::exit(1);
+                // `ipe db migrate` status-op boundary: drift detected, exit non-zero
+                crate::system::exit_process(1);
             }
-            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` status-op boundary: clean status, exit zero [ledger #boundary]
-            std::process::exit(0);
+            // `ipe db migrate` status-op boundary: clean status, exit zero
+            crate::system::exit_process(0);
         }
 
         // 3. Apply pending migrations in declaration order.
@@ -2335,8 +2335,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                             "db: migration '{name}' changed after it was applied — checksum mismatch"
                         ));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
-                        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero [ledger #boundary]
-                        std::process::exit(1);
+                        // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
+                        crate::system::exit_process(1);
                     }
                     return IpeResult::Err(
                         format!(
@@ -2403,8 +2403,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                 ));
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: migrations applied, exit zero [ledger #boundary]
-            std::process::exit(0);
+            // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
+            crate::system::exit_process(0);
         }
         IpeResult::Ok(out)
     })

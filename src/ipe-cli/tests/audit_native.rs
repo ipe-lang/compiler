@@ -1251,9 +1251,28 @@ mod real_jail {
     ///
     /// The app prints `started`, prints the file named by its second argument
     /// when given (a working-tree read), then tries to print the file named by
-    /// its first argument and reports `LEAKED` when that read succeeds.
+    /// its first argument and reports `LEAKED` when that read succeeds. It
+    /// reads through shell builtins only, so it never forks: a profile that
+    /// withholds Subprocess runs it as declared.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn floor_bundle(base: &std::path::Path, caps: &[Capability]) -> (PathBuf, SandboxProfile) {
+        floor_bundle_running(
+            base,
+            caps,
+            "echo started\necho \"tmpdir=$TMPDIR\"\n\
+             if [ -n \"$2\" ]; then while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$2\"; echo; fi\n\
+             if { while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$1\"; } 2>/dev/null; then echo LEAKED; fi\n\
+             exit 0\n",
+        )
+    }
+
+    /// [`floor_bundle`] whose app runs `script` after its embedded floor line.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn floor_bundle_running(
+        base: &std::path::Path,
+        caps: &[Capability],
+        script: &str,
+    ) -> (PathBuf, SandboxProfile) {
         use std::os::unix::fs::PermissionsExt as _;
         let declared: BTreeSet<Capability> = caps.iter().copied().collect();
         let profile = ipe_sandbox::run_jail::profile_from_capabilities(
@@ -1275,8 +1294,7 @@ mod real_jail {
         executable(
             "ipe-app",
             format!(
-                "#!/bin/sh\n# {}\necho started\necho \"tmpdir=$TMPDIR\"\nif [ -n \"$2\" ]; then cat \"$2\"; echo; fi\n\
-                 cat \"$1\" 2>/dev/null && echo LEAKED\nexit 0\n",
+                "#!/bin/sh\n# {}\n{script}",
                 profile.to_capfloor_line(ipe_sandbox::run_jail::FloorIntent::Release)
             ),
         );
@@ -1474,6 +1492,39 @@ mod real_jail {
         assert!(
             !stdout.contains(&token) && !stdout.contains("LEAKED"),
             "nothing outside the grant is readable:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// An app whose profile withholds Subprocess cannot fork under `ipe release run`.
+    ///
+    /// The same app granted Subprocess forks and exits 0 (the control), so the
+    /// refusal is the jail's subprocess denial, not a broken fixture.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_withheld_subprocess_cannot_fork() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-withheld-fork");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let script = "echo started\nif /bin/true; then echo forked; else exit 3; fi\nexit 0\n";
+        let (withheld, _) = floor_bundle_running(&base.join("withheld"), &[], script);
+        let (granted, _) =
+            floor_bundle_running(&base.join("granted"), &[Capability::Subprocess], script);
+        let (granted_ok, granted_stdout, granted_stderr) =
+            release_run(&work, &[granted.into_os_string()]);
+        let (ok, stdout, stderr) = release_run(&work, &[withheld.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            granted_ok && granted_stdout.contains("started") && granted_stdout.contains("forked"),
+            "an app granted Subprocess forks (control):\n\
+             stdout:\n{granted_stdout}\nstderr:\n{granted_stderr}"
+        );
+        assert!(
+            !ok && stdout.contains("started") && !stdout.contains("forked"),
+            "an app with Subprocess withheld starts but cannot fork:\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 

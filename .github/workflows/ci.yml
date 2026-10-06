@@ -1077,9 +1077,9 @@ jobs:
       # `dev-posture` is the dev-intent build outside `full`; its pins prove a
       # dev build on a loopback listener opens each dev-only surface.
       - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
-      # `debugger` is a build-mode opt-in outside `full`; named here so its
-      # overlay and recorder tests run.
-      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
+      # `debugger` and `locale` are opt-ins outside `full`; named here so the
+      # overlay and recorder tests and the ICU case-fold oracle run.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

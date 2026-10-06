@@ -1085,11 +1085,31 @@ fn toolchain_binds_from(
     })
 }
 
+/// The operator's `IPE_FFI_PROC_CAP` override, parsed into the typed cap.
+///
+/// Unset is `Ok(None)` (the default cap stands). A set value that is not
+/// UTF-8, not digits, zero or above `ProcCap::MAX` refuses: it is never
+/// clamped into range and never ignored in favor of the default.
+fn proc_cap_override(
+    raw: Option<&std::ffi::OsStr>,
+) -> Result<Option<ipe_sandbox::run_jail::ProcCap>, ipe_sandbox::run_jail::ProcCapError> {
+    raw.map(|raw| {
+        raw.to_str()
+            .ok_or(ipe_sandbox::run_jail::ProcCapError::NotANumber)
+            .and_then(str::parse)
+    })
+    .transpose()
+}
+
 /// The jail resource caps: the fail-closed defaults, each raisable through an
 /// explicit env override that prints a warning (an SDK-scale dependency
 /// closure — hundreds of crates under one `cargo check`/rustdoc — legitimately
 /// needs more CPU/wall/output than the small-crate defaults).
-fn jail_limits() -> ipe_sandbox::ResourceLimits {
+///
+/// # Errors
+///
+/// A refused `IPE_FFI_PROC_CAP` (see [`proc_cap_override`]) refuses the run.
+fn jail_limits() -> Result<ipe_sandbox::ResourceLimits, CliError> {
     let mut limits = ipe_sandbox::ResourceLimits::default();
     let with_override = |var: &str, slot: &mut u64, scale: u64| {
         if let Ok(raw) = ipe_env::var(var) {
@@ -1115,9 +1135,26 @@ fn jail_limits() -> ipe_sandbox::ResourceLimits {
     with_override("IPE_FFI_CPU_SECS", &mut limits.cpu_secs, 1);
     with_override("IPE_FFI_WALL_SECS", &mut limits.wall_secs, 1);
     with_override("IPE_FFI_FD_CAP", &mut limits.fd_cap, 1);
-    with_override("IPE_FFI_PROC_CAP", &mut limits.proc_cap, 1);
     with_override("IPE_FFI_OUT_CAP_MB", &mut limits.out_cap_bytes, 1024 * 1024);
-    limits
+    let proc_cap = ipe_env::var_os("IPE_FFI_PROC_CAP");
+    match proc_cap_override(proc_cap.as_deref()) {
+        Ok(None) => {}
+        Ok(Some(cap)) => {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!("WARNING: jail cap override IPE_FFI_PROC_CAP={cap}"),
+            );
+            limits.proc_cap = cap;
+        }
+        Err(refused) => {
+            return Err(CliError::Usage(text::msg::command_refusal(
+                &"add",
+                &crate::style::TerminalSafe::sanitize(&format!("IPE_FFI_PROC_CAP: {refused}")),
+            )));
+        }
+    }
+    Ok(limits)
 }
 
 /// Run one jailed inspector phase over the shared `scoped_tmp`, returning its
@@ -1144,7 +1181,7 @@ fn run_phase(
         homes: binds.homes.clone(),
         path_prepend: binds.path_prepend.clone(),
         rustup_home: binds.rustup_home.clone(),
-        limits: jail_limits(),
+        limits: jail_limits()?,
     };
     ipe_sandbox::run_in_bwrap_jail(caps, &spec, payload)
         .map_err(|d| io_err(format!("sandboxed inspection failed: {d}")))
@@ -3931,6 +3968,49 @@ pub(crate) fn rust_wrapper_header_accepted_by_ffi_reader(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffi_proc_cap_override_refuses_zero_and_overflow() {
+        use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
+        use std::ffi::OsStr;
+        let of = |raw: &str| proc_cap_override(Some(OsStr::new(raw)));
+        assert_eq!(of("0"), Err(ProcCapError::Zero));
+        assert_eq!(of("4097"), Err(ProcCapError::PastCeiling));
+        assert_eq!(of("18446744073709551615"), Err(ProcCapError::PastCeiling));
+        assert_eq!(of("18446744073709551616"), Err(ProcCapError::PastCeiling));
+        for not_digits in ["", "+64", "-1", "64k", " 64", "0x10", "\u{663}"] {
+            assert_eq!(
+                of(not_digits),
+                Err(ProcCapError::NotANumber),
+                "{not_digits:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                proc_cap_override(Some(OsStr::from_bytes(b"6\xff4"))),
+                Err(ProcCapError::NotANumber)
+            );
+        }
+        // Controls: unset keeps the default; an in-range value is taken as is.
+        assert_eq!(proc_cap_override(None), Ok(None));
+        assert_eq!(of("64").map(|c| c.map(ProcCap::get)), Ok(Some(64)));
+        assert_eq!(of("4096"), Ok(Some(ProcCap::MAX)));
+    }
+
+    #[test]
+    fn the_proc_cap_env_doc_states_the_typed_range() {
+        let doc = ipe_docs::env_vars::ENV_VARS
+            .iter()
+            .find(|v| v.name == "IPE_FFI_PROC_CAP")
+            .map(|v| v.purpose);
+        let range = format!("1 to {}", ipe_sandbox::run_jail::ProcCap::MAX);
+        assert!(
+            doc.is_some_and(|purpose| purpose.contains(&range)),
+            "IPE_FFI_PROC_CAP must document the range {range}: {doc:?}"
+        );
+    }
 
     /// Seal `emit` against the table `catalog` merges to.
     #[allow(clippy::expect_used)] // every catalog sealed here merges; a refusal is a red test
