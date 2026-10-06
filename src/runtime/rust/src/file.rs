@@ -351,6 +351,9 @@ mod beneath {
     pub(super) enum BeneathRefusal {
         /// The root is not an absolute path.
         RootNotAbsolute,
+        /// The root's final component is not a name (a trailing separator, `.` or `..`), so
+        /// opening it would follow a link the final component names.
+        RootUnnamed,
         /// The path beneath the root is absolute.
         RelAbsolute,
         /// A component of the path beneath the root is empty, `.`, `..`, or carries NUL.
@@ -380,6 +383,9 @@ mod beneath {
         fn describe(&self) -> String {
             match self {
                 Self::RootNotAbsolute => "the root is not an absolute path".to_owned(),
+                Self::RootUnnamed => {
+                    "the root does not end in a name (a trailing `/`, `.` or `..`)".to_owned()
+                }
                 Self::RelAbsolute => "the path beneath the root is absolute".to_owned(),
                 Self::BadName => {
                     "the path beneath the root has an empty, `.`, `..` or NUL-bearing component"
@@ -404,6 +410,7 @@ mod beneath {
             let message = format!("{BENEATH_KERNEL}: {rel:?}: {}", self.describe());
             match self {
                 Self::RootNotAbsolute
+                | Self::RootUnnamed
                 | Self::RelAbsolute
                 | Self::BadName
                 | Self::Link
@@ -436,12 +443,20 @@ mod beneath {
     pub(super) struct BeneathRoot(String);
 
     impl BeneathRoot {
-        /// Accepts `root` when it is absolute.
+        /// Accepts `root` when it is absolute and is `/` or ends in an entry name.
+        ///
+        /// A trailing `/`, `.` or `..` turns the final component into one the open
+        /// resolves through, so a link it names would be followed.
         pub(super) fn parse(root: &Path) -> Result<Self, BeneathRefusal> {
-            if crate::path::path_is_absolute(root.clone()) {
-                Ok(Self(root.as_str().to_owned()))
+            if !crate::path::path_is_absolute(root.clone()) {
+                return Err(BeneathRefusal::RootNotAbsolute);
+            }
+            let text = root.as_str();
+            let named = text == "/" || text.rsplit('/').next().and_then(EntryName::parse).is_some();
+            if named {
+                Ok(Self(text.to_owned()))
             } else {
-                Err(BeneathRefusal::RootNotAbsolute)
+                Err(BeneathRefusal::RootUnnamed)
             }
         }
     }
@@ -1934,6 +1949,30 @@ mod read_file_beneath_tests {
             "symbolic link is never followed",
         );
         assert_read(&read_at(&world.root(), "f", 1024), "ok");
+    }
+
+    /// A root whose text runs past its final name resolves through that name, so it is refused.
+    #[test]
+    fn a_root_not_ending_in_a_name_is_refused() {
+        let world = World::new();
+        world.put("f", b"ok");
+        let alias = world.base().join("alias");
+        symlink(world.root(), &alias).unwrap();
+        let alias = alias.to_string_lossy().into_owned();
+        for unnamed in [
+            format!("{alias}/"),
+            format!("{alias}/."),
+            format!("{alias}/sub/.."),
+        ] {
+            let root = crate::path::path_literal(unnamed);
+            assert_refused(
+                &read_paths(root, sealed("f"), 1024),
+                IpeErrorKind::InvalidInput,
+                "the root does not end in a name",
+            );
+        }
+        let named = crate::path::path_literal(world.root().to_string_lossy().into_owned());
+        assert_read(&read_paths(named, sealed("f"), 1024), "ok");
     }
 
     /// Plants a FIFO with no writer at `path`.
