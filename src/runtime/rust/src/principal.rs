@@ -42,6 +42,8 @@ pub struct Principal {
     claims: Redacted<BTreeMap<String, String>>,
 }
 
+crate::stringify::show_row!("Principal", Redacted, [] Principal, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// Mint a `Principal` with a subject and no claims — a unit-test fixture for
 /// the principal and revocation tests. Production minting goes through
 /// [`principal_mint_with_claims`] alone, so this exists only under `test`.

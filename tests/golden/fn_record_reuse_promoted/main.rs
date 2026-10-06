@@ -52,10 +52,10 @@ impl IpeStringify for RecCountFormatLabelOnChange {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.count)).dispatch(),
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.label)).dispatch(),
-            "<fn>"
+            IpeStringify::ipe_show(&self.count),
+            "<function>",
+            IpeStringify::ipe_show(&self.label),
+            "<function>"
         )
     }
 }

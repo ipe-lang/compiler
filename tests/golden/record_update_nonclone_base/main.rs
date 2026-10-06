@@ -39,8 +39,8 @@ impl IpeStringify for RecActionCount {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.count)).dispatch()
+            IpeStringify::ipe_show(&self.action),
+            IpeStringify::ipe_show(&self.count)
         )
     }
 }

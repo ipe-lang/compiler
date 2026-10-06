@@ -5,6 +5,9 @@ use super::*;
 
 pub type JsonVal = serde_json::Value;
 
+// Compact JSON text; `to_string` on a `serde_json::Value` is infallible.
+crate::stringify::show_row!("Json", Value, [] JsonVal, |j| j.to_string());
+
 /// `Decoder<E, T>` — the unified decoder type shared by JsonDec, DbDec, and Config.
 ///
 /// Changed from a bare `Box<dyn Fn>` type alias to a struct carrying:
@@ -27,6 +30,8 @@ pub struct Decoder<E, T> {
     pub run: std::sync::Arc<dyn Fn(&JsonVal) -> IpeResult<E, T> + Send + Sync>,
     pub fields: Vec<String>,
 }
+
+crate::stringify::show_row!("Decoder", Internals, [E, T] Decoder<E, T>, |_| "<Ipe.Json.Decoder>".to_owned());
 
 // Manual `Clone` (not derived): the carrier `Arc` and `Vec<String>` are always
 // `Clone` regardless of `E`/`T`, so a `Decoder` clones without bounding them —

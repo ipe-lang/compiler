@@ -124,10 +124,9 @@ impl IpeStringify for IpeMoneyCurrency {
             IpeMoneyCurrency::ETH => "ETH".to_string(),
             IpeMoneyCurrency::USDT => "USDT".to_string(),
             IpeMoneyCurrency::USDC => "USDC".to_string(),
-            IpeMoneyCurrency::CurrencyRaw(p0) => format!(
-                "CurrencyRaw {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeMoneyCurrency::CurrencyRaw(p0) => {
+                format!("CurrencyRaw {}", IpeStringify::ipe_show(p0))
+            }
         }
     }
 }

@@ -431,15 +431,12 @@ fn generic_enum_def_construction_and_pattern_emit() -> DResult<()> {
     );
     // Bounded generic IpeStringify impl with a payload-binding arm.
     assert!(
-        out.contains("impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainMaybe<T1> {"),
+        out.contains("impl<T1: IpeStringify> IpeStringify for MainMaybe<T1> {"),
         "generic IpeStringify impl clause missing:\n{out}"
     );
-    // rustfmt wraps the single-field format! arm into a block.
+    // The single-field format! arm fits on one line.
     assert!(
-        out.contains(
-            "MainMaybe::Just(p0) => {\n                format!(\"Just {}\", \
-             (&ipe_runtime::stringify::Wrap(p0)).dispatch())\n            }"
-        ),
+        out.contains("MainMaybe::Just(p0) => format!(\"Just {}\", IpeStringify::ipe_show(p0)),"),
         "payload stringify arm missing or wrong:\n{out}"
     );
     assert!(
@@ -601,8 +598,8 @@ fn concrete_multi_field_enum_emits() -> DResult<()> {
     assert!(
         out.contains(
             "MainShape::Rect(p0, p1) => format!(\n                \"Rect {} {}\",\n                \
-             (&ipe_runtime::stringify::Wrap(p0)).dispatch(),\n                \
-             (&ipe_runtime::stringify::Wrap(p1)).dispatch()\n            )"
+             IpeStringify::ipe_show(p0),\n                \
+             IpeStringify::ipe_show(p1)\n            )"
         ),
         "multi-field stringify arm missing or wrong:\n{out}"
     );

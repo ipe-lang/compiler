@@ -41,11 +41,7 @@ impl std::fmt::Display for Locale {
     }
 }
 
-impl crate::stringify::IpeStringify for Locale {
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+crate::stringify::show_row!("Locale", Value, [] Locale, |l| l.0.clone());
 
 /// `Locale.fromTag : String -> Maybe Locale` — the single parse boundary.
 ///

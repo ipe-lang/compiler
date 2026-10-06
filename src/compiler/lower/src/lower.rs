@@ -12661,20 +12661,16 @@ impl<'a> Lowerer<'a> {
                 ctor_arity.insert((uhome.clone(), ctor.name), ctor.arity);
             }
             // A `Rust.*`-home union that is NOT the opaque-handle placeholder
-            // (one nullary ctor spelling the type name) is a transparent FFI
-            // import: it lowers to a real app enum, and its constructors are
-            // constructible/matchable like any user enum's.
-            let rust_home = union
-                .home
-                .first()
-                .and_then(|s| interner.resolve(*s))
-                .is_some_and(|s| s == "Rust");
-            let placeholder = union.ctors.len() == 1
-                && union
-                    .ctors
-                    .first()
-                    .is_some_and(|c| c.name == union.name && c.arity == 0);
-            if rust_home && !placeholder {
+            // is a transparent FFI import: it lowers to a real app enum, and
+            // its constructors are constructible/matchable like any user
+            // enum's. The type checker's show gate reads the same
+            // classification.
+            if ipe_ir::home_is_ffi_interface(interner, &union.home)
+                && ipe_ir::FfiUnion::classify(
+                    union.name,
+                    union.ctors.iter().map(|c| (c.name, c.arity)),
+                ) == ipe_ir::FfiUnion::Transparent
+            {
                 transparent_ffi_unions.insert((uhome.clone(), union.name));
                 for ctor in &union.ctors {
                     transparent_ffi_ctors.insert((uhome.clone(), ctor.name));
@@ -16357,7 +16353,7 @@ impl<'a> Lowerer<'a> {
                 // `ipe_backend_rust::emit_types`) drops the enum's
                 // `#[derive(Clone, Debug, PartialEq)]` whenever a field embeds a
                 // function, and the hand-written `IpeStringify` impl renders such
-                // a field as the `<fn>` placeholder.
+                // a field as the `<function>` placeholder.
                 let ir = normalize_enum_payload_fun_carrier(ir);
                 fields.push(ir);
             }

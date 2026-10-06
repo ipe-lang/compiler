@@ -71,6 +71,11 @@ pub enum RedirectPolicy {
     FollowRedirects(i64),
 }
 
+crate::stringify::show_row!("RedirectPolicy", Value, [] RedirectPolicy, |p| match p {
+    RedirectPolicy::NoRedirects => "NoRedirects".to_owned(),
+    RedirectPolicy::FollowRedirects(n) => format!("FollowRedirects {n}"),
+});
+
 /// Closed set of HTTP methods — the Rust mirror of the `HttpMethod` ADT in
 /// `Ipe.Http`.  Variant names match the Ipê constructors verbatim so emitted
 /// match arms (`HttpMethod::Get`, `HttpMethod::Post`, …) resolve through the
@@ -88,6 +93,16 @@ pub enum HttpMethod {
     Head,
     Options,
 }
+
+crate::stringify::show_row!("HttpMethod", Value, [] HttpMethod, |m| match m {
+    HttpMethod::Get => "Get".to_owned(),
+    HttpMethod::Post => "Post".to_owned(),
+    HttpMethod::Put => "Put".to_owned(),
+    HttpMethod::Delete => "Delete".to_owned(),
+    HttpMethod::Patch => "Patch".to_owned(),
+    HttpMethod::Head => "Head".to_owned(),
+    HttpMethod::Options => "Options".to_owned(),
+});
 
 impl HttpMethod {
     /// Convert to the canonical uppercase ASCII string.
@@ -148,6 +163,8 @@ pub struct HttpRequest {
     pub timeout: i64,
     pub url: String,
 }
+
+crate::stringify::show_row!("HttpRequest", Redacted, [] HttpRequest, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 // The body, headers (`Authorization`) and URL (an API key in the query) can
 // carry a credential; the Ipê record fixes the field types, so the masking lives

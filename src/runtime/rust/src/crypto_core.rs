@@ -46,11 +46,7 @@ impl std::fmt::Debug for Key {
     }
 }
 
-impl crate::stringify::IpeStringify for Key {
-    fn ipe_show(&self) -> String {
-        "<key>".to_owned()
-    }
-}
+crate::stringify::show_row!("CryptoKey", Redacted, [] Key, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// `Crypto.Mac` — an opaque message authentication code (hex-encoded) returned
 /// by `Crypto.hmacSha256` / `Crypto.hmacSha512` with the typed-key variants.
@@ -71,11 +67,7 @@ pub struct Mac(String);
 
 crate::ct_eq::impl_ct_eq!(Mac);
 
-impl crate::stringify::IpeStringify for Mac {
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+crate::stringify::show_row!("CryptoMac", Value, [] Mac, |m| m.0.clone());
 
 /// Crate-internal raw promotion of a `String` to a `Key`, with no validation.
 /// The ONLY sanctioned no-check path — the password-derivation kernels use it

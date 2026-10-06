@@ -147,6 +147,8 @@ pub struct Route<Page> {
     pub build: Arc<dyn Fn(Vec<String>) -> Option<Page> + Send + Sync>,
 }
 
+crate::stringify::show_row!("WebRoute", Internals, [Page] Route<Page>, |_| "<Ipe.Web.Route>".to_owned());
+
 impl<Page> Route<Page> {
     /// Register `pattern`, parsing it once ([`RoutePattern::parse`]).
     ///

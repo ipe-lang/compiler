@@ -45,7 +45,7 @@ impl Clone for MainCodec {
 impl IpeStringify for MainCodec {
     fn ipe_show(&self) -> String {
         match self {
-            MainCodec::Codec(_) => format!("Codec {}", "<fn>"),
+            MainCodec::Codec(_) => format!("Codec {}", "<function>"),
         }
     }
 }

@@ -37,10 +37,7 @@ pub struct RecX {
 
 impl IpeStringify for RecX {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{}}}",
-            (&ipe_runtime::stringify::Wrap(&self.x)).dispatch()
-        )
+        format!("{{{}}}", IpeStringify::ipe_show(&self.x))
     }
 }
 

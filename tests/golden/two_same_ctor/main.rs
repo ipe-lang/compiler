@@ -36,10 +36,10 @@ pub enum MainBox<T1> {
     Empty,
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainBox<T1> {
+impl<T1: IpeStringify> IpeStringify for MainBox<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainBox::Wrap(p0) => format!("Wrap {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch()),
+            MainBox::Wrap(p0) => format!("Wrap {}", IpeStringify::ipe_show(p0)),
             MainBox::Empty => "Empty".to_string(),
         }
     }

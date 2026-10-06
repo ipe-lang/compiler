@@ -40,8 +40,8 @@ impl IpeStringify for RecXY {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.x)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.y)).dispatch()
+            IpeStringify::ipe_show(&self.x),
+            IpeStringify::ipe_show(&self.y)
         )
     }
 }
