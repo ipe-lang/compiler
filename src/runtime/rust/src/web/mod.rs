@@ -749,6 +749,25 @@ fn value_to_string(v: &serde_json::Value) -> String {
 type RouteEntry<Model, Msg> =
     Arc<dyn Fn(Model, &route::DecodedPath) -> route::Entered<Model, IpeCmd<Msg>> + Send + Sync>;
 
+/// Enters `path` for a new driver of session `sid`, running `seed_cmd` before the entry Cmd.
+///
+/// Every page-handler arm that builds a driver (miss, restored, rebuilt) goes
+/// through here, so the order `[seed, entry]` and the sid scope live in one
+/// place. Relies on one invariant: constructing an `IpeCmd` performs no
+/// effect, only `run_cmd` does, so a seed built for a session that is then
+/// discarded never fires.
+#[cfg(feature = "server")]
+fn enter_session<Model, Msg>(
+    route_entry: &RouteEntry<Model, Msg>,
+    sid: &str,
+    model: Model,
+    seed_cmd: IpeCmd<Msg>,
+    path: &route::DecodedPath,
+) -> (Model, IpeCmd<Msg>) {
+    let entered = pubsub::with_session_sid(sid.to_owned(), || route_entry(model, path));
+    (entered.model, IpeCmd::Batch(vec![seed_cmd, entered.cmd]))
+}
+
 /// Pending URL entries a session driver holds before a new one is refused with 503.
 #[cfg(feature = "server")]
 const ENTER_QUEUE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(7);
@@ -871,6 +890,31 @@ fn entry_unavailable() -> axum::response::Response {
     )
         .into_response()
 }
+
+/// The 503 a request gets when the process holds as many sessions as it admits.
+#[cfg(feature = "server")]
+fn at_capacity() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "2")],
+        "server at session capacity",
+    )
+        .into_response()
+}
+
+// A claim waiter is a request queued on its session, so it waits no longer and
+// in no larger numbers than an entry queued on a live driver.
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's claim waiters outnumber its enter queue [ledger #boundary]
+const _: () = assert!(store::MAX_CLAIM_WAITERS.get() <= ENTER_QUEUE_CAP.get());
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the claim wait drifts from the enter reply timeout [ledger #boundary]
+const _: () = assert!(store::CLAIM_WAIT.as_millis() == ENTER_REPLY_TIMEOUT.as_millis());
+// Every minted sid parses back as a `SessionKey`.
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a minted sid's length drifts from the session key's [ledger #boundary]
+const _: () = assert!(uuid::fmt::Simple::LENGTH == store::SESSION_ID_LEN);
 
 /// Build the routed entry from the route table, the `notFound` page, the
 /// app's emitted `set_page`, and its page renderer.
@@ -1071,6 +1115,29 @@ struct SessionSlot {
 impl Drop for SessionSlot {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Who a page GET's new driver belongs to: a claimed returning sid, or a freshly minted one.
+///
+/// A rejoined session's sid is its claim's key, so the published sid and the
+/// claim it is published under cannot differ.
+#[cfg(feature = "server")]
+enum SessionOwner {
+    /// A returning session rebuilt or restored under its claim; the claim is released once the session is live.
+    Rejoined(store::SidClaim),
+    /// A new session under a sid no other request knows.
+    Minted(String),
+}
+
+#[cfg(feature = "server")]
+impl SessionOwner {
+    /// The sid the session is published under.
+    fn sid(&self) -> &str {
+        match self {
+            Self::Rejoined(claim) => claim.key().as_str(),
+            Self::Minted(sid) => sid,
+        }
     }
 }
 
@@ -3132,8 +3199,10 @@ mod handlers {
         // Cookie-based session lifecycle:
         //   * Web hit  → reuse the in-process session; its driver enters this
         //                 GET's path and runs the entry Cmd (no new driver).
-        //   * Cold hit  → a persisted model (post-restart / different replica);
+        //   * Restored  → a persisted model (post-restart / different replica);
         //                 hydrate a fresh driver seeded with it (no init).
+        //   * Rebuilt   → a persisted model spliced onto a fresh `init` across an
+        //                 additive Model change; init's Cmd runs, then the entry's.
         //   * miss      → init a new session.
         let cookie_sid = sid_from_cookie(&headers);
         // CSRF double-submit token: reuse the browser's existing well-formed
@@ -3164,35 +3233,55 @@ mod handlers {
         // value from THIS incoming GET request — the exact same `init(req)` the
         // clean-reinit miss path runs — so a reconstructed session's new fields
         // hold precisely what a fresh visit would have produced, with no
-        // synthetic request and no surprising default. It is invoked LAZILY:
+        // synthetic request and no surprising default. It runs under the
+        // cookie's sid (the sid a rebuilt session keeps) and returns init's
+        // whole `(Model, Cmd)` pair: the store hands the Cmd back beside the
+        // rebuilt model, and `enter_session` runs it. It is invoked LAZILY:
         // only on a schema-mismatched cold row, never on a live hit or a
-        // matched-schema restore, so `init` (and any side effect it carries)
-        // never fires on the hot paths. Any non-additive change (removed /
-        // retyped field), corrupt / oversized body, or pre-`v2` row falls back
-        // to the clean re-init the store's flat miss always produced.
-        let make_init = || {
-            let params = (st.param_resolver)(&path);
-            let req = req::web_req(&method, &uri, &headers, params);
-            let (m, _cmd) = (st.init)(req);
-            m
-        };
+        // matched-schema restore. Any non-additive change (removed / retyped
+        // field), corrupt / oversized body, or pre-`v2` row falls back to the
+        // clean re-init the store's flat miss always produced.
         // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
         // evaluated once per request (cheap env read, cached by the OS) and is
         // fail-closed — any value other than a recognised truthy string leaves
         // the additive algorithm in place.
-        let hit = if reset_state_from_env() {
-            None
-        } else {
-            match cookie_sid.as_ref() {
-                Some(s) => st
-                    .store
-                    .get_reconstructing(s, &make_init)
-                    .await
-                    .map(|h| (s.clone(), h)),
-                None => None,
+        // A cookie that is not a well-formed sid is a miss: it reaches neither
+        // the claim table nor the store. A well-formed one is claimed first,
+        // so at most one request per sid turns a persisted checkpoint into a
+        // live driver; a request behind the claim waits for the holder to
+        // publish the session and then joins it live. A refused claim is the
+        // 503 a busy session or a full process already answers with.
+        let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
+        let hit = match cookie_key {
+            Some(key) if !reset_state_from_env() => 'rejoin: {
+                // A live session never contends for the claim table: the
+                // claim serialises only the cold-to-live transition.
+                if let Some(handle) = st.store.get(key.as_str()).await {
+                    break 'rejoin Some((key.as_str().to_owned(), store::Rejoin::Live(handle)));
+                }
+                // Once claimed, `get_reconstructing` checks live again first:
+                // the previous holder's publish may have landed while this waited.
+                let claim = match st.store.claim(key).await {
+                    Ok(claim) => claim,
+                    Err(store::ClaimRefusal::InFlight | store::ClaimRefusal::Crowded) => {
+                        return entry_unavailable();
+                    }
+                    Err(store::ClaimRefusal::Saturated) => return at_capacity(),
+                };
+                let sid = claim.key().as_str().to_owned();
+                let make_init = || {
+                    pubsub::with_session_sid(sid.clone(), || {
+                        let params = (st.param_resolver)(&path);
+                        let req = req::web_req(&method, &uri, &headers, params);
+                        (st.init)(req)
+                    })
+                };
+                let rejoin = st.store.get_reconstructing(claim, &make_init).await;
+                Some((sid, rejoin))
             }
+            Some(_) | None => None,
         };
 
         //
@@ -3201,12 +3290,21 @@ mod handlers {
         // the handler index from that view, orphaning every handler on the
         // page the browser is still showing — the next event POST (form
         // submit, click, input) would silently resolve to nothing.
-        if !routed && hit.is_some() {
+        let known = match &hit {
+            Some((
+                _,
+                store::Rejoin::Live(_)
+                | store::Rejoin::Restored { .. }
+                | store::Rejoin::Rebuilt { .. },
+            )) => true,
+            Some((_, store::Rejoin::Miss)) | None => false,
+        };
+        if !routed && known {
             return (StatusCode::NOT_FOUND, "404 page not found").into_response();
         }
 
-        let (sid, model, cmd0) = match hit {
-            Some((sid, store::StoreHit::Web(handle))) => {
+        let (owner, slot, model, cmd0) = match hit {
+            Some((sid, store::Rejoin::Live(handle))) => {
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
                 // serialised with its `update`s, commits, touches the store and
@@ -3240,15 +3338,48 @@ mod handlers {
                 #[cfg(not(feature = "debugger"))]
                 return page_response(&sid, &body, &csrf_tok, &headers);
             }
-            Some((sid, store::StoreHit::Cold(m))) => {
+            Some((_, store::Rejoin::Restored { claim, model })) => {
                 // A returning user with a valid sid cookie → not new attack
-                // volume, so NOT rejected; but count its driver so the slot it
-                // gets below is paired (decremented on the driver's exit).
+                // volume, so NOT rejected; but count its driver. The slot is
+                // taken at once, so the count is given back on every exit,
+                // a cancelled request included.
                 st.session_count.fetch_add(1, Ordering::SeqCst);
-                let entered = pubsub::with_session_sid(sid.clone(), || (st.route_entry)(m, &path));
-                (sid, entered.model, entered.cmd)
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
+                let (m, c) = enter_session(
+                    &st.route_entry,
+                    claim.key().as_str(),
+                    model,
+                    IpeCmd::None,
+                    &path,
+                );
+                (SessionOwner::Rejoined(claim), slot, m, c)
             }
-            None => {
+            Some((
+                _,
+                store::Rejoin::Rebuilt {
+                    claim,
+                    model,
+                    init_cmd,
+                },
+            )) => {
+                // Returning user, same slot pairing as `Restored`; the rebuilt
+                // model's `init` Cmd runs first, exactly as on a new session.
+                st.session_count.fetch_add(1, Ordering::SeqCst);
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
+                let (m, c) = enter_session(
+                    &st.route_entry,
+                    claim.key().as_str(),
+                    model,
+                    init_cmd,
+                    &path,
+                );
+                (SessionOwner::Rejoined(claim), slot, m, c)
+            }
+            Some((_, store::Rejoin::Miss)) | None => {
                 // Admission control (cookieless = brand-new session = the
                 // attack surface). Reserve a slot atomically: fetch_add-then-test
                 // avoids the load-then-add TOCTOU where N concurrent GETs all
@@ -3264,13 +3395,11 @@ mod handlers {
                 let reserved = st.session_count.fetch_add(1, Ordering::SeqCst);
                 if !unlimited && reserved >= cap {
                     st.session_count.fetch_sub(1, Ordering::SeqCst);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [(axum::http::header::RETRY_AFTER, "2")],
-                        "server at session capacity",
-                    )
-                        .into_response();
+                    return at_capacity();
                 }
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
@@ -3281,14 +3410,12 @@ mod handlers {
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
                 let s = new_sid();
-                let (m, c) = pubsub::with_session_sid(s.clone(), || {
-                    let (m, init_cmd) = (st.init)(req);
-                    let entered = (st.route_entry)(m, &path);
-                    (entered.model, IpeCmd::Batch(vec![init_cmd, entered.cmd]))
-                });
-                (s, m, c)
+                let (m, init_cmd) = pubsub::with_session_sid(s.clone(), || (st.init)(req));
+                let (m, c) = enter_session(&st.route_entry, &s, m, init_cmd, &path);
+                (SessionOwner::Minted(s), slot, m, c)
             }
         };
+        let sid = owner.sid().to_owned();
 
         let mut tree = (st.view)(model.clone());
         assign_ipe_ids(&mut tree, "r");
@@ -3319,33 +3446,50 @@ mod handlers {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
         }));
-        st.store.set(&sid, entry.clone()).await;
 
-        // The admission slot for this driver (reserved by the Cold/None arm
-        // above); its Drop decrements session_count when the driver exits.
-        let slot = SessionSlot {
-            count: st.session_count.clone(),
-        };
-        // Spawn the per-session driver with a WEAK entry ref (the store +
-        // any SSE connection are the strong holders) so the driver is mortal:
-        // it exits once the session is evicted and unconnected, releasing the
-        // slot. The local strong `entry` drops at this handler's return,
-        // leaving the store (+ future SSE) as the only strong holders.
-        tokio::spawn(drive_session(
-            Arc::downgrade(&entry),
-            msg_rx,
-            msg_tx.clone(),
-            enter_rx,
-            st.update.clone(),
-            st.view.clone(),
-            st.subs.clone(),
-            st.route_entry.clone(),
-            st.store.clone(),
-            sid.clone(),
-            slot,
-        ));
-        // Fire the entry Cmd into the loop (batched after init's on a miss).
-        pubsub::with_session_sid(sid.clone(), || run_cmd(cmd0, &msg_tx, &sid));
+        // Publishing the session is one task the request cannot cancel: the
+        // store write, the driver spawn and the seed Cmd all run, and only
+        // then is the claim released, so the next request for the sid finds
+        // the live session. The driver holds a WEAK entry ref (the store +
+        // any SSE connection are the strong holders) so it is mortal: it
+        // exits once the session is evicted and unconnected, releasing
+        // `slot`, which decrements `session_count`.
+        let store = st.store.clone();
+        let update = st.update.clone();
+        let view = st.view.clone();
+        let subs = st.subs.clone();
+        let route_entry = st.route_entry.clone();
+        let commit = tokio::spawn(async move {
+            let sid = owner.sid();
+            store.set(sid, entry.clone()).await;
+            tokio::spawn(drive_session(
+                Arc::downgrade(&entry),
+                msg_rx,
+                msg_tx.clone(),
+                enter_rx,
+                update,
+                view,
+                subs,
+                route_entry,
+                store.clone(),
+                sid.to_owned(),
+                slot,
+            ));
+            // Fire the entry Cmd into the loop (batched after init's on a miss).
+            pubsub::with_session_sid(sid.to_owned(), || run_cmd(cmd0, &msg_tx, sid));
+            drop(owner);
+        });
+        if let Err(failed) = commit.await {
+            return match failed.try_into_panic() {
+                Ok(payload) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    crate::core::panic_500_body(&*payload),
+                )
+                    .into_response(),
+                Err(_) => entry_unavailable(),
+            };
+        }
 
         #[cfg(feature = "debugger")]
         {
@@ -3390,10 +3534,7 @@ mod handlers {
         };
         let sid = sid_from_cookie(&headers);
         let entry = match &sid {
-            Some(s) => match st.store.get(s).await {
-                Some(store::StoreHit::Web(h)) => Some(h),
-                _ => None,
-            },
+            Some(s) => st.store.get(s).await,
             None => None,
         };
         let entry = match entry {
@@ -3637,10 +3778,6 @@ mod handlers {
             }
         };
         let entry = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => Some(h),
-            _ => None,
-        };
-        let entry = match entry {
             Some(e) => e,
             // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
             // 404 (reload to recover) from a wedged proxy (client.js probes for
@@ -4339,16 +4476,13 @@ mod handlers {
         // The session must exist (a live Web session) for the frame to have a
         // destination; an unknown sid is the same session-lost 404 the event
         // path returns.
-        match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(_)) => {}
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        if st.store.get(&sid).await.is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
+                SESSION_LOST_BODY,
+            )
+                .into_response();
         }
         // Fail-closed boundary gate: reject an oversized / malformed /
         // over-nested frame BEFORE delivering it. A rejected frame is dropped
@@ -4408,8 +4542,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4475,8 +4609,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4537,8 +4671,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
             }
         };
@@ -4608,8 +4742,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4698,8 +4832,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4770,8 +4904,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4843,8 +4977,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4918,8 +5052,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
             }
         };
@@ -5780,12 +5914,7 @@ mod hot_appearance_push_tests {
             let model_after = store
                 .get("live")
                 .await
-                .and_then(|hit| match hit {
-                    store::StoreHit::Web(h) => {
-                        Some(h.lock().unwrap_or_else(|e| e.into_inner()).model)
-                    }
-                    _ => None,
-                })
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model)
                 .expect("session still present");
             assert_eq!(model_after, 7, "a hot-swap must not advance the Model");
         });
@@ -8100,7 +8229,7 @@ mod hot_init_session_scoping_tests {
     use crate::web::init_datum::{InitDatum, apply_init_hot, clear_dev_init_for_test};
     use crate::web::literal_table::{overlay_test_lock, set_dev_overlay_active_for_test};
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -8304,14 +8433,14 @@ mod hot_init_session_scoping_tests {
             let live_sid = extract_sid(&resp1);
 
             // Confirm the store holds the live session at count = 0.
-            let live_model_before = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session in store"),
-            };
+            let live_model_before = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_before.count, 0,
                 "live session must start at count = 0 (compiled baked datum)"
@@ -8336,14 +8465,14 @@ mod hot_init_session_scoping_tests {
             );
 
             // Step 3: live session Model in the store is UNCHANGED (count = 0).
-            let live_model_after = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session still in store"),
-            };
+            let live_model_after = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session still in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_after.count, 0,
                 "hot-init must not touch a live session's Model"
@@ -8364,14 +8493,14 @@ mod hot_init_session_scoping_tests {
             let fresh_sid = extract_sid(&resp2);
             assert_ne!(fresh_sid, live_sid, "fresh GET must mint a new session id");
 
-            let fresh_model = match store.get(&fresh_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected fresh Web session in store"),
-            };
+            let fresh_model = store
+                .get(&fresh_sid)
+                .await
+                .expect("expected fresh Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 fresh_model.count, 99,
                 "fresh session must decode the replacement init datum (count = 99)"
@@ -9152,7 +9281,7 @@ mod emitted_router_behavior_tests {
 
     use super::*;
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -9407,12 +9536,10 @@ mod emitted_router_behavior_tests {
     /// here; polling it avoids a fixed sleep — the same commit the second socket
     /// GET observes).
     async fn model_of(store: &Arc<Store>, sid: &str) -> Option<Model> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => {
-                Some(h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
-            }
-            _ => None,
-        }
+        store
+            .get(sid)
+            .await
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
     }
 
     /// Wait (bounded) for the async `drive_session` task to commit a model
@@ -10003,7 +10130,7 @@ mod route_entry_cmd_tests {
     use super::*;
     use crate::web::req::WebReq;
     use crate::web::route::{RenderArg, RenderRefusal, Route, RoutePath, render_route};
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -10047,7 +10174,20 @@ mod route_entry_cmd_tests {
         }))
     }
 
+    thread_local! {
+        /// The session sid each fixture `init` call ran under, in call order.
+        static INIT_SIDS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Drain the sids `init` ran under on this thread since the last drain.
+    fn take_init_sids() -> Vec<String> {
+        INIT_SIDS.with(|sids| std::mem::take(&mut *sids.borrow_mut()))
+    }
+
+    /// Records the sid it runs under (where a js port binds its session), then inits.
     fn init(_req: WebReq) -> (Model, IpeCmd<Msg>) {
+        INIT_SIDS.with(|sids| sids.borrow_mut().push(pubsub::current_session_sid()));
         (
             Model {
                 page: Page::Home,
@@ -10117,8 +10257,13 @@ mod route_entry_cmd_tests {
         route::DecodedPath::parse("/").expect("`/` decodes")
     }
 
-    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router(store: Store) -> axum::Router {
+        router_counted(store, Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// The fixture router over `store`, counting its session drivers in `session_count`.
+    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+    fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
         let (route_entry, _, route_matched) =
             routed_resolvers(routes(), Page::Home, set_page, render);
         let state: FixtureState = WebState {
@@ -10130,7 +10275,7 @@ mod route_entry_cmd_tests {
             route_entry,
             param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
             route_matched,
-            session_count: Arc::new(AtomicUsize::new(0)),
+            session_count,
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         build_web_router(state, false).expect("the fixture route table and base are well-formed")
@@ -10158,9 +10303,18 @@ mod route_entry_cmd_tests {
     ///
     /// The cookie name comes from `cookie_name_for`, so the helper follows the
     /// posture's name (`ipe_sid` or `__Host-ipe_sid`) instead of pinning one.
-    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn get(
         store: &Store,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, Option<String>, String, String) {
+        get_via(router(store.clone()), path, cookie).await
+    }
+
+    /// GET `path` through `app`, answering as [`get`] does.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_via(
+        app: axum::Router,
         path: &str,
         cookie: Option<&str>,
     ) -> (StatusCode, Option<String>, String, String) {
@@ -10170,7 +10324,7 @@ mod route_entry_cmd_tests {
         if let Some(c) = cookie {
             b = b.header(header::COOKIE, format!("{name}={c}"));
         }
-        let resp = router(store.clone())
+        let resp = app
             .oneshot(b.body(Body::empty()).expect("build GET"))
             .await
             .expect("router responds");
@@ -10198,10 +10352,7 @@ mod route_entry_cmd_tests {
     }
 
     async fn handle_of(store: &Store, sid: &str) -> Option<SessionHandle<Model, Msg>> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => Some(h),
-            _ => None,
-        }
+        store.get(sid).await
     }
 
     async fn model_of(store: &Store, sid: &str) -> Option<Model> {
@@ -10279,14 +10430,33 @@ mod route_entry_cmd_tests {
 
     #[async_trait::async_trait]
     impl SessionStore<Model, Msg> for ColdStore {
-        async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
-            match self.live.get(sid).await {
-                Some(hit) => Some(hit),
-                None if sid == self.cold_sid => Some(StoreHit::Cold(Model {
-                    page: Page::Home,
-                    log: vec!["persisted".to_owned()],
-                })),
-                None => None,
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.live.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.live.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            _make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            if !self.admission().admits(&claim) {
+                return store::Rejoin::Miss;
+            }
+            if let Some(h) = self.live.get(claim.key().as_str()).await {
+                return store::Rejoin::Live(h);
+            }
+            if claim.key().as_str() == self.cold_sid {
+                store::Rejoin::Restored {
+                    claim,
+                    model: Model {
+                        page: Page::Home,
+                        log: vec!["persisted".to_owned()],
+                    },
+                }
+            } else {
+                store::Rejoin::Miss
             }
         }
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
@@ -10316,6 +10486,535 @@ mod route_entry_cmd_tests {
                 m.map(|m| m.log),
                 Some(vec!["persisted".to_owned(), "enter:item-3".to_owned()]),
                 "a cold restore runs the entry Cmd and never init's"
+            );
+        });
+    }
+
+    /// The live binary's Model schema tag in the file-store fixtures.
+    #[cfg(feature = "web")]
+    const LIVE_TAG: [u8; 32] = [0x11; 32];
+    /// A previous binary's tag: a row under it was written before a Model change.
+    #[cfg(feature = "web")]
+    const OLD_TAG: [u8; 32] = [0x22; 32];
+
+    /// One checkpoint blob framed as the store writes it: `base64(tag ++ json)`.
+    #[cfg(feature = "web")]
+    fn checkpoint(tag: [u8; 32], json: &str) -> String {
+        use base64::Engine as _;
+        let mut framed = tag.to_vec();
+        framed.extend_from_slice(json.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(framed)
+    }
+
+    /// A file store under `LIVE_TAG` whose one persisted row maps `sid` to `blob`.
+    ///
+    /// The map lives in a private scratch directory the returned guard removes
+    /// on drop, so no fixture writes through a name another local user can plant.
+    #[cfg(feature = "web")]
+    #[allow(clippy::expect_used)] // test helper — a temp-file write failure is a test environment issue
+    fn file_store_with(
+        name: &str,
+        sid: &str,
+        blob: String,
+    ) -> (Store, crate::scratch_core::ScratchDir) {
+        let dir = crate::scratch_core::ScratchDir::new(&format!("ipetest-rejoin-{name}"))
+            .expect("a private scratch dir");
+        let path = dir.path().join("sessions.json");
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let mut map: std::collections::HashMap<String, (String, i64)> =
+            std::collections::HashMap::new();
+        map.insert(sid.to_owned(), (blob, last_seen));
+        std::fs::write(
+            &path,
+            serde_json::to_string(&map).expect("encode the seed map"),
+        )
+        .expect("write the seed map");
+        let store: Store = Arc::new(store::FileStore::<Model, Msg>::new(
+            path.to_str().expect("a UTF-8 temp path"),
+            Duration::from_secs(60),
+            LIVE_TAG,
+        ));
+        (store, dir)
+    }
+
+    /// A session rebuilt across an additive Model change runs init's Cmd, then the entry Cmd, under its kept sid.
+    #[cfg(feature = "web")]
+    #[test]
+    fn schema_rebuilt_session_runs_init_cmd_then_entry_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // The old Model had no `log`: an additive change, so the row is rebuilt.
+            let (store, _dir) =
+                file_store_with("rebuilt", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a rebuilt session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "a rebuilt session runs init's Cmd, then the entry Cmd, each once"
+            );
+        });
+    }
+
+    /// The `init` a rebuild evaluates runs under the session's sid, never the empty default.
+    #[cfg(feature = "web")]
+    #[test]
+    fn rebuilt_init_cmd_binds_session_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) =
+                file_store_with("bindsid", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            take_init_sids();
+            let (status, _, _, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                take_init_sids(),
+                vec![sid],
+                "init runs once, scoped to the rebuilt session's sid"
+            );
+        });
+    }
+
+    /// A same-tag checkpoint restores verbatim and never evaluates `init`.
+    #[cfg(feature = "web")]
+    #[test]
+    fn exact_tag_restore_never_calls_init() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with(
+                "exact",
+                &sid,
+                checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
+            );
+            take_init_sids();
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a restored session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:home".to_owned()]),
+                "a verbatim restore runs the entry Cmd and never init's"
+            );
+            assert!(
+                take_init_sids().is_empty(),
+                "a verbatim restore never evaluates init"
+            );
+        });
+    }
+
+    /// An undecodable row is a miss: a fresh sid, `init` evaluated exactly once under it.
+    #[cfg(feature = "web")]
+    #[test]
+    fn failed_rebuild_runs_init_once_under_new_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with("undecodable", &sid, "!! not base64 !!".to_owned());
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(minted, sid, "a miss never adopts the client's sid");
+            assert_eq!(
+                take_init_sids(),
+                vec![minted.clone()],
+                "init runs exactly once, under the minted sid"
+            );
+            let m = settled(&store, &minted, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "the new session runs init's Cmd, then the entry Cmd"
+            );
+        });
+    }
+
+    /// A non-additive old row evaluates `init` for the rebuild attempt, drops that Cmd unrun, and re-inits once.
+    #[cfg(feature = "web")]
+    #[test]
+    fn non_additive_rebuild_discards_its_init_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // `log` retyped (a number where the live Model holds a list): not additive.
+            let (store, _dir) = file_store_with(
+                "retyped",
+                &sid,
+                checkpoint(OLD_TAG, r#"{"page":"Home","log":5}"#),
+            );
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(
+                minted, sid,
+                "a failed rebuild never adopts the client's sid"
+            );
+            assert_eq!(
+                take_init_sids(),
+                vec![sid, minted.clone()],
+                "the rebuild attempt evaluates init under the cookie's sid, the re-init under the minted one"
+            );
+            // Wait past the expected length: a leaked rebuild Cmd would land a second "init".
+            let m = settled(&store, &minted, 3).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "only the re-init's Cmd runs; the discarded rebuild's Cmd never does"
+            );
+        });
+    }
+
+    /// A store that yields between its claimed lookup and the caller's publish, as a networked store's I/O does.
+    ///
+    /// Without the yield every fixture lookup completes in one poll, so two
+    /// concurrent GETs never interleave between lookup and `set` and a race
+    /// test passes with or without the claim.
+    #[cfg(feature = "web")]
+    struct YieldingStore {
+        inner: Store,
+    }
+
+    #[cfg(feature = "web")]
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for YieldingStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            let rejoin = self.inner.get_reconstructing(claim, make_init).await;
+            tokio::task::yield_now().await;
+            rejoin
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// Two concurrent GETs rejoining one schema-rebuilt sid evaluate `init` once; the second joins live.
+    #[cfg(feature = "web")]
+    #[test]
+    fn two_concurrent_rebuilt_gets_run_init_once() {
+        run(false, || async {
+            let sid = new_sid();
+            let (file, _dir) =
+                file_store_with("racedinit", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let store: Store = Arc::new(YieldingStore { inner: file });
+            take_init_sids();
+            let ((first, ..), (second, ..)) =
+                tokio::join!(get(&store, "/", Some(&sid)), get(&store, "/", Some(&sid)));
+            assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+            assert_eq!(
+                take_init_sids(),
+                vec![sid.clone()],
+                "one cold rejoin per sid: init runs once"
+            );
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(
+                m.map(|m| count(&m, "init")),
+                Some(1),
+                "init's Cmd lands once"
+            );
+        });
+    }
+
+    /// Two concurrent GETs restoring one sid verbatim spawn one session driver.
+    #[cfg(feature = "web")]
+    #[test]
+    fn restored_concurrent_gets_spawn_one_driver() {
+        run(false, || async {
+            let sid = new_sid();
+            let (file, _dir) = file_store_with(
+                "raceddriver",
+                &sid,
+                checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
+            );
+            let store: Store = Arc::new(YieldingStore { inner: file });
+            let drivers = Arc::new(AtomicUsize::new(0));
+            let ((first, ..), (second, ..)) = tokio::join!(
+                get_via(
+                    router_counted(store.clone(), drivers.clone()),
+                    "/",
+                    Some(&sid)
+                ),
+                get_via(
+                    router_counted(store.clone(), drivers.clone()),
+                    "/",
+                    Some(&sid)
+                )
+            );
+            assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+            assert_eq!(
+                drivers.load(Ordering::SeqCst),
+                1,
+                "the second rejoin joins the first's live session"
+            );
+        });
+    }
+
+    /// A cold store whose `set` waits for the test's release, so a test cancels a handler mid-commit.
+    struct GatedStore {
+        inner: ColdStore,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for GatedStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.entered.notify_one();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A handler cancelled while its rejoin is being stored still commits the session, its Cmd and its claim release.
+    #[test]
+    fn cancelled_handler_mid_set_still_commits() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let gated = Arc::new(GatedStore {
+                inner: ColdStore {
+                    live: MemoryStore::new(Duration::from_secs(60)),
+                    cold_sid: cold_sid.clone(),
+                },
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let store: Store = gated.clone();
+            let app = router(store.clone());
+            let cookie = cold_sid.clone();
+            let request =
+                tokio::spawn(async move { get_via(app, "/", Some(cookie.as_str())).await });
+            gated.entered.notified().await;
+            request.abort();
+            assert!(
+                request.await.is_err(),
+                "the handler is cancelled mid-commit"
+            );
+            gated.release.add_permits(1);
+            let m = settled(&store, &cold_sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:home".to_owned()]),
+                "the cancelled handler's session is stored and its entry Cmd runs"
+            );
+            gated.release.add_permits(1);
+            let (status, ..) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(status, StatusCode::OK, "the committed claim was released");
+        });
+    }
+
+    /// A cold store whose first `set` panics, so a test drives a commit that unwinds mid-publish.
+    struct PanicOnceStore {
+        inner: ColdStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PanicOnceStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("the first commit unwinds mid-publish");
+            }
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A commit that panics answers the panic 500 and releases its claim, so a retry restores the session.
+    #[test]
+    fn panicking_commit_is_500_and_releases_claim() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let store: Store = Arc::new(PanicOnceStore {
+                inner: ColdStore {
+                    live: MemoryStore::new(Duration::from_secs(60)),
+                    cold_sid: cold_sid.clone(),
+                },
+                armed: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (status, _, _, body) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a panicked commit is the panic 500"
+            );
+            assert!(
+                !body.contains(&cold_sid),
+                "the panic body never carries the sid: {body}"
+            );
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the unwound commit released its claim"
+            );
+            assert_eq!(cookie_sid, cold_sid, "the retry restores the cold session");
+        });
+    }
+
+    /// A claim held past the wait, or a sid with too many waiters, is the busy 503; a full claim table is the capacity 503.
+    #[test]
+    fn claim_refusals_map_to_existing_503s() {
+        run(true, || async {
+            let store = memory();
+            let sid = new_sid();
+            let key = || store::SessionKey::parse(&sid).expect("a minted sid is a session key");
+            let held = store
+                .claim(key())
+                .await
+                .expect("an idle sid is claimed at once");
+
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a wait past CLAIM_WAIT"
+            );
+            assert_eq!(retry_after.as_deref(), Some("1"));
+
+            let mut waiters: Vec<_> = (0..store::MAX_CLAIM_WAITERS.get())
+                .map(|_| store.claim(key()))
+                .collect();
+            for waiter in &mut waiters {
+                assert!(
+                    futures_util::FutureExt::now_or_never(waiter).is_none(),
+                    "a waiter up to the limit queues"
+                );
+            }
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a crowded sid");
+            assert_eq!(retry_after.as_deref(), Some("1"));
+            drop(waiters);
+            drop(held);
+
+            let mut table = Vec::with_capacity(store::MAX_CLAIMS_IN_FLIGHT);
+            for i in 0..store::MAX_CLAIMS_IN_FLIGHT {
+                let k = store::SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid");
+                table.push(
+                    store
+                        .claim(k)
+                        .await
+                        .expect("a sid under the cap is claimed"),
+                );
+            }
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a full claim table"
+            );
+            assert_eq!(retry_after.as_deref(), Some("2"));
+        });
+    }
+
+    /// A live session's GET never touches the claim table, so a full table cannot refuse it.
+    #[test]
+    fn live_session_bypasses_a_full_claim_table() {
+        run(false, || async {
+            let store = memory();
+            let (status, _, sid, _) = get(&store, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                settled(&store, &sid, 2).await.is_some(),
+                "the session is live"
+            );
+            let mut table = Vec::with_capacity(store::MAX_CLAIMS_IN_FLIGHT);
+            for i in 0..store::MAX_CLAIMS_IN_FLIGHT {
+                let k = store::SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid");
+                table.push(
+                    store
+                        .claim(k)
+                        .await
+                        .expect("a sid under the cap is claimed"),
+                );
+            }
+            let cold = store::SessionKey::parse(&new_sid()).expect("a minted sid is a session key");
+            assert_eq!(
+                store.claim(cold).await.err(),
+                Some(store::ClaimRefusal::Saturated),
+                "the claim table is full"
+            );
+            let (status, retry_after, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK, "a live session is never refused");
+            assert_eq!(retry_after, None);
+            assert_eq!(cookie_sid, sid, "the GET joins the live session");
+        });
+    }
+
+    /// A cookie that is not a well-formed sid is never looked up: the GET mints a fresh session.
+    #[test]
+    fn malformed_cookie_mints_without_lookup() {
+        run(false, || async {
+            let malformed = "persisted-session".to_owned();
+            let store: Store = Arc::new(ColdStore {
+                live: MemoryStore::new(Duration::from_secs(60)),
+                cold_sid: malformed.clone(),
+            });
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&malformed)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(minted, malformed, "a malformed sid is never adopted");
+            assert_eq!(take_init_sids(), vec![minted.clone()]);
+            let m = settled(&store, &minted, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "the store's row under the malformed sid is never restored"
             );
         });
     }
