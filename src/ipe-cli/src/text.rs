@@ -937,6 +937,12 @@ messages! {
     cli_child_pipe_unread(stream, kind) = "cli-child-pipe-unread";
     /// A child's stderr was cut at its ceiling; the line closes the kept text.
     cli_child_stderr_truncated(limit) = "cli-child-stderr-truncated";
+    /// The unsandboxed FFI inspector exited unsuccessfully with a code.
+    ffi_inspector_exited(code, stderr: &crate::style::TerminalSafe) = "ffi-inspector-exited";
+    /// A signal ended the unsandboxed FFI inspector.
+    ffi_inspector_signalled(stderr: &crate::style::TerminalSafe) = "ffi-inspector-signalled";
+    /// The unsandboxed FFI inspector's report is not UTF-8.
+    ffi_inspector_not_utf8 = "ffi-inspector-not-utf8";
     /// A source path named a FIFO, device, socket or other non-regular file.
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
