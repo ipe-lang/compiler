@@ -3432,7 +3432,7 @@ const SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH: usize = 50_000;
 // Every reserved character escaped doubles, plus the trailing `%`: the longest
 // pattern a `LikePrefix` renders stays inside SQLite's pattern ceiling.
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the prefix ceiling outgrows SQLite's LIKE pattern ceiling [ledger #boundary]
-const _: () = assert!(2 * MAX_LIKE_PREFIX_BYTES + 1 <= SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH);
+const _: () = assert!(2 * MAX_LIKE_PREFIX_BYTES < SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH);
 // The escape character is neither a wildcard nor a character that ends or
 // opens the quoted `ESCAPE` literal or a placeholder.
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the LIKE escape character is a wildcard, quote or placeholder [ledger #boundary]

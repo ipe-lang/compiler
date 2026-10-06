@@ -202,6 +202,7 @@ impl IpeStringify for IpeDbStoreCompareOp {
 pub(crate) enum IpeDbStoreCond {
     Compare(IpeDbStoreCompareOp, String, MainSqlValue),
     Like(String, String),
+    StartsWith(String, String),
     IsNull(String),
     NotNull(String),
     InList(String, Vec<MainSqlValue>),
@@ -221,6 +222,11 @@ impl IpeStringify for IpeDbStoreCond {
             ),
             IpeDbStoreCond::Like(p0, p1) => format!(
                 "Like {} {}",
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
+            ),
+            IpeDbStoreCond::StartsWith(p0, p1) => format!(
+                "StartsWith {} {}",
                 IpeStringify::ipe_show(p0),
                 IpeStringify::ipe_show(p1)
             ),
@@ -626,6 +632,16 @@ pub(crate) fn user_ipe_db_store_cond_fragment_in(
                 __ipe_fn
             })
         }
+        IpeDbStoreCond::StartsWith(col, prefix) => {
+            ipe_result_map(crate::user_ipe_db_store_live_name(view, col), {
+                let __ipe_fn: Box<
+                    dyn Fn(String) -> ipe_runtime::db::SqlFragment + Send + Sync + 'static,
+                > = Box::new(move |live: String| -> ipe_runtime::db::SqlFragment {
+                    sql_starts_with(sql_column(live), prefix.clone())
+                });
+                __ipe_fn
+            })
+        }
         IpeDbStoreCond::IsNull(col) => {
             ipe_result_map(crate::user_ipe_db_store_live_name(view, col), {
                 let __ipe_fn: Box<
@@ -916,6 +932,7 @@ pub(crate) fn user_ipe_db_store_recast_cond(cond: IpeDbStoreCond) -> IpeDbStoreC
     match cond {
         IpeDbStoreCond::Compare(op, col, value) => IpeDbStoreCond::Compare(op, col, value),
         IpeDbStoreCond::Like(col, pattern) => IpeDbStoreCond::Like(col, pattern),
+        IpeDbStoreCond::StartsWith(col, prefix) => IpeDbStoreCond::StartsWith(col, prefix),
         IpeDbStoreCond::IsNull(col) => IpeDbStoreCond::IsNull(col),
         IpeDbStoreCond::NotNull(col) => IpeDbStoreCond::NotNull(col),
         IpeDbStoreCond::InList(col, values) => IpeDbStoreCond::InList(col, values),
@@ -1108,6 +1125,7 @@ pub(crate) fn user_ipe_db_store_cond_columns(cond: IpeDbStoreCond) -> Vec<String
     match cond {
         IpeDbStoreCond::Compare(_, col, _) => vec![col],
         IpeDbStoreCond::Like(col, _) => vec![col],
+        IpeDbStoreCond::StartsWith(col, _) => vec![col],
         IpeDbStoreCond::IsNull(col) => vec![col],
         IpeDbStoreCond::NotNull(col) => vec![col],
         IpeDbStoreCond::InList(col, _) => vec![col],
