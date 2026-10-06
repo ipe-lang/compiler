@@ -3172,9 +3172,12 @@ like =
 -- `accessor` begins with `prefix`, read literally: `%`, `_` and `\` in it,
 -- including any that come from user text, match only themselves. The prefix
 -- binds as a parameter, never as SQL text, and the match is case-sensitive on
--- every engine. It renders through `Sql.startsWith`, so an empty prefix, one
--- holding a NUL character, or one longer than 16384 bytes is refused as a
--- typed error before any SQL is sent. The accessor must name a `String` field.
+-- every engine under a deterministic collation; a Postgres column declared
+-- with a nondeterministic collation (a case-insensitive ICU one) compares by
+-- that collation instead. It renders through `Sql.startsWith`, so an empty
+-- prefix, one holding a NUL character, or one longer than 16384 bytes is
+-- refused as a typed error before any SQL is sent. The accessor must name a
+-- `String` field.
 --
 -- Example:
 --

@@ -2442,9 +2442,11 @@ pub enum StdlibKernel {
     ///
     /// The accessor must name a `String` field. The prefix is literal: `%`,
     /// `_` and `\` in it match themselves, and the match is case-sensitive on
-    /// every engine. It renders through `Sql.startsWith`, so an empty prefix,
-    /// one holding a NUL character, or one longer than 16384 bytes is refused
-    /// as a typed error before any SQL is sent.
+    /// every engine under a deterministic collation; a Postgres column
+    /// declared with a nondeterministic collation (a case-insensitive ICU one)
+    /// compares by that collation instead. It renders through `Sql.startsWith`,
+    /// so an empty prefix, one holding a NUL character, or one longer than
+    /// 16384 bytes is refused as a typed error before any SQL is sent.
     StoreStartsWith,
     /// `Store.isNull : (row -> t) -> Cond` — accessor-typed IS NULL leaf.
     /// Arity 1: only the accessor (column name), no value.
