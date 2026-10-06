@@ -664,7 +664,7 @@ pub enum InheritedInput {
 pub enum InheritedError {
     /// The hardened spawner refused or failed to start the child.
     Spawn(ipe_runtime_rust::system::SpawnRefusal),
-    /// The child, in a role that must read all of its input, left part of it unwritten.
+    /// The child, in a role that must read all of its input, exited 0 with part of it unwritten.
     Feed(std::io::ErrorKind),
     /// Waiting on the child failed.
     Wait(std::io::Error),
@@ -701,14 +701,16 @@ impl From<InheritedError> for std::io::Error {
 ///
 /// A fed child that closes its stdin or exits before the CLI wrote every byte
 /// has not read its whole input. In a role that must read all of it
-/// ([`InheritedRole::InteractiveInstall`]) that is refused even on exit 0;
-/// another role is judged by its exit status alone. Bytes written into the
-/// pipe and never read by an exiting child are not seen.
+/// ([`InheritedRole::InteractiveInstall`]) that is refused on exit 0, which
+/// cannot then mean the whole input ran; a non-zero exit is already a failure
+/// and is returned as the status that names it. Another role is judged by its
+/// exit status alone. Bytes written into the pipe and never read by an exiting
+/// child are not seen.
 ///
 /// # Errors
 /// [`InheritedError::Spawn`] when the child cannot start;
-/// [`InheritedError::Feed`] when a child that must read all of its input did
-/// not; [`InheritedError::Wait`] when waiting on it fails.
+/// [`InheritedError::Feed`] when a child that must read all of its input
+/// exited 0 without reading it; [`InheritedError::Wait`] when waiting on it fails.
 pub fn run_inherited(
     mut command: Command,
     role: InheritedRole,
@@ -735,7 +737,9 @@ pub fn run_inherited(
     };
     let (status, shortfall) = feed_until_exit(&mut child, bytes)?;
     match shortfall {
-        Some(kind) if role.consumes_all_input() => Err(InheritedError::Feed(kind)),
+        Some(kind) if role.consumes_all_input() && status.success() => {
+            Err(InheritedError::Feed(kind))
+        }
         Some(_) | None => Ok(status),
     }
 }
@@ -4388,6 +4392,21 @@ mod tests {
         );
         assert!(
             matches!(outcome, Err(super::InheritedError::Feed(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// An installer that fails before reading its whole script keeps the exit status naming the failure.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_fails_early_reports_its_exit_status() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 2"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.code() == Some(2)),
             "{outcome:?}"
         );
     }
