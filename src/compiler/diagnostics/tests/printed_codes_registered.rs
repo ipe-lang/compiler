@@ -19,6 +19,15 @@ const NOT_CODES: &[&str] = &["IPE-X0000", "IPE-P0099"];
 /// The CLI message catalog, relative to the `src/` tree.
 const MESSAGE_CATALOG: &str = "ipe-cli/text/messages.md";
 
+/// The shipped non-Rust text trees, relative to the `src/` tree, with the file
+/// suffixes each prints: the CLI help pages, the `ipe init` templates, and the
+/// stdlib whose doc comments `ipe doc` renders. Each file is scanned whole.
+const SHIPPED_TEXT: &[(&str, &[&str])] = &[
+    ("ipe-cli/help", &[".md"]),
+    ("ipe-cli/templates", &[".in", ".ipe"]),
+    ("stdlib", &[".ipe"]),
+];
+
 /// Length of a wire string: `IPE-` plus a family letter plus four digits.
 const WIRE_LEN: usize = 9;
 
@@ -146,9 +155,9 @@ fn skip_test_item(lines: &[&str], attr: usize) -> usize {
     at
 }
 
-/// Collect every production `.rs` file under `dir`: no `tests` directory, no
-/// build output, no hidden directory.
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// Collect every production file under `dir` whose name ends with one of
+/// `suffixes`: no `tests` directory, no build output, no hidden directory.
+fn collect_files(dir: &Path, suffixes: &[&str], out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path
@@ -158,20 +167,38 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()>
             .to_owned();
         if path.is_dir() {
             if name != "tests" && name != "target" && !name.starts_with('.') {
-                collect_rust_files(&path, out)?;
+                collect_files(&path, suffixes, out)?;
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        } else if suffixes.iter().any(|suffix| name.ends_with(suffix)) {
             out.push(path);
         }
     }
     Ok(())
 }
 
+/// Every shipped text file of [`SHIPPED_TEXT`] under `root`, sorted.
+///
+/// # Errors
+/// A tree that cannot be read, or one that yields no file at all, so a moved
+/// or renamed tree fails the scan instead of silently dropping out of it.
+fn shipped_text_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    for (tree, suffixes) in SHIPPED_TEXT {
+        let before = files.len();
+        collect_files(&root.join(tree), suffixes, &mut files)?;
+        if files.len() == before {
+            return Err(format!("the shipped text tree {tree} yields no {suffixes:?} file").into());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 #[test]
 fn every_printed_code_is_registered() -> Result<(), Box<dyn std::error::Error>> {
     let root = source_root();
     let mut files = Vec::new();
-    collect_rust_files(&root, &mut files)?;
+    collect_files(&root, &[".rs"], &mut files)?;
     files.sort();
 
     let mut texts: Vec<(PathBuf, String)> = Vec::new();
@@ -181,6 +208,10 @@ fn every_printed_code_is_registered() -> Result<(), Box<dyn std::error::Error>> 
     }
     let catalog = root.join(MESSAGE_CATALOG);
     texts.push((catalog.clone(), std::fs::read_to_string(&catalog)?));
+    for file in shipped_text_files(&root)? {
+        let text = std::fs::read_to_string(&file)?;
+        texts.push((file, text));
+    }
 
     let scanned: usize = texts.iter().map(|(_, text)| wire_strings(text).len()).sum();
     assert!(
@@ -326,4 +357,36 @@ const A: &str = \"IPE-S9985\";
         ["IPE-S9985"],
         "a blank line where the head should be ends the item: nothing past it is skipped"
     );
+}
+
+#[test]
+fn the_shipped_text_trees_are_scanned() -> Result<(), Box<dyn std::error::Error>> {
+    let root = source_root();
+    let files = shipped_text_files(&root)?;
+    for (tree, _) in SHIPPED_TEXT {
+        let tree = root.join(tree);
+        assert!(
+            files.iter().any(|file| file.starts_with(&tree)),
+            "no scanned file under {}",
+            tree.display()
+        );
+    }
+    let doc_help = root.join("ipe-cli/help/doc.md");
+    assert!(
+        files.contains(&doc_help),
+        "the `ipe doc` help page, which prints codes, must be scanned"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_suffix_no_file_carries_collects_nothing() -> std::io::Result<()> {
+    let mut files = Vec::new();
+    collect_files(
+        &source_root().join("ipe-cli/help"),
+        &[".nomatch"],
+        &mut files,
+    )?;
+    assert!(files.is_empty(), "collected {files:?}");
+    Ok(())
 }
