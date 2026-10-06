@@ -73,20 +73,7 @@ impl Builder<'_> {
                             .insert((self.home()?.into_path(), sub.span), av);
                     }
                 } else {
-                    // A constructor with no registered scheme (imported, outside the
-                    // single-module subset): fall back to the bare enum type.
-                    // We still must recurse into every argument sub-pattern so that
-                    // pattern variables (e.g. `Chunk text` where `Chunk` is an
-                    // imported ctor) get bound into `local`.  Without the recursion
-                    // the body sees `VarLocal("text")` that is absent from the local
-                    // map and fires the "unbound local" ICE.  Use a fresh flex
-                    // variable per arg since the field types are unknown.
-                    let ctor = self.con_var(home.clone(), *type_name, Vec::new())?;
-                    self.eq(pat.span, ctor, scrut_var)?;
-                    for sub in args {
-                        let av = self.flex()?;
-                        self.constrain_pattern(local, sub, av)?;
-                    }
+                    return Err(self.ctor_scheme_miss(pat.span, &key));
                 }
                 Ok(())
             }

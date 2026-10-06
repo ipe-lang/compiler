@@ -2660,11 +2660,11 @@ Ipe.Set — unordered collection of unique elements.
 | `contains` | `contains needle haystack` — `True` when `needle` appears inside `haystack`. |
 | `startsWith` | `startsWith prefix s` — `True` when `s` begins with `prefix`. |
 | `endsWith` | `endsWith suffix s` — `True` when `s` ends with `suffix`. |
-| `containsIn` | `containsIn needle haystack` — `True` when `needle` appears in `haystack`. |
-| `startsWithIn` | `startsWithIn prefix haystack` — `True` when `haystack` starts with `prefix`. |
-| `endsWithIn` | `endsWithIn suffix haystack` — `True` when `haystack` ends with `suffix`. |
-| `casefold` | `casefold s` — case-fold `s` for case-insensitive comparison. |
-| `equalFold` | `equalFold s1 s2` — case-insensitive equality comparison. |
+| `containsIn` | `containsIn haystack needle` — `True` when `needle` appears in `haystack`: `contains` with the arguments swapped. |
+| `startsWithIn` | `startsWithIn haystack prefix` — `True` when `haystack` starts with `prefix`: `startsWith` with the arguments swapped. |
+| `endsWithIn` | `endsWithIn haystack suffix` — `True` when `haystack` ends with `suffix`: `endsWith` with the arguments swapped. |
+| `casefold` | `casefold s` — Unicode default full case folding, for case-insensitive comparison and keys. |
+| `equalFold` | `equalFold a b` — case-insensitive equality: `casefold a == casefold b`. |
 | `isEmail` | `isEmail s` — `True` when `s` looks like a valid email address. |
 | `isUrl` | `isUrl s` — `True` when `s` looks like a valid URL. |
 | `words` | `words s` — split `s` into words on whitespace boundaries. |
