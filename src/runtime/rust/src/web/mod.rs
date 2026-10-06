@@ -3257,7 +3257,14 @@ mod handlers {
         // 503 a busy session or a full process already answers with.
         let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
         let hit = match cookie_key {
-            Some(key) if !reset_state_from_env() => {
+            Some(key) if !reset_state_from_env() => 'rejoin: {
+                // A live session never contends for the claim table: the
+                // claim serialises only the cold-to-live transition.
+                if let Some(handle) = st.store.get(key.as_str()).await {
+                    break 'rejoin Some((key.as_str().to_owned(), store::Rejoin::Live(handle)));
+                }
+                // Once claimed, `get_reconstructing` checks live again first:
+                // the previous holder's publish may have landed while this waited.
                 let claim = match st.store.claim(key).await {
                     Ok(claim) => claim,
                     Err(store::ClaimRefusal::InFlight | store::ClaimRefusal::Crowded) => {
@@ -10950,6 +10957,40 @@ mod route_entry_cmd_tests {
                 "a full claim table"
             );
             assert_eq!(retry_after.as_deref(), Some("2"));
+        });
+    }
+
+    /// A live session's GET never touches the claim table, so a full table cannot refuse it.
+    #[test]
+    fn live_session_bypasses_a_full_claim_table() {
+        run(false, || async {
+            let store = memory();
+            let (status, _, sid, _) = get(&store, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                settled(&store, &sid, 2).await.is_some(),
+                "the session is live"
+            );
+            let mut table = Vec::with_capacity(store::MAX_CLAIMS_IN_FLIGHT);
+            for i in 0..store::MAX_CLAIMS_IN_FLIGHT {
+                let k = store::SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid");
+                table.push(
+                    store
+                        .claim(k)
+                        .await
+                        .expect("a sid under the cap is claimed"),
+                );
+            }
+            let cold = store::SessionKey::parse(&new_sid()).expect("a minted sid is a session key");
+            assert_eq!(
+                store.claim(cold).await.err(),
+                Some(store::ClaimRefusal::Saturated),
+                "the claim table is full"
+            );
+            let (status, retry_after, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK, "a live session is never refused");
+            assert_eq!(retry_after, None);
+            assert_eq!(cookie_sid, sid, "the GET joins the live session");
         });
     }
 
