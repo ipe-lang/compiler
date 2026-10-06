@@ -432,11 +432,14 @@ fn format_guarded(
     let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
         detail: "source parsed but did not lex".to_owned(),
     })?;
-    let out = render(&Printer::new(&interner, &input, Some(src)), &module);
+    let printer = Printer::new(&interner, &input, Some(src), cap);
+    let out = render(&printer, &module);
 
-    // Output guard: the formatted text fits the cap. It fires first so an
-    // over-cap output is never lexed, re-parsed or returned.
-    if !cap.admits(&out) {
+    // Output guard: the formatted text fits the cap, and no pad was refused
+    // its bytes on the way (a refused pad rendered empty, so the text alone
+    // under-counts). It fires first so an over-cap output is never lexed,
+    // re-parsed or returned.
+    if printer.pads.exceeded() || !cap.admits(&out) {
         return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
     }
 
@@ -467,7 +470,7 @@ fn format_guarded(
     let mut verify_interner = Interner::new();
     match ipe_parse::parse_module(&out, &mut verify_interner) {
         Ok(reparsed) => {
-            if !modules_equivalent(&module, &interner, &reparsed, &verify_interner) {
+            if !modules_equivalent(&module, &interner, &reparsed, &verify_interner, cap)? {
                 return Err(FmtError::RoundTrip {
                     detail: "formatted output parsed to a different AST".to_owned(),
                 });
@@ -495,7 +498,13 @@ pub(crate) fn format_source_unchecked(src: &str) -> Result<String, FmtError> {
     let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
         detail: "source parsed but did not lex".to_owned(),
     })?;
-    Ok(Printer::new(&interner, &input, Some(src)).module(&module))
+    Ok(Printer::new(
+        &interner,
+        &input,
+        Some(src),
+        OutputCap::for_input(src.len()),
+    )
+    .module(&module))
 }
 
 #[cfg(test)]
@@ -540,9 +549,19 @@ fn render_call_count() -> u64 {
 /// value depends on its column: the canonical text prints that value, so a
 /// formatter that moves the string to another margin is refused rather than
 /// changing what the program means.
-fn modules_equivalent(a: &Module, ai: &Interner, b: &Module, bi: &Interner) -> bool {
-    ModuleText::of(a, ai) == ModuleText::of(b, bi)
-        && ModuleTree::of(a, ai).is_some_and(|tree| ModuleTree::of(b, bi) == Some(tree))
+///
+/// # Errors
+/// [`FmtError::Limit`] when either canonical text would pass `cap`: the
+/// projection is a print like any other and is charged the same ceiling.
+fn modules_equivalent(
+    a: &Module,
+    ai: &Interner,
+    b: &Module,
+    bi: &Interner,
+    cap: OutputCap,
+) -> Result<bool, FmtError> {
+    Ok(ModuleText::of(a, ai, cap)? == ModuleText::of(b, bi, cap)?
+        && ModuleTree::of(a, ai).is_some_and(|tree| ModuleTree::of(b, bi) == Some(tree)))
 }
 
 /// Every field of a module's AST, with byte positions erased and symbols
@@ -656,7 +675,7 @@ fn split_digits(s: &str) -> Option<(&str, &str)> {
 struct ModuleText(String);
 
 impl ModuleText {
-    fn of(m: &Module, i: &Interner) -> Self {
+    fn of(m: &Module, i: &Interner, cap: OutputCap) -> Result<Self, FmtError> {
         // Reuse the printer with NO trivia: the projection is a canonical string
         // form, and two ASTs are equivalent iff their comment-free canonical
         // forms are byte-identical. (Comments are checked separately by the
@@ -665,7 +684,12 @@ impl ModuleText {
             comments: Vec::new(),
             code: Vec::new(),
         };
-        Self(Printer::new(i, &none, None).module(m))
+        let printer = Printer::new(i, &none, None, cap);
+        let text = printer.module(m);
+        if printer.pads.exceeded() || !cap.admits(&text) {
+            return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+        }
+        Ok(Self(text))
     }
 }
 
@@ -703,10 +727,17 @@ struct Printer<'a> {
     /// Set and restored around each render, like `claimed`, so the outermost
     /// claim of a lambda takes those comments once.
     lambda_head: Cell<Option<usize>>,
+    /// The indentation this print may still emit; every pad renders through it.
+    pads: PadBudget,
 }
 
 impl<'a> Printer<'a> {
-    const fn new(interner: &'a Interner, trivia: &'a Trivia, src: Option<&'a str>) -> Self {
+    const fn new(
+        interner: &'a Interner,
+        trivia: &'a Trivia,
+        src: Option<&'a str>,
+        cap: OutputCap,
+    ) -> Self {
         Self {
             interner,
             comments: trivia.comments.as_slice(),
@@ -714,7 +745,22 @@ impl<'a> Printer<'a> {
             src,
             claimed: Cell::new(None),
             lambda_head: Cell::new(None),
+            pads: PadBudget::new(cap),
         }
+    }
+
+    /// Four spaces per indent level, charged to this print's budget.
+    const fn pad(&self, indent: usize) -> Pad<'_> {
+        self.pads.pad(indent)
+    }
+
+    /// The indentation of the leading-comma continuation lines inside a
+    /// multiline record / list / tuple.
+    ///
+    /// elm-format aligns the `,` with the opening bracket, which sits at the
+    /// construct's own indent.
+    const fn pad_in(&self, indent: usize) -> Pad<'_> {
+        self.pads.pad(indent)
     }
 
     fn sym(&self, s: ipe_intern::Symbol) -> String {
@@ -916,7 +962,7 @@ impl<'a> Printer<'a> {
         if comments.peek().is_none() {
             return body.to_owned();
         }
-        let pad = pad(indent);
+        let pad = self.pad(indent);
         let mut out = String::new();
         for c in comments {
             let _ = write!(out, "{}\n{pad}", c.text);
@@ -1470,7 +1516,7 @@ impl<'a> Printer<'a> {
     /// indents each argument one level under the applied head); anything else is
     /// a single indented line.
     fn type_multiline(&self, t: &TypeAnnotation, indent: usize) -> String {
-        let cur_pad = pad(indent);
+        let cur_pad = self.pad(indent);
         match t {
             TypeAnnotation::TLambda(_, _) => {
                 let parts = self.arrow_chain(t, indent);
@@ -1489,7 +1535,7 @@ impl<'a> Printer<'a> {
                 }
                 // Break the application: head on its own line, each argument one
                 // level deeper on its own line.
-                let arg_pad = pad(indent + 1);
+                let arg_pad = self.pad(indent + 1);
                 let mut out = format!("{cur_pad}{}", self.type_head(*q, segs));
                 for a in args {
                     let _ = write!(out, "\n{arg_pad}{}", self.type_atom_indent(a, indent + 1));
@@ -1512,7 +1558,7 @@ impl<'a> Printer<'a> {
                 } else {
                     // Multiline arrow: each arrow on its own line, four-space
                     // indented past the current level, `->` leading.
-                    let pad = pad(indent + 1);
+                    let pad = self.pad(indent + 1);
                     let mut it = parts.into_iter();
                     let first = it.next().unwrap_or_default();
                     let mut out = first;
@@ -1656,8 +1702,8 @@ impl<'a> Printer<'a> {
         if !force_multi && !has_field_comments && !one.contains('\n') {
             return one;
         }
-        let pad = pad(indent);
-        let inner = pad_in(indent);
+        let pad = self.pad(indent);
+        let inner = self.pad_in(indent);
         let mut out = String::from("{");
         for (i, (part, lead)) in parts.iter().zip(&leading).enumerate() {
             // The comment block precedes the field it annotates, mirroring the
@@ -1892,7 +1938,7 @@ impl<'a> Printer<'a> {
     /// The result expression comes last; comments written between statements
     /// keep their place.
     fn do_block(&self, view: &DoView<'_>, indent: usize) -> String {
-        let stmt_pad = pad(indent + 1);
+        let stmt_pad = self.pad(indent + 1);
         // A parenthesised block's node starts at its `(`: a comment between
         // the `(` and the keyword attaches to the keyword.
         let keyword_lo = view.keyword_end.saturating_sub("do".len());
@@ -2022,7 +2068,7 @@ impl<'a> Printer<'a> {
                 // directly, continuation lines keep their indentation, and the
                 // closing `)` sits on its own line at this atom's indent —
                 // elm-format's parenthesised-block layout.
-                format!("({}\n{})", inner, pad(indent))
+                format!("({}\n{})", inner, self.pad(indent))
             } else {
                 format!("({inner})")
             }
@@ -2064,7 +2110,7 @@ impl<'a> Printer<'a> {
         //     only broke on width, elm-format instead stacks all of them.
         //   * otherwise (Case 3): the function stands alone and EVERY argument
         //     goes on its own indented line.
-        let inner = pad(indent + 1);
+        let inner = self.pad(indent + 1);
         // `split_first` avoids indexing/slicing panics and cleanly expresses the
         // "first argument joins the head line" branch.
         // The first argument hugs the function line — elm-format's `FAJoinFirst`
@@ -2098,9 +2144,7 @@ impl<'a> Printer<'a> {
                 _ => (head_s, arg_one_strs.as_slice()),
             };
         for s in rest_strs {
-            out.push('\n');
-            out.push_str(&inner);
-            out.push_str(s);
+            let _ = write!(out, "\n{inner}{s}");
         }
         out
     }
@@ -2198,7 +2242,7 @@ impl<'a> Printer<'a> {
         // this way. Every other operator (`|>`, `::`, `++`, `==`, …) begins the
         // continuation line instead.
         let all_backward = chain.iter().all(|(_, op)| self.sym(op.value) == "<|");
-        let inner = pad(indent + 1);
+        let inner = self.pad(indent + 1);
         if all_backward {
             // Each right operand opens the next line one level in; its
             // comments head that line.
@@ -2297,14 +2341,14 @@ impl<'a> Printer<'a> {
         if !block_body && !self.was_multiline(span) && !has_layout_newline(&body_s) {
             format!("{head} {body_s}")
         } else {
-            format!("{head}\n{}{body_s}", pad(indent + 1))
+            format!("{head}\n{}{body_s}", self.pad(indent + 1))
         }
     }
 
     fn case(&self, scrut: &Expr, arms: &[(Pattern, Expr)], indent: usize) -> String {
         let scrut_s = self.expr(scrut, indent);
-        let arm_pad = pad(indent + 1);
-        let body_pad = pad(indent + 2);
+        let arm_pad = self.pad(indent + 1);
+        let body_pad = self.pad(indent + 2);
         let mut out = format!("case {scrut_s} of");
         for (i, (pat, body)) in arms.iter().enumerate() {
             // A comment above an arm attaches to its pattern and sits on its
@@ -2337,8 +2381,8 @@ impl<'a> Printer<'a> {
     }
 
     fn let_(&self, bindings: &[LetBinding], body: &Expr, indent: usize) -> String {
-        let bind_pad = pad(indent + 1);
-        let body_val_pad = pad(indent + 2);
+        let bind_pad = self.pad(indent + 1);
+        let body_val_pad = self.pad(indent + 2);
         let mut out = String::from("let");
         for (i, b) in bindings.iter().enumerate() {
             // elm-format separates successive `let` bindings with a blank
@@ -2366,13 +2410,13 @@ impl<'a> Printer<'a> {
             if i > 0 && above.is_empty() && inside.is_empty() {
                 out.push('\n');
             }
-            push_indented_comments(&mut out, above.iter().chain(inside), &bind_pad);
+            push_indented_comments(&mut out, above.iter().chain(inside), bind_pad);
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
             let val = self.expr(value, indent + 2);
             let _ = write!(out, "\n{bind_pad}{binder} =\n{body_val_pad}{val}");
         }
-        let in_pad = pad(indent);
+        let in_pad = self.pad(indent);
         let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, indent));
         out
     }
@@ -2388,7 +2432,7 @@ impl<'a> Printer<'a> {
     }
 
     fn if_(&self, branches: &[(Expr, Expr)], else_: &Expr, indent: usize) -> String {
-        let inner = pad(indent + 1);
+        let inner = self.pad(indent + 1);
         let mut out = String::new();
         for (i, (cond, body)) in branches.iter().enumerate() {
             let lead = if i == 0 { "if" } else { "else if" };
@@ -2399,7 +2443,7 @@ impl<'a> Printer<'a> {
                     .token_before(cond.span.lo as usize)
                     .filter(|t| matches!(t.kind, TokenKind::If));
                 for c in keyword.map_or(&[][..], |t| self.anchored(t.lo)) {
-                    let _ = write!(out, "{}\n{}", c.text, pad(indent));
+                    let _ = write!(out, "{}\n{}", c.text, self.pad(indent));
                 }
             }
             let _ = write!(
@@ -2407,7 +2451,7 @@ impl<'a> Printer<'a> {
                 "{lead} {} then\n{inner}{}\n\n{}",
                 self.expr(cond, indent),
                 self.expr(body, indent + 1),
-                pad(indent)
+                self.pad(indent)
             );
         }
         let _ = write!(out, "else\n{inner}{}", self.expr(else_, indent + 1));
@@ -2493,7 +2537,7 @@ impl<'a> Printer<'a> {
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
         }
-        comma_multiline(open, close, items, closing, indent)
+        comma_multiline(&self.pads, open, close, items, closing, indent)
     }
 
     fn update(
@@ -2518,15 +2562,15 @@ impl<'a> Printer<'a> {
         // `, field` lines indented ONE LEVEL DEEPER than the brace (elm-format
         // aligns the update pipe under the record body, not under the `{`), and
         // the closing `}` back at the brace column.
-        let close_pad = pad(indent);
-        let inner = pad(indent + 1);
+        let close_pad = self.pad(indent);
+        let inner = self.pad(indent + 1);
         let mut out = format!("{{ {base_s}");
         for (i, (comments, p)) in items.iter().enumerate() {
             let lead = if i == 0 { "|" } else { "," };
-            push_indented_comments(&mut out, comments.iter().copied(), &inner);
+            push_indented_comments(&mut out, comments.iter().copied(), inner);
             let _ = write!(out, "\n{inner}{lead} {p}");
         }
-        push_indented_comments(&mut out, closing, &inner);
+        push_indented_comments(&mut out, closing, inner);
         let _ = write!(out, "\n{close_pad}}}");
         out
     }
@@ -2717,7 +2761,7 @@ fn lambda_head(e: &Expr) -> Option<(usize, usize)> {
 fn push_indented_comments<'c>(
     out: &mut String,
     comments: impl IntoIterator<Item = &'c Comment>,
-    pad: &str,
+    pad: Pad<'_>,
 ) {
     for c in comments {
         let _ = write!(out, "\n{pad}{}", c.text);
@@ -2734,17 +2778,18 @@ fn push_indented_comments<'c>(
 /// with comments then drops below the bracket. `closing` comments sit above
 /// the closing bracket.
 fn comma_multiline(
+    pads: &PadBudget,
     open: &str,
     close: &str,
     items: &[Item<'_>],
     closing: &[Comment],
     indent: usize,
 ) -> String {
-    let pad = pad(indent);
-    let inner = pad_in(indent);
+    let pad = pads.pad(indent);
+    let inner = pads.pad(indent);
     let mut out = String::from(open);
     for (i, (comments, part)) in items.iter().enumerate() {
-        push_indented_comments(&mut out, comments.iter().copied(), &inner);
+        push_indented_comments(&mut out, comments.iter().copied(), inner);
         let part = hang_element(part);
         match (i, comments.is_empty()) {
             (0, true) => {
@@ -2758,7 +2803,7 @@ fn comma_multiline(
             }
         }
     }
-    push_indented_comments(&mut out, closing, &inner);
+    push_indented_comments(&mut out, closing, inner);
     let _ = write!(out, "\n{pad}{close}");
     out
 }
@@ -2836,16 +2881,78 @@ impl Decl<'_> {
 // Small formatting helpers
 // ---------------------------------------------------------------------------
 
-/// Four spaces per indent level.
-fn pad(indent: usize) -> String {
-    "    ".repeat(indent)
+/// One indent level.
+const INDENT_UNIT: &str = "    ";
+
+/// The indentation bytes one print may still emit.
+///
+/// A layout repeats one indentation on every line it breaks, so indentation
+/// is the output an input multiplies: every rendering of a [`Pad`] is charged
+/// its bytes here, against the print's [`OutputCap`]. Past the budget a pad
+/// renders nothing and the print is marked exceeded, so the caller refuses it.
+struct PadBudget {
+    left: Cell<usize>,
+    exceeded: Cell<bool>,
 }
 
-/// The indentation of the leading-comma continuation lines inside a multiline
-/// record / list / tuple: elm-format aligns the `,` with the opening bracket,
-/// which sits at the construct's own indent.
-fn pad_in(indent: usize) -> String {
-    "    ".repeat(indent)
+impl PadBudget {
+    const fn new(cap: OutputCap) -> Self {
+        Self {
+            left: Cell::new(cap.bytes()),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    /// The indentation of `level` levels, charged each time it renders.
+    const fn pad(&self, level: usize) -> Pad<'_> {
+        Pad {
+            level,
+            budget: self,
+        }
+    }
+
+    /// Take `bytes` from the budget.
+    ///
+    /// `false`, and exceeded from then on, when they do not fit.
+    fn charge(&self, bytes: usize) -> bool {
+        if self.exceeded.get() {
+            return false;
+        }
+        if let Some(left) = self.left.get().checked_sub(bytes) {
+            self.left.set(left);
+            true
+        } else {
+            self.left.set(0);
+            self.exceeded.set(true);
+            false
+        }
+    }
+
+    /// Whether some pad did not fit the budget.
+    const fn exceeded(&self) -> bool {
+        self.exceeded.get()
+    }
+}
+
+/// Indentation of a number of levels, rendered through its [`PadBudget`].
+#[derive(Clone, Copy)]
+struct Pad<'b> {
+    level: usize,
+    budget: &'b PadBudget,
+}
+
+impl fmt::Display for Pad<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self
+            .budget
+            .charge(self.level.saturating_mul(INDENT_UNIT.len()))
+        {
+            for _ in 0..self.level {
+                f.write_str(INDENT_UNIT)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether `s`, placed at column `col`, fits within [`MAX_WIDTH`]. A multi-line
@@ -3687,6 +3794,86 @@ mod tests {
             matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap })) if cap == short),
             "{refused:?}"
         );
+    }
+
+    /// A module whose one value is a list of `items` names written on one line
+    /// `depth` lets deep: the formatter puts every name on its own line at
+    /// that depth, so the indentation of each line dominates the output.
+    fn nested_deep_list(depth: usize, items: usize) -> String {
+        let names = vec!["aaaaaaaaaaaaaaa"; items].join(",");
+        let mut head = String::from("module M exposing (x)\n\n\nx =\n");
+        let mut tail = String::new();
+        for k in 0..depth {
+            let b = " ".repeat(4 + 8 * k);
+            let _ = write!(head, "{b}let\n{b}    v{k} =\n");
+            tail = format!("{b}in\n{b}v{k}\n{tail}");
+        }
+        let b = " ".repeat(4 + 8 * depth);
+        format!("{head}{b}[ {names}\n{b}]\n{tail}")
+    }
+
+    /// An 8 MiB source whose layout repeats one deep indentation on every
+    /// line is refused, and the indentation past the cap is never rendered:
+    /// the printer's text stays within the cap plus the source's own bytes
+    /// twice, where rendering every pad would hold over 100 MiB.
+    #[test]
+    fn pad_past_the_cap_is_refused_unrendered() {
+        let src = nested_deep_list(24, (8 << 20) / 16);
+        let cap = OutputCap::for_input(src.len());
+        assert_eq!(cap.bytes(), OutputCap::CEILING);
+        let rendered = Cell::new(0usize);
+        let refused = format_guarded(&src, cap, |p, m| {
+            let out = p.module(m);
+            rendered.set(out.len());
+            out
+        });
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap: c })) if c == cap),
+            "{refused:?}"
+        );
+        let bound = cap.bytes() + 2 * src.len();
+        assert!(
+            rendered.get() <= bound,
+            "the printer rendered {} bytes past the pad budget (bound {bound})",
+            rendered.get()
+        );
+    }
+
+    /// The same shape small enough to fit formats under a cap of exactly its
+    /// output, pads included, and refuses one byte under it.
+    #[test]
+    fn deep_list_formats_at_its_exact_output_cap() {
+        let src = nested_deep_list(24, 40);
+        let out = format_source(&src).expect("a small deep list formats");
+        assert!(
+            out.contains(&format!("\n{}, aaaaaaaaaaaaaaa", INDENT_UNIT.repeat(49))),
+            "precondition: the items sit 49 levels deep: {out}"
+        );
+        let exact = OutputCap(out.len());
+        assert_eq!(
+            format_source_capped(&src, exact).ok().as_deref(),
+            Some(out.as_str())
+        );
+        let short = OutputCap(out.len() - 1);
+        let refused = format_source_capped(&src, short);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap })) if cap == short),
+            "{refused:?}"
+        );
+    }
+
+    /// A pad renders only while the budget holds its bytes; once one does not
+    /// fit, every later pad renders empty and the budget stays exceeded.
+    #[test]
+    fn pad_budget_charges_every_rendering() {
+        let budget = PadBudget::new(OutputCap(8));
+        let pad = budget.pad(1);
+        assert_eq!(format!("{pad}{pad}"), "        ");
+        assert!(!budget.exceeded());
+        assert_eq!(format!("{pad}"), "");
+        assert!(budget.exceeded());
+        assert_eq!(format!("{}", budget.pad(0)), "");
+        assert!(budget.exceeded());
     }
 
     /// The cap stops at 16 MiB: a 3 MiB input may not grow to 24 MiB.
