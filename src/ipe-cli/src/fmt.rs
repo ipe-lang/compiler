@@ -230,7 +230,7 @@ pub struct StdinFormatted {
 /// [`CliError::Io`] when it cannot be read or is not UTF-8; otherwise the
 /// errors of [`run_fmt`] for a file named `<stdin>`.
 pub fn format_stdin_from(reader: impl Read) -> Result<StdinFormatted, CliError> {
-    let source = crate::io_bounded::read_opened_capped(
+    let source = crate::io_bounded::read_stream_capped(
         reader,
         Path::new("<stdin>"),
         crate::io_bounded::SOURCE_READ_CAP,
