@@ -28,8 +28,8 @@ use ipe_diagnostics::{
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{
-    Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module,
-    Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
+    BinOp, Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding,
+    Module, Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
 };
 
 use crate::layout;
@@ -1377,7 +1377,7 @@ impl<'a> Parser<'a> {
             if depth.saturating_add(u32::try_from(ops.len()).unwrap_or(u32::MAX)) >= MAX_DEPTH {
                 return Err(self.too_deep(Construct::Expression));
             }
-            let op_sym = self.intern(op)?;
+            let op_sym = self.intern(op.text())?;
             self.bump(Construct::Expression)?;
             ops.push((operand, Located::new(op_span, op_sym)));
             operand = self.parse_app(threshold, depth + 1)?;
@@ -1429,38 +1429,39 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Peek a binary operator that continues the current block. Recognises the
-    /// full core set: arithmetic (`+ - * /`), string append (`++`),
-    /// comparison (`== /= < > <= >=`), and boolean (`&& ||`). Precedence +
-    /// associativity are resolved later, at canonicalisation, from the flat
-    /// chain this records.
-    fn peek_binop(&self, threshold: u32) -> Option<(&'static str, Span)> {
+    /// Peek a binary operator that continues the current block.
+    ///
+    /// The token-to-operator map is closed: each operator token is one
+    /// [`BinOp`], and any other token ends the chain, so no operator outside
+    /// the set is ever recorded. Precedence + associativity are resolved later,
+    /// at canonicalisation, from the flat chain this records.
+    fn peek_binop(&self, threshold: u32) -> Option<(BinOp, Span)> {
         let tok = self.peek()?;
         if !layout::continues_block(tok, threshold) {
             return None;
         }
         let op = match tok.kind {
-            Tok::Plus => "+",
-            Tok::PlusPlus => "++",
-            Tok::Minus => "-",
-            Tok::Star => "*",
-            Tok::Slash => "/",
-            Tok::SlashEq => "/=",
-            Tok::SlashSlash => "//",
-            Tok::EqEq => "==",
-            Tok::Lt => "<",
-            Tok::Gt => ">",
-            Tok::Le => "<=",
-            Tok::Ge => ">=",
-            Tok::AmpAmp => "&&",
-            Tok::PipePipe => "||",
-            Tok::PipeGt => "|>",
-            Tok::LtPipe => "<|",
-            Tok::GtGt => ">>",
-            Tok::LtLt => "<<",
-            Tok::ColonColon => "::",
-            Tok::PipeEq => "|=",
-            Tok::PipeDot => "|.",
+            Tok::Plus => BinOp::Add,
+            Tok::PlusPlus => BinOp::Append,
+            Tok::Minus => BinOp::Sub,
+            Tok::Star => BinOp::Mul,
+            Tok::Slash => BinOp::FloatDiv,
+            Tok::SlashEq => BinOp::Neq,
+            Tok::SlashSlash => BinOp::IntDiv,
+            Tok::EqEq => BinOp::Eq,
+            Tok::Lt => BinOp::Lt,
+            Tok::Gt => BinOp::Gt,
+            Tok::Le => BinOp::Le,
+            Tok::Ge => BinOp::Ge,
+            Tok::AmpAmp => BinOp::And,
+            Tok::PipePipe => BinOp::Or,
+            Tok::PipeGt => BinOp::PipeRight,
+            Tok::LtPipe => BinOp::PipeLeft,
+            Tok::GtGt => BinOp::ComposeRight,
+            Tok::LtLt => BinOp::ComposeLeft,
+            Tok::ColonColon => BinOp::Cons,
+            Tok::PipeEq => BinOp::ParserKeeper,
+            Tok::PipeDot => BinOp::ParserIgnorer,
             _ => return None,
         };
         Some((op, tok.span))

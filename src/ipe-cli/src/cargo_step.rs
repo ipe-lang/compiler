@@ -14,6 +14,11 @@
 //! call returns, on success and on every error. Every captured pipe has a
 //! declared byte ceiling: a drain keeps reading to the end of the stream (so
 //! cargo never stalls on a full pipe) but stops storing at the ceiling.
+//!
+//! Every cargo child starts through `spawn_cargo`, so a build script never
+//! inherits a descriptor the CLI holds open and, on Linux, never outlives the
+//! CLI. A `cargo build` carries no wall: it runs as long as the user's build
+//! takes.
 
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -245,7 +250,26 @@ impl CargoBuild<'_> {
             lock_dependencies(&cmd, dir, self.output.verbosity())?;
         }
         cmd.arg("--locked");
-        let drained = run_to_exit(&mut cmd, ARTIFACT_STREAM_CAP).map_err(io_err)?;
+        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP).map_err(io_err)?;
+        let stdout = self.verdict(drained)?;
+        if let CargoCrate::Emitted(dir) = self.krate {
+            dir.verify()?;
+        }
+        Ok(stdout)
+    }
+
+    /// The build's captured stdout, or why the drained build failed.
+    ///
+    /// A stderr that could not be read outranks a non-zero exit, so a partial
+    /// stderr is never rendered as the build's diagnostic.
+    fn verdict(&self, drained: Drained<ExitStatus>) -> Result<String, CliError> {
+        let io_err = |source: std::io::Error| CliError::Io {
+            path: self.dir().to_path_buf(),
+            source,
+        };
+        if let Some(e) = drained.stderr.error {
+            return Err(io_err(e));
+        }
         let status = drained.waited;
         if !status.success() {
             return Err(CliError::EmittedBuildFailed {
@@ -255,14 +279,8 @@ impl CargoBuild<'_> {
                 runtime: self.runtime.clone(),
             });
         }
-        if let Some(e) = drained.stderr.error {
-            return Err(io_err(e));
-        }
         if let Some(e) = drained.stdout.error {
             return Err(io_err(e));
-        }
-        if let CargoCrate::Emitted(dir) = self.krate {
-            dir.verify()?;
         }
         Ok(drained.stdout.text)
     }
@@ -351,9 +369,10 @@ impl WatchBuild<'_> {
     /// Spawn the rebuild, its pipes taken for [`CargoPipes::drain_while`].
     ///
     /// # Errors
-    /// The spawn error when cargo cannot be started.
+    /// The spawn error when cargo cannot be started, or the refusal of
+    /// `spawn_cargo`.
     pub fn spawn(&self) -> std::io::Result<(Child, CargoPipes)> {
-        let mut child = self.command().spawn()?;
+        let mut child = spawn_cargo(self.command())?;
         let pipes = CargoPipes::take(&mut child, ARTIFACT_STREAM_CAP);
         Ok((child, pipes))
     }
@@ -398,10 +417,22 @@ fn build_command(
     cmd
 }
 
+/// Start a `cargo build` child through the runtime's hardened spawner.
+///
+/// The child inherits no descriptor beyond its three standard streams and, on
+/// Linux, dies with the CLI. No wall is set.
+///
+/// # Errors
+/// The spawn refusal, as an I/O error, when the spawner is unavailable, this
+/// host does not list its open descriptors, or cargo cannot be started.
+fn spawn_cargo(cmd: Command) -> std::io::Result<Child> {
+    ipe_runtime_rust::system::spawn_hardened(cmd).map_err(std::io::Error::from)
+}
+
 /// Spawn `cmd`, drain its pipes while waiting on it, and return its exit
 /// status with both drains; the child is reaped before this returns.
-fn run_to_exit(cmd: &mut Command, stdout_cap: usize) -> std::io::Result<Drained<ExitStatus>> {
-    let mut child = cmd.spawn()?;
+fn run_to_exit(cmd: Command, stdout_cap: usize) -> std::io::Result<Drained<ExitStatus>> {
+    let mut child = spawn_cargo(cmd)?;
     let pipes = CargoPipes::take(&mut child, stdout_cap);
     let Drained {
         waited,
@@ -1021,8 +1052,8 @@ mod tests {
 
         use super::super::{
             CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, LockOutcome, Verbosity,
-            lock_dependencies_within, lock_offline, lock_offline_within, target_directory,
-            target_directory_within,
+            WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
+            target_directory, target_directory_within,
         };
         use crate::CliError;
         use crate::output_dir::OwnedDir;
@@ -1288,6 +1319,126 @@ mod tests {
                     .get(1)
                     .is_some_and(|c| c.starts_with("build ") && c.contains("--locked")),
                 "the build replays the fresh lock, got {calls:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// An inheritable descriptor open in the test process.
+        fn inheritable_marker() -> rustix::fd::OwnedFd {
+            let held = rustix::fs::open(
+                "/dev/null",
+                rustix::fs::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open /dev/null");
+            assert!(
+                rustix::io::fcntl_getfd(&held)
+                    .is_ok_and(|flags| !flags.contains(rustix::io::FdFlags::CLOEXEC)),
+                "the marker descriptor must be inheritable"
+            );
+            held
+        }
+
+        /// A stub whose `build` records under `base/seen` whether `marker` is open in it.
+        fn descriptor_probe_stub(base: &Path, marker: &rustix::fd::OwnedFd) -> CargoBin {
+            use std::os::fd::AsRawFd as _;
+            let seen = base.join("seen");
+            stub(
+                base,
+                &format!(
+                    "[ \"$1\" = build ] || exit 0\nif [ -e /dev/fd/{fd} ]; then echo inherited > '{seen}'; else echo closed > '{seen}'; fi\nexit 0",
+                    fd = marker.as_raw_fd(),
+                    seen = seen.display()
+                ),
+            )
+        }
+
+        /// What the descriptor probe stub recorded under `base`.
+        fn seen(base: &Path) -> String {
+            std::fs::read_to_string(base.join("seen"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        }
+
+        #[test]
+        fn a_build_child_inherits_no_marker_descriptor() {
+            let base = scratch("build-fd");
+            let marker = inheritable_marker();
+            let cargo = descriptor_probe_stub(&base, &marker);
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            assert_eq!(
+                seen(&base),
+                "closed",
+                "a cargo build child must not inherit the CLI's descriptors"
+            );
+            drop(marker);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_watch_build_child_inherits_no_marker_descriptor() {
+            let base = scratch("watch-fd");
+            let marker = inheritable_marker();
+            let cargo = descriptor_probe_stub(&base, &marker);
+            let crate_dir = base.join("crate");
+            std::fs::create_dir_all(&crate_dir).expect("crate dir");
+            let accel = crate::watch::BuildAccel::MachineDefault;
+            let watch = WatchBuild {
+                cargo: cargo.path(),
+                krate: crate::DevMarkedCrate::assume(&crate_dir),
+                target_dir: None,
+                accel: &accel,
+                verbosity: Verbosity::Quiet,
+            };
+            let (mut child, pipes) = watch.spawn().expect("spawn the watch build");
+            let drained = pipes.drain_while(|| child.wait());
+            assert!(
+                drained
+                    .waited
+                    .as_ref()
+                    .is_ok_and(std::process::ExitStatus::success),
+                "{:?}",
+                drained.waited
+            );
+            assert_eq!(
+                seen(&base),
+                "closed",
+                "a watch rebuild child must not inherit the CLI's descriptors"
+            );
+            drop(marker);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_failed_stderr_read_outranks_a_non_zero_exit() {
+            use std::os::unix::process::ExitStatusExt as _;
+            let base = scratch("stderr-read");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let drained = super::super::Drained {
+                waited: std::process::ExitStatus::from_raw(7 << 8),
+                stdout: super::super::Drain::default(),
+                stderr: super::super::Drain {
+                    text: "partial".to_owned(),
+                    error: Some(std::io::Error::other("stderr read failed")),
+                },
+            };
+            let verdict = CargoBuild {
+                cargo: &cargo,
+                krate: CargoCrate::Emitted(&crate_dir),
+                profile: CargoProfile::Dev,
+                target: CargoTarget::Host,
+                output: CargoOutput::JsonStream(Verbosity::Quiet),
+                what: "the stub build",
+                runtime: None,
+            }
+            .verdict(drained);
+            assert!(
+                matches!(&verdict, Err(CliError::Io { .. })),
+                "an unread stderr is an I/O failure, never a partial build diagnostic, got {verdict:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }

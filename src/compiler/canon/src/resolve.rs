@@ -13,7 +13,7 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
 use ipe_syntax as src;
-use ipe_syntax::fixity::{Assoc, Fixity, fixity};
+use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{CtorHome, CtorIdentity, Env, VarHome};
@@ -6366,7 +6366,12 @@ fn resolve_qual_var(
 /// `(operand, operator)` pairs plus a trailing operand, without consulting
 /// precedence. Here we re-associate it via precedence climbing (port of
 /// `Ipe.Canonicalise.Expression.canonicaliseBinops`), reading each operator's
-/// precedence + associativity from [`fixity`].
+/// precedence + associativity from [`BinOp::fixity`].
+///
+/// Each operator's text is parsed once into the closed [`BinOp`] set. The
+/// parser records only operators of that set, so a text outside it is a
+/// broken internal invariant: a [`Diagnostic::CompilerBug`], never a default
+/// fixity.
 ///
 /// Unlike the reference compiler parser — which nests `Src.Binops` pairwise and so needs a
 /// flattening pre-pass — the Rust parser already emits one flat chain per
@@ -6387,17 +6392,17 @@ fn canonicalise_binops(
     let basics = interner.intern("Basics")?;
 
     // Canonicalise every operand once, left to right, into a front-poppable
-    // queue; pair each operator with its precedence + associativity.
+    // queue; parse each operator into the closed set.
     let mut operands: VecDeque<canon::Expr> = VecDeque::with_capacity(pairs.len() + 1);
-    let mut ops: VecDeque<(Located<Symbol>, Fixity)> = VecDeque::with_capacity(pairs.len());
+    let mut ops: VecDeque<Located<BinOp>> = VecDeque::with_capacity(pairs.len());
     for (operand, op) in pairs {
         operands.push_back(canonicalise_expr(operand, env, interner)?);
-        let op_fixity = fixity(resolve_or_bug(
-            interner,
-            op.value,
-            "ipe_canon::canonicalise_binops",
-        )?);
-        ops.push_back((*op, op_fixity));
+        let text = resolve_or_bug(interner, op.value, "ipe_canon::canonicalise_binops")?;
+        let bin_op = BinOp::from_text(text).ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "ipe_canon::canonicalise_binops",
+            detail: format!("operator `{text}` is outside the closed operator set"),
+        })?;
+        ops.push_back(Located::new(op.span, bin_op));
     }
     operands.push_back(canonicalise_expr(final_, env, interner)?);
 
@@ -6430,15 +6435,16 @@ fn canonicalise_binops(
 fn climb_binops(
     left0: canon::Expr,
     operands: &mut VecDeque<canon::Expr>,
-    ops: &mut VecDeque<(Located<Symbol>, Fixity)>,
+    ops: &mut VecDeque<Located<BinOp>>,
     basics: Symbol,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     // Pending frames: left operand + operator + its precedence, awaiting their
     // right subtree once higher-precedence operators to the right are reduced.
-    let mut pending: Vec<(canon::Expr, Located<Symbol>, u8)> = Vec::new();
+    let mut pending: Vec<(canon::Expr, Located<BinOp>, u8)> = Vec::new();
     let mut left = left0;
-    while let Some(&(op, op_fixity)) = ops.front() {
+    while let Some(&op) = ops.front() {
+        let op_fixity = op.value.fixity();
         let prec = op_fixity.prec();
         // Reduce any pending frame whose operator binds at least as tightly as
         // the incoming `op` (left/non-assoc) or strictly tighter (right-assoc).
@@ -6499,38 +6505,26 @@ fn resolve_or_bug<'a>(
 /// Build a single resolved binary-operation node.
 fn combine_binop(
     lhs: canon::Expr,
-    op: Located<Symbol>,
+    op: Located<BinOp>,
     rhs: canon::Expr,
     basics: Symbol,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     let span = Span::new(lhs.span.lo, rhs.span.hi);
-    // The cons operator `::` is not a kernel binop — it builds a list node so
-    // the type checker can give it the proper `a -> List a -> List a` discipline
-    // and the backend can lower it to the runtime list prepend.
-    if interner.resolve(op.value) == Some("::") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Cons(Box::new(lhs), Box::new(rhs)),
-        ));
-    }
-    // Parser-pipeline operators desugar to calls into `Ipe.Parser`.
-    // `a |= b`  keeps b's result:  `Ipe.Parser.ignore a b`
-    // `a |. b`  keeps a's result:  `Ipe.Parser.keep   a b`
-    //
-    // Argument order matches the combinators: `ignore dropped kept` and
-    // `keep kept dropped`, so passing (lhs, rhs) in source order is correct —
-    // lhs is the left operand, rhs the right, and each combinator runs them
-    // left-to-right internally via `map2`.
-    {
-        // Resolve the operator text to an owned string first so the immutable
-        // borrow on `interner` ends before the `intern` calls below.
-        let pipe_kind: Option<&'static str> = match interner.resolve(op.value) {
-            Some("|=") => Some("ignore"),
-            Some("|.") => Some("keep"),
-            _ => None,
-        };
-        if let Some(fn_name) = pipe_kind {
+    let node = match resolve_op_func(op.value) {
+        // The cons operator `::` is not a kernel binop — it builds a list node so
+        // the type checker can give it the proper `a -> List a -> List a`
+        // discipline and the backend can lower it to the runtime list prepend.
+        OpForm::Cons => canon::Expr_::Cons(Box::new(lhs), Box::new(rhs)),
+        // Parser-pipeline operators desugar to calls into `Ipe.Parser`.
+        // `a |= b`  keeps b's result:  `Ipe.Parser.ignore a b`
+        // `a |. b`  keeps a's result:  `Ipe.Parser.keep   a b`
+        //
+        // Argument order matches the combinators: `ignore dropped kept` and
+        // `keep kept dropped`, so passing (lhs, rhs) in source order is correct —
+        // lhs is the left operand, rhs the right, and each combinator runs them
+        // left-to-right internally via `map2`.
+        OpForm::ParserPipe(fn_name) => {
             let mod_ipe = interner.intern("Ipe")?;
             let mod_parser = interner.intern("Parser")?;
             let fn_sym = interner.intern(fn_name)?;
@@ -6541,93 +6535,103 @@ fn combine_binop(
                     name: fn_sym,
                 },
             );
-            return Ok(Located::new(
-                span,
-                canon::Expr_::Call(Box::new(callee), vec![lhs, rhs]),
-            ));
+            canon::Expr_::Call(Box::new(callee), vec![lhs, rhs])
         }
-    }
-    // Pipe operators desugar to function application — no new AST node needed.
-    // `x |> f`  ≡  `f x`  ⇒  Call(rhs, [lhs])
-    // `f <| x`  ≡  `f x`  ⇒  Call(lhs, [rhs])
-    // Correct in a curried language: `(g a) x ≡ g a x`, so a chain
-    // `[1,2,3] |> List.map inc` becomes Call(Call(List.map,[inc]),[[1,2,3]]),
-    // a shape already handled by the existing Call lowering path.
-    if interner.resolve(op.value) == Some("|>") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Call(Box::new(rhs), vec![lhs]),
-        ));
-    }
-    if interner.resolve(op.value) == Some("<|") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Call(Box::new(lhs), vec![rhs]),
-        ));
-    }
-    // Composition operators eta-expand to a lambda over one fresh parameter:
-    //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
-    //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
-    // The parameter name is derived from the operator's source span, so it is
-    // unique per occurrence. Its `compose_` prefix is distinct from every fresh
-    // pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot alias an
-    // eta-expansion name; a user binding the same name would be harmlessly
-    // shadowed, since this lambda's body references only the (already-resolved)
-    // `f`/`g` operands and its own parameter.
-    let op_text = interner.resolve(op.value);
-    if op_text == Some(">>") || op_text == Some("<<") {
-        let forward = op_text == Some(">>");
-        let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
-        // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
-        // first then `f` (lhs). `inner` is the first application, `outer` wraps it.
-        let (first, second) = if forward { (lhs, rhs) } else { (rhs, lhs) };
-        let arg = Located::new(span, canon::Expr_::VarLocal(param));
-        let inner = Located::new(span, canon::Expr_::Call(Box::new(first), vec![arg]));
-        let outer = Located::new(span, canon::Expr_::Call(Box::new(second), vec![inner]));
-        let pat = Located::new(span, canon::Pattern_::PVar(param));
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Lambda(vec![pat], Box::new(outer)),
-        ));
-    }
-    let func = resolve_op_func(op.value, interner)?;
-    Ok(Located::new(
-        span,
-        canon::Expr_::Binop {
-            op: op.value,
+        // Pipe operators desugar to function application — no new AST node.
+        // `x |> f`  ≡  `f x`  ⇒  Call(rhs, [lhs])
+        // `f <| x`  ≡  `f x`  ⇒  Call(lhs, [rhs])
+        // Correct in a curried language: `(g a) x ≡ g a x`, so a chain
+        // `[1,2,3] |> List.map inc` becomes Call(Call(List.map,[inc]),[[1,2,3]]),
+        // a shape already handled by the existing Call lowering path.
+        OpForm::Apply(Toward::Right) => canon::Expr_::Call(Box::new(rhs), vec![lhs]),
+        OpForm::Apply(Toward::Left) => canon::Expr_::Call(Box::new(lhs), vec![rhs]),
+        // Composition operators eta-expand to a lambda over one fresh parameter:
+        //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
+        //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
+        // The parameter name is derived from the operator's source span, so it
+        // is unique per occurrence. Its `compose_` prefix is distinct from every
+        // fresh pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot
+        // alias an eta-expansion name; a user binding the same name would be
+        // harmlessly shadowed, since this lambda's body references only the
+        // (already-resolved) `f`/`g` operands and its own parameter.
+        OpForm::Compose(direction) => {
+            let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
+            // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
+            // first then `f` (lhs). `inner` is the first application, `outer`
+            // wraps it.
+            let (first, second) = match direction {
+                Toward::Right => (lhs, rhs),
+                Toward::Left => (rhs, lhs),
+            };
+            let arg = Located::new(span, canon::Expr_::VarLocal(param));
+            let inner = Located::new(span, canon::Expr_::Call(Box::new(first), vec![arg]));
+            let outer = Located::new(span, canon::Expr_::Call(Box::new(second), vec![inner]));
+            let pat = Located::new(span, canon::Pattern_::PVar(param));
+            canon::Expr_::Lambda(vec![pat], Box::new(outer))
+        }
+        OpForm::Kernel(func_name) => canon::Expr_::Binop {
+            op: interner.intern(op.value.text())?,
             op_span: op.span,
             home: basics,
-            func,
+            func: interner.intern(func_name)?,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         },
-    ))
+    };
+    Ok(Located::new(span, node))
 }
 
-/// Map an operator symbol to its kernel function name. Supported subset of
-/// `Expression.resolveOpName`.
-fn resolve_op_func(op: Symbol, interner: &mut Interner) -> DResult<Symbol> {
-    let func: Option<&'static str> = match interner.resolve(op) {
-        Some("+") => Some("add"),
-        Some("-") => Some("sub"),
-        Some("*") => Some("mul"),
-        Some("/") => Some("fdiv"),
-        Some("//") => Some("idiv"),
-        Some("==") => Some("eq"),
-        Some("/=") => Some("neq"),
-        Some("<") => Some("lt"),
-        Some(">") => Some("gt"),
-        Some("<=") => Some("le"),
-        Some(">=") => Some("ge"),
-        Some("&&") => Some("and"),
-        Some("||") => Some("or"),
-        Some("++") => Some("append"),
-        // Unknown operators map to their own name under Basics, matching the
-        // the compiler fall-through (`_ -> Can.VarKernel "Basics" op`).
-        _ => None,
-    };
-    // The immutable borrow above ends here, so interning is now permitted.
-    func.map_or(Ok(op), |name| interner.intern(name))
+/// The direction an application or composition operator flows.
+#[derive(Clone, Copy)]
+enum Toward {
+    /// `|>` / `>>`: the left operand feeds the right.
+    Right,
+    /// `<|` / `<<`: the right operand feeds the left.
+    Left,
+}
+
+/// The canonical form one [`BinOp`] desugars to.
+#[derive(Clone, Copy)]
+enum OpForm {
+    /// `::` builds a list node.
+    Cons,
+    /// `|=` / `|.` call the named `Ipe.Parser` combinator.
+    ParserPipe(&'static str),
+    /// `|>` / `<|` apply one operand to the other.
+    Apply(Toward),
+    /// `>>` / `<<` eta-expand to a composed lambda.
+    Compose(Toward),
+    /// A `Basics` kernel binop with this function name.
+    Kernel(&'static str),
+}
+
+/// Map an operator to the canonical form it desugars to.
+///
+/// Exhaustive over the closed set, so every operator has exactly one form.
+const fn resolve_op_func(op: BinOp) -> OpForm {
+    match op {
+        BinOp::Cons => OpForm::Cons,
+        BinOp::ParserKeeper => OpForm::ParserPipe("ignore"),
+        BinOp::ParserIgnorer => OpForm::ParserPipe("keep"),
+        BinOp::PipeRight => OpForm::Apply(Toward::Right),
+        BinOp::PipeLeft => OpForm::Apply(Toward::Left),
+        BinOp::ComposeRight => OpForm::Compose(Toward::Right),
+        BinOp::ComposeLeft => OpForm::Compose(Toward::Left),
+        BinOp::Add => OpForm::Kernel("add"),
+        BinOp::Sub => OpForm::Kernel("sub"),
+        BinOp::Mul => OpForm::Kernel("mul"),
+        BinOp::FloatDiv => OpForm::Kernel("fdiv"),
+        BinOp::IntDiv => OpForm::Kernel("idiv"),
+        BinOp::Eq => OpForm::Kernel("eq"),
+        BinOp::Neq => OpForm::Kernel("neq"),
+        BinOp::Lt => OpForm::Kernel("lt"),
+        BinOp::Gt => OpForm::Kernel("gt"),
+        BinOp::Le => OpForm::Kernel("le"),
+        BinOp::Ge => OpForm::Kernel("ge"),
+        BinOp::And => OpForm::Kernel("and"),
+        BinOp::Or => OpForm::Kernel("or"),
+        BinOp::Append => OpForm::Kernel("append"),
+    }
 }
 
 /// An alias a bare or qualified type reference expands through.
@@ -9788,5 +9792,60 @@ mod duplicate_pattern_binder_tests {
             reject_duplicate_pattern_binders(&pat, &i).is_ok(),
             "`_` binds nothing, so `( _, _ )` is fine"
         );
+    }
+}
+
+#[cfg(test)]
+mod closed_operator_set_tests {
+    //! A chain operator is parsed into the closed [`BinOp`] set once, in
+    //! [`canonicalise_binops`]. A text outside the set has no fixity and no
+    //! desugaring, so it is a compiler bug, never a `9 L` default operator.
+    #![allow(clippy::expect_used)] // test setup: a failed parse/intern IS the failure
+
+    use super::*;
+
+    const SOURCE: &str = "module Main exposing (v)\n\nv : Int\nv =\n    1 + 2\n";
+
+    /// `SOURCE` parsed, with its one chain operator respelled as `op_text`.
+    fn module_with_operator(op_text: &str, i: &mut Interner) -> src::Module {
+        let mut parsed = ipe_parse::parse_module(SOURCE, i).expect("SOURCE parses");
+        let op_sym = i.intern(op_text).expect("intern must succeed");
+        let value = parsed.values.first_mut().expect("SOURCE declares `v`");
+        if let src::Expr_::Binops(pairs, _) = &mut value.value.body.value
+            && let Some((_, op)) = pairs.first_mut()
+        {
+            op.value = op_sym;
+        }
+        parsed
+    }
+
+    fn canonicalise(op_text: &str) -> DResult<(canon::Module, crate::ModuleExports)> {
+        let mut i = Interner::new();
+        let parsed = module_with_operator(op_text, &mut i);
+        let main_path = vec![i.intern("Main").expect("intern must succeed")];
+        canonicalise_module(&parsed, &main_path, &BTreeMap::new(), &mut i)
+    }
+
+    #[test]
+    fn operator_inside_the_closed_set_canonicalises() {
+        let result = canonicalise("+");
+        assert!(result.is_ok(), "`1 + 2` canonicalises: {result:?}");
+    }
+
+    #[test]
+    fn operator_text_outside_the_closed_set_is_a_compiler_bug() {
+        for text in ["%", "<?>", "&"] {
+            let result = canonicalise(text);
+            assert!(
+                matches!(
+                    &result,
+                    Err(Diagnostic::CompilerBug {
+                        where_: "ipe_canon::canonicalise_binops",
+                        detail,
+                    }) if detail.contains("closed operator set")
+                ),
+                "`{text}` must be a compiler bug, never a default-fixity operator: {result:?}"
+            );
+        }
     }
 }

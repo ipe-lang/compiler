@@ -11,13 +11,17 @@
 //! hands the backend its [`ipe_backend_rust::FfiEmit`] inputs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use ipe_ffi::driver::{CargoDep, CrateName, CrateSpec, FfiCache, InstalledCrate, VersionPin};
 use ipe_ffi::pkginfo::FeatureName;
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal};
 
 use crate::CliError;
+use crate::io_bounded::{FFI_CACHE_CAP, MANIFEST_CAP, SMALL_FILE_CAP, refusal_error};
 use crate::owner_trust::{self, TrustedCache};
 use crate::remote_ingest::{
     CHILD_STDERR_MAX_BYTES, ChildStderr, FFI_INSPECT_LIMITS, LocalCeiling, LocalRefusal,
@@ -35,6 +39,260 @@ const PROJECT_MANIFEST: &str = "package.ipe";
 /// for `[rust.dependencies]` / `[rust.wrapper]`, pending the ergonomic Rust-FFI
 /// work that lifts those bindings out of a `package.ipe`.
 const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
+
+/// The most entries one source-tree read lists, across every level, before it is refused.
+const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
+
+/// `result` with absence as `None`; every other refusal is the error for `path`.
+fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Option<T>, CliError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(OpenRefusal::Absent) => Ok(None),
+        Err(refusal) => Err(refusal_error(path, refusal)),
+    }
+}
+
+/// `dir` joined with each of `below`.
+fn joined(dir: &Path, below: &[&str]) -> PathBuf {
+    below
+        .iter()
+        .fold(dir.to_path_buf(), |path, name| path.join(name))
+}
+
+/// Hold the directory `below` spells under `dir`; `None` when a level is absent.
+///
+/// `dir` itself is opened as named (an empty `dir` is the working directory);
+/// every level of `below` is opened without following a link.
+///
+/// # Errors
+/// The [`refusal_error`] of a level that is a link, not a directory, or not
+/// openable.
+pub fn open_project_dir(dir: &Path, below: &[&str]) -> Result<Option<HeldDir>, CliError> {
+    absent_as_none(open_levels(dir, below), &joined(dir, below))
+}
+
+/// `dir` opened as named, then each of `below` from its parent's handle without following a link.
+fn open_levels(dir: &Path, below: &[&str]) -> Result<HeldDir, OpenRefusal> {
+    let mut level = HeldDir::open_root(dir)?;
+    for name in below {
+        level = level.child_dir(&EntryName::parse(OsStr::new(name))?)?;
+    }
+    Ok(level)
+}
+
+/// Read the regular file `name` in the held `dir` (at `dir_path`) as UTF-8 within `cap`.
+///
+/// The open never follows a link and never blocks on a FIFO, and the type is
+/// checked on the opened handle; `None` when the entry is absent.
+///
+/// # Errors
+/// The [`refusal_error`] of a link, a non-regular entry, a denied open, a
+/// read past `cap`, or a read failure.
+pub fn read_held_file(
+    dir: &HeldDir,
+    dir_path: &Path,
+    name: &str,
+    cap: ByteCap,
+) -> Result<Option<String>, CliError> {
+    let read = EntryName::parse(OsStr::new(name))
+        .and_then(|entry| dir.open_regular(&entry))
+        .and_then(|file| file.read_utf8(cap));
+    absent_as_none(read, &dir_path.join(name))
+}
+
+/// Read the regular file `name` in the directory `below` spells under `dir`.
+///
+/// `None` when any level, or the file, is absent.
+///
+/// # Errors
+/// As [`open_project_dir`] and [`read_held_file`].
+pub fn read_project_file(
+    dir: &Path,
+    below: &[&str],
+    name: &str,
+    cap: ByteCap,
+) -> Result<Option<String>, CliError> {
+    open_project_dir(dir, below)?.map_or(Ok(None), |held| {
+        read_held_file(&held, &joined(dir, below), name, cap)
+    })
+}
+
+/// What the entry `name` in the held `dir` (at `dir_path`) is, read without following a link.
+///
+/// `None` when the entry is absent.
+///
+/// # Errors
+/// The [`refusal_error`] of a failure other than absence.
+pub fn held_entry_kind(
+    dir: &HeldDir,
+    dir_path: &Path,
+    name: &str,
+) -> Result<Option<FileKind>, CliError> {
+    EntryName::parse(OsStr::new(name))
+        .and_then(|entry| dir.kind_of(&entry))
+        .map_err(|refusal| refusal_error(&dir_path.join(name), refusal))
+}
+
+/// Which entries a [`read_source_tree`] takes.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeSelect {
+    /// Whether a regular file of this name is read.
+    pub keep: fn(&OsStr) -> bool,
+    /// Whether a directory of this name is walked.
+    pub descend: fn(&OsStr) -> bool,
+}
+
+/// How a [`read_source_tree`] treats an entry it cannot read as source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Refuse the whole read: a selected link, special file, or unreadable
+    /// file or directory is an error, so no source goes unscanned.
+    Refuse,
+    /// Leave the entry out: the read is advisory and the compiler reports the
+    /// entry itself.
+    Skip,
+}
+
+/// One directory a [`read_source_tree`] still has to list.
+enum Level {
+    /// The held top of the tree.
+    Top(HeldDir),
+    /// The subdirectory `name` of an already-listed directory.
+    Below(Rc<HeldDir>, EntryName),
+}
+
+/// Read every regular file `select` keeps under the held `top` (at `top_path`), sorted by path.
+///
+/// Every level is opened from its parent's handle without following a link,
+/// every file without following a link and without blocking, each read within
+/// `cap`, and the listing of the whole tree within one entry budget. Only the
+/// directories still being walked stay open. Under [`Unreadable::Refuse`] a
+/// link where `select` would read or walk is refused, so a linked directory
+/// can never hide source from the read.
+///
+/// # Errors
+/// [`CliError::Io`] when the tree lists more entries than its budget; under
+/// [`Unreadable::Refuse`], the [`refusal_error`] of the first selected entry
+/// that is a link, not regular, or unreadable.
+pub fn read_source_tree(
+    top: HeldDir,
+    top_path: &Path,
+    select: TreeSelect,
+    cap: ByteCap,
+    unreadable: Unreadable,
+) -> Result<Vec<(PathBuf, String)>, CliError> {
+    let refused = |path: &Path, refusal: OpenRefusal| -> Result<(), CliError> {
+        match unreadable {
+            Unreadable::Refuse => Err(refusal_error(path, refusal)),
+            Unreadable::Skip => Ok(()),
+        }
+    };
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut listed: u32 = 0;
+    let mut pending: Vec<(Level, PathBuf)> = vec![(Level::Top(top), top_path.to_path_buf())];
+    while let Some((level, dir_path)) = pending.pop() {
+        let opened = match level {
+            Level::Top(dir) => Ok(dir),
+            Level::Below(parent, name) => parent.child_dir(&name),
+        };
+        let dir = match opened {
+            Ok(dir) => Rc::new(dir),
+            Err(refusal) => {
+                refused(&dir_path, refusal)?;
+                continue;
+            }
+        };
+        let over_budget = || refusal_error(&dir_path, OpenRefusal::TooManyEntries(TREE_ENTRY_CAP));
+        let listing_cap =
+            EntryCap::new(TREE_ENTRY_CAP.get().saturating_sub(listed)).ok_or_else(over_budget)?;
+        let entries = match dir.entries(listing_cap) {
+            Ok(entries) => entries,
+            Err(OpenRefusal::TooManyEntries(_)) => return Err(over_budget()),
+            Err(refusal) => {
+                refused(&dir_path, refusal)?;
+                continue;
+            }
+        };
+        listed = listed.saturating_add(u32::try_from(entries.len()).unwrap_or(u32::MAX));
+        for (name, kind) in entries {
+            let walked = (select.descend)(name.as_os_str());
+            let kept = (select.keep)(name.as_os_str());
+            let path = dir_path.join(name.as_os_str());
+            match kind {
+                FileKind::Dir if walked => {
+                    pending.push((Level::Below(Rc::clone(&dir), name), path));
+                }
+                FileKind::Regular if kept => {
+                    match dir.open_regular(&name).and_then(|file| file.read_utf8(cap)) {
+                        Ok(text) => files.push((path, text)),
+                        Err(refusal) => refused(&path, refusal)?,
+                    }
+                }
+                FileKind::Symlink if walked || kept => refused(&path, OpenRefusal::Link)?,
+                FileKind::Fifo | FileKind::Socket | FileKind::Device | FileKind::Other if kept => {
+                    refused(&path, OpenRefusal::NotRegular(kind))?;
+                }
+                FileKind::Dir
+                | FileKind::Regular
+                | FileKind::Symlink
+                | FileKind::Fifo
+                | FileKind::Socket
+                | FileKind::Device
+                | FileKind::Other => {}
+            }
+        }
+    }
+    files.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(files)
+}
+
+/// Whether `name` is a Rust source file name.
+fn is_rust_source(name: &OsStr) -> bool {
+    Path::new(name).extension() == Some(OsStr::new("rs"))
+}
+
+/// Whether `name` is not a Cargo build-output directory.
+///
+/// A built wrapper's `target/` holds its dependencies' source, not the
+/// author's Rust, and would swamp the scan (the manifest already refuses
+/// those dependencies). The author surface is `src/`, `build.rs`, and any
+/// sibling module files.
+fn is_not_build_output(name: &OsStr) -> bool {
+    name != OsStr::new("target")
+}
+
+/// Whether `name` is an Ipê source file name.
+fn is_ipe_source(name: &OsStr) -> bool {
+    Path::new(name).extension() == Some(OsStr::new("ipe"))
+}
+
+/// Whether `name` is an FFI binding file name.
+fn is_binding_source(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.ends_with("_bindings.rs"))
+}
+
+/// Every directory is walked.
+const fn every_dir(_name: &OsStr) -> bool {
+    true
+}
+
+/// The Rust a wrapper crate's author wrote: every `.rs`, `target/` not walked.
+const WRAPPER_SOURCES: TreeSelect = TreeSelect {
+    keep: is_rust_source,
+    descend: is_not_build_output,
+};
+
+/// Every `.ipe` source under a project's `src`.
+const IPE_SOURCES: TreeSelect = TreeSelect {
+    keep: is_ipe_source,
+    descend: every_dir,
+};
+
+/// Every `_bindings.rs` under an FFI cache.
+pub const BINDING_SOURCES: TreeSelect = TreeSelect {
+    keep: is_binding_source,
+    descend: every_dir,
+};
 
 /// Walk up from `start` looking for an FFI artifact cache, bounded at the
 /// nearest `package.ipe` project root.
@@ -1961,26 +2219,31 @@ fn enforce_wrapper_capabilities(
     wrapper_dir: &Path,
     declared: &BTreeSet<ipe_ffi::capability_scan::Capability>,
 ) -> Result<(), CliError> {
-    // Collect every `.rs` under the wrapper crate (incl. `build.rs`, `bin/`,
+    // Read every `.rs` under the wrapper crate (incl. `build.rs`, `bin/`,
     // nested modules). A single unscanned file is a hole, so the walk is
-    // recursive and unfiltered.
-    let mut rs_files: Vec<PathBuf> = Vec::new();
-    collect_wrapper_rust_files(wrapper_dir, &mut rs_files)?;
-    rs_files.sort();
-
-    let mut sources: Vec<(String, String)> = Vec::with_capacity(rs_files.len());
-    for file in &rs_files {
-        let src =
-            crate::io_bounded::read_to_string_capped(file, crate::io_bounded::FFI_CACHE_READ_CAP)?;
-        sources.push((file.display().to_string(), src));
-    }
-    let scan = ipe_ffi::capability_scan::scan_sources(
-        sources.iter().map(|(f, s)| (f.as_str(), s.as_str())),
-    );
+    // recursive and unfiltered. The crate is held once: its manifest and every
+    // source are opened from that handle, no link followed, and a link where a
+    // source or directory could be is refused, so nothing hides from the scan.
+    let wrapper = open_project_dir(wrapper_dir, &[])?
+        .ok_or_else(|| refusal_error(wrapper_dir, OpenRefusal::Absent))?;
 
     // A wrapper with any non-`std` Cargo dependency is opaque: a dependency's
     // capabilities live in source the scan never opens.
-    let non_std_deps = wrapper_non_std_dependencies(wrapper_dir)?;
+    let non_std_deps = wrapper_non_std_dependencies(&wrapper, wrapper_dir)?;
+
+    let sources: Vec<(String, String)> = read_source_tree(
+        wrapper,
+        wrapper_dir,
+        WRAPPER_SOURCES,
+        FFI_CACHE_CAP,
+        Unreadable::Refuse,
+    )?
+    .into_iter()
+    .map(|(file, src)| (file.display().to_string(), src))
+    .collect();
+    let scan = ipe_ffi::capability_scan::scan_sources(
+        sources.iter().map(|(f, s)| (f.as_str(), s.as_str())),
+    );
 
     let jail = jail_for_host();
 
@@ -2046,41 +2309,6 @@ fn enforce_wrapper_capabilities(
     }
 }
 
-/// Recursively collect every `.rs` file under a wrapper crate directory.
-///
-/// # Errors
-/// [`CliError::Io`] on a directory-read failure.
-fn collect_wrapper_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| CliError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| CliError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        if file_type.is_dir() {
-            // Never descend into `target/`: a built wrapper's dependency source is
-            // not the author's Rust and would swamp the scan (and re-flag deps we
-            // already refuse via the manifest). The author surface is `src/`,
-            // `build.rs`, and any sibling module files.
-            if path.file_name().and_then(|n| n.to_str()) == Some("target") {
-                continue;
-            }
-            collect_wrapper_rust_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The wrapper crate's non-`std` Cargo dependency names, read from its
 /// `Cargo.toml`. A wrapper with any external dependency is opaque to the source
 /// scan (a dependency's capabilities live in source the scan never opens), so
@@ -2095,20 +2323,20 @@ fn collect_wrapper_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
 /// build-only, never shipped).
 ///
 /// # Errors
-/// [`CliError::Io`] on a read failure (an unreadable manifest is refused, not
-/// silently treated as dependency-free).
-fn wrapper_non_std_dependencies(wrapper_dir: &Path) -> Result<Vec<String>, CliError> {
-    let manifest = wrapper_dir.join("Cargo.toml");
-    if !manifest.is_file() {
-        // No manifest means no crate to inspect; the inspector will fail loudly
-        // later. Treat as no declared deps here (the source scan still runs).
-        return Ok(Vec::new());
-    }
-    let text = crate::io_bounded::read_to_string_capped(
-        &manifest,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )?;
-    Ok(parse_cargo_dependency_names(&text))
+/// The [`refusal_error`] of a manifest that is a link, not a regular file,
+/// past its cap, or unreadable (refused, not silently treated as
+/// dependency-free).
+fn wrapper_non_std_dependencies(
+    wrapper: &HeldDir,
+    wrapper_dir: &Path,
+) -> Result<Vec<String>, CliError> {
+    // No manifest means no crate to inspect; the inspector will fail loudly
+    // later. Treat as no declared deps here (the source scan still runs).
+    Ok(
+        read_held_file(wrapper, wrapper_dir, "Cargo.toml", SMALL_FILE_CAP)?
+            .as_deref()
+            .map_or_else(Vec::new, parse_cargo_dependency_names),
+    )
 }
 
 /// Extract every dependency name from a `Cargo.toml`'s text — the pure,
@@ -2314,11 +2542,8 @@ fn add_one(
     // into the inspection document before the driver decodes it, so each
     // author-declared adapter/struct/enum flows through the same `PkgInfo` gate
     // and the unforgeable `FfiInterface` module as an inspected binding.
-    let doc_text = match crate::io_bounded::read_to_string_capped(
-        std::path::Path::new(PROJECT_MANIFEST),
-        crate::io_bounded::MANIFEST_READ_CAP,
-    ) {
-        Ok(text) => {
+    let doc_text = match read_project_file(Path::new(""), &[], PROJECT_MANIFEST, MANIFEST_CAP)? {
+        Some(text) => {
             reject_legacy_define_tables(&text)?;
             let src_root = Path::new("src");
             let (closures, structs, enums, opaques) = scan_foreign_defines(src_root)?;
@@ -2334,7 +2559,7 @@ fn add_one(
             )?
         }
         // No manifest (a bare `ipe add` outside a project) ⇒ nothing to merge.
-        Err(_) => doc_text,
+        None => doc_text,
     };
     let build_stage = Stage::with_mode(std::io::stderr(), mode, format!("building {crate_label}…"));
     let install_result = ipe_ffi::driver::install_from_inspection(cache, &doc_text);
@@ -2375,16 +2600,29 @@ fn add_one(
 /// a sibling `ipe.toml` sidecar, which is read here. A path that is already an
 /// `ipe.toml` (or any non-`package.ipe`) is read as-is, and a `package.ipe`
 /// with no sidecar falls back to itself so a pure-Ipê manifest stays a no-op.
-fn ffi_vocabulary_source(manifest_path: &Path) -> PathBuf {
-    if manifest_path.file_name().and_then(|n| n.to_str()) == Some(PROJECT_MANIFEST)
-        && let Some(dir) = manifest_path.parent()
+/// Both are read from one held handle on the manifest's directory, never
+/// following a link and never blocking on a FIFO.
+///
+/// # Errors
+/// [`CliError::Io`] when the manifest is absent; the [`refusal_error`] of a
+/// manifest path that does not end in one plain UTF-8 entry name, or of a
+/// sidecar or manifest that is a link, not a regular file, past
+/// [`MANIFEST_CAP`], or unreadable.
+fn read_ffi_vocabulary(manifest_path: &Path) -> Result<String, CliError> {
+    let (Some(dir), Some(name)) = (
+        manifest_path.parent(),
+        manifest_path.file_name().and_then(OsStr::to_str),
+    ) else {
+        return Err(refusal_error(manifest_path, OpenRefusal::BadName));
+    };
+    let absent = || refusal_error(manifest_path, OpenRefusal::Absent);
+    let held = open_project_dir(dir, &[])?.ok_or_else(absent)?;
+    if name == PROJECT_MANIFEST
+        && let Some(sidecar) = read_held_file(&held, dir, PROJECT_MANIFEST_TOML, MANIFEST_CAP)?
     {
-        let sidecar = dir.join(PROJECT_MANIFEST_TOML);
-        if sidecar.is_file() {
-            return sidecar;
-        }
+        return Ok(sidecar);
     }
-    manifest_path.to_path_buf()
+    read_held_file(&held, dir, name, MANIFEST_CAP)?.ok_or_else(absent)
 }
 
 /// Returns an error if `text` contains a legacy `[[rust.define.*]]` TOML table.
@@ -2428,13 +2666,9 @@ pub fn install_registry_deps_for_project(
 ) -> Result<(), CliError> {
     let project_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     // The `[rust.dependencies]` FFI vocabulary lives in the `ipe.toml` sidecar
-    // for a native `package.ipe`, so resolve the source that actually carries it
+    // for a native `package.ipe`, so read the source that actually carries it
     // before scanning for dependencies.
-    let ffi_source = ffi_vocabulary_source(manifest_path);
-    let text = crate::io_bounded::read_to_string_capped(
-        &ffi_source,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text = read_ffi_vocabulary(manifest_path)?;
     let deps = rust_dependencies_from_manifest(&text);
     if deps.is_empty() {
         return Ok(());
@@ -2640,13 +2874,11 @@ pub fn run_install(rest: &[String]) -> Result<(), CliError> {
             text::msg::rust_install_package_ipe_unsupported(),
         ));
     }
-    let manifest = Path::new(PROJECT_MANIFEST_TOML);
-    if !manifest.is_file() {
-        return Err(CliError::Usage(text::msg::rust_install_no_manifest()));
-    }
-    let text =
-        crate::io_bounded::read_to_string_capped(manifest, crate::io_bounded::MANIFEST_READ_CAP)
-            .map_err(|e| CliError::Usage(text::msg::command_refusal(&"install", &e)))?;
+    let text = match read_project_file(Path::new(""), &[], PROJECT_MANIFEST_TOML, MANIFEST_CAP) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err(CliError::Usage(text::msg::rust_install_no_manifest())),
+        Err(e) => return Err(CliError::Usage(text::msg::command_refusal(&"install", &e))),
+    };
     let deps = rust_dependencies_from_manifest(&text);
     let wrapper = rust_wrapper_from_manifest(&text);
     if deps.is_empty() && wrapper.is_none() {
@@ -3408,22 +3640,20 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
     let mut enums = Vec::new();
     let mut opaques = Vec::new();
 
-    let mut ipe_files = Vec::new();
-    collect_ipe_files(src_root, &mut ipe_files)?;
-    ipe_files.sort();
+    // A missing or unreadable source dir, and any file in it that cannot be
+    // read as source, is left to the compiler to report.
+    let Ok(Some(src)) = open_project_dir(src_root, &[]) else {
+        return Ok((closures, structs, enums, opaques));
+    };
+    let ipe_files = read_source_tree(src, src_root, IPE_SOURCES, MANIFEST_CAP, Unreadable::Skip)?;
 
-    for file in &ipe_files {
-        let Ok(text) =
-            crate::io_bounded::read_to_string_capped(file, crate::io_bounded::MANIFEST_READ_CAP)
-        else {
-            continue;
-        };
+    for (file, text) in &ipe_files {
         // Fast reject: skip files with no `foreign` keyword.
         if !text.contains("foreign") {
             continue;
         }
         let mut interner = ipe_intern::Interner::new();
-        let Ok(module) = ipe_parse::parse_module(&text, &mut interner) else {
+        let Ok(module) = ipe_parse::parse_module(text, &mut interner) else {
             continue; // compile pipeline surfaces parse errors
         };
         if module.foreigns.is_empty() {
@@ -3431,7 +3661,7 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
         }
         let reader = ForeignReader {
             interner: &interner,
-            src: &text,
+            src: text,
             file,
         };
         for foreign in &module.foreigns {
@@ -3444,24 +3674,6 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
         }
     }
     Ok((closures, structs, enums, opaques))
-}
-
-/// Recursively collect every `.ipe` file under `dir`.
-fn collect_ipe_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(()); // missing or unreadable source dir — compiler reports it
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            collect_ipe_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("ipe") {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Borrowed context for lifting one `ForeignDecl` into a `ForeignDefine`.
@@ -6461,6 +6673,118 @@ version = \"1\"
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             closures.is_empty() && structs.is_empty() && enums.is_empty() && opaques.is_empty()
+        );
+    }
+
+    /// A `_bindings.rs` that is a symlink is refused, never followed: the
+    /// read of the FFI cache is the scan's whole input, so a link that could
+    /// point it elsewhere fails the read with the link refusal itself.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn a_symlinked_ffi_cache_binding_is_refused() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-held-binding-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let outside = root.join("outside.rs");
+        std::fs::write(&outside, "pub fn elsewhere() {}\n").expect("write link target");
+        std::fs::write(cache.join("real_bindings.rs"), "pub fn f() {}\n").expect("write binding");
+        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
+        let held = || {
+            open_project_dir(&root, &cache_rel)
+                .expect("open cache")
+                .expect("cache present")
+        };
+        let read = read_source_tree(
+            held(),
+            &cache,
+            BINDING_SOURCES,
+            FFI_CACHE_CAP,
+            Unreadable::Refuse,
+        )
+        .expect("a cache of regular bindings reads");
+        assert_eq!(read.len(), 1, "the one regular binding is read: {read:?}");
+
+        std::os::unix::fs::symlink(&outside, cache.join("linked_bindings.rs"))
+            .expect("plant symlink");
+        let refused = read_source_tree(
+            held(),
+            &cache,
+            BINDING_SOURCES,
+            FFI_CACHE_CAP,
+            Unreadable::Refuse,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    ref path,
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                }) if path.ends_with("linked_bindings.rs")
+            ),
+            "a symlinked binding is refused as a symlink, got: {refused:?}"
+        );
+    }
+
+    /// A manifest path with no entry name is refused as not a regular file, the one mapping every held read shares.
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_path_without_an_entry_name_is_refused_as_not_a_regular_file() {
+        let refused = read_ffi_vocabulary(Path::new("/"));
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                })
+            ),
+            "a nameless manifest path is refused as not a regular file, got: {refused:?}"
+        );
+    }
+
+    /// The wrapper capability scan refuses a linked source directory instead
+    /// of passing over it: a `.rs` reached only through a link is still code
+    /// the wrapper's build compiles, so leaving it out would let it reach a
+    /// capability the declaration never names.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn the_wrapper_scan_refuses_a_linked_source_directory() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-wrapper-linked-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wrapper = root.join("wrapper");
+        std::fs::create_dir_all(wrapper.join("src")).expect("wrapper src");
+        std::fs::write(
+            wrapper.join("Cargo.toml"),
+            "[package]\nname = \"w\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(wrapper.join("src").join("lib.rs"), "pub fn f() {}\n").expect("write lib");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(
+            outside.join("hidden.rs"),
+            "pub fn h() { let _ = std::net::TcpStream::connect(\"a:1\"); }\n",
+        )
+        .expect("write hidden source");
+        std::os::unix::fs::symlink(&outside, wrapper.join("src").join("linked"))
+            .expect("plant dir link");
+        let refused = enforce_wrapper_capabilities(&wrapper, &BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    ref path,
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                }) if path.ends_with("linked")
+            ),
+            "a linked wrapper source directory is refused as a symlink, got: {refused:?}"
         );
     }
 

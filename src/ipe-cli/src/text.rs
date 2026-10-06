@@ -947,7 +947,7 @@ messages! {
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
     cli_source_access_denied(path) = "cli-source-access-denied";
-    /// A module path was reached through a symlink the no-follow walk refuses.
+    /// A convention file or walked module path is a symlink the no-follow open refuses.
     cli_source_symlink(path) = "cli-source-symlink";
     /// A manifest path escaped the project directory.
     cli_path_escape(raw, reason) = "cli-path-escape";

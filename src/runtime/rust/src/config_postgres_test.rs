@@ -179,6 +179,18 @@ mod tests {
     }
 
     #[test]
+    fn like_escape_clause_survives_the_placeholder_rewrite() {
+        assert_eq!(
+            fmt("SELECT * FROM t WHERE (n LIKE ? ESCAPE '\\')"),
+            "SELECT * FROM t WHERE (n LIKE $1 ESCAPE '\\')"
+        );
+        assert_eq!(
+            fmt("SELECT * FROM t WHERE ((n LIKE ? ESCAPE '\\') AND (substr(n, 1, length(?)) = ?))"),
+            "SELECT * FROM t WHERE ((n LIKE $1 ESCAPE '\\') AND (substr(n, 1, length($2)) = $3))"
+        );
+    }
+
+    #[test]
     fn no_placeholders_is_identity() {
         assert_eq!(fmt("SELECT 1"), "SELECT 1");
         assert_eq!(fmt(""), "");

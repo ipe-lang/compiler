@@ -5,8 +5,8 @@ use super::{
     collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
     compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir,
-    run_version, runtime_dep_from_env, single_file_cargo_name_from_env,
+    io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
+    runtime_dep_from_env, single_file_cargo_name_from_env,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
@@ -433,17 +433,25 @@ pub fn resolve_output_root(
 ///
 /// The shape is the single source of truth for delivery: it is derived from
 /// code, never from config or the CLI. `entry_arg` is the raw positional (a
-/// `.ipe` file, a project directory, or a bare `.`); it is routed to its entry
-/// source file the same way the analysis surfaces route it. A source that does
-/// not parse yields [`delivery::Shape::Script`] — the cross-check then does not
-/// fire and the build pipeline reports the real parse error with a blamed span.
+/// `.ipe` file, a project directory, or a bare `.`): a file no manifest governs
+/// is read as the user named it, following a link; a governed project's entry
+/// is the convention file below its source root, never followed. A source that
+/// does not parse yields [`delivery::Shape::Script`] — the cross-check then
+/// does not fire and the build pipeline reports the real parse error with a
+/// blamed span.
 ///
 /// # Errors
 /// [`CliError::Io`] when the entry source cannot be read, or the manifest /
-/// entry-resolution errors of [`resolve_analysis_entry`].
+/// entry-resolution errors of [`super::analysis_root_of`].
 pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
-    let entry_file = resolve_analysis_entry(entry_arg)?;
-    let source = io_bounded::read_to_string_capped(&entry_file, io_bounded::SOURCE_READ_CAP)?;
+    let source = match discover_manifest(entry_arg)? {
+        None => io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?,
+        Some(manifest) => {
+            let parsed = project::parse_manifest(&manifest)?;
+            let entry = super::analysis_root_of(&parsed)?;
+            io_bounded::read_beneath(&parsed.src_root, &entry, io_bounded::SOURCE_CAP)?
+        }
+    };
     let mut interner = Interner::new();
     // A parse failure is the compile pipeline's to report (with a blamed span);
     // the shape cross-check simply does not fire, so classify as a script.
@@ -2545,8 +2553,27 @@ pub fn gate_terminal_decision(
 pub enum SessionPlan {
     /// Build the app and run it with this session env.
     Run(SessionEnv),
-    /// Show the plain trace at this path: nothing is built and nothing re-runs.
-    ShowTrace(PathBuf),
+    /// Show this plain trace: nothing is built and nothing re-runs.
+    ShowTrace(TraceFile),
+}
+
+/// A plain trace to show, typed by who named its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceFile {
+    /// The trace the user named on `--replay`: a final link is followed.
+    Named(PathBuf),
+    /// The trace `--record` wrote in the claimed output directory: never followed.
+    Recorded(PathBuf),
+}
+
+impl TraceFile {
+    /// The trace's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Named(path) | Self::Recorded(path) => path,
+        }
+    }
 }
 
 /// Resolve what a run does with its session, once the output root is known.
@@ -2579,7 +2606,7 @@ pub fn resolve_session_plan(
             }
             let trace = owned.path_to(RECORD_LOG_FILE)?.path();
             if is_regular_file(&trace) {
-                return Ok(SessionPlan::ShowTrace(trace));
+                return Ok(SessionPlan::ShowTrace(TraceFile::Recorded(trace)));
             }
             Err(CliError::Usage(text::msg::replay_no_default_log(
                 &typed.display(),
@@ -2601,7 +2628,7 @@ pub fn replay_plan(path: PathBuf) -> Result<SessionPlan, CliError> {
         )));
     }
     if is_session_trace(&path) {
-        Ok(SessionPlan::ShowTrace(path))
+        Ok(SessionPlan::ShowTrace(TraceFile::Named(path)))
     } else {
         Ok(SessionPlan::Run(SessionEnv::Replay(path)))
     }
@@ -2647,27 +2674,34 @@ pub fn render_session_trace(path: &Path, text: &str) -> String {
     out
 }
 
-/// Read the recorded trace at `path` whole and render it sanitised.
+/// Read `trace` whole and render it sanitised.
 ///
 /// # Errors
 /// [`CliError::FileTooLarge`] past [`io_bounded::SESSION_TRACE_READ_CAP`];
-/// [`CliError::Io`] when the trace cannot be read or is not UTF-8 (kind
-/// `InvalidData`).
-pub fn load_session_trace(path: &Path) -> Result<String, CliError> {
-    let text = io_bounded::read_to_string_capped(path, io_bounded::SESSION_TRACE_READ_CAP)?;
-    Ok(render_session_trace(path, &text))
+/// [`CliError::SourceRefused`] for a recorded trace that is a link or for any
+/// trace that is not a regular file; [`CliError::Io`] when the trace cannot be
+/// read or is not UTF-8 (kind `InvalidData`).
+pub fn load_session_trace(trace: &TraceFile) -> Result<String, CliError> {
+    let text = match trace {
+        TraceFile::Named(path) => io_bounded::read_user_named(path, io_bounded::SESSION_TRACE_CAP)?,
+        TraceFile::Recorded(path) => {
+            io_bounded::read_leaf_capped(path, io_bounded::SESSION_TRACE_READ_CAP)?
+        }
+    };
+    Ok(render_session_trace(trace.path(), &text))
 }
 
-/// Print the recorded trace at `path` to stdout, sanitised.
+/// Print `trace` to stdout, sanitised.
 ///
 /// The read is capped and whole: an oversized or non-UTF-8 trace is refused
 /// before anything is printed.
 ///
 /// # Errors
 /// As [`load_session_trace`]; [`CliError::Io`] when stdout cannot be written.
-pub fn show_session_trace(path: &Path) -> Result<(), CliError> {
+pub fn show_session_trace(trace: &TraceFile) -> Result<(), CliError> {
     use std::io::Write as _;
-    let rendered = load_session_trace(path)?;
+    let path = trace.path();
+    let rendered = load_session_trace(trace)?;
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(rendered.as_bytes())
@@ -3199,8 +3233,11 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
 /// a default would locate another program's binary.
 pub fn emitted_bin_name(crate_dir: &Path) -> Result<String, CliError> {
     let manifest = crate_dir.join("Cargo.toml");
-    let source =
-        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::MANIFEST_READ_CAP)?;
+    let source = crate::io_bounded::read_named_in(
+        crate_dir,
+        &["Cargo.toml"],
+        crate::io_bounded::MANIFEST_CAP,
+    )?;
     emitted_package_name(&source)
         .map(str::to_owned)
         .ok_or_else(|| {
