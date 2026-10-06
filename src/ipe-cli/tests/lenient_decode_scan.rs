@@ -12,16 +12,22 @@
 //!
 //! A path counts however it is spelled: through a nested `use` group, an `as`
 //! alias, a crate-root re-export, a module alias, a bare call to an imported
-//! function, or a `pub use` / `pub(…) use` re-export (a site in its own file,
-//! and refused, since the calls it enables elsewhere name no denied path).
-//! A type alias of a denied type is a site at its definition, since clippy's
-//! `disallowed_types` matches the definition but not the alias's uses.
+//! function, a `self::` / `super::` path to a private import, a raw
+//! identifier (`r#Query` is `Query`), or a `pub use` / `pub(…) use` re-export
+//! (a site in its own file, and refused, since the calls it enables elsewhere
+//! name no denied path). A type alias of a denied type is a site at its
+//! definition, since clippy's `disallowed_types` matches the definition but not
+//! the alias's uses.
 //!
-//! A `macro_rules!` template counts too: a `$name` metavariable standing in a
-//! path segment, or in a `use` tree, is a segment the scan cannot see, so such a
-//! path is refused whenever its known segments touch a denied module or a
-//! denied leaf, and a `use` tree the parser cannot follow is refused whenever it
-//! names a denied leaf. `$crate` is the runtime crate itself, never opaque.
+//! A `macro_rules!` template counts too: a `$name` metavariable or a `$( … )`
+//! repetition standing in a path segment, or in a `use` tree, is a segment the
+//! scan cannot see, so such a path is refused whenever its known segments touch
+//! a denied module or a denied leaf, or some expansion of it names a denied path
+//! (a heading metavariable expanding to any proper prefix, another to one
+//! segment, a repetition to any number); a templated glob or module import is
+//! refused when an expansion may hold a denied path, and a `use` tree the parser
+//! cannot follow is refused whenever it names a denied leaf. `$crate` is the
+//! runtime crate itself, never opaque.
 //!
 //! `src/clippy_paths_resolve.rs` names every denied path on purpose (so a stale
 //! `clippy.toml` path is an unresolved-path build error) and is checked against
@@ -342,14 +348,19 @@ enum Token {
     Punct(char),
 }
 
-/// The tokens of `code`, whitespace dropped.
+/// The tokens of `code`, whitespace dropped; a raw identifier `r#name` is the
+/// identifier `name`.
 fn tokens(code: &str) -> Vec<Token> {
     let chars: Vec<char> = code.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
         if is_ident(c) {
-            let start = i;
+            let raw = c == 'r'
+                && chars.get(i + 1) == Some(&'#')
+                && chars.get(i + 2).is_some_and(|&c| is_ident(c));
+            let start = if raw { i + 2 } else { i };
+            i = start;
             while chars.get(i).is_some_and(|&c| is_ident(c)) {
                 i += 1;
             }
@@ -380,6 +391,8 @@ enum Segment {
     Literal(String),
     /// A `$name` macro metavariable, whose expansion the scan cannot see.
     Opaque(String),
+    /// A `$( … )` macro repetition, standing for any number of segments.
+    Repeated,
 }
 
 impl Segment {
@@ -387,14 +400,42 @@ impl Segment {
     fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(name) => Some(name),
-            Self::Opaque(_) => None,
+            Self::Opaque(_) | Self::Repeated => None,
         }
     }
 
     /// Whether the segment is a metavariable.
     const fn is_opaque(&self) -> bool {
-        matches!(self, Self::Opaque(_))
+        matches!(self, Self::Opaque(_) | Self::Repeated)
     }
+}
+
+/// Whether a `$( … )` macro repetition opens at `i`.
+fn repetition_at(stream: &[Token], i: usize) -> bool {
+    stream.get(i) == Some(&Token::Punct('$')) && stream.get(i + 1) == Some(&Token::Punct('('))
+}
+
+/// Whether the `$( … )` repetition opening at `i` is joined by `::`
+/// (`$( … )::*`, `$( … )::+`), so it spells path segments.
+fn path_repetition_at(stream: &[Token], i: usize) -> bool {
+    if !repetition_at(stream, i) {
+        return false;
+    }
+    let mut depth = 0_usize;
+    for (at, tok) in stream.iter().enumerate().skip(i + 1) {
+        match tok {
+            Token::Punct('(' | '[' | '{') => depth += 1,
+            Token::Punct(')' | ']' | '}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return stream.get(at + 1) == Some(&Token::PathSep)
+                        && matches!(stream.get(at + 2), Some(Token::Punct('*' | '+')));
+                }
+            }
+            Token::Ident(_) | Token::PathSep | Token::Punct(_) => {}
+        }
+    }
+    false
 }
 
 /// The path segment starting at `i` and the index past it: an identifier, or
@@ -418,6 +459,7 @@ fn render(path: &[Segment]) -> String {
         .map(|segment| match segment {
             Segment::Literal(name) => name.clone(),
             Segment::Opaque(name) => format!("${name}"),
+            Segment::Repeated => "$(..)".to_owned(),
         })
         .collect::<Vec<_>>()
         .join("::")
@@ -467,6 +509,12 @@ fn use_tree(stream: &[Token], mut i: usize, prefix: &[Segment], out: &mut Vec<Im
                     all_literal(&path).map_or(Import::Opaque { path, local: None }, Import::Glob),
                 );
                 return i + 1;
+            }
+            _ if repetition_at(stream, i) => {
+                path.push(Segment::Repeated);
+                out.push(Import::Opaque { path, local: None });
+                out.push(Import::Abandoned(Vec::new()));
+                return i;
             }
             _ => {
                 let Some((segment, next)) = segment_at(stream, i) else {
@@ -595,23 +643,21 @@ fn imports(stream: &[Token]) -> Vec<Import> {
     out
 }
 
-/// The index past the `;` ending the item at `i`.
-fn past_semicolon(stream: &[Token], i: usize) -> usize {
-    stream
-        .iter()
-        .skip(i)
-        .position(|tok| *tok == Token::Punct(';'))
-        .map_or(stream.len(), |at| i + at + 1)
-}
-
-/// Every path `stream` names outside its `use` items, metavariables kept: a
-/// run of segments joined by `::`, a method or field after `.` excluded.
+/// Every path `stream` names outside its `use` items (a `use<…>` capture bound
+/// is not one), metavariables kept: a run of segments joined by `::`, a method
+/// or field after `.` excluded; a `$( … )` repetition joined by `::` is a path
+/// of unknown segments.
 fn template_paths(stream: &[Token]) -> Vec<Vec<Segment>> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(tok) = stream.get(i) {
-        if is_word(Some(tok), "use") {
-            i = past_semicolon(stream, i);
+        if is_word(Some(tok), "use") && stream.get(i + 1) != Some(&Token::Punct('<')) {
+            i = use_item_end(stream, i);
+            continue;
+        }
+        if path_repetition_at(stream, i) {
+            out.push(vec![Segment::Repeated]);
+            i += 2;
             continue;
         }
         let Some((first, next)) = segment_at(stream, i) else {
@@ -624,9 +670,15 @@ fn template_paths(stream: &[Token]) -> Vec<Vec<Segment>> {
             .is_some_and(|prev| *prev == Token::Punct('.'));
         let mut path = vec![first];
         i = next;
-        while stream.get(i) == Some(&Token::PathSep)
-            && let Some((segment, next)) = segment_at(stream, i + 1)
-        {
+        while stream.get(i) == Some(&Token::PathSep) {
+            if repetition_at(stream, i + 1) {
+                path.push(Segment::Repeated);
+                i += 2;
+                break;
+            }
+            let Some((segment, next)) = segment_at(stream, i + 1) else {
+                break;
+            };
             path.push(segment);
             i = next;
         }
@@ -703,7 +755,18 @@ impl Scope {
     /// hop by hop; a first segment naming a module the file declares resolves
     /// under `self`.
     fn resolve(&self, path: &[String]) -> Vec<String> {
-        let mut resolved = path.to_vec();
+        // `self::name` and `super::name` reach a private import of this file
+        // from the module itself and from the modules nested in it.
+        let relative = path
+            .iter()
+            .take_while(|segment| matches!(segment.as_str(), "self" | "super"))
+            .count();
+        let mut resolved = match path.get(relative..) {
+            Some(rest @ [first, ..]) if relative > 0 && self.names.contains_key(first) => {
+                rest.to_vec()
+            }
+            _ => path.to_vec(),
+        };
         for _ in 0..MAX_ALIAS_HOPS {
             let Some(first) = resolved.first() else { break };
             if self.modules.contains(first) {
@@ -891,7 +954,7 @@ fn denied_re_exports(code: &str) -> Vec<String> {
                 }
                 Import::Opaque { path, .. } => {
                     let templated = scope.template(&path);
-                    if touches_denied(&templated) {
+                    if touches_denied(&templated) || may_hold(&templated, false) {
                         out.push(render(&templated));
                     }
                 }
@@ -941,16 +1004,87 @@ fn denied_leaves() -> Vec<DeniedLeaf> {
     leaves
 }
 
+/// How far into `denied` an expansion of `path` reaches: whether one names it
+/// (or an item under it), and every depth into `denied` at which an expansion
+/// of the whole of `path` stops.
+///
+/// A metavariable heading the path stands for any proper prefix of `denied`
+/// (an alias, `crate` or `self` expands to one), one elsewhere for exactly one
+/// segment, and a repetition for any number.
+fn expansion_reach(path: &[Segment], denied: &str) -> (bool, BTreeSet<usize>) {
+    let want = segments(denied);
+    let mut depths = BTreeSet::from([0_usize]);
+    let mut names = false;
+    for (at, segment) in path.iter().enumerate() {
+        names |= depths.contains(&want.len());
+        depths = match segment {
+            Segment::Literal(name) => depths
+                .iter()
+                .filter(|&&depth| want.get(depth) == Some(&name.as_str()))
+                .map(|depth| depth + 1)
+                .collect(),
+            Segment::Opaque(_) if at > 0 => depths
+                .iter()
+                .filter(|&&depth| depth < want.len())
+                .map(|depth| depth + 1)
+                .collect(),
+            // A head standing for the whole of `denied` is one invocation
+            // argument naming it, seen where the macro is invoked.
+            Segment::Opaque(_) => (0..want.len()).collect(),
+            Segment::Repeated => depths
+                .first()
+                .map_or_else(BTreeSet::new, |&low| (low..=want.len()).collect()),
+        };
+    }
+    names |= depths.contains(&want.len());
+    (names, depths)
+}
+
+/// Whether an expansion of the templated `path` may name a denied path or a
+/// lenient extractor; a lone `$name` is spelled where the macro is invoked, so
+/// it names none here.
+fn may_name(path: &[Segment]) -> bool {
+    let templated = path.iter().any(Segment::is_opaque) && !matches!(path, [Segment::Opaque(_)]);
+    templated
+        && DENIED_PATHS
+            .iter()
+            .chain(LENIENT_EXTRACTORS)
+            .any(|denied| expansion_reach(path, denied).0)
+}
+
+/// Whether an expansion of the templated `path` may be a module strictly above
+/// a denied path or lenient extractor (a denied method's owner type counted
+/// only when `methods`).
+fn may_hold(path: &[Segment], methods: bool) -> bool {
+    let templated = path.iter().any(Segment::is_opaque) && !matches!(path, [Segment::Opaque(_)]);
+    templated
+        && DENIED_PATHS
+            .iter()
+            .chain(LENIENT_EXTRACTORS)
+            .filter(|denied| methods || !is_denied_method(denied))
+            .any(|denied| {
+                let depth = segments(denied).len();
+                expansion_reach(path, denied)
+                    .1
+                    .iter()
+                    .any(|&stop| stop > 0 && stop < depth)
+            })
+}
+
 /// Whether `path` holds a metavariable and its known segments touch a denied
 /// path.
 ///
 /// They touch one when the literal head is, or holds, a denied path or a
-/// lenient extractor, or when a literal segment after the first metavariable is
-/// a denied leaf (after its owner, when it needs one).
+/// lenient extractor, when a literal segment after the first metavariable is
+/// a denied leaf (after its owner, when it needs one), or when some expansion
+/// of the metavariables names a denied path.
 fn touches_denied(path: &[Segment]) -> bool {
     let Some(first) = path.iter().position(Segment::is_opaque) else {
         return false;
     };
+    if may_name(path) {
+        return true;
+    }
     let Some((prefix, tail)) = path.split_at_checked(first) else {
         return false;
     };
@@ -1000,18 +1134,22 @@ fn abandoned_site(idents: &[String]) -> String {
 fn templated_sites(code: &str) -> Vec<String> {
     let stream = tokens(code);
     let scope = Scope::of(&stream);
-    let refused = |path: &[Segment]| {
+    // A glob, or a templated leaf whose bound name the scan cannot see, is
+    // refused when it may reach a module holding a denied path too.
+    let refused = |path: &[Segment], module: bool| {
         let templated = scope.template(path);
-        touches_denied(&templated).then(|| render(&templated))
+        (touches_denied(&templated) || (module && may_hold(&templated, true)))
+            .then(|| render(&templated))
     };
     let imported = scope.imports.iter().filter_map(|import| match import {
-        Import::Name { path, .. } | Import::Glob(path) => refused(&literal_segments(path)),
-        Import::Opaque { path, .. } => refused(path),
+        Import::Name { path, .. } => refused(&literal_segments(path), false),
+        Import::Glob(path) => refused(&literal_segments(path), true),
+        Import::Opaque { path, local } => refused(path, local.is_none()),
         Import::Abandoned(idents) => names_denied_leaf(idents).then(|| abandoned_site(idents)),
     });
     let named = template_paths(&stream)
         .into_iter()
-        .filter_map(|path| refused(&path));
+        .filter_map(|path| refused(&path, false));
     imported.chain(named).collect()
 }
 
@@ -1596,7 +1734,7 @@ fn a_planted_unparseable_macro_body_naming_a_denied_leaf_is_refused() {
         denied_re_exports(&code_of(
             "macro_rules! m { () => { pub use axum::{$( ; Form}; } }"
         )),
-        ["use axum Form (unparsed)"]
+        ["axum::$(..)", "use axum Form (unparsed)"]
     );
     // An unparsed tree naming no denied leaf is not refused.
     assert!(templated_sites(&code_of("macro_rules! m { () => { use a::{B ; C}; } }")).is_empty());
@@ -1611,6 +1749,9 @@ fn the_runtime_macro_templates_are_clean() {
         "macro_rules! m { ($ctx:expr_2021) => { crate::system::write_stderr_line($ctx) } }",
         "macro_rules! m { ($k:ident) => { use $crate::stringify::$k; } }",
         "fn f() -> impl Sized + use<'a> {}",
+        "macro_rules! m { ($t:ident) => { $t::new() } }",
+        "macro_rules! m { ($t:ty) => { <$t>::from_str(s) } }",
+        "macro_rules! m { ($($x:expr),*) => { f($($x),*) } }",
     ] {
         assert!(
             templated_sites(&code_of(clean)).is_empty(),
@@ -1649,4 +1790,107 @@ fn every_denied_path_leaf_is_in_the_derived_leaf_set() {
             .any(|path| segments(path).last() == Some(&key.leaf))),
         "every derived leaf ends a denied path: {leaves:?}"
     );
+}
+
+#[test]
+fn a_planted_macro_with_known_segments_between_metavariables_is_refused() {
+    // A metavariable heading a path may expand to any prefix, so the known
+    // segments after it are matched against every denied path.
+    for (planted, site) in [
+        (
+            "macro_rules! m { ($a:ident, $k:ident) => { fn h(_: $a::extract::$k<()>) {} } }",
+            "$a::extract::$k",
+        ),
+        (
+            "macro_rules! m { ($a:ident, $b:ident, $k:ident) => { fn h(_: $a::$b::$k<()>) {} } }",
+            "$a::$b::$k",
+        ),
+        // `m!(fu)` after `use url::form_urlencoded as fu;` names the lenient parser.
+        (
+            "macro_rules! m { ($m:ident) => { let p = $m::parse(b); } }",
+            "$m::parse",
+        ),
+        (
+            "macro_rules! m { ($r:ident, $k:ident) => { use $r::extract::$k; } }",
+            "$r::extract::$k",
+        ),
+        // A templated glob, or a templated import of a module, that may reach
+        // a module holding a denied path.
+        (
+            "macro_rules! m { ($r:ident) => { use $r::extract::*; } }",
+            "$r::extract",
+        ),
+        (
+            "macro_rules! m { ($r:ident) => { use $r::form_urlencoded as fu; use fu::*; } }",
+            "$r::form_urlencoded",
+        ),
+    ] {
+        assert_eq!(templated_sites(&code_of(planted)), [site], "{planted}");
+    }
+    assert_eq!(
+        denied_re_exports(&code_of(
+            "macro_rules! m { ($r:ident) => { pub use $r::form_urlencoded; } }"
+        )),
+        ["$r::form_urlencoded"],
+        "a public templated import of a module holding a denied path"
+    );
+}
+
+#[test]
+fn a_planted_macro_repetition_in_a_path_is_refused() {
+    for (planted, site) in [
+        (
+            "macro_rules! m { ($($k:ident),+) => { fn h(_: axum::extract::$($k)::+ <()>) {} } }",
+            "axum::extract::$(..)",
+        ),
+        (
+            "macro_rules! m { ($($s:ident),+) => { fn h(_: $($s)::+ <()>) {} } }",
+            "$(..)",
+        ),
+        (
+            "macro_rules! m { ($($k:ident),+) => { use axum::extract::$($k)::+; } }",
+            "axum::extract::$(..)",
+        ),
+    ] {
+        assert_eq!(templated_sites(&code_of(planted)), [site], "{planted}");
+    }
+}
+
+#[test]
+fn a_planted_raw_identifier_names_its_plain_identifier() {
+    for planted in [
+        "use axum::extract::r#Query;",
+        "use r#axum::extract::Form as F;",
+        "fn h(_: axum::extract::r#Query<M>) {}",
+    ] {
+        assert!(
+            names_lenient_extractor(planted),
+            "a raw identifier is its plain one: {planted}"
+        );
+    }
+}
+
+#[test]
+fn a_planted_relative_path_reaches_a_private_import() {
+    assert!(names_lenient_extractor(
+        "use axum::extract as ex; mod inner { fn h(_: super::ex::Query<M>) {} }"
+    ));
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "use url::form_urlencoded as fu; fn f(b: &[u8]) { self::fu::parse(b); }"
+        )),
+        BTreeMap::from([("url::form_urlencoded::parse", 1)])
+    );
+}
+
+#[test]
+fn a_planted_path_after_a_use_that_is_no_item_is_seen() {
+    // A `use<..>` capture bound is no `use` item, so the code after it is read.
+    assert!(names_lenient_extractor(
+        "fn f<'a>(s: &'a str) -> impl Sized + use<'a> { let q: axum::extract::Query<M> = g(s); q }"
+    ));
+    // A `use` with no `;` in a macro body ends at the brace closing it.
+    assert!(names_lenient_extractor(
+        "macro_rules! m { () => { use x::y } }\nasync fn h(q: axum::extract::Query<M>) -> R { q.0 }"
+    ));
 }
