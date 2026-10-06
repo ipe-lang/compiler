@@ -2297,7 +2297,7 @@ fn insert_wasm_shared_files(
 fn shell_path(rel: &str) -> DResult<BundlePath> {
     BundlePath::parse(rel).map_err(|refusal| Diagnostic::CompilerBug {
         where_: "backend.wasm_shell",
-        detail: format!("shell file {rel:?} is not a bundle path: {refusal}"),
+        detail: format!("shell file `{rel}` is not a bundle path: {refusal}"),
     })
 }
 
@@ -6647,8 +6647,11 @@ mod wasm_shell_tests {
     fn boot_script_attribute_escapes_its_url() {
         let hostile = shell_boot_script("/a\"><script>x</script>");
         assert!(!hostile.contains("\"><script>x"), "{hostile}");
+        let value = hostile
+            .strip_prefix("<script type=\"module\" src=\"")
+            .and_then(|rest| rest.strip_suffix("\"></script>\n"));
         assert!(
-            hostile.contains("src=\"/a&#34;&gt;&lt;script&gt;x"),
+            value.is_some_and(|v| !v.contains(['"', '<', '>'])),
             "{hostile}"
         );
         let plain = shell_boot_script("/app/boot.js");
