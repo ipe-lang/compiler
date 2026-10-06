@@ -1,0 +1,16 @@
+[
+  "module",
+  "import",
+  "exposing",
+  "as",
+  "type",
+  "foreign",
+  "case",
+  "of",
+  "let",
+  "in",
+  "if",
+  "then",
+  "else",
+  "do"
+]

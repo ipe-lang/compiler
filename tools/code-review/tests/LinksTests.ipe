@@ -212,7 +212,7 @@ manyNames : Int -> Links.Candidates
 manyNames n =
     Links.candidates Highlight.Rust
         { kind = "fn", name = "f", qualified = "f" }
-        (Links.references Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
+        (Links.references (Highlight.lex Highlight.Rust 1 (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n)))))
 
 
 candidateCeiling : Bool
@@ -287,13 +287,13 @@ firstOccurrence : Bool
 firstOccurrence =
     let
         wanted =
-            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
+            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references (Highlight.lex Highlight.Ipe 1 "b a b c a"))
 
         resolved =
             Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
 
         assembled =
-            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
+            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls (Highlight.lex Highlight.Unknown 1 "see https://x.io (https://x.io),"))
     in
     wanted.names
         == [ "b", "a", "c" ]
@@ -326,12 +326,59 @@ candidateRule =
 -- unit can hold. A `..` range starts no member, so its end still names.
 referencesFollowTokens : Bool
 referencesFollowTokens =
-    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
+    Links.references (Highlight.lex Highlight.Rust 1 "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b")
         == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
-        && Links.references Highlight.Ipe "Foo.bar(x) model.count"
+        && Links.references (Highlight.lex Highlight.Ipe 1 "Foo.bar(x) model.count")
         == [ Path "Foo.bar", Bare "x", Path "model.count" ]
-        && List.isEmpty (Links.references Highlight.Shell "Foo.bar x")
-        && List.isEmpty (Links.references Highlight.Unknown "Foo.bar x")
+        && List.isEmpty (Links.references (Highlight.lex Highlight.Shell 1 "Foo.bar x"))
+        && List.isEmpty (Links.references (Highlight.lex Highlight.Unknown 1 "Foo.bar x"))
+
+
+-- A one-mebibyte view of distinct references, and one one-mebibyte string
+-- token of distinct URLs, each lex, cut into lines, and yield exactly
+-- `linkCandidateCeiling` candidate names and URLs, within the test. Red if a
+-- step is quadratic in the view (the run never ends) or a list past the
+-- ceiling reaches the page.
+megabyteBounded : Bool
+megabyteBounded =
+    let
+        unit =
+            { kind = "fn", name = "f", qualified = "f" }
+
+        refs =
+            String.left 1048576 (String.join " " (List.map (\i -> "a" ++ String.fromInt i ++ ".b") (List.range 1 200000)))
+
+        urls =
+            "\"" ++ String.left 1048574 (String.join " " (List.map (\i -> "https://x.io/" ++ String.fromInt i) (List.range 1 80000))) ++ "\""
+
+        namesOf lang =
+            let
+                lexed =
+                    Highlight.lex lang 1 refs
+            in
+            List.length (Highlight.lexedLines lexed)
+                == 1
+                && List.length (Links.candidates lang unit (Links.references lexed)).names
+                == Links.linkCandidateCeiling
+
+        urlsOf lang =
+            let
+                lexed =
+                    Highlight.lex lang 1 urls
+            in
+            List.length (Highlight.lexedLines lexed)
+                == 1
+                && List.length (Links.sourceUrls lexed)
+                == Links.linkCandidateCeiling
+    in
+    String.length refs
+        == 1048576
+        && String.length urls
+        == 1048576
+        && Highlight.lexedTokens (Highlight.lex Highlight.Rust 1 urls)
+        == [ Str urls ]
+        && List.all namesOf [ Highlight.Rust, Highlight.Ipe ]
+        && List.all urlsOf [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
 
 
 candidateSqlBound : Bool
@@ -373,7 +420,7 @@ calleeVectorsHold =
 
 calleeVectorHolds : CalleeVector -> Bool
 calleeVectorHolds v =
-    (Links.candidates Highlight.Rust v.unit (List.take 1 (Links.references Highlight.Rust v.callee))).names == v.candidates
+    (Links.candidates Highlight.Rust v.unit (List.take 1 (Links.references (Highlight.lex Highlight.Rust 1 v.callee)))).names == v.candidates
 
 
 calleeVectorDecoder : Decode.Decoder CalleeVector
@@ -402,6 +449,7 @@ checks =
                 , ( "candidates follow ipe-index's callee rule", candidateRule )
                 , ( "references follow the shown tokens", referencesFollowTokens )
                 , ( "candidate names are bound, never spliced into the SQL text", candidateSqlBound )
+                , ( "a one-mebibyte view yields bounded candidates and URLs", megabyteBounded )
                 ]
                     ++ fixtureChecks got
             )

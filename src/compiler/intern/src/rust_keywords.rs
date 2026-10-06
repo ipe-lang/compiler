@@ -74,4 +74,23 @@ mod tests {
             "RUST_KEYWORDS has a duplicate entry"
         );
     }
+
+    /// The Rust keyword fixture code-review's highlighter is pinned
+    /// against: this list, one word per line, in declaration order.
+    const KEYWORD_FIXTURE: &str =
+        include_str!("../../../../tools/ipe-index/tests/keywords_rs.json");
+
+    #[test]
+    fn keyword_fixture_is_this_list() {
+        let body = RUST_KEYWORDS
+            .iter()
+            .map(|w| format!("  \"{w}\""))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        assert_eq!(
+            KEYWORD_FIXTURE,
+            format!("[\n{body}\n]\n"),
+            "tools/ipe-index/tests/keywords_rs.json drifted from `RUST_KEYWORDS`"
+        );
+    }
 }

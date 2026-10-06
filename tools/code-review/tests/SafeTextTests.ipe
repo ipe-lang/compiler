@@ -356,7 +356,7 @@ sourceTokensRendered =
             "let ok = \"admin" ++ rlo ++ " " ++ codeText 8294 ++ "\"; // check" ++ codeText 8297 ++ " done"
 
         shownIn lang =
-            String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
+            String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.lexedTokens (Highlight.lex lang 1 line)))
 
         label =
             [ Links.internal ("Lib." ++ rlo ++ "x") (Uid.toString (uid "u-x")) ]

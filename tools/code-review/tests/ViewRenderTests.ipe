@@ -17,6 +17,7 @@ import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
 import Lib.Format as Format
+import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
@@ -629,12 +630,51 @@ seededChecks a b =
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
+    , ( "a comment spanning lines draws its later lines in the comment colour", drawnLinesComeFromProof a )
     ]
 
 
 showsNoStateText : String -> Bool
 showsNoStateText html =
     List.all (\needle -> not (has needle html)) stateNeedles
+
+
+-- The colour the token drawn as `text` on `loaded`'s unit page is drawn in,
+-- read from the last `color:` declared before that text, when the view
+-- `file` (two lines, lexed as Rust) is shown.
+drawnColor : Index.UnitView -> String -> String -> Maybe String
+drawnColor loaded file text =
+    let
+        html =
+            page (unitPageModel { loaded | view = Index.classifyView Highlight.Rust loaded.unit.uid (Index.attest file) 1 2 file })
+    in
+    case String.split (byteOrderOpen ++ text ++ "<") html of
+        before :: rest ->
+            if List.isEmpty rest then
+                Nothing
+
+            else
+                List.head (List.reverse (String.split "color:" before))
+
+        [] ->
+            Nothing
+
+
+-- Whether `drawn` starts with the CSS spelling of `colour`.
+drawnIn : Ui.Color -> Maybe String -> Bool
+drawnIn colour drawn =
+    Maybe.map (String.startsWith (Ui.colorCss colour)) drawn == Just True
+
+
+-- The lines drawn are the lines of the one lexing of the shown view: a
+-- comment opened on line 1 colours line 2 as a comment, while the same line 2
+-- after a line of code is drawn as code. Red if each drawn line is lexed on
+-- its own.
+drawnLinesComeFromProof : Index.UnitView -> Bool
+drawnLinesComeFromProof a =
+    drawnIn (Ui.rgb 110 110 125) (drawnColor a "/* a\nb */" "b */")
+        && drawnIn (Ui.rgb 205 205 215) (drawnColor a "x\nb */" "b")
+        && not (drawnIn (Ui.rgb 110 110 125) (drawnColor a "x\nb */" "b"))
 
 
 -- ── a hostile source token ──────────────────────────────────────────────

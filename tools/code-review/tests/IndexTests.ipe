@@ -30,7 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, tokenKind, lineTexts, attestedFor, reverifyShown)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -371,7 +371,7 @@ classifyRefusesPastLineCeiling =
         text =
             xLines past
     in
-    case Index.classifyView (uid "u-a") (Index.attest text) 1 past text of
+    case Index.classifyView Highlight.Rust (uid "u-a") (Index.attest text) 1 past text of
         TooLarge (SpanLines o) ->
             o.lines == past
 
@@ -409,22 +409,21 @@ shownLinesAreAttestedLines : Bool
 shownLinesAreAttestedLines =
     let
         file =
-            "a\r\nb\n\n\n"
+            "1\n2\n3\n4\n5\n6\na\r\nb\n\n\n"
 
         span =
-            List.take 4 (Index.viewLines file)
+            List.take 4 (List.drop 6 (Index.viewLines file))
 
-        crView =
-            String.join "\n" span
-
-        drawn start text first last =
-            Maybe.map (\shown -> Index.shownLines shown start) (shownOf (Index.classifyView (uid "u-x") (Index.attest text) first last file))
+        drawn lang text first last source =
+            Maybe.map (\shown -> lineTexts (Index.shownLines shown)) (shownOf (Index.classifyView lang (uid "u-x") (Index.attest text) first last source))
     in
     span
         == [ "a\r", "b", "", "" ]
-        && drawn 7 crView 1 4
+        && drawn Highlight.Unknown (String.join "\n" span) 7 10 file
         == Just [ ( 7, "a\r" ), ( 8, "b" ), ( 9, "" ), ( 10, "" ) ]
-        && Maybe.map (\shown -> Index.shownLines shown 1) (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) 1 2 fixtureMainIpe))
+        && drawn Highlight.Rust (String.join "\n" span) 7 10 file
+        == Just [ ( 7, "a\r" ), ( 8, "b" ), ( 9, "" ), ( 10, "" ) ]
+        && drawn Highlight.Ipe viewB 1 2 fixtureMainIpe
         == Just [ ( 1, "module Main exposing (main)" ), ( 2, "" ) ]
 
 
@@ -801,7 +800,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownLines", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownLexed", "shownLines", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -844,6 +843,183 @@ exposedNames source =
             Nothing
 
 
+-- The source view `text` shows as lines `1..n` of a file that is `text`
+-- alone, under `lang`.
+shownWhole : Highlight.Lang -> String -> Maybe Index.ShownSource
+shownWhole lang text =
+    shownOf (Index.classifyView lang (uid "u-m") (Index.attest text) 1 (List.length (Index.viewLines text)) text)
+
+
+-- Whether every token drawn on the first three lines of `shown` is a
+-- comment or a string, and the references linked from it are `refs`.
+quotedThenLinks : List Links.Reference -> Maybe Index.ShownSource -> Bool
+quotedThenLinks refs found =
+    case found of
+        Just shown ->
+            List.all
+                (\l -> List.all (\tok -> tokenKind tok == "Comment" || tokenKind tok == "Str") l.tokens)
+                (List.take 3 (Index.shownLines shown))
+                && Links.references (Index.shownLexed shown)
+                == refs
+
+        Nothing ->
+            False
+
+
+-- A comment or string spanning lines is drawn and linked as one lexeme: no
+-- path inside it is drawn as code or linked, the path after it is. Red if
+-- the lines are lexed one by one (line 2 reads as code) or the links are
+-- read from another lexing than the one drawn.
+multiLineTokenDrawnAndLinkedAlike : Bool
+multiLineTokenDrawnAndLinkedAlike =
+    quotedThenLinks [ Links.Path "crate::ok::g" ] (shownWhole Highlight.Rust "/*\ncrate::evil::f\n*/\ncrate::ok::g")
+        && quotedThenLinks [ Links.Path "crate::ok::g" ] (shownWhole Highlight.Rust "\"\ncrate::evil::f\n\"\ncrate::ok::g")
+        && quotedThenLinks [ Links.Path "Ok.g" ] (shownWhole Highlight.Ipe "{-\nEvil.f\n-}\nOk.g")
+        && Maybe.map (\shown -> Links.references (Index.shownLexed shown)) (shownWhole Highlight.Rust "crate::evil::f\ncrate::ok::g")
+        == Just [ Links.Path "crate::evil::f", Links.Path "crate::ok::g" ]
+
+
+-- `u-a`'s loaded view, lexed under its file's `files.lang` row: one holding
+-- `stored`, or no row at all for `Nothing`.
+shownUnderLang : Maybe SqlValue -> Task.Task Error (Maybe Index.ShownSource)
+shownUnderLang stored =
+    do
+        at <- freshScratch "ipe-index-unknown-lang"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        insertLibLang at stored
+        found <- loadUnitNow (uid "u-a")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (Maybe.andThen (\loaded -> shownOf loaded.view) found)
+
+
+-- A `files` row for `src/Lib.rs` holding `stored`, or none for `Nothing`.
+insertLibLang : Scratch -> Maybe SqlValue -> Task.Task Error ()
+insertLibLang at stored =
+    case stored of
+        Just lang ->
+            execIndex at.indexDb "INSERT INTO files (path, lang) VALUES (?, ?)" [ SqlString "ipe:src/Lib.rs", lang ]
+
+        Nothing ->
+            Task.succeed ()
+
+
+-- Whether `shown` is drawn as plain text only and links nothing.
+plainOnly : Maybe Index.ShownSource -> Bool
+plainOnly found =
+    case found of
+        Just shown ->
+            List.all (\tok -> tokenKind tok == "Plain") (Highlight.lexedTokens (Index.shownLexed shown))
+                && List.isEmpty (Links.references (Index.shownLexed shown))
+
+        Nothing ->
+            False
+
+
+-- A stored language outside ipe-index's vocabulary, one this lexer has no
+-- rules for, a wrongly cased one, an empty one, NULL and no row each lex as
+-- one plain run that links nothing. Red if an unparsed value falls through
+-- to some language's rules (`RS` read as Rust).
+unknownLanguageFailsClosed : Task.Task Error Bool
+unknownLanguageFailsClosed =
+    do
+        unknown <- Task.sequence (List.map shownUnderLang [ Just (SqlString "weird"), Just (SqlString ""), Just (SqlString "RS"), Just (SqlString "ts"), Just (SqlString "other"), Just (SqlNull (SqlString "")), Nothing ])
+        rust <- shownUnderLang (Just (SqlString "rs"))
+        Task.succeed (List.length unknown == 7 && List.all plainOnly unknown && not (plainOnly rust))
+
+
+-- A view's `\r`s are drawn: a CRLF view has as many drawn lines as attested
+-- lines, each ending in its `\r`. Red if the draw splits with `String.lines`.
+crlfVisible : Bool
+crlfVisible =
+    let
+        file =
+            "a\r\nb\r\n"
+
+        span =
+            List.take 2 (Index.viewLines file)
+    in
+    span
+        == [ "a\r", "b\r" ]
+        && Maybe.map (\shown -> lineTexts (Index.shownLines shown)) (shownOf (Index.classifyView Highlight.Rust (uid "u-c") (Index.attest (String.join "\n" span)) 1 2 file))
+        == Just [ ( 1, "a\r" ), ( 2, "b\r" ) ]
+
+
+-- `fixtureLibRs` padded with `x`s to exactly `size` bytes.
+paddedLibRs : Int -> String
+paddedLibRs size =
+    fixtureLibRs ++ String.repeat (size - String.length fixtureLibRs) "x"
+
+
+-- A source file of exactly the 16 MiB read ceiling is read and its view
+-- shown; one byte more is unreadable, refused by the read before any lexing.
+-- Red if the ceiling moves either way.
+sourceCeilingBinds : Task.Task Error Bool
+sourceCeilingBinds =
+    do
+        atCeiling <- oversizeTag False (paddedLibRs (ByteSize.toBytes Index.sourceCeiling)) 3 6 (Index.attest viewA)
+        past <- oversizeTag False (paddedLibRs (ByteSize.toBytes Index.sourceCeiling + 1)) 3 6 (Index.attest viewA)
+        Task.succeed
+            (ByteSize.toBytes Index.sourceCeiling
+                == 16 * 1024 * 1024
+                && atCeiling
+                == "shown"
+                && String.startsWith "unreadable: " past
+                && String.contains "16777216-byte limit" past
+            )
+
+
+-- The text of `name`'s definition in `src`: its signature line through the
+-- line before the next top-level gap, or "" when `src` has no such signature.
+definitionOf : String -> String -> String
+definitionOf name src =
+    case List.head (List.drop 1 (String.split ("\n" ++ name ++ " :") src)) of
+        Just rest ->
+            Maybe.withDefault "" (List.head (String.split "\n\n\n" rest))
+
+        Nothing ->
+            ""
+
+
+-- Whether `name`'s definition in `src` exists and names no lexed source.
+namesNoLexing : String -> String -> Bool
+namesNoLexing src name =
+    let
+        body =
+            definitionOf name src
+    in
+    body /= "" && List.all (\word -> not (String.contains word body)) [ "Lexed", "ShownSource", "Highlight." ]
+
+
+-- Re-verifying a shown view re-reads and re-hashes its span and lexes
+-- nothing: an unchanged view is attested, a drifted one refused, and the
+-- re-read path (`readVerified`, `judgeView`, `confirmShown`) never names a
+-- lexed source. Red if `reverify` re-derives the view through the shown-view
+-- path, or a drift goes unnoticed.
+reverifyDoesNotLex : Task.Task Error Bool
+reverifyDoesNotLex =
+    do
+        attested <- attestedFor "ipe-index-reverify-unchanged" (uid "u-a")
+        at <- freshScratch "ipe-index-reverify-drifted"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        found <- loadUnitNow (uid "u-a")
+        writeFileText (at.repo ++ "/src/Lib.rs") ("// inserted above\n" ++ fixtureLibRs)
+        drifted <- expectErr (reverifyShown (uid "u-a") found |> Task.map (\_ -> 0))
+        cleanupIndex at.indexDb at.repo
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
+        src <- File.readFileLimit path (ByteSize.kib 64)
+        Task.succeed
+            (Index.attestedUid attested
+                == uid "u-a"
+                && drifted
+                && List.all (namesNoLexing src) [ "readVerified", "judgeView", "confirmShown" ]
+                && String.contains "readVerified settings.roots row" (definitionOf "reverify" src)
+                && not (String.contains "Highlight." (definitionOf "reverify" src))
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -874,4 +1050,9 @@ checks =
         , Task.succeed ( "classifying a span past the line ceiling withholds it", classifyRefusesPastLineCeiling )
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
+        , Task.succeed ( "a token spanning lines is drawn and linked as one lexeme", multiLineTokenDrawnAndLinkedAlike )
+        , check "a stored language with no lexing rules is drawn plain and links nothing" unknownLanguageFailsClosed
+        , Task.succeed ( "a CRLF view draws every line with its carriage return", crlfVisible )
+        , check "a source of exactly the read ceiling is shown, one byte more unreadable" sourceCeilingBinds
+        , check "re-verifying a shown view re-reads and re-hashes, lexing nothing" reverifyDoesNotLex
         ]

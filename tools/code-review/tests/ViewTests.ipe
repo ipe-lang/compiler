@@ -30,7 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, tokenKind, lineTexts, repoFile, probeMessage, probeNames, maybeContains)
 
 
 isKeyword : String -> Token -> Bool
@@ -198,8 +198,9 @@ isUnknown lang =
 
 
 -- The language every stored `files.lang` value highlights as agrees with
--- ipe-index's language vectors, row by row. Red if the vectors file is
--- absent or empty, or if `langFor` maps a stored value differently.
+-- ipe-index's language vectors, row by row, and a value outside ipe-index's
+-- vocabulary parses to no language. Red if the vectors file is absent or
+-- empty, or if `parseStored` or `dialect` maps a stored value differently.
 type alias LangVector =
     { stored : String
     , highlight : String
@@ -213,7 +214,25 @@ langVectorsHold =
         path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "lang_vectors.json"))
         text <- File.readFileLimit path (ByteSize.kib 16)
         vectors <- Task.fromResult (Decode.decodeString (Decode.list langVectorDecoder) text)
-        Task.succeed (not (List.isEmpty vectors) && List.all (\v -> langName (Highlight.langFor v.stored) == v.highlight) vectors)
+        Task.succeed
+            (not (List.isEmpty vectors)
+                && List.all (\v -> langName (dialectOf v.stored) == v.highlight) vectors
+                && Highlight.parseStored "weird"
+                == Nothing
+                && Highlight.parseStored "RS"
+                == Nothing
+            )
+
+
+-- The language a stored value is lexed by; no language is `Unknown`.
+dialectOf : String -> Lang
+dialectOf stored =
+    case Highlight.parseStored stored of
+        Just lang ->
+            Highlight.dialect lang
+
+        Nothing ->
+            Unknown
 
 
 langVectorDecoder : Decode.Decoder LangVector
@@ -247,20 +266,26 @@ rawText tok =
             t
 
 
--- Tokenizing loses and reorders nothing: the tokens' texts, in order, are
--- the source. Red if a closed block comment is rebuilt reversed, or if
--- `/*/` is taken for a closed comment.
+-- The tokens `src` lexes into under `lang`.
+toks : Lang -> String -> List Token
+toks lang src =
+    Highlight.lexedTokens (Highlight.lex lang 1 src)
+
+
+-- Lexing loses and reorders nothing: the tokens' texts, in order, are the
+-- source. Red if a closed block comment is rebuilt reversed, or if `/*/` is
+-- taken for a closed comment.
 reassembles : Lang -> String -> Bool
 reassembles lang src =
-    String.concat (List.map rawText (Highlight.tokenize lang src)) == src
+    String.concat (List.map rawText (toks lang src)) == src
 
 
 -- A one-mebibyte single-line source, past `viewByteCeiling` on purpose so the
--- tokenizer stays bounded beyond any shown view, tokenizes whole. Red if a
--- tokenizer step recurses per character outside tail position, or copies the
--- unread input or the tokens so far per character (quadratic: the run never ends).
-largeLineTokenizes : Bool
-largeLineTokenizes =
+-- lexer stays bounded beyond any shown view, lexes whole. Red if a lexer step
+-- recurses per character outside tail position, or copies the unread input or
+-- the tokens so far per character (quadratic: the run never ends).
+largeLineLexes : Bool
+largeLineLexes =
     let
         src =
             String.repeat 131072 "a1 \"s\"; "
@@ -268,15 +293,15 @@ largeLineTokenizes =
     String.length src == 1048576 && reassembles Highlight.Rust src
 
 
--- A one-mebibyte block comment is one Comment token. Red if the tokenizer
--- copies the open token's text per character (quadratic in one long token).
-largeTokenTokenizes : Bool
-largeTokenTokenizes =
+-- A one-mebibyte block comment is one Comment token. Red if the lexer copies
+-- the open token's text per character (quadratic in one long token).
+largeTokenLexes : Bool
+largeTokenLexes =
     let
         src =
             "/*" ++ String.repeat 1048572 "x" ++ "*/"
     in
-    String.length src == 1048576 && Highlight.tokenize Highlight.Rust src == [ Comment src ]
+    String.length src == 1048576 && toks Highlight.Rust src == [ Comment src ]
 
 
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r
@@ -338,6 +363,273 @@ decisionReachedOnlyThroughDecidableSource =
             )
 
 
+-- Whether no token of `tokens` is a comment.
+noComment : List Token -> Bool
+noComment tokens =
+    List.all (\tok -> tokenKind tok /= "Comment") tokens
+
+
+-- An Ipê `--` comment runs to the end of its line, a `"` inside it opening
+-- nothing. Red if Ipê reads `--` as two operators and `"z"` as a string.
+ipeLineComment : Bool
+ipeLineComment =
+    toks Highlight.Ipe "x -- y \"z\""
+        == [ Ident "x", Plain " ", Comment "-- y \"z\"" ]
+        && toks Highlight.Ipe "x - y"
+        == [ Ident "x", Plain " ", Plain "-", Plain " ", Ident "y" ]
+
+
+-- An Ipê `{- -}` comment nests: it ends after the closer matching its own
+-- opener. Red if it closes at the first `-}` or is not a comment at all.
+ipeNestedBlock : Bool
+ipeNestedBlock =
+    toks Highlight.Ipe "{- a {- b -} c -} d"
+        == [ Comment "{- a {- b -} c -}", Plain " ", Ident "d" ]
+        && toks Highlight.Ipe "{--} d"
+        == [ Comment "{--}", Plain " ", Ident "d" ]
+
+
+-- An Ipê `{-| -}` doc comment does not nest: it ends at the first `-}`. Red
+-- if a doc comment counts the openers inside it.
+ipeDocCommentFlat : Bool
+ipeDocCommentFlat =
+    toks Highlight.Ipe "{-| a {- b -} c"
+        == [ Comment "{-| a {- b -}", Plain " ", Ident "c" ]
+
+
+-- One language's keyword fixture under `tools/ipe-index/tests/`, the list
+-- the compiler side pins too.
+keywordFixture : String -> Task.Task Error (List String)
+keywordFixture name =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd name))
+        text <- File.readFileLimit path (ByteSize.kib 16)
+        Task.fromResult (Decode.decodeString (Decode.list Decode.string) text)
+
+
+-- Every word of a language's keyword fixture lexes as one `Keyword` in that
+-- language. Red if a fixture is absent or empty, or if a reserved word the
+-- compiler knows (`foreign`, `do`) lexes as an identifier.
+allKeywords : Lang -> List String -> Bool
+allKeywords lang words =
+    not (List.isEmpty words) && List.all (\w -> toks lang w == [ Keyword w ]) words
+
+
+-- The Ipê, Rust and shell keyword sets are their fixtures, and a word outside
+-- a set (`where` in Ipê, `union` in Rust) is an identifier.
+keywordsMatchFixtures : Task.Task Error Bool
+keywordsMatchFixtures =
+    do
+        ipeWords <- keywordFixture "keywords_ipe.json"
+        rust <- keywordFixture "keywords_rs.json"
+        shell <- keywordFixture "keywords_sh.json"
+        Task.succeed
+            (allKeywords Highlight.Ipe ipeWords
+                && allKeywords Highlight.Rust rust
+                && allKeywords Highlight.Shell shell
+                && List.member "foreign" ipeWords
+                && List.member "do" ipeWords
+                && toks Highlight.Ipe "where"
+                == [ Ident "where" ]
+                && toks Highlight.Rust "union"
+                == [ Ident "union" ]
+            )
+
+
+-- An Ipê `"""` string closes at the first `"""`, a `\` before a `"` escaping
+-- nothing. Red if the triple string closes at its second `"` or honours `\"`.
+ipeTripleString : Bool
+ipeTripleString =
+    toks Highlight.Ipe "\"\"\"a\\\"b\"\"\""
+        == [ Str "\"\"\"a\\\"b\"\"\"" ]
+        && toks Highlight.Ipe "\"\"\"a\\\"\"\" b"
+        == [ Str "\"\"\"a\\\"\"\"", Plain " ", Ident "b" ]
+        && toks Highlight.Ipe "\"\" b"
+        == [ Str "\"\"", Plain " ", Ident "b" ]
+
+
+-- A shell `#` starts a comment only where a word starts. Red if `$#`, `a#b`
+-- or a quoted `#` comments out the rest of the line.
+shellHashAtWordStart : Bool
+shellHashAtWordStart =
+    toks Highlight.Shell "a # b"
+        == [ Ident "a", Plain " ", Comment "# b" ]
+        && toks Highlight.Shell "# b"
+        == [ Comment "# b" ]
+        && toks Highlight.Shell "$#"
+        == [ Plain "$", Plain "#" ]
+        && toks Highlight.Shell "a#b"
+        == [ Ident "a", Plain "#", Ident "b" ]
+        && toks Highlight.Shell "\"#\""
+        == [ Str "\"#\"" ]
+
+
+-- A shell `'…'` string escapes nothing: it closes at the next `'`. Red if
+-- `\'` is read as an escaped quote.
+shellSingleQuoteRaw : Bool
+shellSingleQuoteRaw =
+    toks Highlight.Shell "'a\\' b"
+        == [ Str "'a\\'", Plain " ", Ident "b" ]
+
+
+-- A Rust `'"'` is one char literal, opening no string. Red if its `"` opens
+-- a string that swallows the rest of the line.
+rustQuoteChar : Bool
+rustQuoteChar =
+    toks Highlight.Rust "'\"' x"
+        == [ Str "'\"'", Plain " ", Ident "x" ]
+        && toks Highlight.Rust "'a'"
+        == [ Str "'a'" ]
+
+
+-- A Rust lifetime opens neither a char literal nor a string. Red if `'a`
+-- opens a char literal that runs to the next `'`.
+rustLifetime : Bool
+rustLifetime =
+    toks Highlight.Rust "&'a str"
+        == [ Plain "&", Plain "'a", Plain " ", Ident "str" ]
+        && List.any (isPlain "'static") (toks Highlight.Rust "&'static str")
+        && List.all (\tok -> tokenKind tok /= "Str") (toks Highlight.Rust "fn f<'a>(x: &'a str) -> &'a str")
+
+
+-- A Rust `/* */` comment nests. Red if it closes at the first `*/`.
+rustNestedBlock : Bool
+rustNestedBlock =
+    toks Highlight.Rust "/* a /* b */ c */ d"
+        == [ Comment "/* a /* b */ c */", Plain " ", Ident "d" ]
+
+
+-- A Rust raw string closes at `"` and its own count of `#`, escaping
+-- nothing. Red if `"` inside `r#"…"#` or `\"` inside `r"…"` closes or
+-- extends it.
+rustRawString : Bool
+rustRawString =
+    toks Highlight.Rust "r#\"a\"b\\\"#"
+        == [ Str "r#\"a\"b\\\"#" ]
+        && toks Highlight.Rust "br\"x\""
+        == [ Str "br\"x\"" ]
+        && toks Highlight.Rust "r\"\\\" x"
+        == [ Str "r\"\\\"", Plain " ", Ident "x" ]
+        && toks Highlight.Rust "r##\"a\"#b\"## x"
+        == [ Str "r##\"a\"#b\"##", Plain " ", Ident "x" ]
+
+
+-- A Rust raw identifier is one identifier, never its keyword. Red if
+-- `r#match` lexes as `r`, `#` and the keyword `match`.
+rustRawIdent : Bool
+rustRawIdent =
+    toks Highlight.Rust "r#match"
+        == [ Ident "r#match" ]
+        && toks Highlight.Rust "match"
+        == [ Keyword "match" ]
+        && toks Highlight.Rust "r# x"
+        == [ Ident "r", Plain "#", Plain " ", Ident "x" ]
+
+
+-- `//` and `/* */` are comments in Rust only. Red if Ipê or shell code after
+-- a `//` or `/*` is drawn as a comment.
+noSlashCommentsOutsideRust : Bool
+noSlashCommentsOutsideRust =
+    List.all
+        (\lang -> noComment (toks lang "// x") && noComment (toks lang "/* x */"))
+        [ Highlight.Ipe, Highlight.Shell ]
+        && toks Highlight.Rust "// x"
+        == [ Comment "// x" ]
+        && toks Highlight.Rust "/* x */"
+        == [ Comment "/* x */" ]
+
+
+-- Lexing `src` under `lang` loses nothing: the tokens' texts concatenate to
+-- `src`, the lines' pieces joined by `\n` are `src`, and there is one line
+-- more than `src` has `\n`s.
+lossless : Lang -> String -> Bool
+lossless lang src =
+    let
+        lexed =
+            Highlight.lex lang 1 src
+
+        drawn =
+            Highlight.lexedLines lexed
+    in
+    String.concat (List.map rawText (Highlight.lexedTokens lexed))
+        == src
+        && String.join "\n" (List.map (\( _, text ) -> text) (lineTexts drawn))
+        == src
+        && List.length drawn
+        == List.length (String.split "\n" src)
+
+
+-- Every language lexes a corpus of edge cases losslessly. Red if a lexeme
+-- open at end of input, a `\r`, a trailing `\n` or a token split across
+-- lines drops or duplicates text.
+lexLossless : Bool
+lexLossless =
+    let
+        corpus =
+            [ ""
+            , "x\n"
+            , "a\r\nb\r\n"
+            , "\n\n"
+            , "x -- y \"z\""
+            , "{- a {- b -} c -} d"
+            , "{-| a {- b -} c"
+            , "\"\"\"a\\\"b\"\"\""
+            , "a # b $# a#b \"#\""
+            , "'a\\' b"
+            , "'\"' x &'a str"
+            , "/* a /* b */ c */ d"
+            , "r#\"a\"b\\\"# br\"x\" r\"\\\" r#match"
+            , "\"open"
+            , "/* open\nstill"
+            , "{- open\nstill"
+            , "r#\"open\n"
+            , "'a"
+            , "'"
+            , "\"a\nb\""
+            , "/* a\r\n b */ c\r\n"
+            ]
+    in
+    List.all (\lang -> List.all (lossless lang) corpus) [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
+
+
+-- Whether `src` under `lang` is the one token `tok` on one line.
+onlyToken : Lang -> String -> Token -> Bool
+onlyToken lang src tok =
+    let
+        lexed =
+            Highlight.lex lang 1 src
+    in
+    Highlight.lexedTokens lexed
+        == [ tok ]
+        && List.map (\l -> l.tokens) (Highlight.lexedLines lexed)
+        == [ [ tok ] ]
+
+
+-- A comment, string, raw string or char literal still open at end of input
+-- ends as its own kind, losslessly, on its own line. Red if the end of a view
+-- falls back to plain text (where a link scan would read it as code).
+unterminatedAtEof : Bool
+unterminatedAtEof =
+    onlyToken Highlight.Rust "/* a" (Comment "/* a")
+        && onlyToken Highlight.Rust "/* a /* b */" (Comment "/* a /* b */")
+        && onlyToken Highlight.Rust "// a" (Comment "// a")
+        && onlyToken Highlight.Rust "\"ab" (Str "\"ab")
+        && onlyToken Highlight.Rust "\"ab\\" (Str "\"ab\\")
+        && onlyToken Highlight.Rust "r#\"ab\"" (Str "r#\"ab\"")
+        && onlyToken Highlight.Rust "'\"" (Str "'\"")
+        && onlyToken Highlight.Rust "'\\" (Str "'\\")
+        && onlyToken Highlight.Ipe "{- a" (Comment "{- a")
+        && onlyToken Highlight.Ipe "-- a" (Comment "-- a")
+        && onlyToken Highlight.Ipe "\"ab" (Str "\"ab")
+        && onlyToken Highlight.Ipe "\"\"\"ab\"\"" (Str "\"\"\"ab\"\"")
+        && onlyToken Highlight.Ipe "'a" (Str "'a")
+        && onlyToken Highlight.Shell "# a" (Comment "# a")
+        && onlyToken Highlight.Shell "\"ab" (Str "\"ab")
+        && onlyToken Highlight.Shell "'ab" (Str "'ab")
+        && onlyToken Highlight.Rust "'a" (Plain "'a")
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -350,24 +642,25 @@ checks =
             )
         , Task.succeed
             ( "highlight: rust keywords vs identifiers"
-            , List.any (isKeyword "fn") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
-                && List.any (isIdent "answer") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
-                && List.any (isNum "42") (Highlight.tokenize Highlight.Rust "fn answer() -> i32 { 42 }")
-                && List.any (isStr "\"hi\"") (Highlight.tokenize Highlight.Rust "let s = \"hi\";")
-                && List.any (isComment "// note") (Highlight.tokenize Highlight.Rust "// note\nfn f() {}")
+            , List.any (isKeyword "fn") (toks Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isIdent "answer") (toks Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isNum "42") (toks Highlight.Rust "fn answer() -> i32 { 42 }")
+                && List.any (isStr "\"hi\"") (toks Highlight.Rust "let s = \"hi\";")
+                && List.any (isComment "// note") (toks Highlight.Rust "// note\nfn f() {}")
             )
         , Task.succeed
-            ( "highlight: shell tokenizes"
-            , List.any (isKeyword "echo") (Highlight.tokenize Highlight.Shell "echo hi")
-                && List.any (isIdent "hi") (Highlight.tokenize Highlight.Shell "echo hi")
-                && isShell (Highlight.langFor "sh")
+            ( "highlight: shell lexes"
+            , List.any (isKeyword "echo") (toks Highlight.Shell "echo hi")
+                && List.any (isIdent "hi") (toks Highlight.Shell "echo hi")
+                && isShell (dialectOf "sh")
             )
         , Task.succeed
-            ( "highlight: malformed degrades to plain"
-            , List.any (isPlain "\"unterminated") (Highlight.tokenize Highlight.Rust "\"unterminated")
-                && List.any (isPlain "/* open") (Highlight.tokenize Highlight.Rust "/* open")
-                && List.any (isPlain "any old text") (Highlight.tokenize Highlight.Unknown "any old text")
-                && isUnknown (Highlight.langFor "weird")
+            ( "highlight: an unknown language is one plain run"
+            , toks Highlight.Unknown "any \"old\" // text"
+                == [ Plain "any \"old\" // text" ]
+                && toks Highlight.Unknown ""
+                == []
+                && isUnknown (dialectOf "weird")
             )
         , Task.succeed
             ( "percent: decided over queued"
@@ -390,22 +683,38 @@ checks =
             , reassembles Highlight.Rust "/* a */ x"
                 && reassembles Highlight.Rust "/*/ y"
                 && reassembles Highlight.Rust "a /* b */ c /* d"
-                && List.any (isComment "/* a */") (Highlight.tokenize Highlight.Rust "/* a */ x")
-                && List.any (isPlain "/*/ y") (Highlight.tokenize Highlight.Rust "/*/ y")
+                && List.any (isComment "/* a */") (toks Highlight.Rust "/* a */ x")
+                && toks Highlight.Rust "/*/ y"
+                == [ Comment "/*/ y" ]
             )
-        , Task.succeed ( "a one-mebibyte single-line source tokenizes", largeLineTokenizes )
-        , Task.succeed ( "a one-mebibyte block comment is one token", largeTokenTokenizes )
+        , Task.succeed ( "a one-mebibyte single-line source lexes whole", largeLineLexes )
+        , Task.succeed ( "a one-mebibyte block comment is one token", largeTokenLexes )
         , Task.succeed
             ( "an escaped quote stays inside its string literal"
-            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c"
+            , toks Highlight.Rust "\"a\\\"b\" c"
                 == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
-                && Highlight.tokenize Highlight.Rust "\"ab\\"
-                == [ Plain "\"ab\\" ]
-                && Highlight.tokenize Highlight.Rust "x // c\ny"
+                && toks Highlight.Rust "\"ab\\"
+                == [ Str "\"ab\\" ]
+                && toks Highlight.Rust "x // c\ny"
                 == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
-                && Highlight.tokenize Highlight.Rust "a/b**/"
+                && toks Highlight.Rust "a/b**/"
                 == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
-                && Highlight.tokenize Highlight.Rust "/**/1.5_"
+                && toks Highlight.Rust "/**/1.5_"
                 == [ Comment "/**/", Num "1.5_" ]
             )
+        , Task.succeed ( "an Ipe -- comment runs to the end of its line", ipeLineComment )
+        , Task.succeed ( "an Ipe block comment nests", ipeNestedBlock )
+        , Task.succeed ( "an Ipe doc comment closes at its first closer", ipeDocCommentFlat )
+        , check "the keyword sets are the shared keyword fixtures" keywordsMatchFixtures
+        , Task.succeed ( "an Ipe triple string closes at its first triple quote", ipeTripleString )
+        , Task.succeed ( "a shell # comments only at a word start", shellHashAtWordStart )
+        , Task.succeed ( "a shell single-quoted string escapes nothing", shellSingleQuoteRaw )
+        , Task.succeed ( "a Rust quote char opens no string", rustQuoteChar )
+        , Task.succeed ( "a Rust lifetime opens no char literal", rustLifetime )
+        , Task.succeed ( "a Rust block comment nests", rustNestedBlock )
+        , Task.succeed ( "a Rust raw string closes at its own hashes", rustRawString )
+        , Task.succeed ( "a Rust raw identifier is one identifier", rustRawIdent )
+        , Task.succeed ( "slash comments are Rust's only", noSlashCommentsOutsideRust )
+        , Task.succeed ( "every language lexes losslessly", lexLossless )
+        , Task.succeed ( "a lexeme open at end of input keeps its kind", unterminatedAtEof )
         ]

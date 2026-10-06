@@ -246,7 +246,7 @@ impl Lang {
     }
 
     /// Every `Lang` variant — read by `tests/lang_vectors.json`'s own test, the
-    /// shared fixture code-review's `Highlight.langFor` is pinned against.
+    /// shared fixture code-review's `Highlight.parseStored` is pinned against.
     ///
     /// Built from an exhaustive match (no wildcard): a new `Lang` variant
     /// fails this build until it is listed here too.
@@ -365,6 +365,43 @@ mod tests {
             "lang_vectors.json must list exactly ipe-index's Lang vocabulary \
              ({want:?}), got {stored:?}"
         );
+    }
+
+    /// The keyword fixture code-review's highlighter reads for `stored`, or
+    /// `None` when that language has none.
+    fn keyword_fixture(stored: &str) -> Option<&'static str> {
+        match stored {
+            "rs" => Some(include_str!("../tests/keywords_rs.json")),
+            "sh" => Some(include_str!("../tests/keywords_sh.json")),
+            "ipe" => Some(include_str!("../tests/keywords_ipe.json")),
+            _ => None,
+        }
+    }
+
+    // Every language code-review highlights (any `highlight` but `Unknown`)
+    // has a keyword fixture, non-empty and free of duplicates; a language
+    // highlighted with no fixture behind it goes red here.
+    #[test]
+    fn every_highlighted_language_has_a_keyword_fixture() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(LANG_VECTORS).unwrap();
+        for row in &rows {
+            let stored = row["stored"].as_str().unwrap();
+            if row["highlight"].as_str().unwrap() == "Unknown" {
+                continue;
+            }
+            let fixture = keyword_fixture(stored)
+                .unwrap_or_else(|| panic!("`{stored}` is highlighted but has no keyword fixture"));
+            let words: Vec<String> = serde_json::from_str(fixture).unwrap();
+            assert!(!words.is_empty(), "keywords_{stored}.json is empty");
+            let mut sorted = words.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                words.len(),
+                "keywords_{stored}.json has a duplicate word: {words:?}"
+            );
+        }
     }
 
     const TAG_VECTORS: &str = include_str!("../tests/repo_tag_vectors.json");
