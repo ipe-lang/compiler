@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::io_bounded::{MANIFEST_READ_CAP, read_opened_capped};
+use crate::io_bounded::{MANIFEST_CAP, prove_regular, read_proven};
 use crate::proven_dir::{EntryName, ProvenDir, ProvenDirError};
 use crate::text;
 
@@ -42,7 +42,7 @@ pub enum WrapperSourceDefect {
     NoBuildRoot,
     /// A directory or file on the way is absent or not proven owner-trusted.
     Unproven(ProvenDirError),
-    /// A manifest could not be read within [`MANIFEST_READ_CAP`] as UTF-8.
+    /// A manifest could not be read within [`MANIFEST_CAP`] as UTF-8.
     Unreadable(PathBuf),
     /// A manifest is not valid TOML.
     Unparsable(PathBuf),
@@ -165,7 +165,8 @@ fn read_manifest(dir: &ProvenDir) -> Result<toml::Table, WrapperSourceDefect> {
     let file = dir
         .open_file(&name)
         .map_err(WrapperSourceDefect::Unproven)?;
-    let text = read_opened_capped(file, &path, MANIFEST_READ_CAP)
+    let text = prove_regular(file, &path)
+        .and_then(|file| read_proven(file, &path, MANIFEST_CAP))
         .map_err(|_| WrapperSourceDefect::Unreadable(path.clone()))?;
     text.parse::<toml::Table>()
         .map_err(|_| WrapperSourceDefect::Unparsable(path))

@@ -371,7 +371,7 @@ impl<'e> SourceDir<'e> {
         if let (Ok(root), Some(name)) = (&self.root, entry.file_name()) {
             return root.read_named(name, entry, cap);
         }
-        read_user_named(entry, cap)
+        read_entry_by_path(entry, cap)
     }
 
     /// The opened sibling file for `module`, walked down by [`walk`].
@@ -435,22 +435,14 @@ fn is_absent(error: &io::Error) -> bool {
     )
 }
 
-/// Read the user-named `entry` by its path, at most `cap` bytes, refusing a non-regular file before opening it.
-///
-/// The type is checked again on the opened handle, so a swap after the
-/// first check is refused too.
+/// Read the user-named `entry` by its path, at most `cap` bytes, following a final link.
 ///
 /// # Errors
 /// As [`SourceDir::read_entry`].
-fn read_user_named(entry: &Path, cap: u64) -> Result<String, CliError> {
-    let meta = fs::metadata(entry).map_err(|error| io_bounded::open_error(entry, error))?;
-    if !meta.is_file() {
-        return Err(io_bounded::source_refused(
-            entry,
-            io_bounded::SourceRefusal::NotRegularFile,
-        ));
-    }
-    io_bounded::read_to_string_capped(entry, cap)
+fn read_entry_by_path(entry: &Path, cap: u64) -> Result<String, CliError> {
+    let file = ipe_fs_open::RegularFile::open_user_named(entry)
+        .map_err(|refusal| io_bounded::refusal_error(entry, refusal))?;
+    io_bounded::read_proven_within(file, entry, cap)
 }
 
 /// What a no-follow lookup finds at one name in a walked directory, decided before anything is opened.
@@ -707,8 +699,8 @@ impl HeldDir {
         let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
         let fd = rustix::fs::openat(&self.0, name, flags, rustix::fs::Mode::empty())
             .map_err(|errno| io_bounded::open_error(path, errno.into()))?;
-        let file = io_bounded::regular_file(fs::File::from(fd), path)?;
-        io_bounded::read_opened_capped(file, path, cap)
+        let file = io_bounded::prove_regular(fs::File::from(fd), path)?;
+        io_bounded::read_proven_within(file, path, cap)
     }
 }
 
@@ -810,7 +802,9 @@ impl VettedSibling {
     /// [`CliError::Io`] when the read fails; [`CliError::FileTooLarge`] past `cap`.
     fn read(self, cap: u64) -> SiblingRead {
         let Self { file, path } = self;
-        io_bounded::read_opened_capped(file, &path, cap).map(|source| (path, source))
+        let source = io_bounded::prove_regular(file, &path)
+            .and_then(|file| io_bounded::read_proven_within(file, &path, cap))?;
+        Ok((path, source))
     }
 }
 
@@ -1686,9 +1680,9 @@ mod tests {
     /// A FIFO entry in an exec-only directory is refused before the by-path
     /// fallback ever opens it.
     ///
-    /// `read_user_named`'s own regular-file check runs on a `stat`, which
-    /// needs only the exec bit on the directory to reach the entry by name.
-    /// Skipped when running as root.
+    /// The by-path fallback opens non-blocking and proves the handle regular,
+    /// which needs only the exec bit on the directory to reach the entry by
+    /// name. Skipped when running as root.
     #[cfg(unix)]
     #[test]
     #[allow(clippy::expect_used)] // test fixture: an unchangeable mode IS the failure
@@ -1708,6 +1702,39 @@ mod tests {
         assert!(
             is_refused(&loaded, io_bounded::SourceRefusal::NotRegularFile),
             "a FIFO entry in an exec-only directory is refused as not a regular file"
+        );
+    }
+
+    /// A user-named entry that is a link, in an exec-only directory, is read through the link.
+    ///
+    /// The by-path fallback is the user-named read, so it follows the final
+    /// link the user named. Skipped when running as root.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an unchangeable mode IS the failure
+    fn a_user_named_entry_symlink_in_an_exec_only_directory_is_followed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("exec-only-link-entry");
+        let real = scratch_dir("exec-only-link-target");
+        write(
+            &real.join("Main.ipe"),
+            "module Main exposing (main)\n\nmain = 1\n",
+        );
+        let entry = dir.join("Main.ipe");
+        std::os::unix::fs::symlink(real.join("Main.ipe"), &entry).expect("plant the entry link");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o311)).expect("drop the read bit");
+        let privileged = fs::read_dir(&dir).is_ok();
+        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&real);
+        if privileged {
+            return;
+        }
+        assert!(
+            loaded.is_ok(),
+            "a user-named entry link must be followed: {:?}",
+            loaded.err()
         );
     }
 

@@ -206,7 +206,7 @@ pub fn read_tree(root: &Path) -> Result<WalkedTree, DiffError> {
         let src = if walked_dir {
             crate::io_bounded::read_walked_source(m.path())?
         } else {
-            crate::io_bounded::read_to_string_capped(m.path(), crate::io_bounded::SOURCE_READ_CAP)?
+            crate::io_bounded::read_user_named(m.path(), crate::io_bounded::SOURCE_CAP)?
         };
         let (path, module_path) = m.into_paths();
         sources.insert(module_path, (path, src));
@@ -650,5 +650,31 @@ mod tests {
             crate::CliError::from(err),
             crate::CliError::DiscoveryLimitReached { .. }
         ));
+    }
+
+    /// A single `.ipe` file the user named through a link is read through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_user_named_single_file_link_is_followed() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe-api-surface-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(std::fs::create_dir_all(&root).is_ok(), "make scratch dir");
+        let target = root.join("Real.ipe");
+        let link = root.join("Lib.ipe");
+        assert!(
+            std::fs::write(&target, "module Lib exposing (one)\n\none = 1\n").is_ok(),
+            "write module"
+        );
+        assert!(
+            std::os::unix::fs::symlink(&target, &link).is_ok(),
+            "make link"
+        );
+        let result = read_tree(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            result.as_ref().is_ok_and(|tree| tree.modules.len() == 1),
+            "a named single-file link must be followed: {result:?}"
+        );
     }
 }
