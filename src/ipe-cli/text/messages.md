@@ -236,6 +236,10 @@ internal: module in topo order not in source map
 
 this is a library package (it declares `exposedModules` and no runnable program) — there is no entry to build. Use `ipe type-check` to verify its public surface, or add a `Package.programs [ … ]` stage to declare a runnable entry
 
+## debugger-needs-runtime-dep
+
+`--debugger` needs the runtime crate: the vendored runtime source (`IPE_RUNTIME_VENDORED=1`) carries no debugger. Unset `IPE_RUNTIME_VENDORED` to build with it
+
 ## pkg-not-found-in-dir
 
 no package.ipe found — run inside a project or pass its path

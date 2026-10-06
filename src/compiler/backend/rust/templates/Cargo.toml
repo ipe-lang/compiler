@@ -75,12 +75,19 @@ email = []
 # Promoted by `config_cargo_toml` for a program that reaches the
 # `config_decode` runtime module, mirroring the runtime crate.
 config = []
-# Declared but never promoted: no vendored emit selects the time-travel
-# debugger or its control-wire codec. Declaring them keeps the gates in the
-# vendored source naming only features this manifest knows, so each evaluates
-# off by declaration rather than by an unknown name.
+# Declared but never promoted: the vendored source tree carries no `debugger`
+# module, so the driver and the emitter both refuse a `--debugger` build under
+# the vendored emit model. Declaring them keeps the gates in the vendored source
+# naming only features this manifest knows, so each evaluates off by
+# declaration rather than by an unknown name.
 debugger = []
 control-wire = []
+# Declared but never promoted: the vendored emit picks the database driver by
+# which `config.rs` it writes, not by a feature. The runtime `config.rs` that a
+# sqlite emit vendors verbatim names both in its two-drivers guard, which
+# therefore stays off by declaration.
+db-sqlite = []
+db-postgres = []
 # Declared but inert in the vendored escape hatch: `chrono` stays non-optional
 # below and the template `ipe_runtime/mod.rs` declares `log` / `time` by
 # inclusion, not by `#[cfg]`. These entries only keep rustc's check-cfg quiet for

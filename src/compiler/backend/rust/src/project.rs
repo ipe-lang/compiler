@@ -2698,13 +2698,37 @@ const _: () = assert!(
 ///
 /// Every [`Diagnostic`] of [`assemble_project_text`] and of
 /// [`refuse_lexer_hazards`].
-fn assemble_project_files(
+pub(crate) fn assemble_project_files(
     ctx: &EmitCtx,
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
     let project = assemble_project_text(ctx, rust_sources)?;
     refuse_lexer_hazards(&project)?;
     Ok(project)
+}
+
+/// Refuse a `--debugger` emit under the vendored model.
+///
+/// The vendored module tree declares no `debugger` module and its manifest never
+/// turns the feature on, so the session codec a debugger emit passes to
+/// `console_app` / `worker_app` and the `ipe_runtime::debugger` paths it names
+/// would reach a runtime compiled without them. The driver refuses the pairing
+/// before compiling; this is the emitter's own fence.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] when `ctx` asks for the debugger with no
+/// dependency-model runtime.
+fn refuse_vendored_debugger(ctx: &EmitCtx) -> DResult<()> {
+    if ctx.debugger && ctx.runtime_dep.is_none() {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::project::refuse_vendored_debugger",
+            detail: "a --debugger emit needs the dependency-model runtime; the vendored \
+                     runtime tree carries no debugger module"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Assemble the final [`EmittedProject`] from the already-rendered Rust source
@@ -2729,6 +2753,7 @@ fn assemble_project_text(
     ctx: &EmitCtx,
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
+    refuse_vendored_debugger(ctx)?;
     // The emitted crate's package name: the caller-supplied sanitized project
     // name, or the safe default when no name was configured.
     let effective_name: &str = if ctx.cargo_name.is_empty() {
@@ -4561,18 +4586,23 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
             where_,
             detail: "default feature list has no closing ']' — golden drifted".to_owned(),
         })?;
+    let split = || Diagnostic::CompilerBug {
+        where_,
+        detail: "default feature list is not on a char boundary".to_owned(),
+    };
+    let (head, tail) = base.split_at_checked(close).ok_or_else(split)?;
+    let list = head.get(search_from..).ok_or_else(split)?;
     let quoted = format!("\"{feature}\"");
-    if base
-        .get(search_from..close)
-        .is_some_and(|list| list.contains(&quoted))
-    {
+    if list.contains(&quoted) {
         return Ok(base.to_owned());
     }
-    let mut out = String::with_capacity(base.len() + quoted.len() + 2);
-    out.push_str(base.get(..close).unwrap_or(""));
-    out.push_str(", ");
+    // An empty list takes the bare name: `[, "x"]` is not TOML.
+    let separator = if list.trim().is_empty() { "" } else { ", " };
+    let mut out = String::with_capacity(base.len() + quoted.len() + separator.len());
+    out.push_str(head);
+    out.push_str(separator);
     out.push_str(&quoted);
-    out.push_str(base.get(close..).unwrap_or(""));
+    out.push_str(tail);
     Ok(out)
 }
 
@@ -6648,6 +6678,18 @@ mod tests {
             promote_default_feature("[features]\ndefault = [\"json\"\n", "config", "test").is_err(),
             "an unclosed default list must be refused"
         );
+    }
+
+    /// Promotion into an empty default list stays valid TOML.
+    #[test]
+    fn promote_default_feature_into_an_empty_list() {
+        let out =
+            promote_default_feature("[features]\ndefault = []\nconfig = []\n", "config", "test")
+                .expect("promote into an empty list");
+        assert_eq!(default_line(&out), r#"default = ["config"]"#);
+        let spaced = promote_default_feature("[features]\ndefault = [ ]\n", "config", "test")
+            .expect("promote into a blank list");
+        assert_eq!(default_line(&spaced), r#"default = [ "config"]"#);
     }
 
     /// A synchronous program whose default list an earlier augmenter already

@@ -5840,3 +5840,61 @@ fn wrapper_source_ignores_planted_ancestor() {
         );
     }
 }
+
+/// A `--debugger` build under the vendored emit model is refused before any
+/// compile work with the catalog message: the vendored runtime tree carries no
+/// debugger, so the emitted project would otherwise fail at `cargo build`.
+#[test]
+fn vendored_debugger_build_is_refused_before_compiling() {
+    let out = ipe_test_temp::temp_root().join(format!(
+        "ipe-vendored-debugger-refused-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&out);
+    let entry_path = vec!["Main".to_owned()];
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    sources.insert(
+        entry_path.clone(),
+        (
+            PathBuf::from("<vendored-debugger>/Main.ipe"),
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\nmain : Task Error ()\nmain =\n    Io.println \"x\"\n".to_owned(),
+        ),
+    );
+    let discovered = vec![project::DiscoveredModule::user(
+        PathBuf::from("<vendored-debugger>/Main.ipe"),
+        entry_path.clone(),
+    )];
+    let refused = |runtime_dep: bool| {
+        let (result, outcome) = compile_modules_observed(
+            sources.clone(),
+            discovered.clone(),
+            &entry_path,
+            &emit_target(&out),
+            Path::new("<no-runtime>"),
+            Path::new("<vendored-debugger>"),
+            ipe_backend_rust::DbDriver::Sqlite,
+            None,
+            BuildOptions {
+                debugger: true,
+                runtime_dep,
+                ..BuildOptions::default()
+            },
+        );
+        let expected = crate::text::msg::debugger_needs_runtime_dep();
+        let is_refusal = matches!(&result, Err(CliError::Usage(message)) if *message == expected);
+        (is_refusal, outcome, result.err())
+    };
+    let (is_refusal, outcome, err) = refused(false);
+    assert!(
+        is_refusal,
+        "a vendored `--debugger` build must be refused with the catalog message: {err:?}"
+    );
+    assert_eq!(outcome, CacheOutcome::Miss);
+    assert!(!out.exists(), "the refusal fires before any emit");
+    let (is_refusal, _, err) = refused(true);
+    assert!(
+        !is_refusal,
+        "the dependency model is not refused by the debugger gate: {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}

@@ -6,12 +6,15 @@
 //! vendored `Cargo.toml` never declares compiles its code out of every vendored
 //! build without a word. The scan lexes each vendored source (the runtime tree
 //! the driver copies into `src/ipe_runtime/`, the trimmed `ipe_runtime/mod.rs`
-//! template, and the `RUNTIME_MOD_RS_*` appends) and refuses any feature name
-//! outside the set the vendored manifest and its augmenters declare.
+//! and stub `config.rs` templates, and the `RUNTIME_MOD_RS_*` appends) and
+//! refuses any feature name outside the set the vendored manifest and its
+//! augmenters declare.
+
+#![cfg(test)]
 
 use super::{
-    CARGO_TOML, RUNTIME_MOD_RS, async_runtime_cargo_toml, jwt_cargo_toml, locale_cargo_toml,
-    server_cargo_toml,
+    CARGO_TOML, RUNTIME_CONFIG_RS, RUNTIME_MOD_RS, async_runtime_cargo_toml, jwt_cargo_toml,
+    locale_cargo_toml, server_cargo_toml,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -28,9 +31,12 @@ const EXCLUDED: &[(&str, &str)] = &[(
      trimmed vendored `mod.rs` never declares it",
 )];
 
-/// Runtime files the emitter overwrites in the vendored tree, so their runtime
-/// copies never reach a vendored build (the template replaces them).
-const REPLACED: &[&str] = &["mod.rs", "config.rs"];
+/// Runtime files the emitter overwrites in EVERY vendored emit, so their
+/// runtime copies never reach a vendored build (the template replaces them).
+///
+/// `config.rs` is absent on purpose: a sqlite db emit vendors the runtime copy
+/// verbatim, so it is scanned like any other file.
+const REPLACED: &[&str] = &["mod.rs"];
 
 /// The backend source, lexed for its `RUNTIME_MOD_RS_*` append constants.
 const PROJECT_RS: &str = include_str!("../project.rs");
@@ -151,10 +157,12 @@ impl Lexer<'_> {
         }
     }
 
-    /// Skip a char literal (`'x'`, `'\n'`, `'"'`) or a lifetime (`'a`).
+    /// Skip a char literal (`'x'`, `'\n'`, `'\''`, `'"'`) or a lifetime (`'a`).
     fn skip_char_or_lifetime(&mut self) {
         if self.at(1) == Some('\\') {
-            self.i += 2;
+            // The escaped char goes with the backslash, so `'\''` does not
+            // end at its own escaped quote.
+            self.i += 3;
             while self.at(0).is_some_and(|ch| ch != '\'') {
                 self.i += 1;
             }
@@ -431,12 +439,15 @@ fn vendored_cfg_features_are_declared() {
             }
         }
     }
-    for (line, name) in cfg_features(RUNTIME_MOD_RS) {
-        scanned += 1;
-        if !declared.contains(&name) {
-            drift.push(format!(
-                "templates/ipe_runtime/mod.rs:{line}: feature {name:?}"
-            ));
+    for (template, text) in [
+        ("templates/ipe_runtime/mod.rs", RUNTIME_MOD_RS),
+        ("templates/ipe_runtime/config.rs", RUNTIME_CONFIG_RS),
+    ] {
+        for (line, name) in cfg_features(text) {
+            scanned += 1;
+            if !declared.contains(&name) {
+                drift.push(format!("{template}:{line}: feature {name:?}"));
+            }
         }
     }
     let appends = mod_rs_appends();
@@ -529,6 +540,9 @@ fn cfg_scan_reads_gates_and_skips_prose() {
         const S: &str = "#[cfg(feature = \"in_string\")]";
         const R: &str = r#"#[cfg(feature = "in_raw")]"#;
         const Q: char = '"';
+        const E: [char; 2] = ['\'','"'];
+        #[cfg(feature = "after_escaped_quote")]
+        fn c() {}
         fn lt<'a>(x: &'a str) -> &'a str { x }
         #[cfg(all(feature = "attr", not(feature = "negated")))]
         fn a() {}
@@ -540,7 +554,14 @@ fn cfg_scan_reads_gates_and_skips_prose() {
     let names: Vec<String> = cfg_features(src).into_iter().map(|(_, n)| n).collect();
     assert_eq!(
         names,
-        ["attr", "negated", "attr_pred", "mac", "inner"],
+        [
+            "after_escaped_quote",
+            "attr",
+            "negated",
+            "attr_pred",
+            "mac",
+            "inner"
+        ],
         "only real gates are read"
     );
 }
