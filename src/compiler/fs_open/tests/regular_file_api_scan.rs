@@ -83,7 +83,7 @@ struct Scan {
 
 impl Scan {
     fn impl_block(&mut self, file: &str, block: &ItemImpl) {
-        if let Some((_, trait_path, _)) = &block.trait_ {
+        if let Some((trait_path, _)) = &block.trait_ {
             let Some(last) = trait_path.segments.last() else {
                 return;
             };
