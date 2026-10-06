@@ -50,7 +50,13 @@ random = []
 # sinks, `web_page_core.rs`) need this entry to compile — every render host (web /
 # wasm-client / webview) promotes it. `web` implies it, mirroring the runtime crate.
 web-core = []
-web = ["web-core"]
+# `web` implies `widget-assets`, mirroring the runtime crate: the vendored
+# `web/mod.rs` serves the SRI-pinned port glue (`port_glue_script`, the glue
+# route) under `#[cfg(feature = "widget-assets")]`, and the trimmed
+# `ipe_runtime/mod.rs` declares `widget_assets` / `js_port_glue` for every web
+# program. Inert otherwise: its deps stay non-optional below.
+widget-assets = []
+web = ["web-core", "widget-assets"]
 redis_store = []
 # `webview = []` is a surgery anchor: `webview_cargo_toml` replaces it with the
 # wry+tao deps AND promotes `web-core` + `webview` into `default` — so a webview
@@ -58,6 +64,30 @@ redis_store = []
 webview = []
 tui = []
 websocket_client = []
+# The outbound HTTP client. `http_client_cargo_toml` promotes it and adds
+# `reqwest` for a program that reaches the `http_client` runtime module; the
+# vendored `web/mod.rs` compiles the telemetry exporters and the console proxy
+# (and `system::exit_process` flushes the exporters) only with it on.
+http_client = []
+# Promoted by `email_cargo_toml` for an `Ipe.Email` program, mirroring the
+# runtime crate; the vendored `ssrf.rs` dial helpers it reaches are gated on it.
+email = []
+# Promoted by `config_cargo_toml` for a program that reaches the
+# `config_decode` runtime module, mirroring the runtime crate.
+config = []
+# Declared but never promoted: the vendored source tree carries no `debugger`
+# module, so the driver and the emitter both refuse a `--debugger` build under
+# the vendored emit model. Declaring them keeps the gates in the vendored source
+# naming only features this manifest knows, so each evaluates off by
+# declaration rather than by an unknown name.
+debugger = []
+control-wire = []
+# Declared but never promoted: the vendored emit picks the database driver by
+# which `config.rs` it writes, not by a feature. The runtime `config.rs` that a
+# sqlite emit vendors verbatim names both in its two-drivers guard, which
+# therefore stays off by declaration.
+db-sqlite = []
+db-postgres = []
 # Declared but inert in the vendored escape hatch: `chrono` stays non-optional
 # below and the template `ipe_runtime/mod.rs` declares `log` / `time` by
 # inclusion, not by `#[cfg]`. These entries only keep rustc's check-cfg quiet for

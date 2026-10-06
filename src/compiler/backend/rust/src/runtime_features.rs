@@ -595,6 +595,51 @@ mod tests {
         );
     }
 
+    /// The vendored runtime tree has no `debugger` module, so a `--debugger`
+    /// emit under the vendored model is refused at `ipe` time on both targets;
+    /// the dependency model is not refused.
+    #[test]
+    fn vendored_debugger_emit_is_refused() {
+        const REFUSER: &str = "ipe_backend_rust::project::refuse_vendored_debugger";
+        let mut interner = Interner::new();
+        let main = interner.intern("Main").expect("intern Main");
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![ctx_module(main, |_| {})],
+        };
+        let refused_by = |result: &ipe_diagnostics::DResult<ipe_backend::EmittedProject>| {
+            matches!(
+                result,
+                Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, .. }) if *where_ == REFUSER
+            )
+        };
+        for target in [ipe_ir::Target::Native, ipe_ir::Target::WasmClient] {
+            let vendored = RustBackend::new(&interner)
+                .with_target(target)
+                .with_debugger(true);
+            let ctx = vendored.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+            let emitted = crate::project::assemble_project_files(&ctx, Vec::new());
+            assert!(
+                refused_by(&emitted),
+                "a vendored `--debugger` emit ({target:?}) must be refused: {:?}",
+                emitted.as_ref().err()
+            );
+        }
+        let dep = RustBackend::new(&interner)
+            .with_debugger(true)
+            .with_runtime_dep(Some(crate::RuntimeDep {
+                root: std::path::PathBuf::from("ipe_runtime_dep"),
+            }));
+        let ctx = dep.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+        let emitted = crate::project::assemble_project_files(&ctx, Vec::new());
+        assert!(
+            !refused_by(&emitted),
+            "a dependency-model `--debugger` emit must not be refused: {:?}",
+            emitted.as_ref().err()
+        );
+    }
+
     /// Compute the selected feature names for an empty program emitted under
     /// `target` with the given build intent.
     fn features_for_intent(

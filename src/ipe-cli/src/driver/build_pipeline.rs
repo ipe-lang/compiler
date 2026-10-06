@@ -971,6 +971,14 @@ pub fn compile_modules_observed(
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
+    // The vendored runtime tree carries no debugger, so a `--debugger` build
+    // needs the dependency model; refused before any work, never at cargo time.
+    if options.debugger && !options.runtime_dep {
+        return (
+            Err(CliError::Usage(text::msg::debugger_needs_runtime_dep())),
+            CacheOutcome::Miss,
+        );
+    }
     // Inject the transitive compiled-source stdlib closure. `injected` is the
     // driver's unforgeable record of which module paths are trusted stdlib
     // source — the ONLY inputs that earn `ModuleOrigin::EmbeddedStdlib` below.
