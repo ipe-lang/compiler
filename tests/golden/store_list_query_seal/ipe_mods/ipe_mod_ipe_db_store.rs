@@ -8,9 +8,7 @@ pub(crate) enum IpeDbStoreColumn {
 impl IpeStringify for IpeDbStoreColumn {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreColumn::Column(p0) => {
-                format!("Column {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeDbStoreColumn::Column(p0) => format!("Column {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -29,34 +27,27 @@ pub(crate) enum IpeDbStoreColumnSpec {
 impl IpeStringify for IpeDbStoreColumnSpec {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreColumnSpec::PrimaryKey(p0) => format!(
-                "PrimaryKey {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            IpeDbStoreColumnSpec::Serial(p0) => {
-                format!("Serial {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
+            IpeDbStoreColumnSpec::PrimaryKey(p0) => {
+                format!("PrimaryKey {}", IpeStringify::ipe_show(p0))
             }
-            IpeDbStoreColumnSpec::Unique(p0) => {
-                format!("Unique {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
+            IpeDbStoreColumnSpec::Serial(p0) => format!("Serial {}", IpeStringify::ipe_show(p0)),
+            IpeDbStoreColumnSpec::Unique(p0) => format!("Unique {}", IpeStringify::ipe_show(p0)),
+            IpeDbStoreColumnSpec::DefaultNow(p0) => {
+                format!("DefaultNow {}", IpeStringify::ipe_show(p0))
             }
-            IpeDbStoreColumnSpec::DefaultNow(p0) => format!(
-                "DefaultNow {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
             IpeDbStoreColumnSpec::DefaultText(p0, p1) => format!(
                 "DefaultText {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
             IpeDbStoreColumnSpec::DefaultInt(p0, p1) => format!(
                 "DefaultInt {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
-            IpeDbStoreColumnSpec::TouchOnUpdate(p0) => format!(
-                "TouchOnUpdate {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeDbStoreColumnSpec::TouchOnUpdate(p0) => {
+                format!("TouchOnUpdate {}", IpeStringify::ipe_show(p0))
+            }
         }
     }
 }
@@ -72,15 +63,14 @@ impl IpeStringify for IpeDbStorePrimaryKeyDecl {
     fn ipe_show(&self) -> String {
         match self {
             IpeDbStorePrimaryKeyDecl::NoPk => "NoPk".to_string(),
-            IpeDbStorePrimaryKeyDecl::SinglePk(p0) => format!(
-                "SinglePk {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeDbStorePrimaryKeyDecl::SinglePk(p0) => {
+                format!("SinglePk {}", IpeStringify::ipe_show(p0))
+            }
             IpeDbStorePrimaryKeyDecl::CompositePk(p0, p1, p2) => format!(
                 "CompositePk {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2)
             ),
         }
     }
@@ -95,13 +85,11 @@ pub(crate) enum IpeDbStoreIndexSpec {
 impl IpeStringify for IpeDbStoreIndexSpec {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreIndexSpec::Index(p0) => {
-                format!("Index {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            IpeDbStoreIndexSpec::Index(p0) => format!("Index {}", IpeStringify::ipe_show(p0)),
             IpeDbStoreIndexSpec::IndexNamed(p0, p1) => format!(
                 "IndexNamed {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
         }
     }
@@ -118,13 +106,13 @@ impl IpeStringify for IpeDbStoreSchemaOp {
         match self {
             IpeDbStoreSchemaOp::RenameColumn(p0, p1) => format!(
                 "RenameColumn {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
             IpeDbStoreSchemaOp::RenameTable(p0, p1) => format!(
                 "RenameTable {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
         }
     }
@@ -142,10 +130,10 @@ impl<T1: Clone + 'static> Clone for IpeDbStoreDraft<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreDraft<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for IpeDbStoreDraft<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreDraft::Draft(_) => format!("Draft {}", "<fn>"),
+            IpeDbStoreDraft::Draft(_) => format!("Draft {}", "<function>"),
         }
     }
 }
@@ -162,10 +150,10 @@ impl<T1: Clone + 'static> Clone for IpeDbStoreStore<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for IpeDbStoreStore<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for IpeDbStoreStore<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreStore::Store(_) => format!("Store {}", "<fn>"),
+            IpeDbStoreStore::Store(_) => format!("Store {}", "<function>"),
         }
     }
 }

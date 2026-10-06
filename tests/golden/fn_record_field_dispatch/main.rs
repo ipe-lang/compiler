@@ -46,7 +46,7 @@ impl Clone for RecAddMul {
 
 impl IpeStringify for RecAddMul {
     fn ipe_show(&self) -> String {
-        format!("{{{} {}}}", "<fn>", "<fn>")
+        format!("{{{} {}}}", "<function>", "<function>")
     }
 }
 

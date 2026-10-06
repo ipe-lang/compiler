@@ -51,6 +51,8 @@ pub struct IpeCustomElement {
     tag: String,
 }
 
+crate::stringify::show_row!("CustomElement", Internals, [] IpeCustomElement, |_| "<Ipe.Ffi.Js.CustomElement>".to_owned());
+
 /// The reserved `CustomElement.fromFile "<js-path>"` constructor. `tag` is the
 /// compiler-minted content-addressed element tag; the constructor is a pure
 /// wrapper — every path/containment seal already ran at compile time.

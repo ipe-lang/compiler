@@ -48,6 +48,8 @@ pub enum StreamWriter {
     StreamWriter(i64),
 }
 
+crate::stringify::show_row!("StreamWriter", Internals, [] StreamWriter, |_| "<Ipe.Http.Server.StreamWriter>".to_owned());
+
 /// Handler with its Ipê error type E erased: the effect IS the emits, the
 /// IpeResult is discarded (await`).
 type ErasedStreamHandler =

@@ -44,7 +44,7 @@ impl Clone for RecRun {
 
 impl IpeStringify for RecRun {
     fn ipe_show(&self) -> String {
-        format!("{{{}}}", "<fn>")
+        format!("{{{}}}", "<function>")
     }
 }
 
@@ -62,7 +62,7 @@ impl Clone for RecShouldRetry {
 
 impl IpeStringify for RecShouldRetry {
     fn ipe_show(&self) -> String {
-        format!("{{{}}}", "<fn>")
+        format!("{{{}}}", "<function>")
     }
 }
 

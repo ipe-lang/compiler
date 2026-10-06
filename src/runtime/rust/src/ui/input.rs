@@ -44,17 +44,9 @@ pub struct Placeholder<M> {
     pub content: Element<M>,
 }
 
-impl<M> crate::stringify::IpeStringify for Label<M> {
-    fn ipe_show(&self) -> String {
-        "<label>".to_string()
-    }
-}
+crate::stringify::show_row!("Label", Internals, [M] Label<M>, |_| "<Ipe.Ui.Label>".to_owned());
 
-impl<M> crate::stringify::IpeStringify for Placeholder<M> {
-    fn ipe_show(&self) -> String {
-        "<placeholder>".to_string()
-    }
-}
+crate::stringify::show_row!("Placeholder", Internals, [M] Placeholder<M>, |_| "<Ipe.Ui.Placeholder>".to_owned());
 
 // ---- Label constructors -----------------------------------------------------
 
@@ -414,11 +406,7 @@ pub struct RadioOption<M> {
     pub label: Element<M>,
 }
 
-impl<M> crate::stringify::IpeStringify for RadioOption<M> {
-    fn ipe_show(&self) -> String {
-        format!("<RadioOption {}>", self.value)
-    }
-}
+crate::stringify::show_row!("RadioOption", Internals, [M] RadioOption<M>, |_| "<Ipe.Ui.RadioOption>".to_owned());
 
 /// `Input.option : String -> Element msg -> RadioOption msg`
 ///

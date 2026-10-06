@@ -12,10 +12,7 @@ impl IpeStringify for IpeDbCodecCell {
         match self {
             IpeDbCodecCell::CellAbsent => "CellAbsent".to_string(),
             IpeDbCodecCell::CellNull => "CellNull".to_string(),
-            IpeDbCodecCell::CellText(p0) => format!(
-                "CellText {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeDbCodecCell::CellText(p0) => format!("CellText {}", IpeStringify::ipe_show(p0)),
         }
     }
 }

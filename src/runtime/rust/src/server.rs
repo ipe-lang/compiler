@@ -48,6 +48,8 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
+crate::stringify::show_row!("ServerRequest", Redacted, [] ServerRequest, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 redacting_debug!(ServerRequest {
     shown: [method],
     masked: [path, body, headers, params, query, cookies, remoteAddr],
@@ -103,6 +105,8 @@ pub struct ServerResponse {
     pub cookies: Vec<SetCookie>,
 }
 
+crate::stringify::show_row!("ServerResponse", Redacted, [] ServerResponse, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 // The body, headers and `Set-Cookie` values can carry a session id or a token;
 // the emitter builds this struct by field name, so the masking lives in `Debug`.
 redacting_debug!(ServerResponse {
@@ -117,6 +121,8 @@ pub struct ServerCookie {
     pub name: CookieName,
     pub value: Redacted<CookieValue>,
 }
+
+crate::stringify::show_row!("ServerCookie", Redacted, [] ServerCookie, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
 /// the result to either the response (Ok) or a 500 marker (Err). Erasing E here
@@ -208,6 +214,8 @@ pub struct ServerRoute {
     pub path: String,
     target: RouteTarget, // private; was the two pub Options
 }
+
+crate::stringify::show_row!("ServerRoute", Internals, [] ServerRoute, |_| "<Ipe.Http.Server.Route>".to_owned());
 
 // ─── handler erasure ──────────────────────────────────────────────────────
 
@@ -357,6 +365,9 @@ pub enum TokenSource {
     Cookie(CookieName),
 }
 
+#[cfg(feature = "jwt")]
+crate::stringify::show_row!("TokenSource", Redacted, [] TokenSource, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// Ipe.Server.AuthConfig (opaque) — the secret, token source, claim key, and
 /// revocation mode the middleware uses. Built by [`server_auth_config`]; the
 /// only value the authed-route kernels accept. The revocation mode defaults to
@@ -369,6 +380,9 @@ pub struct AuthConfig {
     subject_claim: String,
     revocation_mode: crate::app_config::RevocationMode,
 }
+
+#[cfg(feature = "jwt")]
+crate::stringify::show_row!("AuthConfig", Redacted, [] AuthConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 #[cfg(feature = "jwt")]
 /// Ipe.Server.authConfig : Secret -> TokenSource -> AuthConfig. The subject
@@ -2130,6 +2144,8 @@ pub enum WsHandle {
     WebSocketServer(i64),
 }
 
+crate::stringify::show_row!("WebSocketServer", Internals, [] WsHandle, |_| "<Ipe.Http.Server.WebSocket>".to_owned());
+
 /// Ipe.Http.Server.WebSocket.WebSocketServerCfg — fn-pointer callbacks (cannot
 /// capture; capturing handlers need Arc<dyn Fn> erasure, a follow-up).
 ///
@@ -2156,6 +2172,8 @@ pub struct WsServerCfg<E> {
     pub maxMessageBytes: i64,
     pub originPatterns: Vec<String>,
 }
+
+crate::stringify::show_row!("WebSocketServerCfg", Internals, [E] WsServerCfg<E>, |_| "<Ipe.Http.Server.WebSocket.Config>".to_owned());
 
 enum WsOut {
     Text(String),

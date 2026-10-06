@@ -47,11 +47,7 @@ impl std::fmt::Display for EmailAddress {
     }
 }
 
-impl crate::stringify::IpeStringify for EmailAddress {
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+crate::stringify::show_row!("EmailAddress", Value, [] EmailAddress, |a| a.0.clone());
 
 /// `EmailAddress.parse : String -> Maybe EmailAddress` — the single parse
 /// boundary. Returns `None` when the string is not a structurally valid
@@ -111,6 +107,8 @@ pub struct EmailMessage {
     pub replyTo: EmailAddress,
 }
 
+crate::stringify::show_row!("EmailMessage", Redacted, [] EmailMessage, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// Ipê.Email.Attachment — `content` carries the attachment body as raw bytes.
 ///
 /// The Ipê `Attachment.content` field is typed `Bytes` (`Vec<u8>` on Rust),
@@ -126,6 +124,8 @@ pub struct EmailAttachment {
     pub content: Vec<u8>,
 }
 
+crate::stringify::show_row!("EmailAttachment", Redacted, [] EmailAttachment, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// Ipê.Email.SesConfig.
 ///
 /// `secret` is the SES secret access key — a sealed [`Secret`], revealed only
@@ -138,6 +138,8 @@ pub struct SesConfig {
     pub key: String,
     pub secret: Secret,
 }
+
+crate::stringify::show_row!("EmailSesConfig", Redacted, [] SesConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// Ipê.Email.SmtpConfig.
 ///
@@ -152,6 +154,8 @@ pub struct SmtpConfig {
     pub pass: Secret,
 }
 
+crate::stringify::show_row!("EmailSmtpConfig", Redacted, [] SmtpConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 /// Ipê.Email.EmailProvider — the ADT; variant names match the Ipê ctors.
 ///
 /// The Resend / SendGrid API keys are sealed [`Secret`]s; the SES / SMTP
@@ -165,6 +169,8 @@ pub enum EmailProvider {
     SendGrid(Secret),
     Smtp(SmtpConfig),
 }
+
+crate::stringify::show_row!("EmailProvider", Internals, [] EmailProvider, |_| "<Ipe.Email.EmailProvider>".to_owned());
 
 fn email_gen_id() -> String {
     let nanos = SystemTime::now()

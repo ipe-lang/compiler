@@ -25,6 +25,8 @@ pub enum IpeCmd<M> {
     Publish(Box<dyn FnOnce(&str) -> i64 + Send>),
 }
 
+crate::stringify::show_row!("Cmd", Internals, [M] IpeCmd<M>, |_| "<Ipe.Cmd>".to_owned());
+
 /// The boxed message-producing thunk inside [`IpeCmd::Perform`]. Same
 /// cfg-split rationale as `IpeTask` (`core.rs`): wasm futures touch the DOM
 /// and are `!Send`; the native bound backs `tokio::spawn`.
@@ -83,6 +85,8 @@ pub enum IpeSub<M> {
     #[cfg(not(target_arch = "wasm32"))]
     OnLine(LineHandler<M>),
 }
+
+crate::stringify::show_row!("Sub", Internals, [M] IpeSub<M>, |_| "<Ipe.Sub>".to_owned());
 
 // ─── Cmd kernels ──────────────────────────────────────────────────────────
 
@@ -1219,6 +1223,9 @@ pub type MountBuilder = Box<
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WebApp(pub WebAppKind);
 
+#[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WebApp", Internals, [] WebApp, |_| "<Ipe.Web.App>".to_owned());
+
 /// The two run modes a `WebApp` leaf can carry.
 ///
 /// * `Standalone` — from `Web.tea`: a fully-built server task that binds its
@@ -1272,6 +1279,9 @@ impl WebApp {
 pub struct WebViewApp(pub IpeTask<crate::error::IpeError, ()>);
 
 #[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WebApp", Internals, [] WebViewApp, |_| "<Ipe.Web.App>".to_owned());
+
+#[cfg(not(target_arch = "wasm32"))]
 impl WebViewApp {
     /// Blocking entry on the CURRENT thread (required by tao/Cocoa on macOS).
     pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
@@ -1285,6 +1295,9 @@ impl WebViewApp {
 pub struct TuiApp(pub IpeTask<crate::error::IpeError, ()>);
 
 #[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("TuiApp", Internals, [] TuiApp, |_| "<Ipe.Tui.App>".to_owned());
+
+#[cfg(not(target_arch = "wasm32"))]
 impl TuiApp {
     /// Blocking entry: drives the underlying task to completion.
     pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
@@ -1296,6 +1309,9 @@ impl TuiApp {
 /// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct CliApp(pub IpeTask<crate::error::IpeError, ()>);
+
+#[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("CliApp", Internals, [] CliApp, |_| "<Ipe.Cli.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CliApp {
@@ -1498,6 +1514,9 @@ where
 /// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WorkerApp(pub IpeTask<crate::error::IpeError, ()>);
+
+#[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WorkerApp", Internals, [] WorkerApp, |_| "<Ipe.Worker.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
 impl WorkerApp {
