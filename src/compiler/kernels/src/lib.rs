@@ -3516,8 +3516,10 @@ pub enum StdlibKernel {
     /// text begins with exactly the given prefix.
     ///
     /// The prefix is literal: `%`, `_` and `\` in it match themselves, and
-    /// the match is case-sensitive on every engine. A `NULL` value never
-    /// matches. An empty prefix, one holding a NUL character, or one longer
+    /// the match is case-sensitive on every engine under a deterministic
+    /// collation; a Postgres column declared with a nondeterministic
+    /// collation (a case-insensitive ICU one) compares by that collation
+    /// instead. A `NULL` value never matches. An empty prefix, one holding a NUL character, or one longer
     /// than 16384 bytes is refused as a typed error before any SQL is sent.
     /// The predicate renders an escaped `LIKE ? ESCAPE '\'` beside an exact
     /// `substr` comparison, so an index can serve the scan on Postgres (and
