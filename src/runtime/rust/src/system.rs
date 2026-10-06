@@ -2854,15 +2854,21 @@ pub fn run_exit_hook() {
 /// stages Drop would have run happen here first: the registered exit hook
 /// (terminal restore), then, in a build with the telemetry exporters, a flush
 /// of their buffered batches bounded by the exporters' flush deadline.
+///
+/// A stage that panics is abandoned, never the exit: each stage runs under
+/// `catch_unwind`, so the process ends with `code` whatever a stage does (a
+/// tokio thread-start refusal inside the flush's `block_in_place`, a panicking
+/// hook). Without that, the panic would unwind out of this `-> !` call and the
+/// caller (a shutdown grace timer, a watchdog) would keep running.
 pub fn exit_process(code: i32) -> ! {
-    run_exit_hook();
+    let _ = std::panic::catch_unwind(run_exit_hook);
     #[cfg(all(
         feature = "server",
         feature = "http_client",
         feature = "web-core",
         not(target_arch = "wasm32")
     ))]
-    crate::web::flush_exporters_before_exit();
+    let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
     std::process::exit(code);
@@ -3682,6 +3688,75 @@ mod exit_hook_tests {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     fn bump() {
         CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The code the panicking-stage child asks to exit with.
+    const PANICKING_STAGE_EXIT_CODE: i32 = 7;
+
+    /// How long the parent waits for the panicking-stage child before it fails the test.
+    const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// An exit hook that panics, standing in for any panicking pre-exit stage.
+    fn panicking_exit_hook() {
+        panic!("a pre-exit stage panicked");
+    }
+
+    /// A panicking pre-exit stage cannot cancel the exit it precedes.
+    ///
+    /// Runs [`panicking_stage_child`] as a child process of this test binary,
+    /// so its process-wide hook and its exit stay out of this process. A panic
+    /// that unwinds out of `exit_process` fails the child's test, which ends the
+    /// child with the test harness's failure code instead of the one asked for.
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    #[test]
+    fn a_panicking_pre_exit_stage_still_ends_the_process() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::panicking_stage_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the panicking-stage child");
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the panicking-stage child") {
+                break Some(status);
+            }
+            if started.elapsed() > CHILD_LIMIT {
+                let _ = child.kill();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let out = child
+            .wait_with_output()
+            .expect("collect the child's output");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+        assert!(
+            status.is_some_and(|s| s.code() == Some(PANICKING_STAGE_EXIT_CODE)),
+            "a panicking pre-exit stage cancelled the exit ({status:?}):\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The child half of `a_panicking_pre_exit_stage_still_ends_the_process`.
+    ///
+    /// Ignored so it runs only as that test's child.
+    #[ignore = "run as a child process by a_panicking_pre_exit_stage_still_ends_the_process"]
+    #[test]
+    fn panicking_stage_child() {
+        register_exit_hook(panicking_exit_hook);
+        super::exit_process(PANICKING_STAGE_EXIT_CODE);
     }
 
     #[test]
