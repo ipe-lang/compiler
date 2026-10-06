@@ -98,8 +98,8 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     }
 
     // A help flag directly on a group (`ipe dev --help`): its subpage. A bare
-    // group is not a help request — `run_cli` refuses it with
-    // [`CliError::GroupRequired`].
+    // group is not a help request here — `run_cli` answers it per
+    // [`bare_group`].
     if let Some((first, rest)) = args.split_first()
         && help::is_group(first)
         && rest.first().is_some_and(|a| is_help_flag(a))
@@ -191,12 +191,15 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     }
     // An umbrella group (`ipe dev <verb> …`) resolves its member to a typed
     // `Verb`, and `dispatch` runs it with the umbrella's posture. A bare group
-    // refuses; a `release` followed by a non-member token (`release web`)
-    // refuses with the `release build` form carrying that tail; a `dev`
-    // followed by a non-member token is an unknown verb of the group.
+    // answers per [`bare_group`]; a `release` followed by a non-member token
+    // (`release web`) refuses with the `release build` form carrying that tail;
+    // a `dev` followed by a non-member token is an unknown verb of the group.
     if let Some(umbrella) = Umbrella::from_name(cmd) {
         let Some((sub, tail)) = rest.split_first() else {
-            return Err(group_required(cmd, bare_group_forms(umbrella), &[]));
+            return match bare_group(umbrella) {
+                BareGroup::Page => show_group_page(cmd),
+                BareGroup::Refuse(forms) => Err(group_required(cmd, forms, &[])),
+            };
         };
         return match (Verb::member(umbrella, sub), umbrella) {
             (Some(verb), _) => dispatch(verb, tail),
@@ -234,15 +237,37 @@ pub const GROUP_REQUIRED: &[(&str, &[Verb])] = &[
     ("eject", &[Verb::RELEASE_EJECT]),
 ];
 
-/// The forms a bare umbrella group's refusal names.
-///
-/// A bare `ipe dev` names none; its members stay discoverable through
-/// `ipe dev --help`.
-const fn bare_group_forms(umbrella: Umbrella) -> &'static [Verb] {
+/// How a bare umbrella group (`ipe dev`, no member verb) is answered.
+enum BareGroup {
+    /// The group's own help page, exit 0.
+    Page,
+    /// A [`CliError::GroupRequired`] refusal naming these grouped forms.
+    Refuse(&'static [Verb]),
+}
+
+/// The answer to a bare `ipe <umbrella>`.
+const fn bare_group(umbrella: Umbrella) -> BareGroup {
     match umbrella {
-        Umbrella::Dev => &[],
-        Umbrella::Release => &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+        Umbrella::Dev => BareGroup::Page,
+        Umbrella::Release => {
+            BareGroup::Refuse(&[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT])
+        }
     }
+}
+
+/// Print the help page of the group `name`, the page `ipe <name> --help` shows.
+///
+/// A name with no page refuses with an empty-forms [`CliError::GroupRequired`],
+/// so a group that lost its page fails closed rather than printing nothing and
+/// exiting 0.
+fn show_group_page(name: &str) -> Result<(), CliError> {
+    help::group(name, &std::io::stdout()).map_or_else(
+        || Err(group_required(name, &[], &[])),
+        |page| {
+            show_help_page(&page);
+            Ok(())
+        },
+    )
 }
 
 /// The [`CliError::GroupRequired`] refusal for `attempted` followed by `tail`.

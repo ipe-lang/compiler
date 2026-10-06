@@ -327,11 +327,13 @@ fn main() {
     // classify an escaping panic (div-by-zero / index-OOB /
     // overflow) into a Ipe error + exit 1, not a raw Rust backtrace.
     ipe_runtime::core::install_panic_classifier();
+    // Both outcomes end through the runtime's one exit funnel, which runs the
+    // exit hook and flushes buffered telemetry before the process ends.
     match block_on(ipe_main()) {
-        IpeResult::Ok(_) => (),
+        IpeResult::Ok(_) => ipe_runtime::system::exit_process(0),
         IpeResult::Err(e) => {
             ipe_runtime::core::eprint_task_error(&e.to_string());
-            std::process::exit(1);
+            ipe_runtime::system::exit_process(1)
         }
     }
 }

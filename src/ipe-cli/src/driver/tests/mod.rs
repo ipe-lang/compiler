@@ -5345,12 +5345,23 @@ fn release_build_capabilities_flag_is_unknown() {
     }
 }
 
-/// A bare `ipe dev` fails with no hint line; `ipe dev --help` is its page.
+/// A bare `ipe dev` prints the group page and succeeds.
+///
+/// A non-member token after it still refuses as an unknown verb of the group.
 #[test]
-fn bare_dev_refuses_nonzero() {
-    assert_group_required(&["dev"], "dev", &[], "");
+fn bare_dev_prints_usage_and_succeeds() {
+    let bare = run_argv(&["dev"]);
+    assert!(bare.is_ok(), "a bare `ipe dev` must succeed: {bare:?}");
     assert!(intercept_help(&["dev".to_owned()]).is_none());
     assert!(intercept_help(&["dev".to_owned(), "--help".to_owned()]).is_some());
+    let unknown = run_argv(&["dev", "nonesuch"]);
+    assert!(
+        matches!(
+            &unknown,
+            Err(CliError::UnknownGroupSub { group: "dev", attempted }) if attempted.as_str() == "nonesuch"
+        ),
+        "`ipe dev <unknown>` must still refuse: {unknown:?}"
+    );
 }
 
 /// A token after `ipe dev` that names no member is an unknown subcommand.

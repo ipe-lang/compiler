@@ -28,12 +28,17 @@ allow-expect-in-tests = true
 # blocking-pool work through `threads::offload_blocking`, the one site allowed to
 # call tokio's `spawn_blocking` (whose thread-start panic it catches). `tokio` is
 # an optional dependency, so its entries tolerate a build without it.
+#
+# The process ends only through `system::exit_process`, which runs the pre-exit
+# stages Drop would have run (terminal restore, telemetry exporter flush) before
+# its one `std::process::exit`.
 disallowed-methods = [
     # The abrupt-failure constructs the root `clippy.toml` bans, mirrored here
     # because this crate reads its own config.
     { path = "core::option::Option::unwrap_unchecked", reason = "UB on None; return a Result or model the invariant in a type" },
     { path = "core::result::Result::unwrap_unchecked", reason = "UB on Err; return a Result or model the invariant in a type" },
     { path = "std::process::abort", reason = "abrupt termination that skips Drop; return a Result" },
+    { path = "std::process::exit", reason = "skips the pre-exit stages (terminal restore, exporter flush); end the process through `system::exit_process`" },
     { path = "std::panic::panic_any", reason = "a panic; return a Result" },
     { path = "core::hint::unreachable_unchecked", reason = "UB; model the invariant in a type instead" },
     { path = "std::env::home_dir", reason = "an unvalidated home; read it through `system::home_dir`" },

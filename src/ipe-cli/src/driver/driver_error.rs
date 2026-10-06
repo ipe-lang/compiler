@@ -277,7 +277,7 @@ pub enum CliError {
     GroupRequired {
         /// What the user typed: the legacy verb or the bare group word.
         attempted: TerminalSafe,
-        /// The grouped forms the hint offers; empty for a bare `ipe dev`.
+        /// The grouped forms the hint offers; empty for a group with no page.
         forms: &'static [crate::verb::Verb],
         /// The arguments that followed `attempted`, carried onto each hinted
         /// form; empty when there were none.
