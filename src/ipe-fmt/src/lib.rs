@@ -2945,14 +2945,13 @@ impl PadBudget {
         if self.exceeded.get() {
             return false;
         }
-        if let Some(left) = self.left.get().checked_sub(bytes) {
-            self.left.set(left);
-            true
-        } else {
+        let Some(left) = self.left.get().checked_sub(bytes) else {
             self.left.set(0);
             self.exceeded.set(true);
-            false
-        }
+            return false;
+        };
+        self.left.set(left);
+        true
     }
 
     /// Whether some pad did not fit the budget.
