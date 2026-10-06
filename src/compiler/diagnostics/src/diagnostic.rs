@@ -29,9 +29,9 @@ use crate::code::{
     IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
     IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
     IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
-    IPE_P0070, IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011,
-    IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019,
-    IPE_T0020, IPE_T0021, Severity,
+    IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003,
+    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
+    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
 use crate::terminal::TerminalSafe;
@@ -1986,6 +1986,26 @@ pub enum ConsentError {
         /// The pre-formatted risk disclosure (which modules, what risk).
         body: String,
     },
+    /// A disclosed browser web axis the top-level app has not granted
+    /// (`IPE-S0002`).
+    WebAxisUngranted {
+        /// The pre-formatted disclosure: each axis, the modules that disclose it,
+        /// and the remedy.
+        body: String,
+    },
+    /// A native `Rust.` crossing the top-level app has not granted
+    /// (`IPE-S0003`).
+    NativeCrossingUngranted {
+        /// The pre-formatted disclosure: each crate crossed, the modules that
+        /// cross it, and the remedy.
+        body: String,
+    },
+    /// A derived control model the declared `acceptsControl` set does not cover
+    /// (`IPE-S0004`).
+    ControlModelUncovered {
+        /// The pre-formatted refusal: the entry module, the model, and the remedy.
+        body: String,
+    },
 }
 
 // ===========================================================================
@@ -2028,8 +2048,8 @@ pub enum Diagnostic {
     Sandbox {
         msg: SandboxError,
     },
-    /// The unsafe-escape-hatch consent gate refused (`IPE-S0001`). Span-free:
-    /// the refusal is at build/run invocation time, not at a source location.
+    /// A consent gate refused (`IPE-S0001` through `IPE-S0004`). Span-free: the
+    /// refusal is at build/run invocation time, not at a source location.
     Consent {
         msg: ConsentError,
     },
@@ -2255,7 +2275,7 @@ impl Diagnostic {
             Self::CompilerBug { where_, .. } => bug_code(where_),
             Self::Ffi { msg } => ffi_code(msg),
             Self::Sandbox { msg } => sandbox_code(msg),
-            Self::Consent { .. } => IPE_S0001,
+            Self::Consent { msg } => consent_code(msg),
             Self::RegistryUnreachable { .. } => IPE_E0001,
         }
     }
@@ -2425,6 +2445,9 @@ const _: () = assert!(
         && matches!(ffi_code_family().family(), Family::Ffi)
         && matches!(bug_code_family().family(), Family::Internal)
         && matches!(IPE_S0001.family(), Family::Security)
+        && matches!(IPE_S0002.family(), Family::Security)
+        && matches!(IPE_S0003.family(), Family::Security)
+        && matches!(IPE_S0004.family(), Family::Security)
         && matches!(IPE_E0001.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
@@ -3400,21 +3423,36 @@ fn sandbox_help(msg: &SandboxError) -> Vec<HelpLine> {
 }
 
 fn consent_help(msg: &ConsentError) -> Vec<HelpLine> {
-    let remedy = HelpLine::Note(
+    let unsafe_remedy = HelpLine::Note(
         "add `accept = [\"unsafe\"]` under [capabilities] in package.ipe to take \
          responsibility and proceed"
             .into(),
     );
     match msg {
         ConsentError::NonInteractive { .. } => vec![
-            remedy,
+            unsafe_remedy,
             HelpLine::Note(
                 "this is a non-interactive build; it will not prompt — \
                  pre-accept with the manifest token"
                     .into(),
             ),
         ],
-        ConsentError::InteractiveDenied { .. } => vec![remedy],
+        ConsentError::InteractiveDenied { .. } => vec![unsafe_remedy],
+        // The remedy for these refusals is part of the disclosed body: it names
+        // the manifest field and value to add.
+        ConsentError::WebAxisUngranted { .. }
+        | ConsentError::NativeCrossingUngranted { .. }
+        | ConsentError::ControlModelUncovered { .. } => Vec::new(),
+    }
+}
+
+/// The code each consent refusal carries.
+const fn consent_code(msg: &ConsentError) -> Code {
+    match msg {
+        ConsentError::NonInteractive { .. } | ConsentError::InteractiveDenied { .. } => IPE_S0001,
+        ConsentError::WebAxisUngranted { .. } => IPE_S0002,
+        ConsentError::NativeCrossingUngranted { .. } => IPE_S0003,
+        ConsentError::ControlModelUncovered { .. } => IPE_S0004,
     }
 }
 
@@ -3506,6 +3544,30 @@ mod code_family_tests {
             (
                 Diagnostic::Consent {
                     msg: ConsentError::NonInteractive {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::WebAxisUngranted {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::NativeCrossingUngranted {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::ControlModelUncovered {
                         body: "test".to_owned(),
                     },
                 },

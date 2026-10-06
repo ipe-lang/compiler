@@ -1100,16 +1100,12 @@ messages! {
     mobile_ios_note = "mobile-ios-note";
     /// One disclosure line under a consent refusal.
     consent_item(item) = "consent-item";
-    /// The headline of the ungranted web-capability refusal.
-    web_consent_header = "web-consent-header";
     /// An ungranted web axis and the modules that disclose it.
     web_consent_disclosure(wire, via) = "web-consent-disclosure";
     /// An ungranted web axis no scanned module could be attributed to.
     web_consent_disclosure_unattributed(wire) = "web-consent-disclosure-unattributed";
     /// The remedy closing the ungranted web-capability refusal.
     web_consent_remedy = "web-consent-remedy";
-    /// The headline of the ungranted native-crossing refusal.
-    native_ffi_consent_header = "native-ffi-consent-header";
     /// An ungranted native crossing and the modules that cross it.
     native_ffi_crossing(krate, via) = "native-ffi-crossing";
     /// An ungranted native crossing no scanned crate could be attributed to.

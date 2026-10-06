@@ -149,7 +149,7 @@ pub const FAMILIES: [FamilyRow; 8] = [
     FamilyRow {
         family: Family::Security,
         letter: 'S',
-        summary: "security consent — an effect or escape hatch that needs your explicit approval",
+        summary: "security consent — an effect, escape hatch, or control model that needs your explicit approval",
     },
     FamilyRow {
         family: Family::Environment,
@@ -315,6 +315,10 @@ code! {
     IPE_P0020 = "IPE-P0020", "malformed module header", "IPE-P0020";
     /// malformed exposing list
     IPE_P0021 = "IPE-P0021", "malformed exposing list", "IPE-P0021";
+    /// a mobile bundle wraps a `Web` app, and this app's shape is not `Web`
+    IPE_P0022 = "IPE-P0022", "a mobile bundle needs a Web app", "IPE-P0022";
+    /// a mobile bundle wraps the wasm client, and the project's `[wasm]` mode is off
+    IPE_P0023 = "IPE-P0023", "a mobile bundle needs the wasm client", "IPE-P0023";
     /// missing `=` in definition
     IPE_P0030 = "IPE-P0030", "missing '=' in definition", "IPE-P0030";
     /// malformed type declaration
@@ -728,6 +732,12 @@ code! {
     /// acknowledged (non-interactive release build without manifest
     /// pre-acceptance, or an interactive "no")
     IPE_S0001 = "IPE-S0001", "unsafe escape hatch imported without acknowledgment", "IPE-S0001";
+    /// a program reaches a browser web capability the app has not granted
+    IPE_S0002 = "IPE-S0002", "a web capability is reached without the app's grant", "IPE-S0002";
+    /// a program crosses into native `Rust.` code the app has not granted
+    IPE_S0003 = "IPE-S0003", "native Rust code is crossed without the app's grant", "IPE-S0003";
+    /// the program's control model is not covered by the declared `acceptsControl` set
+    IPE_S0004 = "IPE-S0004", "the control model is not covered by acceptsControl", "IPE-S0004";
 
     // -----------------------------------------------------------------------
     // Environment (IPE-E####)

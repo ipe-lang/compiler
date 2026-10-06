@@ -3854,7 +3854,7 @@ fn acknowledge_unsafe_imports(
 /// program that reaches no web capability is untouched.
 ///
 /// # Errors
-/// [`CliError::Usage`] (`IPE-S0002`) when a disclosed web axis is ungranted;
+/// [`CliError::Pipeline`] (`IPE-S0002`) when a disclosed web axis is ungranted;
 /// the source-read errors of the provenance scan.
 fn gate_web_consent(
     resolved: &run_sandbox::ResolvedCapabilities,
@@ -3905,7 +3905,7 @@ fn gate_web_consent(
 /// half — the crossing must be granted before the (costly) emit + cargo build.
 ///
 /// # Errors
-/// [`CliError::Usage`] (`IPE-S0003`) when the disclosed native crossing is
+/// [`CliError::Pipeline`] (`IPE-S0003`) when the disclosed native crossing is
 /// ungranted; the source-read errors of the provenance scan.
 fn gate_native_ffi_consent(
     resolved: &run_sandbox::ResolvedCapabilities,
