@@ -145,6 +145,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "an_in_scratch_write_succeeds_under_the_run_jail",
+        JAIL_ABSENT,
+    ),
+    (
         "src/compiler/sandbox/tests/run_jail_windows_e2e.rs",
         "a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under_control",
         CONTROL_INCONCLUSIVE,
