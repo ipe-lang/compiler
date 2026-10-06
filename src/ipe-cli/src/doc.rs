@@ -3111,8 +3111,9 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
 /// Run the compiled example at `snippet_path` and assert its output matches the
 /// `-->` annotated results (one per line, in order).
 ///
-/// Spawns the current binary as `ipe dev run <snippet_path>` and compares stdout
-/// against the expected output. Returns `Err(description)` on a mismatch or
+/// Runs the current binary as `ipe dev run <snippet_path>`, held to
+/// [`crate::remote_ingest::SELF_RUN_LIMITS`], and compares stdout against the
+/// expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
     snippet_path: &Path,
@@ -3144,12 +3145,15 @@ fn run_example_and_check(
         // ordinary local run keeps the plain `ipe-app` default.
         cmd.env("IPE_EMIT_PACKAGE_NAME", format!("ipe-doc-example-{label}"));
     }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("{label}: ipe dev run failed to spawn: {e}"))?;
+    let out = crate::remote_ingest::run_local(
+        cmd,
+        crate::remote_ingest::SELF_RUN_LIMITS,
+        crate::remote_ingest::LocalSource::SelfRun,
+    )
+    .map_err(|e| format!("{label}: ipe dev run failed: {e}"))?;
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = out.stderr.to_terminal();
         return Err(format!(
             "{label}: ipe dev run exited non-zero\n       {stderr}"
         ));
@@ -5051,8 +5055,11 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
     // A headless caller (CI, a test, a remote shell) opts out of the browser pop
     // with `IPE_DOC_NO_OPEN`; the URL is already printed, so the preview stays
     // reachable.
-    if ipe_env::var_os("IPE_DOC_NO_OPEN").is_none() {
-        open_in_browser(&url);
+    if ipe_env::var_os("IPE_DOC_NO_OPEN").is_none()
+        && let Ok(url) =
+            crate::browser::BrowserUrl::parse(&url, crate::browser::BrowserOrigin::Loopback)
+    {
+        let _ = crate::browser::open_url(&url);
     }
 
     // A single dropped connection must not take the server down; `flatten` skips
@@ -5157,19 +5164,6 @@ fn http_response(status: &str, content_type: &str, body: &str) -> String {
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-}
-
-/// Best-effort open of `url` in the default browser. A failure is silent — the
-/// URL is already printed, so the preview is reachable regardless.
-fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener).arg(url).spawn();
 }
 
 #[cfg(test)]

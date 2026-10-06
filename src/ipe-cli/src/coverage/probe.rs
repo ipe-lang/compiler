@@ -21,6 +21,7 @@ use std::path::Path;
 use ipe_env::artifact::{ProvenBin, ResolveError, Source, resolve_bin_from};
 
 use crate::coverage::contract::StdlibSymbol;
+use crate::remote_ingest::{LocalCeiling, LocalSource, RunError, SELF_RUN_LIMITS, run_local};
 
 /// The browser web axis a symbol's module discloses, when it lives under a
 /// reserved `Ipe.Browser.<Api>` module — the structural property that makes a
@@ -423,6 +424,11 @@ fn unique_package_name(seq: u64) -> String {
 /// than a `--out` flag, so the invocation surface stays exactly the plain
 /// `ipe dev run <snippet>` — the entry is passed absolute, and `out/rust` resolves
 /// under the per-probe working directory.
+///
+/// The self-run is held to [`SELF_RUN_LIMITS`] through
+/// [`run_local`]: its stdout to 1 MiB and its run, cargo build included, to
+/// [`crate::remote_ingest::MAX_LOCAL_WALL_SECS`], its process group killed at
+/// either ceiling.
 #[must_use]
 pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
     use std::process::Command;
@@ -485,23 +491,33 @@ pub fn build_and_run(source: &str, snippet: &Path) -> StageOutcome {
         cmd.env("CARGO_TARGET_DIR", target);
     }
 
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            return StageOutcome::Failed {
-                code: None,
-                message: format!("ipe dev run failed to spawn: {e}"),
-            };
-        }
+    self_run_outcome(cmd, SELF_RUN_LIMITS)
+}
+
+/// Run the self-run `cmd` under `ceiling` and judge it.
+///
+/// A zero exit is [`StageOutcome::Ok`]. A non-zero exit, a crossed ceiling
+/// (the child's process group is killed), a failed spawn and a pipe that could
+/// not be read whole are each a [`StageOutcome::Failed`] naming why.
+fn self_run_outcome(cmd: std::process::Command, ceiling: LocalCeiling) -> StageOutcome {
+    let message = match run_local(cmd, ceiling, LocalSource::SelfRun) {
+        Ok(captured) if captured.status.success() => return StageOutcome::Ok,
+        Ok(captured) => format!(
+            "ipe dev run exited non-zero: {}",
+            captured.stderr.to_terminal()
+        ),
+        Err(RunError::Spawn(e)) => format!("ipe dev run failed to spawn: {e}"),
+        Err(RunError::Wait(e)) => format!("ipe dev run could not be waited on: {e}"),
+        Err(
+            refused @ (RunError::Measure(..)
+            | RunError::Exceeded(_)
+            | RunError::PipeDrainTimeout(_)
+            | RunError::PipeRead(..)),
+        ) => refused.to_string(),
     };
-    if output.status.success() {
-        StageOutcome::Ok
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        StageOutcome::Failed {
-            code: None,
-            message: format!("ipe dev run exited non-zero: {stderr}"),
-        }
+    StageOutcome::Failed {
+        code: None,
+        message,
     }
 }
 
@@ -576,5 +592,91 @@ mod tests {
             code: None,
             message: String::new(),
         }));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod self_run_tests {
+    use super::{StageOutcome, self_run_outcome};
+    use crate::remote_ingest::{LocalCeiling, LocalSource, LocalWall, SELF_RUN_LIMITS};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A `sh -c script` child.
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    /// The outcome of running `script` as a self-run under `ceiling`.
+    fn outcome(script: &str, ceiling: LocalCeiling) -> StageOutcome {
+        self_run_outcome(sh(script), ceiling)
+    }
+
+    /// Whether `outcome` is a failure naming the self-run's crossed ceiling.
+    fn refused_at_its_ceiling(outcome: &StageOutcome) -> bool {
+        let source = LocalSource::SelfRun.to_string();
+        matches!(outcome, StageOutcome::Failed { code: None, message } if message.contains(&source))
+    }
+
+    #[test]
+    fn a_self_run_one_byte_past_its_stdout_ceiling_is_refused() {
+        let past = outcome("head -c 1048577 /dev/zero; exit 0", SELF_RUN_LIMITS);
+        assert!(
+            refused_at_its_ceiling(&past),
+            "a self-run past its stdout ceiling is refused, got {past:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_run_of_exactly_its_stdout_ceiling_runs() {
+        let exact = outcome(
+            "head -c 1048576 /dev/zero; sleep 1; exit 0",
+            SELF_RUN_LIMITS,
+        );
+        assert!(
+            matches!(exact, StageOutcome::Ok),
+            "a self-run of exactly its stdout ceiling is kept, got {exact:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_run_past_its_wall_is_refused_at_the_wall() {
+        let started = Instant::now();
+        let late = outcome(
+            "sleep 30; exit 0",
+            SELF_RUN_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            refused_at_its_ceiling(&late),
+            "a self-run past its wall is refused, got {late:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the refusal lands at the wall, not at the child's exit"
+        );
+    }
+
+    #[test]
+    fn a_self_run_within_its_wall_runs() {
+        let in_time = outcome("sleep 2; exit 0", SELF_RUN_LIMITS);
+        assert!(
+            matches!(in_time, StageOutcome::Ok),
+            "the same sleep under the self-run wall finishes, got {in_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_run_exiting_non_zero_fails_with_its_stderr() {
+        let failed = outcome("echo boom >&2; exit 3", SELF_RUN_LIMITS);
+        assert!(
+            matches!(&failed, StageOutcome::Failed { code: None, message } if message.contains("boom")),
+            "a non-zero self-run fails with its stderr, got {failed:?}"
+        );
+        assert!(
+            !refused_at_its_ceiling(&failed),
+            "a non-zero exit is not reported as a crossed ceiling"
+        );
     }
 }
