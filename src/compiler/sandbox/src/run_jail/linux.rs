@@ -116,7 +116,9 @@ fn app_ro_binds(app: &CanonicalPath) -> Vec<CanonicalPath> {
 ///
 /// Any [`RunJailDefect`]; [`RunJailDefect::Path`] when `scoped_tmp`,
 /// `working_tree`, or `app` does not resolve, the invoker's homes are unknown,
-/// or a path would expose the cargo home. On success (Linux) it does not return.
+/// a path would expose the cargo home, or a granted working tree's
+/// version-control metadata cannot be kept read-only or its configuration names
+/// code inside a writable grant. On success (Linux) it does not return.
 pub fn exec_in_run_jail(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -164,7 +166,8 @@ pub fn exec_in_run_jail(
         Some(seccomp_fd),
         &host_env,
         &payload,
-    );
+    )
+    .map_err(RunJailDefect::Path)?;
 
     Err(exec_jail_argv(&argv))
 }
@@ -185,9 +188,9 @@ pub fn exec_in_run_jail(
 /// # Errors
 ///
 /// Any [`RunJailDefect`]; [`RunJailDefect::Path`] when `scoped_tmp` or
-/// `working_tree` does not resolve, the invoker's homes are unknown, or a path
-/// would expose the cargo home. On
-/// success (Linux) it does not return.
+/// `working_tree` does not resolve, the invoker's homes are unknown, a path
+/// would expose the cargo home, or a granted working tree is refused as in
+/// [`exec_in_run_jail`]. On success (Linux) it does not return.
 pub fn exec_embedded_in_run_jail(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -234,7 +237,8 @@ pub fn exec_embedded_in_run_jail(
         app_fd,
         &host_env,
         app_args,
-    );
+    )
+    .map_err(RunJailDefect::Path)?;
 
     Err(exec_jail_argv(&argv))
 }
@@ -372,7 +376,8 @@ fn write_frozen_memfd(
 ///     Some(sealed.make_inheritable().ok()?),
 ///     &no_env,
 ///     &[OsString::from("app")],
-/// );
+/// )
+/// .ok()?;
 /// drop(sealed);
 /// Some(argv.args().len())
 /// # }

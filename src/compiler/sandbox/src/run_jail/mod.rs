@@ -251,7 +251,11 @@ pub struct RunJailTools {
 /// The env is scrubbed with `--clearenv`; only the fixed minimal allowlist
 /// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter. There
 /// is NO shell token anywhere in the result.
-#[must_use]
+///
+/// # Errors
+/// Any error of [`crate::WritableTree::parse`] when the profile grants the
+/// working tree: its version-control metadata cannot be carved, or the
+/// configuration that metadata holds names code inside a writable grant.
 pub fn run_jail_argv<'fd>(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -259,7 +263,7 @@ pub fn run_jail_argv<'fd>(
     seccomp_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
-) -> JailArgv<'fd> {
+) -> Result<JailArgv<'fd>, JailPathError> {
     jail_argv(tools, profile, mounts, seccomp_fd, None, host_env, payload)
 }
 
@@ -293,7 +297,9 @@ pub fn delivered_app_path(mounts: &JailMounts) -> PathBuf {
 /// reads the bytes from the inherited (sealed, non-cloexec) descriptor, so
 /// the delivered file is exactly the bytes the caller verified, with no host
 /// path lookup to race and no copy left on the host when the jail exits.
-#[must_use]
+///
+/// # Errors
+/// As [`run_jail_argv`].
 pub fn run_jail_argv_with_delivery<'fd>(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -302,7 +308,7 @@ pub fn run_jail_argv_with_delivery<'fd>(
     app_fd: SealedFdNumber<'fd>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     app_args: &[OsString],
-) -> JailArgv<'fd> {
+) -> Result<JailArgv<'fd>, JailPathError> {
     let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len().saturating_add(1));
     payload.push(delivered_app_path(mounts).into_os_string());
     payload.extend(app_args.iter().cloned());
@@ -327,8 +333,9 @@ fn jail_argv<'fd>(
     app_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
-) -> JailArgv<'fd> {
-    let (scoped_tmp, working_tree) = (mounts.scoped_tmp(), mounts.working_tree());
+) -> Result<JailArgv<'fd>, JailPathError> {
+    let tree = crate::mounts::TreeBind::granted_by(&profile.filesystem, mounts)?;
+    let scoped_tmp = mounts.scoped_tmp();
     let mut argv: Vec<OsString> = Vec::new();
 
     // Optional wall clock (only when the profile sets one AND `timeout` is
@@ -381,18 +388,10 @@ fn jail_argv<'fd>(
     // emitted app binary commonly lives under `$HOME` (e.g. a
     // `CARGO_TARGET_DIR` in `~/.cache`); the caller binds the app FILE itself,
     // never its parent directory.
-    let working = crate::mounts::WorkingTree::granted_by(&profile.filesystem);
-    let binds = crate::mounts::jail_binds(mounts, working);
-    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds);
+    let binds = crate::mounts::jail_binds(mounts, &tree);
+    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds)?;
     argv.push("--chdir".into());
-    argv.push(
-        match working {
-            crate::mounts::WorkingTree::ReadWrite => working_tree,
-            crate::mounts::WorkingTree::Unbound => scoped_tmp,
-        }
-        .as_path()
-        .into(),
-    );
+    argv.push(tree.chdir(mounts).as_path().into());
 
     // The seccomp filter (subprocess denial + baseline denials). Attached via a
     // pre-arranged fd. `no_new_privs` is set by bubblewrap by default (it always
@@ -455,10 +454,10 @@ fn jail_argv<'fd>(
     argv.push("--".into());
     argv.extend(payload.iter().cloned());
     // `'fd` is the borrow of every number rendered above.
-    JailArgv {
+    Ok(JailArgv {
         argv,
         fds: std::marker::PhantomData,
-    }
+    })
 }
 
 // ── refusal + the fail-closed platform decision ─────────────────────────────
@@ -1197,6 +1196,7 @@ mod tests {
             &no_env,
             &[OsString::from("/work/tree/target/debug/ipe-app")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1234,6 +1234,7 @@ mod tests {
             &no_env,
             &[OsString::from("app")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1299,6 +1300,7 @@ mod tests {
                 &no_env,
                 &[OsString::from("app")],
             )
+            .expect("the argv builds")
             .args()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1400,6 +1402,7 @@ mod tests {
             &no_env,
             &[OsString::from("--port"), OsString::from("8080")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1485,16 +1488,41 @@ mod tests {
 
     #[test]
     fn filesystem_granted_binds_the_working_tree_read_write() {
+        let base_dir = crate::test_dir::TestDir::new("run-jail-rw").expect("test dir");
+        let tree = base_dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("fixture dir");
+        let tree = CanonicalPath::resolve(&tree).expect("fixture path");
         let p = SandboxProfile {
             filesystem: FilesystemScope::WorkingTreeReadWrite,
             ..SandboxProfile::maximally_isolated()
         };
-        let joined = rendered(&p, None).join(" ");
+        let mounts = mounts_of(
+            CanonicalPath::assumed("/work/tmp-1"),
+            tree.clone(),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let no_env = |_: &str| None;
+        let joined = run_jail_argv(
+            &tools(),
+            &p,
+            &mounts,
+            None,
+            &no_env,
+            &[OsString::from("app")],
+        )
+        .expect("the argv builds")
+        .args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let at = tree.as_path().display();
         assert!(
-            joined.contains("--bind /work/tree /work/tree"),
+            joined.contains(&format!("--bind {at} {at}")),
             "working tree not bound rw: {joined}"
         );
-        assert!(joined.contains("--chdir /work/tree"), "{joined}");
+        assert!(joined.contains(&format!("--chdir {at}")), "{joined}");
     }
 
     #[test]
@@ -1511,17 +1539,10 @@ mod tests {
         }
         let canonical = |path: &Path| CanonicalPath::resolve(path).expect("fixture path");
         let no_env = |_: &str| None;
-        for (filesystem, working) in [
-            (
-                FilesystemScope::Isolated,
-                crate::mounts::WorkingTree::Unbound,
-            ),
-            (
-                FilesystemScope::WorkingTreeReadWrite,
-                crate::mounts::WorkingTree::ReadWrite,
-            ),
+        for filesystem in [
+            FilesystemScope::Isolated,
+            FilesystemScope::WorkingTreeReadWrite,
         ] {
-            assert_eq!(crate::mounts::WorkingTree::granted_by(&filesystem), working);
             let profile = SandboxProfile {
                 filesystem,
                 ..SandboxProfile::maximally_isolated()
@@ -1532,6 +1553,12 @@ mod tests {
                 vec![canonical(&bin)],
                 HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
             );
+            let bind = crate::mounts::TreeBind::granted_by(&profile.filesystem, &mounts)
+                .expect("a tree without metadata parses");
+            assert_eq!(
+                matches!(bind, crate::mounts::TreeBind::ReadWrite(_)),
+                profile.filesystem == FilesystemScope::WorkingTreeReadWrite
+            );
             let argv: Vec<OsString> = run_jail_argv(
                 &tools(),
                 &profile,
@@ -1540,6 +1567,7 @@ mod tests {
                 &no_env,
                 &[OsString::from("app")],
             )
+            .expect("the argv builds")
             .args()
             .to_vec();
             let mut expected: Vec<OsString> =
@@ -1550,17 +1578,11 @@ mod tests {
             crate::mounts::push_mounts(
                 &mut expected,
                 mounts.homes(),
-                &crate::mounts::jail_binds(&mounts, working),
-            );
+                &crate::mounts::jail_binds(&mounts, &bind),
+            )
+            .expect("the plan builds");
             expected.push("--chdir".into());
-            expected.push(
-                match working {
-                    crate::mounts::WorkingTree::ReadWrite => mounts.working_tree(),
-                    crate::mounts::WorkingTree::Unbound => mounts.scoped_tmp(),
-                }
-                .as_path()
-                .into(),
-            );
+            expected.push(bind.chdir(&mounts).as_path().into());
             let start = argv
                 .windows(3)
                 .position(|w| w == ["--ro-bind", "/", "/"])
@@ -1593,7 +1615,8 @@ mod tests {
             None,
             &host,
             &[OsString::from("app")],
-        );
+        )
+        .expect("the argv builds");
         let joined: Vec<String> = argv
             .args()
             .iter()
@@ -2081,6 +2104,7 @@ mod tests {
                 &no_env,
                 &[OsString::from("app")],
             )
+            .expect("the argv builds")
             .args()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -2106,5 +2130,245 @@ mod tests {
             !isolated.contains(&git),
             "an ungranted tree renders no carve: {isolated:?}"
         );
+    }
+
+    /// A tree and scratch under one test dir, with the jail mounts over them.
+    struct TreeFixture {
+        _base: crate::test_dir::TestDir,
+        tree: CanonicalPath,
+        mounts: JailMounts,
+    }
+
+    fn tree_fixture(label: &str) -> TreeFixture {
+        let base = crate::test_dir::TestDir::new(label).expect("test dir");
+        let tree = base.path().join("tree");
+        let tmp = base.path().join("tmp");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::create_dir_all(&tmp).expect("scratch");
+        let tree = CanonicalPath::resolve(&tree).expect("resolve tree");
+        let mounts = mounts_of(
+            CanonicalPath::resolve(&tmp).expect("resolve scratch"),
+            tree.clone(),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        TreeFixture {
+            _base: base,
+            tree,
+            mounts,
+        }
+    }
+
+    /// The run-jail argv for `filesystem` over `mounts`, or why it refused.
+    fn tree_argv(
+        mounts: &JailMounts,
+        filesystem: FilesystemScope,
+    ) -> Result<Vec<String>, crate::JailPathError> {
+        let profile = SandboxProfile {
+            filesystem,
+            ..SandboxProfile::maximally_isolated()
+        };
+        let no_env = |_: &str| None;
+        run_jail_argv(
+            &tools(),
+            &profile,
+            mounts,
+            None,
+            &no_env,
+            &[OsString::from("app")],
+        )
+        .map(|argv| {
+            argv.args()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        })
+    }
+
+    fn write_git_config(tree: &CanonicalPath, text: &str) {
+        let git = tree.as_path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).expect("git dir");
+        std::fs::write(git.join("config"), text).expect("git config");
+    }
+
+    #[test]
+    fn a_hooks_path_into_the_tree_refuses_the_jail() {
+        let fixture = tree_fixture("run-jail-hookspath");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let husky = fixture.tree.as_path().join(".husky");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "a hooks path into the writable tree refuses: {granted:?}"
+        );
+        assert!(
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).is_ok(),
+            "an ungranted tree is never scanned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_symlink_into_the_tree_refuses_the_jail() {
+        let fixture = tree_fixture("run-jail-hooklink");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let target = fixture.tree.as_path().join("evil.sh");
+        std::fs::write(&target, "#!/bin/sh\n").expect("hook target");
+        let hook = fixture
+            .tree
+            .as_path()
+            .join(".git")
+            .join("hooks")
+            .join("pre-commit");
+        std::os::unix::fs::symlink(&target, &hook).expect("hook link");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::LinkNamesWritable {
+                    kind: crate::VcsKind::Git,
+                    link,
+                    named: crate::Named::InGrant(named),
+                })) if *link == hook && *named == target
+            ),
+            "a hook linking into the writable tree refuses: {granted:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unbound_tree_is_never_parsed() {
+        let fixture = tree_fixture("run-jail-unbound");
+        let entry = fixture.tree.as_path().join(".git");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &entry,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let isolated = tree_argv(&fixture.mounts, FilesystemScope::Isolated);
+        assert!(isolated.is_ok(), "an ungranted tree builds: {isolated:?}");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsEntryUnexpectedKind {
+                    kind: crate::VcsKind::Git,
+                    path,
+                }) if *path == entry
+            ),
+            "a granted tree is parsed: {granted:?}"
+        );
+    }
+
+    /// Whether `argv` binds `tree` read-write over itself.
+    fn binds_tree(argv: &[String], tree: &CanonicalPath) -> bool {
+        let tree = tree.as_path().to_string_lossy();
+        argv.windows(3).any(
+            |w| matches!(w, [flag, from, to] if flag == "--bind" && *from == tree && *to == tree),
+        )
+    }
+
+    #[test]
+    fn one_mount_set_serves_both_scopes() {
+        let fixture = tree_fixture("run-jail-both-scopes");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let isolated =
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).expect("isolated argv");
+        assert!(
+            !binds_tree(&isolated, &fixture.tree),
+            "an isolated profile binds no tree: {isolated:?}"
+        );
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite)
+            .expect("granted argv");
+        assert!(
+            binds_tree(&granted, &fixture.tree),
+            "a granted profile binds the tree: {granted:?}"
+        );
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the same mounts scan the granted tree: {refused:?}"
+        );
+        assert!(
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).is_ok(),
+            "the same mounts still serve an isolated profile"
+        );
+    }
+
+    #[test]
+    fn the_jail_rescans_config_at_every_build() {
+        let fixture = tree_fixture("run-jail-rescan");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let first = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(first.is_ok(), "a clean config builds: {first:?}");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let second = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &second,
+                Err(crate::JailPathError::VcsConfig(
+                    crate::ConfigRefusal::NamesWritableCode { .. }
+                ))
+            ),
+            "the same mounts rescan an edited config: {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_edited_after_the_mount_recheck_refuses_at_argv_time() {
+        let fixture = tree_fixture("run-jail-recheck-then-argv");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let first = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(first.is_ok(), "a clean config builds: {first:?}");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        assert_eq!(
+            fixture.mounts.recheck(),
+            Ok(()),
+            "the mount recheck proves paths, never the tree's configuration"
+        );
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the argv builder parses the tree after the mounts were rechecked: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn vcs_config_refusal_display_is_escaped() {
+        let path = std::path::PathBuf::from("/tree/a\nb");
+        let refusal = crate::ConfigRefusal::ConfigInGrant {
+            kind: crate::VcsKind::Git,
+            path: path.clone(),
+            named: crate::Named::InGrant(path),
+        };
+        let shown = crate::JailPathError::VcsConfig(refusal.clone()).to_string();
+        assert_eq!(shown, refusal.to_string());
+        assert!(!shown.contains("a\nb"), "{shown}");
     }
 }
