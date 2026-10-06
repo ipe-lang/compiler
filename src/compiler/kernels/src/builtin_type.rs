@@ -626,9 +626,135 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, KernelHome,
-        every_tag_names_one_row,
+        BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinTag, BuiltinType, KernelHome, SealClass,
+        bare, every_tag_names_one_row, heads_strictly_ascending, homed, roles_partition,
     };
+
+    #[test]
+    fn heads_out_of_order_or_doubled_are_refused() {
+        assert!(heads_strictly_ascending(BUILTIN_TYPES));
+        let int = bare("Int", BuiltinRole::Reserved, SealClass::Plain);
+        let bool_row = bare("Bool", BuiltinRole::Reserved, SealClass::Plain);
+        let ui_color = homed(
+            "Ipe.Ui",
+            "Color",
+            BuiltinRole::LoweredBelowGuard,
+            SealClass::Opaque,
+        );
+        let color = bare("Color", BuiltinRole::LoweredBelowGuard, SealClass::View);
+        let ws = bare(
+            "WebSocketServer",
+            BuiltinRole::LoweredBelowGuard,
+            SealClass::Opaque,
+        );
+        let ws_cfg = bare(
+            "WebSocketServerCfg",
+            BuiltinRole::LoweredBelowGuard,
+            SealClass::Opaque,
+        );
+        assert!(
+            heads_strictly_ascending(&[color, ui_color]),
+            "one name at two homes is two heads"
+        );
+        assert!(heads_strictly_ascending(&[ws, ws_cfg]));
+        for (rows, why) in [
+            ([int, int], "a head on two rows"),
+            ([int, bool_row], "two names out of byte order"),
+            ([ui_color, color], "a module home before the empty home"),
+            ([ws_cfg, ws], "a name before its own prefix"),
+        ] {
+            assert!(!heads_strictly_ascending(&rows), "{why} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_role_disagreeing_with_its_columns_is_refused() {
+        assert!(roles_partition(BUILTIN_TYPES));
+        assert!(
+            roles_partition(&[bare(
+                "Color",
+                BuiltinRole::LoweredBelowGuard,
+                SealClass::View
+            )]),
+            "a view below the guard stays user-declarable"
+        );
+        for (row, why) in [
+            (
+                bare(
+                    "Secret",
+                    BuiltinRole::LoweredBelowGuard,
+                    SealClass::SecretOrSink,
+                ),
+                "a secret seal left user-declarable",
+            ),
+            (
+                bare(
+                    "Topic",
+                    BuiltinRole::KernelImplicit,
+                    SealClass::SealedHandle,
+                ),
+                "a sealed handle left user-declarable",
+            ),
+            (
+                bare("Setting", BuiltinRole::LoweredBelowGuard, SealClass::Opaque).arity(1),
+                "an arity-gated head left user-declarable",
+            ),
+            (
+                homed(
+                    "Ipe.Secret",
+                    "Secret",
+                    BuiltinRole::Reserved,
+                    SealClass::SecretOrSink,
+                ),
+                "a reservation away from the empty home",
+            ),
+            (
+                bare("List", BuiltinRole::Reserved, SealClass::ValueContainer),
+                "a value container with no arity",
+            ),
+            (
+                homed(
+                    "Ipe.Db.Store",
+                    "Order",
+                    BuiltinRole::LoweredBelowGuard,
+                    SealClass::Opaque,
+                )
+                .via(&["Basics"]),
+                "a qualifier spelling on a module-home row",
+            ),
+        ] {
+            assert!(!roles_partition(&[row]), "{why} must be refused");
+        }
+    }
+
+    /// The opaque heads whose lowerer arm sits above the `enum_variants`
+    /// guard: a user declaration of one would be silently mis-lowered.
+    #[test]
+    fn above_guard_handles_are_reserved() {
+        for name in [
+            "SqlFragment",
+            "Secret",
+            "Algorithm",
+            "Path",
+            "Regex",
+            "Url",
+            "Dsn",
+            "Key",
+            "Mac",
+            "EmailAddress",
+            "Locale",
+            "Connection",
+            "ReadOnly",
+            "ReadWrite",
+            "Topic",
+            "StreamId",
+            "ChunkEvent",
+            "HttpMethod",
+        ] {
+            let role = BuiltinType::of_bare_name(name).map(|t| t.row().role());
+            assert_eq!(role, Some(BuiltinRole::Reserved), "`{name}`");
+        }
+    }
 
     #[test]
     fn every_builtin_tag_has_one_row() {
