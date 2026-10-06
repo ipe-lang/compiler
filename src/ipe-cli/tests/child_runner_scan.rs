@@ -1986,7 +1986,7 @@ fn a_test_only_file_is_scanned_as_test_code() {
 
 #[test]
 fn an_unreached_file_is_refused() {
-    let reached: BTreeMap<String, bool> = [("lib.rs".to_owned(), true)].into_iter().collect();
+    let reached: BTreeMap<String, bool> = std::iter::once(("lib.rs".to_owned(), true)).collect();
     let hidden = ["lib.rs".to_owned(), "hidden.rs".to_owned()];
     assert!(!unreached(&reached, &hidden).is_empty());
     assert!(unreached(&reached, &["lib.rs".to_owned()]).is_empty());
