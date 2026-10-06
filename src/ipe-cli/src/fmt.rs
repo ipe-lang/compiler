@@ -70,9 +70,10 @@ use crate::CliError;
 /// # Errors
 /// [`CliError::Usage`] on flag misuse; [`CliError::Io`] on a filesystem
 /// failure; [`CliError::Pipeline`] when a file cannot be parsed or the
-/// formatter's round-trip guard trips; [`CliError::Usage`] when a file's
-/// formatted output would pass its cap. Under `--check`, an unformatted file is
-/// reported as a non-zero exit via [`CliError::Usage`] carrying the list.
+/// formatter's round-trip guard trips; [`CliError::FmtOutputTooLarge`] when a
+/// file's formatted output would pass its cap. Under `--check`, an unformatted
+/// file is reported as a non-zero exit via [`CliError::Usage`] carrying the
+/// list.
 pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
     // `--help` / `-h` is a request for output, not an error — honour it before
     // the typed parse (which treats every dashed token as a flag to validate).
@@ -276,9 +277,10 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
                 detail,
             }),
         },
-        FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::Usage(
-            crate::text::msg::fmt_output_too_large(&file.display(), &cap),
-        ),
+        FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::FmtOutputTooLarge {
+            file: file.to_path_buf(),
+            cap,
+        },
     }
 }
 

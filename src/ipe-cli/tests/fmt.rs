@@ -10,7 +10,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use ipe::CliError;
+use ipe::cli_args::OutputFormat;
 use ipe::fmt::{self, format_source};
+use ipe::machine_output::machine_error;
 
 /// A curated fixture set covering records, lists, tuples, `case`, `let`, `if`,
 /// and comments. Each must be a fixed point of `format_source` after one pass.
@@ -407,7 +410,22 @@ fn fmt_output_too_large_screen() {
         .err()
         .map(ToString::to_string)
         .unwrap_or_default();
-    assert!(res.is_err(), "fmt wrote output past its cap");
+    assert!(
+        matches!(&res, Err(CliError::FmtOutputTooLarge { file: f, cap: c }) if f.ends_with("M.ipe") && *c == cap),
+        "fmt must refuse with the typed output-cap error: {res:?}"
+    );
+    let kind = res.as_ref().err().map(CliError::machine_kind);
+    assert_eq!(kind, Some("fmt-output-too-large"));
+    let json = machine_error(OutputFormat::Json, "fmt", kind.unwrap(), &screen);
+    assert!(
+        json.contains("\"kind\":\"fmt-output-too-large\""),
+        "the JSON refusal carries its kind: {json}"
+    );
+    let plain = machine_error(OutputFormat::Plain, "fmt", kind.unwrap(), &screen);
+    assert!(
+        plain.contains("Split it"),
+        "the plain refusal carries the message: {plain}"
+    );
     assert!(
         screen.contains(&file.display().to_string()),
         "the refusal names the file: {screen}"
@@ -424,5 +442,36 @@ fn fmt_output_too_large_screen() {
         fs::read_to_string(&file).unwrap(),
         src,
         "a refused file must not be rewritten"
+    );
+}
+
+/// The output-cap refusal sanitizes the file path it renders.
+///
+/// A control byte in a directory name never reaches the screen. Unix only: Windows refuses a control byte in a file name.
+#[cfg(unix)]
+#[test]
+fn fmt_output_too_large_screen_sanitizes_the_path() {
+    let src = nested_long_list(10_000);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_output_cap_\u{1b}[31m");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, &src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    assert!(
+        matches!(&res, Err(CliError::FmtOutputTooLarge { .. })),
+        "{res:?}"
+    );
+    let screen = res
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        !screen.contains('\u{1b}'),
+        "a raw ESC reached the screen: {screen:?}"
+    );
+    assert!(
+        screen.contains("M.ipe"),
+        "the refusal names the file: {screen}"
     );
 }

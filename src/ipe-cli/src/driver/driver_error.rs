@@ -373,6 +373,15 @@ pub enum CliError {
         /// The ceiling (bytes) that was enforced.
         max: u64,
     },
+    /// `ipe fmt` refused a file whose formatted output would pass its cap.
+    ///
+    /// The file is left unchanged.
+    FmtOutputTooLarge {
+        /// The file whose output passed the cap.
+        file: PathBuf,
+        /// The output ceiling that was enforced.
+        cap: ipe_fmt::OutputCap,
+    },
     /// A remote transfer crossed its declared ingest budget and was stopped.
     ///
     /// Nothing it staged reached the lock, the manifest or the package cache.
@@ -676,6 +685,7 @@ impl CliError {
             Self::EjectUnsupported { .. } => "eject-unsupported",
             Self::DiagnosticJsonEmitted => "diagnostic-json-emitted",
             Self::FileTooLarge { .. } => "file-too-large",
+            Self::FmtOutputTooLarge { .. } => "fmt-output-too-large",
             Self::RemoteIngestExceeded(_) => "remote-ingest-exceeded",
             Self::LocalLimitExceeded(_) => "local-limit-exceeded",
             Self::ChildPipeHeld(_) => "child-pipe-held",
@@ -762,6 +772,7 @@ impl CliError {
             | Self::EjectUnsupported { .. }
             | Self::DiagnosticJsonEmitted
             | Self::FileTooLarge { .. }
+            | Self::FmtOutputTooLarge { .. }
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
             | Self::ChildPipeHeld(_)
@@ -1041,6 +1052,10 @@ impl std::fmt::Display for CliError {
             Self::FileTooLarge { path, max } => {
                 let path = path.display();
                 f.write_str(&text::cli_file_too_large(&path, max))
+            }
+            Self::FmtOutputTooLarge { file, cap } => {
+                let file = file.display();
+                f.write_str(&text::fmt_output_too_large(&file, cap))
             }
             Self::RemoteIngestExceeded(refusal) => refusal.fmt(f),
             Self::LocalLimitExceeded(refusal) => refusal.fmt(f),
