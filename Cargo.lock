@@ -3248,6 +3248,7 @@ dependencies = [
 name = "ipe_diagnostics"
 version = "0.5.0"
 dependencies = [
+ "e2e-support",
  "ipe_env",
  "ipe_path_core",
  "serde_json",

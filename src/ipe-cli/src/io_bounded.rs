@@ -496,6 +496,37 @@ pub fn read_leaf_bytes_capped(path: &Path, max: u64) -> Result<Vec<u8>, CliError
     read_handle_bytes(file, path, max)
 }
 
+/// Read a non-file stream (stdin) to a `String`, refusing one past `max` bytes.
+///
+/// For a stream with no path to open or prove; `path` only names it in errors.
+/// A stream that yields more than `max` bytes is a typed
+/// [`CliError::FileTooLarge`], never an allocation without a ceiling.
+///
+/// # Errors
+///
+/// - [`CliError::Io`] if the stream fails, or its content is not valid UTF-8.
+/// - [`CliError::FileTooLarge`] if it yields more than `max` bytes.
+pub fn read_stream_capped(
+    reader: impl std::io::Read,
+    path: &Path,
+    max: u64,
+) -> Result<String, CliError> {
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader.take(max.saturating_add(1)), &mut buf).map_err(
+        |source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+    )?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
+        return Err(CliError::FileTooLarge {
+            path: path.to_path_buf(),
+            max,
+        });
+    }
+    utf8(buf, path)
+}
+
 /// `bytes` as UTF-8 text, or the typed `InvalidData` error naming `path`.
 fn utf8(bytes: Vec<u8>, path: &Path) -> Result<String, CliError> {
     String::from_utf8(bytes).map_err(|e| CliError::Io {

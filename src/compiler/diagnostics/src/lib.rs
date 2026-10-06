@@ -167,6 +167,21 @@ mod tests {
                     body: "this program imports Ipe.Html.Unsafe\n".into(),
                 },
             },
+            IPE_S0002 => Diagnostic::Consent {
+                msg: ConsentError::WebAxisUngranted {
+                    body: "`js-port:clipboard` disclosed by Dep.Widget".into(),
+                },
+            },
+            IPE_S0003 => Diagnostic::Consent {
+                msg: ConsentError::NativeCrossingUngranted {
+                    body: "`Rust.Csum` crossed by Dep.Widget".into(),
+                },
+            },
+            IPE_S0004 => Diagnostic::Consent {
+                msg: ConsentError::ControlModelUncovered {
+                    body: "`Main` runs the `direct` control model".into(),
+                },
+            },
             // Compiler bug / internal — where_ strings must match code.rs mapping
             IPE_I0001 => Diagnostic::CompilerBug {
                 where_: "unknown",
@@ -736,7 +751,7 @@ mod tests {
     fn every_code_renders_through_the_pipeline() {
         let representatives: &[Code] = &[
             IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414,
-            IPE_F4415, IPE_S0001, IPE_I0001,
+            IPE_F4415, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_I0001,
         ];
 
         for &code in representatives {

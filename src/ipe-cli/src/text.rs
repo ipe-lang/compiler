@@ -727,6 +727,8 @@ messages! {
     internal_module_not_in_source_map = "internal-module-not-in-source-map";
     /// A library package (only `exposedModules`) has no runnable entry.
     library_package_no_entry = "library-package-no-entry";
+    /// A `--debugger` build under the vendored emit model.
+    debugger_needs_runtime_dep = "debugger-needs-runtime-dep";
     /// A packager could not find a `package.ipe` from the given root.
     pkg_not_found_in_dir = "pkg-not-found-in-dir";
     /// Bare `ipe package`.
@@ -1104,16 +1106,12 @@ messages! {
     mobile_ios_note = "mobile-ios-note";
     /// One disclosure line under a consent refusal.
     consent_item(item) = "consent-item";
-    /// The headline of the ungranted web-capability refusal.
-    web_consent_header = "web-consent-header";
     /// An ungranted web axis and the modules that disclose it.
     web_consent_disclosure(wire, via) = "web-consent-disclosure";
     /// An ungranted web axis no scanned module could be attributed to.
     web_consent_disclosure_unattributed(wire) = "web-consent-disclosure-unattributed";
     /// The remedy closing the ungranted web-capability refusal.
     web_consent_remedy = "web-consent-remedy";
-    /// The headline of the ungranted native-crossing refusal.
-    native_ffi_consent_header = "native-ffi-consent-header";
     /// An ungranted native crossing and the modules that cross it.
     native_ffi_crossing(krate, via) = "native-ffi-crossing";
     /// An ungranted native crossing no scanned crate could be attributed to.
@@ -1155,6 +1153,8 @@ messages! {
     fmt_stdin_unformatted = "fmt-stdin-unformatted";
     /// `ipe fmt` was given a missing path.
     fmt_no_such_path(root) = "fmt-no-such-path";
+    /// `ipe fmt` refused a file whose formatted output would pass its cap.
+    fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.
     health_home_unknown = "health-home-unknown";
     /// An `ipe health` install command was empty (an internal invariant).

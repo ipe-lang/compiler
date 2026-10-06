@@ -236,6 +236,10 @@ internal: module in topo order not in source map
 
 this is a library package (it declares `exposedModules` and no runnable program) — there is no entry to build. Use `ipe type-check` to verify its public surface, or add a `Package.programs [ … ]` stage to declare a runnable entry
 
+## debugger-needs-runtime-dep
+
+`--debugger` needs the runtime crate: the vendored runtime source (`IPE_RUNTIME_VENDORED=1`) carries no debugger. Unset `IPE_RUNTIME_VENDORED` to build with it
+
 ## pkg-not-found-in-dir
 
 no package.ipe found — run inside a project or pass its path
@@ -1184,6 +1188,10 @@ stdin is not formatted (run `ipe fmt --stdin` to fix)
 ## fmt-no-such-path
 
 fmt: no such file or directory: {root}
+
+## fmt-output-too-large
+
+formatted output of `{file}` would exceed {cap} bytes; the file is left unchanged. Split it into smaller modules.
 
 ## health-home-unknown
 
@@ -2156,10 +2164,6 @@ note: the iOS shell project layout is written here, but a signed, runnable .ipa 
 
   = {item}
 
-## web-consent-header
-
-error[IPE-S0002]: this program reaches a browser web capability the app has not granted
-
 ## web-consent-disclosure
 
 `{wire}` disclosed by {via}
@@ -2171,12 +2175,9 @@ error[IPE-S0002]: this program reaches a browser web capability the app has not 
 ## web-consent-remedy
 
   = a web capability is granted ONLY by the top-level app's package.ipe; a dependency
-    discloses but cannot self-authorise. Grant it after review by adding the axis to
-    `accept = [ … ]` under [capabilities] in package.ipe, or drop the dependency.
-
-## native-ffi-consent-header
-
-error[IPE-S0003]: this program crosses into native `Rust.` code the app has not granted
+    discloses but cannot self-authorise. Grant it after review by adding the axis,
+    spelled `JsPort <Axis>`, to `accepts = [ … ]` in the `capabilities` record of
+    package.ipe, or drop the dependency.
 
 ## native-ffi-crossing
 
@@ -2191,17 +2192,17 @@ a native crossing the build could not attribute to a crate
   = a native crossing is granted ONLY by the top-level app's package.ipe; a dependency
     crosses but cannot self-authorise. Its true effects are opaque to Ipê and
     contained at run by the OS jail, but the crossing itself needs the consumer's
-    consent. Grant it after review by adding `native-ffi` to `declared = [ … ]` under
-    [capabilities] in package.ipe, or drop the dependency.
+    consent. Grant it after review by adding `NativeFfi` to `declares = [ … ]` in
+    the `capabilities` record of package.ipe, or drop the dependency.
 
 ## control-model-consent-refusal
 
-error[IPE-S0004]: `{entry_module}` runs the `{model}` control model, which the declared `acceptsControl` set does not cover
+`{entry_module}` runs the `{model}` control model, which the declared `acceptsControl` set does not cover
   = the package opted into control-model consent by declaring `acceptsControl`,
     so that set must cover the program's actual control model; it does not
     list `{model}`, so the declared acceptance is stale.
-  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]`
-    under [capabilities] in package.ipe, or switch the entry to a listed
+  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]` in
+    the `capabilities` record of package.ipe, or switch the entry to a listed
     control model.
 
 ## permission-consent-header

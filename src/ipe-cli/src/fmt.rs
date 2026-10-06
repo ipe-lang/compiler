@@ -32,6 +32,9 @@
 //!   corruption. (The comparison ignores spans — only structure and values
 //!   matter.)
 //! * **Comment-preserving**: every comment in the input appears in the output.
+//! * **Bounded**: the output of one file may not pass
+//!   [`OutputCap::for_input`]; a file it would pass is refused and
+//!   left unchanged.
 //! * **Idempotent**: `format_source(format_source(x)) == format_source(x)`. The
 //!   `ipe fmt` fixtures assert this over records / lists / tuples / `case` /
 //!   `let` / `if` / comments, and the scaffolded `ipe init` template is a fixed
@@ -52,6 +55,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::Diagnostic;
@@ -59,7 +63,7 @@ use ipe_diagnostics::Diagnostic;
 // The formatting engine lives in the `ipe_fmt` crate so both this CLI and the
 // LSP formatting provider can share it. Re-export its public surface so
 // `ipe::fmt::format_source` (used here and by the integration tests) resolves.
-pub use ipe_fmt::{FmtError, format_source};
+pub use ipe_fmt::{FmtError, FmtLimit, OutputCap, format_source};
 
 use crate::CliError;
 /// Run the `fmt` subcommand.
@@ -67,8 +71,10 @@ use crate::CliError;
 /// # Errors
 /// [`CliError::Usage`] on flag misuse; [`CliError::Io`] on a filesystem
 /// failure; [`CliError::Pipeline`] when a file cannot be parsed or the
-/// formatter's round-trip guard trips. Under `--check`, an unformatted file is
-/// reported as a non-zero exit via [`CliError::Usage`] carrying the list.
+/// formatter's round-trip guard trips; [`CliError::FmtOutputTooLarge`] when a
+/// file's formatted output would pass its cap. Under `--check`, an unformatted
+/// file is reported as a non-zero exit via [`CliError::Usage`] carrying the
+/// list.
 pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
     // `--help` / `-h` is a request for output, not an error — honour it before
     // the typed parse (which treats every dashed token as a flag to validate).
@@ -205,16 +211,40 @@ fn report_check(
     }
 }
 
+/// A source read from standard input and its formatted text.
+#[derive(Debug)]
+pub struct StdinFormatted {
+    /// The source exactly as read.
+    pub source: String,
+    /// The formatter's output for `source`.
+    pub formatted: String,
+}
+
+/// Read a source from `reader` the way `ipe fmt` reads stdin, and format it.
+///
+/// The read stops at [`crate::io_bounded::SOURCE_READ_CAP`], the same ceiling a
+/// source file is read under.
+///
+/// # Errors
+/// [`CliError::FileTooLarge`] when the input passes the read cap;
+/// [`CliError::Io`] when it cannot be read or is not UTF-8; otherwise the
+/// errors of [`run_fmt`] for a file named `<stdin>`.
+pub fn format_stdin_from(reader: impl Read) -> Result<StdinFormatted, CliError> {
+    let source = crate::io_bounded::read_stream_capped(
+        reader,
+        Path::new("<stdin>"),
+        crate::io_bounded::SOURCE_READ_CAP,
+    )?;
+    let formatted = format_source(&source).map_err(|e| fmt_err_to_cli(Path::new("<stdin>"), e))?;
+    Ok(StdinFormatted { source, formatted })
+}
+
 /// Format stdin to stdout. When `check` is true, print a diff instead.
 fn run_fmt_stdin(check: bool) -> Result<(), CliError> {
-    let mut src = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut src).map_err(|e| CliError::Io {
-        path: PathBuf::from("<stdin>"),
-        source: e,
-    })?;
-
-    let formatted =
-        format_source(&src).map_err(|e| fmt_err_to_cli(&PathBuf::from("<stdin>"), e))?;
+    let StdinFormatted {
+        source: src,
+        formatted,
+    } = format_stdin_from(std::io::stdin().lock())?;
 
     if check {
         if formatted != src {
@@ -276,6 +306,10 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
                 where_: "ipe fmt",
                 detail,
             }),
+        },
+        FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::FmtOutputTooLarge {
+            file: file.to_path_buf(),
+            cap,
         },
     }
 }

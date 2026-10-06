@@ -21,6 +21,8 @@
 
 use std::collections::BTreeSet;
 
+use ipe_diagnostics::ConsentError;
+
 use crate::CliError;
 use crate::delivery::ControlModel;
 
@@ -60,11 +62,10 @@ fn refusal(derived: ControlModel, entry_module: &str) -> CliError {
     // capitalised constructor the manifest `acceptsControl` list expects.
     let model = derived.word();
     let ctor = control_model_ctor(derived);
-    CliError::Usage(crate::text::msg::control_model_consent_refusal(
-        &entry_module,
-        &model,
-        &ctor,
-    ))
+    let body = crate::text::msg::control_model_consent_refusal(&entry_module, &model, &ctor);
+    CliError::consent_refused(ConsentError::ControlModelUncovered {
+        body: body.to_string(),
+    })
 }
 
 /// The `Ipe.Package` constructor spelling for a control model — the capitalised
@@ -112,6 +113,10 @@ mod tests {
         assert!(
             msg.contains("acceptsControl"),
             "names the remedy field: {msg}"
+        );
+        assert!(
+            !msg.contains("[capabilities]"),
+            "package.ipe has no TOML section; the remedy names the record field: {msg}"
         );
     }
 

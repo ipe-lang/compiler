@@ -325,6 +325,9 @@ fn consent_prose(msg: &ConsentError) -> String {
         ConsentError::InteractiveDenied { body } => {
             format!("{body}The unsafe escape-hatch imports were not acknowledged — build stopped.")
         }
+        ConsentError::WebAxisUngranted { body }
+        | ConsentError::NativeCrossingUngranted { body }
+        | ConsentError::ControlModelUncovered { body } => body.clone(),
     }
 }
 
