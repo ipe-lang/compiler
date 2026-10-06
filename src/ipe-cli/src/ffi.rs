@@ -1445,12 +1445,6 @@ fn run_single_bwrap(
     binds: &ToolchainBinds,
     allow_build_scripts: bool,
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     let with_payload =
         |fetch_only: bool| inspector_payload(inspector, job, None, allow_build_scripts, fetch_only);
     run_phase(
@@ -1467,15 +1461,7 @@ fn run_single_bwrap(
         binds,
         &with_payload(false),
     )?;
-    if out.status != Some(0) {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+    InspectorFailure::from_jailed(out).map_err(|failure| failure.into_cli_error(inspector))
 }
 
 /// The inspector argv for one chunk of the manifest flow: a single-crate
@@ -1518,12 +1504,6 @@ fn run_introspect_chunk(
     binds: &ToolchainBinds,
     payload: &[OsString],
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     let out = run_phase(
         caps,
         ipe_sandbox::NetworkPolicy::Denied,
@@ -1531,15 +1511,8 @@ fn run_introspect_chunk(
         binds,
         payload,
     )?;
-    if out.status != Some(0) {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+    InspectorFailure::from_jailed(out)
+        .map_err(|failure| failure.into_cli_error(binds.inspector.as_path()))
 }
 
 /// Chunk a multi-crate manifest into per-crate jailed runs so no single run
@@ -1723,6 +1696,19 @@ enum InspectorFailure {
 }
 
 impl InspectorFailure {
+    /// The failure of a jailed inspector run, or its stdout as text.
+    ///
+    /// A wall kill leaves no status, which renders as a signal ending the run.
+    fn from_jailed(out: ipe_sandbox::JailedOutput) -> Result<String, Self> {
+        if out.status != Some(0) {
+            return Err(Self::Exit {
+                code: out.status,
+                stderr: kept_stderr(out.stderr),
+            });
+        }
+        String::from_utf8(out.stdout).map_err(|_| Self::NotUtf8)
+    }
+
     /// The CLI error of this failure; `inspector` names the binary on a start or wait failure.
     fn into_cli_error(self, inspector: &Path) -> CliError {
         match self {
@@ -1749,9 +1735,21 @@ impl InspectorFailure {
     }
 }
 
+/// A jailed inspector's stderr held to the child-stderr ceiling, marked when cut.
+fn kept_stderr(mut bytes: Vec<u8>) -> ChildStderr {
+    let ceiling = usize::try_from(CHILD_STDERR_MAX_BYTES.get()).unwrap_or(usize::MAX);
+    if bytes.len() > ceiling {
+        bytes.truncate(ceiling);
+        ChildStderr::Truncated(bytes)
+    } else {
+        ChildStderr::Whole(bytes)
+    }
+}
+
 /// Run the inspector `program` with `args` outside the jail, held to `ceiling`.
 ///
-/// A crossed ceiling kills the inspector's process group.
+/// On unix a crossed ceiling kills the inspector's process group; elsewhere
+/// only the inspector itself.
 ///
 /// # Errors
 /// [`InspectorFailure::Run`] when the run left no result,
@@ -6800,11 +6798,108 @@ iced = "=0.12.1"
         assert_eq!(stderr.to_terminal().as_str(), "boom");
     }
 
-    /// The unsandboxed inspector is held to the jailed inspector's default stdout and wall caps.
+    /// A signal ending the inspector is a typed failure without a code, stderr kept.
+    #[cfg(unix)]
     #[test]
-    fn the_unsandboxed_ceiling_equals_the_jail_default() {
-        let jail = ipe_sandbox::ResourceLimits::default();
-        assert_eq!(FFI_INSPECT_LIMITS.stdout_bytes().get(), jail.out_cap_bytes);
-        assert_eq!(FFI_INSPECT_LIMITS.wall().secs(), jail.wall_secs);
+    fn a_signalled_unsandboxed_inspector_keeps_its_stderr() {
+        let run = stub_inspector("echo dying >&2; kill -KILL $$", FFI_INSPECT_LIMITS);
+        assert!(
+            matches!(run, Err(InspectorFailure::Exit { code: None, .. })),
+            "{run:?}"
+        );
+        let Err(InspectorFailure::Exit { stderr, .. }) = run else {
+            return;
+        };
+        assert_eq!(stderr.to_terminal().as_str(), "dying");
+    }
+
+    /// The build-scripts banner still leads when the refusal arrives through the catalog phrase.
+    #[test]
+    #[allow(clippy::panic)]
+    fn the_build_scripts_banner_survives_the_inspector_phrase() {
+        let failure = InspectorFailure::Exit {
+            code: Some(1),
+            stderr: ChildStderr::Whole(
+                b"refusing to inspect:\n  - x (build script)\nPass --allow-build-scripts to proceed anyway"
+                    .to_vec(),
+            ),
+        };
+        let CliError::Usage(message) = failure.into_cli_error(Path::new("ipe-ffi-inspector"))
+        else {
+            panic!("an inspector exit is a usage refusal");
+        };
+        match map_inspector_error(message) {
+            CliError::Resolve(text) => assert!(
+                text.starts_with(
+                    "warning: some crates in the dependency graph have build scripts."
+                ),
+                "{text:?}"
+            ),
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+    }
+
+    /// An escape sequence in the inspector's stderr never reaches the refusal text.
+    #[test]
+    #[allow(clippy::panic)]
+    fn an_escape_in_inspector_stderr_is_stripped_from_the_refusal() {
+        let failure = InspectorFailure::Exit {
+            code: Some(2),
+            stderr: ChildStderr::Whole(b"\x1b[31mred\x1b[0m".to_vec()),
+        };
+        let CliError::Usage(message) = failure.into_cli_error(Path::new("ipe-ffi-inspector"))
+        else {
+            panic!("an inspector exit is a usage refusal");
+        };
+        assert!(!message.as_str().contains('\u{1b}'), "{message:?}");
+        assert!(message.as_str().contains("red"), "{message:?}");
+    }
+
+    /// A jailed inspector's stderr is held to the child-stderr ceiling and marked when cut.
+    #[test]
+    fn a_jailed_inspector_failure_keeps_a_bounded_stderr() {
+        let flood = ipe_sandbox::JailedOutput {
+            status: Some(2),
+            stdout: Vec::new(),
+            stderr: vec![b'e'; 70 * 1024],
+        };
+        let Err(InspectorFailure::Exit { code, stderr }) = InspectorFailure::from_jailed(flood)
+        else {
+            return;
+        };
+        assert_eq!(code, Some(2));
+        assert!(matches!(stderr, ChildStderr::Truncated(_)));
+        assert_eq!(
+            u64::try_from(stderr.bytes().len()).ok(),
+            Some(CHILD_STDERR_MAX_BYTES.get())
+        );
+    }
+
+    /// A jailed run killed by the wall has no status and is a failure without a code.
+    #[test]
+    fn a_jailed_inspector_killed_by_the_wall_has_no_code() {
+        let killed = ipe_sandbox::JailedOutput {
+            status: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            InspectorFailure::from_jailed(killed),
+            Err(InspectorFailure::Exit { code: None, .. })
+        ));
+    }
+
+    /// A jailed inspection report that is not UTF-8 is a typed failure.
+    #[test]
+    fn a_non_utf8_jailed_inspector_report_is_a_typed_failure() {
+        let bad = ipe_sandbox::JailedOutput {
+            status: Some(0),
+            stdout: vec![0xff],
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            InspectorFailure::from_jailed(bad),
+            Err(InspectorFailure::NotUtf8)
+        ));
     }
 }
